@@ -142,6 +142,11 @@ Full documentation: **[nano.rs/docs](https://nano.rs/docs/getting-started/first-
   write rules, manage lifecycle, tune for noise
 - **[UDM Reference](https://nano.rs/docs/reference/udm-fields/)** — the
   75+ explicit columns the schema is built around
+- **[Coding Agents](https://nano.rs/docs/coding-agents)** — manage
+  searches, parsers, and detections via Claude Code / Codex pointed at
+  your nano instance. The hosted plan ships an in-app AI assistant
+  (pivt); coding-agents brings equivalent leverage to open-core
+  deployments, locally.
 
 ## Ecosystem
 
