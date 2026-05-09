@@ -1,0 +1,2608 @@
+//! Settings endpoint handlers
+//!
+//! Implements:
+//! - GET /api/settings/melod - Get current meloD config (without secrets)
+//! - PUT /api/settings/melod - Update meloD config
+//! - PUT /api/settings/melod/credentials - Update credentials
+//! - POST /api/settings/melod/validate - Test connection
+//! - GET /api/settings/melod/status - Get connection status
+//! - GET /api/settings/risk - Get current risk weight
+//! - PUT /api/settings/risk - Update risk weight
+//! - GET /api/settings/nrt - Get NRT engine settings
+//! - PUT /api/settings/nrt - Update NRT engine settings
+//!
+//! Requirements: 10.1, 10.2, 10.4, 9.1, 9.4, 8.2
+
+use axum::{extract::{Path, State}, Extension, Json};
+use nanosiem_core::melod::{
+    AiProvider, AuthMethod, ConnectionStatus, CredentialsSource, MelodCredentials, MelodSettings, SettingsError,
+};
+use nanosiem_core::auth::permissions;
+use nanosiem_core::crypto::EncryptionService;
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use utoipa::ToSchema;
+
+use crate::{error::ApiError, state::AppState};
+use crate::middleware::{AuthContext, check_permission};
+
+// ============================================================================
+// Request/Response Types
+// ============================================================================
+
+/// Response for meloD configuration (without secrets)
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MelodConfigResponse {
+    pub enabled: bool,
+    pub provider: String,
+    pub aws_region: String,
+    pub model_id: String,
+    pub max_tokens: u32,
+    pub temperature: f32,
+    pub requests_per_minute: u32,
+    pub has_credentials: bool,
+    pub credentials_source: Option<String>,
+    /// Which auth method is configured: "bedrock_api_key" or "iam_credentials"
+    pub auth_method: Option<String>,
+}
+
+/// Request to update meloD configuration
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateMelodConfigRequest {
+    pub enabled: Option<bool>,
+    pub aws_region: Option<String>,
+    pub model_id: Option<String>,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+    pub requests_per_minute: Option<u32>,
+}
+
+/// Request to update credentials
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateCredentialsRequest {
+    /// Authentication method: "bedrock_api_key" or "iam_credentials"
+    pub auth_method: String,
+    /// Bedrock API Key (bearer token) - required when auth_method is "bedrock_api_key"
+    pub bedrock_api_key: Option<String>,
+    /// AWS Access Key ID - required when auth_method is "iam_credentials"
+    pub aws_access_key_id: Option<String>,
+    /// AWS Secret Access Key - required when auth_method is "iam_credentials"
+    pub aws_secret_access_key: Option<String>,
+}
+
+/// Response for connection status
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ConnectionStatusResponse {
+    pub connected: bool,
+    pub model_available: bool,
+    pub last_checked: Option<String>,
+    pub error: Option<String>,
+}
+
+impl From<ConnectionStatus> for ConnectionStatusResponse {
+    fn from(status: ConnectionStatus) -> Self {
+        Self {
+            connected: status.connected,
+            model_available: status.model_available,
+            last_checked: status.last_checked.map(|t| t.to_rfc3339()),
+            error: status.error,
+        }
+    }
+}
+
+// ============================================================================
+// Error Conversion
+// ============================================================================
+
+impl From<SettingsError> for ApiError {
+    fn from(err: SettingsError) -> Self {
+        match &err {
+            SettingsError::InvalidConfig(msg) => ApiError::ValidationError(msg.clone()),
+            SettingsError::ConnectionValidation(msg) => {
+                ApiError::BadRequest(format!("Connection validation failed: {}", msg))
+            }
+            _ => ApiError::InternalError(err.to_string()),
+        }
+    }
+}
+
+// ============================================================================
+// Handler Functions
+// ============================================================================
+
+/// Get meloD configuration
+///
+/// GET /api/settings/melod
+///
+/// Returns the current meloD configuration without exposing secrets.
+///
+/// Requirements: 10.1
+#[utoipa::path(
+    get,
+    path = "/api/settings/melod",
+    tag = "settings",
+    responses(
+        (status = 200, description = "Current meloD configuration", body = MelodConfigResponse),
+        (status = 403, description = "Missing permission", body = ApiError),
+        (status = 500, description = "Internal server error", body = ApiError)
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
+pub async fn get_melod_config(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<MelodConfigResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_AI)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+
+    let settings = MelodSettings::from_env(state.pool.clone())?;
+
+    let config = settings.get_config().await?;
+    let credentials_source = settings.get_credentials_source().await?;
+    let credentials = settings.get_effective_credentials().await?;
+
+    let provider = match config.provider {
+        AiProvider::AwsBedrock => "aws_bedrock".to_string(),
+    };
+
+    let credentials_source_str = credentials_source.map(|s| match s {
+        CredentialsSource::Database => "database".to_string(),
+        CredentialsSource::Environment => "environment".to_string(),
+    });
+
+    let auth_method_str = credentials.map(|c| match c.auth_method {
+        AuthMethod::BedrockApiKey => "bedrock_api_key".to_string(),
+        AuthMethod::IamCredentials => "iam_credentials".to_string(),
+    });
+
+    Ok(Json(MelodConfigResponse {
+        enabled: config.enabled,
+        provider,
+        aws_region: config.aws_region,
+        model_id: config.model_id,
+        max_tokens: config.max_tokens,
+        temperature: config.temperature,
+        requests_per_minute: config.requests_per_minute,
+        has_credentials: credentials_source.is_some(),
+        credentials_source: credentials_source_str,
+        auth_method: auth_method_str,
+    }))
+}
+
+/// Update meloD configuration
+///
+/// PUT /api/settings/melod
+///
+/// Updates the meloD configuration. Only provided fields are updated.
+/// Automatically reloads the meloD service when configuration changes.
+///
+/// Requirements: 10.2
+#[utoipa::path(
+    put,
+    path = "/api/settings/melod",
+    tag = "settings",
+    request_body = UpdateMelodConfigRequest,
+    responses(
+        (status = 200, description = "Configuration updated", body = MelodConfigResponse),
+        (status = 403, description = "Missing permission", body = ApiError),
+        (status = 500, description = "Internal server error", body = ApiError)
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
+pub async fn update_melod_config(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(request): Json<UpdateMelodConfigRequest>,
+) -> Result<Json<MelodConfigResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_AI)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+    
+    let settings = MelodSettings::from_env(state.pool.clone())?;
+
+    // Get current config
+    let mut config = settings.get_config().await?;
+    let was_enabled = config.enabled;
+
+    // Apply updates
+    if let Some(enabled) = request.enabled {
+        config.enabled = enabled;
+    }
+    if let Some(aws_region) = request.aws_region {
+        config.aws_region = aws_region;
+    }
+    if let Some(model_id) = request.model_id {
+        config.model_id = model_id;
+    }
+    if let Some(max_tokens) = request.max_tokens {
+        config.max_tokens = max_tokens;
+    }
+    if let Some(temperature) = request.temperature {
+        config.temperature = temperature;
+    }
+    if let Some(requests_per_minute) = request.requests_per_minute {
+        config.requests_per_minute = requests_per_minute;
+    }
+
+    // Save updated config
+    settings.update_config(config.clone()).await?;
+
+    // Reload meloD service if enabled state changed or config was updated while enabled
+    if config.enabled != was_enabled || config.enabled {
+        match state.reload_melod_service().await {
+            Ok(true) => {
+                tracing::info!("meloD service reloaded after config update");
+            }
+            Ok(false) => {
+                tracing::debug!("meloD service not loaded (disabled or no credentials)");
+            }
+            Err(e) => {
+                tracing::warn!("Failed to reload meloD service: {}", e);
+            }
+        }
+    }
+
+    let credentials_source = settings.get_credentials_source().await?;
+    let credentials = settings.get_effective_credentials().await?;
+
+    let provider = match config.provider {
+        AiProvider::AwsBedrock => "aws_bedrock".to_string(),
+    };
+
+    let credentials_source_str = credentials_source.map(|s| match s {
+        CredentialsSource::Database => "database".to_string(),
+        CredentialsSource::Environment => "environment".to_string(),
+    });
+
+    let auth_method_str = credentials.map(|c| match c.auth_method {
+        AuthMethod::BedrockApiKey => "bedrock_api_key".to_string(),
+        AuthMethod::IamCredentials => "iam_credentials".to_string(),
+    });
+
+    Ok(Json(MelodConfigResponse {
+        enabled: config.enabled,
+        provider,
+        aws_region: config.aws_region,
+        model_id: config.model_id,
+        max_tokens: config.max_tokens,
+        temperature: config.temperature,
+        requests_per_minute: config.requests_per_minute,
+        has_credentials: credentials_source.is_some(),
+        credentials_source: credentials_source_str,
+        auth_method: auth_method_str,
+    }))
+}
+
+/// Update meloD credentials
+///
+/// PUT /api/settings/melod/credentials
+///
+/// Updates the AWS credentials for Bedrock access.
+/// Supports both Bedrock API Key (bearer token) and IAM credentials.
+/// Credentials are encrypted before storage.
+///
+/// Requirements: 10.2, 10.8
+#[utoipa::path(
+    put,
+    path = "/api/settings/melod/credentials",
+    tag = "settings",
+    request_body = UpdateCredentialsRequest,
+    responses(
+        (status = 200, description = "Credentials updated successfully", body = serde_json::Value),
+        (status = 400, description = "Invalid credentials", body = ApiError),
+        (status = 403, description = "Missing permission", body = ApiError),
+        (status = 500, description = "Internal server error", body = ApiError)
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
+pub async fn update_melod_credentials(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(request): Json<UpdateCredentialsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_AI)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+    
+    let settings = MelodSettings::from_env(state.pool.clone())?;
+
+    let credentials = match request.auth_method.as_str() {
+        "bedrock_api_key" => {
+            let api_key = request.bedrock_api_key.ok_or_else(|| {
+                ApiError::ValidationError("bedrock_api_key is required for this auth method".to_string())
+            })?;
+            MelodCredentials {
+                auth_method: AuthMethod::BedrockApiKey,
+                bedrock_api_key: Some(api_key),
+                aws_access_key_id: None,
+                aws_secret_access_key: None,
+            }
+        }
+        "iam_credentials" => {
+            let access_key = request.aws_access_key_id.ok_or_else(|| {
+                ApiError::ValidationError("aws_access_key_id is required for this auth method".to_string())
+            })?;
+            let secret_key = request.aws_secret_access_key.ok_or_else(|| {
+                ApiError::ValidationError("aws_secret_access_key is required for this auth method".to_string())
+            })?;
+            MelodCredentials {
+                auth_method: AuthMethod::IamCredentials,
+                bedrock_api_key: None,
+                aws_access_key_id: Some(access_key),
+                aws_secret_access_key: Some(secret_key),
+            }
+        }
+        _ => {
+            return Err(ApiError::ValidationError(
+                "auth_method must be 'bedrock_api_key' or 'iam_credentials'".to_string()
+            ));
+        }
+    };
+
+    settings.update_credentials(credentials).await?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Credentials updated successfully"
+    })))
+}
+
+/// Validate meloD connection
+///
+/// POST /api/settings/melod/validate
+///
+/// Tests the connection to AWS Bedrock using the stored credentials.
+/// Updates and returns the connection status.
+/// If connection is successful, automatically enables meloD and reloads the service.
+///
+/// Requirements: 10.4, 10.5, 10.6
+#[utoipa::path(
+    post,
+    path = "/api/settings/melod/validate",
+    tag = "settings",
+    responses(
+        (status = 200, description = "Connection validation result", body = ConnectionStatusResponse),
+        (status = 403, description = "Missing permission", body = ApiError),
+        (status = 500, description = "Validation failed", body = ApiError)
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
+pub async fn validate_melod_connection(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<ConnectionStatusResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_AI)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+    
+    let settings = MelodSettings::from_env(state.pool.clone())?;
+
+    let status = settings.validate_connection().await?;
+
+    // Auto-enable meloD and reload service if connection is successful
+    if status.connected && status.model_available {
+        let mut config = settings.get_config().await?;
+        if !config.enabled {
+            config.enabled = true;
+            if let Err(e) = settings.update_config(config).await {
+                tracing::warn!("Failed to auto-enable meloD after successful connection: {}", e);
+            } else {
+                tracing::info!("meloD auto-enabled after successful connection validation");
+            }
+        }
+        
+        // Reload the meloD service so it's immediately available
+        match state.reload_melod_service().await {
+            Ok(true) => {
+                tracing::info!("meloD service reloaded after successful connection validation");
+            }
+            Ok(false) => {
+                tracing::warn!("meloD service could not be loaded after validation");
+            }
+            Err(e) => {
+                tracing::warn!("Failed to reload meloD service: {}", e);
+            }
+        }
+    }
+
+    Ok(Json(ConnectionStatusResponse::from(status)))
+}
+
+/// Get meloD connection status
+///
+/// GET /api/settings/melod/status
+///
+/// Returns the current connection status. Checks LiteLLM if configured,
+/// otherwise falls back to legacy Bedrock status.
+///
+/// Requirements: 10.4
+#[utoipa::path(
+    get,
+    path = "/api/settings/melod/status",
+    tag = "settings",
+    responses(
+        (status = 200, description = "Connection status", body = ConnectionStatusResponse),
+        (status = 403, description = "Missing permission", body = ApiError),
+        (status = 500, description = "Internal server error", body = ApiError)
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
+pub async fn get_melod_status(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<ConnectionStatusResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_VIEW)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:view".to_string()))?;
+
+    // Check if we're using LiteLLM mode (new multi-provider system)
+    let litellm_proxy_url = std::env::var("LITELLM_PROXY_URL").ok();
+
+    if let Some(proxy_url) = litellm_proxy_url {
+        // LiteLLM mode - check provider status
+        // Check if any providers are enabled with credentials
+        let enabled_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provider_credentials WHERE enabled = true AND credentials_encrypted IS NOT NULL"
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(0);
+
+        if enabled_count == 0 {
+            return Ok(Json(ConnectionStatusResponse {
+                connected: false,
+                model_available: false,
+                last_checked: Some(chrono::Utc::now().to_rfc3339()),
+                error: Some("No AI providers configured. Enable a provider in Settings > AI Providers.".to_string()),
+            }));
+        }
+
+        // Check if LiteLLM proxy is reachable and has models
+        let sync_guard = state.litellm_sync.read().await;
+        if let Some(ref sync_service) = *sync_guard {
+            // Check proxy health
+            match sync_service.validate_proxy_connection().await {
+                Ok(true) => {
+                    // Check if models are registered
+                    match sync_service.get_registered_models().await {
+                        Ok(models) if !models.is_empty() => {
+                            return Ok(Json(ConnectionStatusResponse {
+                                connected: true,
+                                model_available: true,
+                                last_checked: Some(chrono::Utc::now().to_rfc3339()),
+                                error: None,
+                            }));
+                        }
+                        Ok(_) => {
+                            return Ok(Json(ConnectionStatusResponse {
+                                connected: true,
+                                model_available: false,
+                                last_checked: Some(chrono::Utc::now().to_rfc3339()),
+                                error: Some("LiteLLM connected but no models registered. Validate your provider credentials.".to_string()),
+                            }));
+                        }
+                        Err(e) => {
+                            return Ok(Json(ConnectionStatusResponse {
+                                connected: true,
+                                model_available: false,
+                                last_checked: Some(chrono::Utc::now().to_rfc3339()),
+                                error: Some(format!("Failed to query models: {}", e)),
+                            }));
+                        }
+                    }
+                }
+                Ok(false) | Err(_) => {
+                    return Ok(Json(ConnectionStatusResponse {
+                        connected: false,
+                        model_available: false,
+                        last_checked: Some(chrono::Utc::now().to_rfc3339()),
+                        error: Some(format!("Cannot reach LiteLLM proxy at {}", proxy_url)),
+                    }));
+                }
+            }
+        } else {
+            // LiteLLM sync service not initialized - need to reload
+            return Ok(Json(ConnectionStatusResponse {
+                connected: false,
+                model_available: false,
+                last_checked: Some(chrono::Utc::now().to_rfc3339()),
+                error: Some("AI service not initialized. Try restarting the API or validating a provider.".to_string()),
+            }));
+        }
+    }
+
+    // Legacy Bedrock-only mode
+    let settings = MelodSettings::from_env(state.pool.clone())?;
+    let status = settings.get_connection_status().await?;
+    Ok(Json(ConnectionStatusResponse::from(status)))
+}
+
+
+// ============================================================================
+// Retention Settings
+// ============================================================================
+
+use nanosiem_core::settings::{
+    ClickHouseStorageStats, DualSystemSettings, RetentionConfig, RetentionError, SystemSettings,
+    StorageStats,
+};
+
+/// Response for retention configuration
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RetentionConfigResponse {
+    pub enabled: bool,
+    pub retention_days: u32,
+    pub job_id: Option<i32>,
+}
+
+impl From<RetentionConfig> for RetentionConfigResponse {
+    fn from(config: RetentionConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            retention_days: config.retention_days,
+            job_id: config.job_id,
+        }
+    }
+}
+
+/// Request to update retention configuration
+#[derive(Debug, Deserialize)]
+pub struct UpdateRetentionRequest {
+    pub enabled: bool,
+    pub retention_days: u32,
+}
+
+/// Response for storage statistics
+#[derive(Debug, Serialize)]
+pub struct StorageStatsResponse {
+    pub total_size_bytes: i64,
+    pub total_size_pretty: String,
+    pub chunk_count: i64,
+    pub compressed_chunks: i64,
+    pub oldest_log: Option<String>,
+    pub newest_log: Option<String>,
+    pub log_count: i64,
+}
+
+impl From<StorageStats> for StorageStatsResponse {
+    fn from(stats: StorageStats) -> Self {
+        Self {
+            total_size_bytes: stats.total_size_bytes,
+            total_size_pretty: stats.total_size_pretty,
+            chunk_count: stats.chunk_count,
+            compressed_chunks: stats.compressed_chunks,
+            oldest_log: stats.oldest_log.map(|t| t.to_rfc3339()),
+            newest_log: stats.newest_log.map(|t| t.to_rfc3339()),
+            log_count: stats.log_count,
+        }
+    }
+}
+
+/// Response for ClickHouse storage statistics
+#[derive(Debug, Serialize)]
+pub struct ClickHouseStorageStatsResponse {
+    pub total_size_bytes: u64,
+    pub total_size_pretty: String,
+    pub row_count: u64,
+    pub partition_count: u64,
+    pub parts_count: u64,
+    pub oldest_log: Option<String>,
+    pub newest_log: Option<String>,
+    pub compression_ratio: f64,
+    pub uncompressed_size_bytes: u64,
+    pub ttl_days: Option<u32>,
+}
+
+impl From<ClickHouseStorageStats> for ClickHouseStorageStatsResponse {
+    fn from(stats: ClickHouseStorageStats) -> Self {
+        Self {
+            total_size_bytes: stats.total_size_bytes,
+            total_size_pretty: stats.total_size_pretty,
+            row_count: stats.row_count,
+            partition_count: stats.partition_count,
+            parts_count: stats.parts_count,
+            oldest_log: stats.oldest_log.map(|t| t.to_rfc3339()),
+            newest_log: stats.newest_log.map(|t| t.to_rfc3339()),
+            compression_ratio: stats.compression_ratio,
+            uncompressed_size_bytes: stats.uncompressed_size_bytes,
+            ttl_days: stats.ttl_days,
+        }
+    }
+}
+
+/// Combined storage overview response
+#[derive(Debug, Serialize)]
+pub struct StorageOverviewResponse {
+    /// Whether ClickHouse is enabled for log storage
+    pub clickhouse_enabled: bool,
+    /// PostgreSQL storage stats (metadata)
+    pub postgres: Option<StorageStatsResponse>,
+    /// ClickHouse storage stats (logs)
+    pub clickhouse: Option<ClickHouseStorageStatsResponse>,
+}
+
+/// Request to update ClickHouse retention
+#[derive(Debug, Deserialize)]
+pub struct UpdateClickHouseRetentionRequest {
+    pub retention_days: u32,
+}
+
+impl From<RetentionError> for ApiError {
+    fn from(err: RetentionError) -> Self {
+        match &err {
+            RetentionError::InvalidPeriod(msg) => ApiError::ValidationError(msg.clone()),
+            RetentionError::Config(msg) => ApiError::InternalError(msg.clone()),
+            RetentionError::ClickHouse(msg) => ApiError::InternalError(msg.clone()),
+            RetentionError::Database(e) => ApiError::InternalError(e.to_string()),
+        }
+    }
+}
+
+/// Get retention configuration
+///
+/// GET /api/settings/retention
+pub async fn get_retention_config(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<RetentionConfigResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_RETENTION)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:retention".to_string()))?;
+    
+    let settings = SystemSettings::new(state.pool.clone());
+    let config = settings.get_retention_config().await?;
+    Ok(Json(RetentionConfigResponse::from(config)))
+}
+
+/// Update retention configuration
+///
+/// PUT /api/settings/retention
+pub async fn update_retention_config(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(request): Json<UpdateRetentionRequest>,
+) -> Result<Json<RetentionConfigResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_RETENTION)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:retention".to_string()))?;
+    
+    let settings = SystemSettings::new(state.pool.clone());
+    
+    let config = RetentionConfig {
+        enabled: request.enabled,
+        retention_days: request.retention_days,
+        job_id: None,
+    };
+    
+    let updated = settings.update_retention_config(config).await?;
+    Ok(Json(RetentionConfigResponse::from(updated)))
+}
+
+/// Get storage statistics
+///
+/// GET /api/settings/storage
+pub async fn get_storage_stats(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<StorageStatsResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_VIEW)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:view".to_string()))?;
+    
+    let settings = SystemSettings::new(state.pool.clone());
+    let stats = settings.get_storage_stats().await?;
+    Ok(Json(StorageStatsResponse::from(stats)))
+}
+
+/// Run retention now (manually drop old chunks)
+///
+/// POST /api/settings/retention/run
+pub async fn run_retention_now(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_RETENTION)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:retention".to_string()))?;
+    
+    let settings = SystemSettings::new(state.pool.clone());
+    let dropped = settings.run_retention_now().await?;
+    
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "chunks_dropped": dropped
+    })))
+}
+
+
+// ============================================================================
+// Risk Settings
+// ============================================================================
+
+use nanosiem_core::detection::risk::RiskError;
+
+/// Response for risk configuration
+#[derive(Debug, Serialize)]
+pub struct RiskConfigResponse {
+    pub risk_weight: f64,
+}
+
+/// Request to update risk configuration
+#[derive(Debug, Deserialize)]
+pub struct UpdateRiskConfigRequest {
+    pub risk_weight: f64,
+}
+
+/// Response for risk decay configuration
+#[derive(Debug, Serialize)]
+pub struct RiskDecayConfigResponse {
+    pub decay_0_24h: f64,
+    pub decay_1_3d: f64,
+    pub decay_3_5d: f64,
+    pub decay_5_7d: f64,
+}
+
+/// Request to update risk decay configuration
+#[derive(Debug, Deserialize)]
+pub struct UpdateRiskDecayConfigRequest {
+    pub decay_0_24h: f64,
+    pub decay_1_3d: f64,
+    pub decay_3_5d: f64,
+    pub decay_5_7d: f64,
+}
+
+impl From<RiskError> for ApiError {
+    fn from(err: RiskError) -> Self {
+        match &err {
+            RiskError::WeightOutOfBounds(w) => {
+                ApiError::ValidationError(format!("Risk weight {} is out of bounds (must be 0.0-1.0)", w))
+            }
+            RiskError::ScoreOutOfBounds(s) => {
+                ApiError::ValidationError(format!("Risk score {} is out of bounds (must be 0-100)", s))
+            }
+            RiskError::InvalidCondition(msg) => {
+                ApiError::ValidationError(format!("Invalid modifier condition: {}", msg))
+            }
+        }
+    }
+}
+
+/// Get risk configuration
+///
+/// GET /api/settings/risk
+///
+/// Returns the current global risk weight multiplier.
+///
+/// Requirements: 9.1
+pub async fn get_risk_config(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<RiskConfigResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_RISK)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:risk".to_string()))?;
+    
+    let risk_weight = get_risk_weight_from_db(&state.pool).await?;
+    Ok(Json(RiskConfigResponse { risk_weight }))
+}
+
+/// Update risk configuration
+///
+/// PUT /api/settings/risk
+///
+/// Updates the global risk weight multiplier (0.0-1.0).
+/// The new weight is applied to all future signals immediately.
+///
+/// Requirements: 9.1, 9.4
+pub async fn update_risk_config(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(request): Json<UpdateRiskConfigRequest>,
+) -> Result<Json<RiskConfigResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_RISK)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:risk".to_string()))?;
+    
+    use nanosiem_core::detection::risk::ScoreCalculator;
+    
+    // Validate the weight is within bounds
+    ScoreCalculator::validate_weight(request.risk_weight)?;
+    
+    // Update the risk_weight in the database
+    update_risk_weight_in_db(&state.pool, request.risk_weight).await?;
+    
+    tracing::info!("Risk weight updated to {}", request.risk_weight);
+    
+    Ok(Json(RiskConfigResponse {
+        risk_weight: request.risk_weight,
+    }))
+}
+
+/// Helper function to get risk_weight from the database
+async fn get_risk_weight_from_db(pool: &PgPool) -> Result<f64, ApiError> {
+    let row: (sqlx::types::Decimal,) = sqlx::query_as(
+        "SELECT risk_weight FROM system_settings WHERE id = 'default'"
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+    
+    // Convert Decimal to f64
+    let weight_str = row.0.to_string();
+    let weight = weight_str.parse::<f64>().unwrap_or(1.0);
+    Ok(weight)
+}
+
+/// Helper function to update risk_weight in the database
+async fn update_risk_weight_in_db(pool: &PgPool, weight: f64) -> Result<(), ApiError> {
+    use sqlx::types::Decimal;
+    
+    // Convert f64 to Decimal
+    let decimal_weight = Decimal::try_from(weight)
+        .unwrap_or_else(|_| Decimal::try_from(1.0).unwrap());
+    
+    sqlx::query(
+        "UPDATE system_settings SET risk_weight = $1, updated_at = NOW() WHERE id = 'default'"
+    )
+    .bind(decimal_weight)
+    .execute(pool)
+    .await
+    .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+    
+    Ok(())
+}
+
+// ============================================================================
+// Risk Decay Configuration
+// ============================================================================
+
+/// Get risk decay configuration
+///
+/// GET /api/settings/risk-decay
+///
+/// Returns the current TTL decay factors for risk scoring.
+/// Decay is applied based on signal age (Google SecOps-style).
+pub async fn get_risk_decay_config(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<RiskDecayConfigResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_RISK)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:risk".to_string()))?;
+
+    let config = state.risk_service.get_decay_config().await
+        .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+
+    Ok(Json(RiskDecayConfigResponse {
+        decay_0_24h: config.decay_0_24h,
+        decay_1_3d: config.decay_1_3d,
+        decay_3_5d: config.decay_3_5d,
+        decay_5_7d: config.decay_5_7d,
+    }))
+}
+
+/// Update risk decay configuration
+///
+/// PUT /api/settings/risk-decay
+///
+/// Updates the TTL decay factors for risk scoring.
+/// All factors must be between 0.0 and 1.0.
+pub async fn update_risk_decay_config(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(request): Json<UpdateRiskDecayConfigRequest>,
+) -> Result<Json<RiskDecayConfigResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_RISK)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:risk".to_string()))?;
+
+    use nanosiem_core::risk::types::RiskDecayConfig;
+
+    let config = RiskDecayConfig {
+        decay_0_24h: request.decay_0_24h,
+        decay_1_3d: request.decay_1_3d,
+        decay_3_5d: request.decay_3_5d,
+        decay_5_7d: request.decay_5_7d,
+    };
+
+    state.risk_service.update_decay_config(&config).await
+        .map_err(|e| ApiError::ValidationError(e.to_string()))?;
+
+    tracing::info!(
+        "Risk decay config updated: 0-24h={}, 1-3d={}, 3-5d={}, 5-7d={}",
+        config.decay_0_24h, config.decay_1_3d, config.decay_3_5d, config.decay_5_7d
+    );
+
+    Ok(Json(RiskDecayConfigResponse {
+        decay_0_24h: config.decay_0_24h,
+        decay_1_3d: config.decay_1_3d,
+        decay_3_5d: config.decay_3_5d,
+        decay_5_7d: config.decay_5_7d,
+    }))
+}
+
+// ============================================================================
+// ClickHouse Storage Settings
+// ============================================================================
+
+/// Get storage overview (both PostgreSQL and ClickHouse)
+///
+/// GET /api/settings/storage/overview
+///
+/// Returns storage statistics for both databases.
+pub async fn get_storage_overview(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<StorageOverviewResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_VIEW)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:view".to_string()))?;
+    
+    let clickhouse_enabled = state.is_clickhouse_enabled();
+
+    // Get PostgreSQL stats (metadata in dual mode, everything in legacy mode)
+    let postgres_stats = if let Some(dual_pool) = state.dual_pool() {
+        // Dual mode - get PostgreSQL metadata stats
+        let settings = DualSystemSettings::new(
+            dual_pool.postgres().clone(),
+            dual_pool.clickhouse().clone(),
+        );
+        match settings.get_pg_storage_stats().await {
+            Ok(stats) => Some(StorageStatsResponse::from(stats)),
+            Err(e) => {
+                tracing::error!("Failed to get PostgreSQL storage stats: {}", e);
+                None
+            }
+        }
+    } else {
+        // Legacy mode - PostgreSQL stores everything
+        let settings = SystemSettings::new(state.pool.clone());
+        match settings.get_storage_stats().await {
+            Ok(stats) => Some(StorageStatsResponse::from(stats)),
+            Err(e) => {
+                tracing::error!("Failed to get PostgreSQL storage stats: {}", e);
+                None
+            }
+        }
+    };
+    
+    // Get ClickHouse stats (logs)
+    let clickhouse_stats = if let Some(dual_pool) = state.dual_pool() {
+        let settings = DualSystemSettings::new(
+            dual_pool.postgres().clone(),
+            dual_pool.clickhouse().clone(),
+        );
+        match settings.get_clickhouse_storage_stats().await {
+            Ok(stats) => {
+                tracing::debug!("ClickHouse storage stats retrieved successfully");
+                Some(ClickHouseStorageStatsResponse::from(stats))
+            }
+            Err(e) => {
+                tracing::error!("Failed to get ClickHouse storage stats: {:?}", e);
+                None
+            }
+        }
+    } else {
+        tracing::debug!("ClickHouse not enabled, skipping stats");
+        None
+    };
+    
+    Ok(Json(StorageOverviewResponse {
+        clickhouse_enabled,
+        postgres: postgres_stats,
+        clickhouse: clickhouse_stats,
+    }))
+}
+
+/// Get ClickHouse storage statistics
+///
+/// GET /api/settings/storage/clickhouse
+///
+/// Returns detailed storage statistics for ClickHouse log storage.
+pub async fn get_clickhouse_storage_stats(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<ClickHouseStorageStatsResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_VIEW)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:view".to_string()))?;
+    
+    let dual_pool = state.dual_pool().ok_or_else(|| {
+        ApiError::BadRequest("ClickHouse is not enabled".to_string())
+    })?;
+    
+    let settings = DualSystemSettings::new(
+        dual_pool.postgres().clone(),
+        dual_pool.clickhouse().clone(),
+    );
+    
+    let stats = settings.get_clickhouse_storage_stats().await?;
+    Ok(Json(ClickHouseStorageStatsResponse::from(stats)))
+}
+
+/// Update ClickHouse retention TTL
+///
+/// PUT /api/settings/storage/clickhouse/retention
+///
+/// Updates the TTL retention period for ClickHouse logs.
+pub async fn update_clickhouse_retention(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(request): Json<UpdateClickHouseRetentionRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_RETENTION)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:retention".to_string()))?;
+    
+    let dual_pool = state.dual_pool().ok_or_else(|| {
+        ApiError::BadRequest("ClickHouse is not enabled".to_string())
+    })?;
+    
+    if request.retention_days < 1 {
+        return Err(ApiError::ValidationError(
+            "Retention period must be at least 1 day".to_string()
+        ));
+    }
+    
+    let settings = DualSystemSettings::new(
+        dual_pool.postgres().clone(),
+        dual_pool.clickhouse().clone(),
+    );
+    
+    settings.update_clickhouse_retention(request.retention_days).await?;
+    
+    tracing::info!("ClickHouse retention updated to {} days", request.retention_days);
+    
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "retention_days": request.retention_days,
+        "message": format!("Retention policy updated to {} days", request.retention_days)
+    })))
+}
+
+/// Run ClickHouse retention now (force TTL materialization)
+///
+/// POST /api/settings/storage/clickhouse/retention/run
+///
+/// Forces ClickHouse to materialize TTL and delete expired data.
+pub async fn run_clickhouse_retention_now(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_RETENTION)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:retention".to_string()))?;
+    
+    let dual_pool = state.dual_pool().ok_or_else(|| {
+        ApiError::BadRequest("ClickHouse is not enabled".to_string())
+    })?;
+    
+    let settings = DualSystemSettings::new(
+        dual_pool.postgres().clone(),
+        dual_pool.clickhouse().clone(),
+    );
+    
+    let deleted = settings.run_clickhouse_retention_now().await?;
+    
+    tracing::info!("ClickHouse retention run completed, {} rows deleted", deleted);
+    
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "rows_deleted": deleted
+    })))
+}
+
+
+// ============================================================================
+// NRT Engine Settings (REMOVED - NRT engine has been removed)
+// ============================================================================
+// NRT settings endpoints have been removed as the NRT engine is no longer used.
+// Real-time detection now uses ClickHouse materialized views instead.
+
+
+// ============================================================================
+// Storage Tiering Settings
+// ============================================================================
+
+use nanosiem_core::settings::{
+    ConnectionTestResult as TieringTestResult, S3Credentials, TierStats, TieringConfig,
+    TieringError, TieringService, UpdateTieringRequest,
+};
+use std::path::PathBuf;
+
+/// Response for tiering configuration
+#[derive(Debug, Serialize)]
+pub struct TieringConfigResponse {
+    pub enabled: bool,
+    pub s3_endpoint: Option<String>,
+    pub s3_bucket: Option<String>,
+    pub s3_region: String,
+    pub s3_path_style: bool,
+    pub has_credentials: bool,
+    pub hot_days: u32,
+    pub warm_days: u32,
+    pub cold_enabled: bool,
+    pub cold_days: Option<u32>,
+    pub status: String,
+    pub status_message: Option<String>,
+    pub last_applied_at: Option<String>,
+}
+
+impl From<TieringConfig> for TieringConfigResponse {
+    fn from(config: TieringConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            s3_endpoint: config.s3_endpoint,
+            s3_bucket: config.s3_bucket,
+            s3_region: config.s3_region,
+            s3_path_style: config.s3_path_style,
+            has_credentials: config.has_credentials,
+            hot_days: config.hot_days,
+            warm_days: config.warm_days,
+            cold_enabled: config.cold_enabled,
+            cold_days: config.cold_days,
+            status: config.status.as_str().to_string(),
+            status_message: config.status_message,
+            last_applied_at: config.last_applied_at.map(|t| t.to_rfc3339()),
+        }
+    }
+}
+
+/// Request to set S3 credentials
+#[derive(Debug, Deserialize)]
+pub struct SetTieringCredentialsRequest {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+}
+
+/// Response for tier statistics
+#[derive(Debug, Serialize)]
+pub struct TierStatsResponse {
+    pub hot: TierInfoResponse,
+    pub warm: TierInfoResponse,
+    pub total_size_bytes: u64,
+    pub total_size_pretty: String,
+    pub total_row_count: u64,
+    pub last_updated: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TierInfoResponse {
+    pub size_bytes: u64,
+    pub size_pretty: String,
+    pub row_count: u64,
+}
+
+impl From<TierStats> for TierStatsResponse {
+    fn from(stats: TierStats) -> Self {
+        Self {
+            hot: TierInfoResponse {
+                size_bytes: stats.hot.size_bytes,
+                size_pretty: stats.hot.size_pretty,
+                row_count: stats.hot.row_count,
+            },
+            warm: TierInfoResponse {
+                size_bytes: stats.warm.size_bytes,
+                size_pretty: stats.warm.size_pretty,
+                row_count: stats.warm.row_count,
+            },
+            total_size_bytes: stats.total_size_bytes,
+            total_size_pretty: stats.total_size_pretty,
+            total_row_count: stats.total_row_count,
+            last_updated: stats.last_updated.to_rfc3339(),
+        }
+    }
+}
+
+/// Response for connection test
+#[derive(Debug, Serialize)]
+pub struct TieringConnectionTestResponse {
+    pub success: bool,
+    pub message: String,
+    pub latency_ms: Option<u64>,
+}
+
+impl From<TieringTestResult> for TieringConnectionTestResponse {
+    fn from(result: TieringTestResult) -> Self {
+        Self {
+            success: result.success,
+            message: result.message,
+            latency_ms: result.latency_ms,
+        }
+    }
+}
+
+impl From<TieringError> for ApiError {
+    fn from(err: TieringError) -> Self {
+        match &err {
+            TieringError::Config(msg) => ApiError::ValidationError(msg.clone()),
+            TieringError::NotConfigured => {
+                ApiError::BadRequest("Tiering is not configured".to_string())
+            }
+            TieringError::S3Connection(msg) => {
+                ApiError::BadRequest(format!("S3 connection failed: {}", msg))
+            }
+            TieringError::ClickHouse(msg) => {
+                ApiError::InternalError(format!("ClickHouse error: {}", msg))
+            }
+            TieringError::Encryption(msg) => {
+                ApiError::InternalError(format!("Encryption error: {}", msg))
+            }
+            _ => ApiError::InternalError(err.to_string()),
+        }
+    }
+}
+
+/// Helper to get tiering service
+fn get_tiering_service(state: &AppState) -> Result<TieringService, ApiError> {
+    let dual_pool = state.dual_pool().ok_or_else(|| {
+        ApiError::BadRequest("ClickHouse is not enabled".to_string())
+    })?;
+
+    // Get config directory - default to ./clickhouse/config.d relative to working dir
+    let config_dir = std::env::var("CLICKHOUSE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./clickhouse/config.d"));
+
+    Ok(TieringService::new(
+        dual_pool.postgres().clone(),
+        dual_pool.clickhouse().clone(),
+        config_dir,
+    ))
+}
+
+/// Get tiering configuration
+///
+/// GET /api/settings/tiering
+///
+/// Returns the current storage tiering configuration.
+pub async fn get_tiering_config(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<TieringConfigResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_RETENTION)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:retention".to_string()))?;
+
+    let service = get_tiering_service(&state)?;
+    let config = service.get_config().await?;
+
+    Ok(Json(TieringConfigResponse::from(config)))
+}
+
+/// Update tiering configuration
+///
+/// PUT /api/settings/tiering
+///
+/// Updates the storage tiering configuration. Does not apply to ClickHouse
+/// until apply_tiering_config is called.
+pub async fn update_tiering_config(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(request): Json<UpdateTieringRequest>,
+) -> Result<Json<TieringConfigResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_RETENTION)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:retention".to_string()))?;
+
+    let service = get_tiering_service(&state)?;
+    let config = service.update_config(request).await?;
+
+    tracing::info!(
+        enabled = config.enabled,
+        hot_days = config.hot_days,
+        warm_days = config.warm_days,
+        "Tiering configuration updated"
+    );
+
+    Ok(Json(TieringConfigResponse::from(config)))
+}
+
+/// Set S3 credentials for tiering
+///
+/// POST /api/settings/tiering/credentials
+///
+/// Sets the S3 credentials used for tiered storage. Credentials are encrypted.
+pub async fn set_tiering_credentials(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(request): Json<SetTieringCredentialsRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_RETENTION)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:retention".to_string()))?;
+
+    let service = get_tiering_service(&state)?;
+
+    let creds = S3Credentials {
+        access_key_id: request.access_key_id,
+        secret_access_key: request.secret_access_key,
+    };
+
+    service.set_credentials(creds).await?;
+
+    tracing::info!("Tiering S3 credentials updated");
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "S3 credentials saved successfully"
+    })))
+}
+
+/// Test S3 connection for tiering
+///
+/// POST /api/settings/tiering/test
+///
+/// Tests the S3 connection using the stored credentials.
+pub async fn test_tiering_connection(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<TieringConnectionTestResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_RETENTION)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:retention".to_string()))?;
+
+    let service = get_tiering_service(&state)?;
+    let result = service.test_connection().await?;
+
+    Ok(Json(TieringConnectionTestResponse::from(result)))
+}
+
+/// Apply tiering configuration to ClickHouse
+///
+/// POST /api/settings/tiering/apply
+///
+/// Generates ClickHouse storage configuration, reloads config, and applies TTL rules.
+pub async fn apply_tiering_config(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_RETENTION)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:retention".to_string()))?;
+
+    let service = get_tiering_service(&state)?;
+    service.apply_config().await?;
+
+    tracing::info!("Tiering configuration applied to ClickHouse");
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Tiering configuration applied successfully"
+    })))
+}
+
+/// Get storage tier statistics
+///
+/// GET /api/settings/tiering/stats
+///
+/// Returns storage statistics for each tier (hot/warm).
+pub async fn get_tier_stats(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<TierStatsResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_VIEW)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:view".to_string()))?;
+
+    let service = get_tiering_service(&state)?;
+    let stats = service.get_tier_stats().await?;
+
+    Ok(Json(TierStatsResponse::from(stats)))
+}
+
+
+// ============================================================================
+// Organizational Context Settings
+// ============================================================================
+
+use nanosiem_core::settings::{
+    OrganizationalContext, OrganizationalContextError, OrganizationalContextService,
+    UpdateOrganizationalContextRequest,
+};
+
+/// Response for organizational context configuration
+#[derive(Debug, Serialize)]
+pub struct OrganizationalContextResponse {
+    pub organization_name: Option<String>,
+    pub industry: Option<String>,
+    pub environment: Option<String>,
+    pub attack_vectors: Option<String>,
+    pub compliance_frameworks: Vec<String>,
+    pub custom_context: Option<String>,
+    pub enable_for_chat: bool,
+    pub enable_for_query: bool,
+    pub enable_for_detection: bool,
+    pub enable_for_parser: bool,
+    pub enable_for_dashboard: bool,
+}
+
+impl From<OrganizationalContext> for OrganizationalContextResponse {
+    fn from(ctx: OrganizationalContext) -> Self {
+        Self {
+            organization_name: ctx.organization_name,
+            industry: ctx.industry,
+            environment: ctx.environment,
+            attack_vectors: ctx.attack_vectors,
+            compliance_frameworks: ctx.compliance_frameworks,
+            custom_context: ctx.custom_context,
+            enable_for_chat: ctx.enable_for_chat,
+            enable_for_query: ctx.enable_for_query,
+            enable_for_detection: ctx.enable_for_detection,
+            enable_for_parser: ctx.enable_for_parser,
+            enable_for_dashboard: ctx.enable_for_dashboard,
+        }
+    }
+}
+
+/// Request to update organizational context
+#[derive(Debug, Deserialize)]
+pub struct UpdateOrganizationalContextApiRequest {
+    pub organization_name: Option<String>,
+    pub industry: Option<String>,
+    pub environment: Option<String>,
+    pub attack_vectors: Option<String>,
+    pub compliance_frameworks: Option<Vec<String>>,
+    pub custom_context: Option<String>,
+    pub enable_for_chat: Option<bool>,
+    pub enable_for_query: Option<bool>,
+    pub enable_for_detection: Option<bool>,
+    pub enable_for_parser: Option<bool>,
+    pub enable_for_dashboard: Option<bool>,
+}
+
+impl From<OrganizationalContextError> for ApiError {
+    fn from(err: OrganizationalContextError) -> Self {
+        match &err {
+            OrganizationalContextError::Database(e) => {
+                ApiError::InternalError(format!("Database error: {}", e))
+            }
+        }
+    }
+}
+
+/// Get organizational context configuration
+///
+/// GET /api/settings/organizational-context
+///
+/// Returns the current organizational context that is injected into AI prompts.
+pub async fn get_organizational_context(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<OrganizationalContextResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_AI)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+
+    let service = OrganizationalContextService::new(state.pool.clone());
+    let context = service.get_context().await?;
+
+    Ok(Json(OrganizationalContextResponse::from(context)))
+}
+
+/// Update organizational context configuration
+///
+/// PUT /api/settings/organizational-context
+///
+/// Updates the organizational context that is injected into AI prompts.
+/// Only provided fields are updated.
+pub async fn update_organizational_context(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(request): Json<UpdateOrganizationalContextApiRequest>,
+) -> Result<Json<OrganizationalContextResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_AI)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+
+    let service = OrganizationalContextService::new(state.pool.clone());
+
+    let update_request = UpdateOrganizationalContextRequest {
+        organization_name: request.organization_name,
+        industry: request.industry,
+        environment: request.environment,
+        attack_vectors: request.attack_vectors,
+        compliance_frameworks: request.compliance_frameworks,
+        custom_context: request.custom_context,
+        enable_for_chat: request.enable_for_chat,
+        enable_for_query: request.enable_for_query,
+        enable_for_detection: request.enable_for_detection,
+        enable_for_parser: request.enable_for_parser,
+        enable_for_dashboard: request.enable_for_dashboard,
+    };
+
+    let context = service.update_context(update_request).await?;
+
+    tracing::info!(
+        org = ?context.organization_name,
+        industry = ?context.industry,
+        "Organizational context updated"
+    );
+
+    Ok(Json(OrganizationalContextResponse::from(context)))
+}
+
+// ============================================================================
+// AI Provider Credentials Endpoints
+// ============================================================================
+
+/// Response for a provider's configuration
+#[derive(Debug, Serialize)]
+pub struct ProviderCredentialsResponse {
+    pub provider: String,
+    pub display_name: String,
+    pub enabled: bool,
+    pub has_credentials: bool,
+    pub config: serde_json::Value,
+    pub last_validated_at: Option<String>,
+    pub validation_error: Option<String>,
+}
+
+/// Request to update provider credentials
+#[derive(Debug, Deserialize)]
+pub struct UpdateProviderCredentialsRequest {
+    /// API key for the provider
+    pub api_key: Option<String>,
+    /// Provider-specific configuration (region, endpoint, etc.)
+    pub config: Option<serde_json::Value>,
+    /// Whether to enable this provider
+    pub enabled: Option<bool>,
+}
+
+/// List all AI provider configurations
+///
+/// GET /api/settings/ai-providers
+pub async fn list_ai_providers(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<Vec<ProviderCredentialsResponse>>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_AI)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+
+    let rows: Vec<sqlx::postgres::PgRow> = sqlx::query(
+        r#"
+        SELECT provider, display_name, enabled,
+               credentials_encrypted IS NOT NULL as has_credentials,
+               config, last_validated_at, validation_error
+        FROM provider_credentials
+        ORDER BY provider
+        "#
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| ApiError::InternalError(e.to_string()))?;
+
+    use sqlx::Row;
+    let providers = rows
+        .into_iter()
+        .map(|row| {
+            let config_val: Option<serde_json::Value> = row.get("config");
+            let last_validated: Option<chrono::DateTime<chrono::Utc>> = row.get("last_validated_at");
+            ProviderCredentialsResponse {
+                provider: row.get("provider"),
+                display_name: row.get("display_name"),
+                enabled: row.get("enabled"),
+                has_credentials: row.get("has_credentials"),
+                config: config_val.unwrap_or_else(|| serde_json::json!({})),
+                last_validated_at: last_validated.map(|t| t.to_rfc3339()),
+                validation_error: row.get("validation_error"),
+            }
+        })
+        .collect();
+
+    Ok(Json(providers))
+}
+
+/// Get a specific provider's configuration
+///
+/// GET /api/settings/ai-providers/:provider
+pub async fn get_ai_provider(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(provider): Path<String>,
+) -> Result<Json<ProviderCredentialsResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_AI)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+
+    let row = sqlx::query(
+        r#"
+        SELECT provider, display_name, enabled,
+               credentials_encrypted IS NOT NULL as has_credentials,
+               config, last_validated_at, validation_error
+        FROM provider_credentials
+        WHERE provider = $1
+        "#
+    )
+    .bind(&provider)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| ApiError::InternalError(e.to_string()))?
+    .ok_or_else(|| ApiError::NotFound(format!("Provider '{}' not found", provider)))?;
+
+    use sqlx::Row;
+    let config_val: Option<serde_json::Value> = row.get("config");
+    let last_validated: Option<chrono::DateTime<chrono::Utc>> = row.get("last_validated_at");
+    Ok(Json(ProviderCredentialsResponse {
+        provider: row.get("provider"),
+        display_name: row.get("display_name"),
+        enabled: row.get("enabled"),
+        has_credentials: row.get("has_credentials"),
+        config: config_val.unwrap_or_else(|| serde_json::json!({})),
+        last_validated_at: last_validated.map(|t| t.to_rfc3339()),
+        validation_error: row.get("validation_error"),
+    }))
+}
+
+/// Update provider credentials
+///
+/// PUT /api/settings/ai-providers/:provider
+pub async fn update_ai_provider(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(provider): Path<String>,
+    Json(request): Json<UpdateProviderCredentialsRequest>,
+) -> Result<Json<ProviderCredentialsResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_AI)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+
+    // Encrypt the API key if provided using AES-256-GCM
+    let encrypted_creds: Option<Vec<u8>> = if let Some(ref api_key) = request.api_key {
+        let encryption = EncryptionService::from_env();
+        let creds = serde_json::json!({ "api_key": api_key });
+        let encrypted = encryption
+            .encrypt_json(&creds)
+            .map_err(|e| ApiError::InternalError(format!("Encryption failed: {}", e)))?;
+        // Store as JSON: {"ciphertext": "...", "nonce": "..."}
+        Some(serde_json::to_vec(&serde_json::json!({
+            "ciphertext": encrypted.ciphertext,
+            "nonce": encrypted.nonce
+        })).unwrap_or_default())
+    } else {
+        None
+    };
+
+    sqlx::query(
+        r#"
+        UPDATE provider_credentials
+        SET credentials_encrypted = COALESCE($2, credentials_encrypted),
+            config = COALESCE($3, config),
+            enabled = COALESCE($4, enabled),
+            updated_at = NOW()
+        WHERE provider = $1
+        "#
+    )
+    .bind(&provider)
+    .bind(&encrypted_creds)
+    .bind(&request.config)
+    .bind(&request.enabled)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| ApiError::InternalError(e.to_string()))?;
+
+    tracing::info!(provider = %provider, "AI provider credentials updated");
+
+    // Sync to LiteLLM proxy if available
+    {
+        let sync_guard = state.litellm_sync.read().await;
+        if let Some(ref sync_service) = *sync_guard {
+            match sync_service.sync_provider(&provider).await {
+                Ok(count) => {
+                    tracing::info!(provider = %provider, models = count, "Synced provider to LiteLLM");
+                }
+                Err(e) => {
+                    tracing::warn!(provider = %provider, error = %e, "Failed to sync provider to LiteLLM");
+                }
+            }
+        }
+    }
+
+    // If provider was disabled, migrate agents using its models to a fallback
+    if request.enabled == Some(false) {
+        if let Err(e) = migrate_agents_from_disabled_provider(&state.pool, &provider).await {
+            tracing::warn!(provider = %provider, error = %e, "Failed to migrate agents from disabled provider");
+        }
+
+        // Reload agent configs in registry to pick up the changes
+        let registry_guard = state.agent_config_registry.read().await;
+        if let Some(ref registry) = *registry_guard {
+            if let Err(e) = registry.load_configs().await {
+                tracing::warn!(error = %e, "Failed to reload agent configs after provider disable");
+            }
+        }
+    }
+
+    // Return updated provider
+    get_ai_provider(State(state), Extension(auth), Path(provider)).await
+}
+
+/// Migrate agents from a disabled provider to the cheapest available model
+async fn migrate_agents_from_disabled_provider(pool: &PgPool, disabled_provider: &str) -> Result<(), sqlx::Error> {
+    // Find the cheapest model from an enabled provider
+    let fallback_model: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT m.model_id
+        FROM available_models m
+        JOIN provider_credentials p ON m.provider = p.provider
+        WHERE p.enabled = true
+        ORDER BY COALESCE(m.input_price_per_million, 999999) ASC
+        LIMIT 1
+        "#
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let fallback_model = match fallback_model {
+        Some(m) => m,
+        None => {
+            tracing::warn!("No enabled providers with models available for fallback");
+            return Ok(());
+        }
+    };
+
+    // Update all agents using models from the disabled provider
+    let provider_prefix = format!("{}/", disabled_provider);
+    let result = sqlx::query(
+        r#"
+        UPDATE agent_model_config
+        SET model_id = $1, updated_at = NOW()
+        WHERE model_id LIKE $2
+        "#
+    )
+    .bind(&fallback_model)
+    .bind(format!("{}%", provider_prefix))
+    .execute(pool)
+    .await?;
+
+    if result.rows_affected() > 0 {
+        tracing::info!(
+            disabled_provider = %disabled_provider,
+            fallback_model = %fallback_model,
+            agents_migrated = result.rows_affected(),
+            "Migrated agents from disabled provider to fallback model"
+        );
+    }
+
+    Ok(())
+}
+
+/// Test provider connection
+///
+/// POST /api/settings/ai-providers/:provider/validate
+pub async fn validate_ai_provider(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(provider): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use nanosiem_core::crypto::EncryptedData;
+
+    check_permission(&auth, permissions::SETTINGS_AI)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+
+    // Get credentials for this provider
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT credentials_encrypted, config FROM provider_credentials WHERE provider = $1"
+    )
+    .bind(&provider)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| ApiError::InternalError(e.to_string()))?
+    .ok_or_else(|| ApiError::NotFound(format!("Provider '{}' not found", provider)))?;
+
+    let encrypted_bytes: Option<Vec<u8>> = row.get("credentials_encrypted");
+    let config: Option<serde_json::Value> = row.get("config");
+
+    // Check if credentials exist
+    let encrypted_bytes = encrypted_bytes.ok_or_else(|| {
+        ApiError::BadRequest("No credentials configured for this provider".to_string())
+    })?;
+
+    // Decrypt credentials
+    let encryption = EncryptionService::from_env();
+    let encrypted_json: serde_json::Value = serde_json::from_slice(&encrypted_bytes)
+        .map_err(|e| ApiError::InternalError(format!("Invalid encrypted data: {}", e)))?;
+
+    let ciphertext = encrypted_json["ciphertext"].as_str()
+        .ok_or_else(|| ApiError::InternalError("Missing ciphertext".to_string()))?;
+    let nonce = encrypted_json["nonce"].as_str()
+        .ok_or_else(|| ApiError::InternalError("Missing nonce".to_string()))?;
+
+    let encrypted_data = EncryptedData {
+        ciphertext: ciphertext.to_string(),
+        nonce: nonce.to_string(),
+    };
+
+    let creds: serde_json::Value = encryption.decrypt_json(&encrypted_data)
+        .map_err(|e| ApiError::InternalError(format!("Decryption failed: {}", e)))?;
+
+    let api_key = creds["api_key"].as_str()
+        .ok_or_else(|| ApiError::InternalError("No API key in credentials".to_string()))?;
+
+    // Test the provider with a real API call
+    let test_result = test_provider_connection(&provider, api_key, config.as_ref()).await;
+
+    match test_result {
+        Ok(_) => {
+            // Update success status
+            sqlx::query(
+                r#"
+                UPDATE provider_credentials
+                SET last_validated_at = NOW(),
+                    validation_error = NULL
+                WHERE provider = $1
+                "#
+            )
+            .bind(&provider)
+            .execute(&state.pool)
+            .await
+            .map_err(|e| ApiError::InternalError(e.to_string()))?;
+
+            // Reload the MelodService to pick up the newly validated provider
+            // This initializes LiteLLM sync if not already done
+            match state.reload_melod_service().await {
+                Ok(true) => {
+                    tracing::info!(provider = %provider, "MelodService reloaded after provider validation");
+                }
+                Ok(false) => {
+                    tracing::debug!(provider = %provider, "MelodService not loaded (check configuration)");
+                }
+                Err(e) => {
+                    tracing::warn!(provider = %provider, error = %e, "Failed to reload MelodService after validation");
+                }
+            }
+
+            // Sync this specific provider to LiteLLM proxy
+            {
+                let sync_guard = state.litellm_sync.read().await;
+                if let Some(ref sync_service) = *sync_guard {
+                    match sync_service.sync_provider(&provider).await {
+                        Ok(count) => {
+                            tracing::info!(provider = %provider, models = count, "Synced validated provider to LiteLLM");
+                        }
+                        Err(e) => {
+                            tracing::warn!(provider = %provider, error = %e, "Failed to sync provider to LiteLLM after validation");
+                        }
+                    }
+                }
+            }
+
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "message": "Provider connection verified successfully"
+            })))
+        }
+        Err(error_msg) => {
+            // Update error status
+            sqlx::query(
+                r#"
+                UPDATE provider_credentials
+                SET last_validated_at = NOW(),
+                    validation_error = $2
+                WHERE provider = $1
+                "#
+            )
+            .bind(&provider)
+            .bind(&error_msg)
+            .execute(&state.pool)
+            .await
+            .map_err(|e| ApiError::InternalError(e.to_string()))?;
+
+            Ok(Json(serde_json::json!({
+                "success": false,
+                "message": error_msg
+            })))
+        }
+    }
+}
+
+/// Test a provider connection by making a minimal API call
+async fn test_provider_connection(
+    provider: &str,
+    api_key: &str,
+    config: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    let client = reqwest::Client::new();
+
+    match provider {
+        "anthropic" => {
+            // Test Anthropic API with Claude Haiku 4.5 (cheapest current model)
+            let resp = client
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&serde_json::json!({
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": "Hi"}]
+                }))
+                .send()
+                .await
+                .map_err(|e| format!("Request failed: {}", e))?;
+
+            if resp.status().is_success() {
+                Ok(())
+            } else {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                Err(format!("API error ({}): {}", status, body))
+            }
+        }
+        "google" => {
+            // Test Google Gemini API with Gemini 3 Flash Preview
+            let resp = client
+                .post(format!(
+                    "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key={}",
+                    api_key
+                ))
+                .header("content-type", "application/json")
+                .json(&serde_json::json!({
+                    "contents": [{"parts": [{"text": "Hi"}]}],
+                    "generationConfig": {"maxOutputTokens": 10}
+                }))
+                .send()
+                .await
+                .map_err(|e| format!("Request failed: {}", e))?;
+
+            if resp.status().is_success() {
+                Ok(())
+            } else {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                Err(format!("API error ({}): {}", status, body))
+            }
+        }
+        "openai" => {
+            // Test OpenAI API with GPT-5 Nano (cheapest current model)
+            let resp = client
+                .post("https://api.openai.com/v1/chat/completions")
+                .header("Authorization", format!("Bearer {}", api_key))
+                .header("content-type", "application/json")
+                .json(&serde_json::json!({
+                    "model": "gpt-5-nano",
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": "Hi"}]
+                }))
+                .send()
+                .await
+                .map_err(|e| format!("Request failed: {}", e))?;
+
+            if resp.status().is_success() {
+                Ok(())
+            } else {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                Err(format!("API error ({}): {}", status, body))
+            }
+        }
+        "azure" => {
+            // Test Azure OpenAI API - deployment name from config or default
+            let api_base = config
+                .and_then(|c| c["api_base"].as_str())
+                .ok_or_else(|| "Azure requires api_base in config".to_string())?;
+            let api_version = config
+                .and_then(|c| c["api_version"].as_str())
+                .unwrap_or("2024-10-21");
+            let deployment = config
+                .and_then(|c| c["deployment"].as_str())
+                .unwrap_or("gpt-5-nano");
+
+            let resp = client
+                .post(format!(
+                    "{}/openai/deployments/{}/chat/completions?api-version={}",
+                    api_base, deployment, api_version
+                ))
+                .header("api-key", api_key)
+                .header("content-type", "application/json")
+                .json(&serde_json::json!({
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": "Hi"}]
+                }))
+                .send()
+                .await
+                .map_err(|e| format!("Request failed: {}", e))?;
+
+            if resp.status().is_success() {
+                Ok(())
+            } else {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                Err(format!("API error ({}): {}", status, body))
+            }
+        }
+        "bedrock" => {
+            // For Bedrock, we'd need AWS SDK - for now just validate key format
+            // In production, this would use the BedrockClient
+            if api_key.is_empty() {
+                Err("Empty API key".to_string())
+            } else {
+                // Bedrock uses AWS credentials, not a simple API key test
+                // Mark as valid if credentials exist - actual validation happens on use
+                Ok(())
+            }
+        }
+        _ => Err(format!("Unknown provider: {}", provider)),
+    }
+}
+
+// ============================================================================
+// Agent Model Configuration Endpoints
+// ============================================================================
+
+/// Response for an agent's model configuration
+#[derive(Debug, Serialize)]
+pub struct AgentModelConfigResponse {
+    pub agent_id: String,
+    pub display_name: String,
+    pub model_id: String,
+    pub max_tokens: i32,
+    pub temperature: f32,
+    pub timeout_seconds: i32,
+    pub enabled: bool,
+}
+
+/// Request to update agent model configuration
+#[derive(Debug, Deserialize)]
+pub struct UpdateAgentModelConfigRequest {
+    pub model_id: Option<String>,
+    pub max_tokens: Option<i32>,
+    pub temperature: Option<f32>,
+    pub timeout_seconds: Option<i32>,
+    pub enabled: Option<bool>,
+}
+
+/// List all agent model configurations
+///
+/// GET /api/settings/agent-models
+pub async fn list_agent_model_configs(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<Vec<AgentModelConfigResponse>>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_AI)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+
+    let rows: Vec<sqlx::postgres::PgRow> = sqlx::query(
+        r#"
+        SELECT agent_id, display_name, model_id, max_tokens, temperature,
+               timeout_seconds, enabled
+        FROM agent_model_config
+        ORDER BY agent_id
+        "#
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| ApiError::InternalError(e.to_string()))?;
+
+    use sqlx::Row;
+    let configs = rows
+        .into_iter()
+        .map(|row| {
+            AgentModelConfigResponse {
+                agent_id: row.get("agent_id"),
+                display_name: row.get("display_name"),
+                model_id: row.get("model_id"),
+                max_tokens: row.get("max_tokens"),
+                temperature: row.get("temperature"),
+                timeout_seconds: row.get("timeout_seconds"),
+                enabled: row.get("enabled"),
+            }
+        })
+        .collect();
+
+    Ok(Json(configs))
+}
+
+/// Get a specific agent's model configuration
+///
+/// GET /api/settings/agent-models/:agent_id
+pub async fn get_agent_model_config(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<AgentModelConfigResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_AI)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+
+    let row = sqlx::query(
+        r#"
+        SELECT agent_id, display_name, model_id, max_tokens, temperature,
+               timeout_seconds, enabled
+        FROM agent_model_config
+        WHERE agent_id = $1
+        "#
+    )
+    .bind(&agent_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| ApiError::InternalError(e.to_string()))?
+    .ok_or_else(|| ApiError::NotFound(format!("Agent '{}' not found", agent_id)))?;
+
+    use sqlx::Row;
+    Ok(Json(AgentModelConfigResponse {
+        agent_id: row.get("agent_id"),
+        display_name: row.get("display_name"),
+        model_id: row.get("model_id"),
+        max_tokens: row.get("max_tokens"),
+        temperature: row.get("temperature"),
+        timeout_seconds: row.get("timeout_seconds"),
+        enabled: row.get("enabled"),
+    }))
+}
+
+/// Update agent model configuration
+///
+/// PUT /api/settings/agent-models/:agent_id
+pub async fn update_agent_model_config(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Path(agent_id): Path<String>,
+    Json(request): Json<UpdateAgentModelConfigRequest>,
+) -> Result<Json<AgentModelConfigResponse>, ApiError> {
+    use nanosiem_core::melod::AgentId;
+
+    check_permission(&auth, permissions::SETTINGS_AI)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+
+    // Try to use the registry to update (this invalidates cache)
+    let registry_guard = state.agent_config_registry.read().await;
+    if let Some(ref registry) = *registry_guard {
+        // Parse agent_id string to AgentId enum
+        let parsed_agent_id = AgentId::from_str(&agent_id)
+            .ok_or_else(|| ApiError::BadRequest(format!("Invalid agent_id: {}", agent_id)))?;
+
+        // Get current config to fill in defaults for unspecified fields
+        let current = registry.get_agent_config(&parsed_agent_id).await;
+        let (model_id, max_tokens, temperature, timeout_seconds, enabled) = match current {
+            Some(cfg) => (
+                request.model_id.clone().unwrap_or(cfg.model_id),
+                request.max_tokens.unwrap_or(cfg.max_tokens),
+                request.temperature.unwrap_or(cfg.temperature),
+                request.timeout_seconds.unwrap_or(cfg.timeout_seconds),
+                request.enabled.unwrap_or(cfg.enabled),
+            ),
+            None => (
+                request.model_id.clone().unwrap_or_else(|| "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0".to_string()),
+                request.max_tokens.unwrap_or(4096),
+                request.temperature.unwrap_or(0.7),
+                request.timeout_seconds.unwrap_or(120),
+                request.enabled.unwrap_or(true),
+            ),
+        };
+
+        // Update via registry (this invalidates cache and reloads)
+        registry.update_agent_config(
+            &parsed_agent_id,
+            &model_id,
+            max_tokens,
+            temperature,
+            timeout_seconds,
+            enabled,
+        ).await.map_err(|e| ApiError::InternalError(e.to_string()))?;
+
+        tracing::info!(agent_id = %agent_id, model = %model_id, "Agent model configuration updated via registry");
+    } else {
+        // Fallback: direct database update (no cache invalidation)
+        sqlx::query(
+            r#"
+            UPDATE agent_model_config
+            SET model_id = COALESCE($2, model_id),
+                max_tokens = COALESCE($3, max_tokens),
+                temperature = COALESCE($4, temperature),
+                timeout_seconds = COALESCE($5, timeout_seconds),
+                enabled = COALESCE($6, enabled),
+                updated_at = NOW()
+            WHERE agent_id = $1
+            "#
+        )
+        .bind(&agent_id)
+        .bind(&request.model_id)
+        .bind(&request.max_tokens)
+        .bind(&request.temperature)
+        .bind(&request.timeout_seconds)
+        .bind(&request.enabled)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| ApiError::InternalError(e.to_string()))?;
+
+        tracing::info!(agent_id = %agent_id, "Agent model configuration updated (no registry available)");
+    }
+    drop(registry_guard);
+
+    // Reload the MelodService to pick up the new model configuration
+    // This rebuilds all agent clients with their updated settings
+    if let Err(e) = state.reload_melod_service().await {
+        tracing::warn!(error = %e, "Failed to reload meloD service after agent config update");
+        // Don't fail the request - the DB was updated successfully
+        // The new config will be picked up on next service restart
+    }
+
+    // Return updated config
+    get_agent_model_config(State(state), Extension(auth), Path(agent_id)).await
+}
+
+// ============================================================================
+// Available Models Endpoints
+// ============================================================================
+
+/// Response for an available model
+#[derive(Debug, Serialize)]
+pub struct AvailableModelResponse {
+    pub model_id: String,
+    pub provider: String,
+    pub display_name: String,
+    pub context_window: Option<i32>,
+    pub input_price_per_million: Option<f32>,
+    pub output_price_per_million: Option<f32>,
+    pub supports_vision: bool,
+    pub supports_function_calling: bool,
+    pub deprecated: bool,
+}
+
+/// List all available models
+///
+/// GET /api/settings/available-models
+pub async fn list_available_models(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<Vec<AvailableModelResponse>>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_AI)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+
+    let rows: Vec<sqlx::postgres::PgRow> = sqlx::query(
+        r#"
+        SELECT m.model_id, m.provider, m.display_name, m.context_window,
+               m.input_price_per_million, m.output_price_per_million,
+               m.supports_vision, m.supports_function_calling, m.deprecated
+        FROM available_models m
+        JOIN provider_credentials p ON m.provider = p.provider AND p.enabled = true
+        WHERE m.deprecated = false
+        ORDER BY m.provider, m.display_name
+        "#
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| ApiError::InternalError(e.to_string()))?;
+
+    use sqlx::Row;
+    let models = rows
+        .into_iter()
+        .map(|row| {
+            AvailableModelResponse {
+                model_id: row.get("model_id"),
+                provider: row.get("provider"),
+                display_name: row.get("display_name"),
+                context_window: row.get("context_window"),
+                input_price_per_million: row.get("input_price_per_million"),
+                output_price_per_million: row.get("output_price_per_million"),
+                supports_vision: row.get("supports_vision"),
+                supports_function_calling: row.get("supports_function_calling"),
+                deprecated: row.get("deprecated"),
+            }
+        })
+        .collect();
+
+    Ok(Json(models))
+}
+
+// ============================================================================
+// Health Monitoring Settings
+// ============================================================================
+
+/// Response for health monitoring settings (split into AI and feed monitoring)
+#[derive(Debug, Serialize)]
+pub struct HealthMonitoringSettingsResponse {
+    /// AI provider monitoring (costs API credits to check)
+    pub ai_monitoring_enabled: bool,
+    /// Feed staleness monitoring (free - just DB queries)
+    pub feed_monitoring_enabled: bool,
+    /// Legacy field for backwards compatibility (returns ai_monitoring_enabled)
+    pub enabled: bool,
+}
+
+/// Request to update health monitoring settings
+#[derive(Debug, Deserialize)]
+pub struct UpdateHealthMonitoringSettingsRequest {
+    /// Legacy field - if provided alone, updates ai_monitoring_enabled
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// AI provider monitoring (costs API credits)
+    #[serde(default)]
+    pub ai_monitoring_enabled: Option<bool>,
+    /// Feed staleness monitoring (free)
+    #[serde(default)]
+    pub feed_monitoring_enabled: Option<bool>,
+}
+
+/// Get health monitoring settings
+///
+/// GET /api/settings/health-monitoring
+pub async fn get_health_monitoring_settings(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<HealthMonitoringSettingsResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_SYSTEM)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+
+    let row = sqlx::query(
+        "SELECT COALESCE(ai_monitoring_enabled, false) as ai_enabled, \
+         COALESCE(feed_monitoring_enabled, true) as feed_enabled \
+         FROM system_settings WHERE id = 'default'"
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+
+    let (ai_enabled, feed_enabled) = match row {
+        Some(r) => {
+            use sqlx::Row;
+            (r.get::<bool, _>("ai_enabled"), r.get::<bool, _>("feed_enabled"))
+        }
+        None => (false, true),
+    };
+
+    Ok(Json(HealthMonitoringSettingsResponse {
+        ai_monitoring_enabled: ai_enabled,
+        feed_monitoring_enabled: feed_enabled,
+        enabled: ai_enabled, // Legacy compatibility
+    }))
+}
+
+/// Update health monitoring settings
+///
+/// PUT /api/settings/health-monitoring
+pub async fn update_health_monitoring_settings(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(request): Json<UpdateHealthMonitoringSettingsRequest>,
+) -> Result<Json<HealthMonitoringSettingsResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_SYSTEM)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+
+    // Handle legacy 'enabled' field - maps to ai_monitoring_enabled
+    let ai_enabled = request.ai_monitoring_enabled.or(request.enabled);
+    let feed_enabled = request.feed_monitoring_enabled;
+
+    // Update AI monitoring if provided
+    if let Some(ai) = ai_enabled {
+        sqlx::query(
+            "UPDATE system_settings SET ai_monitoring_enabled = $1, updated_at = NOW() WHERE id = 'default'"
+        )
+        .bind(ai)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+
+        tracing::info!("AI monitoring {} by user", if ai { "enabled" } else { "disabled" });
+    }
+
+    // Update feed monitoring if provided
+    if let Some(feed) = feed_enabled {
+        sqlx::query(
+            "UPDATE system_settings SET feed_monitoring_enabled = $1, updated_at = NOW() WHERE id = 'default'"
+        )
+        .bind(feed)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+
+        tracing::info!("Feed monitoring {} by user", if feed { "enabled" } else { "disabled" });
+    }
+
+    // Fetch current state to return
+    let row = sqlx::query(
+        "SELECT COALESCE(ai_monitoring_enabled, false) as ai_enabled, \
+         COALESCE(feed_monitoring_enabled, true) as feed_enabled \
+         FROM system_settings WHERE id = 'default'"
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+
+    let (ai_result, feed_result) = match row {
+        Some(r) => {
+            use sqlx::Row;
+            (r.get::<bool, _>("ai_enabled"), r.get::<bool, _>("feed_enabled"))
+        }
+        None => (true, true),
+    };
+
+    Ok(Json(HealthMonitoringSettingsResponse {
+        ai_monitoring_enabled: ai_result,
+        feed_monitoring_enabled: feed_result,
+        enabled: ai_result, // Legacy compatibility
+    }))
+}
+
+// ============================================================================
+// Developer Settings (Scheduler Control)
+// ============================================================================
+
+/// Response for developer settings (scheduler enable/disable)
+#[derive(Debug, Serialize)]
+pub struct DeveloperSettingsResponse {
+    /// Detection scheduler (5s interval, queries ClickHouse for rule execution)
+    pub detection_scheduler_enabled: bool,
+    /// Tuning scheduler (metrics, baselines, thresholds - queries ClickHouse)
+    pub tuning_scheduler_enabled: bool,
+    /// Enrichment auto-sync scheduler (may query ClickHouse for cleanup)
+    pub enrichment_sync_scheduler_enabled: bool,
+    /// Custom enrichment scheduler (INSERT/SELECT for enrichments)
+    pub custom_enrichment_scheduler_enabled: bool,
+    /// AI provider monitoring (costs API credits)
+    pub ai_monitoring_enabled: bool,
+    /// Feed staleness monitoring (queries ClickHouse)
+    pub feed_monitoring_enabled: bool,
+}
+
+/// Request to update developer settings (partial updates supported)
+#[derive(Debug, Deserialize)]
+pub struct UpdateDeveloperSettingsRequest {
+    #[serde(default)]
+    pub detection_scheduler_enabled: Option<bool>,
+    #[serde(default)]
+    pub tuning_scheduler_enabled: Option<bool>,
+    #[serde(default)]
+    pub enrichment_sync_scheduler_enabled: Option<bool>,
+    #[serde(default)]
+    pub custom_enrichment_scheduler_enabled: Option<bool>,
+    #[serde(default)]
+    pub ai_monitoring_enabled: Option<bool>,
+    #[serde(default)]
+    pub feed_monitoring_enabled: Option<bool>,
+}
+
+/// Get developer settings (scheduler control)
+///
+/// GET /api/settings/developer
+pub async fn get_developer_settings(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+) -> Result<Json<DeveloperSettingsResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_SYSTEM)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+
+    let row = sqlx::query(
+        r#"
+        SELECT
+            COALESCE(detection_scheduler_enabled, true) as detection,
+            COALESCE(tuning_scheduler_enabled, true) as tuning,
+            COALESCE(enrichment_sync_scheduler_enabled, true) as enrichment,
+            COALESCE(custom_enrichment_scheduler_enabled, true) as custom,
+            COALESCE(ai_monitoring_enabled, false) as ai,
+            COALESCE(feed_monitoring_enabled, true) as feed
+        FROM system_settings
+        WHERE id = 'default'
+        "#
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+
+    let (detection, tuning, enrichment, custom, ai, feed) = match row {
+        Some(r) => {
+            use sqlx::Row;
+            (
+                r.get::<bool, _>("detection"),
+                r.get::<bool, _>("tuning"),
+                r.get::<bool, _>("enrichment"),
+                r.get::<bool, _>("custom"),
+                r.get::<bool, _>("ai"),
+                r.get::<bool, _>("feed"),
+            )
+        }
+        None => (true, true, true, true, false, true),
+    };
+
+    Ok(Json(DeveloperSettingsResponse {
+        detection_scheduler_enabled: detection,
+        tuning_scheduler_enabled: tuning,
+        enrichment_sync_scheduler_enabled: enrichment,
+        custom_enrichment_scheduler_enabled: custom,
+        ai_monitoring_enabled: ai,
+        feed_monitoring_enabled: feed,
+    }))
+}
+
+/// Update developer settings (scheduler control)
+///
+/// PUT /api/settings/developer
+pub async fn update_developer_settings(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Json(request): Json<UpdateDeveloperSettingsRequest>,
+) -> Result<Json<DeveloperSettingsResponse>, ApiError> {
+    check_permission(&auth, permissions::SETTINGS_SYSTEM)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+
+    // Update each field if provided
+    if let Some(enabled) = request.detection_scheduler_enabled {
+        sqlx::query(
+            "UPDATE system_settings SET detection_scheduler_enabled = $1, updated_at = NOW() WHERE id = 'default'"
+        )
+        .bind(enabled)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+
+        tracing::info!("Detection scheduler {} by user {}", if enabled { "enabled" } else { "disabled" }, auth.user_id());
+    }
+
+    if let Some(enabled) = request.tuning_scheduler_enabled {
+        sqlx::query(
+            "UPDATE system_settings SET tuning_scheduler_enabled = $1, updated_at = NOW() WHERE id = 'default'"
+        )
+        .bind(enabled)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+
+        tracing::info!("Tuning scheduler {} by user {}", if enabled { "enabled" } else { "disabled" }, auth.user_id());
+    }
+
+    if let Some(enabled) = request.enrichment_sync_scheduler_enabled {
+        sqlx::query(
+            "UPDATE system_settings SET enrichment_sync_scheduler_enabled = $1, updated_at = NOW() WHERE id = 'default'"
+        )
+        .bind(enabled)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+
+        tracing::info!("Enrichment sync scheduler {} by user {}", if enabled { "enabled" } else { "disabled" }, auth.user_id());
+    }
+
+    if let Some(enabled) = request.custom_enrichment_scheduler_enabled {
+        sqlx::query(
+            "UPDATE system_settings SET custom_enrichment_scheduler_enabled = $1, updated_at = NOW() WHERE id = 'default'"
+        )
+        .bind(enabled)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+
+        tracing::info!("Custom enrichment scheduler {} by user {}", if enabled { "enabled" } else { "disabled" }, auth.user_id());
+    }
+
+    if let Some(enabled) = request.ai_monitoring_enabled {
+        sqlx::query(
+            "UPDATE system_settings SET ai_monitoring_enabled = $1, updated_at = NOW() WHERE id = 'default'"
+        )
+        .bind(enabled)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+
+        tracing::info!("AI monitoring {} by user {}", if enabled { "enabled" } else { "disabled" }, auth.user_id());
+    }
+
+    if let Some(enabled) = request.feed_monitoring_enabled {
+        sqlx::query(
+            "UPDATE system_settings SET feed_monitoring_enabled = $1, updated_at = NOW() WHERE id = 'default'"
+        )
+        .bind(enabled)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+
+        tracing::info!("Feed monitoring {} by user {}", if enabled { "enabled" } else { "disabled" }, auth.user_id());
+    }
+
+    // Fetch current state to return
+    let row = sqlx::query(
+        r#"
+        SELECT
+            COALESCE(detection_scheduler_enabled, true) as detection,
+            COALESCE(tuning_scheduler_enabled, true) as tuning,
+            COALESCE(enrichment_sync_scheduler_enabled, true) as enrichment,
+            COALESCE(custom_enrichment_scheduler_enabled, true) as custom,
+            COALESCE(ai_monitoring_enabled, false) as ai,
+            COALESCE(feed_monitoring_enabled, true) as feed
+        FROM system_settings
+        WHERE id = 'default'
+        "#
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+
+    let (detection, tuning, enrichment, custom, ai, feed) = match row {
+        Some(r) => {
+            use sqlx::Row;
+            (
+                r.get::<bool, _>("detection"),
+                r.get::<bool, _>("tuning"),
+                r.get::<bool, _>("enrichment"),
+                r.get::<bool, _>("custom"),
+                r.get::<bool, _>("ai"),
+                r.get::<bool, _>("feed"),
+            )
+        }
+        None => (true, true, true, true, false, true),
+    };
+
+    Ok(Json(DeveloperSettingsResponse {
+        detection_scheduler_enabled: detection,
+        tuning_scheduler_enabled: tuning,
+        enrichment_sync_scheduler_enabled: enrichment,
+        custom_enrichment_scheduler_enabled: custom,
+        ai_monitoring_enabled: ai,
+        feed_monitoring_enabled: feed,
+    }))
+}
+

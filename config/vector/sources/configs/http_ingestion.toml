@@ -1,0 +1,16 @@
+# Auto-generated routing rules for system-level source: HTTP Ingestion
+# DO NOT EDIT - changes will be overwritten
+# Generated at: 2026-04-18T01:38:15.146750+00:00
+
+[transforms.http_ingestion_route]
+type = "remap"
+inputs = ["source_type_extract"]
+source = '''
+# Apply routing rules to set source_type
+if .source_type == "squid_proxy" {
+    .source_type = "squid_proxy"
+} else if .source_type == "aws_cloudtrail" {
+    .source_type = "aws_cloudtrail"
+}
+# else: passthrough — keep existing .source_type
+'''

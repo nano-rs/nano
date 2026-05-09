@@ -1,0 +1,103 @@
+[package]
+name = "nanosiem-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Keep fuzz tests out of the main workspace
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+chrono = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+uuid = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["rt"] }
+
+[dependencies.nanosiem-core]
+path = ".."
+
+# nPL Parser Fuzzer - feeds random strings to parse_query()
+# Catches: panics, infinite loops, stack overflows in parser
+[[bin]]
+name = "fuzz_npl_parser"
+path = "fuzz_targets/fuzz_npl_parser.rs"
+test = false
+doc = false
+bench = false
+
+# nPL to SQL Fuzzer - tests full pipeline from nPL to ClickHouse SQL
+# Catches: SQL injection, panics in SQL generation, malformed output
+[[bin]]
+name = "fuzz_npl_to_sql"
+path = "fuzz_targets/fuzz_npl_to_sql.rs"
+test = false
+doc = false
+bench = false
+
+# File Upload Parser Fuzzer - tests CSV/JSON/NDJSON parsing
+# Catches: panics on malformed files, encoding issues, format detection bugs
+[[bin]]
+name = "fuzz_file_parser"
+path = "fuzz_targets/fuzz_file_parser.rs"
+test = false
+doc = false
+bench = false
+
+# CSV Parser Fuzzer - tests CSV parsing with various delimiters
+# Catches: delimiter handling bugs, header parsing issues, field escaping
+[[bin]]
+name = "fuzz_csv_parser"
+path = "fuzz_targets/fuzz_csv_parser.rs"
+test = false
+doc = false
+bench = false
+
+# Log Parser Fuzzer - tests syslog/CEF/LEEF/JSON log parsing
+# Catches: format detection bugs, field extraction panics
+[[bin]]
+name = "fuzz_log_parser"
+path = "fuzz_targets/fuzz_log_parser.rs"
+test = false
+doc = false
+bench = false
+
+# Auth Fuzzer - tests password validation and JWT token parsing
+# Catches: panics in password complexity checks, JWT parsing crashes
+[[bin]]
+name = "fuzz_auth"
+path = "fuzz_targets/fuzz_auth.rs"
+test = false
+doc = false
+bench = false
+
+# Auto-Detect Fuzzer - tests log source type detection with regex patterns
+# Catches: ReDoS vulnerabilities, regex compilation panics, detection crashes
+[[bin]]
+name = "fuzz_auto_detect"
+path = "fuzz_targets/fuzz_auto_detect.rs"
+test = false
+doc = false
+bench = false
+
+# VRL Validator Fuzzer - tests VRL code validation logic
+# Catches: panics in security checks, nesting depth, bracket balancing, TOML injection
+[[bin]]
+name = "fuzz_vrl_validator"
+path = "fuzz_targets/fuzz_vrl_validator.rs"
+test = false
+doc = false
+bench = false
+
+# Query Validation Fuzzer - tests field validation and query cost analysis
+# Catches: panics in Levenshtein distance, field validation crashes, cost analysis bugs
+[[bin]]
+name = "fuzz_query_validation"
+path = "fuzz_targets/fuzz_query_validation.rs"
+test = false
+doc = false
+bench = false

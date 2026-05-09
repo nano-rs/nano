@@ -1,0 +1,4026 @@
+//! Unified Data Model field definitions
+//!
+//! This module defines the standard UDM fields for normalized log data.
+//! These fields provide a consistent schema for common entities across
+//! different log sources, enabling cross-source searching.
+//!
+//! Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 2.1, 2.2, 2.3, 2.4
+
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
+
+/// Standard UDM fields for normalized log data
+///
+/// This enum contains ~500 fields covering all major security data models:
+/// - Entity fields (IPs, hosts, users, actions)
+/// - Network fields (ports, protocols, bytes, sessions)
+/// - Authentication fields (auth type, result, session)
+/// - Endpoint fields (OS, CPU, memory, processes)
+/// - Process fields (name, ID, command line, parent)
+/// - File fields (path, name, hash, operations)
+/// - Email fields (sender, recipient, subject, attachments)
+/// - Web fields (URL, HTTP method, user agent, referrer)
+/// - Database fields (queries, performance, connections)
+/// - DNS fields (queries, responses, record types)
+/// - Certificate fields (SSL/TLS certificate information)
+/// - Malware fields (signatures, file hashes, detection)
+/// - Vulnerability fields (CVE, CVSS, scan results)
+/// - And many more...
+///
+/// Custom NanoSIEM fields (prevalence, risk scoring) are preserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UdmField {
+    // ========================================
+    // Legacy/Compatibility Fields
+    // These fields are not in the CSV but are used in existing code
+    // ========================================
+    
+    /// Generic timestamp field
+    Timestamp,
+    /// Source hostname
+    SrcHost,
+    /// Destination hostname
+    DestHost,
+    /// Destination username (target user or account)
+    DestUser,
+    /// Authentication type/method
+    AuthType,
+    /// Authentication result
+    AuthResult,
+    /// Command line
+    CommandLine,
+    /// File action/operation
+    FileAction,
+    
+    // ========================================
+    // Standard UDM Fields from CSV
+    // ========================================
+    
+    /// access_count
+    AccessCount,
+    /// access_time
+    AccessTime,
+    /// action
+    Action,
+    /// action_mode
+    ActionMode,
+    /// action_name
+    ActionName,
+    /// action_status
+    ActionStatus,
+    /// additional_answer_count
+    AdditionalAnswerCount,
+    /// affect_dest
+    AffectDest,
+    /// answer
+    Answer,
+    /// answer_count
+    AnswerCount,
+    /// app
+    App,
+    /// app_id
+    AppId,
+    /// array
+    Array,
+    /// authentication_method
+    AuthenticationMethod,
+    /// authentication_service
+    AuthenticationService,
+    /// authority_answer_count
+    AuthorityAnswerCount,
+    /// availability
+    Availability,
+    /// avg_executions
+    AvgExecutions,
+    /// blocksize
+    Blocksize,
+    /// body
+    Body,
+    /// buckets
+    Buckets,
+    /// buckets_size
+    BucketsSize,
+    /// buffer_cache_hit_ratio
+    BufferCacheHitRatio,
+    /// bugtraq
+    Bugtraq,
+    /// bytes
+    Bytes,
+    /// bytes_in
+    BytesIn,
+    /// bytes_out
+    BytesOut,
+    /// cached
+    Cached,
+    /// category
+    Category,
+    /// cert
+    Cert,
+    /// change
+    Change,
+    /// change_type
+    ChangeType,
+    /// channel
+    Channel,
+    /// cluster
+    Cluster,
+    /// cm_enabled
+    CmEnabled,
+    /// cm_supported
+    CmSupported,
+    /// command
+    Command,
+    /// comments
+    Comments,
+    /// commits
+    Commits,
+    /// committed_memory
+    CommittedMemory,
+    /// compilation_time
+    CompilationTime,
+    /// complete
+    Complete,
+    /// component
+    Component,
+    /// cookie
+    Cookie,
+    /// cpu_cores
+    CpuCores,
+    /// cpu_count
+    CpuCount,
+    /// cpu_load_mhz
+    CpuLoadMhz,
+    /// cpu_load_percent
+    CpuLoadPercent,
+    /// cpu_mhz
+    CpuMhz,
+    /// cpu_time
+    CpuTime,
+    /// cpu_time_enabled
+    CpuTimeEnabled,
+    /// cpu_time_supported
+    CpuTimeSupported,
+    /// cpu_used
+    CpuUsed,
+    /// cpu_user_percent
+    CpuUserPercent,
+    /// creation_time
+    CreationTime,
+    /// cron
+    Cron,
+    /// current_cpu_time
+    CurrentCpuTime,
+    /// current_loaded
+    CurrentLoaded,
+    /// current_user_time
+    CurrentUserTime,
+    /// cursor
+    Cursor,
+    /// cve
+    Cve,
+    /// cvss
+    Cvss,
+    /// daemon_thread_count
+    DaemonThreadCount,
+    /// datamodel
+    Datamodel,
+    /// date
+    Date,
+    /// delay
+    Delay,
+    /// description
+    Description,
+    /// dest
+    Dest,
+    /// dest_bunit
+    DestBunit,
+    /// dest_category
+    DestCategory,
+    /// dest_dns
+    DestDns,
+    /// dest_interface
+    DestInterface,
+    /// dest_ip
+    DestIp,
+    /// dest_ip_range
+    DestIpRange,
+    /// dest_is_expected
+    DestIsExpected,
+    /// dest_mac
+    DestMac,
+    /// dest_name
+    DestName,
+    /// dest_nt_domain
+    DestNtDomain,
+    /// dest_nt_host
+    DestNtHost,
+    /// dest_port
+    DestPort,
+    /// dest_port_range
+    DestPortRange,
+    /// dest_priority
+    DestPriority,
+    /// dest_requires_av
+    DestRequiresAv,
+    /// dest_should_timesync
+    DestShouldTimesync,
+    /// dest_should_update
+    DestShouldUpdate,
+    /// dest_translated_ip
+    DestTranslatedIp,
+    /// dest_translated_port
+    DestTranslatedPort,
+    /// dest_type
+    DestType,
+    /// dest_url
+    DestUrl,
+    /// dest_zone
+    DestZone,
+    /// digest
+    Digest,
+    /// direction
+    Direction,
+    /// dlp_type
+    DlpType,
+    /// dns
+    Dns,
+    /// dump_area_used
+    DumpAreaUsed,
+    /// duration
+    Duration,
+    /// dvc
+    Dvc,
+    /// dvc_bunit
+    DvcBunit,
+    /// dvc_category
+    DvcCategory,
+    /// dvc_ip
+    DvcIp,
+    /// dvc_mac
+    DvcMac,
+    /// dvc_priority
+    DvcPriority,
+    /// dvc_zone
+    DvcZone,
+    /// earliest
+    Earliest,
+    /// elapsed_time
+    ElapsedTime,
+    /// email
+    Email,
+    /// enabled
+    Enabled,
+    /// endpoint
+    Endpoint,
+    /// endpoint_version
+    EndpointVersion,
+    /// error_code
+    ErrorCode,
+    /// event_id
+    EventId,
+    /// family
+    Family,
+    /// fan_speed
+    FanSpeed,
+    /// fd_max
+    FdMax,
+    /// fd_used
+    FdUsed,
+    /// file_access_time
+    FileAccessTime,
+    /// file_acl
+    FileAcl,
+    /// file_create_time
+    FileCreateTime,
+    /// file_hash
+    FileHash,
+    /// file_modify_time
+    FileModifyTime,
+    /// file_name
+    FileName,
+    /// file_path
+    FilePath,
+    /// file_size
+    FileSize,
+    /// filter_action
+    FilterAction,
+    /// filter_score
+    FilterScore,
+    /// flow_id
+    FlowId,
+    /// free_bytes
+    FreeBytes,
+    /// free_physical_memory
+    FreePhysicalMemory,
+    /// free_swap
+    FreeSwap,
+    /// heap_committed
+    HeapCommitted,
+    /// heap_initial
+    HeapInitial,
+    /// heap_max
+    HeapMax,
+    /// heap_used
+    HeapUsed,
+    /// host
+    Host,
+    /// http_content_type
+    HttpContentType,
+    /// http_method
+    HttpMethod,
+    /// http_referrer
+    HttpReferrer,
+    /// http_referrer_domain
+    HttpReferrerDomain,
+    /// http_user_agent
+    HttpUserAgent,
+    /// http_user_agent_length
+    HttpUserAgentLength,
+    /// hypervisor
+    Hypervisor,
+    /// hypervisor_id
+    HypervisorId,
+    /// icmp_code
+    IcmpCode,
+    /// icmp_type
+    IcmpType,
+    /// id
+    Id,
+    /// ids_type
+    IdsType,
+    /// image_id
+    ImageId,
+    /// incident
+    Incident,
+    /// indexes_hit
+    IndexesHit,
+    /// info
+    Info,
+    /// inline_nat
+    InlineNat,
+    /// instance_name
+    InstanceName,
+    /// instance_reads
+    InstanceReads,
+    /// instance_type
+    InstanceType,
+    /// instance_version
+    InstanceVersion,
+    /// instance_writes
+    InstanceWrites,
+    /// interactive
+    Interactive,
+    /// interface
+    Interface,
+    /// internal_message_id
+    InternalMessageId,
+    /// ip
+    Ip,
+    /// is_inprogress
+    IsInprogress,
+    /// jvm_description
+    JvmDescription,
+    /// last_call_minute
+    LastCallMinute,
+    /// last_error
+    LastError,
+    /// last_sid
+    LastSid,
+    /// latency
+    Latency,
+    /// latest
+    Latest,
+    /// lb_method
+    LbMethod,
+    /// lease_duration
+    LeaseDuration,
+    /// lease_scope
+    LeaseScope,
+    /// lock_mode
+    LockMode,
+    /// lock_session_id
+    LockSessionId,
+    /// logical_reads
+    LogicalReads,
+    /// logon_time
+    LogonTime,
+    /// mac
+    Mac,
+    /// machine
+    Machine,
+    /// max_file_descriptors
+    MaxFileDescriptors,
+    /// mem
+    Mem,
+    /// mem_committed
+    MemCommitted,
+    /// mem_free
+    MemFree,
+    /// mem_used
+    MemUsed,
+    /// memory_sorts
+    MemorySorts,
+    /// message
+    Message,
+    /// message_consumed_time
+    MessageConsumedTime,
+    /// message_correlation_id
+    MessageCorrelationId,
+    /// message_delivered_time
+    MessageDeliveredTime,
+    /// message_delivery_mode
+    MessageDeliveryMode,
+    /// message_expiration_time
+    MessageExpirationTime,
+    /// message_id
+    MessageId,
+    /// message_info
+    MessageInfo,
+    /// message_priority
+    MessagePriority,
+    /// message_properties
+    MessageProperties,
+    /// message_received_time
+    MessageReceivedTime,
+    /// message_redelivered
+    MessageRedelivered,
+    /// message_reply_dest
+    MessageReplyDest,
+    /// message_type
+    MessageType,
+    /// mitre_technique_id
+    MitreTechniqueId,
+    /// mod_time
+    ModTime,
+    /// mount
+    Mount,
+    /// msft
+    Msft,
+    /// mskb
+    Mskb,
+    /// name
+    Name,
+    /// node
+    Node,
+    /// node_port
+    NodePort,
+    /// non_heap_committed
+    NonHeapCommitted,
+    /// non_heap_initial
+    NonHeapInitial,
+    /// non_heap_max
+    NonHeapMax,
+    /// non_heap_used
+    NonHeapUsed,
+    /// number_of_users
+    NumberOfUsers,
+    /// obj_name
+    ObjName,
+    /// object
+    Object,
+    /// object_attrs
+    ObjectAttrs,
+    /// object_category
+    ObjectCategory,
+    /// object_id
+    ObjectId,
+    /// object_path
+    ObjectPath,
+    /// object_size
+    ObjectSize,
+    /// objects_pending
+    ObjectsPending,
+    /// omu_supported
+    OmuSupported,
+    /// open_file_descriptors
+    OpenFileDescriptors,
+    /// operation
+    Operation,
+    /// orig_dest
+    OrigDest,
+    /// orig_recipient
+    OrigRecipient,
+    /// orig_rid
+    OrigRid,
+    /// orig_sid
+    OrigSid,
+    /// orig_src
+    OrigSrc,
+    /// original_file_name
+    OriginalFileName,
+    /// os
+    Os,
+    /// os_architecture
+    OsArchitecture,
+    /// os_pid
+    OsPid,
+    /// os_version
+    OsVersion,
+    /// owner
+    Owner,
+    /// owner_email
+    OwnerEmail,
+    /// owner_id
+    OwnerId,
+    /// packets
+    Packets,
+    /// packets_in
+    PacketsIn,
+    /// packets_out
+    PacketsOut,
+    /// parameters
+    Parameters,
+    /// parent
+    Parent,
+    /// parent_object
+    ParentObject,
+    /// parent_object_category
+    ParentObjectCategory,
+    /// parent_object_id
+    ParentObjectId,
+    /// parent_process
+    ParentProcess,
+    /// parent_process_exec
+    ParentProcessExec,
+    /// parent_process_guid
+    ParentProcessGuid,
+    /// parent_process_id
+    ParentProcessId,
+    /// parent_process_name
+    ParentProcessName,
+    /// parent_process_path
+    ParentProcessPath,
+    /// password
+    Password,
+    /// payload
+    Payload,
+    /// payload_type
+    PayloadType,
+    /// peak_thread_count
+    PeakThreadCount,
+    /// physical_memory
+    PhysicalMemory,
+    /// physical_reads
+    PhysicalReads,
+    /// power
+    Power,
+    /// priority
+    Priority,
+    /// problem
+    Problem,
+    /// process
+    Process,
+    /// process_current_directory
+    ProcessCurrentDirectory,
+    /// process_exec
+    ProcessExec,
+    /// process_guid
+    ProcessGuid,
+    /// process_hash
+    ProcessHash,
+    /// process_id
+    ProcessId,
+    /// process_integrity_level
+    ProcessIntegrityLevel,
+    /// process_limit
+    ProcessLimit,
+    /// process_name
+    ProcessName,
+    /// process_path
+    ProcessPath,
+    /// processes
+    Processes,
+    /// product_version
+    ProductVersion,
+    /// protocol
+    Protocol,
+    /// protocol_version
+    ProtocolVersion,
+    /// query
+    Query,
+    /// query_count
+    QueryCount,
+    /// query_id
+    QueryId,
+    /// query_plan_hit
+    QueryPlanHit,
+    /// query_time
+    QueryTime,
+    /// query_type
+    QueryType,
+    /// read_blocks
+    ReadBlocks,
+    /// read_latency
+    ReadLatency,
+    /// read_ops
+    ReadOps,
+    /// reason
+    Reason,
+    /// recipient
+    Recipient,
+    /// recipient_count
+    RecipientCount,
+    /// recipient_domain
+    RecipientDomain,
+    /// recipient_status
+    RecipientStatus,
+    /// record_type
+    RecordType,
+    /// records_affected
+    RecordsAffected,
+    /// registry_hive
+    RegistryHive,
+    /// registry_key_name
+    RegistryKeyName,
+    /// registry_path
+    RegistryPath,
+    /// registry_value_data
+    RegistryValueData,
+    /// registry_value_name
+    RegistryValueName,
+    /// registry_value_text
+    RegistryValueText,
+    /// registry_value_type
+    RegistryValueType,
+    /// reply_code
+    ReplyCode,
+    /// reply_code_id
+    ReplyCodeId,
+    /// request_payload
+    RequestPayload,
+    /// request_payload_type
+    RequestPayloadType,
+    /// request_sent_time
+    RequestSentTime,
+    /// resource_type
+    ResourceType,
+    /// response_code
+    ResponseCode,
+    /// response_payload_type
+    ResponsePayloadType,
+    /// response_received_time
+    ResponseReceivedTime,
+    /// response_time
+    ResponseTime,
+    /// result
+    Result,
+    /// result_id
+    ResultId,
+    /// retention
+    Retention,
+    /// retries
+    Retries,
+    /// return_addr
+    ReturnAddr,
+    /// return_message
+    ReturnMessage,
+    /// rid
+    Rid,
+    /// rpc_protocol
+    RpcProtocol,
+    /// rule
+    Rule,
+    /// rule_action
+    RuleAction,
+    /// savedsearch_name
+    SavedsearchName,
+    /// search
+    Search,
+    /// search_et
+    SearchEt,
+    /// search_lt
+    SearchLt,
+    /// search_name
+    SearchName,
+    /// search_type
+    SearchType,
+    /// seconds_in_wait
+    SecondsInWait,
+    /// sender
+    Sender,
+    /// serial
+    Serial,
+    /// serial_num
+    SerialNum,
+    /// service
+    Service,
+    /// service_dll
+    ServiceDll,
+    /// service_dll_hash
+    ServiceDllHash,
+    /// service_dll_path
+    ServiceDllPath,
+    /// service_dll_signature_exists
+    ServiceDllSignatureExists,
+    /// service_dll_signature_verified
+    ServiceDllSignatureVerified,
+    /// service_exec
+    ServiceExec,
+    /// service_hash
+    ServiceHash,
+    /// service_id
+    ServiceId,
+    /// service_name
+    ServiceName,
+    /// service_path
+    ServicePath,
+    /// service_signature_exists
+    ServiceSignatureExists,
+    /// service_signature_verified
+    ServiceSignatureVerified,
+    /// session_id
+    SessionId,
+    /// session_limit
+    SessionLimit,
+    /// session_status
+    SessionStatus,
+    /// sessions
+    Sessions,
+    /// severity
+    Severity,
+    /// severity_id
+    SeverityId,
+    /// sga_buffer_cache_size
+    SgaBufferCacheSize,
+    /// sga_buffer_hit_limit
+    SgaBufferHitLimit,
+    /// sga_data_dict_hit_ratio
+    SgaDataDictHitRatio,
+    /// sga_fixed_area_size
+    SgaFixedAreaSize,
+    /// sga_free_memory
+    SgaFreeMemory,
+    /// sga_library_cache_size
+    SgaLibraryCacheSize,
+    /// sga_redo_log_buffer_size
+    SgaRedoLogBufferSize,
+    /// sga_shared_pool_size
+    SgaSharedPoolSize,
+    /// sga_sql_area_size
+    SgaSqlAreaSize,
+    /// shell
+    Shell,
+    /// sid
+    Sid,
+    /// signature
+    Signature,
+    /// signature_extra
+    SignatureExtra,
+    /// signature_id
+    SignatureId,
+    /// signature_version
+    SignatureVersion,
+    /// site
+    Site,
+    /// size
+    Size,
+    /// snapshot
+    Snapshot,
+    /// source
+    Source,
+    /// sourcetype
+    Sourcetype,
+    /// spent
+    Spent,
+    /// platform_id
+    PlatformId,
+    /// platform_realm
+    PlatformRealm,
+    /// platform_server
+    PlatformServer,
+    /// src
+    Src,
+    /// src_bunit
+    SrcBunit,
+    /// src_category
+    SrcCategory,
+    /// src_dns
+    SrcDns,
+    /// src_interface
+    SrcInterface,
+    /// src_ip
+    SrcIp,
+    /// src_ip_range
+    SrcIpRange,
+    /// src_mac
+    SrcMac,
+    /// src_nt_domain
+    SrcNtDomain,
+    /// src_nt_host
+    SrcNtHost,
+    /// src_port
+    SrcPort,
+    /// src_port_range
+    SrcPortRange,
+    /// src_priority
+    SrcPriority,
+    /// src_requires_av
+    SrcRequiresAv,
+    /// src_should_timesync
+    SrcShouldTimesync,
+    /// src_should_update
+    SrcShouldUpdate,
+    /// src_translated_ip
+    SrcTranslatedIp,
+    /// src_translated_port
+    SrcTranslatedPort,
+    /// src_type
+    SrcType,
+    /// src_user
+    SrcUser,
+    /// src_user_bunit
+    SrcUserBunit,
+    /// src_user_category
+    SrcUserCategory,
+    /// src_user_domain
+    SrcUserDomain,
+    /// src_user_id
+    SrcUserId,
+    /// src_user_name
+    SrcUserName,
+    /// src_user_priority
+    SrcUserPriority,
+    /// src_user_role
+    SrcUserRole,
+    /// src_user_type
+    SrcUserType,
+    /// src_zone
+    SrcZone,
+    /// ssid
+    Ssid,
+    /// ssl_end_time
+    SslEndTime,
+    /// ssl_engine
+    SslEngine,
+    /// ssl_hash
+    SslHash,
+    /// ssl_is_valid
+    SslIsValid,
+    /// ssl_issuer
+    SslIssuer,
+    /// ssl_issuer_common_name
+    SslIssuerCommonName,
+    /// ssl_issuer_email
+    SslIssuerEmail,
+    /// ssl_issuer_email_domain
+    SslIssuerEmailDomain,
+    /// ssl_issuer_locality
+    SslIssuerLocality,
+    /// ssl_issuer_organization
+    SslIssuerOrganization,
+    /// ssl_issuer_state
+    SslIssuerState,
+    /// ssl_issuer_street
+    SslIssuerStreet,
+    /// ssl_issuer_unit
+    SslIssuerUnit,
+    /// ssl_name
+    SslName,
+    /// ssl_policies
+    SslPolicies,
+    /// ssl_publickey
+    SslPublickey,
+    /// ssl_publickey_algorithm
+    SslPublickeyAlgorithm,
+    /// ssl_serial
+    SslSerial,
+    /// ssl_session_id
+    SslSessionId,
+    /// ssl_signature_algorithm
+    SslSignatureAlgorithm,
+    /// ssl_start_time
+    SslStartTime,
+    /// ssl_subject
+    SslSubject,
+    /// ssl_subject_common_name
+    SslSubjectCommonName,
+    /// ssl_subject_email
+    SslSubjectEmail,
+    /// ssl_subject_email_domain
+    SslSubjectEmailDomain,
+    /// ssl_subject_locality
+    SslSubjectLocality,
+    /// ssl_subject_organization
+    SslSubjectOrganization,
+    /// ssl_subject_state
+    SslSubjectState,
+    /// ssl_subject_street
+    SslSubjectStreet,
+    /// ssl_subject_unit
+    SslSubjectUnit,
+    /// ssl_validity_window
+    SslValidityWindow,
+    /// ssl_version
+    SslVersion,
+    /// start_mode
+    StartMode,
+    /// start_time
+    StartTime,
+    /// state
+    State,
+    /// status
+    Status,
+    /// status_code
+    StatusCode,
+    /// storage
+    Storage,
+    /// storage_free
+    StorageFree,
+    /// storage_free_percent
+    StorageFreePercent,
+    /// storage_name
+    StorageName,
+    /// storage_used
+    StorageUsed,
+    /// storage_used_percent
+    StorageUsedPercent,
+    /// stored_procedures_called
+    StoredProceduresCalled,
+    /// subject
+    Subject,
+    /// summary_id
+    SummaryId,
+    /// swap
+    Swap,
+    /// swap_free
+    SwapFree,
+    /// swap_space
+    SwapSpace,
+    /// swap_used
+    SwapUsed,
+    /// synch_supported
+    SynchSupported,
+    /// system_load
+    SystemLoad,
+    /// table_scans
+    TableScans,
+    /// tables_hit
+    TablesHit,
+    /// tablespace_name
+    TablespaceName,
+    /// tablespace_reads
+    TablespaceReads,
+    /// tablespace_status
+    TablespaceStatus,
+    /// tablespace_used
+    TablespaceUsed,
+    /// tablespace_writes
+    TablespaceWrites,
+    /// tag
+    Tag,
+    /// tcp_flag
+    TcpFlag,
+    /// temperature
+    Temperature,
+    /// thread_count
+    ThreadCount,
+    /// threads_started
+    ThreadsStarted,
+    /// thruput
+    Thruput,
+    /// thruput_max
+    ThruputMax,
+    /// ticket_id
+    TicketId,
+    /// time
+    Time,
+    /// time_submitted
+    TimeSubmitted,
+    /// tos
+    Tos,
+    /// total_loaded
+    TotalLoaded,
+    /// total_processors
+    TotalProcessors,
+    /// total_unloaded
+    TotalUnloaded,
+    /// transaction_id
+    TransactionId,
+    /// transport
+    Transport,
+    /// transport_dest_port
+    TransportDestPort,
+    /// ttl
+    Ttl,
+    /// type
+    Type,
+    /// uptime
+    Uptime,
+    /// uri
+    Uri,
+    /// uri_path
+    UriPath,
+    /// uri_query
+    UriQuery,
+    /// url
+    Url,
+    /// url_domain
+    UrlDomain,
+    /// url_length
+    UrlLength,
+    /// user
+    User,
+    /// user_agent
+    UserAgent,
+    /// user_bunit
+    UserBunit,
+    /// user_category
+    UserCategory,
+    /// user_group
+    UserGroup,
+    /// user_id
+    UserId,
+    /// user_name
+    UserName,
+    /// user_priority
+    UserPriority,
+    /// user_role
+    UserRole,
+    /// user_type
+    UserType,
+    /// vendor_account
+    VendorAccount,
+    /// vendor_product
+    VendorProduct,
+    /// vendor_product_id
+    VendorProductId,
+    /// vendor_region
+    VendorRegion,
+    /// version
+    Version,
+    /// view
+    View,
+    /// vip_port
+    VipPort,
+    /// vlan
+    Vlan,
+    /// wait_state
+    WaitState,
+    /// wait_time
+    WaitTime,
+    /// wifi
+    Wifi,
+    /// write_blocks
+    WriteBlocks,
+    /// write_latency
+    WriteLatency,
+    /// write_ops
+    WriteOps,
+    /// xdelay
+    Xdelay,
+    /// xref
+    Xref,
+
+    // ========================================
+    // Custom NanoSIEM Fields (Preserved)
+    // ========================================
+    
+    /// Number of unique hosts that have seen an artifact (prevalence tracking)
+    HostCount,
+    /// Boolean flag for rare artifacts (host_count ≤ 3)
+    IsRare,
+    /// Inverse of host_count (higher = rarer)
+    PrevalenceScore,
+    /// First observation timestamp for prevalence
+    PrevalenceFirstSeen,
+    /// Last observation timestamp for prevalence
+    PrevalenceLastSeen,
+    /// Calculated risk score for entities
+    RiskScore,
+    /// Entity being scored for risk (user, host, IP, etc.)
+    RiskEntity,
+    /// Risk level classification (low, medium, high, critical)
+    RiskLevel,
+    /// Log source type identifier
+    SourceType,
+    /// Original unparsed log content
+    RawContent,
+    /// Parser version used for normalization
+    ParserVersion,
+    
+    // ========================================
+    // Parser-Specific Fields (Added manually)
+    // ========================================
+    
+    /// Provider name (Sysmon)
+    Provider,
+    /// Parent process command line (Sysmon)
+    ParentCommandLine,
+    /// Parent process user (Sysmon)
+    ParentUser,
+    /// DNS answers (Sysmon)
+    DnsAnswers,
+}
+
+
+/// Metadata for a UDM field
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UdmFieldMetadata {
+    /// Field name (snake_case)
+    pub name: &'static str,
+    /// Database column name
+    pub column_name: &'static str,
+    /// Data type
+    pub data_type: UdmDataType,
+    /// Category
+    pub category: UdmFieldCategory,
+    /// Human-readable description
+    pub description: &'static str,
+    /// Data models that use this field
+    pub data_models: &'static [&'static str],
+}
+
+/// Category of UDM fields for grouping and filtering
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UdmFieldCategory {
+    /// Alert-related fields
+    Alerts,
+    /// Authentication-related fields
+    Authentication,
+    /// Certificate-related fields (SSL/TLS)
+    Certificate,
+    /// Change management fields
+    Change,
+    /// Data access fields
+    DataAccess,
+    /// Database-related fields
+    Database,
+    /// Data loss prevention fields
+    DataLossPrevention,
+    /// DNS resolution fields
+    Dns,
+    /// Email message fields
+    Email,
+    /// Endpoint/host fields
+    Endpoint,
+    /// Interprocess messaging fields
+    InterprocessMessaging,
+    /// Intrusion detection fields
+    Intrusion,
+    /// Asset inventory fields
+    Inventory,
+    /// Java Virtual Machine fields
+    JavaVirtualMachines,
+    /// Malware detection fields
+    Malware,
+    /// Network traffic fields
+    Network,
+    /// System performance fields
+    Performance,
+    /// Platform audit log fields
+    AuditLogs,
+    /// Ticket management fields
+    TicketManagement,
+    /// Vulnerability scanning fields
+    Vulnerability,
+    /// Web/HTTP traffic fields
+    Web,
+    /// Custom NanoSIEM extensions
+    Custom,
+}
+
+/// Data types for UDM fields
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UdmDataType {
+    /// String/text value
+    String,
+    /// Integer value (i32)
+    Integer,
+    /// Long integer value (i64)
+    Long,
+    /// Floating point value
+    Float,
+    /// Boolean value
+    Boolean,
+    /// IP address (IPv4 or IPv6)
+    IpAddress,
+    /// Timestamp with timezone
+    Timestamp,
+    /// Array of values
+    Array,
+}
+
+
+impl UdmField {
+    /// Get the database column name for this UDM field
+    pub fn column_name(&self) -> &'static str {
+        match self {
+            UdmField::AccessCount => "access_count",
+            UdmField::AccessTime => "access_time",
+            UdmField::Action => "action",
+            UdmField::ActionMode => "action_mode",
+            UdmField::ActionName => "action_name",
+            UdmField::ActionStatus => "action_status",
+            UdmField::AdditionalAnswerCount => "additional_answer_count",
+            UdmField::AffectDest => "affect_dest",
+            UdmField::Answer => "answer",
+            UdmField::AnswerCount => "answer_count",
+            UdmField::App => "app",
+            UdmField::AppId => "app_id",
+            UdmField::Array => "array",
+            UdmField::AuthenticationMethod => "authentication_method",
+            UdmField::AuthenticationService => "authentication_service",
+            UdmField::AuthorityAnswerCount => "authority_answer_count",
+            UdmField::Availability => "availability",
+            UdmField::AvgExecutions => "avg_executions",
+            UdmField::Blocksize => "blocksize",
+            UdmField::Body => "body",
+            UdmField::Buckets => "buckets",
+            UdmField::BucketsSize => "buckets_size",
+            UdmField::BufferCacheHitRatio => "buffer_cache_hit_ratio",
+            UdmField::Bugtraq => "bugtraq",
+            UdmField::Bytes => "bytes",
+            UdmField::BytesIn => "bytes_in",
+            UdmField::BytesOut => "bytes_out",
+            UdmField::Cached => "cached",
+            UdmField::Category => "category",
+            UdmField::Cert => "cert",
+            UdmField::Change => "change",
+            UdmField::ChangeType => "change_type",
+            UdmField::Channel => "channel",
+            UdmField::Cluster => "cluster",
+            UdmField::CmEnabled => "cm_enabled",
+            UdmField::CmSupported => "cm_supported",
+            UdmField::Command => "command",
+            UdmField::Comments => "comments",
+            UdmField::Commits => "commits",
+            UdmField::CommittedMemory => "committed_memory",
+            UdmField::CompilationTime => "compilation_time",
+            UdmField::Complete => "complete",
+            UdmField::Component => "component",
+            UdmField::Cookie => "cookie",
+            UdmField::CpuCores => "cpu_cores",
+            UdmField::CpuCount => "cpu_count",
+            UdmField::CpuLoadMhz => "cpu_load_mhz",
+            UdmField::CpuLoadPercent => "cpu_load_percent",
+            UdmField::CpuMhz => "cpu_mhz",
+            UdmField::CpuTime => "cpu_time",
+            UdmField::CpuTimeEnabled => "cpu_time_enabled",
+            UdmField::CpuTimeSupported => "cpu_time_supported",
+            UdmField::CpuUsed => "cpu_used",
+            UdmField::CpuUserPercent => "cpu_user_percent",
+            UdmField::CreationTime => "creation_time",
+            UdmField::Cron => "cron",
+            UdmField::CurrentCpuTime => "current_cpu_time",
+            UdmField::CurrentLoaded => "current_loaded",
+            UdmField::CurrentUserTime => "current_user_time",
+            UdmField::Cursor => "cursor",
+            UdmField::Cve => "cve",
+            UdmField::Cvss => "cvss",
+            UdmField::DaemonThreadCount => "daemon_thread_count",
+            UdmField::Datamodel => "datamodel",
+            UdmField::Date => "date",
+            UdmField::Delay => "delay",
+            UdmField::Description => "description",
+            UdmField::Dest => "dest",
+            UdmField::DestBunit => "dest_bunit",
+            UdmField::DestCategory => "dest_category",
+            UdmField::DestDns => "dest_dns",
+            UdmField::DestInterface => "dest_interface",
+            UdmField::DestIp => "dest_ip",
+            UdmField::DestIpRange => "dest_ip_range",
+            UdmField::DestIsExpected => "dest_is_expected",
+            UdmField::DestMac => "dest_mac",
+            UdmField::DestName => "dest_name",
+            UdmField::DestNtDomain => "dest_nt_domain",
+            UdmField::DestNtHost => "dest_nt_host",
+            UdmField::DestPort => "dest_port",
+            UdmField::DestPortRange => "dest_port_range",
+            UdmField::DestPriority => "dest_priority",
+            UdmField::DestRequiresAv => "dest_requires_av",
+            UdmField::DestShouldTimesync => "dest_should_timesync",
+            UdmField::DestShouldUpdate => "dest_should_update",
+            UdmField::DestTranslatedIp => "dest_translated_ip",
+            UdmField::DestTranslatedPort => "dest_translated_port",
+            UdmField::DestType => "dest_type",
+            UdmField::DestUrl => "dest_url",
+            UdmField::DestZone => "dest_zone",
+            UdmField::Digest => "digest",
+            UdmField::Direction => "direction",
+            UdmField::DlpType => "dlp_type",
+            UdmField::Dns => "dns",
+            UdmField::DumpAreaUsed => "dump_area_used",
+            UdmField::Duration => "duration",
+            UdmField::Dvc => "dvc",
+            UdmField::DvcBunit => "dvc_bunit",
+            UdmField::DvcCategory => "dvc_category",
+            UdmField::DvcIp => "dvc_ip",
+            UdmField::DvcMac => "dvc_mac",
+            UdmField::DvcPriority => "dvc_priority",
+            UdmField::DvcZone => "dvc_zone",
+            UdmField::Earliest => "earliest",
+            UdmField::ElapsedTime => "elapsed_time",
+            UdmField::Email => "email",
+            UdmField::Enabled => "enabled",
+            UdmField::Endpoint => "endpoint",
+            UdmField::EndpointVersion => "endpoint_version",
+            UdmField::ErrorCode => "error_code",
+            UdmField::EventId => "event_id",
+            UdmField::Family => "family",
+            UdmField::FanSpeed => "fan_speed",
+            UdmField::FdMax => "fd_max",
+            UdmField::FdUsed => "fd_used",
+            UdmField::FileAccessTime => "file_access_time",
+            UdmField::FileAcl => "file_acl",
+            UdmField::FileCreateTime => "file_create_time",
+            UdmField::FileHash => "file_hash",
+            UdmField::FileModifyTime => "file_modify_time",
+            UdmField::FileName => "file_name",
+            UdmField::FilePath => "file_path",
+            UdmField::FileSize => "file_size",
+            UdmField::FilterAction => "filter_action",
+            UdmField::FilterScore => "filter_score",
+            UdmField::FlowId => "flow_id",
+            UdmField::FreeBytes => "free_bytes",
+            UdmField::FreePhysicalMemory => "free_physical_memory",
+            UdmField::FreeSwap => "free_swap",
+            UdmField::HeapCommitted => "heap_committed",
+            UdmField::HeapInitial => "heap_initial",
+            UdmField::HeapMax => "heap_max",
+            UdmField::HeapUsed => "heap_used",
+            UdmField::Host => "host",
+            UdmField::HttpContentType => "http_content_type",
+            UdmField::HttpMethod => "http_method",
+            UdmField::HttpReferrer => "http_referrer",
+            UdmField::HttpReferrerDomain => "http_referrer_domain",
+            UdmField::HttpUserAgent => "http_user_agent",
+            UdmField::HttpUserAgentLength => "http_user_agent_length",
+            UdmField::Hypervisor => "hypervisor",
+            UdmField::HypervisorId => "hypervisor_id",
+            UdmField::IcmpCode => "icmp_code",
+            UdmField::IcmpType => "icmp_type",
+            UdmField::Id => "id",
+            UdmField::IdsType => "ids_type",
+            UdmField::ImageId => "image_id",
+            UdmField::Incident => "incident",
+            UdmField::IndexesHit => "indexes_hit",
+            UdmField::Info => "info",
+            UdmField::InlineNat => "inline_nat",
+            UdmField::InstanceName => "instance_name",
+            UdmField::InstanceReads => "instance_reads",
+            UdmField::InstanceType => "instance_type",
+            UdmField::InstanceVersion => "instance_version",
+            UdmField::InstanceWrites => "instance_writes",
+            UdmField::Interactive => "interactive",
+            UdmField::Interface => "interface",
+            UdmField::InternalMessageId => "internal_message_id",
+            UdmField::Ip => "ip",
+            UdmField::IsInprogress => "is_inprogress",
+            UdmField::JvmDescription => "jvm_description",
+            UdmField::LastCallMinute => "last_call_minute",
+            UdmField::LastError => "last_error",
+            UdmField::LastSid => "last_sid",
+            UdmField::Latency => "latency",
+            UdmField::Latest => "latest",
+            UdmField::LbMethod => "lb_method",
+            UdmField::LeaseDuration => "lease_duration",
+            UdmField::LeaseScope => "lease_scope",
+            UdmField::LockMode => "lock_mode",
+            UdmField::LockSessionId => "lock_session_id",
+            UdmField::LogicalReads => "logical_reads",
+            UdmField::LogonTime => "logon_time",
+            UdmField::Mac => "mac",
+            UdmField::Machine => "machine",
+            UdmField::MaxFileDescriptors => "max_file_descriptors",
+            UdmField::Mem => "mem",
+            UdmField::MemCommitted => "mem_committed",
+            UdmField::MemFree => "mem_free",
+            UdmField::MemUsed => "mem_used",
+            UdmField::MemorySorts => "memory_sorts",
+            UdmField::Message => "message",
+            UdmField::MessageConsumedTime => "message_consumed_time",
+            UdmField::MessageCorrelationId => "message_correlation_id",
+            UdmField::MessageDeliveredTime => "message_delivered_time",
+            UdmField::MessageDeliveryMode => "message_delivery_mode",
+            UdmField::MessageExpirationTime => "message_expiration_time",
+            UdmField::MessageId => "message_id",
+            UdmField::MessageInfo => "message_info",
+            UdmField::MessagePriority => "message_priority",
+            UdmField::MessageProperties => "message_properties",
+            UdmField::MessageReceivedTime => "message_received_time",
+            UdmField::MessageRedelivered => "message_redelivered",
+            UdmField::MessageReplyDest => "message_reply_dest",
+            UdmField::MessageType => "message_type",
+            UdmField::MitreTechniqueId => "mitre_technique_id",
+            UdmField::ModTime => "mod_time",
+            UdmField::Mount => "mount",
+            UdmField::Msft => "msft",
+            UdmField::Mskb => "mskb",
+            UdmField::Name => "name",
+            UdmField::Node => "node",
+            UdmField::NodePort => "node_port",
+            UdmField::NonHeapCommitted => "non_heap_committed",
+            UdmField::NonHeapInitial => "non_heap_initial",
+            UdmField::NonHeapMax => "non_heap_max",
+            UdmField::NonHeapUsed => "non_heap_used",
+            UdmField::NumberOfUsers => "number_of_users",
+            UdmField::ObjName => "obj_name",
+            UdmField::Object => "object",
+            UdmField::ObjectAttrs => "object_attrs",
+            UdmField::ObjectCategory => "object_category",
+            UdmField::ObjectId => "object_id",
+            UdmField::ObjectPath => "object_path",
+            UdmField::ObjectSize => "object_size",
+            UdmField::ObjectsPending => "objects_pending",
+            UdmField::OmuSupported => "omu_supported",
+            UdmField::OpenFileDescriptors => "open_file_descriptors",
+            UdmField::Operation => "operation",
+            UdmField::OrigDest => "orig_dest",
+            UdmField::OrigRecipient => "orig_recipient",
+            UdmField::OrigRid => "orig_rid",
+            UdmField::OrigSid => "orig_sid",
+            UdmField::OrigSrc => "orig_src",
+            UdmField::OriginalFileName => "original_file_name",
+            UdmField::Os => "os",
+            UdmField::OsArchitecture => "os_architecture",
+            UdmField::OsPid => "os_pid",
+            UdmField::OsVersion => "os_version",
+            UdmField::Owner => "owner",
+            UdmField::OwnerEmail => "owner_email",
+            UdmField::OwnerId => "owner_id",
+            UdmField::Packets => "packets",
+            UdmField::PacketsIn => "packets_in",
+            UdmField::PacketsOut => "packets_out",
+            UdmField::Parameters => "parameters",
+            UdmField::Parent => "parent",
+            UdmField::ParentObject => "parent_object",
+            UdmField::ParentObjectCategory => "parent_object_category",
+            UdmField::ParentObjectId => "parent_object_id",
+            UdmField::ParentProcess => "parent_process",
+            UdmField::ParentProcessExec => "parent_process_exec",
+            UdmField::ParentProcessGuid => "parent_process_guid",
+            UdmField::ParentProcessId => "parent_process_id",
+            UdmField::ParentProcessName => "parent_process_name",
+            UdmField::ParentProcessPath => "parent_process_path",
+            UdmField::Password => "password",
+            UdmField::Payload => "payload",
+            UdmField::PayloadType => "payload_type",
+            UdmField::PeakThreadCount => "peak_thread_count",
+            UdmField::PhysicalMemory => "physical_memory",
+            UdmField::PhysicalReads => "physical_reads",
+            UdmField::Power => "power",
+            UdmField::Priority => "priority",
+            UdmField::Problem => "problem",
+            UdmField::Process => "process",
+            UdmField::ProcessCurrentDirectory => "process_current_directory",
+            UdmField::ProcessExec => "process_exec",
+            UdmField::ProcessGuid => "process_guid",
+            UdmField::ProcessHash => "process_hash",
+            UdmField::ProcessId => "process_id",
+            UdmField::ProcessIntegrityLevel => "process_integrity_level",
+            UdmField::ProcessLimit => "process_limit",
+            UdmField::ProcessName => "process_name",
+            UdmField::ProcessPath => "process_path",
+            UdmField::Processes => "processes",
+            UdmField::ProductVersion => "product_version",
+            UdmField::Protocol => "protocol",
+            UdmField::ProtocolVersion => "protocol_version",
+            UdmField::Query => "query",
+            UdmField::QueryCount => "query_count",
+            UdmField::QueryId => "query_id",
+            UdmField::QueryPlanHit => "query_plan_hit",
+            UdmField::QueryTime => "query_time",
+            UdmField::QueryType => "query_type",
+            UdmField::ReadBlocks => "read_blocks",
+            UdmField::ReadLatency => "read_latency",
+            UdmField::ReadOps => "read_ops",
+            UdmField::Reason => "reason",
+            UdmField::Recipient => "recipient",
+            UdmField::RecipientCount => "recipient_count",
+            UdmField::RecipientDomain => "recipient_domain",
+            UdmField::RecipientStatus => "recipient_status",
+            UdmField::RecordType => "record_type",
+            UdmField::RecordsAffected => "records_affected",
+            UdmField::RegistryHive => "registry_hive",
+            UdmField::RegistryKeyName => "registry_key_name",
+            UdmField::RegistryPath => "registry_path",
+            UdmField::RegistryValueData => "registry_value_data",
+            UdmField::RegistryValueName => "registry_value_name",
+            UdmField::RegistryValueText => "registry_value_text",
+            UdmField::RegistryValueType => "registry_value_type",
+            UdmField::ReplyCode => "reply_code",
+            UdmField::ReplyCodeId => "reply_code_id",
+            UdmField::RequestPayload => "request_payload",
+            UdmField::RequestPayloadType => "request_payload_type",
+            UdmField::RequestSentTime => "request_sent_time",
+            UdmField::ResourceType => "resource_type",
+            UdmField::ResponseCode => "response_code",
+            UdmField::ResponsePayloadType => "response_payload_type",
+            UdmField::ResponseReceivedTime => "response_received_time",
+            UdmField::ResponseTime => "response_time",
+            UdmField::Result => "result",
+            UdmField::ResultId => "result_id",
+            UdmField::Retention => "retention",
+            UdmField::Retries => "retries",
+            UdmField::ReturnAddr => "return_addr",
+            UdmField::ReturnMessage => "return_message",
+            UdmField::Rid => "rid",
+            UdmField::RpcProtocol => "rpc_protocol",
+            UdmField::Rule => "rule",
+            UdmField::RuleAction => "rule_action",
+            UdmField::SavedsearchName => "savedsearch_name",
+            UdmField::Search => "search",
+            UdmField::SearchEt => "search_et",
+            UdmField::SearchLt => "search_lt",
+            UdmField::SearchName => "search_name",
+            UdmField::SearchType => "search_type",
+            UdmField::SecondsInWait => "seconds_in_wait",
+            UdmField::Sender => "sender",
+            UdmField::Serial => "serial",
+            UdmField::SerialNum => "serial_num",
+            UdmField::Service => "service",
+            UdmField::ServiceDll => "service_dll",
+            UdmField::ServiceDllHash => "service_dll_hash",
+            UdmField::ServiceDllPath => "service_dll_path",
+            UdmField::ServiceDllSignatureExists => "service_dll_signature_exists",
+            UdmField::ServiceDllSignatureVerified => "service_dll_signature_verified",
+            UdmField::ServiceExec => "service_exec",
+            UdmField::ServiceHash => "service_hash",
+            UdmField::ServiceId => "service_id",
+            UdmField::ServiceName => "service_name",
+            UdmField::ServicePath => "service_path",
+            UdmField::ServiceSignatureExists => "service_signature_exists",
+            UdmField::ServiceSignatureVerified => "service_signature_verified",
+            UdmField::SessionId => "session_id",
+            UdmField::SessionLimit => "session_limit",
+            UdmField::SessionStatus => "session_status",
+            UdmField::Sessions => "sessions",
+            UdmField::Severity => "severity",
+            UdmField::SeverityId => "severity_id",
+            UdmField::SgaBufferCacheSize => "sga_buffer_cache_size",
+            UdmField::SgaBufferHitLimit => "sga_buffer_hit_limit",
+            UdmField::SgaDataDictHitRatio => "sga_data_dict_hit_ratio",
+            UdmField::SgaFixedAreaSize => "sga_fixed_area_size",
+            UdmField::SgaFreeMemory => "sga_free_memory",
+            UdmField::SgaLibraryCacheSize => "sga_library_cache_size",
+            UdmField::SgaRedoLogBufferSize => "sga_redo_log_buffer_size",
+            UdmField::SgaSharedPoolSize => "sga_shared_pool_size",
+            UdmField::SgaSqlAreaSize => "sga_sql_area_size",
+            UdmField::Shell => "shell",
+            UdmField::Sid => "sid",
+            UdmField::Signature => "signature",
+            UdmField::SignatureExtra => "signature_extra",
+            UdmField::SignatureId => "signature_id",
+            UdmField::SignatureVersion => "signature_version",
+            UdmField::Site => "site",
+            UdmField::Size => "size",
+            UdmField::Snapshot => "snapshot",
+            UdmField::Source => "source",
+            UdmField::Sourcetype => "sourcetype",
+            UdmField::Spent => "spent",
+            UdmField::PlatformId => "platform_id",
+            UdmField::PlatformRealm => "platform_realm",
+            UdmField::PlatformServer => "platform_server",
+            UdmField::Src => "src",
+            UdmField::SrcBunit => "src_bunit",
+            UdmField::SrcCategory => "src_category",
+            UdmField::SrcDns => "src_dns",
+            UdmField::SrcInterface => "src_interface",
+            UdmField::SrcIp => "src_ip",
+            UdmField::SrcIpRange => "src_ip_range",
+            UdmField::SrcMac => "src_mac",
+            UdmField::SrcNtDomain => "src_nt_domain",
+            UdmField::SrcNtHost => "src_nt_host",
+            UdmField::SrcPort => "src_port",
+            UdmField::SrcPortRange => "src_port_range",
+            UdmField::SrcPriority => "src_priority",
+            UdmField::SrcRequiresAv => "src_requires_av",
+            UdmField::SrcShouldTimesync => "src_should_timesync",
+            UdmField::SrcShouldUpdate => "src_should_update",
+            UdmField::SrcTranslatedIp => "src_translated_ip",
+            UdmField::SrcTranslatedPort => "src_translated_port",
+            UdmField::SrcType => "src_type",
+            UdmField::SrcUser => "src_user",
+            UdmField::SrcUserBunit => "src_user_bunit",
+            UdmField::SrcUserCategory => "src_user_category",
+            UdmField::SrcUserDomain => "src_user_domain",
+            UdmField::SrcUserId => "src_user_id",
+            UdmField::SrcUserName => "src_user_name",
+            UdmField::SrcUserPriority => "src_user_priority",
+            UdmField::SrcUserRole => "src_user_role",
+            UdmField::SrcUserType => "src_user_type",
+            UdmField::SrcZone => "src_zone",
+            UdmField::Ssid => "ssid",
+            UdmField::SslEndTime => "ssl_end_time",
+            UdmField::SslEngine => "ssl_engine",
+            UdmField::SslHash => "ssl_hash",
+            UdmField::SslIsValid => "ssl_is_valid",
+            UdmField::SslIssuer => "ssl_issuer",
+            UdmField::SslIssuerCommonName => "ssl_issuer_common_name",
+            UdmField::SslIssuerEmail => "ssl_issuer_email",
+            UdmField::SslIssuerEmailDomain => "ssl_issuer_email_domain",
+            UdmField::SslIssuerLocality => "ssl_issuer_locality",
+            UdmField::SslIssuerOrganization => "ssl_issuer_organization",
+            UdmField::SslIssuerState => "ssl_issuer_state",
+            UdmField::SslIssuerStreet => "ssl_issuer_street",
+            UdmField::SslIssuerUnit => "ssl_issuer_unit",
+            UdmField::SslName => "ssl_name",
+            UdmField::SslPolicies => "ssl_policies",
+            UdmField::SslPublickey => "ssl_publickey",
+            UdmField::SslPublickeyAlgorithm => "ssl_publickey_algorithm",
+            UdmField::SslSerial => "ssl_serial",
+            UdmField::SslSessionId => "ssl_session_id",
+            UdmField::SslSignatureAlgorithm => "ssl_signature_algorithm",
+            UdmField::SslStartTime => "ssl_start_time",
+            UdmField::SslSubject => "ssl_subject",
+            UdmField::SslSubjectCommonName => "ssl_subject_common_name",
+            UdmField::SslSubjectEmail => "ssl_subject_email",
+            UdmField::SslSubjectEmailDomain => "ssl_subject_email_domain",
+            UdmField::SslSubjectLocality => "ssl_subject_locality",
+            UdmField::SslSubjectOrganization => "ssl_subject_organization",
+            UdmField::SslSubjectState => "ssl_subject_state",
+            UdmField::SslSubjectStreet => "ssl_subject_street",
+            UdmField::SslSubjectUnit => "ssl_subject_unit",
+            UdmField::SslValidityWindow => "ssl_validity_window",
+            UdmField::SslVersion => "ssl_version",
+            UdmField::StartMode => "start_mode",
+            UdmField::StartTime => "start_time",
+            UdmField::State => "state",
+            UdmField::Status => "status",
+            UdmField::StatusCode => "status_code",
+            UdmField::Storage => "storage",
+            UdmField::StorageFree => "storage_free",
+            UdmField::StorageFreePercent => "storage_free_percent",
+            UdmField::StorageName => "storage_name",
+            UdmField::StorageUsed => "storage_used",
+            UdmField::StorageUsedPercent => "storage_used_percent",
+            UdmField::StoredProceduresCalled => "stored_procedures_called",
+            UdmField::Subject => "subject",
+            UdmField::SummaryId => "summary_id",
+            UdmField::Swap => "swap",
+            UdmField::SwapFree => "swap_free",
+            UdmField::SwapSpace => "swap_space",
+            UdmField::SwapUsed => "swap_used",
+            UdmField::SynchSupported => "synch_supported",
+            UdmField::SystemLoad => "system_load",
+            UdmField::TableScans => "table_scans",
+            UdmField::TablesHit => "tables_hit",
+            UdmField::TablespaceName => "tablespace_name",
+            UdmField::TablespaceReads => "tablespace_reads",
+            UdmField::TablespaceStatus => "tablespace_status",
+            UdmField::TablespaceUsed => "tablespace_used",
+            UdmField::TablespaceWrites => "tablespace_writes",
+            UdmField::Tag => "tag",
+            UdmField::TcpFlag => "tcp_flag",
+            UdmField::Temperature => "temperature",
+            UdmField::ThreadCount => "thread_count",
+            UdmField::ThreadsStarted => "threads_started",
+            UdmField::Thruput => "thruput",
+            UdmField::ThruputMax => "thruput_max",
+            UdmField::TicketId => "ticket_id",
+            UdmField::Time => "time",
+            UdmField::TimeSubmitted => "time_submitted",
+            UdmField::Tos => "tos",
+            UdmField::TotalLoaded => "total_loaded",
+            UdmField::TotalProcessors => "total_processors",
+            UdmField::TotalUnloaded => "total_unloaded",
+            UdmField::TransactionId => "transaction_id",
+            UdmField::Transport => "transport",
+            UdmField::TransportDestPort => "transport_dest_port",
+            UdmField::Ttl => "ttl",
+            UdmField::Type => "type",
+            UdmField::Uptime => "uptime",
+            UdmField::Uri => "uri",
+            UdmField::UriPath => "uri_path",
+            UdmField::UriQuery => "uri_query",
+            UdmField::Url => "url",
+            UdmField::UrlDomain => "url_domain",
+            UdmField::UrlLength => "url_length",
+            UdmField::User => "user",
+            UdmField::UserAgent => "user_agent",
+            UdmField::UserBunit => "user_bunit",
+            UdmField::UserCategory => "user_category",
+            UdmField::UserGroup => "user_group",
+            UdmField::UserId => "user_id",
+            UdmField::UserName => "user_name",
+            UdmField::UserPriority => "user_priority",
+            UdmField::UserRole => "user_role",
+            UdmField::UserType => "user_type",
+            UdmField::VendorAccount => "vendor_account",
+            UdmField::VendorProduct => "vendor_product",
+            UdmField::VendorProductId => "vendor_product_id",
+            UdmField::VendorRegion => "vendor_region",
+            UdmField::Version => "version",
+            UdmField::View => "view",
+            UdmField::VipPort => "vip_port",
+            UdmField::Vlan => "vlan",
+            UdmField::WaitState => "wait_state",
+            UdmField::WaitTime => "wait_time",
+            UdmField::Wifi => "wifi",
+            UdmField::WriteBlocks => "write_blocks",
+            UdmField::WriteLatency => "write_latency",
+            UdmField::WriteOps => "write_ops",
+            UdmField::Xdelay => "xdelay",
+            UdmField::Xref => "xref",
+            // Legacy/Compatibility fields
+            UdmField::Timestamp => "timestamp",
+            UdmField::SrcHost => "src_host",
+            UdmField::DestHost => "dest_host",
+            UdmField::DestUser => "dest_user",
+            UdmField::AuthType => "auth_type",
+            UdmField::AuthResult => "auth_result",
+            UdmField::CommandLine => "command_line",
+            UdmField::FileAction => "file_action",
+            // Custom NanoSIEM fields
+            UdmField::HostCount => "host_count",
+            UdmField::IsRare => "is_rare",
+            UdmField::PrevalenceScore => "prevalence_score",
+            UdmField::PrevalenceFirstSeen => "prevalence_first_seen",
+            UdmField::PrevalenceLastSeen => "prevalence_last_seen",
+            UdmField::RiskScore => "risk_score",
+            UdmField::RiskEntity => "risk_entity",
+            UdmField::RiskLevel => "risk_level",
+            UdmField::SourceType => "source_type",
+            UdmField::RawContent => "raw_content",
+            UdmField::ParserVersion => "parser_version",
+            // Parser-specific fields
+            UdmField::Provider => "provider",
+            UdmField::ParentCommandLine => "parent_command_line",
+            UdmField::ParentUser => "parent_user",
+            UdmField::DnsAnswers => "dns_answers",
+        }
+    }
+
+    /// Get the category this field belongs to
+    pub fn category(&self) -> UdmFieldCategory {
+        match self {
+            UdmField::AccessCount => UdmFieldCategory::AuditLogs,
+            UdmField::AccessTime => UdmFieldCategory::AuditLogs,
+            UdmField::Action => UdmFieldCategory::Authentication,
+            UdmField::ActionMode => UdmFieldCategory::AuditLogs,
+            UdmField::ActionName => UdmFieldCategory::AuditLogs,
+            UdmField::ActionStatus => UdmFieldCategory::AuditLogs,
+            UdmField::AdditionalAnswerCount => UdmFieldCategory::Dns,
+            UdmField::AffectDest => UdmFieldCategory::TicketManagement,
+            UdmField::Answer => UdmFieldCategory::Dns,
+            UdmField::AnswerCount => UdmFieldCategory::Dns,
+            UdmField::App => UdmFieldCategory::Alerts,
+            UdmField::AppId => UdmFieldCategory::DataAccess,
+            UdmField::Array => UdmFieldCategory::Inventory,
+            UdmField::AuthenticationMethod => UdmFieldCategory::Authentication,
+            UdmField::AuthenticationService => UdmFieldCategory::Authentication,
+            UdmField::AuthorityAnswerCount => UdmFieldCategory::Dns,
+            UdmField::Availability => UdmFieldCategory::Database,
+            UdmField::AvgExecutions => UdmFieldCategory::Database,
+            UdmField::Blocksize => UdmFieldCategory::Inventory,
+            UdmField::Body => UdmFieldCategory::Alerts,
+            UdmField::Buckets => UdmFieldCategory::AuditLogs,
+            UdmField::BucketsSize => UdmFieldCategory::AuditLogs,
+            UdmField::BufferCacheHitRatio => UdmFieldCategory::Database,
+            UdmField::Bugtraq => UdmFieldCategory::Vulnerability,
+            UdmField::Bytes => UdmFieldCategory::Network,
+            UdmField::BytesIn => UdmFieldCategory::Network,
+            UdmField::BytesOut => UdmFieldCategory::Network,
+            UdmField::Cached => UdmFieldCategory::Web,
+            UdmField::Category => UdmFieldCategory::DataLossPrevention,
+            UdmField::Cert => UdmFieldCategory::Vulnerability,
+            UdmField::Change => UdmFieldCategory::TicketManagement,
+            UdmField::ChangeType => UdmFieldCategory::Change,
+            UdmField::Channel => UdmFieldCategory::Network,
+            UdmField::Cluster => UdmFieldCategory::Inventory,
+            UdmField::CmEnabled => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::CmSupported => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::Command => UdmFieldCategory::Change,
+            UdmField::Comments => UdmFieldCategory::TicketManagement,
+            UdmField::Commits => UdmFieldCategory::Database,
+            UdmField::CommittedMemory => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::CompilationTime => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::Complete => UdmFieldCategory::AuditLogs,
+            UdmField::Component => UdmFieldCategory::AuditLogs,
+            UdmField::Cookie => UdmFieldCategory::Web,
+            UdmField::CpuCores => UdmFieldCategory::Inventory,
+            UdmField::CpuCount => UdmFieldCategory::Inventory,
+            UdmField::CpuLoadMhz => UdmFieldCategory::Performance,
+            UdmField::CpuLoadPercent => UdmFieldCategory::Endpoint,
+            UdmField::CpuMhz => UdmFieldCategory::Inventory,
+            UdmField::CpuTime => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::CpuTimeEnabled => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::CpuTimeSupported => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::CpuUsed => UdmFieldCategory::Database,
+            UdmField::CpuUserPercent => UdmFieldCategory::Performance,
+            UdmField::CreationTime => UdmFieldCategory::Endpoint,
+            UdmField::Cron => UdmFieldCategory::AuditLogs,
+            UdmField::CurrentCpuTime => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::CurrentLoaded => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::CurrentUserTime => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::Cursor => UdmFieldCategory::Database,
+            UdmField::Cve => UdmFieldCategory::Vulnerability,
+            UdmField::Cvss => UdmFieldCategory::Vulnerability,
+            UdmField::DaemonThreadCount => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::Datamodel => UdmFieldCategory::AuditLogs,
+            UdmField::Date => UdmFieldCategory::Malware,
+            UdmField::Delay => UdmFieldCategory::Email,
+            UdmField::Description => UdmFieldCategory::Alerts,
+            UdmField::Dest => UdmFieldCategory::Alerts,
+            UdmField::DestBunit => UdmFieldCategory::Alerts,
+            UdmField::DestCategory => UdmFieldCategory::Alerts,
+            UdmField::DestDns => UdmFieldCategory::Network,
+            UdmField::DestInterface => UdmFieldCategory::Network,
+            UdmField::DestIp => UdmFieldCategory::Inventory,
+            UdmField::DestIpRange => UdmFieldCategory::Change,
+            UdmField::DestIsExpected => UdmFieldCategory::Endpoint,
+            UdmField::DestMac => UdmFieldCategory::Network,
+            UdmField::DestName => UdmFieldCategory::DataAccess,
+            UdmField::DestNtDomain => UdmFieldCategory::Authentication,
+            UdmField::DestNtHost => UdmFieldCategory::Network,
+            UdmField::DestPort => UdmFieldCategory::Certificate,
+            UdmField::DestPortRange => UdmFieldCategory::Change,
+            UdmField::DestPriority => UdmFieldCategory::Alerts,
+            UdmField::DestRequiresAv => UdmFieldCategory::Endpoint,
+            UdmField::DestShouldTimesync => UdmFieldCategory::Endpoint,
+            UdmField::DestShouldUpdate => UdmFieldCategory::Endpoint,
+            UdmField::DestTranslatedIp => UdmFieldCategory::Network,
+            UdmField::DestTranslatedPort => UdmFieldCategory::Network,
+            UdmField::DestType => UdmFieldCategory::Alerts,
+            UdmField::DestUrl => UdmFieldCategory::DataAccess,
+            UdmField::DestZone => UdmFieldCategory::DataLossPrevention,
+            UdmField::Digest => UdmFieldCategory::AuditLogs,
+            UdmField::Direction => UdmFieldCategory::Change,
+            UdmField::DlpType => UdmFieldCategory::DataLossPrevention,
+            UdmField::Dns => UdmFieldCategory::Inventory,
+            UdmField::DumpAreaUsed => UdmFieldCategory::Database,
+            UdmField::Duration => UdmFieldCategory::Authentication,
+            UdmField::Dvc => UdmFieldCategory::Change,
+            UdmField::DvcBunit => UdmFieldCategory::DataLossPrevention,
+            UdmField::DvcCategory => UdmFieldCategory::DataLossPrevention,
+            UdmField::DvcIp => UdmFieldCategory::Network,
+            UdmField::DvcMac => UdmFieldCategory::Network,
+            UdmField::DvcPriority => UdmFieldCategory::DataLossPrevention,
+            UdmField::DvcZone => UdmFieldCategory::DataLossPrevention,
+            UdmField::Earliest => UdmFieldCategory::AuditLogs,
+            UdmField::ElapsedTime => UdmFieldCategory::Database,
+            UdmField::Email => UdmFieldCategory::DataAccess,
+            UdmField::Enabled => UdmFieldCategory::Inventory,
+            UdmField::Endpoint => UdmFieldCategory::InterprocessMessaging,
+            UdmField::EndpointVersion => UdmFieldCategory::InterprocessMessaging,
+            UdmField::ErrorCode => UdmFieldCategory::Web,
+            UdmField::EventId => UdmFieldCategory::AuditLogs,
+            UdmField::Family => UdmFieldCategory::Inventory,
+            UdmField::FanSpeed => UdmFieldCategory::Performance,
+            UdmField::FdMax => UdmFieldCategory::Inventory,
+            UdmField::FdUsed => UdmFieldCategory::Performance,
+            UdmField::FileAccessTime => UdmFieldCategory::Endpoint,
+            UdmField::FileAcl => UdmFieldCategory::Endpoint,
+            UdmField::FileCreateTime => UdmFieldCategory::Endpoint,
+            UdmField::FileHash => UdmFieldCategory::Email,
+            UdmField::FileModifyTime => UdmFieldCategory::Endpoint,
+            UdmField::FileName => UdmFieldCategory::Email,
+            UdmField::FilePath => UdmFieldCategory::Endpoint,
+            UdmField::FileSize => UdmFieldCategory::Email,
+            UdmField::FilterAction => UdmFieldCategory::Email,
+            UdmField::FilterScore => UdmFieldCategory::Email,
+            UdmField::FlowId => UdmFieldCategory::Network,
+            UdmField::FreeBytes => UdmFieldCategory::Database,
+            UdmField::FreePhysicalMemory => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::FreeSwap => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::HeapCommitted => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::HeapInitial => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::HeapMax => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::HeapUsed => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::Host => UdmFieldCategory::AuditLogs,
+            UdmField::HttpContentType => UdmFieldCategory::Web,
+            UdmField::HttpMethod => UdmFieldCategory::Web,
+            UdmField::HttpReferrer => UdmFieldCategory::Web,
+            UdmField::HttpReferrerDomain => UdmFieldCategory::Web,
+            UdmField::HttpUserAgent => UdmFieldCategory::Web,
+            UdmField::HttpUserAgentLength => UdmFieldCategory::Web,
+            UdmField::Hypervisor => UdmFieldCategory::Inventory,
+            UdmField::HypervisorId => UdmFieldCategory::Inventory,
+            UdmField::IcmpCode => UdmFieldCategory::Network,
+            UdmField::IcmpType => UdmFieldCategory::Network,
+            UdmField::Id => UdmFieldCategory::Alerts,
+            UdmField::IdsType => UdmFieldCategory::Intrusion,
+            UdmField::ImageId => UdmFieldCategory::Change,
+            UdmField::Incident => UdmFieldCategory::TicketManagement,
+            UdmField::IndexesHit => UdmFieldCategory::Database,
+            UdmField::Info => UdmFieldCategory::AuditLogs,
+            UdmField::InlineNat => UdmFieldCategory::Inventory,
+            UdmField::InstanceName => UdmFieldCategory::Database,
+            UdmField::InstanceReads => UdmFieldCategory::Database,
+            UdmField::InstanceType => UdmFieldCategory::Change,
+            UdmField::InstanceVersion => UdmFieldCategory::Database,
+            UdmField::InstanceWrites => UdmFieldCategory::Database,
+            UdmField::Interactive => UdmFieldCategory::Inventory,
+            UdmField::Interface => UdmFieldCategory::Inventory,
+            UdmField::InternalMessageId => UdmFieldCategory::Email,
+            UdmField::Ip => UdmFieldCategory::Inventory,
+            UdmField::IsInprogress => UdmFieldCategory::AuditLogs,
+            UdmField::JvmDescription => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::LastCallMinute => UdmFieldCategory::Database,
+            UdmField::LastError => UdmFieldCategory::AuditLogs,
+            UdmField::LastSid => UdmFieldCategory::AuditLogs,
+            UdmField::Latency => UdmFieldCategory::Inventory,
+            UdmField::Latest => UdmFieldCategory::AuditLogs,
+            UdmField::LbMethod => UdmFieldCategory::Inventory,
+            UdmField::LeaseDuration => UdmFieldCategory::Network,
+            UdmField::LeaseScope => UdmFieldCategory::Network,
+            UdmField::LockMode => UdmFieldCategory::Database,
+            UdmField::LockSessionId => UdmFieldCategory::Database,
+            UdmField::LogicalReads => UdmFieldCategory::Database,
+            UdmField::LogonTime => UdmFieldCategory::Database,
+            UdmField::Mac => UdmFieldCategory::Inventory,
+            UdmField::Machine => UdmFieldCategory::Database,
+            UdmField::MaxFileDescriptors => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::Mem => UdmFieldCategory::Inventory,
+            UdmField::MemCommitted => UdmFieldCategory::Performance,
+            UdmField::MemFree => UdmFieldCategory::Performance,
+            UdmField::MemUsed => UdmFieldCategory::Endpoint,
+            UdmField::MemorySorts => UdmFieldCategory::Database,
+            UdmField::Message => UdmFieldCategory::InterprocessMessaging,
+            UdmField::MessageConsumedTime => UdmFieldCategory::InterprocessMessaging,
+            UdmField::MessageCorrelationId => UdmFieldCategory::InterprocessMessaging,
+            UdmField::MessageDeliveredTime => UdmFieldCategory::InterprocessMessaging,
+            UdmField::MessageDeliveryMode => UdmFieldCategory::InterprocessMessaging,
+            UdmField::MessageExpirationTime => UdmFieldCategory::InterprocessMessaging,
+            UdmField::MessageId => UdmFieldCategory::Email,
+            UdmField::MessageInfo => UdmFieldCategory::Email,
+            UdmField::MessagePriority => UdmFieldCategory::InterprocessMessaging,
+            UdmField::MessageProperties => UdmFieldCategory::InterprocessMessaging,
+            UdmField::MessageReceivedTime => UdmFieldCategory::InterprocessMessaging,
+            UdmField::MessageRedelivered => UdmFieldCategory::InterprocessMessaging,
+            UdmField::MessageReplyDest => UdmFieldCategory::InterprocessMessaging,
+            UdmField::MessageType => UdmFieldCategory::InterprocessMessaging,
+            UdmField::MitreTechniqueId => UdmFieldCategory::Alerts,
+            UdmField::ModTime => UdmFieldCategory::AuditLogs,
+            UdmField::Mount => UdmFieldCategory::Inventory,
+            UdmField::Msft => UdmFieldCategory::Vulnerability,
+            UdmField::Mskb => UdmFieldCategory::Vulnerability,
+            UdmField::Name => UdmFieldCategory::Inventory,
+            UdmField::Node => UdmFieldCategory::Inventory,
+            UdmField::NodePort => UdmFieldCategory::Inventory,
+            UdmField::NonHeapCommitted => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::NonHeapInitial => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::NonHeapMax => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::NonHeapUsed => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::NumberOfUsers => UdmFieldCategory::Database,
+            UdmField::ObjName => UdmFieldCategory::Database,
+            UdmField::Object => UdmFieldCategory::Change,
+            UdmField::ObjectAttrs => UdmFieldCategory::Change,
+            UdmField::ObjectCategory => UdmFieldCategory::Change,
+            UdmField::ObjectId => UdmFieldCategory::Change,
+            UdmField::ObjectPath => UdmFieldCategory::Change,
+            UdmField::ObjectSize => UdmFieldCategory::DataAccess,
+            UdmField::ObjectsPending => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::OmuSupported => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::OpenFileDescriptors => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::Operation => UdmFieldCategory::Web,
+            UdmField::OrigDest => UdmFieldCategory::Email,
+            UdmField::OrigRecipient => UdmFieldCategory::Email,
+            UdmField::OrigRid => UdmFieldCategory::AuditLogs,
+            UdmField::OrigSid => UdmFieldCategory::AuditLogs,
+            UdmField::OrigSrc => UdmFieldCategory::Email,
+            UdmField::OriginalFileName => UdmFieldCategory::Endpoint,
+            UdmField::Os => UdmFieldCategory::Endpoint,
+            UdmField::OsArchitecture => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::OsPid => UdmFieldCategory::Database,
+            UdmField::OsVersion => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::Owner => UdmFieldCategory::DataAccess,
+            UdmField::OwnerEmail => UdmFieldCategory::DataAccess,
+            UdmField::OwnerId => UdmFieldCategory::DataAccess,
+            UdmField::Packets => UdmFieldCategory::Network,
+            UdmField::PacketsIn => UdmFieldCategory::Network,
+            UdmField::PacketsOut => UdmFieldCategory::Network,
+            UdmField::Parameters => UdmFieldCategory::InterprocessMessaging,
+            UdmField::Parent => UdmFieldCategory::Inventory,
+            UdmField::ParentObject => UdmFieldCategory::DataAccess,
+            UdmField::ParentObjectCategory => UdmFieldCategory::DataAccess,
+            UdmField::ParentObjectId => UdmFieldCategory::DataAccess,
+            UdmField::ParentProcess => UdmFieldCategory::Endpoint,
+            UdmField::ParentProcessExec => UdmFieldCategory::Endpoint,
+            UdmField::ParentProcessGuid => UdmFieldCategory::Endpoint,
+            UdmField::ParentProcessId => UdmFieldCategory::Endpoint,
+            UdmField::ParentProcessName => UdmFieldCategory::Endpoint,
+            UdmField::ParentProcessPath => UdmFieldCategory::Endpoint,
+            UdmField::Password => UdmFieldCategory::Inventory,
+            UdmField::Payload => UdmFieldCategory::InterprocessMessaging,
+            UdmField::PayloadType => UdmFieldCategory::InterprocessMessaging,
+            UdmField::PeakThreadCount => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::PhysicalMemory => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::PhysicalReads => UdmFieldCategory::Database,
+            UdmField::Power => UdmFieldCategory::Performance,
+            UdmField::Priority => UdmFieldCategory::TicketManagement,
+            UdmField::Problem => UdmFieldCategory::TicketManagement,
+            UdmField::Process => UdmFieldCategory::Email,
+            UdmField::ProcessCurrentDirectory => UdmFieldCategory::Endpoint,
+            UdmField::ProcessExec => UdmFieldCategory::Endpoint,
+            UdmField::ProcessGuid => UdmFieldCategory::Endpoint,
+            UdmField::ProcessHash => UdmFieldCategory::Endpoint,
+            UdmField::ProcessId => UdmFieldCategory::Email,
+            UdmField::ProcessIntegrityLevel => UdmFieldCategory::Endpoint,
+            UdmField::ProcessLimit => UdmFieldCategory::Database,
+            UdmField::ProcessName => UdmFieldCategory::Endpoint,
+            UdmField::ProcessPath => UdmFieldCategory::Endpoint,
+            UdmField::Processes => UdmFieldCategory::Database,
+            UdmField::ProductVersion => UdmFieldCategory::Malware,
+            UdmField::Protocol => UdmFieldCategory::Change,
+            UdmField::ProtocolVersion => UdmFieldCategory::Network,
+            UdmField::Query => UdmFieldCategory::Database,
+            UdmField::QueryCount => UdmFieldCategory::Dns,
+            UdmField::QueryId => UdmFieldCategory::Database,
+            UdmField::QueryPlanHit => UdmFieldCategory::Database,
+            UdmField::QueryTime => UdmFieldCategory::Database,
+            UdmField::QueryType => UdmFieldCategory::Dns,
+            UdmField::ReadBlocks => UdmFieldCategory::Inventory,
+            UdmField::ReadLatency => UdmFieldCategory::Inventory,
+            UdmField::ReadOps => UdmFieldCategory::Inventory,
+            UdmField::Reason => UdmFieldCategory::Authentication,
+            UdmField::Recipient => UdmFieldCategory::Email,
+            UdmField::RecipientCount => UdmFieldCategory::Email,
+            UdmField::RecipientDomain => UdmFieldCategory::Email,
+            UdmField::RecipientStatus => UdmFieldCategory::Email,
+            UdmField::RecordType => UdmFieldCategory::Dns,
+            UdmField::RecordsAffected => UdmFieldCategory::Database,
+            UdmField::RegistryHive => UdmFieldCategory::Endpoint,
+            UdmField::RegistryKeyName => UdmFieldCategory::Endpoint,
+            UdmField::RegistryPath => UdmFieldCategory::Endpoint,
+            UdmField::RegistryValueData => UdmFieldCategory::Endpoint,
+            UdmField::RegistryValueName => UdmFieldCategory::Endpoint,
+            UdmField::RegistryValueText => UdmFieldCategory::Endpoint,
+            UdmField::RegistryValueType => UdmFieldCategory::Endpoint,
+            UdmField::ReplyCode => UdmFieldCategory::Dns,
+            UdmField::ReplyCodeId => UdmFieldCategory::Dns,
+            UdmField::RequestPayload => UdmFieldCategory::InterprocessMessaging,
+            UdmField::RequestPayloadType => UdmFieldCategory::InterprocessMessaging,
+            UdmField::RequestSentTime => UdmFieldCategory::InterprocessMessaging,
+            UdmField::ResourceType => UdmFieldCategory::Performance,
+            UdmField::ResponseCode => UdmFieldCategory::InterprocessMessaging,
+            UdmField::ResponsePayloadType => UdmFieldCategory::InterprocessMessaging,
+            UdmField::ResponseReceivedTime => UdmFieldCategory::InterprocessMessaging,
+            UdmField::ResponseTime => UdmFieldCategory::Authentication,
+            UdmField::Result => UdmFieldCategory::Change,
+            UdmField::ResultId => UdmFieldCategory::Change,
+            UdmField::Retention => UdmFieldCategory::AuditLogs,
+            UdmField::Retries => UdmFieldCategory::Email,
+            UdmField::ReturnAddr => UdmFieldCategory::Email,
+            UdmField::ReturnMessage => UdmFieldCategory::InterprocessMessaging,
+            UdmField::Rid => UdmFieldCategory::AuditLogs,
+            UdmField::RpcProtocol => UdmFieldCategory::InterprocessMessaging,
+            UdmField::Rule => UdmFieldCategory::Network,
+            UdmField::RuleAction => UdmFieldCategory::Change,
+            UdmField::SavedsearchName => UdmFieldCategory::AuditLogs,
+            UdmField::Search => UdmFieldCategory::AuditLogs,
+            UdmField::SearchEt => UdmFieldCategory::AuditLogs,
+            UdmField::SearchLt => UdmFieldCategory::AuditLogs,
+            UdmField::SearchName => UdmFieldCategory::AuditLogs,
+            UdmField::SearchType => UdmFieldCategory::AuditLogs,
+            UdmField::SecondsInWait => UdmFieldCategory::Database,
+            UdmField::Sender => UdmFieldCategory::Malware,
+            UdmField::Serial => UdmFieldCategory::Inventory,
+            UdmField::SerialNum => UdmFieldCategory::Database,
+            UdmField::Service => UdmFieldCategory::Endpoint,
+            UdmField::ServiceDll => UdmFieldCategory::Endpoint,
+            UdmField::ServiceDllHash => UdmFieldCategory::Endpoint,
+            UdmField::ServiceDllPath => UdmFieldCategory::Endpoint,
+            UdmField::ServiceDllSignatureExists => UdmFieldCategory::Endpoint,
+            UdmField::ServiceDllSignatureVerified => UdmFieldCategory::Endpoint,
+            UdmField::ServiceExec => UdmFieldCategory::Endpoint,
+            UdmField::ServiceHash => UdmFieldCategory::Endpoint,
+            UdmField::ServiceId => UdmFieldCategory::Endpoint,
+            UdmField::ServiceName => UdmFieldCategory::Endpoint,
+            UdmField::ServicePath => UdmFieldCategory::Endpoint,
+            UdmField::ServiceSignatureExists => UdmFieldCategory::Endpoint,
+            UdmField::ServiceSignatureVerified => UdmFieldCategory::Endpoint,
+            UdmField::SessionId => UdmFieldCategory::Database,
+            UdmField::SessionLimit => UdmFieldCategory::Database,
+            UdmField::SessionStatus => UdmFieldCategory::Database,
+            UdmField::Sessions => UdmFieldCategory::Database,
+            UdmField::Severity => UdmFieldCategory::Alerts,
+            UdmField::SeverityId => UdmFieldCategory::Alerts,
+            UdmField::SgaBufferCacheSize => UdmFieldCategory::Database,
+            UdmField::SgaBufferHitLimit => UdmFieldCategory::Database,
+            UdmField::SgaDataDictHitRatio => UdmFieldCategory::Database,
+            UdmField::SgaFixedAreaSize => UdmFieldCategory::Database,
+            UdmField::SgaFreeMemory => UdmFieldCategory::Database,
+            UdmField::SgaLibraryCacheSize => UdmFieldCategory::Database,
+            UdmField::SgaRedoLogBufferSize => UdmFieldCategory::Database,
+            UdmField::SgaSharedPoolSize => UdmFieldCategory::Database,
+            UdmField::SgaSqlAreaSize => UdmFieldCategory::Database,
+            UdmField::Shell => UdmFieldCategory::Inventory,
+            UdmField::Sid => UdmFieldCategory::AuditLogs,
+            UdmField::Signature => UdmFieldCategory::Alerts,
+            UdmField::SignatureExtra => UdmFieldCategory::Email,
+            UdmField::SignatureId => UdmFieldCategory::Alerts,
+            UdmField::SignatureVersion => UdmFieldCategory::Malware,
+            UdmField::Site => UdmFieldCategory::Web,
+            UdmField::Size => UdmFieldCategory::Email,
+            UdmField::Snapshot => UdmFieldCategory::Inventory,
+            UdmField::Source => UdmFieldCategory::AuditLogs,
+            UdmField::Sourcetype => UdmFieldCategory::AuditLogs,
+            UdmField::Spent => UdmFieldCategory::AuditLogs,
+            UdmField::PlatformId => UdmFieldCategory::TicketManagement,
+            UdmField::PlatformRealm => UdmFieldCategory::TicketManagement,
+            UdmField::PlatformServer => UdmFieldCategory::AuditLogs,
+            UdmField::Src => UdmFieldCategory::Alerts,
+            UdmField::SrcBunit => UdmFieldCategory::Alerts,
+            UdmField::SrcCategory => UdmFieldCategory::Alerts,
+            UdmField::SrcDns => UdmFieldCategory::Network,
+            UdmField::SrcInterface => UdmFieldCategory::Network,
+            UdmField::SrcIp => UdmFieldCategory::Inventory,
+            UdmField::SrcIpRange => UdmFieldCategory::Change,
+            UdmField::SrcMac => UdmFieldCategory::Network,
+            UdmField::SrcNtDomain => UdmFieldCategory::Authentication,
+            UdmField::SrcNtHost => UdmFieldCategory::Network,
+            UdmField::SrcPort => UdmFieldCategory::Certificate,
+            UdmField::SrcPortRange => UdmFieldCategory::Change,
+            UdmField::SrcPriority => UdmFieldCategory::Alerts,
+            UdmField::SrcRequiresAv => UdmFieldCategory::Endpoint,
+            UdmField::SrcShouldTimesync => UdmFieldCategory::Endpoint,
+            UdmField::SrcShouldUpdate => UdmFieldCategory::Endpoint,
+            UdmField::SrcTranslatedIp => UdmFieldCategory::Network,
+            UdmField::SrcTranslatedPort => UdmFieldCategory::Network,
+            UdmField::SrcType => UdmFieldCategory::Alerts,
+            UdmField::SrcUser => UdmFieldCategory::Authentication,
+            UdmField::SrcUserBunit => UdmFieldCategory::Authentication,
+            UdmField::SrcUserCategory => UdmFieldCategory::Authentication,
+            UdmField::SrcUserDomain => UdmFieldCategory::Email,
+            UdmField::SrcUserId => UdmFieldCategory::Authentication,
+            UdmField::SrcUserName => UdmFieldCategory::Change,
+            UdmField::SrcUserPriority => UdmFieldCategory::Authentication,
+            UdmField::SrcUserRole => UdmFieldCategory::Authentication,
+            UdmField::SrcUserType => UdmFieldCategory::Authentication,
+            UdmField::SrcZone => UdmFieldCategory::DataLossPrevention,
+            UdmField::Ssid => UdmFieldCategory::Network,
+            UdmField::SslEndTime => UdmFieldCategory::Certificate,
+            UdmField::SslEngine => UdmFieldCategory::Certificate,
+            UdmField::SslHash => UdmFieldCategory::Certificate,
+            UdmField::SslIsValid => UdmFieldCategory::Certificate,
+            UdmField::SslIssuer => UdmFieldCategory::Certificate,
+            UdmField::SslIssuerCommonName => UdmFieldCategory::Certificate,
+            UdmField::SslIssuerEmail => UdmFieldCategory::Certificate,
+            UdmField::SslIssuerEmailDomain => UdmFieldCategory::Certificate,
+            UdmField::SslIssuerLocality => UdmFieldCategory::Certificate,
+            UdmField::SslIssuerOrganization => UdmFieldCategory::Certificate,
+            UdmField::SslIssuerState => UdmFieldCategory::Certificate,
+            UdmField::SslIssuerStreet => UdmFieldCategory::Certificate,
+            UdmField::SslIssuerUnit => UdmFieldCategory::Certificate,
+            UdmField::SslName => UdmFieldCategory::Certificate,
+            UdmField::SslPolicies => UdmFieldCategory::Certificate,
+            UdmField::SslPublickey => UdmFieldCategory::Certificate,
+            UdmField::SslPublickeyAlgorithm => UdmFieldCategory::Certificate,
+            UdmField::SslSerial => UdmFieldCategory::Certificate,
+            UdmField::SslSessionId => UdmFieldCategory::Certificate,
+            UdmField::SslSignatureAlgorithm => UdmFieldCategory::Certificate,
+            UdmField::SslStartTime => UdmFieldCategory::Certificate,
+            UdmField::SslSubject => UdmFieldCategory::Certificate,
+            UdmField::SslSubjectCommonName => UdmFieldCategory::Certificate,
+            UdmField::SslSubjectEmail => UdmFieldCategory::Certificate,
+            UdmField::SslSubjectEmailDomain => UdmFieldCategory::Certificate,
+            UdmField::SslSubjectLocality => UdmFieldCategory::Certificate,
+            UdmField::SslSubjectOrganization => UdmFieldCategory::Certificate,
+            UdmField::SslSubjectState => UdmFieldCategory::Certificate,
+            UdmField::SslSubjectStreet => UdmFieldCategory::Certificate,
+            UdmField::SslSubjectUnit => UdmFieldCategory::Certificate,
+            UdmField::SslValidityWindow => UdmFieldCategory::Certificate,
+            UdmField::SslVersion => UdmFieldCategory::Certificate,
+            UdmField::StartMode => UdmFieldCategory::Endpoint,
+            UdmField::StartTime => UdmFieldCategory::Database,
+            UdmField::State => UdmFieldCategory::Endpoint,
+            UdmField::Status => UdmFieldCategory::Change,
+            UdmField::StatusCode => UdmFieldCategory::Email,
+            UdmField::Storage => UdmFieldCategory::Inventory,
+            UdmField::StorageFree => UdmFieldCategory::Performance,
+            UdmField::StorageFreePercent => UdmFieldCategory::Performance,
+            UdmField::StorageName => UdmFieldCategory::Web,
+            UdmField::StorageUsed => UdmFieldCategory::Performance,
+            UdmField::StorageUsedPercent => UdmFieldCategory::Performance,
+            UdmField::StoredProceduresCalled => UdmFieldCategory::Database,
+            UdmField::Subject => UdmFieldCategory::Alerts,
+            UdmField::SummaryId => UdmFieldCategory::AuditLogs,
+            UdmField::Swap => UdmFieldCategory::Performance,
+            UdmField::SwapFree => UdmFieldCategory::Performance,
+            UdmField::SwapSpace => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::SwapUsed => UdmFieldCategory::Performance,
+            UdmField::SynchSupported => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::SystemLoad => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::TableScans => UdmFieldCategory::Database,
+            UdmField::TablesHit => UdmFieldCategory::Database,
+            UdmField::TablespaceName => UdmFieldCategory::Database,
+            UdmField::TablespaceReads => UdmFieldCategory::Database,
+            UdmField::TablespaceStatus => UdmFieldCategory::Database,
+            UdmField::TablespaceUsed => UdmFieldCategory::Database,
+            UdmField::TablespaceWrites => UdmFieldCategory::Database,
+            UdmField::Tag => UdmFieldCategory::Alerts,
+            UdmField::TcpFlag => UdmFieldCategory::Network,
+            UdmField::Temperature => UdmFieldCategory::Performance,
+            UdmField::ThreadCount => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::ThreadsStarted => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::Thruput => UdmFieldCategory::Performance,
+            UdmField::ThruputMax => UdmFieldCategory::Performance,
+            UdmField::TicketId => UdmFieldCategory::TicketManagement,
+            UdmField::Time => UdmFieldCategory::Inventory,
+            UdmField::TimeSubmitted => UdmFieldCategory::TicketManagement,
+            UdmField::Tos => UdmFieldCategory::Network,
+            UdmField::TotalLoaded => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::TotalProcessors => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::TotalUnloaded => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::TransactionId => UdmFieldCategory::Dns,
+            UdmField::Transport => UdmFieldCategory::Certificate,
+            UdmField::TransportDestPort => UdmFieldCategory::Endpoint,
+            UdmField::Ttl => UdmFieldCategory::Dns,
+            UdmField::Type => UdmFieldCategory::Alerts,
+            UdmField::Uptime => UdmFieldCategory::JavaVirtualMachines,
+            UdmField::Uri => UdmFieldCategory::AuditLogs,
+            UdmField::UriPath => UdmFieldCategory::Web,
+            UdmField::UriQuery => UdmFieldCategory::Web,
+            UdmField::Url => UdmFieldCategory::Email,
+            UdmField::UrlDomain => UdmFieldCategory::Web,
+            UdmField::UrlLength => UdmFieldCategory::Web,
+            UdmField::User => UdmFieldCategory::Alerts,
+            UdmField::UserAgent => UdmFieldCategory::Authentication,
+            UdmField::UserBunit => UdmFieldCategory::Alerts,
+            UdmField::UserCategory => UdmFieldCategory::Alerts,
+            UdmField::UserGroup => UdmFieldCategory::DataAccess,
+            UdmField::UserId => UdmFieldCategory::Authentication,
+            UdmField::UserName => UdmFieldCategory::Alerts,
+            UdmField::UserPriority => UdmFieldCategory::Alerts,
+            UdmField::UserRole => UdmFieldCategory::Authentication,
+            UdmField::UserType => UdmFieldCategory::Authentication,
+            UdmField::VendorAccount => UdmFieldCategory::Alerts,
+            UdmField::VendorProduct => UdmFieldCategory::Authentication,
+            UdmField::VendorProductId => UdmFieldCategory::Alerts,
+            UdmField::VendorRegion => UdmFieldCategory::Alerts,
+            UdmField::Version => UdmFieldCategory::Inventory,
+            UdmField::View => UdmFieldCategory::AuditLogs,
+            UdmField::VipPort => UdmFieldCategory::Inventory,
+            UdmField::Vlan => UdmFieldCategory::Network,
+            UdmField::WaitState => UdmFieldCategory::Database,
+            UdmField::WaitTime => UdmFieldCategory::Database,
+            UdmField::Wifi => UdmFieldCategory::Network,
+            UdmField::WriteBlocks => UdmFieldCategory::Inventory,
+            UdmField::WriteLatency => UdmFieldCategory::Inventory,
+            UdmField::WriteOps => UdmFieldCategory::Inventory,
+            UdmField::Xdelay => UdmFieldCategory::Email,
+            UdmField::Xref => UdmFieldCategory::Email,
+            // Legacy/Compatibility fields
+            UdmField::Timestamp => UdmFieldCategory::Custom,
+            UdmField::SrcHost | UdmField::DestHost => UdmFieldCategory::Inventory,
+            UdmField::DestUser => UdmFieldCategory::Authentication,
+            UdmField::AuthType | UdmField::AuthResult => UdmFieldCategory::Authentication,
+            UdmField::CommandLine | UdmField::FileAction => UdmFieldCategory::Endpoint,
+            // Custom NanoSIEM fields
+            UdmField::HostCount
+            | UdmField::IsRare
+            | UdmField::PrevalenceScore
+            | UdmField::PrevalenceFirstSeen
+            | UdmField::PrevalenceLastSeen
+            | UdmField::RiskScore
+            | UdmField::RiskEntity
+            | UdmField::RiskLevel
+            | UdmField::SourceType
+            | UdmField::RawContent
+            | UdmField::ParserVersion
+            | UdmField::Provider
+            | UdmField::ParentCommandLine
+            | UdmField::ParentUser
+            | UdmField::DnsAnswers => UdmFieldCategory::Custom,
+        }
+    }
+
+    /// Get the expected data type for this field
+    pub fn data_type(&self) -> UdmDataType {
+        match self {
+            UdmField::AccessCount => UdmDataType::Integer,
+            UdmField::AccessTime => UdmDataType::Timestamp,
+            UdmField::Action => UdmDataType::String,
+            UdmField::ActionMode => UdmDataType::String,
+            UdmField::ActionName => UdmDataType::String,
+            UdmField::ActionStatus => UdmDataType::String,
+            UdmField::AdditionalAnswerCount => UdmDataType::Integer,
+            UdmField::AffectDest => UdmDataType::String,
+            UdmField::Answer => UdmDataType::String,
+            UdmField::AnswerCount => UdmDataType::Integer,
+            UdmField::App => UdmDataType::String,
+            UdmField::AppId => UdmDataType::Integer,
+            UdmField::Array => UdmDataType::String,
+            UdmField::AuthenticationMethod => UdmDataType::String,
+            UdmField::AuthenticationService => UdmDataType::String,
+            UdmField::AuthorityAnswerCount => UdmDataType::Integer,
+            UdmField::Availability => UdmDataType::String,
+            UdmField::AvgExecutions => UdmDataType::String,
+            UdmField::Blocksize => UdmDataType::String,
+            UdmField::Body => UdmDataType::String,
+            UdmField::Buckets => UdmDataType::String,
+            UdmField::BucketsSize => UdmDataType::Long,
+            UdmField::BufferCacheHitRatio => UdmDataType::Float,
+            UdmField::Bugtraq => UdmDataType::String,
+            UdmField::Bytes => UdmDataType::Long,
+            UdmField::BytesIn => UdmDataType::Long,
+            UdmField::BytesOut => UdmDataType::Long,
+            UdmField::Cached => UdmDataType::String,
+            UdmField::Category => UdmDataType::String,
+            UdmField::Cert => UdmDataType::String,
+            UdmField::Change => UdmDataType::String,
+            UdmField::ChangeType => UdmDataType::String,
+            UdmField::Channel => UdmDataType::String,
+            UdmField::Cluster => UdmDataType::String,
+            UdmField::CmEnabled => UdmDataType::Boolean,
+            UdmField::CmSupported => UdmDataType::Boolean,
+            UdmField::Command => UdmDataType::String,
+            UdmField::Comments => UdmDataType::String,
+            UdmField::Commits => UdmDataType::String,
+            UdmField::CommittedMemory => UdmDataType::Long,
+            UdmField::CompilationTime => UdmDataType::Timestamp,
+            UdmField::Complete => UdmDataType::String,
+            UdmField::Component => UdmDataType::String,
+            UdmField::Cookie => UdmDataType::String,
+            UdmField::CpuCores => UdmDataType::String,
+            UdmField::CpuCount => UdmDataType::Integer,
+            UdmField::CpuLoadMhz => UdmDataType::Float,
+            UdmField::CpuLoadPercent => UdmDataType::Float,
+            UdmField::CpuMhz => UdmDataType::String,
+            UdmField::CpuTime => UdmDataType::Timestamp,
+            UdmField::CpuTimeEnabled => UdmDataType::Timestamp,
+            UdmField::CpuTimeSupported => UdmDataType::Timestamp,
+            UdmField::CpuUsed => UdmDataType::String,
+            UdmField::CpuUserPercent => UdmDataType::Float,
+            UdmField::CreationTime => UdmDataType::Timestamp,
+            UdmField::Cron => UdmDataType::String,
+            UdmField::CurrentCpuTime => UdmDataType::Timestamp,
+            UdmField::CurrentLoaded => UdmDataType::Float,
+            UdmField::CurrentUserTime => UdmDataType::Timestamp,
+            UdmField::Cursor => UdmDataType::String,
+            UdmField::Cve => UdmDataType::String,
+            UdmField::Cvss => UdmDataType::String,
+            UdmField::DaemonThreadCount => UdmDataType::Integer,
+            UdmField::Datamodel => UdmDataType::String,
+            UdmField::Date => UdmDataType::String,
+            UdmField::Delay => UdmDataType::String,
+            UdmField::Description => UdmDataType::String,
+            UdmField::Dest => UdmDataType::String,
+            UdmField::DestBunit => UdmDataType::String,
+            UdmField::DestCategory => UdmDataType::String,
+            UdmField::DestDns => UdmDataType::String,
+            UdmField::DestInterface => UdmDataType::String,
+            UdmField::DestIp => UdmDataType::IpAddress,
+            UdmField::DestIpRange => UdmDataType::IpAddress,
+            UdmField::DestIsExpected => UdmDataType::String,
+            UdmField::DestMac => UdmDataType::String,
+            UdmField::DestName => UdmDataType::String,
+            UdmField::DestNtDomain => UdmDataType::String,
+            UdmField::DestNtHost => UdmDataType::String,
+            UdmField::DestPort => UdmDataType::Integer,
+            UdmField::DestPortRange => UdmDataType::String,
+            UdmField::DestPriority => UdmDataType::String,
+            UdmField::DestRequiresAv => UdmDataType::String,
+            UdmField::DestShouldTimesync => UdmDataType::Timestamp,
+            UdmField::DestShouldUpdate => UdmDataType::String,
+            UdmField::DestTranslatedIp => UdmDataType::IpAddress,
+            UdmField::DestTranslatedPort => UdmDataType::Integer,
+            UdmField::DestType => UdmDataType::String,
+            UdmField::DestUrl => UdmDataType::String,
+            UdmField::DestZone => UdmDataType::String,
+            UdmField::Digest => UdmDataType::String,
+            UdmField::Direction => UdmDataType::String,
+            UdmField::DlpType => UdmDataType::String,
+            UdmField::Dns => UdmDataType::String,
+            UdmField::DumpAreaUsed => UdmDataType::String,
+            UdmField::Duration => UdmDataType::String,
+            UdmField::Dvc => UdmDataType::String,
+            UdmField::DvcBunit => UdmDataType::String,
+            UdmField::DvcCategory => UdmDataType::String,
+            UdmField::DvcIp => UdmDataType::IpAddress,
+            UdmField::DvcMac => UdmDataType::String,
+            UdmField::DvcPriority => UdmDataType::String,
+            UdmField::DvcZone => UdmDataType::String,
+            UdmField::Earliest => UdmDataType::String,
+            UdmField::ElapsedTime => UdmDataType::Timestamp,
+            UdmField::Email => UdmDataType::String,
+            UdmField::Enabled => UdmDataType::String,
+            UdmField::Endpoint => UdmDataType::String,
+            UdmField::EndpointVersion => UdmDataType::String,
+            UdmField::ErrorCode => UdmDataType::Integer,
+            UdmField::EventId => UdmDataType::Integer,
+            UdmField::Family => UdmDataType::String,
+            UdmField::FanSpeed => UdmDataType::String,
+            UdmField::FdMax => UdmDataType::String,
+            UdmField::FdUsed => UdmDataType::String,
+            UdmField::FileAccessTime => UdmDataType::Timestamp,
+            UdmField::FileAcl => UdmDataType::String,
+            UdmField::FileCreateTime => UdmDataType::Timestamp,
+            UdmField::FileHash => UdmDataType::String,
+            UdmField::FileModifyTime => UdmDataType::Timestamp,
+            UdmField::FileName => UdmDataType::String,
+            UdmField::FilePath => UdmDataType::String,
+            UdmField::FileSize => UdmDataType::Long,
+            UdmField::FilterAction => UdmDataType::String,
+            UdmField::FilterScore => UdmDataType::Float,
+            UdmField::FlowId => UdmDataType::Integer,
+            UdmField::FreeBytes => UdmDataType::Long,
+            UdmField::FreePhysicalMemory => UdmDataType::Long,
+            UdmField::FreeSwap => UdmDataType::String,
+            UdmField::HeapCommitted => UdmDataType::String,
+            UdmField::HeapInitial => UdmDataType::String,
+            UdmField::HeapMax => UdmDataType::String,
+            UdmField::HeapUsed => UdmDataType::String,
+            UdmField::Host => UdmDataType::String,
+            UdmField::HttpContentType => UdmDataType::String,
+            UdmField::HttpMethod => UdmDataType::String,
+            UdmField::HttpReferrer => UdmDataType::String,
+            UdmField::HttpReferrerDomain => UdmDataType::String,
+            UdmField::HttpUserAgent => UdmDataType::String,
+            UdmField::HttpUserAgentLength => UdmDataType::String,
+            UdmField::Hypervisor => UdmDataType::String,
+            UdmField::HypervisorId => UdmDataType::Integer,
+            UdmField::IcmpCode => UdmDataType::Integer,
+            UdmField::IcmpType => UdmDataType::String,
+            UdmField::Id => UdmDataType::String,
+            UdmField::IdsType => UdmDataType::String,
+            UdmField::ImageId => UdmDataType::Integer,
+            UdmField::Incident => UdmDataType::String,
+            UdmField::IndexesHit => UdmDataType::String,
+            UdmField::Info => UdmDataType::String,
+            UdmField::InlineNat => UdmDataType::String,
+            UdmField::InstanceName => UdmDataType::String,
+            UdmField::InstanceReads => UdmDataType::String,
+            UdmField::InstanceType => UdmDataType::String,
+            UdmField::InstanceVersion => UdmDataType::String,
+            UdmField::InstanceWrites => UdmDataType::String,
+            UdmField::Interactive => UdmDataType::String,
+            UdmField::Interface => UdmDataType::String,
+            UdmField::InternalMessageId => UdmDataType::Integer,
+            UdmField::Ip => UdmDataType::IpAddress,
+            UdmField::IsInprogress => UdmDataType::Boolean,
+            UdmField::JvmDescription => UdmDataType::String,
+            UdmField::LastCallMinute => UdmDataType::String,
+            UdmField::LastError => UdmDataType::String,
+            UdmField::LastSid => UdmDataType::String,
+            UdmField::Latency => UdmDataType::String,
+            UdmField::Latest => UdmDataType::String,
+            UdmField::LbMethod => UdmDataType::String,
+            UdmField::LeaseDuration => UdmDataType::String,
+            UdmField::LeaseScope => UdmDataType::String,
+            UdmField::LockMode => UdmDataType::String,
+            UdmField::LockSessionId => UdmDataType::Integer,
+            UdmField::LogicalReads => UdmDataType::String,
+            UdmField::LogonTime => UdmDataType::Timestamp,
+            UdmField::Mac => UdmDataType::String,
+            UdmField::Machine => UdmDataType::String,
+            UdmField::MaxFileDescriptors => UdmDataType::String,
+            UdmField::Mem => UdmDataType::String,
+            UdmField::MemCommitted => UdmDataType::String,
+            UdmField::MemFree => UdmDataType::String,
+            UdmField::MemUsed => UdmDataType::String,
+            UdmField::MemorySorts => UdmDataType::Long,
+            UdmField::Message => UdmDataType::String,
+            UdmField::MessageConsumedTime => UdmDataType::Timestamp,
+            UdmField::MessageCorrelationId => UdmDataType::Integer,
+            UdmField::MessageDeliveredTime => UdmDataType::Timestamp,
+            UdmField::MessageDeliveryMode => UdmDataType::String,
+            UdmField::MessageExpirationTime => UdmDataType::Timestamp,
+            UdmField::MessageId => UdmDataType::Integer,
+            UdmField::MessageInfo => UdmDataType::String,
+            UdmField::MessagePriority => UdmDataType::String,
+            UdmField::MessageProperties => UdmDataType::String,
+            UdmField::MessageReceivedTime => UdmDataType::Timestamp,
+            UdmField::MessageRedelivered => UdmDataType::String,
+            UdmField::MessageReplyDest => UdmDataType::String,
+            UdmField::MessageType => UdmDataType::String,
+            UdmField::MitreTechniqueId => UdmDataType::Integer,
+            UdmField::ModTime => UdmDataType::Timestamp,
+            UdmField::Mount => UdmDataType::String,
+            UdmField::Msft => UdmDataType::String,
+            UdmField::Mskb => UdmDataType::String,
+            UdmField::Name => UdmDataType::String,
+            UdmField::Node => UdmDataType::String,
+            UdmField::NodePort => UdmDataType::Integer,
+            UdmField::NonHeapCommitted => UdmDataType::String,
+            UdmField::NonHeapInitial => UdmDataType::String,
+            UdmField::NonHeapMax => UdmDataType::String,
+            UdmField::NonHeapUsed => UdmDataType::String,
+            UdmField::NumberOfUsers => UdmDataType::String,
+            UdmField::ObjName => UdmDataType::String,
+            UdmField::Object => UdmDataType::String,
+            UdmField::ObjectAttrs => UdmDataType::String,
+            UdmField::ObjectCategory => UdmDataType::String,
+            UdmField::ObjectId => UdmDataType::Integer,
+            UdmField::ObjectPath => UdmDataType::String,
+            UdmField::ObjectSize => UdmDataType::Long,
+            UdmField::ObjectsPending => UdmDataType::String,
+            UdmField::OmuSupported => UdmDataType::Boolean,
+            UdmField::OpenFileDescriptors => UdmDataType::String,
+            UdmField::Operation => UdmDataType::String,
+            UdmField::OrigDest => UdmDataType::String,
+            UdmField::OrigRecipient => UdmDataType::String,
+            UdmField::OrigRid => UdmDataType::String,
+            UdmField::OrigSid => UdmDataType::String,
+            UdmField::OrigSrc => UdmDataType::String,
+            UdmField::OriginalFileName => UdmDataType::String,
+            UdmField::Os => UdmDataType::String,
+            UdmField::OsArchitecture => UdmDataType::String,
+            UdmField::OsPid => UdmDataType::Integer,
+            UdmField::OsVersion => UdmDataType::String,
+            UdmField::Owner => UdmDataType::String,
+            UdmField::OwnerEmail => UdmDataType::String,
+            UdmField::OwnerId => UdmDataType::Integer,
+            UdmField::Packets => UdmDataType::String,
+            UdmField::PacketsIn => UdmDataType::String,
+            UdmField::PacketsOut => UdmDataType::String,
+            UdmField::Parameters => UdmDataType::String,
+            UdmField::Parent => UdmDataType::String,
+            UdmField::ParentObject => UdmDataType::String,
+            UdmField::ParentObjectCategory => UdmDataType::String,
+            UdmField::ParentObjectId => UdmDataType::Integer,
+            UdmField::ParentProcess => UdmDataType::String,
+            UdmField::ParentProcessExec => UdmDataType::String,
+            UdmField::ParentProcessGuid => UdmDataType::String,
+            UdmField::ParentProcessId => UdmDataType::Integer,
+            UdmField::ParentProcessName => UdmDataType::String,
+            UdmField::ParentProcessPath => UdmDataType::String,
+            UdmField::Password => UdmDataType::String,
+            UdmField::Payload => UdmDataType::String,
+            UdmField::PayloadType => UdmDataType::String,
+            UdmField::PeakThreadCount => UdmDataType::Integer,
+            UdmField::PhysicalMemory => UdmDataType::Long,
+            UdmField::PhysicalReads => UdmDataType::String,
+            UdmField::Power => UdmDataType::String,
+            UdmField::Priority => UdmDataType::String,
+            UdmField::Problem => UdmDataType::String,
+            UdmField::Process => UdmDataType::String,
+            UdmField::ProcessCurrentDirectory => UdmDataType::String,
+            UdmField::ProcessExec => UdmDataType::String,
+            UdmField::ProcessGuid => UdmDataType::String,
+            UdmField::ProcessHash => UdmDataType::String,
+            UdmField::ProcessId => UdmDataType::Integer,
+            UdmField::ProcessIntegrityLevel => UdmDataType::String,
+            UdmField::ProcessLimit => UdmDataType::String,
+            UdmField::ProcessName => UdmDataType::String,
+            UdmField::ProcessPath => UdmDataType::String,
+            UdmField::Processes => UdmDataType::String,
+            UdmField::ProductVersion => UdmDataType::String,
+            UdmField::Protocol => UdmDataType::String,
+            UdmField::ProtocolVersion => UdmDataType::String,
+            UdmField::Query => UdmDataType::String,
+            UdmField::QueryCount => UdmDataType::Integer,
+            UdmField::QueryId => UdmDataType::Integer,
+            UdmField::QueryPlanHit => UdmDataType::String,
+            UdmField::QueryTime => UdmDataType::Timestamp,
+            UdmField::QueryType => UdmDataType::String,
+            UdmField::ReadBlocks => UdmDataType::String,
+            UdmField::ReadLatency => UdmDataType::String,
+            UdmField::ReadOps => UdmDataType::String,
+            UdmField::Reason => UdmDataType::String,
+            UdmField::Recipient => UdmDataType::String,
+            UdmField::RecipientCount => UdmDataType::Integer,
+            UdmField::RecipientDomain => UdmDataType::String,
+            UdmField::RecipientStatus => UdmDataType::String,
+            UdmField::RecordType => UdmDataType::String,
+            UdmField::RecordsAffected => UdmDataType::String,
+            UdmField::RegistryHive => UdmDataType::String,
+            UdmField::RegistryKeyName => UdmDataType::String,
+            UdmField::RegistryPath => UdmDataType::String,
+            UdmField::RegistryValueData => UdmDataType::String,
+            UdmField::RegistryValueName => UdmDataType::String,
+            UdmField::RegistryValueText => UdmDataType::String,
+            UdmField::RegistryValueType => UdmDataType::String,
+            UdmField::ReplyCode => UdmDataType::Integer,
+            UdmField::ReplyCodeId => UdmDataType::Integer,
+            UdmField::RequestPayload => UdmDataType::String,
+            UdmField::RequestPayloadType => UdmDataType::String,
+            UdmField::RequestSentTime => UdmDataType::Timestamp,
+            UdmField::ResourceType => UdmDataType::String,
+            UdmField::ResponseCode => UdmDataType::Integer,
+            UdmField::ResponsePayloadType => UdmDataType::String,
+            UdmField::ResponseReceivedTime => UdmDataType::Timestamp,
+            UdmField::ResponseTime => UdmDataType::Timestamp,
+            UdmField::Result => UdmDataType::String,
+            UdmField::ResultId => UdmDataType::Integer,
+            UdmField::Retention => UdmDataType::String,
+            UdmField::Retries => UdmDataType::String,
+            UdmField::ReturnAddr => UdmDataType::String,
+            UdmField::ReturnMessage => UdmDataType::String,
+            UdmField::Rid => UdmDataType::String,
+            UdmField::RpcProtocol => UdmDataType::String,
+            UdmField::Rule => UdmDataType::String,
+            UdmField::RuleAction => UdmDataType::String,
+            UdmField::SavedsearchName => UdmDataType::String,
+            UdmField::Search => UdmDataType::String,
+            UdmField::SearchEt => UdmDataType::String,
+            UdmField::SearchLt => UdmDataType::String,
+            UdmField::SearchName => UdmDataType::String,
+            UdmField::SearchType => UdmDataType::String,
+            UdmField::SecondsInWait => UdmDataType::String,
+            UdmField::Sender => UdmDataType::String,
+            UdmField::Serial => UdmDataType::String,
+            UdmField::SerialNum => UdmDataType::String,
+            UdmField::Service => UdmDataType::String,
+            UdmField::ServiceDll => UdmDataType::String,
+            UdmField::ServiceDllHash => UdmDataType::String,
+            UdmField::ServiceDllPath => UdmDataType::String,
+            UdmField::ServiceDllSignatureExists => UdmDataType::String,
+            UdmField::ServiceDllSignatureVerified => UdmDataType::String,
+            UdmField::ServiceExec => UdmDataType::String,
+            UdmField::ServiceHash => UdmDataType::String,
+            UdmField::ServiceId => UdmDataType::Integer,
+            UdmField::ServiceName => UdmDataType::String,
+            UdmField::ServicePath => UdmDataType::String,
+            UdmField::ServiceSignatureExists => UdmDataType::String,
+            UdmField::ServiceSignatureVerified => UdmDataType::String,
+            UdmField::SessionId => UdmDataType::Integer,
+            UdmField::SessionLimit => UdmDataType::String,
+            UdmField::SessionStatus => UdmDataType::String,
+            UdmField::Sessions => UdmDataType::String,
+            UdmField::Severity => UdmDataType::String,
+            UdmField::SeverityId => UdmDataType::Integer,
+            UdmField::SgaBufferCacheSize => UdmDataType::Long,
+            UdmField::SgaBufferHitLimit => UdmDataType::String,
+            UdmField::SgaDataDictHitRatio => UdmDataType::Float,
+            UdmField::SgaFixedAreaSize => UdmDataType::Long,
+            UdmField::SgaFreeMemory => UdmDataType::Long,
+            UdmField::SgaLibraryCacheSize => UdmDataType::Long,
+            UdmField::SgaRedoLogBufferSize => UdmDataType::Long,
+            UdmField::SgaSharedPoolSize => UdmDataType::Long,
+            UdmField::SgaSqlAreaSize => UdmDataType::Long,
+            UdmField::Shell => UdmDataType::String,
+            UdmField::Sid => UdmDataType::String,
+            UdmField::Signature => UdmDataType::String,
+            UdmField::SignatureExtra => UdmDataType::String,
+            UdmField::SignatureId => UdmDataType::Integer,
+            UdmField::SignatureVersion => UdmDataType::String,
+            UdmField::Site => UdmDataType::String,
+            UdmField::Size => UdmDataType::String,
+            UdmField::Snapshot => UdmDataType::String,
+            UdmField::Source => UdmDataType::String,
+            UdmField::Sourcetype => UdmDataType::String,
+            UdmField::Spent => UdmDataType::String,
+            UdmField::PlatformId => UdmDataType::Integer,
+            UdmField::PlatformRealm => UdmDataType::String,
+            UdmField::PlatformServer => UdmDataType::String,
+            UdmField::Src => UdmDataType::String,
+            UdmField::SrcBunit => UdmDataType::String,
+            UdmField::SrcCategory => UdmDataType::String,
+            UdmField::SrcDns => UdmDataType::String,
+            UdmField::SrcInterface => UdmDataType::String,
+            UdmField::SrcIp => UdmDataType::IpAddress,
+            UdmField::SrcIpRange => UdmDataType::IpAddress,
+            UdmField::SrcMac => UdmDataType::String,
+            UdmField::SrcNtDomain => UdmDataType::String,
+            UdmField::SrcNtHost => UdmDataType::String,
+            UdmField::SrcPort => UdmDataType::Integer,
+            UdmField::SrcPortRange => UdmDataType::String,
+            UdmField::SrcPriority => UdmDataType::String,
+            UdmField::SrcRequiresAv => UdmDataType::String,
+            UdmField::SrcShouldTimesync => UdmDataType::Timestamp,
+            UdmField::SrcShouldUpdate => UdmDataType::String,
+            UdmField::SrcTranslatedIp => UdmDataType::IpAddress,
+            UdmField::SrcTranslatedPort => UdmDataType::Integer,
+            UdmField::SrcType => UdmDataType::String,
+            UdmField::SrcUser => UdmDataType::String,
+            UdmField::SrcUserBunit => UdmDataType::String,
+            UdmField::SrcUserCategory => UdmDataType::String,
+            UdmField::SrcUserDomain => UdmDataType::String,
+            UdmField::SrcUserId => UdmDataType::Integer,
+            UdmField::SrcUserName => UdmDataType::String,
+            UdmField::SrcUserPriority => UdmDataType::String,
+            UdmField::SrcUserRole => UdmDataType::String,
+            UdmField::SrcUserType => UdmDataType::String,
+            UdmField::SrcZone => UdmDataType::String,
+            UdmField::Ssid => UdmDataType::String,
+            UdmField::SslEndTime => UdmDataType::Timestamp,
+            UdmField::SslEngine => UdmDataType::String,
+            UdmField::SslHash => UdmDataType::String,
+            UdmField::SslIsValid => UdmDataType::String,
+            UdmField::SslIssuer => UdmDataType::String,
+            UdmField::SslIssuerCommonName => UdmDataType::String,
+            UdmField::SslIssuerEmail => UdmDataType::String,
+            UdmField::SslIssuerEmailDomain => UdmDataType::String,
+            UdmField::SslIssuerLocality => UdmDataType::String,
+            UdmField::SslIssuerOrganization => UdmDataType::String,
+            UdmField::SslIssuerState => UdmDataType::String,
+            UdmField::SslIssuerStreet => UdmDataType::String,
+            UdmField::SslIssuerUnit => UdmDataType::String,
+            UdmField::SslName => UdmDataType::String,
+            UdmField::SslPolicies => UdmDataType::String,
+            UdmField::SslPublickey => UdmDataType::String,
+            UdmField::SslPublickeyAlgorithm => UdmDataType::String,
+            UdmField::SslSerial => UdmDataType::String,
+            UdmField::SslSessionId => UdmDataType::Integer,
+            UdmField::SslSignatureAlgorithm => UdmDataType::String,
+            UdmField::SslStartTime => UdmDataType::Timestamp,
+            UdmField::SslSubject => UdmDataType::String,
+            UdmField::SslSubjectCommonName => UdmDataType::String,
+            UdmField::SslSubjectEmail => UdmDataType::String,
+            UdmField::SslSubjectEmailDomain => UdmDataType::String,
+            UdmField::SslSubjectLocality => UdmDataType::String,
+            UdmField::SslSubjectOrganization => UdmDataType::String,
+            UdmField::SslSubjectState => UdmDataType::String,
+            UdmField::SslSubjectStreet => UdmDataType::String,
+            UdmField::SslSubjectUnit => UdmDataType::String,
+            UdmField::SslValidityWindow => UdmDataType::String,
+            UdmField::SslVersion => UdmDataType::String,
+            UdmField::StartMode => UdmDataType::String,
+            UdmField::StartTime => UdmDataType::Timestamp,
+            UdmField::State => UdmDataType::String,
+            UdmField::Status => UdmDataType::String,
+            UdmField::StatusCode => UdmDataType::Integer,
+            UdmField::Storage => UdmDataType::String,
+            UdmField::StorageFree => UdmDataType::String,
+            UdmField::StorageFreePercent => UdmDataType::Float,
+            UdmField::StorageName => UdmDataType::String,
+            UdmField::StorageUsed => UdmDataType::String,
+            UdmField::StorageUsedPercent => UdmDataType::Float,
+            UdmField::StoredProceduresCalled => UdmDataType::String,
+            UdmField::Subject => UdmDataType::String,
+            UdmField::SummaryId => UdmDataType::Integer,
+            UdmField::Swap => UdmDataType::String,
+            UdmField::SwapFree => UdmDataType::String,
+            UdmField::SwapSpace => UdmDataType::String,
+            UdmField::SwapUsed => UdmDataType::String,
+            UdmField::SynchSupported => UdmDataType::Boolean,
+            UdmField::SystemLoad => UdmDataType::Float,
+            UdmField::TableScans => UdmDataType::String,
+            UdmField::TablesHit => UdmDataType::String,
+            UdmField::TablespaceName => UdmDataType::String,
+            UdmField::TablespaceReads => UdmDataType::String,
+            UdmField::TablespaceStatus => UdmDataType::String,
+            UdmField::TablespaceUsed => UdmDataType::String,
+            UdmField::TablespaceWrites => UdmDataType::String,
+            UdmField::Tag => UdmDataType::String,
+            UdmField::TcpFlag => UdmDataType::String,
+            UdmField::Temperature => UdmDataType::String,
+            UdmField::ThreadCount => UdmDataType::Integer,
+            UdmField::ThreadsStarted => UdmDataType::String,
+            UdmField::Thruput => UdmDataType::String,
+            UdmField::ThruputMax => UdmDataType::String,
+            UdmField::TicketId => UdmDataType::Integer,
+            UdmField::Time => UdmDataType::Timestamp,
+            UdmField::TimeSubmitted => UdmDataType::String,
+            UdmField::Tos => UdmDataType::String,
+            UdmField::TotalLoaded => UdmDataType::Float,
+            UdmField::TotalProcessors => UdmDataType::String,
+            UdmField::TotalUnloaded => UdmDataType::String,
+            UdmField::TransactionId => UdmDataType::Integer,
+            UdmField::Transport => UdmDataType::String,
+            UdmField::TransportDestPort => UdmDataType::Integer,
+            UdmField::Ttl => UdmDataType::String,
+            UdmField::Type => UdmDataType::String,
+            UdmField::Uptime => UdmDataType::String,
+            UdmField::Uri => UdmDataType::String,
+            UdmField::UriPath => UdmDataType::String,
+            UdmField::UriQuery => UdmDataType::String,
+            UdmField::Url => UdmDataType::String,
+            UdmField::UrlDomain => UdmDataType::String,
+            UdmField::UrlLength => UdmDataType::String,
+            UdmField::User => UdmDataType::String,
+            UdmField::UserAgent => UdmDataType::String,
+            UdmField::UserBunit => UdmDataType::String,
+            UdmField::UserCategory => UdmDataType::String,
+            UdmField::UserGroup => UdmDataType::String,
+            UdmField::UserId => UdmDataType::Integer,
+            UdmField::UserName => UdmDataType::String,
+            UdmField::UserPriority => UdmDataType::String,
+            UdmField::UserRole => UdmDataType::String,
+            UdmField::UserType => UdmDataType::String,
+            UdmField::VendorAccount => UdmDataType::String,
+            UdmField::VendorProduct => UdmDataType::String,
+            UdmField::VendorProductId => UdmDataType::Integer,
+            UdmField::VendorRegion => UdmDataType::String,
+            UdmField::Version => UdmDataType::String,
+            UdmField::View => UdmDataType::String,
+            UdmField::VipPort => UdmDataType::Integer,
+            UdmField::Vlan => UdmDataType::String,
+            UdmField::WaitState => UdmDataType::String,
+            UdmField::WaitTime => UdmDataType::Timestamp,
+            UdmField::Wifi => UdmDataType::String,
+            UdmField::WriteBlocks => UdmDataType::String,
+            UdmField::WriteLatency => UdmDataType::String,
+            UdmField::WriteOps => UdmDataType::String,
+            UdmField::Xdelay => UdmDataType::String,
+            UdmField::Xref => UdmDataType::String,
+            // Legacy/Compatibility fields
+            UdmField::Timestamp => UdmDataType::Timestamp,
+            UdmField::SrcHost | UdmField::DestHost | UdmField::DestUser => UdmDataType::String,
+            UdmField::AuthType | UdmField::AuthResult => UdmDataType::String,
+            UdmField::CommandLine | UdmField::FileAction => UdmDataType::String,
+            // Custom NanoSIEM fields
+            UdmField::HostCount => UdmDataType::Integer,
+            UdmField::IsRare => UdmDataType::Boolean,
+            UdmField::PrevalenceScore => UdmDataType::Float,
+            UdmField::PrevalenceFirstSeen | UdmField::PrevalenceLastSeen => UdmDataType::Timestamp,
+            UdmField::RiskScore => UdmDataType::Float,
+            UdmField::RiskEntity | UdmField::RiskLevel | UdmField::SourceType | UdmField::RawContent | UdmField::ParserVersion => UdmDataType::String,
+            // Parser-specific fields
+            UdmField::Provider | UdmField::ParentCommandLine | UdmField::ParentUser | UdmField::DnsAnswers => UdmDataType::String,
+        }
+    }
+
+    /// Get field description
+    pub fn description(&self) -> &'static str {
+        // For now, return the field name as description
+        // This will be enhanced in task 2.3 with proper descriptions
+        self.column_name()
+    }
+
+    /// Get applicable data models for this field
+    pub fn data_models(&self) -> &'static [&'static str] {
+        // For now, return empty array
+        // This will be populated in task 2.3 with actual data models
+        &[]
+    }
+
+    /// Get field metadata
+    pub fn metadata(&self) -> UdmFieldMetadata {
+        UdmFieldMetadata {
+            name: self.column_name(),
+            column_name: self.column_name(),
+            data_type: self.data_type(),
+            category: self.category(),
+            description: self.description(),
+            data_models: self.data_models(),
+        }
+    }
+
+    /// Get all UDM fields
+    pub fn all() -> &'static [UdmField] {
+        &[
+            UdmField::AccessCount,
+            UdmField::AccessTime,
+            UdmField::Action,
+            UdmField::ActionMode,
+            UdmField::ActionName,
+            UdmField::ActionStatus,
+            UdmField::AdditionalAnswerCount,
+            UdmField::AffectDest,
+            UdmField::Answer,
+            UdmField::AnswerCount,
+            UdmField::App,
+            UdmField::AppId,
+            UdmField::Array,
+            UdmField::AuthenticationMethod,
+            UdmField::AuthenticationService,
+            UdmField::AuthorityAnswerCount,
+            UdmField::Availability,
+            UdmField::AvgExecutions,
+            UdmField::Blocksize,
+            UdmField::Body,
+            UdmField::Buckets,
+            UdmField::BucketsSize,
+            UdmField::BufferCacheHitRatio,
+            UdmField::Bugtraq,
+            UdmField::Bytes,
+            UdmField::BytesIn,
+            UdmField::BytesOut,
+            UdmField::Cached,
+            UdmField::Category,
+            UdmField::Cert,
+            UdmField::Change,
+            UdmField::ChangeType,
+            UdmField::Channel,
+            UdmField::Cluster,
+            UdmField::CmEnabled,
+            UdmField::CmSupported,
+            UdmField::Command,
+            UdmField::Comments,
+            UdmField::Commits,
+            UdmField::CommittedMemory,
+            UdmField::CompilationTime,
+            UdmField::Complete,
+            UdmField::Component,
+            UdmField::Cookie,
+            UdmField::CpuCores,
+            UdmField::CpuCount,
+            UdmField::CpuLoadMhz,
+            UdmField::CpuLoadPercent,
+            UdmField::CpuMhz,
+            UdmField::CpuTime,
+            UdmField::CpuTimeEnabled,
+            UdmField::CpuTimeSupported,
+            UdmField::CpuUsed,
+            UdmField::CpuUserPercent,
+            UdmField::CreationTime,
+            UdmField::Cron,
+            UdmField::CurrentCpuTime,
+            UdmField::CurrentLoaded,
+            UdmField::CurrentUserTime,
+            UdmField::Cursor,
+            UdmField::Cve,
+            UdmField::Cvss,
+            UdmField::DaemonThreadCount,
+            UdmField::Datamodel,
+            UdmField::Date,
+            UdmField::Delay,
+            UdmField::Description,
+            UdmField::Dest,
+            UdmField::DestBunit,
+            UdmField::DestCategory,
+            UdmField::DestDns,
+            UdmField::DestInterface,
+            UdmField::DestIp,
+            UdmField::DestIpRange,
+            UdmField::DestIsExpected,
+            UdmField::DestMac,
+            UdmField::DestName,
+            UdmField::DestNtDomain,
+            UdmField::DestNtHost,
+            UdmField::DestPort,
+            UdmField::DestPortRange,
+            UdmField::DestPriority,
+            UdmField::DestRequiresAv,
+            UdmField::DestShouldTimesync,
+            UdmField::DestShouldUpdate,
+            UdmField::DestTranslatedIp,
+            UdmField::DestTranslatedPort,
+            UdmField::DestType,
+            UdmField::DestUrl,
+            UdmField::DestZone,
+            UdmField::Digest,
+            UdmField::Direction,
+            UdmField::DlpType,
+            UdmField::Dns,
+            UdmField::DumpAreaUsed,
+            UdmField::Duration,
+            UdmField::Dvc,
+            UdmField::DvcBunit,
+            UdmField::DvcCategory,
+            UdmField::DvcIp,
+            UdmField::DvcMac,
+            UdmField::DvcPriority,
+            UdmField::DvcZone,
+            UdmField::Earliest,
+            UdmField::ElapsedTime,
+            UdmField::Email,
+            UdmField::Enabled,
+            UdmField::Endpoint,
+            UdmField::EndpointVersion,
+            UdmField::ErrorCode,
+            UdmField::EventId,
+            UdmField::Family,
+            UdmField::FanSpeed,
+            UdmField::FdMax,
+            UdmField::FdUsed,
+            UdmField::FileAccessTime,
+            UdmField::FileAcl,
+            UdmField::FileCreateTime,
+            UdmField::FileHash,
+            UdmField::FileModifyTime,
+            UdmField::FileName,
+            UdmField::FilePath,
+            UdmField::FileSize,
+            UdmField::FilterAction,
+            UdmField::FilterScore,
+            UdmField::FlowId,
+            UdmField::FreeBytes,
+            UdmField::FreePhysicalMemory,
+            UdmField::FreeSwap,
+            UdmField::HeapCommitted,
+            UdmField::HeapInitial,
+            UdmField::HeapMax,
+            UdmField::HeapUsed,
+            UdmField::Host,
+            UdmField::HttpContentType,
+            UdmField::HttpMethod,
+            UdmField::HttpReferrer,
+            UdmField::HttpReferrerDomain,
+            UdmField::HttpUserAgent,
+            UdmField::HttpUserAgentLength,
+            UdmField::Hypervisor,
+            UdmField::HypervisorId,
+            UdmField::IcmpCode,
+            UdmField::IcmpType,
+            UdmField::Id,
+            UdmField::IdsType,
+            UdmField::ImageId,
+            UdmField::Incident,
+            UdmField::IndexesHit,
+            UdmField::Info,
+            UdmField::InlineNat,
+            UdmField::InstanceName,
+            UdmField::InstanceReads,
+            UdmField::InstanceType,
+            UdmField::InstanceVersion,
+            UdmField::InstanceWrites,
+            UdmField::Interactive,
+            UdmField::Interface,
+            UdmField::InternalMessageId,
+            UdmField::Ip,
+            UdmField::IsInprogress,
+            UdmField::JvmDescription,
+            UdmField::LastCallMinute,
+            UdmField::LastError,
+            UdmField::LastSid,
+            UdmField::Latency,
+            UdmField::Latest,
+            UdmField::LbMethod,
+            UdmField::LeaseDuration,
+            UdmField::LeaseScope,
+            UdmField::LockMode,
+            UdmField::LockSessionId,
+            UdmField::LogicalReads,
+            UdmField::LogonTime,
+            UdmField::Mac,
+            UdmField::Machine,
+            UdmField::MaxFileDescriptors,
+            UdmField::Mem,
+            UdmField::MemCommitted,
+            UdmField::MemFree,
+            UdmField::MemUsed,
+            UdmField::MemorySorts,
+            UdmField::Message,
+            UdmField::MessageConsumedTime,
+            UdmField::MessageCorrelationId,
+            UdmField::MessageDeliveredTime,
+            UdmField::MessageDeliveryMode,
+            UdmField::MessageExpirationTime,
+            UdmField::MessageId,
+            UdmField::MessageInfo,
+            UdmField::MessagePriority,
+            UdmField::MessageProperties,
+            UdmField::MessageReceivedTime,
+            UdmField::MessageRedelivered,
+            UdmField::MessageReplyDest,
+            UdmField::MessageType,
+            UdmField::MitreTechniqueId,
+            UdmField::ModTime,
+            UdmField::Mount,
+            UdmField::Msft,
+            UdmField::Mskb,
+            UdmField::Name,
+            UdmField::Node,
+            UdmField::NodePort,
+            UdmField::NonHeapCommitted,
+            UdmField::NonHeapInitial,
+            UdmField::NonHeapMax,
+            UdmField::NonHeapUsed,
+            UdmField::NumberOfUsers,
+            UdmField::ObjName,
+            UdmField::Object,
+            UdmField::ObjectAttrs,
+            UdmField::ObjectCategory,
+            UdmField::ObjectId,
+            UdmField::ObjectPath,
+            UdmField::ObjectSize,
+            UdmField::ObjectsPending,
+            UdmField::OmuSupported,
+            UdmField::OpenFileDescriptors,
+            UdmField::Operation,
+            UdmField::OrigDest,
+            UdmField::OrigRecipient,
+            UdmField::OrigRid,
+            UdmField::OrigSid,
+            UdmField::OrigSrc,
+            UdmField::OriginalFileName,
+            UdmField::Os,
+            UdmField::OsArchitecture,
+            UdmField::OsPid,
+            UdmField::OsVersion,
+            UdmField::Owner,
+            UdmField::OwnerEmail,
+            UdmField::OwnerId,
+            UdmField::Packets,
+            UdmField::PacketsIn,
+            UdmField::PacketsOut,
+            UdmField::Parameters,
+            UdmField::Parent,
+            UdmField::ParentObject,
+            UdmField::ParentObjectCategory,
+            UdmField::ParentObjectId,
+            UdmField::ParentProcess,
+            UdmField::ParentProcessExec,
+            UdmField::ParentProcessGuid,
+            UdmField::ParentProcessId,
+            UdmField::ParentProcessName,
+            UdmField::ParentProcessPath,
+            UdmField::Password,
+            UdmField::Payload,
+            UdmField::PayloadType,
+            UdmField::PeakThreadCount,
+            UdmField::PhysicalMemory,
+            UdmField::PhysicalReads,
+            UdmField::Power,
+            UdmField::Priority,
+            UdmField::Problem,
+            UdmField::Process,
+            UdmField::ProcessCurrentDirectory,
+            UdmField::ProcessExec,
+            UdmField::ProcessGuid,
+            UdmField::ProcessHash,
+            UdmField::ProcessId,
+            UdmField::ProcessIntegrityLevel,
+            UdmField::ProcessLimit,
+            UdmField::ProcessName,
+            UdmField::ProcessPath,
+            UdmField::Processes,
+            UdmField::ProductVersion,
+            UdmField::Protocol,
+            UdmField::ProtocolVersion,
+            UdmField::Query,
+            UdmField::QueryCount,
+            UdmField::QueryId,
+            UdmField::QueryPlanHit,
+            UdmField::QueryTime,
+            UdmField::QueryType,
+            UdmField::ReadBlocks,
+            UdmField::ReadLatency,
+            UdmField::ReadOps,
+            UdmField::Reason,
+            UdmField::Recipient,
+            UdmField::RecipientCount,
+            UdmField::RecipientDomain,
+            UdmField::RecipientStatus,
+            UdmField::RecordType,
+            UdmField::RecordsAffected,
+            UdmField::RegistryHive,
+            UdmField::RegistryKeyName,
+            UdmField::RegistryPath,
+            UdmField::RegistryValueData,
+            UdmField::RegistryValueName,
+            UdmField::RegistryValueText,
+            UdmField::RegistryValueType,
+            UdmField::ReplyCode,
+            UdmField::ReplyCodeId,
+            UdmField::RequestPayload,
+            UdmField::RequestPayloadType,
+            UdmField::RequestSentTime,
+            UdmField::ResourceType,
+            UdmField::ResponseCode,
+            UdmField::ResponsePayloadType,
+            UdmField::ResponseReceivedTime,
+            UdmField::ResponseTime,
+            UdmField::Result,
+            UdmField::ResultId,
+            UdmField::Retention,
+            UdmField::Retries,
+            UdmField::ReturnAddr,
+            UdmField::ReturnMessage,
+            UdmField::Rid,
+            UdmField::RpcProtocol,
+            UdmField::Rule,
+            UdmField::RuleAction,
+            UdmField::SavedsearchName,
+            UdmField::Search,
+            UdmField::SearchEt,
+            UdmField::SearchLt,
+            UdmField::SearchName,
+            UdmField::SearchType,
+            UdmField::SecondsInWait,
+            UdmField::Sender,
+            UdmField::Serial,
+            UdmField::SerialNum,
+            UdmField::Service,
+            UdmField::ServiceDll,
+            UdmField::ServiceDllHash,
+            UdmField::ServiceDllPath,
+            UdmField::ServiceDllSignatureExists,
+            UdmField::ServiceDllSignatureVerified,
+            UdmField::ServiceExec,
+            UdmField::ServiceHash,
+            UdmField::ServiceId,
+            UdmField::ServiceName,
+            UdmField::ServicePath,
+            UdmField::ServiceSignatureExists,
+            UdmField::ServiceSignatureVerified,
+            UdmField::SessionId,
+            UdmField::SessionLimit,
+            UdmField::SessionStatus,
+            UdmField::Sessions,
+            UdmField::Severity,
+            UdmField::SeverityId,
+            UdmField::SgaBufferCacheSize,
+            UdmField::SgaBufferHitLimit,
+            UdmField::SgaDataDictHitRatio,
+            UdmField::SgaFixedAreaSize,
+            UdmField::SgaFreeMemory,
+            UdmField::SgaLibraryCacheSize,
+            UdmField::SgaRedoLogBufferSize,
+            UdmField::SgaSharedPoolSize,
+            UdmField::SgaSqlAreaSize,
+            UdmField::Shell,
+            UdmField::Sid,
+            UdmField::Signature,
+            UdmField::SignatureExtra,
+            UdmField::SignatureId,
+            UdmField::SignatureVersion,
+            UdmField::Site,
+            UdmField::Size,
+            UdmField::Snapshot,
+            UdmField::Source,
+            UdmField::Sourcetype,
+            UdmField::Spent,
+            UdmField::PlatformId,
+            UdmField::PlatformRealm,
+            UdmField::PlatformServer,
+            UdmField::Src,
+            UdmField::SrcBunit,
+            UdmField::SrcCategory,
+            UdmField::SrcDns,
+            UdmField::SrcInterface,
+            UdmField::SrcIp,
+            UdmField::SrcIpRange,
+            UdmField::SrcMac,
+            UdmField::SrcNtDomain,
+            UdmField::SrcNtHost,
+            UdmField::SrcPort,
+            UdmField::SrcPortRange,
+            UdmField::SrcPriority,
+            UdmField::SrcRequiresAv,
+            UdmField::SrcShouldTimesync,
+            UdmField::SrcShouldUpdate,
+            UdmField::SrcTranslatedIp,
+            UdmField::SrcTranslatedPort,
+            UdmField::SrcType,
+            UdmField::SrcUser,
+            UdmField::SrcUserBunit,
+            UdmField::SrcUserCategory,
+            UdmField::SrcUserDomain,
+            UdmField::SrcUserId,
+            UdmField::SrcUserName,
+            UdmField::SrcUserPriority,
+            UdmField::SrcUserRole,
+            UdmField::SrcUserType,
+            UdmField::SrcZone,
+            UdmField::Ssid,
+            UdmField::SslEndTime,
+            UdmField::SslEngine,
+            UdmField::SslHash,
+            UdmField::SslIsValid,
+            UdmField::SslIssuer,
+            UdmField::SslIssuerCommonName,
+            UdmField::SslIssuerEmail,
+            UdmField::SslIssuerEmailDomain,
+            UdmField::SslIssuerLocality,
+            UdmField::SslIssuerOrganization,
+            UdmField::SslIssuerState,
+            UdmField::SslIssuerStreet,
+            UdmField::SslIssuerUnit,
+            UdmField::SslName,
+            UdmField::SslPolicies,
+            UdmField::SslPublickey,
+            UdmField::SslPublickeyAlgorithm,
+            UdmField::SslSerial,
+            UdmField::SslSessionId,
+            UdmField::SslSignatureAlgorithm,
+            UdmField::SslStartTime,
+            UdmField::SslSubject,
+            UdmField::SslSubjectCommonName,
+            UdmField::SslSubjectEmail,
+            UdmField::SslSubjectEmailDomain,
+            UdmField::SslSubjectLocality,
+            UdmField::SslSubjectOrganization,
+            UdmField::SslSubjectState,
+            UdmField::SslSubjectStreet,
+            UdmField::SslSubjectUnit,
+            UdmField::SslValidityWindow,
+            UdmField::SslVersion,
+            UdmField::StartMode,
+            UdmField::StartTime,
+            UdmField::State,
+            UdmField::Status,
+            UdmField::StatusCode,
+            UdmField::Storage,
+            UdmField::StorageFree,
+            UdmField::StorageFreePercent,
+            UdmField::StorageName,
+            UdmField::StorageUsed,
+            UdmField::StorageUsedPercent,
+            UdmField::StoredProceduresCalled,
+            UdmField::Subject,
+            UdmField::SummaryId,
+            UdmField::Swap,
+            UdmField::SwapFree,
+            UdmField::SwapSpace,
+            UdmField::SwapUsed,
+            UdmField::SynchSupported,
+            UdmField::SystemLoad,
+            UdmField::TableScans,
+            UdmField::TablesHit,
+            UdmField::TablespaceName,
+            UdmField::TablespaceReads,
+            UdmField::TablespaceStatus,
+            UdmField::TablespaceUsed,
+            UdmField::TablespaceWrites,
+            UdmField::Tag,
+            UdmField::TcpFlag,
+            UdmField::Temperature,
+            UdmField::ThreadCount,
+            UdmField::ThreadsStarted,
+            UdmField::Thruput,
+            UdmField::ThruputMax,
+            UdmField::TicketId,
+            UdmField::Time,
+            UdmField::TimeSubmitted,
+            UdmField::Tos,
+            UdmField::TotalLoaded,
+            UdmField::TotalProcessors,
+            UdmField::TotalUnloaded,
+            UdmField::TransactionId,
+            UdmField::Transport,
+            UdmField::TransportDestPort,
+            UdmField::Ttl,
+            UdmField::Type,
+            UdmField::Uptime,
+            UdmField::Uri,
+            UdmField::UriPath,
+            UdmField::UriQuery,
+            UdmField::Url,
+            UdmField::UrlDomain,
+            UdmField::UrlLength,
+            UdmField::User,
+            UdmField::UserAgent,
+            UdmField::UserBunit,
+            UdmField::UserCategory,
+            UdmField::UserGroup,
+            UdmField::UserId,
+            UdmField::UserName,
+            UdmField::UserPriority,
+            UdmField::UserRole,
+            UdmField::UserType,
+            UdmField::VendorAccount,
+            UdmField::VendorProduct,
+            UdmField::VendorProductId,
+            UdmField::VendorRegion,
+            UdmField::Version,
+            UdmField::View,
+            UdmField::VipPort,
+            UdmField::Vlan,
+            UdmField::WaitState,
+            UdmField::WaitTime,
+            UdmField::Wifi,
+            UdmField::WriteBlocks,
+            UdmField::WriteLatency,
+            UdmField::WriteOps,
+            UdmField::Xdelay,
+            UdmField::Xref,
+            // Legacy/Compatibility fields
+            UdmField::Timestamp,
+            UdmField::SrcHost,
+            UdmField::DestHost,
+            UdmField::DestUser,
+            UdmField::AuthType,
+            UdmField::AuthResult,
+            UdmField::CommandLine,
+            UdmField::FileAction,
+            // Custom NanoSIEM fields
+            UdmField::HostCount,
+            UdmField::IsRare,
+            UdmField::PrevalenceScore,
+            UdmField::PrevalenceFirstSeen,
+            UdmField::PrevalenceLastSeen,
+            UdmField::RiskScore,
+            UdmField::RiskEntity,
+            UdmField::RiskLevel,
+            UdmField::SourceType,
+            UdmField::RawContent,
+            UdmField::ParserVersion,
+            // Parser-specific fields
+            UdmField::Provider,
+            UdmField::ParentCommandLine,
+            UdmField::ParentUser,
+            UdmField::DnsAnswers,
+        ]
+    }
+
+    /// Get all fields in a specific category
+    pub fn by_category(category: UdmFieldCategory) -> Vec<UdmField> {
+        Self::all()
+            .iter()
+            .filter(|f| f.category() == category)
+            .copied()
+            .collect()
+    }
+}
+
+impl fmt::Display for UdmField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.column_name())
+    }
+}
+
+impl FromStr for UdmField {
+    type Err = UdmFieldParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "access_count" => Ok(UdmField::AccessCount),
+            "access_time" => Ok(UdmField::AccessTime),
+            "action" => Ok(UdmField::Action),
+            "action_mode" => Ok(UdmField::ActionMode),
+            "action_name" => Ok(UdmField::ActionName),
+            "action_status" => Ok(UdmField::ActionStatus),
+            "additional_answer_count" => Ok(UdmField::AdditionalAnswerCount),
+            "affect_dest" => Ok(UdmField::AffectDest),
+            "answer" => Ok(UdmField::Answer),
+            "answer_count" => Ok(UdmField::AnswerCount),
+            "app" => Ok(UdmField::App),
+            "app_id" => Ok(UdmField::AppId),
+            "array" => Ok(UdmField::Array),
+            "authentication_method" => Ok(UdmField::AuthenticationMethod),
+            "authentication_service" => Ok(UdmField::AuthenticationService),
+            "authority_answer_count" => Ok(UdmField::AuthorityAnswerCount),
+            "availability" => Ok(UdmField::Availability),
+            "avg_executions" => Ok(UdmField::AvgExecutions),
+            "blocksize" => Ok(UdmField::Blocksize),
+            "body" => Ok(UdmField::Body),
+            "buckets" => Ok(UdmField::Buckets),
+            "buckets_size" => Ok(UdmField::BucketsSize),
+            "buffer_cache_hit_ratio" => Ok(UdmField::BufferCacheHitRatio),
+            "bugtraq" => Ok(UdmField::Bugtraq),
+            "bytes" => Ok(UdmField::Bytes),
+            "bytes_in" => Ok(UdmField::BytesIn),
+            "bytes_out" => Ok(UdmField::BytesOut),
+            "cached" => Ok(UdmField::Cached),
+            "category" => Ok(UdmField::Category),
+            "cert" => Ok(UdmField::Cert),
+            "change" => Ok(UdmField::Change),
+            "change_type" => Ok(UdmField::ChangeType),
+            "channel" => Ok(UdmField::Channel),
+            "cluster" => Ok(UdmField::Cluster),
+            "cm_enabled" => Ok(UdmField::CmEnabled),
+            "cm_supported" => Ok(UdmField::CmSupported),
+            "command" => Ok(UdmField::Command),
+            "comments" => Ok(UdmField::Comments),
+            "commits" => Ok(UdmField::Commits),
+            "committed_memory" => Ok(UdmField::CommittedMemory),
+            "compilation_time" => Ok(UdmField::CompilationTime),
+            "complete" => Ok(UdmField::Complete),
+            "component" => Ok(UdmField::Component),
+            "cookie" => Ok(UdmField::Cookie),
+            "cpu_cores" => Ok(UdmField::CpuCores),
+            "cpu_count" => Ok(UdmField::CpuCount),
+            "cpu_load_mhz" => Ok(UdmField::CpuLoadMhz),
+            "cpu_load_percent" => Ok(UdmField::CpuLoadPercent),
+            "cpu_mhz" => Ok(UdmField::CpuMhz),
+            "cpu_time" => Ok(UdmField::CpuTime),
+            "cpu_time_enabled" => Ok(UdmField::CpuTimeEnabled),
+            "cpu_time_supported" => Ok(UdmField::CpuTimeSupported),
+            "cpu_used" => Ok(UdmField::CpuUsed),
+            "cpu_user_percent" => Ok(UdmField::CpuUserPercent),
+            "creation_time" => Ok(UdmField::CreationTime),
+            "cron" => Ok(UdmField::Cron),
+            "current_cpu_time" => Ok(UdmField::CurrentCpuTime),
+            "current_loaded" => Ok(UdmField::CurrentLoaded),
+            "current_user_time" => Ok(UdmField::CurrentUserTime),
+            "cursor" => Ok(UdmField::Cursor),
+            "cve" => Ok(UdmField::Cve),
+            "cvss" => Ok(UdmField::Cvss),
+            "daemon_thread_count" => Ok(UdmField::DaemonThreadCount),
+            "datamodel" => Ok(UdmField::Datamodel),
+            "date" => Ok(UdmField::Date),
+            "delay" => Ok(UdmField::Delay),
+            "description" => Ok(UdmField::Description),
+            "dest" => Ok(UdmField::Dest),
+            "dest_bunit" => Ok(UdmField::DestBunit),
+            "dest_category" => Ok(UdmField::DestCategory),
+            "dest_dns" => Ok(UdmField::DestDns),
+            "dest_interface" => Ok(UdmField::DestInterface),
+            "dest_ip" => Ok(UdmField::DestIp),
+            "dest_ip_range" => Ok(UdmField::DestIpRange),
+            "dest_is_expected" => Ok(UdmField::DestIsExpected),
+            "dest_mac" => Ok(UdmField::DestMac),
+            "dest_name" => Ok(UdmField::DestName),
+            "dest_nt_domain" => Ok(UdmField::DestNtDomain),
+            "dest_nt_host" => Ok(UdmField::DestNtHost),
+            "dest_port" => Ok(UdmField::DestPort),
+            "dest_port_range" => Ok(UdmField::DestPortRange),
+            "dest_priority" => Ok(UdmField::DestPriority),
+            "dest_requires_av" => Ok(UdmField::DestRequiresAv),
+            "dest_should_timesync" => Ok(UdmField::DestShouldTimesync),
+            "dest_should_update" => Ok(UdmField::DestShouldUpdate),
+            "dest_translated_ip" => Ok(UdmField::DestTranslatedIp),
+            "dest_translated_port" => Ok(UdmField::DestTranslatedPort),
+            "dest_type" => Ok(UdmField::DestType),
+            "dest_url" => Ok(UdmField::DestUrl),
+            "dest_zone" => Ok(UdmField::DestZone),
+            "digest" => Ok(UdmField::Digest),
+            "direction" => Ok(UdmField::Direction),
+            "dlp_type" => Ok(UdmField::DlpType),
+            "dns" => Ok(UdmField::Dns),
+            "dump_area_used" => Ok(UdmField::DumpAreaUsed),
+            "duration" => Ok(UdmField::Duration),
+            "dvc" => Ok(UdmField::Dvc),
+            "dvc_bunit" => Ok(UdmField::DvcBunit),
+            "dvc_category" => Ok(UdmField::DvcCategory),
+            "dvc_ip" => Ok(UdmField::DvcIp),
+            "dvc_mac" => Ok(UdmField::DvcMac),
+            "dvc_priority" => Ok(UdmField::DvcPriority),
+            "dvc_zone" => Ok(UdmField::DvcZone),
+            "earliest" => Ok(UdmField::Earliest),
+            "elapsed_time" => Ok(UdmField::ElapsedTime),
+            "email" => Ok(UdmField::Email),
+            "enabled" => Ok(UdmField::Enabled),
+            "endpoint" => Ok(UdmField::Endpoint),
+            "endpoint_version" => Ok(UdmField::EndpointVersion),
+            "error_code" => Ok(UdmField::ErrorCode),
+            "event_id" => Ok(UdmField::EventId),
+            "family" => Ok(UdmField::Family),
+            "fan_speed" => Ok(UdmField::FanSpeed),
+            "fd_max" => Ok(UdmField::FdMax),
+            "fd_used" => Ok(UdmField::FdUsed),
+            "file_access_time" => Ok(UdmField::FileAccessTime),
+            "file_acl" => Ok(UdmField::FileAcl),
+            "file_create_time" => Ok(UdmField::FileCreateTime),
+            "file_hash" => Ok(UdmField::FileHash),
+            "file_modify_time" => Ok(UdmField::FileModifyTime),
+            "file_name" => Ok(UdmField::FileName),
+            "file_path" => Ok(UdmField::FilePath),
+            "file_size" => Ok(UdmField::FileSize),
+            "filter_action" => Ok(UdmField::FilterAction),
+            "filter_score" => Ok(UdmField::FilterScore),
+            "flow_id" => Ok(UdmField::FlowId),
+            "free_bytes" => Ok(UdmField::FreeBytes),
+            "free_physical_memory" => Ok(UdmField::FreePhysicalMemory),
+            "free_swap" => Ok(UdmField::FreeSwap),
+            "heap_committed" => Ok(UdmField::HeapCommitted),
+            "heap_initial" => Ok(UdmField::HeapInitial),
+            "heap_max" => Ok(UdmField::HeapMax),
+            "heap_used" => Ok(UdmField::HeapUsed),
+            "host" => Ok(UdmField::Host),
+            "http_content_type" => Ok(UdmField::HttpContentType),
+            "http_method" => Ok(UdmField::HttpMethod),
+            "http_referrer" => Ok(UdmField::HttpReferrer),
+            "http_referrer_domain" => Ok(UdmField::HttpReferrerDomain),
+            "http_user_agent" => Ok(UdmField::HttpUserAgent),
+            "http_user_agent_length" => Ok(UdmField::HttpUserAgentLength),
+            "hypervisor" => Ok(UdmField::Hypervisor),
+            "hypervisor_id" => Ok(UdmField::HypervisorId),
+            "icmp_code" => Ok(UdmField::IcmpCode),
+            "icmp_type" => Ok(UdmField::IcmpType),
+            "id" => Ok(UdmField::Id),
+            "ids_type" => Ok(UdmField::IdsType),
+            "image_id" => Ok(UdmField::ImageId),
+            "incident" => Ok(UdmField::Incident),
+            "indexes_hit" => Ok(UdmField::IndexesHit),
+            "info" => Ok(UdmField::Info),
+            "inline_nat" => Ok(UdmField::InlineNat),
+            "instance_name" => Ok(UdmField::InstanceName),
+            "instance_reads" => Ok(UdmField::InstanceReads),
+            "instance_type" => Ok(UdmField::InstanceType),
+            "instance_version" => Ok(UdmField::InstanceVersion),
+            "instance_writes" => Ok(UdmField::InstanceWrites),
+            "interactive" => Ok(UdmField::Interactive),
+            "interface" => Ok(UdmField::Interface),
+            "internal_message_id" => Ok(UdmField::InternalMessageId),
+            "ip" => Ok(UdmField::Ip),
+            "is_inprogress" => Ok(UdmField::IsInprogress),
+            "jvm_description" => Ok(UdmField::JvmDescription),
+            "last_call_minute" => Ok(UdmField::LastCallMinute),
+            "last_error" => Ok(UdmField::LastError),
+            "last_sid" => Ok(UdmField::LastSid),
+            "latency" => Ok(UdmField::Latency),
+            "latest" => Ok(UdmField::Latest),
+            "lb_method" => Ok(UdmField::LbMethod),
+            "lease_duration" => Ok(UdmField::LeaseDuration),
+            "lease_scope" => Ok(UdmField::LeaseScope),
+            "lock_mode" => Ok(UdmField::LockMode),
+            "lock_session_id" => Ok(UdmField::LockSessionId),
+            "logical_reads" => Ok(UdmField::LogicalReads),
+            "logon_time" => Ok(UdmField::LogonTime),
+            "mac" => Ok(UdmField::Mac),
+            "machine" => Ok(UdmField::Machine),
+            "max_file_descriptors" => Ok(UdmField::MaxFileDescriptors),
+            "mem" => Ok(UdmField::Mem),
+            "mem_committed" => Ok(UdmField::MemCommitted),
+            "mem_free" => Ok(UdmField::MemFree),
+            "mem_used" => Ok(UdmField::MemUsed),
+            "memory_sorts" => Ok(UdmField::MemorySorts),
+            "message" => Ok(UdmField::Message),
+            "message_consumed_time" => Ok(UdmField::MessageConsumedTime),
+            "message_correlation_id" => Ok(UdmField::MessageCorrelationId),
+            "message_delivered_time" => Ok(UdmField::MessageDeliveredTime),
+            "message_delivery_mode" => Ok(UdmField::MessageDeliveryMode),
+            "message_expiration_time" => Ok(UdmField::MessageExpirationTime),
+            "message_id" => Ok(UdmField::MessageId),
+            "message_info" => Ok(UdmField::MessageInfo),
+            "message_priority" => Ok(UdmField::MessagePriority),
+            "message_properties" => Ok(UdmField::MessageProperties),
+            "message_received_time" => Ok(UdmField::MessageReceivedTime),
+            "message_redelivered" => Ok(UdmField::MessageRedelivered),
+            "message_reply_dest" => Ok(UdmField::MessageReplyDest),
+            "message_type" => Ok(UdmField::MessageType),
+            "mitre_technique_id" => Ok(UdmField::MitreTechniqueId),
+            "mod_time" => Ok(UdmField::ModTime),
+            "mount" => Ok(UdmField::Mount),
+            "msft" => Ok(UdmField::Msft),
+            "mskb" => Ok(UdmField::Mskb),
+            "name" => Ok(UdmField::Name),
+            "node" => Ok(UdmField::Node),
+            "node_port" => Ok(UdmField::NodePort),
+            "non_heap_committed" => Ok(UdmField::NonHeapCommitted),
+            "non_heap_initial" => Ok(UdmField::NonHeapInitial),
+            "non_heap_max" => Ok(UdmField::NonHeapMax),
+            "non_heap_used" => Ok(UdmField::NonHeapUsed),
+            "number_of_users" => Ok(UdmField::NumberOfUsers),
+            "obj_name" => Ok(UdmField::ObjName),
+            "object" => Ok(UdmField::Object),
+            "object_attrs" => Ok(UdmField::ObjectAttrs),
+            "object_category" => Ok(UdmField::ObjectCategory),
+            "object_id" => Ok(UdmField::ObjectId),
+            "object_path" => Ok(UdmField::ObjectPath),
+            "object_size" => Ok(UdmField::ObjectSize),
+            "objects_pending" => Ok(UdmField::ObjectsPending),
+            "omu_supported" => Ok(UdmField::OmuSupported),
+            "open_file_descriptors" => Ok(UdmField::OpenFileDescriptors),
+            "operation" => Ok(UdmField::Operation),
+            "orig_dest" => Ok(UdmField::OrigDest),
+            "orig_recipient" => Ok(UdmField::OrigRecipient),
+            "orig_rid" => Ok(UdmField::OrigRid),
+            "orig_sid" => Ok(UdmField::OrigSid),
+            "orig_src" => Ok(UdmField::OrigSrc),
+            "original_file_name" => Ok(UdmField::OriginalFileName),
+            "os" => Ok(UdmField::Os),
+            "os_architecture" => Ok(UdmField::OsArchitecture),
+            "os_pid" => Ok(UdmField::OsPid),
+            "os_version" => Ok(UdmField::OsVersion),
+            "owner" => Ok(UdmField::Owner),
+            "owner_email" => Ok(UdmField::OwnerEmail),
+            "owner_id" => Ok(UdmField::OwnerId),
+            "packets" => Ok(UdmField::Packets),
+            "packets_in" => Ok(UdmField::PacketsIn),
+            "packets_out" => Ok(UdmField::PacketsOut),
+            "parameters" => Ok(UdmField::Parameters),
+            "parent" => Ok(UdmField::Parent),
+            "parent_object" => Ok(UdmField::ParentObject),
+            "parent_object_category" => Ok(UdmField::ParentObjectCategory),
+            "parent_object_id" => Ok(UdmField::ParentObjectId),
+            "parent_process" => Ok(UdmField::ParentProcess),
+            "parent_process_exec" => Ok(UdmField::ParentProcessExec),
+            "parent_process_guid" => Ok(UdmField::ParentProcessGuid),
+            "parent_process_id" => Ok(UdmField::ParentProcessId),
+            "parent_process_name" => Ok(UdmField::ParentProcessName),
+            "parent_process_path" => Ok(UdmField::ParentProcessPath),
+            "password" => Ok(UdmField::Password),
+            "payload" => Ok(UdmField::Payload),
+            "payload_type" => Ok(UdmField::PayloadType),
+            "peak_thread_count" => Ok(UdmField::PeakThreadCount),
+            "physical_memory" => Ok(UdmField::PhysicalMemory),
+            "physical_reads" => Ok(UdmField::PhysicalReads),
+            "power" => Ok(UdmField::Power),
+            "priority" => Ok(UdmField::Priority),
+            "problem" => Ok(UdmField::Problem),
+            "process" => Ok(UdmField::Process),
+            "process_current_directory" => Ok(UdmField::ProcessCurrentDirectory),
+            "process_exec" => Ok(UdmField::ProcessExec),
+            "process_guid" => Ok(UdmField::ProcessGuid),
+            "process_hash" => Ok(UdmField::ProcessHash),
+            "process_id" => Ok(UdmField::ProcessId),
+            "process_integrity_level" => Ok(UdmField::ProcessIntegrityLevel),
+            "process_limit" => Ok(UdmField::ProcessLimit),
+            "process_name" => Ok(UdmField::ProcessName),
+            "process_path" => Ok(UdmField::ProcessPath),
+            "processes" => Ok(UdmField::Processes),
+            "product_version" => Ok(UdmField::ProductVersion),
+            "protocol" => Ok(UdmField::Protocol),
+            "protocol_version" => Ok(UdmField::ProtocolVersion),
+            "query" => Ok(UdmField::Query),
+            "query_count" => Ok(UdmField::QueryCount),
+            "query_id" => Ok(UdmField::QueryId),
+            "query_plan_hit" => Ok(UdmField::QueryPlanHit),
+            "query_time" => Ok(UdmField::QueryTime),
+            "query_type" => Ok(UdmField::QueryType),
+            "read_blocks" => Ok(UdmField::ReadBlocks),
+            "read_latency" => Ok(UdmField::ReadLatency),
+            "read_ops" => Ok(UdmField::ReadOps),
+            "reason" => Ok(UdmField::Reason),
+            "recipient" => Ok(UdmField::Recipient),
+            "recipient_count" => Ok(UdmField::RecipientCount),
+            "recipient_domain" => Ok(UdmField::RecipientDomain),
+            "recipient_status" => Ok(UdmField::RecipientStatus),
+            "record_type" => Ok(UdmField::RecordType),
+            "records_affected" => Ok(UdmField::RecordsAffected),
+            "registry_hive" => Ok(UdmField::RegistryHive),
+            "registry_key_name" => Ok(UdmField::RegistryKeyName),
+            "registry_path" => Ok(UdmField::RegistryPath),
+            "registry_value_data" => Ok(UdmField::RegistryValueData),
+            "registry_value_name" => Ok(UdmField::RegistryValueName),
+            "registry_value_text" => Ok(UdmField::RegistryValueText),
+            "registry_value_type" => Ok(UdmField::RegistryValueType),
+            "reply_code" => Ok(UdmField::ReplyCode),
+            "reply_code_id" => Ok(UdmField::ReplyCodeId),
+            "request_payload" => Ok(UdmField::RequestPayload),
+            "request_payload_type" => Ok(UdmField::RequestPayloadType),
+            "request_sent_time" => Ok(UdmField::RequestSentTime),
+            "resource_type" => Ok(UdmField::ResourceType),
+            "response_code" => Ok(UdmField::ResponseCode),
+            "response_payload_type" => Ok(UdmField::ResponsePayloadType),
+            "response_received_time" => Ok(UdmField::ResponseReceivedTime),
+            "response_time" => Ok(UdmField::ResponseTime),
+            "result" => Ok(UdmField::Result),
+            "result_id" => Ok(UdmField::ResultId),
+            "retention" => Ok(UdmField::Retention),
+            "retries" => Ok(UdmField::Retries),
+            "return_addr" => Ok(UdmField::ReturnAddr),
+            "return_message" => Ok(UdmField::ReturnMessage),
+            "rid" => Ok(UdmField::Rid),
+            "rpc_protocol" => Ok(UdmField::RpcProtocol),
+            "rule" => Ok(UdmField::Rule),
+            "rule_action" => Ok(UdmField::RuleAction),
+            "savedsearch_name" => Ok(UdmField::SavedsearchName),
+            "search" => Ok(UdmField::Search),
+            "search_et" => Ok(UdmField::SearchEt),
+            "search_lt" => Ok(UdmField::SearchLt),
+            "search_name" => Ok(UdmField::SearchName),
+            "search_type" => Ok(UdmField::SearchType),
+            "seconds_in_wait" => Ok(UdmField::SecondsInWait),
+            "sender" => Ok(UdmField::Sender),
+            "serial" => Ok(UdmField::Serial),
+            "serial_num" => Ok(UdmField::SerialNum),
+            "service" => Ok(UdmField::Service),
+            "service_dll" => Ok(UdmField::ServiceDll),
+            "service_dll_hash" => Ok(UdmField::ServiceDllHash),
+            "service_dll_path" => Ok(UdmField::ServiceDllPath),
+            "service_dll_signature_exists" => Ok(UdmField::ServiceDllSignatureExists),
+            "service_dll_signature_verified" => Ok(UdmField::ServiceDllSignatureVerified),
+            "service_exec" => Ok(UdmField::ServiceExec),
+            "service_hash" => Ok(UdmField::ServiceHash),
+            "service_id" => Ok(UdmField::ServiceId),
+            "service_name" => Ok(UdmField::ServiceName),
+            "service_path" => Ok(UdmField::ServicePath),
+            "service_signature_exists" => Ok(UdmField::ServiceSignatureExists),
+            "service_signature_verified" => Ok(UdmField::ServiceSignatureVerified),
+            "session_id" => Ok(UdmField::SessionId),
+            "session_limit" => Ok(UdmField::SessionLimit),
+            "session_status" => Ok(UdmField::SessionStatus),
+            "sessions" => Ok(UdmField::Sessions),
+            "severity" => Ok(UdmField::Severity),
+            "severity_id" => Ok(UdmField::SeverityId),
+            "sga_buffer_cache_size" => Ok(UdmField::SgaBufferCacheSize),
+            "sga_buffer_hit_limit" => Ok(UdmField::SgaBufferHitLimit),
+            "sga_data_dict_hit_ratio" => Ok(UdmField::SgaDataDictHitRatio),
+            "sga_fixed_area_size" => Ok(UdmField::SgaFixedAreaSize),
+            "sga_free_memory" => Ok(UdmField::SgaFreeMemory),
+            "sga_library_cache_size" => Ok(UdmField::SgaLibraryCacheSize),
+            "sga_redo_log_buffer_size" => Ok(UdmField::SgaRedoLogBufferSize),
+            "sga_shared_pool_size" => Ok(UdmField::SgaSharedPoolSize),
+            "sga_sql_area_size" => Ok(UdmField::SgaSqlAreaSize),
+            "shell" => Ok(UdmField::Shell),
+            "sid" => Ok(UdmField::Sid),
+            "signature" => Ok(UdmField::Signature),
+            "signature_extra" => Ok(UdmField::SignatureExtra),
+            "signature_id" => Ok(UdmField::SignatureId),
+            "signature_version" => Ok(UdmField::SignatureVersion),
+            "site" => Ok(UdmField::Site),
+            "size" => Ok(UdmField::Size),
+            "snapshot" => Ok(UdmField::Snapshot),
+            "source" => Ok(UdmField::Source),
+            "sourcetype" => Ok(UdmField::Sourcetype),
+            "spent" => Ok(UdmField::Spent),
+            "platform_id" => Ok(UdmField::PlatformId),
+            "platform_realm" => Ok(UdmField::PlatformRealm),
+            "platform_server" => Ok(UdmField::PlatformServer),
+            "src" => Ok(UdmField::Src),
+            "src_bunit" => Ok(UdmField::SrcBunit),
+            "src_category" => Ok(UdmField::SrcCategory),
+            "src_dns" => Ok(UdmField::SrcDns),
+            "src_interface" => Ok(UdmField::SrcInterface),
+            "src_ip" => Ok(UdmField::SrcIp),
+            "src_ip_range" => Ok(UdmField::SrcIpRange),
+            "src_mac" => Ok(UdmField::SrcMac),
+            "src_nt_domain" => Ok(UdmField::SrcNtDomain),
+            "src_nt_host" => Ok(UdmField::SrcNtHost),
+            "src_port" => Ok(UdmField::SrcPort),
+            "src_port_range" => Ok(UdmField::SrcPortRange),
+            "src_priority" => Ok(UdmField::SrcPriority),
+            "src_requires_av" => Ok(UdmField::SrcRequiresAv),
+            "src_should_timesync" => Ok(UdmField::SrcShouldTimesync),
+            "src_should_update" => Ok(UdmField::SrcShouldUpdate),
+            "src_translated_ip" => Ok(UdmField::SrcTranslatedIp),
+            "src_translated_port" => Ok(UdmField::SrcTranslatedPort),
+            "src_type" => Ok(UdmField::SrcType),
+            "src_user" => Ok(UdmField::SrcUser),
+            "src_user_bunit" => Ok(UdmField::SrcUserBunit),
+            "src_user_category" => Ok(UdmField::SrcUserCategory),
+            "src_user_domain" => Ok(UdmField::SrcUserDomain),
+            "src_user_id" => Ok(UdmField::SrcUserId),
+            "src_user_name" => Ok(UdmField::SrcUserName),
+            "src_user_priority" => Ok(UdmField::SrcUserPriority),
+            "src_user_role" => Ok(UdmField::SrcUserRole),
+            "src_user_type" => Ok(UdmField::SrcUserType),
+            "src_zone" => Ok(UdmField::SrcZone),
+            "ssid" => Ok(UdmField::Ssid),
+            "ssl_end_time" => Ok(UdmField::SslEndTime),
+            "ssl_engine" => Ok(UdmField::SslEngine),
+            "ssl_hash" => Ok(UdmField::SslHash),
+            "ssl_is_valid" => Ok(UdmField::SslIsValid),
+            "ssl_issuer" => Ok(UdmField::SslIssuer),
+            "ssl_issuer_common_name" => Ok(UdmField::SslIssuerCommonName),
+            "ssl_issuer_email" => Ok(UdmField::SslIssuerEmail),
+            "ssl_issuer_email_domain" => Ok(UdmField::SslIssuerEmailDomain),
+            "ssl_issuer_locality" => Ok(UdmField::SslIssuerLocality),
+            "ssl_issuer_organization" => Ok(UdmField::SslIssuerOrganization),
+            "ssl_issuer_state" => Ok(UdmField::SslIssuerState),
+            "ssl_issuer_street" => Ok(UdmField::SslIssuerStreet),
+            "ssl_issuer_unit" => Ok(UdmField::SslIssuerUnit),
+            "ssl_name" => Ok(UdmField::SslName),
+            "ssl_policies" => Ok(UdmField::SslPolicies),
+            "ssl_publickey" => Ok(UdmField::SslPublickey),
+            "ssl_publickey_algorithm" => Ok(UdmField::SslPublickeyAlgorithm),
+            "ssl_serial" => Ok(UdmField::SslSerial),
+            "ssl_session_id" => Ok(UdmField::SslSessionId),
+            "ssl_signature_algorithm" => Ok(UdmField::SslSignatureAlgorithm),
+            "ssl_start_time" => Ok(UdmField::SslStartTime),
+            "ssl_subject" => Ok(UdmField::SslSubject),
+            "ssl_subject_common_name" => Ok(UdmField::SslSubjectCommonName),
+            "ssl_subject_email" => Ok(UdmField::SslSubjectEmail),
+            "ssl_subject_email_domain" => Ok(UdmField::SslSubjectEmailDomain),
+            "ssl_subject_locality" => Ok(UdmField::SslSubjectLocality),
+            "ssl_subject_organization" => Ok(UdmField::SslSubjectOrganization),
+            "ssl_subject_state" => Ok(UdmField::SslSubjectState),
+            "ssl_subject_street" => Ok(UdmField::SslSubjectStreet),
+            "ssl_subject_unit" => Ok(UdmField::SslSubjectUnit),
+            "ssl_validity_window" => Ok(UdmField::SslValidityWindow),
+            "ssl_version" => Ok(UdmField::SslVersion),
+            "start_mode" => Ok(UdmField::StartMode),
+            "start_time" => Ok(UdmField::StartTime),
+            "state" => Ok(UdmField::State),
+            "status" => Ok(UdmField::Status),
+            "status_code" => Ok(UdmField::StatusCode),
+            "storage" => Ok(UdmField::Storage),
+            "storage_free" => Ok(UdmField::StorageFree),
+            "storage_free_percent" => Ok(UdmField::StorageFreePercent),
+            "storage_name" => Ok(UdmField::StorageName),
+            "storage_used" => Ok(UdmField::StorageUsed),
+            "storage_used_percent" => Ok(UdmField::StorageUsedPercent),
+            "stored_procedures_called" => Ok(UdmField::StoredProceduresCalled),
+            "subject" => Ok(UdmField::Subject),
+            "summary_id" => Ok(UdmField::SummaryId),
+            "swap" => Ok(UdmField::Swap),
+            "swap_free" => Ok(UdmField::SwapFree),
+            "swap_space" => Ok(UdmField::SwapSpace),
+            "swap_used" => Ok(UdmField::SwapUsed),
+            "synch_supported" => Ok(UdmField::SynchSupported),
+            "system_load" => Ok(UdmField::SystemLoad),
+            "table_scans" => Ok(UdmField::TableScans),
+            "tables_hit" => Ok(UdmField::TablesHit),
+            "tablespace_name" => Ok(UdmField::TablespaceName),
+            "tablespace_reads" => Ok(UdmField::TablespaceReads),
+            "tablespace_status" => Ok(UdmField::TablespaceStatus),
+            "tablespace_used" => Ok(UdmField::TablespaceUsed),
+            "tablespace_writes" => Ok(UdmField::TablespaceWrites),
+            "tag" => Ok(UdmField::Tag),
+            "tcp_flag" => Ok(UdmField::TcpFlag),
+            "temperature" => Ok(UdmField::Temperature),
+            "thread_count" => Ok(UdmField::ThreadCount),
+            "threads_started" => Ok(UdmField::ThreadsStarted),
+            "thruput" => Ok(UdmField::Thruput),
+            "thruput_max" => Ok(UdmField::ThruputMax),
+            "ticket_id" => Ok(UdmField::TicketId),
+            "time" => Ok(UdmField::Time),
+            "time_submitted" => Ok(UdmField::TimeSubmitted),
+            "tos" => Ok(UdmField::Tos),
+            "total_loaded" => Ok(UdmField::TotalLoaded),
+            "total_processors" => Ok(UdmField::TotalProcessors),
+            "total_unloaded" => Ok(UdmField::TotalUnloaded),
+            "transaction_id" => Ok(UdmField::TransactionId),
+            "transport" => Ok(UdmField::Transport),
+            "transport_dest_port" => Ok(UdmField::TransportDestPort),
+            "ttl" => Ok(UdmField::Ttl),
+            "type" => Ok(UdmField::Type),
+            "uptime" => Ok(UdmField::Uptime),
+            "uri" => Ok(UdmField::Uri),
+            "uri_path" => Ok(UdmField::UriPath),
+            "uri_query" => Ok(UdmField::UriQuery),
+            "url" => Ok(UdmField::Url),
+            "url_domain" => Ok(UdmField::UrlDomain),
+            "url_length" => Ok(UdmField::UrlLength),
+            "user" => Ok(UdmField::User),
+            "user_agent" => Ok(UdmField::UserAgent),
+            "user_bunit" => Ok(UdmField::UserBunit),
+            "user_category" => Ok(UdmField::UserCategory),
+            "user_group" => Ok(UdmField::UserGroup),
+            "user_id" => Ok(UdmField::UserId),
+            "user_name" => Ok(UdmField::UserName),
+            "user_priority" => Ok(UdmField::UserPriority),
+            "user_role" => Ok(UdmField::UserRole),
+            "user_type" => Ok(UdmField::UserType),
+            "vendor_account" => Ok(UdmField::VendorAccount),
+            "vendor_product" => Ok(UdmField::VendorProduct),
+            "vendor_product_id" => Ok(UdmField::VendorProductId),
+            "vendor_region" => Ok(UdmField::VendorRegion),
+            "version" => Ok(UdmField::Version),
+            "view" => Ok(UdmField::View),
+            "vip_port" => Ok(UdmField::VipPort),
+            "vlan" => Ok(UdmField::Vlan),
+            "wait_state" => Ok(UdmField::WaitState),
+            "wait_time" => Ok(UdmField::WaitTime),
+            "wifi" => Ok(UdmField::Wifi),
+            "write_blocks" => Ok(UdmField::WriteBlocks),
+            "write_latency" => Ok(UdmField::WriteLatency),
+            "write_ops" => Ok(UdmField::WriteOps),
+            "xdelay" => Ok(UdmField::Xdelay),
+            "xref" => Ok(UdmField::Xref),
+            // Legacy/Compatibility fields
+            "timestamp" => Ok(UdmField::Timestamp),
+            "src_host" => Ok(UdmField::SrcHost),
+            "dest_host" => Ok(UdmField::DestHost),
+            "dest_user" => Ok(UdmField::DestUser),
+            "auth_type" => Ok(UdmField::AuthType),
+            "auth_result" => Ok(UdmField::AuthResult),
+            "command_line" => Ok(UdmField::CommandLine),
+            "file_action" => Ok(UdmField::FileAction),
+            // Custom NanoSIEM fields
+            "host_count" => Ok(UdmField::HostCount),
+            "is_rare" => Ok(UdmField::IsRare),
+            "prevalence_score" => Ok(UdmField::PrevalenceScore),
+            "prevalence_first_seen" => Ok(UdmField::PrevalenceFirstSeen),
+            "prevalence_last_seen" => Ok(UdmField::PrevalenceLastSeen),
+            "risk_score" => Ok(UdmField::RiskScore),
+            "risk_entity" => Ok(UdmField::RiskEntity),
+            "risk_level" => Ok(UdmField::RiskLevel),
+            "source_type" => Ok(UdmField::SourceType),
+            "raw_content" => Ok(UdmField::RawContent),
+            "parser_version" => Ok(UdmField::ParserVersion),
+            // Parser-specific fields
+            "provider" => Ok(UdmField::Provider),
+            "parent_command_line" => Ok(UdmField::ParentCommandLine),
+            "parent_user" => Ok(UdmField::ParentUser),
+            "dns_answers" => Ok(UdmField::DnsAnswers),
+            _ => Err(UdmFieldParseError(s.to_string())),
+        }
+    }
+}
+
+/// Error when parsing an unknown UDM field name
+#[derive(Debug, Clone)]
+pub struct UdmFieldParseError(pub String);
+
+impl fmt::Display for UdmFieldParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unknown UDM field: {}", self.0)
+    }
+}
+
+impl std::error::Error for UdmFieldParseError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_udm_field_column_names() {
+        assert_eq!(UdmField::SrcIp.column_name(), "src_ip");
+        assert_eq!(UdmField::User.column_name(), "user");
+        assert_eq!(UdmField::ProcessId.column_name(), "process_id");
+        assert_eq!(UdmField::HostCount.column_name(), "host_count");
+    }
+
+    #[test]
+    fn test_udm_field_categories() {
+        assert_eq!(UdmField::SrcIp.category(), UdmFieldCategory::Inventory);
+        assert_eq!(UdmField::SrcPort.category(), UdmFieldCategory::Network);
+        assert_eq!(UdmField::AuthType.category(), UdmFieldCategory::Authentication);
+        assert_eq!(UdmField::ProcessName.category(), UdmFieldCategory::Endpoint);
+        assert_eq!(UdmField::FilePath.category(), UdmFieldCategory::Endpoint);
+        assert_eq!(UdmField::HostCount.category(), UdmFieldCategory::Custom);
+    }
+
+    #[test]
+    fn test_udm_field_from_str() {
+        assert_eq!("src_ip".parse::<UdmField>().unwrap(), UdmField::SrcIp);
+        assert_eq!("user".parse::<UdmField>().unwrap(), UdmField::User);
+        assert_eq!("host_count".parse::<UdmField>().unwrap(), UdmField::HostCount);
+        assert!("unknown_field".parse::<UdmField>().is_err());
+    }
+
+    #[test]
+    fn test_udm_field_display() {
+        assert_eq!(format!("{}", UdmField::SrcIp), "src_ip");
+        assert_eq!(format!("{}", UdmField::ProcessId), "process_id");
+        assert_eq!(format!("{}", UdmField::HostCount), "host_count");
+    }
+
+    #[test]
+    fn test_udm_field_data_types() {
+        assert_eq!(UdmField::SrcIp.data_type(), UdmDataType::IpAddress);
+        assert_eq!(UdmField::SrcPort.data_type(), UdmDataType::Integer);
+        assert_eq!(UdmField::BytesIn.data_type(), UdmDataType::Long);
+        assert_eq!(UdmField::Timestamp.data_type(), UdmDataType::Timestamp);
+        assert_eq!(UdmField::User.data_type(), UdmDataType::String);
+        assert_eq!(UdmField::HostCount.data_type(), UdmDataType::Integer);
+        assert_eq!(UdmField::IsRare.data_type(), UdmDataType::Boolean);
+    }
+
+    #[test]
+    fn test_by_category() {
+        let custom_fields = UdmField::by_category(UdmFieldCategory::Custom);
+        assert!(custom_fields.contains(&UdmField::HostCount));
+        assert!(custom_fields.contains(&UdmField::IsRare));
+        assert!(custom_fields.contains(&UdmField::PrevalenceScore));
+        
+        let network_fields = UdmField::by_category(UdmFieldCategory::Network);
+        assert!(network_fields.contains(&UdmField::BytesIn));
+        assert!(network_fields.contains(&UdmField::BytesOut));
+    }
+
+    #[test]
+    fn test_all_fields_count() {
+        // Should have 507 CSV fields + 7 legacy fields + 10 custom fields = 524 total
+        assert_eq!(UdmField::all().len(), 524);
+    }
+
+    #[test]
+    fn test_custom_fields_preserved() {
+        // Ensure prevalence fields exist
+        assert!(UdmField::from_str("host_count").is_ok());
+        assert!(UdmField::from_str("is_rare").is_ok());
+        assert!(UdmField::from_str("prevalence_score").is_ok());
+        assert!(UdmField::from_str("prevalence_first_seen").is_ok());
+        assert!(UdmField::from_str("prevalence_last_seen").is_ok());
+        
+        // Ensure risk fields exist
+        assert!(UdmField::from_str("risk_score").is_ok());
+        assert!(UdmField::from_str("risk_entity").is_ok());
+        assert!(UdmField::from_str("risk_level").is_ok());
+    }
+}

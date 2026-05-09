@@ -1,0 +1,67 @@
+# NanoSIEM Vector Sinks Configuration
+# Loaded after all transforms are defined
+#
+# INGESTION PATHS:
+# 1. Via NanoSIEM API (default): Vector → nanosiem-ingest → ClickHouse
+#    - Includes validation, enrichment, error logging
+#    - Lower throughput (~1k events/sec)
+#    - Recommended for most deployments
+#
+# 2. Direct ClickHouse (optional): Vector → ClickHouse
+#    - Higher throughput (~10k events/sec)
+#    - Lower latency
+#    - Bypasses API validation
+#    - Enable by including sinks/clickhouse.toml and transforms/clickhouse_mapping.toml
+#    - See .kiro/specs/direct-clickhouse-ingestion/ for details
+
+# =============================================================================
+# Internal Metrics
+# =============================================================================
+[sources.internal_metrics]
+type = "internal_metrics"
+scrape_interval_secs = 15
+namespace = "nanosiem_vector"
+
+# =============================================================================
+# Main Sink - NanoSIEM API
+# =============================================================================
+[sinks.nanosiem_api]
+type = "http"
+# Inputs from:
+# - prepare_output: logs from generic parser
+# - db_parsers_combined: logs from deployed DB parsers (e.g., Apache)
+inputs = ["prepare_output", "db_parsers_combined"]
+uri = "${NANOSIEM_INGESTION_URL:-http://nanosiem-ingest:3001/api/ingest}"
+method = "post"
+encoding.codec = "json"
+
+[sinks.nanosiem_api.buffer]
+type = "disk"
+max_size = 1073741824
+when_full = "block"
+
+[sinks.nanosiem_api.batch]
+max_bytes = 1048576
+max_events = 100
+timeout_secs = 5
+
+[sinks.nanosiem_api.request]
+concurrency = 10
+rate_limit_duration_secs = 1
+rate_limit_num = 1000
+retry_initial_backoff_secs = 1
+retry_max_duration_secs = 300
+timeout_secs = 30
+
+[sinks.nanosiem_api.request.headers]
+Content-Type = "application/json"
+X-API-Key = "${NANOSIEM_API_KEY:-}"
+
+# =============================================================================
+# Prometheus Metrics Sink
+# =============================================================================
+[sinks.prometheus_metrics]
+type = "prometheus_exporter"
+inputs = ["internal_metrics"]
+address = "0.0.0.0:9598"
+default_namespace = "nanosiem"

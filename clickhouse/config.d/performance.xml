@@ -1,0 +1,64 @@
+<?xml version="1.0"?>
+<!--
+  ClickHouse Performance Configuration for SIEM Workloads
+
+  Note: Many settings are now user-level and must be in profiles.
+  This file only contains confirmed server-level settings.
+-->
+<clickhouse>
+    <!-- =======================================================================
+         CACHE CONFIGURATION (Server-level)
+         ======================================================================= -->
+
+    <mark_cache_size>10737418240</mark_cache_size> <!-- 10GB -->
+    <uncompressed_cache_size>8589934592</uncompressed_cache_size> <!-- 8GB -->
+    <index_mark_cache_size>5368709120</index_mark_cache_size> <!-- 5GB -->
+    <index_uncompressed_cache_size>5368709120</index_uncompressed_cache_size> <!-- 5GB -->
+    <compiled_expression_cache_size>134217728</compiled_expression_cache_size> <!-- 128MB -->
+    <compiled_expression_cache_elements_size>10000</compiled_expression_cache_elements_size>
+
+    <!-- ClickHouse 25.3+ Query Condition Cache (Server-level)
+         Stores which granules match WHERE conditions for repeated queries
+         At 256MB can cache ~2 billion granule entries -->
+    <query_condition_cache_size>268435456</query_condition_cache_size> <!-- 256MB -->
+
+    <!-- =======================================================================
+         BACKGROUND POOLS (Server-level)
+         ======================================================================= -->
+
+    <background_pool_size>32</background_pool_size>
+    <background_merges_mutations_concurrency_ratio>4</background_merges_mutations_concurrency_ratio>
+    <background_schedule_pool_size>128</background_schedule_pool_size>
+    <background_fetches_pool_size>8</background_fetches_pool_size>
+    <background_move_pool_size>8</background_move_pool_size>
+    <background_common_pool_size>16</background_common_pool_size>
+    <background_buffer_flush_schedule_pool_size>16</background_buffer_flush_schedule_pool_size>
+    <background_message_broker_schedule_pool_size>16</background_message_broker_schedule_pool_size>
+
+    <!-- =======================================================================
+         CONCURRENT QUERY LIMITS (Server-level)
+         ======================================================================= -->
+
+    <max_concurrent_queries>500</max_concurrent_queries>
+    <max_concurrent_insert_queries>200</max_concurrent_insert_queries>
+    <max_concurrent_select_queries>300</max_concurrent_select_queries>
+
+    <!-- =======================================================================
+         ASYNC INSERT THREADS (Server-level)
+         ======================================================================= -->
+
+    <async_insert_threads>8</async_insert_threads>
+
+    <!-- =======================================================================
+         DICTIONARY CONFIGURATION (Server-level)
+         ======================================================================= -->
+
+    <dictionaries_lazy_load>1</dictionaries_lazy_load>
+
+    <!-- =======================================================================
+         CONNECTION SETTINGS (Server-level)
+         ======================================================================= -->
+
+    <keep_alive_timeout>30</keep_alive_timeout>
+    <max_connections>4096</max_connections>
+</clickhouse>

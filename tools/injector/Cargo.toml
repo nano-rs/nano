@@ -1,0 +1,19 @@
+[package]
+name = "injector"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Attack scenario injector for SIEM testing"
+
+[dependencies]
+event-core = { path = "../event-core" }
+tokio.workspace = true
+clap = { version = "4", features = ["derive"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+rand = "0.9"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+parking_lot = "0.12"

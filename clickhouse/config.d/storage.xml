@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<!-- Temporary storage policy to allow ClickHouse to start -->
+<!-- This will be removed after migrating the table back to default policy -->
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <default>
+                <keep_free_space_bytes>1073741824</keep_free_space_bytes>
+            </default>
+            <warm_disk>
+                <path>/var/lib/clickhouse/warm/</path>
+                <keep_free_space_bytes>1073741824</keep_free_space_bytes>
+            </warm_disk>
+        </disks>
+        <policies>
+            <tiered>
+                <volumes>
+                    <hot>
+                        <disk>default</disk>
+                    </hot>
+                    <warm>
+                        <disk>warm_disk</disk>
+                    </warm>
+                </volumes>
+            </tiered>
+        </policies>
+    </storage_configuration>
+</clickhouse>

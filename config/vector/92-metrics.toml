@@ -1,0 +1,61 @@
+# Vector Metrics and Observability Configuration
+#
+# Exposes internal metrics and logs for monitoring the SIEM pipeline.
+# Metrics available at http://localhost:9598/metrics (Prometheus format)
+#
+# Key metrics to monitor:
+# - nanosiem_vector_component_sent_events_total{component_id="clickhouse_logs"}
+# - nanosiem_vector_component_errors_total{component_id="clickhouse_logs"}
+# - nanosiem_vector_buffer_byte_size{component_id="clickhouse_logs"}
+# - nanosiem_vector_buffer_events{component_id="clickhouse_logs"}
+# - nanosiem_vector_adaptive_concurrency_in_flight{component_id="clickhouse_logs"}
+
+# =============================================================================
+# Internal Metrics Source
+# =============================================================================
+# Collects metrics from all Vector components (sources, transforms, sinks)
+[sources.internal_metrics]
+type = "internal_metrics"
+scrape_interval_secs = 10      # More frequent scraping (was 15s)
+namespace = "nanosiem_vector"
+
+# Tags are added automatically by Vector
+
+# =============================================================================
+# Internal Logs Source (New)
+# =============================================================================
+# Captures Vector's internal logs for debugging and alerting
+# Useful for detecting pipeline issues, parse errors, and connection problems
+[sources.internal_logs]
+type = "internal_logs"
+
+# =============================================================================
+# Log Level Filter
+# =============================================================================
+# Only expose warnings and errors to avoid noise
+[transforms.filter_internal_logs]
+type = "filter"
+inputs = ["internal_logs"]
+condition = '.metadata.level == "WARN" || .metadata.level == "ERROR"'
+
+# =============================================================================
+# Prometheus Metrics Sink
+# =============================================================================
+# Exposes metrics in Prometheus format for scraping
+[sinks.prometheus_metrics]
+type = "prometheus_exporter"
+inputs = ["internal_metrics"]
+address = "0.0.0.0:9598"
+default_namespace = "nanosiem"
+
+# Use default histogram buckets - they work well for most use cases
+# Custom buckets can cause configuration issues
+
+# =============================================================================
+# Internal Logs Sink (Console for Docker logs)
+# =============================================================================
+# Outputs important internal logs to stdout for Docker logging
+[sinks.internal_logs_console]
+type = "console"
+inputs = ["filter_internal_logs"]
+encoding.codec = "json"

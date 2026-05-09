@@ -1,0 +1,519 @@
+field_name,data_models
+ai_confidence,Enrichment
+ai_reasoning,Enrichment
+ai_verdict,Enrichment
+additional_answer_count,DNS
+answer,DNS
+answer_count,DNS
+app,System
+app_id,Data Access
+array,Inventory
+authentication_method,Authentication
+authentication_service,Authentication
+auth_result,Authentication
+auth_type,Authentication
+authority_answer_count,DNS
+availability,Databases
+avg_executions,Databases
+blocksize,Inventory
+buffer_cache_hit_ratio,Databases
+bugtraq,Vulnerability
+bytes,Network
+bytes_in,Network
+bytes_out,Network
+cached,Web
+category,Data Loss Prevention
+cert,Vulnerability
+change_type,System
+channel,Network
+cloud_account_id,Cloud
+cloud_account_name,Cloud
+cloud_provider,Cloud
+cloud_region,Cloud
+cloud_service,Cloud
+cluster,Inventory
+command,Endpoint
+command_line,Endpoint
+commits,Databases
+cookie,Web
+cpu_cores,Inventory
+cpu_count,Inventory
+cpu_load_mhz,Performance
+cpu_load_percent,Endpoint
+cpu_mhz,Inventory
+cpu_used,Databases
+cpu_user_percent,Performance
+creation_time,Endpoint
+cursor,Databases
+custom_dest_ip_risk,Custom Enrichment
+custom_dest_ip_tags,Custom Enrichment
+custom_domain_risk,Custom Enrichment
+custom_domain_tags,Custom Enrichment
+custom_hash_risk,Custom Enrichment
+custom_hash_tags,Custom Enrichment
+custom_ioc_dest_ip_confidence,Custom Enrichment
+custom_ioc_dest_ip_malware,Custom Enrichment
+custom_ioc_dest_ip_threat_type,Custom Enrichment
+custom_ioc_domain_confidence,Custom Enrichment
+custom_ioc_domain_threat_type,Custom Enrichment
+custom_ioc_hash_confidence,Custom Enrichment
+custom_ioc_hash_threat_type,Custom Enrichment
+custom_ioc_src_ip_confidence,Custom Enrichment
+custom_ioc_src_ip_malware,Custom Enrichment
+custom_ioc_src_ip_threat_type,Custom Enrichment
+custom_src_ip_risk,Custom Enrichment
+custom_src_ip_tags,Custom Enrichment
+custom_url_risk,Custom Enrichment
+custom_url_tags,Custom Enrichment
+cve,Vulnerability
+cvss,Vulnerability
+date,System
+delay,Email
+description,Alerts
+dest,Alerts
+dest_dns,Network
+dest_host,Network
+dest_interface,Network
+dest_ip,Network
+dest_ip_range,Network
+dest_mac,Network
+dest_name,Data Access
+dest_nt_domain,Authentication
+dest_nt_host,Network
+dest_port,Network
+dest_port_range,Network
+dest_user,Authentication
+dest_user_identity_account_status,Enrichment
+dest_user_identity_company,Enrichment
+dest_user_identity_country,Enrichment
+dest_user_identity_department,Enrichment
+dest_user_identity_display_name,Enrichment
+dest_user_identity_email,Enrichment
+dest_user_identity_employee_id,Enrichment
+dest_user_identity_employee_type,Enrichment
+dest_user_identity_groups,Enrichment
+dest_user_identity_manager,Enrichment
+dest_user_identity_manager_upn,Enrichment
+dest_user_identity_mfa_enabled,Enrichment
+dest_user_identity_office_location,Enrichment
+dest_user_identity_phone,Enrichment
+dest_user_identity_title,Enrichment
+dest_translated_ip,Network
+dest_translated_port,Network
+dest_type,Alerts
+dest_url,Data Access
+dest_zone,Data Loss Prevention
+direction,Network
+dlp_type,Data Loss Prevention
+dns,Inventory
+dns_answers,DNS
+dump_area_used,Databases
+duration,Network
+dvc,Network
+dvc_ip,Network
+dvc_mac,Network
+dvc_zone,Network
+elapsed_time,Databases
+email,Data Access
+enabled,Inventory
+enrich_time,System
+enriched_dest_as_domain,Enrichment
+enriched_dest_as_name,Enrichment
+enriched_dest_asn,Enrichment
+enriched_dest_continent,Enrichment
+enriched_dest_continent_code,Enrichment
+enriched_dest_country,Enrichment
+enriched_dest_country_code,Enrichment
+enriched_src_as_domain,Enrichment
+enriched_src_as_name,Enrichment
+enriched_src_asn,Enrichment
+enriched_src_continent,Enrichment
+enriched_src_continent_code,Enrichment
+enriched_src_country,Enrichment
+enriched_src_country_code,Enrichment
+enrichment_label_1,Enrichment
+enrichment_label_2,Enrichment
+enrichment_label_3,Enrichment
+enrichment_label_4,Enrichment
+enrichment_label_5,Enrichment
+enrichment_value_1,Enrichment
+enrichment_value_2,Enrichment
+enrichment_value_3,Enrichment
+enrichment_value_4,Enrichment
+enrichment_value_5,Enrichment
+error_code,Web
+event_type,Endpoint
+ext,System
+family,Inventory
+fan_speed,Performance
+fd_max,Inventory
+fd_used,Performance
+file_access_time,Endpoint
+file_action,Endpoint
+file_acl,Endpoint
+file_create_time,Endpoint
+file_hash,Endpoint
+file_modify_time,Endpoint
+file_name,Endpoint
+file_path,Endpoint
+file_size,Endpoint
+filter_action,Email
+filter_score,Email
+flow_id,Network
+free_bytes,Databases
+http_content_type,Web
+http_method,Web
+http_referrer,Web
+http_status_code,Web
+http_referrer_domain,Web
+http_user_agent,Web
+http_user_agent_length,Web
+hypervisor,Inventory
+hypervisor_id,Inventory
+icmp_code,Network
+icmp_type,Network
+id,System
+ids_type,Alerts
+image_id,Cloud
+ingest_time,System
+indexes_hit,Databases
+inline_nat,Inventory
+instance_name,Databases
+instance_reads,Databases
+instance_type,Cloud
+instance_version,Databases
+instance_writes,Databases
+interactive,Inventory
+interface,Inventory
+ioc_confidence,Threat Intelligence
+ioc_dest_ip_confidence,Threat Intelligence
+ioc_dest_ip_malware,Threat Intelligence
+ioc_dest_ip_threat_type,Threat Intelligence
+ioc_domain_confidence,Threat Intelligence
+ioc_domain_malware,Threat Intelligence
+ioc_domain_threat_type,Threat Intelligence
+ioc_hash_confidence,Threat Intelligence
+ioc_hash_malware,Threat Intelligence
+ioc_hash_threat_type,Threat Intelligence
+ioc_matched,Threat Intelligence
+ioc_source,Threat Intelligence
+ioc_src_ip_confidence,Threat Intelligence
+ioc_src_ip_malware,Threat Intelligence
+ioc_src_ip_threat_type,Threat Intelligence
+ioc_tags,Threat Intelligence
+internal_message_id,Email
+ip,Inventory
+last_call_minute,Databases
+latency,Inventory
+lb_method,Inventory
+lease_duration,Network
+lease_scope,Network
+lock_mode,Databases
+lock_session_id,Databases
+logical_reads,Databases
+logon_time,Authentication
+mac,Inventory
+machine,Endpoint
+mem,Inventory
+mem_committed,Performance
+mem_free,Performance
+mem_used,Endpoint
+memory_sorts,Databases
+message,System
+metadata,System
+message_id,Email
+message_info,Email
+mfa_used,Authentication
+mitre_technique_id,Alerts
+mount,Inventory
+msft,Vulnerability
+mskb,Vulnerability
+name,System
+namespace,System
+node,Inventory
+node_port,Inventory
+number_of_users,Databases
+obj_name,Databases
+object,Endpoint
+object_attrs,Endpoint
+object_category,Endpoint
+object_id,Endpoint
+object_path,Endpoint
+object_size,Data Access
+operation,Web
+orig_dest,Email
+orig_recipient,Email
+orig_src,Email
+original_file_name,Endpoint
+os,Endpoint
+os_pid,Endpoint
+owner,Data Access
+owner_email,Data Access
+owner_id,Data Access
+packets,Network
+packets_in,Network
+packets_out,Network
+parent,Inventory
+parent_object,Data Access
+parent_object_category,Data Access
+parent_object_id,Data Access
+parent_command_line,Endpoint
+parent_process_exec,Endpoint
+parent_process_guid,Endpoint
+parent_process_id,Endpoint
+parent_process_name,Endpoint
+parent_process_path,Endpoint
+password,Inventory
+physical_reads,Databases
+power,Performance
+prevalence_dest_domain,Prevalence
+prevalence_dest_ip,Prevalence
+prevalence_file_hash,Prevalence
+prevalence_min,Prevalence
+prevalence_process_hash,Prevalence
+process_current_directory,Endpoint
+process_exec,Endpoint
+process_guid,Endpoint
+process_hash,Endpoint
+process_id,Endpoint
+process_integrity_level,Endpoint
+process_limit,Databases
+process_name,Endpoint
+process_path,Endpoint
+processes,Databases
+product,Authentication
+product_version,Endpoint
+protocol,Network
+protocol_version,Network
+query,DNS
+query_count,DNS
+query_id,Databases
+query_plan_hit,Databases
+query_time,Databases
+query_type,DNS
+read_blocks,Inventory
+read_latency,Inventory
+read_ops,Inventory
+reason,Authentication
+recipient,Email
+recipient_count,Email
+recipient_domain,Email
+recipient_status,Email
+record_type,DNS
+records_affected,Databases
+registry_hive,Endpoint
+registry_key_name,Endpoint
+registry_path,Endpoint
+registry_value_data,Endpoint
+registry_value_name,Endpoint
+registry_value_text,Endpoint
+registry_value_type,Endpoint
+reply_code,DNS
+reply_code_id,DNS
+resource_id,Cloud
+resource_name,Cloud
+resource_type,Cloud
+response_time,Authentication
+result,System
+result_id,System
+risk_entity,Risk
+risk_level,Risk
+risk_score,Risk
+retries,Email
+return_addr,Email
+rule,Network
+rule_action,Network
+rule_id,Alerts
+rule_name,Alerts
+seconds_in_wait,Databases
+sender,Email
+sender_domain,Email
+serial,Inventory
+serial_num,Databases
+service,Endpoint
+service_dll,Endpoint
+service_dll_hash,Endpoint
+service_dll_path,Endpoint
+service_dll_signature_exists,Endpoint
+service_dll_signature_verified,Endpoint
+service_exec,Endpoint
+service_hash,Endpoint
+service_id,Endpoint
+service_name,Endpoint
+service_path,Endpoint
+service_signature_exists,Endpoint
+service_signature_verified,Endpoint
+session_id,Authentication
+session_limit,Databases
+session_status,Databases
+sessions,Databases
+severity,Alerts
+severity_id,Alerts
+sga_buffer_cache_size,Databases
+sga_buffer_hit_limit,Databases
+sga_data_dict_hit_ratio,Databases
+sga_fixed_area_size,Databases
+sga_free_memory,Databases
+sga_library_cache_size,Databases
+sga_redo_log_buffer_size,Databases
+sga_shared_pool_size,Databases
+sga_sql_area_size,Databases
+shell,Inventory
+signature,Alerts
+signature_extra,Email
+signature_id,Alerts
+signature_version,Endpoint
+site,Web
+size,Email
+snapshot,Inventory
+source,System
+source_type,System
+src,Alerts
+src_dns,Network
+src_host,Network
+src_interface,Network
+src_ip,Network
+src_ip_range,Network
+src_mac,Network
+src_nt_domain,Authentication
+src_nt_host,Network
+src_port,Network
+src_port_range,Network
+src_translated_ip,Network
+src_translated_port,Network
+src_type,Alerts
+src_user,Authentication
+src_user_domain,Authentication
+src_user_id,Authentication
+src_user_name,Authentication
+src_user_role,Authentication
+src_user_identity_account_status,Enrichment
+src_user_identity_company,Enrichment
+src_user_identity_country,Enrichment
+src_user_identity_department,Enrichment
+src_user_identity_display_name,Enrichment
+src_user_identity_email,Enrichment
+src_user_identity_employee_id,Enrichment
+src_user_identity_employee_type,Enrichment
+src_user_identity_groups,Enrichment
+src_user_identity_manager,Enrichment
+src_user_identity_manager_upn,Enrichment
+src_user_identity_mfa_enabled,Enrichment
+src_user_identity_office_location,Enrichment
+src_user_identity_phone,Enrichment
+src_user_identity_title,Enrichment
+src_user_type,Authentication
+src_zone,Data Loss Prevention
+ssid,Network
+ssl_end_time,Certificates
+ssl_engine,Certificates
+ssl_hash,Certificates
+ssl_is_valid,Certificates
+ssl_issuer,Certificates
+ssl_issuer_common_name,Certificates
+ssl_issuer_email,Certificates
+ssl_issuer_email_domain,Certificates
+ssl_issuer_locality,Certificates
+ssl_issuer_organization,Certificates
+ssl_issuer_state,Certificates
+ssl_issuer_street,Certificates
+ssl_issuer_unit,Certificates
+ssl_name,Certificates
+ssl_policies,Certificates
+ssl_publickey,Certificates
+ssl_publickey_algorithm,Certificates
+ssl_serial,Certificates
+ssl_session_id,Certificates
+ssl_signature_algorithm,Certificates
+ssl_start_time,Certificates
+ssl_subject,Certificates
+ssl_subject_common_name,Certificates
+ssl_subject_email,Certificates
+ssl_subject_email_domain,Certificates
+ssl_subject_locality,Certificates
+ssl_subject_organization,Certificates
+ssl_subject_state,Certificates
+ssl_subject_street,Certificates
+ssl_subject_unit,Certificates
+ssl_validity_window,Certificates
+ssl_version,Certificates
+start_mode,Endpoint
+start_time,System
+state,Endpoint
+status,System
+status_code,Web
+storage,Inventory
+storage_free,Performance
+storage_free_percent,Performance
+storage_name,Web
+storage_used,Performance
+storage_used_percent,Performance
+stored_procedures_called,Databases
+subject,Email
+swap,Performance
+swap_free,Performance
+swap_used,Performance
+table_scans,Databases
+tables_hit,Databases
+tablespace_name,Databases
+tablespace_reads,Databases
+tablespace_status,Databases
+tablespace_used,Databases
+tablespace_writes,Databases
+tag,Alerts
+tcp_flag,Network
+temperature,Performance
+thruput,Performance
+thruput_max,Performance
+time,System
+timestamp,System
+tos,Network
+transaction_id,DNS
+transport,Network
+transport_dest_port,Endpoint
+ttl,DNS
+type,Alerts
+uri_path,Web
+uri_query,Web
+url,Web
+url_domain,Web
+url_length,Web
+user,Authentication
+user_identity_account_status,Enrichment
+user_identity_company,Enrichment
+user_identity_country,Enrichment
+user_identity_department,Enrichment
+user_identity_display_name,Enrichment
+user_identity_email,Enrichment
+user_identity_employee_id,Enrichment
+user_identity_employee_type,Enrichment
+user_identity_groups,Enrichment
+user_identity_manager,Enrichment
+user_identity_manager_upn,Enrichment
+user_identity_mfa_enabled,Enrichment
+user_identity_office_location,Enrichment
+user_identity_phone,Enrichment
+user_identity_title,Enrichment
+user_agent,Web
+user_domain,Authentication
+user_group,Data Access
+user_id,Authentication
+user_name,Authentication
+user_role,Authentication
+user_type,Authentication
+vendor,Authentication
+vendor_account,Alerts
+vendor_product,Authentication
+vendor_product_id,Alerts
+vendor_region,Alerts
+version,Inventory
+vip_port,Inventory
+vlan,Network
+wait_state,Databases
+wait_time,Databases
+wifi,Network
+write_blocks,Inventory
+write_latency,Inventory
+write_ops,Inventory
+xdelay,Email
+xref,Email

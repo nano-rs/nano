@@ -1,0 +1,9 @@
+# Auto-generated combiner for all DB parsers
+# DO NOT EDIT - changes will be overwritten
+
+[transforms.db_parsers_combined]
+type = "remap"
+inputs = ["aws_cloudtrail_output", "squid_proxy_output"]
+source = '''
+. = .
+'''

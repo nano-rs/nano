@@ -1,0 +1,105 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! Parser service for business logic
+//!
+//! Submodules organized by concern:
+//! - `config_gen`: Vector TOML configuration generation
+//! - `credentials`: Cloud credential injection for parsers
+//! - `crud`: Parser CRUD operations (create, read, update, delete, enable, disable)
+//! - `deployment`: Parser deployment lifecycle (deploy, undeploy, rollback)
+//! - `library`: Parser library management
+//! - `validation`: VRL and UDM field validation
+
+mod config_gen;
+mod credentials;
+mod crud;
+mod deployment;
+mod library;
+mod validation;
+
+#[cfg(test)]
+mod tests;
+
+use sqlx::PgPool;
+use std::sync::Arc;
+use thiserror::Error;
+
+use super::credential_repository::{CredentialRepository, CredentialRepositoryError};
+use super::repository::ParserRepositoryError;
+use super::repository::{ParserLibraryRepository, ParserRepository};
+use super::validator::VrlValidator;
+use super::vector_config::{VectorConfigError, VectorConfigManager};
+
+#[derive(Error, Debug)]
+pub enum ParserServiceError {
+    #[error("Repository error: {0}")]
+    RepositoryError(#[from] ParserRepositoryError),
+    #[error("Credential error: {0}")]
+    CredentialError(#[from] CredentialRepositoryError),
+    #[error("Invalid VRL: {0}")]
+    InvalidVrl(String),
+    #[error("Invalid source type: {0}")]
+    InvalidSourceType(String),
+    #[error("Parser must be validated before enabling")]
+    NotValidated,
+    #[error("Vector config error: {0}")]
+    VectorConfigError(#[from] VectorConfigError),
+    #[error("VRL validation failed: {0}")]
+    VrlValidationFailed(String),
+    #[error("Vector validation failed: {0}")]
+    VectorValidationFailed(String),
+    #[error("Deployment failed: {0}")]
+    DeploymentFailed(String),
+    #[error("Reload failed")]
+    ReloadFailed,
+    #[error("Rollback failed: {0}")]
+    RollbackFailed(String),
+}
+
+/// Parser service for managing VRL parsers
+#[derive(Clone)]
+pub struct ParserService {
+    pool: PgPool,
+    vector_config: Arc<VectorConfigManager>,
+    vrl_validator: Arc<VrlValidator>,
+}
+
+impl ParserService {
+    pub fn new(pool: PgPool) -> Self {
+        Self {
+            pool,
+            vector_config: Arc::new(VectorConfigManager::with_defaults()),
+            vrl_validator: Arc::new(VrlValidator::new()),
+        }
+    }
+
+    /// Create with a custom Vector config directory
+    pub fn with_vector_config_dir(pool: PgPool, config_dir: impl AsRef<std::path::Path>) -> Self {
+        Self {
+            pool,
+            vector_config: Arc::new(VectorConfigManager::new(config_dir)),
+            vrl_validator: Arc::new(VrlValidator::new()),
+        }
+    }
+
+    /// Create with a custom VRL validator (useful for testing)
+    pub fn with_validator(pool: PgPool, validator: VrlValidator) -> Self {
+        Self {
+            pool,
+            vector_config: Arc::new(VectorConfigManager::with_defaults()),
+            vrl_validator: Arc::new(validator),
+        }
+    }
+
+    fn repository(&self) -> ParserRepository {
+        ParserRepository::new(self.pool.clone())
+    }
+
+    fn credential_repository(&self) -> CredentialRepository {
+        CredentialRepository::new(self.pool.clone())
+    }
+
+    fn library_repository(&self) -> ParserLibraryRepository {
+        ParserLibraryRepository::new(self.pool.clone())
+    }
+}

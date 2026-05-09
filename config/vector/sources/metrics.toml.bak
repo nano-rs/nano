@@ -1,0 +1,87 @@
+# Internal Metrics Configuration for NanoSIEM
+#
+# This configuration exposes Vector's internal metrics for monitoring
+# buffer health, event processing, and pipeline performance.
+#
+# Requirements: 2.6, 7.2
+
+# =============================================================================
+# Internal Metrics Source
+# =============================================================================
+# Captures Vector's internal metrics including buffer statistics
+# Requirement 2.6: Buffer metrics for current size, events buffered, oldest event age
+# Requirement 7.2: Buffer metrics exposure
+
+[sources.internal_metrics]
+type = "internal_metrics"
+# Scrape interval for metrics collection
+scrape_interval_secs = 15
+
+# Namespace for metrics (helps with filtering in monitoring systems)
+namespace = "nanosiem_vector"
+
+# =============================================================================
+# Host Metrics Source (Optional)
+# =============================================================================
+# Captures host-level metrics for resource monitoring
+
+[sources.host_metrics]
+type = "host_metrics"
+# Scrape interval for host metrics
+scrape_interval_secs = 30
+
+# Collectors to enable
+collectors = ["cpu", "memory", "disk", "network"]
+
+# Namespace for host metrics
+namespace = "nanosiem_host"
+
+# =============================================================================
+# Prometheus Metrics Sink
+# =============================================================================
+# Exposes metrics in Prometheus format on port 9598
+# This allows external monitoring systems to scrape Vector metrics
+
+[sinks.prometheus_metrics]
+type = "prometheus_exporter"
+inputs = ["internal_metrics", "host_metrics"]
+address = "0.0.0.0:9598"
+
+# Default namespace for exported metrics
+default_namespace = "nanosiem"
+
+# Buckets for histogram metrics (latency distributions)
+buckets = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+
+# Quantiles for summary metrics
+quantiles = [0.5, 0.75, 0.9, 0.95, 0.99]
+
+# =============================================================================
+# Key Buffer Metrics Exposed
+# =============================================================================
+# The following metrics are automatically exposed by Vector's internal_metrics:
+#
+# Buffer Size Metrics:
+#   - buffer_byte_size: Current size of the buffer in bytes
+#   - buffer_events: Number of events currently in the buffer
+#   - buffer_max_size: Maximum configured buffer size
+#
+# Buffer Event Metrics:
+#   - buffer_received_events_total: Total events received by buffer
+#   - buffer_sent_events_total: Total events sent from buffer
+#   - buffer_discarded_events_total: Events discarded due to buffer overflow
+#
+# Buffer Age Metrics:
+#   - buffer_received_event_bytes_total: Total bytes received
+#   - buffer_sent_event_bytes_total: Total bytes sent
+#
+# Sink Metrics (includes buffer drain info):
+#   - component_sent_events_total: Events successfully sent by sink
+#   - component_sent_event_bytes_total: Bytes successfully sent
+#   - component_errors_total: Total errors encountered
+#
+# Request Metrics:
+#   - http_client_requests_sent_total: HTTP requests sent
+#   - http_client_responses_total: HTTP responses received
+#   - http_client_request_duration_seconds: Request latency histogram
+

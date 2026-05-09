@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<!--
+  ClickHouse Logging Configuration
+  Limits log file sizes to prevent disk bloat
+-->
+<clickhouse>
+    <logger>
+        <!-- Log level: trace, debug, information, warning, error -->
+        <level>warning</level>
+
+        <!-- Main log file -->
+        <log>/var/log/clickhouse-server/clickhouse-server.log</log>
+        <errorlog>/var/log/clickhouse-server/clickhouse-server.err.log</errorlog>
+
+        <!-- Rotation settings -->
+        <size>100M</size>
+        <count>3</count>
+
+        <!-- Disable console logging in container -->
+        <console>0</console>
+    </logger>
+</clickhouse>

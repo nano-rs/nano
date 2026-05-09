@@ -1,0 +1,126 @@
+<?xml version="1.0"?>
+<!--
+  Monitoring and Observability Configuration for SIEM
+
+  Provides:
+  - Prometheus metrics endpoint for Grafana dashboards
+  - Session logging for security audit
+  - Backup logging for disaster recovery tracking
+  - Error collection for troubleshooting
+
+  Integrates with existing Prometheus/Grafana stack in docker-compose.yml
+-->
+<clickhouse>
+    <!-- =======================================================================
+         PROMETHEUS METRICS
+         Exposes metrics for Grafana dashboards
+         ======================================================================= -->
+    <prometheus>
+        <!-- Endpoint path -->
+        <endpoint>/metrics</endpoint>
+
+        <!-- Port for Prometheus to scrape (add to docker-compose ports) -->
+        <port>9363</port>
+
+        <!-- Metric categories to expose -->
+        <metrics>true</metrics>
+        <asynchronous_metrics>true</asynchronous_metrics>
+        <events>true</events>
+        <errors>true</errors>
+
+        <!-- Status info -->
+        <status_info>true</status_info>
+    </prometheus>
+
+    <!-- =======================================================================
+         SESSION LOG
+         Tracks user connections for security audit
+         ======================================================================= -->
+    <session_log>
+        <database>system</database>
+        <table>session_log</table>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        <!-- Keep session logs for 7 days for security investigations -->
+        <ttl>event_date + INTERVAL 7 DAY</ttl>
+    </session_log>
+
+    <!-- =======================================================================
+         BACKUP LOG
+         Tracks backup operations for DR compliance
+         ======================================================================= -->
+    <backup_log>
+        <database>system</database>
+        <table>backup_log</table>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        <!-- Keep backup logs for 30 days -->
+        <ttl>event_date + INTERVAL 30 DAY</ttl>
+    </backup_log>
+
+    <!-- =======================================================================
+         ERROR LOG
+         Collects errors for troubleshooting
+         ======================================================================= -->
+    <error_log>
+        <database>system</database>
+        <table>error_log</table>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        <ttl>event_date + INTERVAL 7 DAY</ttl>
+    </error_log>
+
+    <!-- =======================================================================
+         BLOB STORAGE LOG (for future S3/GCS tiering)
+         ======================================================================= -->
+    <blob_storage_log>
+        <database>system</database>
+        <table>blob_storage_log</table>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        <ttl>event_date + INTERVAL 3 DAY</ttl>
+    </blob_storage_log>
+
+    <!-- =======================================================================
+         QUERY CACHE LOG
+         Tracks query cache hits/misses
+         ======================================================================= -->
+    <query_cache>
+        <max_size_in_bytes>1073741824</max_size_in_bytes> <!-- 1GB -->
+        <max_entries>1024</max_entries>
+        <max_entry_size_in_bytes>104857600</max_entry_size_in_bytes> <!-- 100MB per entry -->
+        <max_entry_size_in_rows>30000000</max_entry_size_in_rows>
+    </query_cache>
+
+    <!-- =======================================================================
+         DISABLE UNUSED LOGS
+         Reduce overhead from logs not needed for SIEM
+         ======================================================================= -->
+
+    <!-- Disable ZooKeeper log (not using replication yet) -->
+    <zookeeper_log remove="1"/>
+
+    <!-- Disable OpenTelemetry span log (not using OTel tracing) -->
+    <opentelemetry_span_log remove="1"/>
+
+    <!-- =======================================================================
+         GRAPHITE METRICS (optional, if using Graphite)
+         ======================================================================= -->
+    <!--
+    <graphite>
+        <host>graphite.example.com</host>
+        <port>2003</port>
+        <timeout>0.1</timeout>
+        <interval>60</interval>
+        <root_path>clickhouse</root_path>
+        <hostname_in_path>true</hostname_in_path>
+    </graphite>
+    -->
+
+    <!-- =======================================================================
+         INTERNAL METRICS COLLECTION
+         ======================================================================= -->
+
+    <!-- How often to collect async metrics -->
+    <asynchronous_metrics_update_period_s>60</asynchronous_metrics_update_period_s>
+
+    <!-- Enable memory profiler for debugging -->
+    <total_memory_profiler_step>4194304</total_memory_profiler_step> <!-- 4MB -->
+    <total_memory_tracker_sample_probability>0.01</total_memory_tracker_sample_probability>
+</clickhouse>

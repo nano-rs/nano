@@ -1,0 +1,85 @@
+# HTTP Source Configuration for NanoSIEM
+#
+# This configuration provides HTTP input sources for Vector.
+# Allows applications to send logs via HTTP POST requests.
+#
+# Note: For production use, prefer http_secure.toml which includes
+# authentication, rate limiting, and body size limits.
+
+# =============================================================================
+# HTTP JSON Endpoint
+# =============================================================================
+# Receives JSON-formatted logs via HTTP POST
+
+[sources.http_json]
+type = "http_server"
+address = "0.0.0.0:8080"
+path = "/logs"
+encoding = "json"
+strict_path = true
+
+# Request limits
+headers = ["Content-Type", "X-Source-Type", "X-Api-Key"]
+
+# Request body size limit (10MB default)
+# Requirement 3.3: Maximum request body size
+max_body_size = 10485760
+
+# =============================================================================
+# HTTP NDJSON Endpoint
+# =============================================================================
+# Receives newline-delimited JSON (NDJSON) for batch submissions
+
+[sources.http_ndjson]
+type = "http_server"
+address = "0.0.0.0:8081"
+path = "/logs/batch"
+encoding = "ndjson"
+strict_path = true
+
+# Request body size limit (10MB default)
+max_body_size = 10485760
+
+# =============================================================================
+# HTTP Text Endpoint
+# =============================================================================
+# Receives plain text logs (one log per line)
+
+[sources.http_text]
+type = "http_server"
+address = "0.0.0.0:8082"
+path = "/logs/text"
+encoding = "text"
+strict_path = true
+
+# Request body size limit (10MB default)
+max_body_size = 10485760
+
+# =============================================================================
+# Webhook Endpoint
+# =============================================================================
+# Generic webhook endpoint for third-party integrations
+
+[sources.webhook]
+type = "http_server"
+address = "0.0.0.0:8083"
+path = "/webhook"
+encoding = "json"
+strict_path = false  # Allow subpaths like /webhook/github, /webhook/slack
+
+# Request body size limit (10MB default)
+max_body_size = 10485760
+
+# =============================================================================
+# Health Check Endpoint
+# =============================================================================
+# Simple health check endpoint for monitoring
+
+[sources.health]
+type = "http_server"
+address = "0.0.0.0:8084"
+path = "/health"
+encoding = "text"
+
+# Health check doesn't need large body size
+max_body_size = 1024

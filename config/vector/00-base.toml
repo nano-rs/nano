@@ -1,0 +1,297 @@
+# NanoSIEM Vector Base Configuration
+# This file contains the core pipeline: sources, auth, rate limiting, and sinks.
+# Parser routing is handled by dynamically generated configs in sources/parsers/
+#
+# File loading order (alphabetical):
+#   00-base.toml        - This file (sources, auth, rate limiting, sinks)
+#   sources/parsers/    - Dynamically generated parser configs
+#   transforms/         - Additional transforms (dynamic_router.toml)
+#
+# TLS: Handled by load balancer (Hetzner LB terminates HTTPS, forwards HTTP to Vector)
+
+data_dir = "/var/lib/vector"
+
+# =============================================================================
+# Vector API (for config reload)
+# =============================================================================
+[api]
+enabled = true
+address = "0.0.0.0:8686"
+playground = true
+
+# =============================================================================
+# Single HTTP Source - All formats on one port
+# Supports both single events and NDJSON batches
+# =============================================================================
+[sources.http_ingest]
+type = "http_server"
+address = "0.0.0.0:8080"
+strict_path = false
+path = "/"
+headers = ["Authorization", "X-Source-Type", "X-Api-Key", "Content-Type", "X-Forwarded-For", "X-Real-IP", "X-Webhook-Secret"]
+max_body_size = 52428800  # 50MB to match batch size (was 10MB)
+
+# Keep-alive for better connection reuse from log shippers
+keepalive.max_connection_age_secs = 300  # 5 minutes
+
+# Note: End-to-end acknowledgements are enabled in the sink (91-clickhouse-sink.toml)
+# This ensures HTTP clients receive 200 only after ClickHouse confirms receipt
+
+# Split incoming body by newlines - each line becomes a separate event
+# This enables NDJSON batch ingestion from log shippers (Cribl, Fluentd, etc.)
+[sources.http_ingest.framing]
+method = "newline_delimited"
+
+# Decode each line as raw bytes (transforms handle JSON parsing)
+[sources.http_ingest.decoding]
+codec = "bytes"
+
+# =============================================================================
+# Authentication Transform
+# =============================================================================
+[transforms.auth_check]
+type = "remap"
+inputs = ["http_ingest"]
+source = '''
+auth_header = ""
+if exists(.Authorization) {
+    auth_header = to_string(.Authorization) ?? ""
+} else if exists(.authorization) {
+    auth_header = to_string(.authorization) ?? ""
+}
+
+expected_token = get_env_var("VECTOR_AUTH_TOKEN") ?? ""
+
+if expected_token == "" {
+    .auth_status = "skipped"
+} else {
+    if auth_header == "" {
+        log("Auth failed: No Authorization header", level: "warn")
+        abort
+    }
+    if !starts_with(auth_header, "Bearer ") {
+        log("Auth failed: Invalid format", level: "warn")
+        abort
+    }
+    token = slice!(auth_header, 7)
+    if token != expected_token {
+        log("Auth failed: Invalid token", level: "warn")
+        abort
+    }
+    .auth_status = "authenticated"
+}
+
+# Extract source_type from header, defaulting to "unknown"
+# With framing, headers might exist but be empty - treat empty as unknown
+source_type = "unknown"
+if exists(."X-Source-Type") {
+    st = to_string(."X-Source-Type") ?? ""
+    if st != "" {
+        source_type = st
+    }
+}
+.source_type = source_type
+.request_path = to_string(.path) ?? "/"
+
+del(.Authorization)
+del(.authorization)
+'''
+
+# =============================================================================
+# Rate Limiting
+# =============================================================================
+[transforms.rate_limit_prep]
+type = "remap"
+inputs = ["auth_check"]
+source = '''
+client_ip = null
+xff = to_string(."X-Forwarded-For") ?? ""
+if xff != "" {
+    parts = split(xff, ",")
+    if length(parts) > 0 {
+        client_ip = strip_whitespace(parts[0]) ?? null
+    }
+}
+if client_ip == null {
+    client_ip = to_string(."X-Real-IP") ?? null
+}
+if client_ip == null {
+    client_ip = "unknown"
+}
+.client_ip = client_ip
+'''
+
+[transforms.rate_limit]
+type = "throttle"
+inputs = ["rate_limit_prep"]
+threshold = 5000      # 5000 events/sec per client IP (was 1000)
+window_secs = 1
+key_field = "client_ip"
+
+# =============================================================================
+# Content-Type Detection & Parsing
+# =============================================================================
+[transforms.parse_content]
+type = "remap"
+inputs = ["rate_limit"]
+source = '''
+content_type = to_string(."Content-Type") ?? to_string(."content-type") ?? ""
+content_type = downcase(content_type)
+
+raw = to_string(.message) ?? ""
+.metadata = {}
+.metadata.forwarded_via = "http"
+.content_format = "unknown"
+
+# Normalize empty source_type to "unknown" for consistent extraction logic
+current_source_type = to_string(.source_type) ?? ""
+if current_source_type == "" {
+    .source_type = "unknown"
+}
+
+if contains(content_type, "application/json") {
+    .content_format = "json"
+    parsed, err = parse_json(raw)
+    if err == null {
+        # Merge parsed JSON fields to top-level (parsers can access .referrer directly)
+        # Skip 'message' which we handle specially below
+        parsed_keys, key_err = keys(parsed)
+        if key_err == null {
+            for_each(parsed_keys) -> |_idx, key| {
+                if key != "message" {
+                    val, get_err = get(parsed, [key])
+                    if get_err == null && val != null {
+                        . = set!(., [key], val)
+                    }
+                }
+            }
+        }
+        # Extract the actual log message if present
+        if exists(parsed.message) && is_string(parsed.message) {
+            .message = to_string!(parsed.message)
+        } else {
+            .message = raw
+        }
+        if .source_type == "unknown" {
+            body_source_type = to_string(parsed.source_type) ?? null
+            if body_source_type != null {
+                .source_type = body_source_type
+            }
+        }
+    } else {
+        .message = raw
+    }
+} else if contains(content_type, "application/x-ndjson") || contains(content_type, "ndjson") {
+    .content_format = "ndjson"
+    parsed, err = parse_json(raw)
+    if err == null {
+        # Merge parsed JSON fields to top-level
+        parsed_keys, key_err = keys(parsed)
+        if key_err == null {
+            for_each(parsed_keys) -> |_idx, key| {
+                if key != "message" {
+                    val, get_err = get(parsed, [key])
+                    if get_err == null && val != null {
+                        . = set!(., [key], val)
+                    }
+                }
+            }
+        }
+        if exists(parsed.message) && is_string(parsed.message) {
+            .message = to_string!(parsed.message)
+        } else {
+            .message = raw
+        }
+        if .source_type == "unknown" {
+            body_source_type = to_string(parsed.source_type) ?? null
+            if body_source_type != null {
+                .source_type = body_source_type
+            }
+        }
+    } else {
+        .message = raw
+    }
+} else if contains(content_type, "text/plain") || contains(content_type, "text/") {
+    .content_format = "raw"
+    .message = raw
+} else {
+    if starts_with(raw, "{") || starts_with(raw, "[") {
+        parsed, err = parse_json(raw)
+        if err == null {
+            .content_format = "json"
+            # Merge parsed JSON fields to top-level
+            parsed_keys, key_err = keys(parsed)
+            if key_err == null {
+                for_each(parsed_keys) -> |_idx, key| {
+                    if key != "message" {
+                        val, get_err = get(parsed, [key])
+                        if get_err == null && val != null {
+                            . = set!(., [key], val)
+                        }
+                    }
+                }
+            }
+            if exists(parsed.message) && is_string(parsed.message) {
+                .message = to_string!(parsed.message)
+            } else {
+                .message = raw
+            }
+            if .source_type == "unknown" {
+                body_source_type = to_string(parsed.source_type) ?? null
+                if body_source_type != null {
+                    .source_type = body_source_type
+                }
+            }
+        } else {
+            .content_format = "raw"
+            .message = raw
+        }
+    } else {
+        .content_format = "raw"
+        .message = raw
+    }
+}
+
+if contains(to_string(.request_path) ?? "", "/webhook") {
+    .is_webhook = true
+}
+'''
+
+# =============================================================================
+# Source Type Extraction and Normalization
+# =============================================================================
+[transforms.source_type_extract]
+type = "remap"
+inputs = ["parse_content"]
+source = '''
+source_type = "unknown"
+if exists(.source_type) && is_string(.source_type) {
+    source_type = to_string!(.source_type)
+}
+
+if source_type == "unknown" {
+    if exists(."X-Source-Type") {
+        st = to_string(."X-Source-Type") ?? ""
+        if st != "" { source_type = downcase(st) }
+    }
+}
+if source_type == "unknown" {
+    if exists(."x-source-type") {
+        st = to_string(."x-source-type") ?? ""
+        if st != "" { source_type = downcase(st) }
+    }
+}
+
+if source_type == "unknown" {
+    if is_object(.metadata) && exists(.metadata.source_type) {
+        st = to_string(.metadata.source_type) ?? ""
+        if st != "" { source_type = downcase(st) }
+    }
+}
+
+# Source type aliasing is handled dynamically by the router via match_values
+# on each parser — no hardcoded aliases needed here.
+
+.source_type = source_type
+.routing_timestamp = now()
+'''

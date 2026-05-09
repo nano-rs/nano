@@ -1,0 +1,408 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! SQL transformation utilities for ClickHouse Cloud and cluster compatibility.
+
+use super::ClickHouseMigrator;
+use regex::Regex;
+
+impl ClickHouseMigrator {
+    /// Substitute `{clickhouse_self_*}` placeholders in dictionary SOURCE blocks
+    /// that reference the local CH instance.
+    ///
+    /// NAN-707: Historically only `init.sql` ran this substitution (see the
+    /// inline `replace(...)` chain in `runner::run_init_sql`). Numbered migrations
+    /// got the placeholder text verbatim, so any migration referencing the local
+    /// CH instance had to hardcode credentials — and `nanosiem`/`nanosiem` only
+    /// happened to work because most tenants kept the default password. Saturn
+    /// rotated, migration 114 hit AUTHENTICATION_FAILED, and every dictGet
+    /// against the IP prevalence dict broke.
+    ///
+    /// Now both code paths share this helper so the same placeholder semantics
+    /// apply everywhere.
+    pub(super) fn substitute_clickhouse_self_vars(sql: &str) -> String {
+        let ch_self_host =
+            std::env::var("CLICKHOUSE_SELF_HOST").unwrap_or_else(|_| "localhost".into());
+        let ch_self_port =
+            std::env::var("CLICKHOUSE_SELF_PORT").unwrap_or_else(|_| "9000".into());
+        let ch_self_user = std::env::var("CLICKHOUSE_SELF_USER")
+            .or_else(|_| std::env::var("CLICKHOUSE_USER"))
+            .unwrap_or_else(|_| "default".into());
+        let ch_self_password = std::env::var("CLICKHOUSE_SELF_PASSWORD")
+            .or_else(|_| std::env::var("CLICKHOUSE_PASSWORD"))
+            .unwrap_or_default();
+        sql.replace("{clickhouse_self_host}", &ch_self_host)
+            .replace("{clickhouse_self_port}", &ch_self_port)
+            .replace("{clickhouse_self_user}", &ch_self_user)
+            .replace("{clickhouse_self_password}", &ch_self_password)
+    }
+
+    /// Substitute PostgreSQL connection details in dictionary SOURCE blocks.
+    ///
+    /// Replaces hardcoded Docker Compose defaults (`host 'postgres'`, `password 'nanosiem'`)
+    /// with values from environment variables so dictionaries work in cloud deployments
+    /// where Postgres runs at a different hostname with a generated password.
+    pub(super) fn substitute_postgres_vars(sql: &str) -> String {
+        let pg_host = std::env::var("POSTGRES_DICT_HOST")
+            .or_else(|_| std::env::var("POSTGRES_HOST"))
+            .unwrap_or_else(|_| "postgres".into());
+        let pg_password = std::env::var("POSTGRES_DICT_PASSWORD")
+            .or_else(|_| std::env::var("POSTGRES_PASSWORD"))
+            .unwrap_or_else(|_| "nanosiem".into());
+
+        // Replace the hardcoded values in SOURCE(POSTGRESQL(...)) blocks
+        let re_host =
+            Regex::new(r"(?i)(SOURCE\s*\(\s*POSTGRESQL\s*\([^)]*?)host\s+'postgres'").unwrap();
+        let result = re_host
+            .replace_all(sql, |caps: &regex::Captures| {
+                format!("{}host '{}'", &caps[1], pg_host)
+            })
+            .to_string();
+
+        let re_pass =
+            Regex::new(r"(?i)(SOURCE\s*\(\s*POSTGRESQL\s*\([^)]*?)password\s+'nanosiem'").unwrap();
+        re_pass
+            .replace_all(&result, |caps: &regex::Captures| {
+                format!("{}password '{}'", &caps[1], pg_password)
+            })
+            .to_string()
+    }
+
+    /// Sanitize SQL for ClickHouse Cloud compatibility.
+    ///
+    /// CH Cloud has restrictions that self-hosted doesn't:
+    /// - `storage_policy = 'tiered'` - Cloud manages storage internally
+    /// - `allow_experimental_full_text_index` - constrained, cannot be changed
+    /// - `enable_full_text_index` - doesn't exist in some CH Cloud versions
+    /// - `text()` index type - requires the experimental setting above
+    ///
+    /// Instead of skipping entire statements, we strip the incompatible parts
+    /// so the core DDL still executes.
+    pub(super) fn sanitize_for_cloud(sql: &str) -> String {
+        let mut s = sql.to_string();
+
+        // 1. Remove storage_policy from SETTINGS clauses
+        //    e.g. ", storage_policy = 'tiered'" or "storage_policy = 'tiered', "
+        let re = Regex::new(r#"(?i),?\s*storage_policy\s*=\s*'[^']*'\s*,?"#).unwrap();
+        s = re
+            .replace_all(&s, |caps: &regex::Captures| {
+                // If it matched comma on both sides, keep one comma
+                let m = caps.get(0).unwrap().as_str();
+                if m.starts_with(',') && m.ends_with(',') {
+                    ","
+                } else {
+                    ""
+                }
+                .to_string()
+            })
+            .to_string();
+
+        // 2. Remove full-text index experimental settings from inline SETTINGS clauses
+        //    Handles: allow_experimental_full_text_index = 1, enable_full_text_index = 1
+        for setting_name in &[
+            "allow_experimental_full_text_index",
+            "enable_full_text_index",
+        ] {
+            let re = Regex::new(&format!(
+                r"(?i),?\s*{}\s*=\s*\d+\s*,?",
+                regex::escape(setting_name)
+            ))
+            .unwrap();
+            s = re
+                .replace_all(&s, |caps: &regex::Captures| {
+                    let m = caps.get(0).unwrap().as_str();
+                    if m.starts_with(',') && m.trim_end().ends_with(',') {
+                        ","
+                    } else {
+                        ""
+                    }
+                    .to_string()
+                })
+                .to_string();
+        }
+
+        // 3. Remove `text()` index type declarations (requires experimental setting)
+        //    e.g. "INDEX idx_message_ft lower(message) TYPE text(tokenizer = ngrams(3)) GRANULARITY 100000000"
+        //    Handle nested parens: text(tokenizer = ngrams(3))
+        let re = Regex::new(
+            r"(?i),?\s*INDEX\s+\w+\s+(?:\w+(?:\([^)]*\))?|\w+)\s+TYPE\s+text\([^()]*(?:\([^()]*\))?[^()]*\)\s+GRANULARITY\s+\d+"
+        ).unwrap();
+        s = re.replace_all(&s, "").to_string();
+
+        // 4. Clean up empty or trailing SETTINGS clauses
+        //    "SETTINGS ;" -> ";"   "SETTINGS \n" -> ""
+        let re = Regex::new(r"(?i)SETTINGS\s*([;\n]|$)").unwrap();
+        s = re.replace_all(&s, "$1").to_string();
+        // "SETTINGS ," -> "SETTINGS "
+        let re = Regex::new(r"(?i)SETTINGS\s*,").unwrap();
+        s = re.replace_all(&s, "SETTINGS ").to_string();
+
+        s
+    }
+
+    /// Transform a SQL statement for cluster mode.
+    ///
+    /// Applies the following transformations:
+    /// - Adds `ON CLUSTER '{cluster}'` to DDL statements (CREATE, ALTER, DROP, TRUNCATE)
+    /// - Converts MergeTree -> ReplicatedMergeTree with ZooKeeper paths
+    /// - Converts AggregatingMergeTree -> ReplicatedAggregatingMergeTree
+    /// - Converts ReplacingMergeTree -> ReplicatedReplacingMergeTree
+    /// - Adds `storage_policy = 'tiered'` to main data tables (logs, signals)
+    /// - Fixes ClickHouse dictionary source ports (9000 -> 9001 for operator)
+    ///
+    /// Statements that already contain ON CLUSTER are returned unchanged.
+    pub(super) fn transform_for_cluster(
+        statement: &str,
+        cluster_name: &str,
+        default_db: &str,
+    ) -> String {
+        let trimmed = statement.trim();
+        if trimmed.is_empty() {
+            return statement.to_string();
+        }
+
+        let upper = trimmed.to_uppercase();
+
+        // Skip if already has ON CLUSTER
+        if upper.contains("ON CLUSTER") {
+            return statement.to_string();
+        }
+
+        // Skip non-DDL statements (SET, INSERT, SELECT, SYSTEM, etc.)
+        if upper.starts_with("SET ")
+            || upper.starts_with("INSERT ")
+            || upper.starts_with("SELECT ")
+            || upper.starts_with("SYSTEM ")
+            || upper.starts_with("GRANT ")
+            || upper.starts_with("REVOKE ")
+            || upper.starts_with("OPTIMIZE ")
+        {
+            return statement.to_string();
+        }
+
+        let mut s = statement.to_string();
+
+        // When cluster name == database name, we're in a Replicated database.
+        // The Replicated engine auto-propagates DDL — no ON CLUSTER needed.
+        // Only add ON CLUSTER for explicit clusters (e.g., nanosiem_cluster from operator).
+        let replicated_db = cluster_name == default_db;
+        let on_cluster_clause = if replicated_db {
+            String::new()
+        } else {
+            format!(" ON CLUSTER '{}'", cluster_name)
+        };
+
+        // Helper: split "db.table" into (db, table), defaulting db if unqualified
+        let split_name = |name: &str| -> (String, String) {
+            if let Some(dot) = name.find('.') {
+                (name[..dot].to_string(), name[dot + 1..].to_string())
+            } else {
+                (default_db.to_string(), name.to_string())
+            }
+        };
+
+        // 1. CREATE DATABASE — skip entirely for Replicated DB (already exists, auto-propagates)
+        if upper.starts_with("CREATE DATABASE") {
+            if replicated_db {
+                return s; // No-op: Replicated database already exists on all nodes
+            }
+            let re =
+                Regex::new(r"(?i)(CREATE\s+DATABASE\s+(?:IF\s+NOT\s+EXISTS\s+)?)(\w+)").unwrap();
+            s = re
+                .replace(&s, |caps: &regex::Captures| {
+                    format!("{}{}{}", &caps[1], &caps[2], on_cluster_clause)
+                })
+                .to_string();
+            return s;
+        }
+
+        // 2. CREATE TABLE
+        if upper.starts_with("CREATE TABLE") {
+            // Extract name (qualified or unqualified)
+            let re_name =
+                Regex::new(r"(?i)(CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)(\w+(?:\.\w+)?)")
+                    .unwrap();
+
+            let (db_name, table_name) = if let Some(caps) = re_name.captures(&s) {
+                split_name(&caps[2])
+            } else {
+                return s;
+            };
+
+            // Insert ON CLUSTER after the table name (empty for Replicated DB)
+            s = re_name
+                .replace(&s, |caps: &regex::Captures| {
+                    format!("{}{}{}", &caps[1], &caps[2], on_cluster_clause)
+                })
+                .to_string();
+
+            // Convert engine: MergeTree -> ReplicatedMergeTree
+            //
+            // When the database uses ENGINE = Replicated (auto-cluster name == db name),
+            // ClickHouse manages ZooKeeper paths automatically — use empty args.
+            // For explicit clusters (e.g., nanosiem_cluster from CH operator), supply paths.
+            let replicated_db = cluster_name == default_db;
+            let zoo_path = format!("/clickhouse/tables/{{shard}}/{}/{}", db_name, table_name);
+            let (mt_args, amt_args, smt_args) = if replicated_db {
+                // Replicated database: empty args, CH manages zoo paths
+                ("()".to_string(), "()".to_string(), "()".to_string())
+            } else {
+                // Explicit cluster: supply zoo path + replica macro
+                (
+                    format!("('{}', '{{replica}}')", zoo_path),
+                    format!("('{}', '{{replica}}')", zoo_path),
+                    format!("('{}', '{{replica}}')", zoo_path),
+                )
+            };
+
+            // MergeTree (with or without empty parens)
+            let re_mt = Regex::new(r"(?i)\bENGINE\s*=\s*MergeTree(?:\s*\(\s*\))?").unwrap();
+            if re_mt.is_match(&s) {
+                s = re_mt
+                    .replace(
+                        &s,
+                        format!("ENGINE = ReplicatedMergeTree{}", mt_args).as_str(),
+                    )
+                    .to_string();
+            }
+
+            // AggregatingMergeTree (with or without empty parens)
+            let re_amt =
+                Regex::new(r"(?i)\bENGINE\s*=\s*AggregatingMergeTree(?:\s*\(\s*\))?").unwrap();
+            if re_amt.is_match(&s) {
+                s = re_amt
+                    .replace(
+                        &s,
+                        format!("ENGINE = ReplicatedAggregatingMergeTree{}", amt_args).as_str(),
+                    )
+                    .to_string();
+            }
+
+            // ReplacingMergeTree(version_col) - preserve the version argument
+            let re_rmt = Regex::new(r"(?i)\bENGINE\s*=\s*ReplacingMergeTree\(([^)]+)\)").unwrap();
+            if re_rmt.is_match(&s) {
+                s = re_rmt
+                    .replace(&s, |caps: &regex::Captures| {
+                        if replicated_db {
+                            format!("ENGINE = ReplicatedReplacingMergeTree({})", &caps[1])
+                        } else {
+                            format!(
+                                "ENGINE = ReplicatedReplacingMergeTree('{}', '{{replica}}', {})",
+                                zoo_path, &caps[1]
+                            )
+                        }
+                    })
+                    .to_string();
+            }
+
+            // SummingMergeTree (with or without empty parens)
+            let re_smt = Regex::new(r"(?i)\bENGINE\s*=\s*SummingMergeTree(?:\s*\(\s*\))?").unwrap();
+            if re_smt.is_match(&s) {
+                s = re_smt
+                    .replace(
+                        &s,
+                        format!("ENGINE = ReplicatedSummingMergeTree{}", smt_args).as_str(),
+                    )
+                    .to_string();
+            }
+
+            // Add storage_policy = 'tiered' for main data tables (skip if already present)
+            if matches!(
+                table_name.as_str(),
+                "logs" | "signals" | "ingestion_errors" | "custom_enrichment_results"
+            ) {
+                let upper_check = s.to_uppercase();
+                if !upper_check.contains("STORAGE_POLICY") {
+                    if let Some(settings_pos) = upper_check.rfind("SETTINGS ") {
+                        let insert_at = settings_pos + "SETTINGS ".len();
+                        s.insert_str(insert_at, "storage_policy = 'tiered', ");
+                    }
+                }
+            }
+
+            return s;
+        }
+
+        // 3. CREATE MATERIALIZED VIEW
+        if upper.starts_with("CREATE MATERIALIZED VIEW") {
+            let re = Regex::new(
+                r"(?i)(CREATE\s+MATERIALIZED\s+VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?)(\w+(?:\.\w+)?)",
+            )
+            .unwrap();
+            s = re
+                .replace(&s, |caps: &regex::Captures| {
+                    format!("{}{}{}", &caps[1], &caps[2], on_cluster_clause)
+                })
+                .to_string();
+            return s;
+        }
+
+        // 4. CREATE DICTIONARY (also handles CREATE OR REPLACE DICTIONARY)
+        if upper.starts_with("CREATE DICTIONARY")
+            || upper.starts_with("CREATE OR REPLACE DICTIONARY")
+        {
+            let re = Regex::new(
+                r"(?i)(CREATE\s+(?:OR\s+REPLACE\s+)?DICTIONARY\s+(?:IF\s+NOT\s+EXISTS\s+)?)(\w+(?:\.\w+)?)",
+            )
+            .unwrap();
+            s = re
+                .replace(&s, |caps: &regex::Captures| {
+                    format!("{}{}{}", &caps[1], &caps[2], on_cluster_clause)
+                })
+                .to_string();
+
+            // Fix ClickHouse self-referencing dictionary port (operator uses 9001, not 9000)
+            // Skip for Replicated DB — dictionaries connect to localhost:9000 inside the pod
+            if !replicated_db {
+                let re_port = Regex::new(r"(?i)\bPORT\s+9000\b").unwrap();
+                s = re_port.replace_all(&s, "PORT 9001").to_string();
+            }
+
+            return s;
+        }
+
+        // 5. ALTER TABLE
+        if upper.starts_with("ALTER TABLE") {
+            // In cluster mode, skip non_replicated_deduplication_window
+            // (replicated_deduplication_window is set in global server config)
+            if upper.contains("NON_REPLICATED_DEDUPLICATION_WINDOW") {
+                tracing::debug!("Skipping non_replicated_deduplication_window in cluster mode");
+                return String::new();
+            }
+
+            let re = Regex::new(r"(?i)(ALTER\s+TABLE\s+)(\w+(?:\.\w+)?)").unwrap();
+            s = re
+                .replace(&s, |caps: &regex::Captures| {
+                    format!("{}{}{}", &caps[1], &caps[2], on_cluster_clause)
+                })
+                .to_string();
+            return s;
+        }
+
+        // 6. TRUNCATE TABLE
+        if upper.starts_with("TRUNCATE") {
+            let re = Regex::new(r"(?i)(TRUNCATE\s+(?:TABLE\s+)?)(\w+(?:\.\w+)?)").unwrap();
+            s = re
+                .replace(&s, |caps: &regex::Captures| {
+                    format!("{}{}{}", &caps[1], &caps[2], on_cluster_clause)
+                })
+                .to_string();
+            return s;
+        }
+
+        // 7. DROP TABLE/VIEW/DICTIONARY
+        if upper.starts_with("DROP ") {
+            let re = Regex::new(
+                r"(?i)(DROP\s+(?:TABLE|VIEW|DICTIONARY|MATERIALIZED\s+VIEW)\s+(?:IF\s+EXISTS\s+)?)(\w+(?:\.\w+)?)",
+            )
+            .unwrap();
+            s = re
+                .replace(&s, |caps: &regex::Captures| {
+                    format!("{}{}{}", &caps[1], &caps[2], on_cluster_clause)
+                })
+                .to_string();
+            return s;
+        }
+
+        s
+    }
+}

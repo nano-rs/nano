@@ -1,0 +1,59 @@
+# NanoSIEM Search Service Dockerfile
+# Multi-stage build for minimal production image
+
+# Stage 1: Build
+FROM rust:1.83-slim-bookworm AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy workspace files
+COPY Cargo.toml Cargo.lock ./
+COPY nanosiem-core ./nanosiem-core
+COPY nanosiem-search ./nanosiem-search
+# Copy other workspace members (needed for workspace resolution)
+COPY nanosiem-api/Cargo.toml ./nanosiem-api/Cargo.toml
+COPY nanosiem-cli/Cargo.toml ./nanosiem-cli/Cargo.toml
+COPY nanosiem-ingest/Cargo.toml ./nanosiem-ingest/Cargo.toml
+
+# Create dummy source files for other workspace members
+RUN mkdir -p nanosiem-api/src && echo "fn main() {}" > nanosiem-api/src/main.rs
+RUN mkdir -p nanosiem-cli/src && echo "fn main() {}" > nanosiem-cli/src/main.rs
+RUN mkdir -p nanosiem-ingest/src && echo "fn main() {}" > nanosiem-ingest/src/main.rs
+
+# Build only the search service
+RUN cargo build --release --package nanosiem-search
+
+# Stage 2: Runtime
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy the binary from builder
+COPY --from=builder /app/target/release/nanosiem-search /app/nanosiem-search
+
+# Create non-root user with explicit UID for K8s runAsNonRoot validation
+RUN useradd -r -u 999 -s /bin/false nanosiem
+USER 999
+
+# Expose the search service port
+EXPOSE 3002
+
+# Health check
+HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:3002/health || exit 1
+
+# Run the search service
+CMD ["/app/nanosiem-search"]

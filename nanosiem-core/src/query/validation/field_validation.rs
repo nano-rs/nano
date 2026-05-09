@@ -1,0 +1,1077 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! Field name validation against the UDM schema
+//!
+//! Validates field references in queries, suggests corrections for typos,
+//! and allows ext JSON fields that don't closely match UDM fields.
+
+use crate::query::ast::{Command, Query, RiskScoreExpr, SearchExpr};
+use crate::udm::fields::UdmField;
+use std::collections::HashSet;
+use std::str::FromStr;
+
+use super::derived_fields::collect_command_output_fields;
+
+/// Error type for field validation
+#[derive(Debug, Clone)]
+pub struct FieldValidationError {
+    pub field_name: String,
+    pub message: String,
+    pub suggestions: Vec<String>,
+}
+
+impl std::fmt::Display for FieldValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)?;
+        if !self.suggestions.is_empty() {
+            write!(f, "\n\nDid you mean one of these?\n")?;
+            for suggestion in &self.suggestions {
+                write!(f, "  - {}\n", suggestion)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for FieldValidationError {}
+
+/// Validate that a field name is a valid UDM field
+///
+/// Returns Ok(UdmField) if the field is valid, or Err with suggestions if invalid.
+///
+/// # Examples
+///
+/// ```
+/// use nanosiem_core::query::validation::validate_field_name;
+///
+/// // Valid field
+/// assert!(validate_field_name("src_ip").is_ok());
+///
+/// // Invalid field with suggestions
+/// let err = validate_field_name("source_ip").unwrap_err();
+/// assert!(err.suggestions.contains(&"src_ip".to_string()));
+/// ```
+/// Check that a field name has a safe syntactic format (no parentheses, SQL operators, etc.)
+///
+/// Field names must match `^[a-zA-Z_][a-zA-Z0-9_.]*$`. This prevents injection of
+/// function calls like `version()` or SQL fragments through field name positions.
+pub fn validate_field_name_format(field_name: &str) -> Result<(), FieldValidationError> {
+    if field_name.is_empty() {
+        return Err(FieldValidationError {
+            field_name: field_name.to_string(),
+            message: "Field name cannot be empty".to_string(),
+            suggestions: vec![],
+        });
+    }
+
+    // First character must be a letter or underscore
+    let first = field_name.chars().next().unwrap();
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return Err(FieldValidationError {
+            field_name: field_name.to_string(),
+            message: format!(
+                "Invalid field name '{}': must start with a letter or underscore",
+                field_name
+            ),
+            suggestions: vec![],
+        });
+    }
+
+    // Remaining characters must be alphanumeric, underscore, or dot (for nested fields)
+    for ch in field_name.chars().skip(1) {
+        if !ch.is_ascii_alphanumeric() && ch != '_' && ch != '.' {
+            return Err(FieldValidationError {
+                field_name: field_name.to_string(),
+                message: format!(
+                    "Invalid field name '{}': contains illegal character '{}'. Field names may only contain letters, digits, underscores, and dots.",
+                    field_name, ch
+                ),
+                suggestions: vec![],
+            });
+        }
+    }
+
+    Ok(())
+}
+
+pub fn validate_field_name(field_name: &str) -> Result<UdmField, FieldValidationError> {
+    // Reject syntactically invalid field names (e.g. "version()", "1+1")
+    validate_field_name_format(field_name)?;
+
+    // Check direct UDM field match first
+    if let Ok(field) = UdmField::from_str(field_name) {
+        return Ok(field);
+    }
+
+    // Check known aliases (fields accepted in queries that map to UDM columns)
+    if let Some(canonical) = resolve_field_alias(field_name) {
+        if let Ok(field) = UdmField::from_str(canonical) {
+            return Ok(field);
+        }
+    }
+
+    // Field not found - generate suggestions
+    let suggestions = suggest_similar_fields(field_name, 5);
+    Err(FieldValidationError {
+        field_name: field_name.to_string(),
+        message: format!("Unknown field '{}' in query", field_name),
+        suggestions,
+    })
+}
+
+/// Resolve a field alias to its canonical UDM field name.
+///
+/// These aliases are accepted in queries and transparently mapped to the
+/// underlying UDM column during SQL generation (see `field_utils.rs` and
+/// `clickhouse_sql_gen.rs`). The validator must accept them too.
+fn resolve_field_alias(field_name: &str) -> Option<&'static str> {
+    match field_name {
+        "process" => Some("command_line"),
+        "parent_process" => Some("parent_command_line"),
+        _ => None,
+    }
+}
+
+/// Suggest similar field names for a typo or unknown field
+///
+/// Uses Levenshtein distance to find the closest matching field names.
+/// Returns up to `max_suggestions` field names sorted by similarity.
+///
+/// # Examples
+///
+/// ```ignore
+/// use nanosiem_core::query::validation::suggest_similar_fields;
+///
+/// let suggestions = suggest_similar_fields("source_ip", 3);
+/// assert!(!suggestions.is_empty());
+/// ```
+pub fn suggest_similar_fields(field_name: &str, max_suggestions: usize) -> Vec<String> {
+    let all_fields = UdmField::all();
+    let mut scored_fields: Vec<(String, usize)> = all_fields
+        .iter()
+        .map(|field| {
+            let field_str = field.column_name();
+            let distance = levenshtein_distance(field_name, field_str);
+            (field_str.to_string(), distance)
+        })
+        .collect();
+
+    // Sort by distance (lower is better)
+    scored_fields.sort_by_key(|(_, distance)| *distance);
+
+    // Return top N suggestions, but only if they're reasonably close
+    // (distance <= 3 or within 50% of the field name length)
+    let max_distance = std::cmp::max(3, field_name.len() / 2);
+    scored_fields
+        .into_iter()
+        .filter(|(_, distance)| *distance <= max_distance)
+        .take(max_suggestions)
+        .map(|(field, _)| field)
+        .collect()
+}
+
+/// Calculate Levenshtein distance between two strings
+///
+/// This is the minimum number of single-character edits (insertions, deletions, or substitutions)
+/// required to change one string into the other.
+fn levenshtein_distance(s1: &str, s2: &str) -> usize {
+    let len1 = s1.len();
+    let len2 = s2.len();
+
+    if len1 == 0 {
+        return len2;
+    }
+    if len2 == 0 {
+        return len1;
+    }
+
+    let mut matrix = vec![vec![0; len2 + 1]; len1 + 1];
+
+    // Initialize first row and column
+    for i in 0..=len1 {
+        matrix[i][0] = i;
+    }
+    for j in 0..=len2 {
+        matrix[0][j] = j;
+    }
+
+    // Fill in the rest of the matrix
+    for (i, c1) in s1.chars().enumerate() {
+        for (j, c2) in s2.chars().enumerate() {
+            let cost = if c1 == c2 { 0 } else { 1 };
+            matrix[i + 1][j + 1] = std::cmp::min(
+                std::cmp::min(
+                    matrix[i][j + 1] + 1, // deletion
+                    matrix[i + 1][j] + 1, // insertion
+                ),
+                matrix[i][j] + cost, // substitution
+            );
+        }
+    }
+
+    matrix[len1][len2]
+}
+
+/// Validate all field references in a query
+///
+/// Walks through the query AST and validates all field names against UDM fields,
+/// derived fields from pipeline stages, and potential ext JSON fields.
+///
+/// Fields that closely match a UDM field are flagged as likely typos. Fields with
+/// no close UDM match are allowed through as potential ext JSON fields.
+///
+/// # Examples
+///
+/// ```
+/// use nanosiem_core::query::{parse_query, validation::validate_query_fields};
+///
+/// // Typo "source_ip" is close to "src_ip" — caught as error
+/// let query = parse_query("source_ip=192.168.1.1").unwrap();
+/// let errors = validate_query_fields(&query);
+/// assert_eq!(errors.len(), 1);
+/// assert_eq!(errors[0].field_name, "source_ip");
+/// ```
+pub fn validate_query_fields(query: &Query) -> Vec<FieldValidationError> {
+    let mut errors = Vec::new();
+    let mut derived = HashSet::new();
+    validate_query_fields_recursive(query, &mut errors, &mut derived);
+    errors
+}
+
+/// Check if a field is valid in pipeline context.
+///
+/// A field is valid if it's:
+/// 1. A derived field from a prior pipeline stage (stats alias, eval, etc.)
+/// 2. A known UDM field or alias
+/// 3. An unknown field that doesn't closely resemble a UDM field (likely an ext JSON field)
+///
+/// Only rejects fields that have similar UDM matches (suggesting a typo). Fields with
+/// no close UDM match are allowed through as potential ext JSON fields — the SQL generator
+/// handles these via JSON extraction.
+fn is_valid_field(field_name: &str, derived: &HashSet<String>) -> Result<(), FieldValidationError> {
+    if derived.contains(&field_name.to_lowercase()) {
+        return Ok(());
+    }
+    match validate_field_name(field_name) {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            // Compute minimum edit distance to any UDM field. Use a tight threshold
+            // (≤ 33% of name length, min 2) to catch likely typos while allowing
+            // legitimate ext fields. The suggestion list uses a looser threshold
+            // (max(3, len/2)) which would false-flag long ext field names.
+            let lower = field_name.to_lowercase();
+            let min_distance = UdmField::all()
+                .iter()
+                .map(|f| levenshtein_distance(&lower, f.column_name()))
+                .min()
+                .unwrap_or(usize::MAX);
+            let typo_threshold = std::cmp::max(2, field_name.len() / 3);
+            if min_distance <= typo_threshold {
+                Err(err)
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Recursively validate field names in a query, accumulating derived fields through the pipeline.
+fn validate_query_fields_recursive(
+    query: &Query,
+    errors: &mut Vec<FieldValidationError>,
+    derived: &mut HashSet<String>,
+) {
+    match query {
+        Query::Search(search_expr) => {
+            validate_search_expr_fields(search_expr, errors, derived);
+        }
+        Query::Piped { source, command } => {
+            validate_query_fields_recursive(source, errors, derived);
+            validate_command_fields(command, errors, derived);
+            collect_command_output_fields(command, derived);
+        }
+    }
+}
+
+/// Validate field names in a search expression
+fn validate_search_expr_fields(
+    expr: &SearchExpr,
+    errors: &mut Vec<FieldValidationError>,
+    derived: &HashSet<String>,
+) {
+    match expr {
+        SearchExpr::Keyword(_) => {
+            // Keywords don't reference fields
+        }
+        SearchExpr::FieldFilter { field, .. } => {
+            if let Err(err) = is_valid_field(field, derived) {
+                errors.push(err);
+            }
+        }
+        SearchExpr::FunctionFilter { function, .. } => {
+            // Validate fields referenced in function arguments
+            validate_eval_expr_fields(function, errors, derived);
+        }
+        SearchExpr::FieldFunctionFilter {
+            field, function, ..
+        } => {
+            // Validate the field and fields referenced in function arguments
+            if let Err(err) = is_valid_field(field, derived) {
+                errors.push(err);
+            }
+            validate_eval_expr_fields(function, errors, derived);
+        }
+        SearchExpr::InList { field, .. } => {
+            if let Err(err) = is_valid_field(field, derived) {
+                errors.push(err);
+            }
+        }
+        SearchExpr::And(left, right) | SearchExpr::Or(left, right) => {
+            validate_search_expr_fields(left, errors, derived);
+            validate_search_expr_fields(right, errors, derived);
+        }
+        SearchExpr::Not(expr) | SearchExpr::Group(expr) => {
+            validate_search_expr_fields(expr, errors, derived);
+        }
+        SearchExpr::BooleanFunction(function) => {
+            validate_eval_expr_fields(function, errors, derived);
+        }
+        SearchExpr::LiteralComparison { .. } => {
+            // Literal comparisons don't reference fields
+        }
+        SearchExpr::InSubsearch { field, subsearch, .. } => {
+            if let Err(err) = is_valid_field(field, derived) {
+                errors.push(err);
+            }
+            // Validate fields in the subsearch query
+            let mut sub_derived = HashSet::new();
+            validate_query_fields_recursive(subsearch, errors, &mut sub_derived);
+        }
+    }
+}
+
+/// Validate field names in an eval expression
+fn validate_eval_expr_fields(
+    expr: &crate::query::EvalExpression,
+    errors: &mut Vec<FieldValidationError>,
+    derived: &HashSet<String>,
+) {
+    use crate::query::EvalExpression;
+
+    match expr {
+        EvalExpression::Field(field) => {
+            if let Err(err) = is_valid_field(field, derived) {
+                errors.push(err);
+            }
+        }
+        EvalExpression::Literal(_) => {
+            // Literals don't reference fields
+        }
+        EvalExpression::FunctionCall { args, .. } => {
+            // Validate fields in function arguments
+            for arg in args {
+                validate_eval_expr_fields(arg, errors, derived);
+            }
+        }
+        EvalExpression::BinaryOp { left, right, .. } => {
+            validate_eval_expr_fields(left, errors, derived);
+            validate_eval_expr_fields(right, errors, derived);
+        }
+    }
+}
+
+/// Validate field names in a command
+fn validate_command_fields(
+    command: &Command,
+    errors: &mut Vec<FieldValidationError>,
+    derived: &mut HashSet<String>,
+) {
+    match command {
+        Command::Stats {
+            aggregations,
+            group_by,
+        }
+        | Command::Chart {
+            aggregations,
+            group_by,
+        } => {
+            // Validate aggregation fields
+            for agg in aggregations {
+                if let Some(field) = &agg.field {
+                    if let Err(err) = is_valid_field(field, derived) {
+                        errors.push(err);
+                    }
+                }
+            }
+            // Validate group by fields
+            if let Some(fields) = group_by {
+                for field in fields {
+                    if let Err(err) = is_valid_field(field, derived) {
+                        errors.push(err);
+                    }
+                }
+            }
+        }
+        Command::StreamStats {
+            aggregations,
+            group_by,
+            ..
+        } => {
+            // Validate aggregation fields
+            for agg in aggregations {
+                if let Some(field) = &agg.field {
+                    if let Err(err) = is_valid_field(field, derived) {
+                        errors.push(err);
+                    }
+                }
+            }
+            // Validate group by fields
+            if let Some(fields) = group_by {
+                for field in fields {
+                    if let Err(err) = is_valid_field(field, derived) {
+                        errors.push(err);
+                    }
+                }
+            }
+        }
+        Command::Where { condition } => {
+            validate_search_expr_fields(condition, errors, derived);
+        }
+        Command::Sort { fields, .. } => {
+            for sf in fields {
+                if let Err(err) = is_valid_field(&sf.field, derived) {
+                    errors.push(err);
+                }
+            }
+        }
+        Command::Timechart {
+            aggregations,
+            split_by,
+            ..
+        } => {
+            // Validate aggregation fields
+            for agg in aggregations {
+                if let Some(field) = &agg.field {
+                    if let Err(err) = is_valid_field(field, derived) {
+                        errors.push(err);
+                    }
+                }
+            }
+            // Validate split by fields
+            for field in split_by {
+                if let Err(err) = is_valid_field(field, derived) {
+                    errors.push(err);
+                }
+            }
+        }
+        Command::Table { fields } => {
+            for table_field in fields {
+                // Skip validation for wildcard
+                if table_field.name == "*" {
+                    continue;
+                }
+                if let Err(err) = is_valid_field(&table_field.name, derived) {
+                    errors.push(err);
+                }
+            }
+        }
+        Command::Rename { mappings } => {
+            for mapping in mappings {
+                if let Err(err) = is_valid_field(&mapping.from, derived) {
+                    errors.push(err);
+                }
+                // Note: We don't validate the 'to' field since it's a new name being created
+            }
+        }
+        Command::Lookup {
+            key_field,
+            output_fields,
+            ..
+        } => {
+            if let Err(err) = is_valid_field(key_field, derived) {
+                errors.push(err);
+            }
+            if let Some(fields) = output_fields {
+                for field in fields {
+                    if let Err(err) = is_valid_field(field, derived) {
+                        errors.push(err);
+                    }
+                }
+            }
+        }
+        Command::Dedup { fields, .. } => {
+            for field in fields {
+                if let Err(err) = is_valid_field(field, derived) {
+                    errors.push(err);
+                }
+            }
+        }
+        Command::Bin { field, .. } => {
+            if let Some(field_name) = field {
+                if let Err(err) = is_valid_field(field_name, derived) {
+                    errors.push(err);
+                }
+            }
+        }
+        Command::Rex { field, .. } => {
+            if let Some(field_name) = field {
+                if let Err(err) = is_valid_field(field_name, derived) {
+                    errors.push(err);
+                }
+            }
+        }
+        Command::Fields { fields, .. } => {
+            for field in fields {
+                if let Err(err) = is_valid_field(field, derived) {
+                    errors.push(err);
+                }
+            }
+        }
+        Command::Top {
+            field, by_fields, ..
+        }
+        | Command::Rare {
+            field, by_fields, ..
+        } => {
+            if let Err(err) = is_valid_field(field, derived) {
+                errors.push(err);
+            }
+            for by in by_fields {
+                if let Err(err) = is_valid_field(by, derived) {
+                    errors.push(err);
+                }
+            }
+        }
+        Command::Transaction {
+            fields,
+            startswith,
+            endswith,
+            ..
+        } => {
+            for field in fields {
+                if let Err(err) = is_valid_field(field, derived) {
+                    errors.push(err);
+                }
+            }
+            if let Some(expr) = startswith {
+                validate_search_expr_fields(expr, errors, derived);
+            }
+            if let Some(expr) = endswith {
+                validate_search_expr_fields(expr, errors, derived);
+            }
+        }
+        Command::Fillnull { fields, .. } => {
+            if let Some(field_list) = fields {
+                for field in field_list {
+                    if let Err(err) = is_valid_field(field, derived) {
+                        errors.push(err);
+                    }
+                }
+            }
+        }
+        Command::Mvexpand { field, .. } => {
+            if let Err(err) = is_valid_field(field, derived) {
+                errors.push(err);
+            }
+        }
+        Command::Spath { input, output, .. } => {
+            if let Some(field_name) = input {
+                if let Err(err) = is_valid_field(field_name, derived) {
+                    errors.push(err);
+                }
+            }
+            if let Some(field_name) = output {
+                // Output field is being created, so we don't validate it
+                let _ = field_name;
+            }
+        }
+        Command::Append { subsearch, .. } => {
+            // Validate subsearch in its own context, then merge its output
+            // fields into the parent pipeline (appended rows carry those fields)
+            let mut sub_derived = HashSet::new();
+            validate_query_fields_recursive(subsearch, errors, &mut sub_derived);
+            derived.extend(sub_derived);
+        }
+        Command::Join {
+            fields, subsearch, ..
+        } => {
+            for field in fields {
+                if let Err(err) = is_valid_field(field, derived) {
+                    errors.push(err);
+                }
+            }
+            // Validate subsearch in its own context, then merge its output
+            // fields into the parent pipeline (joined columns are available downstream)
+            let mut sub_derived = HashSet::new();
+            validate_query_fields_recursive(subsearch, errors, &mut sub_derived);
+            derived.extend(sub_derived);
+        }
+        Command::Return { fields, .. } => {
+            for field in fields {
+                if let Err(err) = is_valid_field(field, derived) {
+                    errors.push(err);
+                }
+            }
+        }
+        Command::Risk {
+            score,
+            entity_field,
+            weight,
+            ..
+        } => {
+            if let Some(field) = entity_field {
+                if let Err(err) = is_valid_field(field, derived) {
+                    errors.push(err);
+                }
+            }
+            // Validate literal score is within bounds (already validated at parse time, but double-check)
+            if let RiskScoreExpr::Literal(s) = score {
+                if *s < 0 || *s > 100 {
+                    errors.push(FieldValidationError {
+                        field_name: "score".to_string(),
+                        message: format!("Risk score {} is out of bounds (must be 0-100)", s),
+                        suggestions: vec![],
+                    });
+                }
+            }
+            // Validate weight is within bounds if provided
+            if let Some(w) = weight {
+                if !(*w >= 0.0 && *w <= 1.0) {
+                    errors.push(FieldValidationError {
+                        field_name: "weight".to_string(),
+                        message: format!("Risk weight {} is out of bounds (must be 0.0-1.0)", w),
+                        suggestions: vec![],
+                    });
+                }
+            }
+            // For dynamic expressions, validate field references
+            if let RiskScoreExpr::Dynamic(expr) = score {
+                validate_eval_expr_fields(expr, errors, derived);
+            }
+        }
+        Command::Prevalence { conditions, .. } => {
+            // Prevalence conditions use special PrevalenceField enum, not regular field names
+            // So we don't validate them here
+            let _ = conditions;
+        }
+        Command::EventStats {
+            aggregations,
+            group_by,
+        } => {
+            // Validate aggregation fields
+            for agg in aggregations {
+                if let Some(field) = &agg.field {
+                    if let Err(err) = is_valid_field(field, derived) {
+                        errors.push(err);
+                    }
+                }
+            }
+            // Validate group by fields
+            if let Some(fields) = group_by {
+                for field in fields {
+                    if let Err(err) = is_valid_field(field, derived) {
+                        errors.push(err);
+                    }
+                }
+            }
+        }
+        Command::Sequence {
+            group_by,
+            conditions,
+            ..
+        } => {
+            if group_by.is_empty() {
+                errors.push(FieldValidationError {
+                    field_name: "sequence".to_string(),
+                    message: "Sequence requires at least one group by field".to_string(),
+                    suggestions: vec![],
+                });
+            }
+            if conditions.len() < 2 {
+                errors.push(FieldValidationError {
+                    field_name: "sequence".to_string(),
+                    message: "Sequence requires at least two conditions".to_string(),
+                    suggestions: vec![],
+                });
+            }
+            for field in group_by {
+                if let Err(err) = is_valid_field(field, derived) {
+                    errors.push(err);
+                }
+            }
+            for condition in conditions {
+                validate_search_expr_fields(condition, errors, derived);
+            }
+        }
+        Command::Funnel {
+            group_by, steps, ..
+        } => {
+            if group_by.is_empty() {
+                errors.push(FieldValidationError {
+                    field_name: "funnel".to_string(),
+                    message: "Funnel requires at least one group by field".to_string(),
+                    suggestions: vec![],
+                });
+            }
+            if steps.len() < 2 {
+                errors.push(FieldValidationError {
+                    field_name: "funnel".to_string(),
+                    message: "Funnel requires at least two steps".to_string(),
+                    suggestions: vec![],
+                });
+            }
+            for field in group_by {
+                if let Err(err) = is_valid_field(field, derived) {
+                    errors.push(err);
+                }
+            }
+            for (_, condition) in steps {
+                validate_search_expr_fields(condition, errors, derived);
+            }
+        }
+        Command::Anomaly {
+            field, by_fields, ..
+        } => {
+            // Skip validation for aggregation expressions like "count()" or "sum(bytes_out)"
+            if !field.contains('(') {
+                if let Err(err) = is_valid_field(field, derived) {
+                    errors.push(err);
+                }
+            }
+            for by in by_fields {
+                if let Err(err) = is_valid_field(by, derived) {
+                    errors.push(err);
+                }
+            }
+        }
+        Command::Eval { assignments } => {
+            // Validate RHS expressions. Assignments are sequential: earlier
+            // assignments in the same eval are available to later ones.
+            let mut local_derived = derived.clone();
+            for assignment in assignments {
+                validate_eval_expr_fields(&assignment.expression, errors, &local_derived);
+                local_derived.insert(assignment.field.to_lowercase());
+            }
+        }
+        // Commands that don't reference fields
+        Command::Head { .. }
+        | Command::Tail { .. }
+        | Command::Format { .. }
+        | Command::Sample { .. }
+        | Command::Reverse
+        | Command::InputLookup { .. }
+        | Command::Tree { .. }
+        | Command::ResolveIdentity { .. }
+        | Command::Asset { .. }
+        | Command::Cloud { .. }
+        | Command::Lateral { .. }
+        | Command::Ai { .. }
+        | Command::Output { .. } => {
+            // These commands don't reference UDM fields directly or are handled in post-processing
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query::parse_query;
+
+    #[test]
+    fn test_validate_field_name_valid() {
+        assert!(validate_field_name("src_ip").is_ok());
+        assert!(validate_field_name("dest_port").is_ok());
+        assert!(validate_field_name("user").is_ok());
+        assert!(validate_field_name("process_name").is_ok());
+    }
+
+    #[test]
+    fn test_validate_field_name_aliases() {
+        // process is a backward-compat alias for command_line
+        let field = validate_field_name("process").unwrap();
+        assert_eq!(field, UdmField::CommandLine);
+
+        // parent_process is a backward-compat alias for parent_command_line
+        let field = validate_field_name("parent_process").unwrap();
+        assert_eq!(field, UdmField::ParentCommandLine);
+    }
+
+    #[test]
+    fn test_validate_field_name_invalid() {
+        let err = validate_field_name("src_ipp").unwrap_err();
+        assert_eq!(err.field_name, "src_ipp");
+        assert!(!err.suggestions.is_empty());
+        assert!(err.suggestions.contains(&"src_ip".to_string()));
+    }
+
+    #[test]
+    fn test_suggest_similar_fields() {
+        let suggestions = suggest_similar_fields("source_ip", 5);
+        assert!(suggestions.contains(&"src_ip".to_string()));
+
+        let suggestions = suggest_similar_fields("destination_port", 5);
+        assert!(suggestions.contains(&"dest_port".to_string()));
+
+        let suggestions = suggest_similar_fields("username", 5);
+        assert!(
+            suggestions.contains(&"user".to_string())
+                || suggestions.contains(&"user_name".to_string())
+        );
+    }
+
+    #[test]
+    fn test_levenshtein_distance() {
+        assert_eq!(levenshtein_distance("", ""), 0);
+        assert_eq!(levenshtein_distance("abc", "abc"), 0);
+        assert_eq!(levenshtein_distance("abc", "ab"), 1);
+        assert_eq!(levenshtein_distance("abc", "abcd"), 1);
+        assert_eq!(levenshtein_distance("abc", "adc"), 1);
+        assert_eq!(levenshtein_distance("kitten", "sitting"), 3);
+    }
+
+    #[test]
+    fn test_validate_query_fields_valid() {
+        let query = parse_query("src_ip=192.168.1.1 AND dest_port=80").unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(errors.len(), 0);
+    }
+
+    #[test]
+    fn test_validate_query_fields_typo_rejected() {
+        // source_ip is close to src_ip — should be caught as a typo
+        let query = parse_query("source_ip=192.168.1.1").unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field_name, "source_ip");
+        assert!(errors[0].suggestions.contains(&"src_ip".to_string()));
+    }
+
+    #[test]
+    fn test_validate_query_fields_typo_in_stats() {
+        // src_ipp is a typo for src_ip
+        let query = parse_query("error | stats count() by src_ipp").unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field_name, "src_ipp");
+    }
+
+    #[test]
+    fn test_validate_query_fields_typo_in_where() {
+        let query = parse_query("error | where src_ipp=test").unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field_name, "src_ipp");
+    }
+
+    #[test]
+    fn test_validate_query_fields_typo_in_sort() {
+        let query = parse_query("error | sort src_ipp").unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field_name, "src_ipp");
+    }
+
+    #[test]
+    fn test_validate_query_fields_typo_in_table() {
+        let query = parse_query("error | table src_ip, src_ipp").unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field_name, "src_ipp");
+    }
+
+    // --- Derived fields from pipeline stages ---
+
+    #[test]
+    fn test_stats_derived_fields_accepted_in_where() {
+        let query = parse_query(
+            "* | stats dc(src_host) as host_count by process_hash | where host_count < 10",
+        )
+        .unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(
+            errors.len(),
+            0,
+            "where should accept derived field from stats: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_stats_derived_fields_accepted_in_table() {
+        let query = parse_query(
+            "* | stats dc(user) as unique_users by src_ip | table src_ip, unique_users",
+        )
+        .unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(
+            errors.len(),
+            0,
+            "table should accept derived fields from stats: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_stats_derived_fields_accepted_in_sort() {
+        let query = parse_query("* | stats count() as cnt by src_ip | sort -cnt").unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(
+            errors.len(),
+            0,
+            "sort should accept derived field from stats: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_eval_derived_fields_accepted_downstream() {
+        let query = parse_query("* | eval total=bytes_in+bytes_out | where total > 1000").unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(
+            errors.len(),
+            0,
+            "where should accept derived field from eval: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_multi_stage_derived_fields() {
+        let query = parse_query("* | stats dc(user) as unique_users by src_ip | where unique_users > 5 | table src_ip, unique_users").unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(
+            errors.len(),
+            0,
+            "multi-stage pipeline should accept derived fields: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_default_stats_count_accepted() {
+        let query = parse_query("* | stats count() by src_ip | where count > 100").unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(
+            errors.len(),
+            0,
+            "where should accept default 'count' from stats: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_typo_still_rejected_after_stats() {
+        // stats creates host_count, but src_ipp is a typo (not derived)
+        let query = parse_query(
+            "* | stats dc(src_host) as host_count by process_hash | where src_ipp < 10",
+        )
+        .unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field_name, "src_ipp");
+    }
+
+    // --- Ext JSON fields (non-UDM, no close match) ---
+
+    #[test]
+    fn test_ext_field_accepted_in_search() {
+        // threat_score is not a UDM field and not close to one — treat as ext field
+        let query = parse_query("threat_score=high").unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(
+            errors.len(),
+            0,
+            "ext fields should be accepted: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_ext_field_accepted_in_where() {
+        let query = parse_query("* | where vendor_severity > 5").unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(
+            errors.len(),
+            0,
+            "ext fields in where should be accepted: {:?}",
+            errors
+        );
+    }
+
+    // --- Join/append subsearch fields propagated ---
+
+    #[test]
+    fn test_join_subsearch_fields_available_downstream() {
+        let query = parse_query("* | join type=left src_ip [search * | stats dc(src_host) as unique_hosts by src_ip] | where unique_hosts > 5").unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(
+            errors.len(),
+            0,
+            "join subsearch derived fields should be available downstream: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_append_subsearch_fields_available_downstream() {
+        let query = parse_query("* | append [search * | stats count() as alert_count by src_ip] | where alert_count > 0").unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(
+            errors.len(),
+            0,
+            "append subsearch derived fields should be available downstream: {:?}",
+            errors
+        );
+    }
+
+    // --- Eval RHS validation ---
+
+    #[test]
+    fn test_eval_rhs_typo_caught() {
+        // src_ipp is a typo in eval expression — should be caught
+        let query = parse_query("* | eval total=src_ipp+dest_port").unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field_name, "src_ipp");
+    }
+
+    #[test]
+    fn test_eval_rhs_valid_udm_fields() {
+        let query = parse_query("* | eval total=bytes_in+bytes_out").unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(
+            errors.len(),
+            0,
+            "eval should accept valid UDM fields: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_eval_sequential_assignments() {
+        // Second assignment references field from first — should be valid
+        let query =
+            parse_query("* | eval total=bytes_in+bytes_out, ratio=total/bytes_out").unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(
+            errors.len(),
+            0,
+            "eval should accept earlier assignment fields: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_eval_rhs_accepts_derived_from_prior_stage() {
+        let query =
+            parse_query("* | stats sum(bytes_in) as total_in by src_ip | eval doubled=total_in*2")
+                .unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(
+            errors.len(),
+            0,
+            "eval should accept derived fields from prior stages: {:?}",
+            errors
+        );
+    }
+}

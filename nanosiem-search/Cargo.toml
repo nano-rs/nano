@@ -1,0 +1,54 @@
+[package]
+name = "nanosiem-search"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Standalone search service for NanoSIEM"
+
+[lib]
+name = "nanosiem_search"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nanosiem-search"
+path = "src/main.rs"
+
+[dependencies]
+nanosiem-core = { path = "../nanosiem-core" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+
+# SSE streaming
+async-stream = "0.3"
+futures = "0.3"
+
+# Metrics
+axum-prometheus = "0.10"
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+# OpenAPI / Swagger documentation
+utoipa.workspace = true
+utoipa-axum.workspace = true
+utoipa-swagger-ui.workspace = true
+
+# Search result cache (Dragonfly/Redis)
+redis = { version = "1.2", features = ["tokio-comp", "connection-manager"] }
+sha2 = "0.11"
+hex = "0.4"
+flate2 = "1"
+
+[features]
+default = []
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("enterprise"))'] }

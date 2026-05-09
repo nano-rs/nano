@@ -1,0 +1,24 @@
+[package]
+name = "nanosiem-api-lib"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Shared library code for nanosiem-api: auth context, request helpers, and cookie builders that are needed by both the open-core API and the enterprise handler crate. Extracting these into a thin shared crate breaks the circular dependency that would otherwise prevent enterprise handler modules from importing API-tier types"
+publish = false
+
+[lib]
+name = "nanosiem_api_lib"
+path = "src/lib.rs"
+
+[dependencies]
+nanosiem-core = { path = "../nanosiem-core" }
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+utoipa.workspace = true

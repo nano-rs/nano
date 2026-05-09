@@ -1,0 +1,154 @@
+# Authentication Transform for NanoSIEM
+#
+# This transform validates Bearer token authentication for secure HTTP endpoints.
+# Requests without valid authentication are aborted.
+#
+# Requirements: 1.1, 1.2
+
+# =============================================================================
+# Authentication Validation Transform
+# =============================================================================
+# Validates Bearer token from Authorization header against configured secret
+# Aborts requests with invalid or missing tokens
+
+[transforms.auth_check]
+type = "remap"
+inputs = ["http_secure", "https_secure", "http_secure_ndjson", "webhook_secure"]
+source = '''
+# =============================================================================
+# Step 1: Extract Authorization Header
+# =============================================================================
+# Get the Authorization header from the request
+# Vector stores headers in a nested object under .headers or as top-level fields
+
+auth_header = ""
+
+# Try to get Authorization header from various locations
+if exists(.Authorization) {
+    auth_header = to_string(.Authorization) ?? ""
+} else if exists(.authorization) {
+    auth_header = to_string(.authorization) ?? ""
+} else if is_object(.headers) {
+    if exists(.headers.Authorization) {
+        auth_header = to_string(.headers.Authorization) ?? ""
+    } else if exists(.headers.authorization) {
+        auth_header = to_string(.headers.authorization) ?? ""
+    }
+}
+
+# =============================================================================
+# Step 2: Get Expected Token from Environment
+# =============================================================================
+# The expected token is configured via VECTOR_AUTH_TOKEN environment variable
+
+expected_token = get_env_var("VECTOR_AUTH_TOKEN") ?? ""
+
+# If no token is configured, allow all requests (development mode)
+# In production, always set VECTOR_AUTH_TOKEN
+if expected_token == "" {
+    # Development mode - skip auth check but log warning
+    .auth_status = "skipped"
+    .auth_warning = "No VECTOR_AUTH_TOKEN configured - authentication disabled"
+} else {
+    # =============================================================================
+    # Step 3: Validate Bearer Token Format
+    # =============================================================================
+    # Authorization header must be in format: "Bearer <token>"
+
+    if auth_header == "" {
+        # No Authorization header provided
+        # Requirement 1.2: Reject with 401 Unauthorized
+        log("Authentication failed: No Authorization header provided", level: "warn")
+        abort
+    }
+
+    if !starts_with(auth_header, "Bearer ") {
+        # Invalid format - must be Bearer token
+        log("Authentication failed: Invalid Authorization header format", level: "warn")
+        abort
+    }
+
+    # =============================================================================
+    # Step 4: Extract and Validate Token
+    # =============================================================================
+    # Extract the token part after "Bearer "
+
+    token = slice!(auth_header, 7)
+
+    if token != expected_token {
+        # Token mismatch
+        # Requirement 1.2: Reject with 401 Unauthorized
+        log("Authentication failed: Invalid token", level: "warn")
+        abort
+    }
+
+    # Authentication successful
+    .auth_status = "authenticated"
+}
+
+# =============================================================================
+# Step 5: Extract Source Type for Routing
+# =============================================================================
+# Source type can come from X-Source-Type header or source_type field in body
+# Requirement 5.1, 5.2: Route based on source type
+
+source_type = "unknown"
+
+# Check X-Source-Type header first
+if exists(."X-Source-Type") {
+    source_type = to_string(."X-Source-Type") ?? "unknown"
+} else if exists(."x-source-type") {
+    source_type = to_string(."x-source-type") ?? "unknown"
+} else if is_object(.headers) {
+    if exists(.headers."X-Source-Type") {
+        source_type = to_string(.headers."X-Source-Type") ?? "unknown"
+    } else if exists(.headers."x-source-type") {
+        source_type = to_string(.headers."x-source-type") ?? "unknown"
+    }
+}
+
+# Fall back to source_type in body if header not present
+if source_type == "unknown" {
+    if exists(.source_type) {
+        source_type = to_string(.source_type) ?? "unknown"
+    } else if is_object(.message) && exists(.message.source_type) {
+        source_type = to_string(.message.source_type) ?? "unknown"
+    }
+}
+
+.source_type = source_type
+
+# =============================================================================
+# Step 6: Add Ingestion Metadata
+# =============================================================================
+# Add metadata about the ingestion for tracking and debugging
+
+.ingest_timestamp = now()
+.ingest_source = "http_secure"
+
+# Clean up auth-related fields from output (don't store tokens)
+del(.Authorization)
+del(.authorization)
+if is_object(.headers) {
+    del(.headers.Authorization)
+    del(.headers.authorization)
+}
+'''
+
+# =============================================================================
+# Authenticated Events Router
+# =============================================================================
+# Routes authenticated events to rate limiting
+# Events that pass auth go to rate_limit_prep for IP extraction and rate limiting
+
+[transforms.auth_passthrough]
+type = "remap"
+inputs = ["auth_check"]
+source = '''
+# Events that reach here have passed authentication
+# Pass through to rate limiting stage
+.authenticated = true
+'''
+
+# Note: The rate limiting pipeline is defined in transforms/rate_limit.toml
+# Flow: auth_check -> rate_limit_prep -> rate_limit -> rate_limit_passthrough -> request_validation

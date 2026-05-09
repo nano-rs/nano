@@ -1,0 +1,7 @@
+[advisories]
+ignore = [
+    # RSA timing sidechannel - only affects MySQL connections
+    # We only use Postgres, so this code path is never exercised
+    # sqlx-macros pulls in all backends for compile-time checking
+    "RUSTSEC-2023-0071",
+]

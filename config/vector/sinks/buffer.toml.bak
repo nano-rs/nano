@@ -1,0 +1,81 @@
+# Disk Buffer Configuration for NanoSIEM
+#
+# This configuration provides disk-based buffering for reliable log delivery.
+# Ensures no data loss during downstream outages or high load conditions.
+#
+# Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6
+
+# =============================================================================
+# Primary HTTP Sink with Disk Buffer
+# =============================================================================
+# Sends logs to NanoSIEM's REST API with disk buffering for reliability
+# This replaces the basic nanosiem_api sink in vector.toml
+
+[sinks.nanosiem_buffered]
+type = "http"
+# Include outputs from: main pipeline and DB-managed parsers
+inputs = ["prepare_output", "db_parsers_combined"]
+uri = "${NANOSIEM_INGESTION_URL:-http://localhost:3000/api/ingest}"
+method = "post"
+
+# Encoding
+encoding.codec = "json"
+
+# =============================================================================
+# Disk Buffer Configuration
+# =============================================================================
+# Requirement 2.1: Persist incoming logs to disk when downstream is unavailable
+# Requirement 2.2: Configurable maximum size (default 1GB)
+# Requirement 2.5: Survive Vector restarts without data loss
+
+[sinks.nanosiem_buffered.buffer]
+type = "disk"
+# Maximum buffer size: 1GB (1073741824 bytes)
+# Requirement 2.2: Configurable maximum size
+max_size = 1073741824
+
+# Backpressure behavior when buffer is full
+# Requirement 2.3: Apply backpressure by returning HTTP 503
+# "block" causes Vector to apply backpressure to upstream sources
+when_full = "block"
+
+# =============================================================================
+# Batching Configuration
+# =============================================================================
+# Optimize throughput while maintaining reasonable latency
+
+[sinks.nanosiem_buffered.batch]
+# Maximum batch size in bytes (1MB)
+max_bytes = 1048576
+# Maximum events per batch
+max_events = 100
+# Maximum time to wait before sending a batch
+timeout_secs = 5
+
+# =============================================================================
+# Request and Retry Configuration
+# =============================================================================
+# Requirement 2.4: Automatically drain buffered logs when downstream available
+# Configure retry settings for downstream failures
+
+[sinks.nanosiem_buffered.request]
+# Number of concurrent requests
+concurrency = 10
+
+# Rate limiting
+rate_limit_duration_secs = 1
+rate_limit_num = 1000
+
+# Retry configuration for downstream failures
+# Initial backoff delay before first retry
+retry_initial_backoff_secs = 1
+# Maximum backoff delay between retries
+retry_max_duration_secs = 300
+
+# Request timeout
+timeout_secs = 30
+
+# Headers
+[sinks.nanosiem_buffered.request.headers]
+Content-Type = "application/json"
+

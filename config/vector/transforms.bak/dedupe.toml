@@ -1,0 +1,60 @@
+# Deduplication Transform for NanoSIEM
+#
+# This transform removes duplicate log entries within a configurable time window.
+# Requirement 1.2: Deduplicate logs before storage
+
+# =============================================================================
+# Content-Based Deduplication
+# =============================================================================
+# Deduplicates based on raw_content field
+# Keeps the first occurrence of each unique log within the cache window
+
+[transforms.dedupe_content]
+type = "dedupe"
+inputs = ["normalize_logs"]
+
+# Match on raw content for exact duplicate detection
+fields.match = ["raw_content"]
+
+# Cache configuration
+# num_events: Maximum number of unique events to track
+# Higher values = better deduplication but more memory usage
+cache.num_events = 10000
+
+# =============================================================================
+# Hash-Based Deduplication (Alternative)
+# =============================================================================
+# For high-volume environments, use hash-based deduplication
+# This is more memory-efficient but may have rare hash collisions
+
+# [transforms.dedupe_hash]
+# type = "remap"
+# inputs = ["normalize_logs"]
+# source = '''
+# # Generate a hash of the raw content
+# .content_hash = sha256(.raw_content)
+# '''
+
+# [transforms.dedupe_by_hash]
+# type = "dedupe"
+# inputs = ["dedupe_hash"]
+# fields.match = ["content_hash"]
+# cache.num_events = 50000
+
+# =============================================================================
+# Multi-Field Deduplication
+# =============================================================================
+# Deduplicate based on multiple fields for semantic deduplication
+# Useful when the same event may have slightly different raw content
+
+# [transforms.dedupe_semantic]
+# type = "dedupe"
+# inputs = ["normalize_logs"]
+# fields.match = [
+#     "udm.src_ip",
+#     "udm.dest_ip",
+#     "udm.user",
+#     "udm.action",
+#     "udm.process_name"
+# ]
+# cache.num_events = 10000

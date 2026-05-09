@@ -1,0 +1,51 @@
+# Syslog Source Configuration for NanoSIEM
+# 
+# This configuration provides syslog input sources for Vector.
+# Include this file in your main vector.toml using:
+#   [sources]
+#   include = ["sources/syslog.toml"]
+
+# =============================================================================
+# Syslog UDP Source
+# =============================================================================
+# Standard syslog over UDP (port 514)
+# Note: UDP port 514 requires root privileges
+
+[sources.syslog_udp]
+type = "syslog"
+address = "0.0.0.0:514"
+mode = "udp"
+max_length = 102400  # 100KB max message size
+
+# =============================================================================
+# Syslog TCP Source
+# =============================================================================
+# Syslog over TCP (port 1514) - more reliable than UDP
+
+[sources.syslog_tcp]
+type = "syslog"
+address = "0.0.0.0:1514"
+mode = "tcp"
+max_length = 102400
+
+# Connection settings
+connection_limit = 1000
+keepalive.time_secs = 60
+
+# =============================================================================
+# Syslog TLS Source (Optional)
+# =============================================================================
+# Secure syslog over TLS (port 6514)
+# Uncomment and configure certificates to enable
+
+# [sources.syslog_tls]
+# type = "syslog"
+# address = "0.0.0.0:6514"
+# mode = "tcp"
+# max_length = 102400
+# 
+# [sources.syslog_tls.tls]
+# enabled = true
+# ca_file = "/etc/vector/certs/ca.crt"
+# crt_file = "/etc/vector/certs/server.crt"
+# key_file = "/etc/vector/certs/server.key"

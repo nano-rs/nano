@@ -1,0 +1,338 @@
+# Log Normalization Transform for NanoSIEM
+#
+# This transform parses and normalizes logs to the Unified Data Model (UDM).
+# Requirements: 1.1, 2.6, 3.4
+
+# =============================================================================
+# Main Normalization Transform
+# =============================================================================
+
+[transforms.normalize_logs]
+type = "remap"
+inputs = ["*"]  # Accept from all sources - override in main config
+source = '''
+# =============================================================================
+# Step 1: Preserve Raw Content
+# =============================================================================
+# Store the original message for full-text search
+.raw_content = to_string(.message) ?? to_string(encode_json(.))
+
+# =============================================================================
+# Step 2: Initialize Metadata
+# =============================================================================
+.metadata = {}
+
+# Try to parse message as JSON
+if is_string(.message) && starts_with(.message, "{") {
+    parsed, err = parse_json(.message)
+    if err == null {
+        .metadata = parsed
+    }
+} else if is_object(.message) {
+    .metadata = .message
+}
+
+# Copy Vector-added fields to metadata
+if exists(.host) { .metadata._host = .host }
+if exists(.source_type) { .metadata._source_type = .source_type }
+if exists(.file) { .metadata._file = .file }
+
+# Copy syslog-specific fields
+if exists(.hostname) { .metadata.hostname = .hostname }
+if exists(.appname) { .metadata.appname = .appname }
+if exists(.facility) { .metadata.facility = .facility }
+if exists(.severity) { .metadata.severity = .severity }
+if exists(.procid) { .metadata.procid = .procid }
+if exists(.msgid) { .metadata.msgid = .msgid }
+
+# =============================================================================
+# Step 3: Detect Source Type
+# =============================================================================
+# Determine the log format for proper field mapping
+
+source_type = "unknown"
+
+# Check for CEF format
+if is_string(.message) && starts_with(.message, "CEF:") {
+    source_type = "cef"
+}
+# Check for LEEF format
+else if is_string(.message) && starts_with(.message, "LEEF:") {
+    source_type = "leef"
+}
+# Check for syslog indicators
+else if exists(.facility) || exists(.severity) || exists(.appname) {
+    source_type = "syslog"
+}
+# Check for JSON with common fields
+else if is_object(.metadata) && (exists(.metadata.src_ip) || exists(.metadata.source_ip) || exists(.metadata.event_type)) {
+    source_type = "json"
+}
+
+.source_type = source_type
+
+# =============================================================================
+# Step 4: UDM Field Normalization
+# =============================================================================
+.udm = {}
+
+# -----------------------------------------------------------------------------
+# Entity Fields
+# -----------------------------------------------------------------------------
+
+# Source IP - check multiple common field names
+src_ip = null
+src_ip = .metadata.src_ip ?? src_ip
+src_ip = .metadata.source_ip ?? src_ip
+src_ip = .metadata.src ?? src_ip
+src_ip = .metadata.client_ip ?? src_ip
+src_ip = .metadata.clientip ?? src_ip
+src_ip = .metadata.remote_addr ?? src_ip
+if is_object(.metadata.source) { src_ip = .metadata.source.ip ?? src_ip }
+if is_object(.metadata.client) { src_ip = .metadata.client.ip ?? src_ip }
+.udm.src_ip = src_ip
+
+# Destination IP
+dest_ip = null
+dest_ip = .metadata.dest_ip ?? dest_ip
+dest_ip = .metadata.destination_ip ?? dest_ip
+dest_ip = .metadata.dst ?? dest_ip
+dest_ip = .metadata.server_ip ?? dest_ip
+dest_ip = .metadata.serverip ?? dest_ip
+if is_object(.metadata.destination) { dest_ip = .metadata.destination.ip ?? dest_ip }
+if is_object(.metadata.server) { dest_ip = .metadata.server.ip ?? dest_ip }
+.udm.dest_ip = dest_ip
+
+# Source Host
+src_host = null
+src_host = .metadata.src_host ?? src_host
+src_host = .metadata.source_host ?? src_host
+src_host = .metadata.hostname ?? src_host
+src_host = .metadata.host ?? src_host
+src_host = .metadata.shost ?? src_host
+src_host = .hostname ?? src_host
+if is_object(.metadata.source) { src_host = .metadata.source.hostname ?? src_host }
+.udm.src_host = src_host
+
+# Destination Host
+dest_host = null
+dest_host = .metadata.dest_host ?? dest_host
+dest_host = .metadata.destination_host ?? dest_host
+dest_host = .metadata.dhost ?? dest_host
+if is_object(.metadata.destination) { dest_host = .metadata.destination.hostname ?? dest_host }
+.udm.dest_host = dest_host
+
+# User
+user = null
+user = .metadata.user ?? user
+user = .metadata.username ?? user
+user = .metadata.suser ?? user
+user = .metadata.usrName ?? user
+user = .metadata.accountName ?? user
+if is_object(.metadata.user) { user = .metadata.user.name ?? user }
+.udm.user = user
+
+# Action
+action = null
+action = .metadata.action ?? action
+action = .metadata.event_type ?? action
+action = .metadata.act ?? action
+action = .metadata.eventType ?? action
+if is_object(.metadata.event) { action = .metadata.event.action ?? action }
+.udm.action = action
+
+# Status
+status = null
+status = .metadata.status ?? status
+status = .metadata.result ?? status
+status = .metadata.outcome ?? status
+status = .metadata.response_code ?? status
+.udm.status = status
+
+# -----------------------------------------------------------------------------
+# Network Fields
+# -----------------------------------------------------------------------------
+
+# Source Port
+src_port = null
+src_port = .metadata.src_port ?? src_port
+src_port = .metadata.source_port ?? src_port
+src_port = .metadata.spt ?? src_port
+src_port = .metadata.srcPort ?? src_port
+if is_object(.metadata.source) { src_port = .metadata.source.port ?? src_port }
+if is_string(src_port) { src_port = to_int(src_port) ?? null }
+.udm.src_port = src_port
+
+# Destination Port
+dest_port = null
+dest_port = .metadata.dest_port ?? dest_port
+dest_port = .metadata.destination_port ?? dest_port
+dest_port = .metadata.dpt ?? dest_port
+dest_port = .metadata.dstPort ?? dest_port
+if is_object(.metadata.destination) { dest_port = .metadata.destination.port ?? dest_port }
+if is_string(dest_port) { dest_port = to_int(dest_port) ?? null }
+.udm.dest_port = dest_port
+
+# Protocol
+protocol = null
+protocol = .metadata.protocol ?? protocol
+protocol = .metadata.proto ?? protocol
+if is_object(.metadata.network) { protocol = .metadata.network.protocol ?? protocol }
+if is_string(protocol) { protocol = upcase(protocol) }
+.udm.protocol = protocol
+
+# Bytes In/Out
+bytes_in = .metadata.bytes_in ?? .metadata.bytes_received ?? .metadata.in ?? null
+bytes_out = .metadata.bytes_out ?? .metadata.bytes_sent ?? .metadata.out ?? null
+if is_object(.metadata.network) {
+    bytes_in = .metadata.network.bytes_in ?? bytes_in
+    bytes_out = .metadata.network.bytes_out ?? bytes_out
+}
+.udm.bytes_in = bytes_in
+.udm.bytes_out = bytes_out
+
+# -----------------------------------------------------------------------------
+# Process Fields
+# -----------------------------------------------------------------------------
+
+# Process Name
+process_name = null
+process_name = .metadata.process_name ?? process_name
+process_name = .metadata.program ?? process_name
+process_name = .metadata.appname ?? process_name
+process_name = .metadata.sproc ?? process_name
+process_name = .metadata.processName ?? process_name
+process_name = .appname ?? process_name
+if is_object(.metadata.process) { process_name = .metadata.process.name ?? process_name }
+.udm.process_name = process_name
+
+# Process ID
+process_id = null
+process_id = .metadata.process_id ?? process_id
+process_id = .metadata.pid ?? process_id
+process_id = .metadata.procid ?? process_id
+process_id = .metadata.spid ?? process_id
+process_id = .metadata.processId ?? process_id
+process_id = .procid ?? process_id
+if is_object(.metadata.process) { process_id = .metadata.process.pid ?? process_id }
+if is_string(process_id) { process_id = to_int(process_id) ?? null }
+.udm.process_id = process_id
+
+# Parent Process
+parent_process = null
+parent_process = .metadata.parent_process ?? parent_process
+parent_process = .metadata.parentProcessName ?? parent_process
+if is_object(.metadata.process) && is_object(.metadata.process.parent) {
+    parent_process = .metadata.process.parent.name ?? parent_process
+}
+.udm.parent_process = parent_process
+
+# Command Line
+command_line = null
+command_line = .metadata.command_line ?? command_line
+command_line = .metadata.cmdline ?? command_line
+command_line = .metadata.commandLine ?? command_line
+if is_object(.metadata.process) { command_line = .metadata.process.command_line ?? command_line }
+.udm.command_line = command_line
+
+# -----------------------------------------------------------------------------
+# File Fields
+# -----------------------------------------------------------------------------
+
+# File Path
+file_path = null
+file_path = .metadata.file_path ?? file_path
+file_path = .metadata.path ?? file_path
+file_path = .metadata.filePath ?? file_path
+if is_object(.metadata.file) { file_path = .metadata.file.path ?? file_path }
+.udm.file_path = file_path
+
+# File Name
+file_name = null
+file_name = .metadata.file_name ?? file_name
+file_name = .metadata.filename ?? file_name
+file_name = .metadata.fname ?? file_name
+file_name = .metadata.fileName ?? file_name
+if is_object(.metadata.file) { file_name = .metadata.file.name ?? file_name }
+.udm.file_name = file_name
+
+# File Hash
+file_hash = null
+file_hash = .metadata.file_hash ?? file_hash
+file_hash = .metadata.hash ?? file_hash
+file_hash = .metadata.fileHash ?? file_hash
+if is_object(.metadata.file) { file_hash = .metadata.file.hash ?? file_hash }
+.udm.file_hash = file_hash
+
+# File Action
+file_action = null
+file_action = .metadata.file_action ?? file_action
+file_action = .metadata.fileAction ?? file_action
+if is_object(.metadata.file) { file_action = .metadata.file.action ?? file_action }
+.udm.file_action = file_action
+
+# -----------------------------------------------------------------------------
+# Authentication Fields
+# -----------------------------------------------------------------------------
+
+# Auth Type
+auth_type = null
+auth_type = .metadata.auth_type ?? auth_type
+auth_type = .metadata.authType ?? auth_type
+if is_object(.metadata.authentication) { auth_type = .metadata.authentication.type ?? auth_type }
+.udm.auth_type = auth_type
+
+# Auth Result
+auth_result = null
+auth_result = .metadata.auth_result ?? auth_result
+auth_result = .metadata.authResult ?? auth_result
+if is_object(.metadata.authentication) { auth_result = .metadata.authentication.result ?? auth_result }
+.udm.auth_result = auth_result
+
+# Session ID
+session_id = null
+session_id = .metadata.session_id ?? session_id
+session_id = .metadata.sessionId ?? session_id
+session_id = .metadata.cs1 ?? session_id  # CEF custom string 1 often used for session
+if is_object(.metadata.session) { session_id = .metadata.session.id ?? session_id }
+.udm.session_id = session_id
+
+# =============================================================================
+# Step 5: Timestamp Handling
+# =============================================================================
+
+# Try to extract timestamp from various sources
+ts = null
+ts = .metadata.timestamp ?? ts
+ts = .metadata."@timestamp" ?? ts
+ts = .metadata.time ?? ts
+ts = .metadata.rt ?? ts  # CEF receipt time
+ts = .metadata.devTime ?? ts  # LEEF device time
+ts = .timestamp ?? ts
+
+# Convert to timestamp if string
+if is_string(ts) {
+    parsed_ts, err = parse_timestamp(ts, "%+")
+    if err == null {
+        ts = parsed_ts
+    } else {
+        # Try common formats
+        parsed_ts, err = parse_timestamp(ts, "%Y-%m-%dT%H:%M:%S%.fZ")
+        if err == null {
+            ts = parsed_ts
+        } else {
+            parsed_ts, err = parse_timestamp(ts, "%Y-%m-%d %H:%M:%S")
+            if err == null {
+                ts = parsed_ts
+            }
+        }
+    }
+}
+
+# Default to now if no valid timestamp
+if !is_timestamp(ts) {
+    ts = now()
+}
+
+.udm.timestamp = format_timestamp!(ts, "%+")
+'''

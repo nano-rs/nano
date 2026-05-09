@@ -1,0 +1,70 @@
+# Rust build artifacts (** matches nested dirs like fuzz/target/)
+**/target/
+**/*.rs.bk
+**/*.pdb
+
+# Fuzz corpus/artifacts (not needed for builds)
+**/fuzz/corpus/
+**/fuzz/artifacts/
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Documentation
+*.md
+docs/
+docs-site/
+examples/
+samples/
+
+# IDE
+.vscode/
+.idea/
+.kiro/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Test files
+test-*.sh
+*_test.rs
+tests/
+
+# CI/CD
+.github/
+.claude/
+
+# Docker
+docker-compose*.yml
+Dockerfile*
+.dockerignore
+
+# Node / frontend (not needed for Rust builds)
+nanosiem-web/
+deploy/
+
+# Database
+*.db
+*.sqlite
+clickhouse/*.xml
+clickhouse/config.d/
+
+# Misc
+*.png
+*.jpg
+*.svg
+cursor_alignment_test.html
+test_syntax_highlighting.html
+scripts/
+config/

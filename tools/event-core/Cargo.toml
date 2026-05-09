@@ -1,0 +1,25 @@
+[package]
+name = "event-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Shared event generation core for log-blaster and injector tools"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+
+# HTTP client
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+
+# RNG
+rand = "0.9"
+
+# Fast concurrent data structures
+parking_lot = "0.12"

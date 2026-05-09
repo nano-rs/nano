@@ -1,0 +1,34 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* Linting */
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+
+    /* for ShadCN — paths is relative to this tsconfig (TS 6 deprecated baseUrl) */
+    /* @/enterprise/* falls back from real enterprise impls to stubs so type
+       checking succeeds in both editions — open-edition Vite swaps to stubs
+       at build time via alias. See vite.config.ts and the open-core split
+       plan at ~/.claude/plans/buzzing-brewing-crown.md. */
+    "paths": {
+      "@/enterprise/*": ["./src/enterprise/*", "./src/enterprise-stubs/*"],
+      "@/*": ["./src/*"]
+    }
+  },
+  "include": ["src"]
+}

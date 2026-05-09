@@ -1,0 +1,289 @@
+<?xml version="1.0"?>
+<!--
+  Query Limits and User Profiles for SIEM Workloads
+
+  Profiles:
+  - default: Standard analyst queries (dashboards, searches)
+  - analytics: Long-running reports and threat hunting
+  - realtime: NRT detection rules (fast, limited resources)
+  - ingestion: Optimized for Vector/insert operations
+
+  These prevent resource exhaustion during incident investigations
+  when multiple analysts run concurrent queries.
+-->
+<clickhouse>
+    <!-- =======================================================================
+         USER PROFILES
+         ======================================================================= -->
+    <profiles>
+        <!-- =================================================================
+             DEFAULT PROFILE
+             Standard SIEM analyst queries: searches, dashboards, investigations
+             ================================================================= -->
+        <default>
+            <!-- Memory Limits -->
+            <max_memory_usage>20000000000</max_memory_usage> <!-- 20GB per query -->
+            <max_memory_usage_for_user>40000000000</max_memory_usage_for_user> <!-- 40GB per user session -->
+
+            <!-- External processing when memory exceeded -->
+            <max_bytes_before_external_group_by>10000000000</max_bytes_before_external_group_by> <!-- 10GB -->
+            <max_bytes_before_external_sort>10000000000</max_bytes_before_external_sort> <!-- 10GB -->
+
+            <!-- Execution Time Limits -->
+            <max_execution_time>300</max_execution_time> <!-- 5 minutes -->
+            <timeout_before_checking_execution_speed>30</timeout_before_checking_execution_speed>
+
+            <!-- Data Volume Limits -->
+            <max_rows_to_read>1000000000</max_rows_to_read> <!-- 1 billion rows -->
+            <max_bytes_to_read>100000000000</max_bytes_to_read> <!-- 100GB -->
+            <max_result_rows>1000000</max_result_rows> <!-- 1M result rows -->
+            <max_result_bytes>1000000000</max_result_bytes> <!-- 1GB result size -->
+
+            <!-- Thread Settings -->
+            <max_threads>16</max_threads>
+            <max_insert_threads>8</max_insert_threads>
+
+            <!-- Queue Settings -->
+            <queue_max_wait_ms>60000</queue_max_wait_ms> <!-- 60s wait in queue -->
+            <priority>0</priority> <!-- Default priority -->
+
+            <!-- Query Optimization (SIEM-specific) -->
+            <optimize_move_to_prewhere>1</optimize_move_to_prewhere>
+            <optimize_read_in_order>1</optimize_read_in_order>
+            <read_in_order_two_level_merge_threshold>100</read_in_order_two_level_merge_threshold>
+            <optimize_aggregation_in_order>1</optimize_aggregation_in_order>
+
+            <!-- Index Usage -->
+            <force_index_by_date>0</force_index_by_date>
+            <force_primary_key>0</force_primary_key>
+            <use_skip_indexes>1</use_skip_indexes>
+
+            <!-- ClickHouse 25.3+ Query Condition Cache
+                 Caches which granules match WHERE conditions - huge win for
+                 repeated dashboard/alert queries with same filters -->
+            <use_query_condition_cache>1</use_query_condition_cache>
+
+            <!-- ClickHouse 25.12+ Top-N Query Optimizations
+                 Speeds up ORDER BY ... LIMIT queries significantly -->
+            <use_skip_indexes_for_top_k>1</use_skip_indexes_for_top_k>
+
+            <!-- ClickHouse 25.12+ Lazy Reading Optimization
+                 75x faster for large LIMIT queries -->
+            <query_plan_max_limit_for_lazy_materialization>10000</query_plan_max_limit_for_lazy_materialization>
+
+            <!-- Join Settings -->
+            <join_algorithm>auto</join_algorithm>
+            <partial_merge_join_optimizations>1</partial_merge_join_optimizations>
+            <join_overflow_mode>throw</join_overflow_mode>
+
+            <!-- Async Insert (for application inserts) -->
+            <async_insert>1</async_insert>
+            <wait_for_async_insert>0</wait_for_async_insert>
+            <async_insert_max_data_size>104857600</async_insert_max_data_size>
+
+            <!-- Result Formatting -->
+            <output_format_pretty_max_rows>10000</output_format_pretty_max_rows>
+
+            <!-- Security -->
+            <readonly>0</readonly>
+            <allow_ddl>0</allow_ddl>
+
+            <!-- Distributed Query Settings -->
+            <distributed_product_mode>allow</distributed_product_mode>
+            <distributed_aggregation_memory_efficient>1</distributed_aggregation_memory_efficient>
+
+            <!-- Logging -->
+            <log_queries>1</log_queries>
+            <log_query_threads>0</log_query_threads>
+
+            <!-- Disable profiling - prevents trace_log bloat and CPU spikes -->
+            <memory_profiler_step>0</memory_profiler_step>
+            <memory_profiler_sample_probability>0</memory_profiler_sample_probability>
+            <query_profiler_real_time_period_ns>0</query_profiler_real_time_period_ns>
+            <query_profiler_cpu_time_period_ns>0</query_profiler_cpu_time_period_ns>
+            <trace_profile_events>0</trace_profile_events>
+
+            <!-- Enable full-text index support (required for tokenbf_v1 indexes in CH 25.12+) -->
+            <enable_full_text_index>1</enable_full_text_index>
+        </default>
+
+        <!-- =================================================================
+             ANALYTICS PROFILE
+             Long-running threat hunting, reports, and forensic analysis
+             ================================================================= -->
+        <analytics>
+            <!-- Extended limits for deep analysis -->
+            <max_execution_time>3600</max_execution_time> <!-- 1 hour -->
+            <max_memory_usage>50000000000</max_memory_usage> <!-- 50GB -->
+            <max_memory_usage_for_user>80000000000</max_memory_usage_for_user> <!-- 80GB -->
+
+            <!-- Allow reading more data -->
+            <max_rows_to_read>10000000000</max_rows_to_read> <!-- 10 billion rows -->
+            <max_bytes_to_read>500000000000</max_bytes_to_read> <!-- 500GB -->
+            <max_result_rows>10000000</max_result_rows> <!-- 10M result rows -->
+
+            <!-- More threads for parallel processing -->
+            <max_threads>32</max_threads>
+
+            <!-- Lower priority than realtime queries -->
+            <priority>5</priority>
+
+            <!-- External processing for large aggregations -->
+            <max_bytes_before_external_group_by>20000000000</max_bytes_before_external_group_by> <!-- 20GB -->
+            <max_bytes_before_external_sort>20000000000</max_bytes_before_external_sort>
+
+            <!-- Logging -->
+            <log_queries>1</log_queries>
+            <log_query_threads>1</log_query_threads>
+
+            <!-- Disable profiling -->
+            <memory_profiler_step>0</memory_profiler_step>
+            <query_profiler_real_time_period_ns>0</query_profiler_real_time_period_ns>
+            <query_profiler_cpu_time_period_ns>0</query_profiler_cpu_time_period_ns>
+        </analytics>
+
+        <!-- =================================================================
+             REALTIME PROFILE
+             NRT detection rules - must be fast and predictable
+             ================================================================= -->
+        <realtime>
+            <!-- Strict time limits for detection latency -->
+            <max_execution_time>30</max_execution_time> <!-- 30 seconds max -->
+            <timeout_before_checking_execution_speed>5</timeout_before_checking_execution_speed>
+
+            <!-- Limited memory to prevent impact on other queries -->
+            <max_memory_usage>5000000000</max_memory_usage> <!-- 5GB -->
+            <max_memory_usage_for_user>10000000000</max_memory_usage_for_user> <!-- 10GB -->
+
+            <!-- Limited data volume -->
+            <max_rows_to_read>100000000</max_rows_to_read> <!-- 100M rows -->
+            <max_bytes_to_read>10000000000</max_bytes_to_read> <!-- 10GB -->
+            <max_result_rows>100000</max_result_rows> <!-- 100K results -->
+
+            <!-- Fewer threads to leave resources for other queries -->
+            <max_threads>8</max_threads>
+
+            <!-- Highest priority in queue -->
+            <priority>1</priority>
+            <queue_max_wait_ms>5000</queue_max_wait_ms> <!-- 5s max wait -->
+
+            <!-- Optimization for time-series queries -->
+            <optimize_read_in_order>1</optimize_read_in_order>
+            <read_in_order_two_level_merge_threshold>10</read_in_order_two_level_merge_threshold>
+
+            <!-- ClickHouse 25.3+ Query Condition Cache - Critical for NRT rules
+                 that run the same time-window filters repeatedly -->
+            <use_query_condition_cache>1</use_query_condition_cache>
+            <use_skip_indexes_for_top_k>1</use_skip_indexes_for_top_k>
+
+            <!-- Logging -->
+            <log_queries>1</log_queries>
+
+            <!-- Disable profiling -->
+            <memory_profiler_step>0</memory_profiler_step>
+            <query_profiler_real_time_period_ns>0</query_profiler_real_time_period_ns>
+            <query_profiler_cpu_time_period_ns>0</query_profiler_cpu_time_period_ns>
+        </realtime>
+
+        <!-- =================================================================
+             INGESTION PROFILE
+             Optimized for Vector and bulk data loading
+             ================================================================= -->
+        <ingestion>
+            <!-- No time limit for ingestion -->
+            <max_execution_time>0</max_execution_time>
+
+            <!-- Memory for insert operations -->
+            <max_memory_usage>10000000000</max_memory_usage> <!-- 10GB -->
+
+            <!-- Insert-specific settings -->
+            <max_insert_threads>16</max_insert_threads>
+            <max_insert_block_size>1048576</max_insert_block_size> <!-- 1M rows -->
+
+            <!-- Async insert optimization -->
+            <async_insert>1</async_insert>
+            <wait_for_async_insert>0</wait_for_async_insert>
+            <async_insert_max_data_size>104857600</async_insert_max_data_size> <!-- 100MB -->
+            <async_insert_busy_timeout_ms>1000</async_insert_busy_timeout_ms>
+            <async_insert_stale_timeout_ms>5000</async_insert_stale_timeout_ms>
+
+            <!-- Allow deduplication for idempotent inserts -->
+            <insert_deduplicate>1</insert_deduplicate>
+
+            <!-- Parallel inserts -->
+            <parallel_distributed_insert_select>2</parallel_distributed_insert_select>
+
+            <!-- Don't log every insert query -->
+            <log_queries>0</log_queries>
+
+            <!-- Lower priority than queries -->
+            <priority>8</priority>
+
+            <!-- Disable profiling -->
+            <memory_profiler_step>0</memory_profiler_step>
+            <query_profiler_real_time_period_ns>0</query_profiler_real_time_period_ns>
+            <query_profiler_cpu_time_period_ns>0</query_profiler_cpu_time_period_ns>
+        </ingestion>
+
+        <!-- =================================================================
+             ADMIN PROFILE
+             For schema changes and maintenance operations
+             ================================================================= -->
+        <admin>
+            <!-- No limits for admin operations -->
+            <max_execution_time>0</max_execution_time>
+            <max_memory_usage>0</max_memory_usage>
+            <max_rows_to_read>0</max_rows_to_read>
+            <max_bytes_to_read>0</max_bytes_to_read>
+            <max_threads>64</max_threads>
+
+            <!-- Allow DDL -->
+            <readonly>0</readonly>
+            <allow_ddl>1</allow_ddl>
+
+            <!-- Enable full-text index support (required for tokenbf_v1 indexes in CH 25.12+) -->
+            <enable_full_text_index>1</enable_full_text_index>
+
+            <!-- Logging -->
+            <log_queries>1</log_queries>
+            <log_query_threads>1</log_query_threads>
+
+            <!-- Disable profiling -->
+            <memory_profiler_step>0</memory_profiler_step>
+            <query_profiler_real_time_period_ns>0</query_profiler_real_time_period_ns>
+            <query_profiler_cpu_time_period_ns>0</query_profiler_cpu_time_period_ns>
+        </admin>
+    </profiles>
+
+    <!-- =======================================================================
+         USERS
+         Map users to profiles
+         ======================================================================= -->
+    <users>
+        <!-- Main application user -->
+        <nanosiem>
+            <profile>default</profile>
+            <quota>default</quota>
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+        </nanosiem>
+    </users>
+
+    <!-- =======================================================================
+         QUOTAS
+         Resource usage limits over time periods
+         ======================================================================= -->
+    <quotas>
+        <default>
+            <interval>
+                <duration>3600</duration> <!-- 1 hour -->
+                <queries>100000</queries>
+                <errors>100000</errors>
+                <result_rows>1000000000</result_rows>
+                <read_rows>100000000000</read_rows>
+                <execution_time>36000</execution_time> <!-- 10 hours total -->
+            </interval>
+        </default>
+    </quotas>
+</clickhouse>

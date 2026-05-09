@@ -1,0 +1,1134 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (.dark &);
+
+@theme inline {
+  /* Colors — all map to CSS vars in :root/.dark */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-warning-muted: var(--warning-muted);
+  --color-warning-border: var(--warning-border);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-input-border: var(--input-border);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-ai: var(--ai);
+  --color-ai-foreground: var(--ai-foreground);
+  --color-ai-muted: var(--ai-muted);
+  --color-ai-border: var(--ai-border);
+  --color-ai-bg: var(--ai-bg);
+  --color-ai-bg-subtle: var(--ai-bg-subtle);
+  --color-ai-shadow: var(--ai-shadow);
+  --color-brand-50: var(--brand-50);
+  --color-brand-100: var(--brand-100);
+  --color-brand-200: var(--brand-200);
+  --color-brand-300: var(--brand-300);
+  --color-brand-400: var(--brand-400);
+  --color-brand-500: var(--brand-500);
+  --color-brand-600: var(--brand-600);
+  --color-brand-700: var(--brand-700);
+  --color-brand-800: var(--brand-800);
+  --color-brand-900: var(--brand-900);
+  --color-brand-1000: var(--brand-1000);
+  --color-accent-purple: var(--accent-purple);
+  --color-accent-green: var(--accent-green);
+  --color-accent-blue: var(--accent-blue);
+  --color-accent-orange: var(--accent-orange);
+  --color-accent-cyan: var(--accent-cyan);
+  --color-accent-yellow: var(--accent-yellow);
+  --color-accent-light-blue: var(--accent-light-blue);
+  --color-alpha-white-50: var(--alpha-white-50);
+  --color-alpha-white-100: var(--alpha-white-100);
+  --color-alpha-white-200: var(--alpha-white-200);
+  --color-alpha-white-300: var(--alpha-white-300);
+  --color-alpha-white-400: var(--alpha-white-400);
+  --color-alpha-white-500: var(--alpha-white-500);
+  --color-alpha-white-600: var(--alpha-white-600);
+  --color-alpha-white-700: var(--alpha-white-700);
+  --color-alpha-white-800: var(--alpha-white-800);
+  --color-alpha-white-900: var(--alpha-white-900);
+
+  /* Design-kit specific tokens (NAN-368 redesign) */
+  --color-outer: var(--outer);
+  --color-card-2: var(--card-2);
+  --color-panel: var(--panel);
+  --color-inspector: var(--inspector);
+  --color-border-2: var(--border-2);
+  --color-rule: var(--rule);
+  --color-brand: var(--brand);
+  --color-brand-2: var(--brand-2);
+  --color-brand-ink: var(--brand-ink);
+  --color-str: var(--str);
+  --color-success: var(--success);
+
+  /* Border radius — kit scale: sharp, restrained */
+  --radius-sm: 3px;
+  --radius-md: 5px;
+  --radius-lg: 6px;
+  --radius-xl: 8px;
+  --radius-2xl: 10px;
+
+  /* Font families (literal — same in light/dark) */
+  --font-sans: 'Geist', system-ui, sans-serif;
+  --font-serif: Georgia, serif;
+  --font-mono: 'Geist Mono', Menlo, Courier, monospace;
+
+  /* Letter spacing */
+  --tracking-tighter: -0.05em;
+  --tracking-tight: -0.025em;
+  --tracking-normal: 0em;
+  --tracking-wide: 0.025em;
+  --tracking-wider: 0.05em;
+  --tracking-widest: 0.1em;
+
+  /* Shadows — map to CSS vars (differ per theme) */
+  --shadow-2xs: var(--shadow-2xs);
+  --shadow-xs: var(--shadow-xs);
+  --shadow-sm: var(--shadow-sm);
+  --shadow: var(--shadow);
+  --shadow-md: var(--shadow-md);
+  --shadow-lg: var(--shadow-lg);
+  --shadow-xl: var(--shadow-xl);
+  --shadow-2xl: var(--shadow-2xl);
+
+  /* Spacing base */
+  --spacing: 0.25rem;
+
+  /* Accordion animations */
+  --animate-accordion-down: accordion-down 0.2s ease-out;
+  --animate-accordion-up: accordion-up 0.2s ease-out;
+}
+
+@keyframes accordion-down {
+  from { height: 0; }
+  to { height: var(--radix-accordion-content-height); }
+}
+@keyframes accordion-up {
+  from { height: var(--radix-accordion-content-height); }
+  to { height: 0; }
+}
+@keyframes indeterminate {
+  0% { width: 10%; margin-left: 0; }
+  50% { width: 40%; margin-left: 30%; }
+  100% { width: 10%; margin-left: 90%; }
+}
+
+/* =============================================================================
+   CUSTOM OVERRIDES: Base Font and Rendering Settings
+   Requirements: 4.3 - Preserve base font-family and rendering settings
+   These settings ensure consistent typography and text rendering across browsers.
+   ============================================================================= */
+:root {
+  font-family: Geist, system-ui, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+
+  /* Font rendering optimizations for crisp text */
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  /* PIVT (ambient AI assistant) accent tokens. Violet is deliberately off the
+     cyan brand so PIVT's voice reads as distinct. Hue 300° approximates the
+     mockup's #A78BFA. */
+  --pivt-accent: oklch(74% 0.16 300);
+  --pivt-accent-dim: oklch(58% 0.12 300);
+  --pivt-accent-bg: color-mix(in srgb, var(--pivt-accent) 10%, transparent);
+  --pivt-accent-border: color-mix(in srgb, var(--pivt-accent) 28%, transparent);
+}
+
+@keyframes pivt-summon-pulse {
+  0%   { box-shadow: 0 0 0 0   color-mix(in srgb, var(--pivt-accent) 55%, transparent); }
+  70%  { box-shadow: 0 0 0 10px color-mix(in srgb, var(--pivt-accent) 0%,  transparent); }
+  100% { box-shadow: 0 0 0 0   color-mix(in srgb, var(--pivt-accent) 0%,  transparent); }
+}
+
+/* Override vaul drawer's user-select: none so text is selectable */
+[vaul-drawer] {
+  user-select: text !important;
+  -webkit-user-select: text !important;
+}
+
+/* Base layout settings to prevent horizontal overflow */
+html {
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+.search-console-page {
+  position: relative;
+}
+
+.search-console-page::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: none;
+}
+
+.search-console-page::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: none;
+}
+
+.search-console-card {
+  background: var(--card);
+  border-color: transparent;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 12px 28px rgba(2, 6, 23, 0.14);
+}
+
+.search-console-card::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 0;
+  background: transparent;
+  pointer-events: none;
+}
+
+.search-console-header,
+.search-console-toolbar {
+  position: relative;
+  z-index: 1;
+}
+
+.search-console-header {
+  color: color-mix(in srgb, var(--foreground) 78%, transparent);
+}
+
+.search-console-mode {
+  color: color-mix(in srgb, var(--primary) 62%, var(--foreground));
+}
+
+.search-console-separator {
+  color: color-mix(in srgb, var(--primary) 48%, transparent);
+}
+
+.search-console-time {
+  color: color-mix(in srgb, var(--foreground) 52%, transparent);
+}
+
+.search-console-input-shell {
+  background: var(--background);
+  border-color: color-mix(in srgb, var(--border) 78%, white 8%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.03),
+    0 0 0 1px rgba(255, 255, 255, 0.02);
+}
+
+.search-console-input-shell:focus-within {
+  border-color: color-mix(in srgb, var(--primary) 45%, var(--border));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    0 0 0 1px color-mix(in srgb, var(--primary) 28%, transparent);
+}
+
+.search-console-dropdown,
+.search-console-subpanel {
+  background: var(--card);
+  border-color: rgba(148, 163, 184, 0.18);
+}
+
+.search-console-history {
+  box-shadow:
+    0 10px 28px rgba(2, 6, 23, 0.16),
+    0 0 0 1px rgba(148, 163, 184, 0.08);
+}
+
+.search-console-action {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.search-console-toolbar {
+  color: color-mix(in srgb, var(--foreground) 72%, transparent);
+}
+
+:root .search-console-card {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.04),
+    0 4px 12px rgba(2, 6, 23, 0.06);
+}
+
+.search-workspace-panel {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.03),
+    0 1px 3px rgba(2, 6, 23, 0.04);
+}
+
+.dark .search-workspace-panel {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.02),
+    0 2px 8px rgba(2, 6, 23, 0.12);
+}
+
+/* Redesign (NAN-372): Search workspace no longer uses a unified outer shell.
+   Each panel (field index, chart card, inspector, results) is its own
+   bordered card with gap-2.5 spacing, per design-ref/shadcn/app.jsx. */
+.search-workspace-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 0.625rem; /* 10px == gap-2.5 */
+}
+
+.search-workspace-attached {
+  /* No-op now: retained for backward-compat with existing className usage */
+}
+
+.search-workspace-section {
+  /* No-op now: panels apply their own bg/border via utility classes */
+}
+
+:root .search-console-input-shell {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.02),
+    0 0 0 1px rgba(15, 23, 42, 0.03);
+}
+
+:root .search-console-input-shell:focus-within {
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.03),
+    0 0 0 1px color-mix(in srgb, var(--primary) 22%, transparent);
+}
+
+/* Reserve room on the right of the search-console input for the always-
+   visible keyboard hint overlay ("⌘↵ run · ↓ history") so typed content
+   doesn't overlap it. */
+.search-console-input-shell .cm-content {
+  padding-right: 160px;
+}
+
+/* Natural-language mode — when the shell is in aiMode (bg-ai-bg-subtle),
+   override the CodeMirror content color so the typed prose renders in
+   the AI purple instead of the default foreground. */
+.search-console-input-shell.bg-ai-bg-subtle .cm-content,
+.search-console-input-shell.bg-ai-bg-subtle .cm-line,
+.search-console-input-shell.bg-ai-bg-subtle .cm-cursor {
+  color: var(--ai-muted);
+}
+.search-console-input-shell.bg-ai-bg-subtle .cm-cursor {
+  border-left-color: var(--ai-muted);
+}
+
+.search-console-section-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--foreground) 76%, transparent);
+}
+
+.search-console-section-header > svg {
+  width: 14px;
+  height: 14px;
+  color: color-mix(in srgb, var(--foreground) 55%, transparent);
+  flex-shrink: 0;
+}
+
+.search-console-section-meta {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--foreground) 44%, transparent);
+}
+
+.search-console-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: var(--font-sans);
+}
+
+:root .search-console-header {
+  color: color-mix(in srgb, var(--foreground) 86%, transparent);
+}
+
+:root .search-console-mode {
+  color: color-mix(in srgb, var(--primary) 72%, var(--foreground));
+}
+
+:root .search-console-separator {
+  color: color-mix(in srgb, var(--primary) 56%, transparent);
+}
+
+:root .search-console-time,
+:root .search-console-section-meta {
+  color: color-mix(in srgb, var(--foreground) 58%, transparent);
+}
+
+#root {
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* =============================================================================
+   TWEAKCN TWITTER THEME: CSS Variables
+   These variables are generated by tweakcn and define the color scheme for
+   both light and dark modes using the oklch color format.
+   ============================================================================= */
+@layer base {
+  /* Light mode — kit `.light` values (NAN-368)
+   * Note: Dark is the default theme (applied by theme init script in index.html).
+   * Light is the override. */
+  :root {
+    /* Surfaces */
+    --background: #F1F5F9;
+    --foreground: #0F172A;
+    --card: #FFFFFF;
+    --card-foreground: #0F172A;
+    --popover: #FFFFFF;
+    --popover-foreground: #0F172A;
+
+    /* Brand (shadcn "primary" ↔ kit "brand") */
+    --primary: #0891B2;
+    --primary-foreground: #FFFFFF;
+
+    /* Secondary = kit card-2 (subtle elevated surface) */
+    --secondary: #F1F5F9;
+    --secondary-foreground: #0F172A;
+
+    /* Muted = kit panel (softer bg), muted-fg = kit fg-3 */
+    --muted: #F8FAFC;
+    --muted-foreground: #64748B;
+
+    /* Accent = kit card-2 (hover/selected states) */
+    --accent: #F1F5F9;
+    --accent-foreground: #0F172A;
+
+    /* Destructive / warning */
+    --destructive: #B91C1C;
+    --destructive-foreground: #FFFFFF;
+    --warning: #CA8A04;
+    --warning-foreground: #422006;
+    --warning-muted: #FEF9C3;
+    --warning-border: #FDE68A;
+
+    /* Borders + input */
+    --border: #E2E8F0;
+    --input: #FFFFFF;
+    --input-border: #CBD5E1;
+    --ring: #0891B2;
+
+    /* Chart palette — neutral placeholders; route PRs can refine */
+    --chart-1: #0891B2;
+    --chart-2: #059669;
+    --chart-3: #CA8A04;
+    --chart-4: #7C3AED;
+    --chart-5: #2563EB;
+
+    --radius: 6px;
+
+    /* Sidebar = kit outer (chrome-level bg) */
+    --sidebar: #E2E8F0;
+    --sidebar-foreground: #0F172A;
+    --sidebar-primary: #0891B2;
+    --sidebar-primary-foreground: #FFFFFF;
+    --sidebar-accent: #F1F5F9;
+    --sidebar-accent-foreground: #0F172A;
+    --sidebar-border: #E2E8F0;
+    --sidebar-ring: #0891B2;
+
+    /* Design-kit specific tokens */
+    --outer: #E2E8F0;
+    --card-2: #F1F5F9;
+    --panel: #F8FAFC;
+    --inspector: #F8FAFC;
+    --border-2: #CBD5E1;
+    --rule: #EDF2F7;
+    --brand: #0891B2;
+    --brand-2: #0E7490;
+    --brand-ink: #FFFFFF;
+    --str: #0E7490;
+    --success: #059669;
+
+    /* Fonts */
+    --font-sans: Geist, system-ui, sans-serif;
+    --font-serif: Georgia, serif;
+    --font-mono: 'Geist Mono', Menlo, Courier, monospace;
+
+    /* Shadows — disabled by default; kit uses shadows only on modals/popovers */
+    --shadow-color: rgba(15, 23, 42, 0.10);
+    --shadow-opacity: 0;
+    --shadow-blur: 0px;
+    --shadow-spread: 0px;
+    --shadow-offset-x: 0px;
+    --shadow-offset-y: 2px;
+    --letter-spacing: 0em;
+    --spacing: 0.25rem;
+    --shadow-2xs: 0 1px 2px 0 rgba(15, 23, 42, 0.04);
+    --shadow-xs: 0 1px 2px 0 rgba(15, 23, 42, 0.06);
+    --shadow-sm: 0 1px 3px 0 rgba(15, 23, 42, 0.08);
+    --shadow: 0 2px 4px 0 rgba(15, 23, 42, 0.08);
+    --shadow-md: 0 4px 8px -2px rgba(15, 23, 42, 0.10);
+    --shadow-lg: 0 10px 20px -4px rgba(15, 23, 42, 0.12);
+    --shadow-xl: 0 20px 40px -8px rgba(15, 23, 42, 0.16);
+    --shadow-2xl: 0 28px 60px -12px rgba(15, 23, 42, 0.24);
+    --tracking-normal: 0em;
+
+    /* Syntax highlighting — light mode (preserved; CodeMirror-specific, not part of kit) */
+    --syntax-comment: #6a737d;
+    --syntax-string: #c2185b;
+    --syntax-regex: #c2185b;
+    --syntax-regex-delim: #9c1453;
+    --syntax-regex-bg: rgba(194, 24, 91, 0.07);
+    --syntax-wildcard: #e65100;
+    --syntax-wildcard-bg: rgba(230, 81, 0, 0.07);
+    --syntax-keyword: #7b1fa2;
+    --syntax-function: #2e7d32;
+    --syntax-eval-function: #0277bd;
+    --syntax-udm-field: #1565c0;
+    --syntax-field: #1976d2;
+    --syntax-operator: #6a737d;
+    --syntax-pipe: #6a737d;
+    --syntax-arithmetic: #e65100;
+    --syntax-number: #e65100;
+
+    /* Heatmap empty cell color */
+    --heatmap-empty: #E2E8F0;
+
+    /* Accent colors (status chips, legends, etc.) — light mode */
+    --accent-purple: #7c3aed;
+    --accent-green: #16a34a;
+    --accent-blue: #2563eb;
+    --accent-orange: #c2410c;
+    --accent-cyan: #0891b2;
+    --accent-yellow: #ca8a04;
+    --accent-light-blue: #3b82f6;
+
+    /* AI/MeloD theme — distinct purple for AI features, preserved across redesign */
+    --ai: #7c3aed;
+    --ai-foreground: #ffffff;
+    --ai-muted: #6d28d9;
+    --ai-border: rgba(124, 58, 237, 0.35);
+    --ai-bg: rgba(124, 58, 237, 0.10);
+    --ai-bg-subtle: rgba(124, 58, 237, 0.06);
+    --ai-shadow: rgba(124, 58, 237, 0.15);
+
+    /* Brand alpha scale (light) — uses kit brand cyan #0891B2 = rgb(8, 145, 178) */
+    --brand-50: rgba(8, 145, 178, 0.05);
+    --brand-100: rgba(8, 145, 178, 0.10);
+    --brand-200: rgba(8, 145, 178, 0.20);
+    --brand-300: rgba(8, 145, 178, 0.30);
+    --brand-400: rgba(8, 145, 178, 0.40);
+    --brand-500: rgba(8, 145, 178, 0.50);
+    --brand-600: rgba(8, 145, 178, 0.60);
+    --brand-700: rgba(8, 145, 178, 0.70);
+    --brand-800: rgba(8, 145, 178, 0.80);
+    --brand-900: rgba(8, 145, 178, 0.90);
+    --brand-1000: #0891B2;
+
+    /* Alpha white scale (light — uses near-black since "white overlay" is inverted) */
+    --alpha-white-50: rgba(15, 23, 42, 0.05);
+    --alpha-white-100: rgba(15, 23, 42, 0.10);
+    --alpha-white-200: rgba(15, 23, 42, 0.20);
+    --alpha-white-300: rgba(15, 23, 42, 0.30);
+    --alpha-white-400: rgba(15, 23, 42, 0.40);
+    --alpha-white-500: rgba(15, 23, 42, 0.50);
+    --alpha-white-600: rgba(15, 23, 42, 0.60);
+    --alpha-white-700: rgba(15, 23, 42, 0.70);
+    --alpha-white-800: rgba(15, 23, 42, 0.80);
+    --alpha-white-900: rgba(15, 23, 42, 0.90);
+  }
+  /* =============================================================================
+     THEME UTILITY CLASS: Letter Spacing Utilities
+     Note: Font and radius variables removed as they duplicate :root and .dark values.
+     These tracking utilities are used for fine-tuning letter spacing.
+     ============================================================================= */
+  .theme {
+    --tracking-tighter: calc(var(--tracking-normal) - 0.05em);
+    --tracking-tight: calc(var(--tracking-normal) - 0.025em);
+    --tracking-wide: calc(var(--tracking-normal) + 0.025em);
+    --tracking-wider: calc(var(--tracking-normal) + 0.05em);
+    --tracking-widest: calc(var(--tracking-normal) + 0.1em);
+  }
+  /* Dark mode — kit `@theme` canonical values (NAN-368). Default theme for nanosiem. */
+  .dark {
+    /* Surfaces */
+    --background: #0B0E12;
+    --foreground: #E5E7EB;
+    --card: #11151B;
+    --card-foreground: #E5E7EB;
+    --popover: #0E1319;
+    --popover-foreground: #E5E7EB;
+
+    /* Brand (shadcn "primary" ↔ kit "brand") */
+    --primary: #5EE7F0;
+    --primary-foreground: #06080B;
+
+    /* Secondary = kit card-2 (subtle elevated surface) */
+    --secondary: #161B23;
+    --secondary-foreground: #E5E7EB;
+
+    /* Muted = kit panel, muted-fg = kit fg-3 */
+    --muted: #0F1319;
+    --muted-foreground: #A8ACB4;
+
+    /* Accent = kit card-2 (hover/selected) */
+    --accent: #161B23;
+    --accent-foreground: #E5E7EB;
+
+    /* Destructive / warning */
+    --destructive: #F87171;
+    --destructive-foreground: #FFFFFF;
+    --warning: #F59E0B;
+    --warning-foreground: #422006;
+    --warning-muted: rgba(245, 158, 11, 0.15);
+    --warning-border: rgba(245, 158, 11, 0.35);
+
+    /* Borders + input */
+    --border: #1A1F27;
+    --input: #0E1319;
+    --input-border: #272C35;
+    --ring: #5EE7F0;
+
+    /* Chart palette — dark mode */
+    --chart-1: #5EE7F0;
+    --chart-2: #34D399;
+    --chart-3: #F59E0B;
+    --chart-4: #C084FC;
+    --chart-5: #60A5FA;
+
+    --radius: 6px;
+
+    /* Sidebar = kit outer (chrome-level bg) */
+    --sidebar: #06080B;
+    --sidebar-foreground: #E5E7EB;
+    --sidebar-primary: #5EE7F0;
+    --sidebar-primary-foreground: #06080B;
+    --sidebar-accent: #161B23;
+    --sidebar-accent-foreground: #E5E7EB;
+    --sidebar-border: #1A1F27;
+    --sidebar-ring: #5EE7F0;
+
+    /* Design-kit specific tokens */
+    --outer: #06080B;
+    --card-2: #161B23;
+    --panel: #0F1319;
+    --inspector: #0E1218;
+    --border-2: #272C35;
+    --rule: #12161C;
+    --brand: #5EE7F0;
+    --brand-2: #9FF3F8;
+    --brand-ink: #06080B;
+    --str: #D8F7F9;
+    --success: #34D399;
+
+    /* Fonts (same across themes) */
+    --font-sans: Geist, system-ui, sans-serif;
+    --font-serif: Georgia, serif;
+    --font-mono: 'Geist Mono', Menlo, Courier, monospace;
+
+    /* Shadows — restrained; kit reserves shadows for modals/popovers */
+    --shadow-color: rgba(0, 0, 0, 0.40);
+    --shadow-opacity: 0;
+    --shadow-blur: 0px;
+    --shadow-spread: 0px;
+    --shadow-offset-x: 0px;
+    --shadow-offset-y: 2px;
+    --letter-spacing: 0em;
+    --spacing: 0.25rem;
+    --shadow-2xs: 0 1px 2px 0 rgba(0, 0, 0, 0.30);
+    --shadow-xs: 0 1px 2px 0 rgba(0, 0, 0, 0.40);
+    --shadow-sm: 0 1px 3px 0 rgba(0, 0, 0, 0.50);
+    --shadow: 0 2px 4px 0 rgba(0, 0, 0, 0.50);
+    --shadow-md: 0 4px 8px -2px rgba(0, 0, 0, 0.55);
+    --shadow-lg: 0 10px 20px -4px rgba(0, 0, 0, 0.60);
+    --shadow-xl: 0 20px 40px -8px rgba(0, 0, 0, 0.70);
+    --shadow-2xl: 0 28px 60px -12px rgba(0, 0, 0, 0.80);
+
+    /* Syntax highlighting — dark mode. Palette aligned with
+       `design-ref/shadcn/editor-code.jsx` (NAN-484): YAML keys + strings in
+       cyan, pipe as the loud structural token, logic operators + numbers in
+       amber, functions in brand cyan. UDM field names stay plain fg so the
+       query body has visual variety — otherwise everything reads cyan. */
+    --syntax-comment: #8b949e;
+    --syntax-string: #D8F7F9;
+    --syntax-regex: #f48fb1;
+    --syntax-regex-delim: #f06292;
+    --syntax-regex-bg: rgba(244, 143, 177, 0.08);
+    --syntax-wildcard: #ffb74d;
+    --syntax-wildcard-bg: rgba(255, 183, 77, 0.08);
+    --syntax-keyword: #ffb74d;
+    --syntax-function: var(--primary);
+    --syntax-eval-function: #64b5f6;
+    --syntax-udm-field: var(--foreground);
+    --syntax-field: #9FF3F8;
+    --syntax-operator: #ffb74d;
+    --syntax-pipe: #9FF3F8;
+    --syntax-arithmetic: #ffb74d;
+    --syntax-number: #ffb74d;
+
+    /* AI/MeloD theme — dark mode (distinct purple preserved across redesign) */
+    --ai: #a855f7;
+    --ai-foreground: #ffffff;
+    --ai-muted: #c084fc;
+    --ai-border: rgba(168, 85, 247, 0.3);
+    --ai-bg: rgba(168, 85, 247, 0.1);
+    --ai-bg-subtle: rgba(168, 85, 247, 0.05);
+    --ai-shadow: rgba(168, 85, 247, 0.2);
+
+    /* Heatmap empty cell color */
+    --heatmap-empty: #161B23;
+
+    /* Brand alpha scale (dark) — uses kit brand cyan #5EE7F0 = rgb(94, 231, 240) */
+    --brand-50: rgba(94, 231, 240, 0.05);
+    --brand-100: rgba(94, 231, 240, 0.10);
+    --brand-200: rgba(94, 231, 240, 0.20);
+    --brand-300: rgba(94, 231, 240, 0.30);
+    --brand-400: rgba(94, 231, 240, 0.40);
+    --brand-500: rgba(94, 231, 240, 0.50);
+    --brand-600: rgba(94, 231, 240, 0.60);
+    --brand-700: rgba(94, 231, 240, 0.70);
+    --brand-800: rgba(94, 231, 240, 0.80);
+    --brand-900: rgba(94, 231, 240, 0.90);
+    --brand-1000: #5EE7F0;
+
+    /* Accent colors (status chips, legends, etc.) — dark mode */
+    --accent-purple: #C084FC;
+    --accent-green: #4ADE80;
+    --accent-blue: #60A5FA;
+    --accent-orange: #FDBA74;
+    --accent-cyan: #22D3EE;
+    --accent-yellow: #FACC15;
+    --accent-light-blue: #93C5FD;
+
+    /* Alpha white scale (dark) */
+    --alpha-white-50: rgba(255, 255, 255, 0.05);
+    --alpha-white-100: rgba(255, 255, 255, 0.10);
+    --alpha-white-200: rgba(255, 255, 255, 0.20);
+    --alpha-white-300: rgba(255, 255, 255, 0.30);
+    --alpha-white-400: rgba(255, 255, 255, 0.40);
+    --alpha-white-500: rgba(255, 255, 255, 0.50);
+    --alpha-white-600: rgba(255, 255, 255, 0.60);
+    --alpha-white-700: rgba(255, 255, 255, 0.70);
+    --alpha-white-800: rgba(255, 255, 255, 0.80);
+    --alpha-white-900: rgba(255, 255, 255, 0.90);
+
+    /* Legacy border tokens (used by pre-redesign components; kept for back-compat until routes are ported) */
+    --border-primary: #0F1B28;
+    --border-secondary: #182029;
+  }
+  body {
+    letter-spacing: var(--tracking-normal);
+  }
+}
+
+/* =============================================================================
+   BASE LAYER: Global Styles
+   ============================================================================= */
+@layer base {
+  * {
+    @apply border-border;
+  }
+  /* Restore cursor: pointer on interactive elements (Tailwind v4 Preflight removed it) */
+  button, [role="button"], a, select, summary, [type="button"], [type="submit"], [type="reset"] {
+    cursor: pointer;
+  }
+  html,
+  body,
+  #root {
+    @apply bg-background text-foreground;
+    margin: 0;
+    padding: 0;
+  }
+  
+  /* Global link styles - use primary color with hover effect */
+  a {
+    @apply text-primary transition-colors;
+  }
+  a:hover {
+    color: oklch(from var(--primary) l c h / 0.8);
+  }
+  
+  /* Reset link styles for navigation items that handle their own styling */
+  nav a,
+  a[class*="flex"],
+  a[class*="button"],
+  a[class*="btn"] {
+    color: inherit;
+  }
+  
+  /* Ensure elements with bg-primary get the proper ink color — the
+     `--primary-foreground` token flips per theme (light: white, dark:
+     near-black) so cyan brand buttons in dark mode render black text.
+     Scope excludes react-day-picker day buttons, whose selected-state
+     styling (range start/end vs. middle) handles its own text color. */
+  nav a.bg-primary,
+  a.bg-primary,
+  button.bg-primary:not(.rdp-button),
+  [data-state="active"].bg-primary,
+  .bg-primary:not(button):not(a) {
+    color: var(--primary-foreground) !important;
+  }
+}
+
+/* =============================================================================
+   UTILITY CLASSES: Field Labels
+   Standardized styling for field labels in cards and detail views.
+   Use .field-label for consistent mini-header style across the app.
+   ============================================================================= */
+.field-label {
+  @apply text-xs font-medium uppercase tracking-wide mb-1;
+  color: oklch(0.45 0 0); /* Gray-500 equivalent for light mode */
+}
+.dark .field-label {
+  color: oklch(0.65 0 0); /* Gray-400 equivalent for dark mode */
+}
+
+/* =============================================================================
+   CUSTOM OVERRIDES: Recharts Bar Hover Effects
+   Requirements: 4.2 - Preserve Recharts bar hover effects
+   Provides subtle visual feedback when hovering over chart bars.
+   ============================================================================= */
+.recharts-bar-rectangle {
+  transition: opacity 0.15s ease;
+}
+.recharts-bar-rectangle:hover {
+  opacity: 0.8;
+}
+
+/* Recharts tooltip styling - theme-aware */
+.recharts-tooltip-wrapper .recharts-default-tooltip {
+  background-color: var(--card) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: var(--radius) !important;
+}
+.recharts-tooltip-wrapper .recharts-default-tooltip .recharts-tooltip-label {
+  color: var(--muted-foreground) !important;
+}
+.recharts-tooltip-wrapper .recharts-default-tooltip .recharts-tooltip-item {
+  color: var(--foreground) !important;
+}
+
+/* Recharts axis tick labels - theme-aware for light/dark mode */
+.recharts-cartesian-axis-tick-value {
+  fill: oklch(0.5 0 0) !important; /* Neutral gray that works in both modes */
+}
+.dark .recharts-cartesian-axis-tick-value {
+  fill: oklch(0.65 0 0) !important; /* Lighter for dark mode */
+}
+
+/* Recharts grid lines - visible in both light and dark modes */
+.recharts-cartesian-grid-horizontal line,
+.recharts-cartesian-grid-vertical line {
+  stroke: oklch(0.85 0 0) !important; /* Light gray for light mode */
+}
+.dark .recharts-cartesian-grid-horizontal line,
+.dark .recharts-cartesian-grid-vertical line {
+  stroke: oklch(0.25 0 0) !important; /* Dark gray for dark mode */
+}
+
+/* =============================================================================
+   CUSTOM OVERRIDES: Scrollbar Styling
+   Requirements: 4.1 - Preserve custom scrollbar styles
+   Auto-hiding scrollbars with theme-aware styling for a cleaner UI.
+   ============================================================================= */
+
+/* Firefox scrollbar styling */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+*:hover {
+  scrollbar-color: oklch(from var(--muted-foreground) l c h / 0.3) transparent;
+}
+
+/* Webkit browsers (Chrome, Safari, Edge) */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 4px;
+  transition: background 0.2s ease;
+}
+
+*:hover::-webkit-scrollbar-thumb {
+  background: oklch(from var(--muted-foreground) l c h / 0.3);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: oklch(from var(--muted-foreground) l c h / 0.5);
+}
+
+/* Hide scrollbar corner */
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* Utility class for thin/minimal scrollbar */
+.scrollbar-thin {
+  scrollbar-width: thin;
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  width: 4px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: oklch(from var(--muted-foreground) l c h / 0.2);
+  border-radius: 2px;
+}
+
+/* Utility class to hide scrollbar but keep scroll functionality */
+.scrollbar-hidden {
+  scrollbar-width: none; /* Firefox */
+  -ms-overflow-style: none; /* IE/Edge */
+}
+
+.scrollbar-hidden::-webkit-scrollbar {
+  display: none; /* Chrome/Safari/Opera */
+}
+
+/* =============================================================================
+   CODEMIRROR 6 STYLING: Detection Rule Editor
+   ============================================================================= */
+
+/* Container fills its parent */
+.cm-editor-container {
+  height: 100%;
+  width: 100%;
+}
+
+/* Editor fills container */
+.cm-editor {
+  height: 100% !important;
+  max-height: 100% !important;
+}
+
+/* Scroller fills available space */
+.cm-scroller {
+  overflow: auto !important;
+  font-family: 'Geist Mono', Menlo, Courier, monospace;
+}
+
+/* Line wrapping */
+.cm-line {
+  line-height: 1.5;
+}
+
+/* Selection colors */
+.cm-selectionBackground,
+.cm-focused .cm-selectionBackground {
+  background-color: rgba(59, 130, 246, 0.3) !important;
+}
+
+/* Autocomplete popup refinements */
+.cm-tooltip-autocomplete {
+  background-color: var(--card) !important;
+  color: var(--card-foreground) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 8px !important;
+  box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3), 0 8px 10px -6px rgba(0, 0, 0, 0.15) !important;
+  overflow: hidden;
+}
+
+.cm-tooltip-autocomplete > ul {
+  max-height: 300px;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.8125rem;
+}
+
+.cm-tooltip-autocomplete > ul > li {
+  padding: 6px 12px !important;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--card-foreground);
+}
+
+.cm-tooltip-autocomplete > ul > li[aria-selected="true"] {
+  background-color: var(--primary) !important;
+  color: var(--primary-foreground) !important;
+}
+
+.cm-tooltip-autocomplete > ul > li[aria-selected="true"] .cm-completionDetail {
+  color: var(--primary-foreground) !important;
+  opacity: 0.7;
+}
+
+.cm-completionDetail {
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+  font-style: normal !important;
+}
+
+.cm-completionInfo {
+  background-color: var(--card) !important;
+  color: var(--card-foreground) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 8px !important;
+  padding: 8px 12px;
+}
+
+/* Completion icons */
+.cm-completionIcon {
+  width: 16px;
+  height: 16px;
+  opacity: 0.7;
+}
+
+/* Lint gutter styling */
+.cm-lint-marker {
+  cursor: pointer;
+}
+
+.cm-lint-marker-error {
+  content: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23ef4444' stroke-width='2'%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3Cline x1='12' y1='8' x2='12' y2='12'/%3E%3Cline x1='12' y1='16' x2='12.01' y2='16'/%3E%3C/svg%3E");
+}
+
+.cm-lint-marker-warning {
+  content: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23f59e0b' stroke-width='2'%3E%3Cpath d='m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z'/%3E%3Cline x1='12' y1='9' x2='12' y2='13'/%3E%3Cline x1='12' y1='17' x2='12.01' y2='17'/%3E%3C/svg%3E");
+}
+
+/* Lint range underline styling */
+.cm-lintRange-error {
+  background-image: none !important;
+  background: none !important;
+  text-decoration-line: underline !important;
+  text-decoration-style: wavy !important;
+  text-decoration-color: var(--destructive) !important;
+  text-decoration-skip-ink: none !important;
+  text-underline-offset: 2px;
+}
+
+.cm-lintRange-warning {
+  background-image: none !important;
+  background: none !important;
+  text-decoration-line: underline !important;
+  text-decoration-style: wavy !important;
+  text-decoration-color: var(--chart-3) !important;
+  text-decoration-skip-ink: none !important;
+  text-underline-offset: 2px;
+}
+
+.cm-lintRange-info {
+  background-image: none !important;
+  background: none !important;
+  text-decoration-line: underline !important;
+  text-decoration-style: dotted !important;
+  text-decoration-color: var(--primary) !important;
+  text-decoration-skip-ink: none !important;
+  text-underline-offset: 2px;
+}
+
+/* Diagnostic panel styling */
+.cm-panel.cm-panel-lint {
+  background-color: var(--card);
+  border-top: 1px solid var(--border);
+}
+
+.cm-panel.cm-panel-lint ul {
+  padding: 8px;
+}
+
+.cm-panel.cm-panel-lint li {
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+/* Tooltip for lint errors */
+.cm-tooltip.cm-tooltip-lint {
+  border-radius: 6px;
+  background-color: var(--popover);
+  border: 1px solid var(--border);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.cm-diagnostic {
+  padding: 8px 12px;
+  font-size: 13px;
+}
+
+.cm-diagnostic-error {
+  border-left: 3px solid var(--destructive);
+  background-color: rgba(239, 68, 68, 0.1);
+}
+
+.cm-diagnostic-warning {
+  border-left: 3px solid #f59e0b;
+  background-color: rgba(245, 158, 11, 0.1);
+}
+
+.cm-diagnostic-info {
+  border-left: 3px solid var(--primary);
+  background-color: rgba(59, 130, 246, 0.1);
+}
+
+/* Dark mode adjustments for CodeMirror */
+.dark .cm-selectionBackground,
+.dark .cm-focused .cm-selectionBackground {
+  background-color: rgba(59, 130, 246, 0.25) !important;
+}
+
+.dark .cm-activeLine {
+  background-color: rgba(255, 255, 255, 0.03) !important;
+}
+
+.dark .cm-activeLineGutter {
+  background-color: rgba(255, 255, 255, 0.03) !important;
+}
+
+/* Drop-shadow glow for rare dots in the rarity scatter plot. */
+.rare-glow {
+  filter: drop-shadow(0 0 4px color-mix(in srgb, var(--primary) 60%, transparent));
+}

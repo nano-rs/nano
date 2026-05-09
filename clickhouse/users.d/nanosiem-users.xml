@@ -1,0 +1,39 @@
+<clickhouse>
+  <!-- Docs: <https://clickhouse.com/docs/operations/settings/settings_users/> -->
+  <users>
+    <!-- Remove default user -->
+    <default remove="remove">
+    </default>
+
+    <!-- Admin user for migrations (DDL enabled) -->
+    <nanosiem_admin>
+      <profile>admin</profile>
+      <networks>
+        <ip>::/0</ip>
+      </networks>
+      <password><![CDATA[nanosiem_admin_secret]]></password>
+      <quota>default</quota>
+      <access_management>1</access_management>
+      <allow_ddl>1</allow_ddl>
+    </nanosiem_admin>
+
+    <!-- Runtime user for queries (no DDL for security) -->
+    <nanosiem>
+      <profile>default</profile>
+      <networks>
+        <ip>::/0</ip>
+      </networks>
+      <password><![CDATA[nanosiem]]></password>
+      <quota>default</quota>
+      <access_management>0</access_management>
+      <allow_ddl>0</allow_ddl>
+      <!-- Grant access to nanosiem database -->
+      <grants>
+        <query>GRANT SELECT, INSERT, ALTER, CREATE, DROP ON nanosiem.*</query>
+        <query>GRANT dictGet ON nanosiem.*</query>
+        <query>GRANT SELECT(bytes_on_disk, rows, data_uncompressed_bytes, partition, database, table, active) ON system.parts</query>
+        <query>GRANT SELECT(total_space, free_space, type) ON system.disks</query>
+      </grants>
+    </nanosiem>
+  </users>
+</clickhouse>

@@ -1,0 +1,28 @@
+[package]
+name = "log-blaster"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "High-performance SIEM log generator using real telemetry profiles"
+
+[dependencies]
+event-core = { path = "../event-core" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+
+# HTTP client
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# RNG
+rand = "0.9"
+
+# Fast concurrent data structures
+parking_lot = "0.12"

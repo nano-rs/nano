@@ -1,0 +1,5 @@
+# Placeholder for TLS certificates
+# Place your server.crt and server.key files here for HTTPS support
+# 
+# To generate self-signed certificates for development:
+# openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -days 365 -nodes -subj "/CN=localhost"

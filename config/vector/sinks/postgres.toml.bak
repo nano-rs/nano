@@ -1,0 +1,128 @@
+# PostgreSQL Sink Configuration for NanoSIEM
+#
+# This configuration sends processed logs to the NanoSIEM PostgreSQL database.
+# Requirement 1.3: Write both raw_content and metadata to the database
+
+# =============================================================================
+# Prepare Output Transform
+# =============================================================================
+# Flatten the structure for PostgreSQL insertion
+
+[transforms.prepare_postgres]
+type = "remap"
+inputs = ["dedupe_content"]
+source = '''
+# Build the final output structure matching the logs table schema
+. = {
+    "timestamp": .udm.timestamp,
+    "raw_content": .raw_content,
+    "metadata": encode_json(.metadata),
+    "src_ip": .udm.src_ip,
+    "dest_ip": .udm.dest_ip,
+    "src_host": .udm.src_host,
+    "dest_host": .udm.dest_host,
+    "src_port": .udm.src_port,
+    "dest_port": .udm.dest_port,
+    "protocol": .udm.protocol,
+    "user": .udm.user,
+    "action": .udm.action,
+    "status": .udm.status,
+    "auth_type": .udm.auth_type,
+    "auth_result": .udm.auth_result,
+    "session_id": .udm.session_id,
+    "process_name": .udm.process_name,
+    "process_id": .udm.process_id,
+    "parent_process": .udm.parent_process,
+    "command_line": .udm.command_line,
+    "file_path": .udm.file_path,
+    "file_name": .udm.file_name,
+    "file_hash": .udm.file_hash,
+    "file_action": .udm.file_action,
+    "bytes_in": .udm.bytes_in,
+    "bytes_out": .udm.bytes_out
+}
+'''
+
+# =============================================================================
+# HTTP Sink to NanoSIEM Ingestion API
+# =============================================================================
+# Sends logs to NanoSIEM's REST API for ingestion
+# This is the recommended approach for flexibility and error handling
+
+[sinks.nanosiem_http]
+type = "http"
+inputs = ["prepare_postgres"]
+uri = "${NANOSIEM_INGESTION_URL:-http://localhost:3000/api/ingest}"
+method = "post"
+
+# Encoding
+encoding.codec = "json"
+
+# Disk Buffer Configuration
+# Requirement 2.1: Persist incoming logs to disk when downstream is unavailable
+# Requirement 2.2: Configurable maximum size (default 1GB)
+# Requirement 2.5: Survive Vector restarts without data loss
+[sinks.nanosiem_http.buffer]
+type = "disk"
+# Maximum buffer size: 1GB (1073741824 bytes)
+max_size = 1073741824
+# Backpressure behavior when buffer is full
+# Requirement 2.3: Apply backpressure by returning HTTP 503
+when_full = "block"
+
+# Batching for performance
+[sinks.nanosiem_http.batch]
+max_bytes = 5242880  # 5MB
+max_events = 500
+timeout_secs = 10
+
+# Request and Retry Configuration
+# Requirement 2.4: Automatically drain buffered logs when downstream available
+[sinks.nanosiem_http.request]
+concurrency = 10
+rate_limit_duration_secs = 1
+rate_limit_num = 1000
+# Retry configuration for downstream failures
+retry_initial_backoff_secs = 1
+retry_max_duration_secs = 300
+timeout_secs = 30
+
+# Headers
+[sinks.nanosiem_http.request.headers]
+Content-Type = "application/json"
+
+# =============================================================================
+# Alternative: Direct PostgreSQL Sink
+# =============================================================================
+# Note: Vector's native postgres sink may require specific configuration
+# and may not support all PostgreSQL features. The HTTP sink above is
+# recommended for production use.
+# To enable direct PostgreSQL sink, uncomment the section below and set
+# the DATABASE_URL environment variable in docker-compose.yml
+
+# =============================================================================
+# File Sink for Backup/Debug
+# =============================================================================
+# Writes logs to files as backup or for debugging
+# Includes disk buffer for reliability
+
+# [sinks.file_backup]
+# type = "file"
+# inputs = ["prepare_postgres"]
+# path = "/var/log/nanosiem/backup/%Y-%m-%d.ndjson"
+# encoding.codec = "json"
+# 
+# [sinks.file_backup.buffer]
+# type = "disk"
+# max_size = 268435488  # 256MB
+# when_full = "block"
+
+# =============================================================================
+# Console Sink for Debugging
+# =============================================================================
+# Uncomment for development/debugging
+
+# [sinks.console_debug]
+# type = "console"
+# inputs = ["prepare_postgres"]
+# encoding.codec = "json"

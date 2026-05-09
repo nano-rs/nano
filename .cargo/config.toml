@@ -1,0 +1,20 @@
+[build]
+# Incremental compilation is great for dev but bloats target/
+# GitHub Actions doesn't need it since it's always a fresh build
+incremental = false
+
+[profile.release]
+# Optimize for size in release builds
+opt-level = "z"     # Optimize for size
+lto = true          # Link-time optimization
+codegen-units = 1   # Better optimization, slower compile
+strip = true        # Strip symbols from binary
+panic = "abort"     # Smaller binary size
+
+[profile.dev]
+# Keep incremental for local dev
+incremental = true
+
+# Speed up dev builds
+opt-level = 0
+debug = true

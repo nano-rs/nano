@@ -1,0 +1,9 @@
+# ClickHouse Dynamic Configuration Directory
+#
+# This directory contains dynamically generated ClickHouse configuration files.
+# Files placed here are automatically loaded by ClickHouse on startup.
+#
+# Generated files:
+# - storage.xml: S3 storage tiering configuration (generated when tiering is enabled)
+#
+# DO NOT manually edit generated files - they will be overwritten by the API.

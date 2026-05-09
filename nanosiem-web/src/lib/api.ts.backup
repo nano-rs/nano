@@ -1,0 +1,5841 @@
+/**
+ * NanoSIEM API Client
+ * Handles all communication with the backend API
+ * 
+ * In microservices mode, routes requests to different services:
+ * - Main API (port 3000): detections, alerts, parsers, auth, settings, etc.
+ * - Ingest Service (port 3001): /api/ingest/*
+ * - Search Service (port 3002): /api/search, /api/search/sql, /api/search/explain, /api/search/saved/*
+ */
+
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
+const INGEST_URL = import.meta.env.VITE_INGEST_URL || API_BASE_URL;
+const SEARCH_URL = import.meta.env.VITE_SEARCH_URL || API_BASE_URL;
+
+/**
+ * Get the appropriate base URL for a given API path
+ * Routes to different services based on the endpoint
+ */
+function getServiceUrl(path: string): string {
+  // Ingest endpoints -> Ingest Service
+  if (path.startsWith('/api/ingest')) {
+    return INGEST_URL;
+  }
+  
+  // Core search endpoints -> Search Service
+  // Note: /api/search/history, /api/search/share, /api/search/shared, /api/search/explanation
+  // stay on Main API (user-tied features)
+  if (path === '/api/search' ||
+      path === '/api/search/sql' ||
+      path === '/api/search/explain' ||
+      path === '/api/search/prevalence-artifacts' ||
+      path.startsWith('/api/search/saved')) {
+    return SEARCH_URL;
+  }
+  
+  // Everything else -> Main API
+  return API_BASE_URL;
+}
+
+// Types matching the backend API
+export interface TimeRange {
+  start: string;
+  end: string;
+}
+
+export interface SearchRequest {
+  query: string;
+  time_range: TimeRange;
+  limit?: number;
+  offset?: number;
+}
+
+export interface RawSqlRequest {
+  sql: string;
+  time_range: TimeRange;
+  limit?: number;
+  offset?: number;
+}
+
+export interface HistogramBucket {
+  time: string;
+  count: number;
+}
+
+// Query warning from cost analysis (Splunk-style job inspector)
+export interface QueryWarning {
+  severity: 'info' | 'warning' | 'error';
+  code: string;
+  message: string;
+  suggestion?: string;
+  impact?: string;
+}
+
+export interface SearchResponse {
+  results: Record<string, unknown>[];
+  total_count: number;
+  execution_time_ms: number;
+  fields: FieldInfo[];
+  generated_sql?: string;
+  histogram?: HistogramBucket[];
+  warnings?: QueryWarning[];
+  cost_score?: number;
+}
+
+export interface FieldInfo {
+  name: string;
+  field_type: string;
+  count: number;
+  top_values: [string, number][];
+}
+
+// AI triage hints for guiding automated alert analysis
+export interface AiTriageHints {
+  ignore_when: string[];  // Conditions indicating benign/expected activity
+  suspicious_when: string[];  // Conditions indicating especially suspicious activity
+  context?: string;  // Additional context for the AI about this detection
+}
+
+export interface DetectionRule {
+  id: string;
+  name: string;
+  description?: string;
+  query: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'informational';
+  mode: 'staging' | 'live' | 'alerting';
+  detection_mode?: 'real-time' | 'scheduled';
+  materialized_view_name?: string;
+  enabled: boolean;
+  schedule_cron?: string;
+  lookback_minutes?: number;
+  mitre_tactics: string[];
+  mitre_techniques: string[];
+  narrative?: string;
+  reference_url?: string;
+  author?: string;
+  tags: string[];
+  ai_generated?: boolean;
+  realtime_enabled?: boolean;
+  risk_score?: number;
+  risk_entity_field?: string;
+  risk_modifiers?: RiskModifier[];
+  ai_triage_hints?: AiTriageHints;
+  archived?: boolean;
+  folder?: string;
+  created_at: string;
+  updated_at: string;
+  last_run_at?: string;
+  last_match_at?: string;
+  match_count: number;
+  live_match_count?: number;
+}
+
+// Response type for create/update operations that may include warnings
+export interface DetectionResponse extends DetectionRule {
+  warning?: string; // Warning message from backend (e.g., auto-correction)
+}
+
+export interface CreateDetectionRequest {
+  name: string;
+  description?: string;
+  query: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'informational';
+  mode: 'staging' | 'live' | 'alerting';
+  detection_mode?: 'real-time' | 'scheduled';
+  schedule_cron?: string;
+  lookback_minutes?: number; // Custom lookback period in minutes
+  mitre_tactics?: string[];
+  mitre_techniques?: string[];
+  narrative?: string;
+  reference_url?: string;
+  author?: string;
+  tags?: string[];
+  ai_generated?: boolean;
+  realtime_enabled?: boolean;
+  risk_score?: number;
+  risk_entity_field?: string;
+  risk_modifiers?: RiskModifier[];
+  ai_triage_hints?: AiTriageHints;
+  archived?: boolean;
+  folder?: string;
+}
+
+export type UpdateDetectionRequest = Partial<CreateDetectionRequest>;
+
+export interface Alert {
+  id: string;
+  rule_id: string;
+  rule_name?: string;
+  rule_query?: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'informational';
+  status: 'new' | 'acknowledged' | 'closed';
+  disposition?: 'true_positive' | 'false_positive' | 'benign';
+  matched_events: Record<string, unknown>[];
+  matched_event_count?: number;
+  risk_score?: number;
+  assigned_to?: string;
+  acknowledged_by?: string;
+  acknowledged_at?: string;
+  closed_by?: string;
+  closed_at?: string;
+  created_at: string;
+  // AI Triage status
+  triage_status?: 'none' | 'running' | 'completed' | 'failed';
+  triage_verdict?: TriageVerdict;
+}
+
+export interface AlertCounts {
+  total: number;
+  new: number;
+  acknowledged: number;
+  closed: number;
+  by_severity: Record<string, number>;
+}
+
+export interface CloseAlertRequest {
+  disposition: 'true_positive' | 'false_positive' | 'benign';
+  notes?: string;
+}
+
+export interface BulkAlertRequest {
+  alert_ids: string[];
+  action: 'acknowledge' | 'close' | 'assign';
+  disposition?: 'true_positive' | 'false_positive' | 'benign';
+  assigned_to?: string;
+}
+
+// ============================================================================
+// Case Management Types
+// ============================================================================
+
+export type CaseStatus = 'open' | 'in_progress' | 'pending' | 'resolved' | 'closed';
+export type CaseDisposition = 'true_positive' | 'false_positive' | 'benign' | 'inconclusive';
+export type CaseEntityType = 'user' | 'host' | 'ip' | 'domain' | 'hash' | 'url' | 'file' | 'process' | 'email';
+export type CaseWallEntryType = 'comment' | 'status_change' | 'assignment_change' | 'alert_added' | 'alert_removed' | 'ai_analysis' | 'action_taken';
+export type CaseRelationType = 'related' | 'parent' | 'child' | 'duplicate';
+export type GroupingType = 'host' | 'user' | 'rule' | 'ip' | 'manual';
+
+export interface Case {
+  id: string;
+  case_number: number;
+  title: string;
+  description?: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'informational';
+  status: CaseStatus;
+  disposition?: CaseDisposition;
+  priority: number;
+  assigned_to?: string;
+  assigned_at?: string;
+  ai_summary?: string;
+  ai_recommendations?: AiRecommendation[];
+  ai_summary_generated_at?: string;
+  grouping_key?: string;
+  grouping_type?: GroupingType;
+  mitre_tactics: string[];
+  mitre_techniques: string[];
+  tags: string[];
+  created_at: string;
+  updated_at: string;
+  first_activity_at?: string;
+  last_activity_at?: string;
+  resolved_at?: string;
+  closed_at?: string;
+}
+
+export interface AiRecommendation {
+  action: string;
+  reasoning: string;
+  priority: number;
+  automated: boolean;
+}
+
+export interface CaseWithDetails extends Case {
+  alert_count: number;
+  entity_count: number;
+  assignee_name?: string;
+}
+
+export interface CaseSummary {
+  id: string;
+  case_number: number;
+  title: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'informational';
+  status: CaseStatus;
+  alert_count: number;
+  created_at: string;
+  last_activity_at?: string;
+}
+
+export interface CaseEntity {
+  id: string;
+  case_id: string;
+  entity_type: CaseEntityType;
+  entity_value: string;
+  occurrence_count: number;
+  risk_score?: number;
+  is_primary: boolean;
+  enrichment_data?: Record<string, unknown>;
+  enrichment_updated_at?: string;
+  created_at: string;
+}
+
+export interface EntityTypeSummary {
+  entity_type: string;
+  count: number;
+  entities: CaseEntity[];
+}
+
+export interface CaseWallEntry {
+  id: string;
+  case_id: string;
+  entry_type: CaseWallEntryType;
+  content?: string;
+  metadata: Record<string, unknown>;
+  is_internal: boolean;
+  created_by?: string;
+  creator_name?: string;
+  created_at: string;
+}
+
+export interface CaseRelation {
+  source_case_id: string;
+  target_case_id: string;
+  relation_type: CaseRelationType;
+  confidence?: number;
+  reason?: string;
+  shared_entities?: string[];
+  created_at: string;
+}
+
+export interface RelatedCaseSummary {
+  case_id: string;
+  case_number: number;
+  title: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'informational';
+  status: CaseStatus;
+  relation_type: CaseRelationType;
+  confidence?: number;
+  shared_entity_count: number;
+}
+
+export interface CaseAlertDetail {
+  id: string;
+  alert_id: string;
+  rule_name?: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'informational';
+  status: string;
+  disposition?: string;
+  matched_event_count?: number;
+  created_at: string;
+  added_at: string;
+  is_primary: boolean;
+  triage_verdict?: string;
+  triage_confidence?: number;
+}
+
+export interface CaseStats {
+  total: number;
+  open: number;
+  in_progress: number;
+  pending: number;
+  resolved: number;
+  closed: number;
+  by_severity: Record<string, number>;
+  avg_resolution_time_hours?: number;
+}
+
+export interface CaseFullResponse {
+  case: Case;
+  alerts: CaseAlertDetail[];
+  entities: EntityTypeSummary[];
+  related_cases: RelatedCaseSummary[];
+  stats: {
+    alert_count: number;
+    entity_count: number;
+    comment_count: number;
+    time_open_hours?: number;
+  };
+}
+
+export interface CaseGroupingRule {
+  id: string;
+  name: string;
+  description?: string;
+  enabled: boolean;
+  priority: number;
+  match_type: string;
+  time_window_minutes: number;
+  max_alerts: number;
+  case_title_template?: string;
+  case_severity_rule: string;
+  auto_assign_to?: string;
+  created_by?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateCaseRequest {
+  title: string;
+  description?: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'informational';
+  priority?: number;
+  assigned_to?: string;
+  grouping_key?: string;
+  grouping_type?: GroupingType;
+  tags?: string[];
+}
+
+export interface UpdateCaseRequest {
+  title?: string;
+  description?: string;
+  severity?: 'critical' | 'high' | 'medium' | 'low' | 'informational';
+  priority?: number;
+  mitre_tactics?: string[];
+  mitre_techniques?: string[];
+  tags?: string[];
+}
+
+export interface CaseFilter {
+  status?: CaseStatus[];
+  severity?: string[];
+  assigned_to?: string;
+  search?: string;
+  tags?: string[];
+  created_after?: string;
+  created_before?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface AddAlertToCaseRequest {
+  alert_id: string;
+  is_primary?: boolean;
+}
+
+export interface AddWallEntryRequest {
+  entry_type: CaseWallEntryType;
+  content?: string;
+  metadata?: Record<string, unknown>;
+  is_internal?: boolean;
+}
+
+export interface ChangeCaseStatusRequest {
+  status: CaseStatus;
+  disposition?: CaseDisposition;
+}
+
+export interface CreateGroupingRuleRequest {
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  priority?: number;
+  match_type: string;
+  time_window_minutes?: number;
+  max_alerts?: number;
+  case_title_template?: string;
+  case_severity_rule?: string;
+  auto_assign_to?: string;
+}
+
+export interface UpdateGroupingRuleRequest {
+  name?: string;
+  description?: string;
+  enabled?: boolean;
+  priority?: number;
+  match_type?: string;
+  time_window_minutes?: number;
+  max_alerts?: number;
+  case_title_template?: string;
+  case_severity_rule?: string;
+  auto_assign_to?: string;
+}
+
+export interface CaseSettings {
+  auto_grouping_enabled: boolean;
+  max_alerts_per_case: number;
+  default_time_window_minutes: number;
+}
+
+export interface UpdateCaseSettingsRequest {
+  auto_grouping_enabled?: boolean;
+  max_alerts_per_case?: number;
+  default_time_window_minutes?: number;
+}
+
+export interface SavedSearch {
+  id: string;
+  name: string;
+  query: string;
+  query_mode: 'piped' | 'sql';
+  time_range?: TimeRange;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateSavedSearchRequest {
+  name: string;
+  query: string;
+  query_mode: 'piped' | 'sql';
+  time_range?: TimeRange;
+}
+
+export interface SharedSearchResponse {
+  id: string;
+  query: string;
+  query_mode: string;
+  time_range_type: string;
+  time_range_preset?: string;
+  time_range_start?: string;
+  time_range_end?: string;
+}
+
+export interface CreateSharedSearchRequest {
+  query: string;
+  query_mode: string;
+  time_range_type: string;
+  time_range_preset?: string;
+  time_range_start?: string;
+  time_range_end?: string;
+}
+
+export interface CreateSharedSearchResponse {
+  id: string;
+  short_url: string;
+}
+
+// Query explanation types (AI reasoning cache)
+export interface StoreQueryExplanationRequest {
+  query: string;
+  query_mode: string;
+  natural_language_prompt?: string;
+  explanation?: string;
+  reasoning_steps?: ReasoningStep[];
+  fields_used?: string[];
+  generated_sql?: string;
+  complexity?: string;
+  suggested_time_range?: string;
+}
+
+export interface QueryExplanationResponse {
+  query_hash: string;
+  query: string;
+  query_mode: string;
+  natural_language_prompt?: string;
+  explanation?: string;
+  reasoning_steps?: ReasoningStep[];
+  fields_used?: string[];
+  generated_sql?: string;
+  complexity?: string;
+  suggested_time_range?: string;
+}
+
+export interface TestDetectionResult {
+  rule_id: string;
+  rule_name: string;
+  time_range: TimeRange;
+  total_matches: number;
+  sample_events: Record<string, unknown>[];
+  matches_by_day: { date: string; count: number }[];
+  execution_time_ms: number;
+}
+
+export interface DetectionMatch {
+  id: string;
+  detected_at: string;
+  severity: string;
+  status: string;
+  event_count: number;
+  events: Record<string, unknown>[];
+}
+
+export interface DetectionMatchesResponse {
+  total: number;
+  matches: DetectionMatch[];
+}
+
+export interface DailyStat {
+  date: string;
+  match_count: number;
+  alert_count: number;
+}
+
+export interface ApiError {
+  code: string;
+  message: string;
+  details?: ParseErrorDetails;
+}
+
+export interface ParseErrorDetails {
+  position: number;
+  line: number;
+  column: number;
+  token?: string;
+  expected: string[];
+  suggestions: ErrorSuggestion[];
+  formatted: string;
+  impact?: string; // For warnings
+}
+
+export interface ErrorSuggestion {
+  description: string;
+  replacement: string;
+}
+
+export interface EnrichmentSource {
+  id: string;
+  name: string;
+  source_type: string;
+  description?: string;
+  download_url?: string;
+  enabled: boolean;
+  last_sync_at?: string;
+  last_sync_status?: string;
+  record_count: number;
+}
+
+export interface EnrichmentSyncResult {
+  success: boolean;
+  records_loaded: number;
+  duration_ms: number;
+  error?: string;
+}
+
+export interface EnrichmentStats {
+  enabled_sources: number;
+  total_ip_records: number;
+}
+
+export interface IpLookupResult {
+  ip: string;
+  found: boolean;
+  country?: string;
+  country_code?: string;
+  continent?: string;
+  continent_code?: string;
+  asn?: string;
+  as_name?: string;
+  as_domain?: string;
+}
+
+export interface AutoSyncConfig {
+  source_id: string;
+  auto_sync_enabled: boolean;
+  sync_interval_hours: number;
+  next_sync_at?: string;
+}
+
+export interface Feed {
+  id: string;
+  name: string;
+  description?: string;
+  match_field?: string;
+  match_pattern?: string;
+  match_values?: string[];
+  category?: string;
+  vendor?: string;
+  product?: string;
+  icon?: string;
+  color?: string;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateFeedRequest {
+  name: string;
+  description?: string;
+  match_field?: string;
+  match_pattern?: string;
+  match_values?: string[];
+  category?: string;
+  vendor?: string;
+  product?: string;
+  icon?: string;
+  color?: string;
+}
+
+export interface UpdateFeedRequest extends Partial<CreateFeedRequest> {
+  enabled?: boolean;
+}
+
+export interface FeedStats {
+  feed_id: string;
+  feed_name: string;
+  event_count: number;
+  last_event_at?: string;
+}
+
+export interface FeedHealthMetrics {
+  feed_id: string;
+  feed_name: string;
+  total_events: number;
+  events_last_24h: number;
+  events_last_hour: number;
+  avg_events_per_hour: number;
+  last_event_at?: string;
+  first_event_at?: string;
+  data_freshness_hours?: number;
+  ingestion_rate_trend: string;
+  health_status: string;
+  total_size_bytes: number;
+  avg_event_size_bytes: number;
+  error_rate_24h: number;
+  parse_errors_24h: number;
+  storage_errors_24h: number;
+}
+
+export interface FeedHistoryPoint {
+  time: string;
+  event_count: number;
+  hour_label: string;
+}
+
+export interface DiscoveredSourcetype {
+  name: string;
+  count: number;
+  has_feed: boolean;
+}
+
+// Parser types
+export interface Parser {
+  id: string;
+  name: string;
+  description?: string;
+  source_type: string;
+  source_config: Record<string, unknown>;
+  parser_vrl: string;
+  output_fields?: Record<string, unknown>;
+  feed_id?: string;
+  credential_id?: string;
+  enabled: boolean;
+  validated: boolean;
+  validation_error?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateParserRequest {
+  name: string;
+  description?: string;
+  source_type: string;
+  source_config: Record<string, unknown>;
+  parser_vrl: string;
+  output_fields?: Record<string, unknown>;
+  feed_id?: string;
+  credential_id?: string;
+}
+
+export interface UpdateParserRequest extends Partial<CreateParserRequest> {
+  enabled?: boolean;
+}
+
+export interface VrlValidationResult {
+  valid: boolean;
+  error?: string;
+  warnings: string[];
+}
+
+export interface ParserTestResult {
+  success: boolean;
+  input: string;
+  output?: Record<string, unknown>;
+  error?: string;
+  duration_ms: number;
+}
+
+export interface VectorConfigResponse {
+  config: string;
+}
+
+export interface DeployParsersResponse {
+  success: boolean;
+  message: string;
+  enabled_parsers: number;
+}
+
+// Cloud Credential types
+export interface CloudCredential {
+  id: string;
+  name: string;
+  provider: 'aws_s3' | 'gcp_pubsub' | 'kafka';
+  description?: string;
+  region?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateCloudCredentialRequest {
+  name: string;
+  provider: 'aws_s3' | 'gcp_pubsub' | 'kafka';
+  credentials: AwsS3Credentials | GcpPubSubCredentials | KafkaCredentials;
+  description?: string;
+  region?: string;
+}
+
+export interface UpdateCloudCredentialRequest {
+  name?: string;
+  credentials?: AwsS3Credentials | GcpPubSubCredentials | KafkaCredentials;
+  description?: string;
+  region?: string;
+}
+
+export interface AwsS3Credentials {
+  access_key_id: string;
+  secret_access_key: string;
+  session_token?: string;
+  assume_role_arn?: string;
+}
+
+export interface GcpPubSubCredentials {
+  credentials_json: string;
+}
+
+export interface KafkaCredentials {
+  sasl_mechanism?: 'PLAIN' | 'SCRAM-SHA-256' | 'SCRAM-SHA-512';
+  sasl_username?: string;
+  sasl_password?: string;
+  tls_enabled?: boolean;
+  tls_ca_cert?: string;
+}
+
+export interface CredentialListResponse {
+  credentials: CloudCredential[];
+  total: number;
+}
+
+// Parser Library types
+export interface ParserLibraryEntry {
+  id: string;
+  name: string;
+  display_name: string;
+  description?: string;
+  category: string;
+  vendor?: string;
+  source_type: string;
+  parser_vrl: string;
+  sample_logs: string[];
+  field_mappings: Record<string, string>;
+  version: string;
+  is_system: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ParserDeployment {
+  id: string;
+  parser_id: string;
+  action: string;
+  status: string;
+  error_message?: string;
+  config_snapshot?: string;
+  deployed_at: string;
+}
+
+// Log Sources (unified feeds + parsers)
+export interface LogSource {
+  id: string;
+  name: string;
+  description?: string;
+  source_type: string;
+  source_config: Record<string, unknown>;
+  credential_id?: string;
+  parser_vrl: string;
+  output_fields?: Record<string, unknown>;
+  category?: string;
+  vendor?: string;
+  product?: string;
+  icon?: string;
+  color?: string;
+  match_field?: string;
+  match_pattern?: string;
+  match_values?: string[];
+  validated: boolean;
+  validation_error?: string;
+  deployed: boolean;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NewLogSource {
+  name: string;
+  description?: string;
+  source_type: string;
+  source_config: Record<string, unknown>;
+  credential_id?: string;
+  parser_vrl: string;
+  output_fields?: Record<string, unknown>;
+  category?: string;
+  vendor?: string;
+  product?: string;
+  icon?: string;
+  color?: string;
+  match_field?: string;
+  match_pattern?: string;
+  match_values?: string[];
+}
+
+export interface UpdateLogSource {
+  name?: string;
+  description?: string;
+  source_type?: string;
+  source_config?: Record<string, unknown>;
+  credential_id?: string;
+  parser_vrl?: string;
+  output_fields?: Record<string, unknown>;
+  category?: string;
+  vendor?: string;
+  product?: string;
+  icon?: string;
+  color?: string;
+  match_field?: string;
+  match_pattern?: string;
+  match_values?: string[];
+}
+
+export interface LogSourceHealth {
+  log_source_id: string;
+  log_source_name: string;
+  total_events: number;
+  events_last_24h: number;
+  events_last_hour: number;
+  error_rate: number;
+  status: 'healthy' | 'degraded' | 'error' | 'unknown';
+  last_event_at?: string;
+  avg_events_per_minute: number;
+}
+
+export interface LogSourceDeployment {
+  id: string;
+  log_source_id: string;
+  action: string;
+  status: string;
+  error_message?: string;
+  config_snapshot?: string;
+  deployed_at: string;
+}
+
+export interface LogSourceVrlValidationResult {
+  valid: boolean;
+  errors: string[];
+}
+
+export interface LogSourceTestResult {
+  input: string;
+  success: boolean;
+  output?: Record<string, unknown>;
+  error?: string;
+}
+
+export interface EnhancedDeploymentResponse {
+  success: boolean;
+  parser_id: string;
+  action: string;
+  message: string;
+  validation_result?: {
+    success: boolean;
+    errors: string[];
+    warnings: string[];
+    raw_output: string;
+  };
+  deployment_id?: string;
+  recent_deployments: ParserDeployment[];
+}
+
+// meloD Settings types
+export interface MelodConfig {
+  enabled: boolean;
+  provider: string;
+  aws_region: string;
+  model_id: string;
+  max_tokens: number;
+  temperature: number;
+  requests_per_minute: number;
+  has_credentials: boolean;
+  credentials_source?: string;
+}
+
+export interface UpdateMelodConfigRequest {
+  enabled?: boolean;
+  aws_region?: string;
+  model_id?: string;
+  max_tokens?: number;
+  temperature?: number;
+  requests_per_minute?: number;
+}
+
+export type AuthMethod = 'bedrock_api_key' | 'iam_credentials';
+
+export interface UpdateMelodCredentialsRequest {
+  auth_method: AuthMethod;
+  bedrock_api_key?: string;
+  aws_access_key_id?: string;
+  aws_secret_access_key?: string;
+}
+
+export interface MelodConnectionStatus {
+  connected: boolean;
+  model_available: boolean;
+  last_checked?: string;
+  error?: string;
+}
+
+// Organizational Context types (Custom Prompt Data)
+export interface OrganizationalContext {
+  organization_name: string | null;
+  industry: string | null;
+  environment: string | null;
+  attack_vectors: string | null;
+  compliance_frameworks: string[];
+  custom_context: string | null;
+  enable_for_chat: boolean;
+  enable_for_query: boolean;
+  enable_for_detection: boolean;
+  enable_for_parser: boolean;
+  enable_for_dashboard: boolean;
+}
+
+export interface UpdateOrganizationalContextRequest {
+  organization_name?: string | null;
+  industry?: string | null;
+  environment?: string | null;
+  attack_vectors?: string | null;
+  compliance_frameworks?: string[];
+  custom_context?: string | null;
+  enable_for_chat?: boolean;
+  enable_for_query?: boolean;
+  enable_for_detection?: boolean;
+  enable_for_parser?: boolean;
+  enable_for_dashboard?: boolean;
+}
+
+// AI Failures Debug types
+export type AiAgentType = 'query' | 'dashboard' | 'detection' | 'parser' | 'summarize';
+
+export interface AiFailure {
+  id: string;
+  agent_type: string;
+  user_request: string;
+  generated_query: string;
+  error_message: string;
+  retry_count: number;
+  was_resolved: boolean;
+  created_at: string;
+}
+
+export interface AiFailureStats {
+  agent_type: string;
+  total_failures: number;
+  resolved_count: number;
+  avg_retries: number;
+}
+
+export interface GetAiFailuresResponse {
+  failures: AiFailure[];
+  total_count: number;
+  stats: AiFailureStats[];
+}
+
+// Retention Settings types
+export interface RetentionConfig {
+  enabled: boolean;
+  retention_days: number;
+  job_id: number | null;
+}
+
+export interface UpdateRetentionRequest {
+  enabled: boolean;
+  retention_days: number;
+}
+
+export interface StorageStats {
+  total_size_bytes: number;
+  total_size_pretty: string;
+  chunk_count: number;
+  compressed_chunks: number;
+  oldest_log: string | null;
+  newest_log: string | null;
+  log_count: number;
+}
+
+// ClickHouse Storage Stats types
+export interface ClickHouseStorageStats {
+  total_size_bytes: number;
+  total_size_pretty: string;
+  row_count: number;
+  partition_count: number;
+  parts_count: number;
+  oldest_log: string | null;
+  newest_log: string | null;
+  compression_ratio: number;
+  uncompressed_size_bytes: number;
+  ttl_days: number | null;
+}
+
+export interface StorageOverview {
+  clickhouse_enabled: boolean;
+  postgres: StorageStats | null;
+  clickhouse: ClickHouseStorageStats | null;
+}
+
+export interface UpdateClickHouseRetentionRequest {
+  retention_days: number;
+}
+
+// Storage Tiering types
+export type TieringStatus = 'unconfigured' | 'pending' | 'applying' | 'active' | 'error';
+
+export interface TieringConfig {
+  enabled: boolean;
+  s3_endpoint: string | null;
+  s3_bucket: string | null;
+  s3_region: string;
+  s3_path_style: boolean;
+  has_credentials: boolean;
+  hot_days: number;
+  warm_days: number;
+  cold_enabled: boolean;
+  cold_days: number | null;
+  move_factor: number;
+  status: TieringStatus;
+  status_message: string | null;
+  last_applied_at: string | null;
+}
+
+export interface UpdateTieringRequest {
+  enabled?: boolean;
+  s3_endpoint?: string;
+  s3_bucket?: string;
+  s3_region?: string;
+  s3_path_style?: boolean;
+  hot_days?: number;
+  warm_days?: number;
+  cold_enabled?: boolean;
+  cold_days?: number;
+  move_factor?: number;
+}
+
+export interface SetTieringCredentialsRequest {
+  access_key_id: string;
+  secret_access_key: string;
+}
+
+export interface TierInfo {
+  size_bytes: number;
+  size_pretty: string;
+  row_count: number;
+}
+
+export interface TierStats {
+  hot: TierInfo;
+  warm: TierInfo;
+  total_size_bytes: number;
+  total_size_pretty: string;
+  total_row_count: number;
+  last_updated: string;
+}
+
+export interface TieringConnectionTestResult {
+  success: boolean;
+  message: string;
+  latency_ms: number | null;
+}
+
+// Risk Settings types
+export interface RiskConfig {
+  risk_weight: number;
+}
+
+export interface UpdateRiskConfigRequest {
+  risk_weight: number;
+}
+
+// Risk Decay Configuration (Google SecOps-style TTL decay)
+export interface RiskDecayConfig {
+  decay_0_24h: number;  // Decay factor for 0-24h signals (default 1.0)
+  decay_1_3d: number;   // Decay factor for 1-3 day signals (default 0.7)
+  decay_3_5d: number;   // Decay factor for 3-5 day signals (default 0.4)
+  decay_5_7d: number;   // Decay factor for 5-7 day signals (default 0.2)
+}
+
+export interface UpdateRiskDecayConfigRequest {
+  decay_0_24h: number;
+  decay_1_3d: number;
+  decay_3_5d: number;
+  decay_5_7d: number;
+}
+
+// Risk Modifier type for detection rules
+export interface RiskModifier {
+  condition: string;
+  score: number;
+}
+
+// Risk Analytics types
+export type RiskLevel = 'low' | 'medium' | 'high' | 'critical';
+
+export interface EntityRiskSummary {
+  entity: string;
+  entity_type: string;
+  risk_score: number;
+  signal_count: number;
+  last_signal_at?: string;
+  last_rule_name?: string;
+  last_severity?: string;
+  risk_level: RiskLevel;
+}
+
+export interface RiskAnalyticsOverview {
+  total_entities: number;
+  critical_entities: number;
+  high_entities: number;
+  medium_entities: number;
+  low_entities: number;
+  total_signals: number;
+  avg_risk_score: number;
+}
+
+export interface EntityTypeCount {
+  entity_type: string;
+  count: number;
+}
+
+export interface RiskOverviewResponse {
+  overview_24h: RiskAnalyticsOverview;
+  overview_7d: RiskAnalyticsOverview;
+  entity_types: EntityTypeCount[];
+}
+
+export interface RiskEntitiesResponse {
+  entities: EntityRiskSummary[];
+  total: number;
+}
+
+// Time-windowed risk scores with TTL decay (from signals table)
+export interface TimeWindowedRiskScore {
+  entity: string;
+  entity_type: string;
+  risk_score_24h: number;     // Raw sum of scores (no decay)
+  risk_score_7d: number;      // Raw sum of scores (no decay)
+  decayed_score_24h: number;  // With TTL decay applied
+  decayed_score_7d: number;   // With TTL decay applied
+  signal_count_24h: number;
+  signal_count_7d: number;
+  last_signal_at?: string;
+  last_rule_name?: string;
+  last_severity?: string;
+}
+
+export interface TimeWindowedRiskResponse {
+  entities: TimeWindowedRiskScore[];
+  total: number;
+}
+
+export interface TimeWindowedRiskQuery {
+  min_score_24h?: number;
+  min_score_7d?: number;
+  limit?: number;
+}
+
+export interface ClearEntityRiskRequest {
+  entity: string;
+  entity_type?: string;
+  reason?: string;
+}
+
+export interface ClearRiskResponse {
+  success: boolean;
+  cleared_count: number;
+}
+
+export interface RiskEntitiesQuery {
+  window?: '24h' | '7d' | 'all';
+  entity_type?: string;
+  min_score?: number;
+  limit?: number;
+  offset?: number;
+}
+
+// meloD Agent types
+export interface GeneratedParser {
+  vrl_code: string;
+  description: string;
+  output_fields: Record<string, string>;
+  test_results?: {
+    passed: number;
+    failed: number;
+    samples: Array<{ input: string; output: Record<string, unknown>; success: boolean }>;
+  };
+}
+
+export interface SuggestedTimeRange {
+  preset?: string;
+  description: string;
+  duration_seconds?: number;
+}
+
+export interface GeneratedQuery {
+  spl_query: string;
+  sql_query: string;
+  explanation: string;
+  fields_used?: string[];
+  estimated_complexity?: string;
+  suggested_time_range?: SuggestedTimeRange;
+  reasoning_steps?: ReasoningStep[];
+}
+
+export interface ReasoningStep {
+  step_type: 'parse_request' | 'source_discovery' | 'field_analysis' | 'query_generation' | 'validation';
+  title: string;
+  description: string;
+  details?: Record<string, unknown>;
+}
+
+// Detection validation result
+export interface DetectionValidation {
+  syntax_valid: boolean;
+  syntax_errors: string[];
+  execution_valid: boolean;
+  execution_errors: string[];
+  valid_fields: string[];
+  invalid_fields: string[];
+}
+
+// Noise level classification
+export type NoiseLevel = 'very_low' | 'low' | 'moderate' | 'high' | 'very_high' | 'unknown';
+
+// Alert fatigue risk level
+export type AlertFatigueRisk = 'low' | 'medium' | 'high' | 'critical';
+
+// Threshold suggestion for tuning
+export interface ThresholdSuggestion {
+  description: string;
+  modified_query: string;
+  estimated_reduction_percent: number;
+}
+
+// Noise assessment for a detection
+export interface NoiseAssessment {
+  level: NoiseLevel;
+  daily_average: number;
+  peak_daily_matches: number;
+  estimated_daily_alerts: number;
+  alert_fatigue_risk: AlertFatigueRisk;
+  explanation: string;
+  threshold_suggestions: ThresholdSuggestion[];
+}
+
+// Recommended action for a detection
+export type RecommendedAction = 'proceed' | 'proceed_with_tuning' | 'review_first' | 'not_recommended' | 'unable_to_assess';
+
+// Overall recommendation for a detection
+export interface DetectionRecommendation {
+  action: RecommendedAction;
+  confidence: number;
+  reasoning: string;
+  alternatives: string[];
+}
+
+// Historical analysis result
+export interface HistoricalAnalysisResult {
+  total_matches: number;
+  days_analyzed: number;
+  daily_average: number;
+}
+
+// Tuning suggestion
+export interface TuningSuggestion {
+  issue: string;
+  suggestion: string;
+  modified_query?: string;
+}
+
+export interface GeneratedDetection {
+  name: string;
+  description: string;
+  query: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'informational';
+  mitre_tactics: string[];
+  mitre_techniques: string[];
+  narrative?: string;
+  tags?: string[];
+  historical_analysis?: HistoricalAnalysisResult;
+  tuning_suggestions?: TuningSuggestion[];
+  validation?: DetectionValidation;
+  noise_assessment?: NoiseAssessment;
+  recommendation?: DetectionRecommendation;
+}
+
+export interface MelodChatRequest {
+  session_id?: string;
+  message: string;
+}
+
+export interface MelodCreateParserRequest {
+  session_id?: string;
+  /** Feed ID - optional when sample_logs are provided (wizard mode) */
+  feed_id?: string;
+  message?: string;
+  /** Optional sample logs to use instead of fetching from database.
+   * Use this when logs haven't been ingested yet (e.g., S3/cloud sources).
+   * Required when feed_id is not provided. */
+  sample_logs?: string[];
+}
+
+export interface MelodBuildQueryRequest {
+  session_id?: string;
+  message: string;
+  time_range: TimeRange;
+}
+
+export interface MelodCreateDetectionRequest {
+  session_id?: string;
+  description: string;
+  run_historical?: boolean;
+}
+
+export interface MelodTuneDetectionRequest {
+  session_id?: string;
+  rule_id: string;
+  feedback?: string;
+}
+
+export interface MelodSummarizeRequest {
+  query: string;
+  query_mode: string;
+  results: Record<string, unknown>[];
+  total_count: number;
+  time_range: TimeRange;
+  histogram?: Array<{ time: string; count: number }>;
+}
+
+export interface MelodEditParserRequest {
+  parser_id: string;
+  current_vrl: string;
+  message: string;
+  sample_logs?: string[];
+  session_id?: string;
+}
+
+// Edit operation types for AI parser editing
+export type EditOperation =
+  | { type: 'replace'; find: string; with: string }
+  | { type: 'insert_after'; marker: string; code: string }
+  | { type: 'insert_before'; marker: string; code: string }
+  | { type: 'append'; code: string }
+  | { type: 'prepend'; code: string };
+
+export interface MelodEditParserResponse {
+  session_id: string;
+  message: string;
+  updated_vrl?: string;
+  edits_applied?: EditOperation[];
+  validation?: {
+    valid: boolean;
+    errors: string[];
+  };
+  test_results?: Array<{
+    input: string;
+    success: boolean;
+    output?: Record<string, unknown>;
+    error?: string;
+  }>;
+}
+
+// Dashboard Generation Types
+export type DashboardTemplate =
+  | 'windows_security'
+  | 'network_monitoring'
+  | 'web_application_security'
+  | 'cloud_security_aws'
+  | 'endpoint_detection'
+  | 'authentication_audit'
+  | 'firewall_analysis';
+
+export interface GeneratedPanel {
+  id: string;
+  title: string;
+  query: string;
+  query_mode: 'piped' | 'sql';
+  visualization_type: string;
+  visualization_config: Record<string, unknown>;
+  rationale?: string;
+}
+
+export interface GeneratedVariable {
+  name: string;
+  label: string;
+  variable_type: 'dropdown' | 'text' | 'query';
+  default_value?: string;
+  options?: string[];
+  query?: string;
+  query_field?: string;
+  multi?: boolean;
+  rationale?: string;
+}
+
+export interface GeneratedLayoutItem {
+  panel_id: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface GeneratedLayout {
+  columns: number;
+  row_height: number;
+  items: GeneratedLayoutItem[];
+}
+
+export type QuestionType = 'single_choice' | 'multi_choice' | 'free_text' | 'yes_no';
+
+export interface ClarifyingQuestion {
+  id: string;
+  question: string;
+  question_type: QuestionType;
+  options?: string[];
+  default_answer?: string;
+  required: boolean;
+}
+
+export interface GeneratedDashboard {
+  name: string;
+  description: string;
+  panels: GeneratedPanel[];
+  layout: GeneratedLayout;
+  variables: GeneratedVariable[];
+  explanation: string;
+  refresh_interval?: number;
+  clarifying_questions?: ClarifyingQuestion[];
+  is_complete: boolean;
+}
+
+export interface GenerateDashboardRequest {
+  session_id?: string;
+  description: string;
+  template?: DashboardTemplate;
+  time_range?: TimeRange;
+  answers?: Record<string, string | string[]>;
+}
+
+// Partial dashboard for refine - only needs essential fields
+export interface RefineDashboardCurrentState {
+  name: string;
+  description?: string;
+  panels: GeneratedPanel[];
+  variables: GeneratedVariable[];
+  layout?: GeneratedLayout;
+  explanation?: string;
+  is_complete?: boolean;
+}
+
+export interface RefineDashboardRequest {
+  session_id?: string;
+  current_dashboard: RefineDashboardCurrentState;
+  refinement: string;
+}
+
+export interface GenerateDashboardResponse {
+  session_id: string;
+  message: string;
+  dashboard?: GeneratedDashboard;
+  clarifying_questions?: ClarifyingQuestion[];
+  is_complete: boolean;
+}
+
+// Async job types for dashboard generation
+export type DashboardJobStatus = 'pending' | 'running' | 'completed' | 'failed';
+
+export interface DashboardJobStartResponse {
+  job_id: string;
+  session_id: string;
+  status: DashboardJobStatus;
+  message: string;
+}
+
+export interface DashboardJobStatusResponse {
+  job_id: string;
+  session_id: string;
+  status: DashboardJobStatus;
+  message?: string;
+  dashboard?: GeneratedDashboard;
+  clarifying_questions?: ClarifyingQuestion[];
+  is_complete?: boolean;
+  error?: string;
+}
+
+// System metrics types
+export interface ActivityPoint {
+  time: string;
+  event_count: number;
+  alert_count: number;
+}
+
+export interface SystemOverview {
+  events_24h: number;
+  events_1h: number;
+  events_trend: number;
+  alerts_24h: number;
+  alerts_1h: number;
+  alerts_trend: number;
+  critical_alerts_24h: number;
+  critical_alerts_trend: number;
+  active_rules: number;
+  total_rules: number;
+  active_rules_trend: number;
+  activity: ActivityPoint[];
+}
+
+export interface SearchSummary {
+  narrative: string;
+  key_findings: KeyFinding[];
+  field_insights: FieldInsight[];
+  suggested_queries: SuggestedQuery[];
+  timeline_analysis?: TimelineAnalysis;
+  risk_assessment?: RiskAssessment;
+  diagrams: MermaidDiagram[];
+}
+
+export interface MermaidDiagram {
+  diagram_type: 'flowchart' | 'sequence' | 'entity_relationship';
+  title: string;
+  code: string;
+}
+
+export interface KeyFinding {
+  category: string;
+  title: string;
+  description: string;
+  importance: 'low' | 'medium' | 'high' | 'critical';
+  related_fields: string[];
+}
+
+export interface FieldInsight {
+  field: string;
+  total_count: number;
+  unique_count: number;
+  top_values: Array<{ value: string; count: number; percentage: number }>;
+  insight?: string;
+}
+
+export interface SuggestedQuery {
+  description: string;
+  query: string;
+  rationale: string;
+  priority: 'low' | 'medium' | 'high';
+}
+
+export interface TimelineAnalysis {
+  start_time: string;
+  end_time: string;
+  duration: string;
+  peak_periods: Array<{ start: string; end: string; event_count: number; description: string }>;
+  gaps: Array<{ start: string; end: string; duration: string }>;
+}
+
+export interface RiskAssessment {
+  level: 'none' | 'low' | 'medium' | 'high' | 'critical';
+  explanation: string;
+  indicators: Array<{ indicator: string; description: string; severity: string }>;
+}
+
+export interface MelodApiResponse {
+  session_id: string;
+  message: string;
+  parser?: GeneratedParser;
+  query?: GeneratedQuery;
+  detection?: GeneratedDetection;
+}
+
+// Parser progress event types for streaming
+export type ParserProgressEvent = 
+  | { type: 'started'; feed_name: string; sample_count: number }
+  | { type: 'generating_parser'; attempt: number; max_attempts: number }
+  | { type: 'validating_syntax' }
+  | { type: 'syntax_validation_result'; valid: boolean; errors: string[] }
+  | { type: 'testing_parser'; sample_index: number; total_samples: number }
+  | { type: 'test_result'; sample_index: number; success: boolean; error?: string }
+  | { type: 'retrying_with_feedback'; attempt: number; max_attempts: number; reason: string }
+  | { type: 'completed'; success: boolean; message: string }
+  | { type: 'error'; message: string };
+
+// Upload types
+export type FileFormat = 'csv' | 'json' | 'ndjson';
+
+export interface UploadConfig {
+  format?: FileFormat;
+  destination_type: 'logs' | 'lookup';
+  destination_name: string;
+  parser_id?: string;
+  primary_key?: string;
+  mode?: 'replace' | 'append';
+  csv_delimiter?: string;
+  csv_has_headers?: boolean;
+}
+
+export interface UploadResponse {
+  upload_id: string;
+  records_processed: number;
+  records_ingested: number;
+  errors: string[];
+  duration_ms: number;
+}
+
+export interface ColumnInfo {
+  name: string;
+  detected_type: string;
+  sample_values: string[];
+  null_count: number;
+}
+
+export interface PreviewResult {
+  format: FileFormat;
+  columns: ColumnInfo[];
+  rows: Record<string, unknown>[];
+  total_rows_estimate: number;
+}
+
+export interface UploadRecord {
+  id: string;
+  filename: string;
+  file_size: number;
+  file_format: string;
+  destination_type: string;
+  destination_name: string;
+  records_total: number;
+  records_success: number;
+  records_failed: number;
+  status: string;
+  error_message?: string;
+  created_at: string;
+  completed_at?: string;
+}
+
+export interface UploadHistoryFilter {
+  destination_type?: string;
+  destination_name?: string;
+  status?: string;
+  start_date?: string;
+  end_date?: string;
+  limit?: number;
+  offset?: number;
+}
+
+// Lookup table types
+export interface LookupColumn {
+  name: string;
+  data_type: string;
+  nullable: boolean;
+}
+
+export interface LookupTable {
+  id: string;
+  name: string;
+  description?: string;
+  table_name: string;
+  columns: LookupColumn[];
+  primary_key?: string;
+  row_count: number;
+  size_bytes: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateLookupTableConfig {
+  name: string;
+  description?: string;
+  primary_key?: string;
+  format?: FileFormat;
+  csv_delimiter?: string;
+  csv_has_headers?: boolean;
+  mode?: 'replace' | 'append';
+  column_types?: { column: string; data_type: string }[];
+  flatten_json?: boolean;
+}
+
+export interface CreateLookupTableResponse {
+  table: LookupTable;
+  records_inserted: number;
+}
+
+export interface LookupQueryRequest {
+  table_name: string;
+  key_field: string;
+  key_value?: unknown;
+  key_values?: unknown[];
+  output_fields?: string[];
+  case_insensitive?: boolean;
+}
+
+export interface LookupResult {
+  fields?: Record<string, unknown>;
+  found: boolean;
+}
+
+export interface BatchLookupResult {
+  results: Record<string, Record<string, unknown>>;
+  matched_count: number;
+  total_count: number;
+}
+
+// Dashboard types
+export type DashboardVariableType = 'dropdown' | 'text' | 'query';
+
+export interface DashboardVariable {
+  name: string;           // Variable name (used as $name in queries)
+  label: string;          // Display label
+  type: DashboardVariableType;
+  defaultValue?: string;
+  // For dropdown type - static options
+  options?: string[];
+  // For query type - dynamic options from search
+  query?: string;         // Query to fetch options
+  queryField?: string;    // Field from results to use as options
+  multi?: boolean;        // Allow multiple selections
+}
+
+export interface Dashboard {
+  id: string;
+  name: string;
+  description?: string;
+  layout: DashboardLayout;  // variables are stored in layout.variables
+  panels: PanelConfig[];
+  refresh_interval?: number;
+  owner_id?: string;
+  owner_name?: string;
+  is_private: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DashboardSummary {
+  id: string;
+  name: string;
+  description?: string;
+  panel_count: number;
+  owner_id?: string;
+  owner_name?: string;
+  is_private: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DashboardLayout {
+  columns: number;
+  rowHeight: number;
+  items: LayoutItem[];
+  variables?: DashboardVariable[];
+}
+
+export interface LayoutItem {
+  i: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  minW?: number;
+  minH?: number;
+}
+
+export type VisualizationType = 
+  | 'bar' 
+  | 'line' 
+  | 'area' 
+  | 'pie' 
+  | 'table' 
+  | 'single_value' 
+  | 'timeline';
+
+export interface VisualizationConfig {
+  orientation?: 'horizontal' | 'vertical';
+  stacked?: boolean;
+  showPoints?: boolean;
+  smooth?: boolean;
+  fillOpacity?: number;
+  showLabels?: boolean;
+  donut?: boolean;
+  columns?: TableColumnConfig[];
+  pageSize?: number;
+  unit?: string;
+  thresholds?: ThresholdConfig[];
+  showTrend?: boolean;
+  bucketSize?: string;
+}
+
+export interface TableColumnConfig {
+  field: string;
+  label: string;
+  sortable: boolean;
+  width?: number;
+}
+
+export interface ThresholdConfig {
+  value: number;
+  color: string;
+  label?: string;
+}
+
+export interface PanelConfig {
+  id: string;
+  title: string;
+  query: string;
+  queryMode: 'piped' | 'sql';
+  visualizationType: VisualizationType;
+  visualizationConfig: VisualizationConfig;
+  timeRangeMode: 'dashboard' | 'custom';
+  customTimeRange?: TimeRange;
+  drilldownEnabled: boolean;
+  drilldownTemplate?: string;
+}
+
+export interface CreateDashboardRequest {
+  name: string;
+  description?: string;
+  layout: DashboardLayout;  // variables are embedded in layout
+  panels: PanelConfig[];
+  refresh_interval?: number;
+  is_private?: boolean;
+}
+
+export interface UpdateDashboardRequest {
+  name?: string;
+  description?: string;
+  layout?: DashboardLayout;  // variables are embedded in layout
+  panels?: PanelConfig[];
+  refresh_interval?: number;
+  is_private?: boolean;
+}
+
+export interface PanelQueryRequest {
+  query: string;
+  query_mode: string;
+  time_range: TimeRange;
+  variables?: Record<string, string>;
+}
+
+export interface PanelQueryResponse {
+  results: Record<string, unknown>[];
+  total_count: number;
+  execution_time_ms: number;
+}
+
+export interface DashboardExport {
+  version: string;
+  exported_at: string;
+  dashboard: CreateDashboardRequest;
+}
+
+export interface ImportDashboardRequest {
+  json: string;
+}
+
+// Notebook types
+export type NotebookVisibility = 'private' | 'shared' | 'public';
+export type NotebookStatus = 'active' | 'paused' | 'closed';
+export type SharePermission = 'view' | 'edit';
+export type ReferenceType = 'alert' | 'detection' | 'saved_search' | 'case';
+export type NotebookEntryType =
+  | 'manual_note'
+  | 'search_executed'
+  | 'search_refined'
+  | 'alert_viewed'
+  | 'alert_actioned'
+  | 'detection_viewed'
+  | 'detection_modified'
+  | 'ai_suggestion'
+  | 'ai_summary'
+  // @ command entry types
+  | 'entity_reference'
+  | 'ioc_marker'
+  | 'timeline_marker'
+  | 'linked_alert'
+  | 'linked_detection'
+  | 'ai_query'
+  | 'pivot_suggestions'
+  // Generated content
+  | 'investigation_timeline';
+
+export interface Notebook {
+  id: string;
+  title: string;
+  owner_id: string;
+  case_id?: string;
+  visibility: NotebookVisibility;
+  status: NotebookStatus;
+  summary?: string;
+  created_at: string;
+  updated_at: string;
+  closed_at?: string;
+}
+
+export interface NotebookWithOwner extends Notebook {
+  owner_name?: string;
+}
+
+export interface NotebookSummary extends NotebookWithOwner {
+  entry_count: number;
+}
+
+export interface MatchedEntity {
+  entity_type: string;
+  value: string;
+}
+
+export interface RelatedNotebook extends NotebookSummary {
+  matched_entities: MatchedEntity[];
+}
+
+export interface NotebookResponse extends NotebookWithOwner {
+  entry_count: number;
+  can_edit: boolean;
+}
+
+export interface NotebookEntry {
+  id: string;
+  notebook_id: string;
+  entry_type: NotebookEntryType;
+  content: Record<string, unknown>;
+  source_url?: string;
+  created_by: string;
+  created_at: string;
+}
+
+export interface NotebookEntryWithCreator extends NotebookEntry {
+  creator_name?: string;
+}
+
+export interface NotebookShare {
+  id: string;
+  notebook_id: string;
+  shared_with_user_id?: string;
+  shared_with_group_id?: string;
+  permission: SharePermission;
+  created_at: string;
+}
+
+export interface NotebookShareWithNames extends NotebookShare {
+  user_name?: string;
+  group_name?: string;
+}
+
+export interface NotebookReference {
+  id: string;
+  notebook_id: string;
+  reference_type: ReferenceType;
+  reference_id: string;
+  reference_name?: string;
+  created_at: string;
+}
+
+export interface CreateNotebookRequest {
+  title: string;
+  visibility?: NotebookVisibility;
+}
+
+export interface UpdateNotebookRequest {
+  title?: string;
+  visibility?: NotebookVisibility;
+  status?: NotebookStatus;
+  summary?: string;
+}
+
+export interface AddEntryRequest {
+  entry_type: NotebookEntryType;
+  content: Record<string, unknown>;
+  source_url?: string;
+}
+
+export interface AddShareRequest {
+  user_id?: string;
+  group_id?: string;
+  permission?: SharePermission;
+}
+
+export interface AddReferenceRequest {
+  reference_type: ReferenceType;
+  reference_id: string;
+  reference_name?: string;
+}
+
+export interface NotebookAISummary {
+  summary: string;
+  key_findings: string[];
+  entities_investigated: string[];
+  queries_run: number;
+  alerts_reviewed: number;
+  suggested_next_steps: string[];
+}
+
+// Investigation timeline types
+export interface TimelineEvent {
+  id: string;
+  sequence: number;
+  phase: string;
+  title: string;
+  description: string;
+  timestamp: string;
+  duration?: string;
+  severity?: 'critical' | 'high' | 'medium' | 'low';
+  related_entries: string[];
+  entities?: string[];
+}
+
+export interface InvestigationTimelineResponse {
+  events: TimelineEvent[];
+  summary?: string;
+  generated_at: string;
+}
+
+export interface QuerySuggestion {
+  query: string;
+  description: string;
+  rationale: string;
+}
+
+export interface NotebookQuerySuggestions {
+  suggestions: QuerySuggestion[];
+  context_summary: string;
+}
+
+// Scheduled job types
+export type JobStatus = 'success' | 'failed' | 'running';
+
+export interface RetryPolicy {
+  max_retries: number;
+  retry_delay_secs: number;
+}
+
+export interface UploadDestination {
+  type: 'logs' | 'lookup';
+  source_type?: string;
+  parser_id?: string;
+  table_name?: string;
+  primary_key?: string;
+  mode?: 'replace' | 'append';
+}
+
+export interface ParserConfig {
+  format: FileFormat;
+  csv_delimiter?: string;
+  csv_has_headers?: boolean;
+  custom_headers?: string[];
+  encoding?: string;
+  max_records?: number;
+  skip_invalid?: boolean;
+}
+
+export interface ScheduledJob {
+  id: string;
+  name: string;
+  description?: string;
+  cron_expression: string;
+  url: string;
+  auth_headers?: Record<string, string>;
+  destination: UploadDestination;
+  parser_config: ParserConfig;
+  retry_policy: RetryPolicy;
+  enabled: boolean;
+  last_run_at?: string;
+  last_run_status?: JobStatus;
+  last_run_error?: string;
+  next_run_at?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NewScheduledJob {
+  name: string;
+  description?: string;
+  cron_expression: string;
+  url: string;
+  auth_headers?: Record<string, string>;
+  destination: UploadDestination;
+  parser_config: ParserConfig;
+  retry_policy?: RetryPolicy;
+  enabled?: boolean;
+}
+
+export interface UpdateScheduledJob {
+  name?: string;
+  description?: string | null;
+  cron_expression?: string;
+  url?: string;
+  auth_headers?: Record<string, string> | null;
+  destination?: UploadDestination;
+  parser_config?: ParserConfig;
+  retry_policy?: RetryPolicy;
+  enabled?: boolean;
+}
+
+export interface JobExecution {
+  job_id: string;
+  started_at: string;
+  completed_at?: string;
+  status: JobStatus;
+  records_processed?: number;
+  records_ingested?: number;
+  error?: string;
+  duration_ms?: number;
+}
+
+export interface JobFilter {
+  enabled?: boolean;
+  destination_type?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface JobStats {
+  total_jobs: number;
+  enabled_jobs: number;
+  jobs_run_24h: number;
+  successful_runs_24h: number;
+  failed_runs_24h: number;
+}
+
+export interface ValidateCronRequest {
+  expression: string;
+  preview_count?: number;
+}
+
+export interface ValidateCronResponse {
+  valid: boolean;
+  description?: string;
+  next_runs: string[];
+  error?: string;
+}
+
+// ============================================================================
+// Authentication Types
+// ============================================================================
+
+export interface AuthResponse {
+  user: CurrentUser;
+  tokens: TokenPairResponse;
+}
+
+export interface TokenPairResponse {
+  access_token: string;
+  refresh_token: string;
+  token_type: string;
+  expires_in: number;
+}
+
+export interface CurrentUser {
+  id: string;
+  email: string;
+  name: string;
+  roles: string[];
+  permissions: string[];
+  is_api_key?: boolean;
+}
+
+export interface OidcProviderInfo {
+  id: string;
+  name: string;
+  slug: string;
+}
+
+// OIDC Provider Management Types
+export interface OidcProviderSummary {
+  id: string;
+  name: string;
+  slug: string;
+  issuer: string;
+  enabled: boolean;
+  scopes: string[];
+  group_claim?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface OidcProviderListResponse {
+  providers: OidcProviderSummary[];
+  total: number;
+}
+
+export interface CreateOidcProviderRequest {
+  name: string;
+  slug: string;
+  issuer: string;
+  client_id: string;
+  client_secret: string;
+  scopes?: string[];
+  group_claim?: string;
+  enabled?: boolean;
+}
+
+export interface UpdateOidcProviderRequest {
+  name?: string;
+  issuer?: string;
+  client_id?: string;
+  client_secret?: string;
+  scopes?: string[];
+  group_claim?: string;
+  enabled?: boolean;
+}
+
+export interface OidcGroupMapping {
+  id: string;
+  provider_id: string;
+  oidc_group: string;
+  local_group_id: string;
+  local_group_name?: string;
+}
+
+export interface OidcGroupMappingsResponse {
+  mappings: OidcGroupMapping[];
+}
+
+export interface UpdateOidcGroupMappingsRequest {
+  mappings: Array<{
+    oidc_group: string;
+    local_group_id: string;
+  }>;
+}
+
+export interface OidcAuthUrlResponse {
+  url: string;
+  state: string;
+  nonce: string;
+  code_verifier: string;
+}
+
+export interface OidcCallbackResponse {
+  user: CurrentUser;
+  tokens: TokenPairResponse;
+}
+
+// User Management Types
+export interface UserDetail {
+  id: string;
+  email: string;
+  name: string;
+  status: 'active' | 'locked' | 'disabled';
+  groups: GroupSummary[];
+  oidc_provider?: string;
+  last_login_at?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface UserListResponse {
+  users: UserDetail[];
+  total: number;
+}
+
+// Notification types
+export type NotificationType = 'case_mention' | 'case_assigned' | 'case_status_change' | 'alert_assigned' | 'system';
+
+export interface Notification {
+  id: string;
+  user_id: string;
+  notification_type: NotificationType;
+  title: string;
+  message?: string;
+  link?: string;
+  metadata: Record<string, unknown>;
+  read_at?: string;
+  created_at: string;
+}
+
+export interface NotificationListResponse {
+  notifications: Notification[];
+}
+
+export interface UnreadCountResponse {
+  count: number;
+}
+
+export interface MarkAllReadResponse {
+  marked_count: number;
+}
+
+export interface CreateUserRequest {
+  email: string;
+  name: string;
+  password: string;
+  group_ids?: string[];
+}
+
+export interface UpdateUserRequest {
+  email?: string;
+  name?: string;
+  password?: string;
+  group_ids?: string[];
+}
+
+// Group Management Types
+export interface GroupSummary {
+  id: string;
+  name: string;
+  is_system: boolean;
+}
+
+export interface GroupDetail {
+  id: string;
+  name: string;
+  description?: string;
+  is_system: boolean;
+  roles: RoleSummary[];
+  member_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface GroupListResponse {
+  groups: GroupDetail[];
+  total: number;
+}
+
+export interface CreateGroupRequest {
+  name: string;
+  description?: string;
+  role_ids?: string[];
+}
+
+export interface UpdateGroupRequest {
+  name?: string;
+  description?: string;
+  role_ids?: string[];
+}
+
+// Role Management Types
+export interface RoleSummary {
+  id: string;
+  name: string;
+  is_system: boolean;
+}
+
+export interface RoleDetail {
+  id: string;
+  name: string;
+  description?: string;
+  is_system: boolean;
+  permissions: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RoleListResponse {
+  roles: RoleDetail[];
+  total: number;
+}
+
+export interface CreateRoleRequest {
+  name: string;
+  description?: string;
+  permissions: string[];
+}
+
+export interface UpdateRoleRequest {
+  name?: string;
+  description?: string;
+  permissions?: string[];
+}
+
+export interface PermissionInfo {
+  id: string;
+  name: string;
+  description: string;
+  category: string;
+}
+
+// API Key Types
+export interface ApiKeySummary {
+  id: string;
+  name: string;
+  description?: string;
+  key_prefix: string;
+  permissions: string[];
+  enabled: boolean;
+  expires_at?: string;
+  rate_limit?: number;
+  last_used_at?: string;
+  created_at: string;
+}
+
+export interface ApiKeyListResponse {
+  api_keys: ApiKeySummary[];
+  total: number;
+}
+
+export interface CreateApiKeyRequest {
+  name: string;
+  description?: string;
+  permissions: string[];
+  expires_at?: string;
+  rate_limit?: number;
+}
+
+export interface ApiKeyCreatedResponse {
+  id: string;
+  key: string;
+  name: string;
+  created_at: string;
+}
+
+// Session Types
+export interface SessionInfo {
+  id: string;
+  user_id: string;
+  ip_address?: string;
+  user_agent?: string;
+  created_at: string;
+  last_used_at: string;
+  expires_at: string;
+  is_current: boolean;
+}
+
+export interface SessionListResponse {
+  sessions: SessionInfo[];
+  total: number;
+}
+
+// Audit Log Types
+export interface AuditLogEntry {
+  id: string;
+  timestamp: string;
+  user_id?: string;
+  user_name?: string;
+  api_key_id?: string;
+  api_key_name?: string;
+  action: string;
+  resource_type?: string;
+  resource_id?: string;
+  details?: Record<string, unknown>;
+  ip_address?: string;
+  success: boolean;
+}
+
+export interface AuditLogResponse {
+  logs: AuditLogEntry[];
+  total: number;
+}
+
+export interface AuditLogQuery {
+  user_id?: string;
+  action?: string;
+  start_time?: string;
+  end_time?: string;
+  limit?: number;
+  offset?: number;
+}
+
+// ============================================================================
+// Prevalence Tracking Types
+// ============================================================================
+
+export type PrevalenceArtifactType = 'hash_md5' | 'hash_sha256' | 'hash_unknown' | 'domain' | 'subdomain' | 'ip_address' | 'ip_address_private';
+
+export interface PrevalenceData {
+  artifact: string;
+  artifact_type: PrevalenceArtifactType;
+  host_count: number;
+  total_occurrences: number;
+  first_seen: string;
+  last_seen: string;
+  is_rare: boolean;
+  prevalence_score: number;
+}
+
+export interface PrevalenceResponse {
+  data: PrevalenceData;
+}
+
+export interface BulkPrevalenceRequest {
+  artifacts: string[];
+  window?: string;
+}
+
+export interface BulkPrevalenceResponse {
+  data: PrevalenceData[];
+  total: number;
+}
+
+export interface RareArtifactsQuery {
+  window?: string;
+  type?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface NewArtifactsQuery {
+  since?: string;
+  type?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface ArtifactListResponse {
+  artifacts: PrevalenceData[];
+  total: number;
+  limit: number;
+  offset: number;
+  has_more: boolean;
+}
+
+export interface ScatterPlotRequest {
+  artifacts: {
+    hashes: string[];
+    domains: string[];
+    ips: string[];
+  };
+  window?: string;
+}
+
+export interface PrevalenceScatterPoint {
+  artifact: string;
+  artifact_type: PrevalenceArtifactType;
+  host_count: number;
+  first_seen: string;
+  last_seen: string;
+  total_occurrences: number;
+  is_rare: boolean;
+  prevalence_score: number;
+}
+
+export interface PrevalenceScatterDataResponse {
+  hash_points: PrevalenceScatterPoint[];
+  domain_points: PrevalenceScatterPoint[];
+  ip_points: PrevalenceScatterPoint[];
+  rarity_threshold: number;
+}
+
+export interface PrevalenceSettingsResponse {
+  rarity_threshold: number;
+  enable_hash_tracking: boolean;
+  enable_domain_tracking: boolean;
+  enable_ip_tracking: boolean;
+  retention_days: number;
+  cache_ttl_seconds: number;
+}
+
+export interface UpdatePrevalenceSettingsRequest {
+  rarity_threshold?: number;
+  enable_hash_tracking?: boolean;
+  enable_domain_tracking?: boolean;
+  enable_ip_tracking?: boolean;
+  retention_days?: number;
+  cache_ttl_seconds?: number;
+}
+
+// Auto-Tuning Settings
+export interface TuningSettings {
+  auto_tuning_enabled: boolean;
+  auto_tuning_min_confidence: number;
+  auto_tuning_critical: boolean;
+  auto_tuning_disabled_until?: string;
+  auto_apply_enabled: boolean;
+}
+
+// Cybersecurity News Feed
+export interface NewsItem {
+  title: string;
+  link: string;
+  source: string;
+  source_id: string;
+  published: string | null;
+  summary: string | null;
+}
+
+export interface NewsSourceStatus {
+  name: string;
+  id: string;
+  status: string;
+  item_count: number;
+  error?: string;
+}
+
+export interface NewsResponse {
+  items: NewsItem[];
+  last_updated: string;
+  sources: NewsSourceStatus[];
+}
+
+// Feedback types
+export type FeedbackCategory = 'bug' | 'enhancement' | 'general';
+export type FeedbackStatus = 'open' | 'in_progress' | 'resolved' | 'closed';
+
+export interface Feedback {
+  id: string;
+  user_id: string;
+  category: FeedbackCategory;
+  title: string;
+  description: string;
+  status: FeedbackStatus;
+  admin_notes?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FeedbackWithUser extends Feedback {
+  user_name?: string;
+  user_email?: string;
+}
+
+export interface CreateFeedbackRequest {
+  category: FeedbackCategory;
+  title: string;
+  description: string;
+}
+
+export interface UpdateFeedbackRequest {
+  status?: FeedbackStatus;
+  admin_notes?: string;
+}
+
+export interface FeedbackListResponse {
+  feedback: FeedbackWithUser[];
+  total: number;
+}
+
+export interface MyFeedbackResponse {
+  feedback: Feedback[];
+}
+
+export interface FeedbackResponse {
+  feedback: Feedback;
+}
+
+// ============================================================
+// Agent Enrichment Types (AI-powered threat intelligence)
+// ============================================================
+
+export type ArtifactType = 
+  | 'hash_md5' 
+  | 'hash_sha256' 
+  | 'hash_sha1' 
+  | 'domain' 
+  | 'ip' 
+  | 'url' 
+  | 'email' 
+  | 'filename';
+
+export type ProviderType = 
+  | 'virustotal' 
+  | 'abuseipdb' 
+  | 'shodan' 
+  | 'greynoise' 
+  | 'otx' 
+  | 'urlhaus' 
+  | 'malwarebazaar' 
+  | 'custom';
+
+export interface AgentEnrichmentProvider {
+  id: string;
+  name: string;
+  provider_type: ProviderType;
+  enabled: boolean;
+  has_api_key: boolean;
+  supported_artifacts: ArtifactType[];
+  rate_limit_per_minute: number;
+  rate_limit_per_day: number;
+  requests_today: number;
+  last_request_at?: string;
+  last_error?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ListAgentEnrichmentProvidersResponse {
+  providers: AgentEnrichmentProvider[];
+}
+
+export interface CreateAgentEnrichmentProviderRequest {
+  id: string;
+  name: string;
+  provider_type: ProviderType;
+  enabled?: boolean;
+  api_key?: string;
+  config?: Record<string, unknown>;
+  rate_limit_per_minute?: number;
+  rate_limit_per_day?: number;
+}
+
+export interface UpdateAgentEnrichmentProviderRequest {
+  name?: string;
+  enabled?: boolean;
+  config?: Record<string, unknown>;
+  rate_limit_per_minute?: number;
+  rate_limit_per_day?: number;
+}
+
+export interface UpdateAgentEnrichmentCredentialsRequest {
+  api_key: string;
+}
+
+export interface QuotaInfo {
+  used_today: number;
+  daily_limit: number;
+  used_this_month?: number;
+  monthly_limit?: number;
+}
+
+export interface TestAgentEnrichmentConnectionResponse {
+  success: boolean;
+  response_time_ms?: number;
+  error?: string;
+  quota_info?: QuotaInfo;
+}
+
+export interface AgentEnrichmentUsageStats {
+  provider_id: string;
+  requests_today: number;
+  daily_limit: number;
+  remaining_today: number;
+  requests_this_month: number;
+  cache_hit_rate: number;
+  avg_response_time_ms: number;
+  error_rate: number;
+  last_success_at?: string;
+  last_error?: string;
+  last_error_at?: string;
+}
+
+// ============================================================================
+// Alert Triage Types (AI-powered alert analysis)
+// ============================================================================
+
+export type TriageVerdict = 'true_positive' | 'likely_true_positive' | 'suspicious' | 'needs_investigation' | 'likely_false_positive' | 'false_positive' | 'benign' | 'inconclusive';
+
+export type TriageConfidence = 'high' | 'medium' | 'low';
+
+export type RiskTrend = 'increasing' | 'stable' | 'decreasing';
+
+export type AgentType = 'initial_triage' | 'correlation' | 'enrichment' | 'context' | 'risk_assessment' | 'verdict';
+
+export type AgentStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
+
+export interface ExtractedEntity {
+  entity_type: 'user' | 'asset' | 'ip' | 'domain' | 'hash' | 'url' | 'file' | 'process';
+  value: string;
+  field_source: string;
+  confidence: number;
+}
+
+export interface InitialTriageResult {
+  alert_id: string;
+  // Backend returns entities as categorized object, not extracted_entities array
+  entities?: {
+    users?: string[];
+    hostnames?: string[];
+    ip_addresses?: string[];
+    file_hashes?: string[];
+    domains?: string[];
+    urls?: string[];
+    processes?: string[];
+    file_paths?: string[];
+  };
+  extracted_entities?: ExtractedEntity[];  // Legacy format
+  primary_entity?: ExtractedEntity | { entity_type: string; value: string; confidence?: number; reason?: string };
+  threat_hypothesis: string;
+  recommended_agents?: AgentType[];
+  alert_summary?: string;
+  severity?: string;
+  mitre_tactics?: string[];
+  mitre_techniques?: string[];
+  alert_context?: {
+    rule_name: string;
+    severity: string;
+    matched_event_count: number;
+  };
+}
+
+export interface RelatedAlert {
+  alert_id: string;
+  rule_name: string;
+  rule_id?: string;
+  severity: string;
+  created_at?: string;
+  timestamp?: string;
+  matched_event_count?: number;
+  matched_entity?: string;
+  entity_field?: string;
+  mitre_tactics?: string[];
+}
+
+export interface PatternAnalysis {
+  total_related_alerts: number;
+  severity_distribution: Record<string, number>;
+  unique_rules_triggered: number;
+  alert_frequency: string;
+  mitre_tactics_seen: string[];
+  mitre_techniques_seen: string[];
+  top_rules: [string, number][];
+  time_span_hours: number;
+}
+
+export interface AttackChainAssessment {
+  is_attack_chain: boolean;
+  confidence: number;
+  description: string;
+  tactics_sequence: string[];
+  chain_alert_ids: string[];
+}
+
+export interface RelatedDetectionMatch {
+  match_id: string;
+  rule_name: string;
+  rule_id: string;
+  severity: string;
+  detected_at: string;
+  matched_entity: string;
+  entity_field: string;
+  event_count: number;
+}
+
+export interface CorrelationResult {
+  user_alerts: RelatedAlert[];
+  asset_alerts: RelatedAlert[];
+  ip_alerts?: RelatedAlert[];
+  detection_matches?: RelatedDetectionMatch[];
+  total_related_alerts?: number;
+  severity_distribution?: Record<string, number>;
+  mitre_tactics_coverage?: string[];
+  attack_chain_detected?: boolean;
+  attack_chain_description?: string;
+  pattern_analysis?: string | PatternAnalysis;
+  attack_chain_assessment?: AttackChainAssessment;
+  summary?: string;
+}
+
+export interface HashEnrichment {
+  hash: string;
+  hash_type: 'md5' | 'sha1' | 'sha256';
+  provider: string;
+  malicious: boolean;
+  detection_count?: number;
+  total_engines?: number;
+  detection_names: string[];
+  threat_categories: string[];
+  first_seen?: string;
+  last_seen?: string;
+}
+
+export interface DomainEnrichment {
+  domain: string;
+  provider: string;
+  malicious: boolean;
+  categories: string[];
+  reputation_score?: number;
+  registrar?: string;
+  creation_date?: string;
+}
+
+export interface IpEnrichment {
+  ip: string;
+  provider: string;
+  malicious: boolean;
+  abuse_confidence_score?: number;
+  country?: string;
+  isp?: string;
+  categories: string[];
+  reports_count?: number;
+}
+
+export interface EnrichmentResult {
+  hash_enrichments: HashEnrichment[];
+  domain_enrichments: DomainEnrichment[];
+  ip_enrichments: IpEnrichment[];
+  summary: string;
+  high_risk_indicators: string[];
+}
+
+export interface TimelineEvent {
+  timestamp: string;
+  event_type: string;
+  summary: string;
+  relevance_score: number;
+  fields: Record<string, unknown>;
+}
+
+export interface RareArtifact {
+  artifact: string;
+  artifact_type: string;
+  host_count: number;
+  total_occurrences: number;
+  first_seen: string;
+}
+
+export interface ContextResult {
+  event_timeline: TimelineEvent[];
+  stats_summary: Record<string, unknown>;
+  rare_artifacts: RareArtifact[];
+  suspicious_patterns: string[];
+  context_summary?: string;
+  context_analysis?: string;  // Backend returns this field name
+}
+
+export interface RiskSignal {
+  rule_name: string;
+  severity: string;
+  score: number;
+  created_at: string;
+}
+
+export interface RiskAssessmentResult {
+  entity: string;
+  entity_type: string;
+  current_risk_score?: number;
+  risk_score_24h?: number;
+  risk_score_7d?: number;
+  decayed_score_24h?: number;
+  decayed_score_7d?: number;
+  risk_level?: string;
+  signal_count_24h?: number;
+  signal_count_7d?: number;
+  recent_signals?: RiskSignal[];
+  risk_trend?: RiskTrend;
+  risk_context?: string;
+  risk_assessment?: string;  // Backend returns this field name
+  was_already_high_risk?: boolean;
+  was_high_risk?: boolean;  // Backend returns this field name
+  summary?: string;
+  last_signal_at?: string;
+}
+
+export interface FollowUpQuery {
+  description: string;
+  query: string;
+  rationale: string;
+}
+
+// Triage-specific reasoning step (different from query ReasoningStep)
+export interface TriageReasoningStep {
+  step_number: number;
+  title: string;
+  description: string;
+  evidence: string[];
+  conclusion: string;
+}
+
+export interface TriageRecommendation {
+  action: string;
+  priority: string;
+  description: string;
+  one_click_available: boolean;
+}
+
+export interface TriageAnalysisGap {
+  description: string;
+  impact: string;
+  mitigation?: string;
+}
+
+// Verdict can be either a string or an object with type/severity
+export interface VerdictObject {
+  type: TriageVerdict;
+  severity?: string;
+}
+
+export interface VerdictResult {
+  verdict: TriageVerdict | VerdictObject;
+  confidence: TriageConfidence | number;
+  confidence_score: number;
+  reasoning: string;
+  reasoning_steps: TriageReasoningStep[];
+  key_findings: string[];
+  recommendations: TriageRecommendation[];
+  follow_up_queries: FollowUpQuery[];
+  analysis_gaps: TriageAnalysisGap[];
+  summary?: string;
+}
+
+// Agent status can be a string or an object
+export interface AgentStatusObject {
+  status: AgentStatus;
+  duration_ms?: number;
+  reason?: string;
+}
+
+export interface TriageResult {
+  alert_id: string;
+  session_id: string;
+  started_at: string;
+  completed_at: string;
+  duration_ms: number;
+  initial_triage: InitialTriageResult;
+  correlation?: CorrelationResult;
+  enrichment?: EnrichmentResult;
+  context?: ContextResult;
+  risk?: RiskAssessmentResult;
+  verdict: VerdictResult;
+  agent_statuses: [AgentType, AgentStatus | AgentStatusObject][];
+}
+
+export interface TriageProgressEvent {
+  type: 'triage_started' | 'agent_started' | 'agent_completed' | 'agent_failed' | 'agent_skipped' | 'triage_completed' | 'triage_failed';
+  agent?: AgentType;
+  session_id?: string;
+  alert_id?: string;
+  status?: AgentStatus | AgentStatusObject;
+  reason?: string;
+  verdict?: string;
+  confidence?: number;
+  duration_ms?: number;
+  timestamp: string;
+  error?: string;
+}
+
+export interface TriageConfig {
+  correlation_enabled?: boolean;
+  enrichment_enabled?: boolean;
+  context_enabled?: boolean;
+  risk_enabled?: boolean;
+  context_window_minutes?: number;
+  correlation_days?: number;
+}
+
+// =============================================================================
+// Case-Level Triage Types (Multi-Alert Analysis)
+// =============================================================================
+
+/** Event from any alert in a case, used to build unified timeline */
+export interface CaseTimelineEvent {
+  timestamp: string;
+  source_alert_id: string;
+  source_rule_name: string;
+  event_summary: string;
+  event_data: Record<string, unknown>;
+  attack_phase?: string;
+  relevance_score: number;
+}
+
+/** Entity aggregated across multiple alerts with source tracking */
+export interface AggregatedEntity {
+  entity_type: string;
+  value: string;
+  source_alert_ids: string[];
+  occurrence_count: number;
+  first_seen: string;
+  last_seen: string;
+  is_primary: boolean;
+  risk_score?: number;
+}
+
+/** Detected attack phase/stage from MITRE ATT&CK framework */
+export interface AttackPhase {
+  phase_name: string;
+  mitre_tactic: string;
+  start_time: string;
+  end_time?: string;
+  alert_ids: string[];
+  confidence: number;
+  description: string;
+  techniques: string[];
+}
+
+/** Summary of a single alert for case context */
+export interface AlertSummary {
+  alert_id: string;
+  rule_name: string;
+  severity: string;
+  timestamp: string;
+  matched_event_count: number;
+  key_entities: string[];
+  threat_hypothesis?: string;
+  mitre_tactics: string[];
+  mitre_techniques: string[];
+}
+
+/** Initial triage result for a case (aggregated from all alerts) */
+export interface CaseInitialTriageResult {
+  case_id: string;
+  alert_count: number;
+  alert_summaries: AlertSummary[];
+  aggregated_entities: AggregatedEntity[];
+  primary_entity?: AggregatedEntity;
+  case_hypothesis: string;
+  unified_timeline: CaseTimelineEvent[];
+  time_span_hours: number;
+  mitre_tactics: string[];
+  mitre_techniques: string[];
+}
+
+/** Attack progression analysis result */
+export interface AttackProgressionResult {
+  detected_phases: AttackPhase[];
+  attack_chain_detected: boolean;
+  attack_chain_confidence: number;
+  attack_narrative: string;
+  recommended_response_phase: string;
+  kill_chain_stage?: string;
+}
+
+/** Recommendation specific to a case */
+export interface CaseRecommendation {
+  action: string;
+  priority: string;
+  description: string;
+  affected_alert_ids: string[];
+  one_click_available: boolean;
+}
+
+/** Suggested bulk actions for all alerts in a case */
+export interface BulkActionSuggestion {
+  close_all_as?: string;
+  escalate: boolean;
+  merge_recommended: boolean;
+  reason: string;
+}
+
+/** Case-level verdict with recommendations */
+export interface CaseVerdictResult {
+  verdict: TriageVerdict | VerdictObject;
+  confidence: number;
+  reasoning: string;
+  reasoning_steps: TriageReasoningStep[];
+  key_findings: string[];
+  recommendations: CaseRecommendation[];
+  follow_up_queries: FollowUpQuery[];
+  analysis_gaps: TriageAnalysisGap[];
+  bulk_actions?: BulkActionSuggestion;
+  executive_summary: string;
+}
+
+/** Complete result of a case triage session */
+export interface CaseTriageResult {
+  case_id: string;
+  session_id: string;
+  started_at: string;
+  completed_at: string;
+  duration_ms: number;
+  alert_count: number;
+  initial_triage: CaseInitialTriageResult;
+  correlation?: CorrelationResult;
+  enrichment?: EnrichmentResult;
+  context?: ContextResult;
+  attack_progression?: AttackProgressionResult;
+  verdict: CaseVerdictResult;
+  agent_statuses: [AgentType, AgentStatus | AgentStatusObject][];
+}
+
+/** Progress events for case triage SSE streaming */
+export type CaseTriageProgressEvent =
+  | { type: 'case_triage_started'; session_id: string; case_id: string; alert_count: number; timestamp: string }
+  | { type: 'collecting_alerts'; session_id: string; completed: number; total: number; current_alert_id?: string; timestamp: string }
+  | { type: 'building_timeline'; session_id: string; event_count: number; timestamp: string }
+  | { type: 'aggregating_entities'; session_id: string; entity_count: number; timestamp: string }
+  | { type: 'agent_started'; session_id: string; agent: AgentType; timestamp: string }
+  | { type: 'agent_completed'; session_id: string; agent: AgentType; status: AgentStatus | AgentStatusObject; timestamp: string }
+  | { type: 'agent_failed'; session_id: string; agent: AgentType; error: string; timestamp: string }
+  | { type: 'attack_progression_started'; session_id: string; timestamp: string }
+  | { type: 'attack_phase_detected'; session_id: string; phase_name: string; mitre_tactic: string; confidence: number; timestamp: string }
+  | { type: 'attack_progression_completed'; session_id: string; phases_detected: number; attack_chain_detected: boolean; timestamp: string }
+  | { type: 'keepalive'; session_id: string; timestamp: string }
+  | { type: 'case_triage_completed'; session_id: string; case_id: string; verdict: string; confidence: number; duration_ms: number; timestamp: string }
+  | { type: 'case_triage_failed'; session_id: string; case_id: string; error: string; timestamp: string };
+
+/** Configuration for case triage */
+export interface CaseTriageConfig {
+  correlation_enabled?: boolean;
+  enrichment_enabled?: boolean;
+  context_enabled?: boolean;
+  attack_progression_enabled?: boolean;
+  max_alerts?: number;
+  context_window_hours?: number;
+  keepalive_interval_secs?: number;
+  agent_timeout_secs?: number;
+  total_timeout_secs?: number;
+}
+
+// Callback type for when auth fails completely (logout needed)
+type AuthFailureCallback = () => void;
+
+// Queue entry for requests waiting on token refresh
+interface QueuedRequest {
+  resolve: (value: unknown) => void;
+  reject: (reason: unknown) => void;
+  endpoint: string;
+  options: RequestInit;
+}
+
+class ApiClient {
+  private baseUrl: string;
+  private isRefreshing = false;
+  private refreshQueue: QueuedRequest[] = [];
+  private onAuthFailure: AuthFailureCallback | null = null;
+
+  constructor(baseUrl: string = API_BASE_URL) {
+    this.baseUrl = baseUrl;
+  }
+
+  /**
+   * Set callback to be called when auth fails completely (refresh token invalid).
+   * This should trigger logout in the AuthContext.
+   */
+  setAuthFailureCallback(callback: AuthFailureCallback) {
+    this.onAuthFailure = callback;
+  }
+
+  private getAccessToken(): string | null {
+    try {
+      const stored = localStorage.getItem('nanosiem_auth');
+      if (!stored) return null;
+      const tokens = JSON.parse(stored);
+      // Check if token is expired (but still return it - server is source of truth)
+      // We'll handle 401s properly now
+      return tokens.accessToken || null;
+    } catch {
+      return null;
+    }
+  }
+
+  private getRefreshToken(): string | null {
+    try {
+      const stored = localStorage.getItem('nanosiem_auth');
+      if (!stored) return null;
+      const tokens = JSON.parse(stored);
+      return tokens.refreshToken || null;
+    } catch {
+      return null;
+    }
+  }
+
+  private storeTokens(accessToken: string, refreshToken: string, expiresIn: number) {
+    const expiresAt = Date.now() + expiresIn * 1000;
+    localStorage.setItem(
+      'nanosiem_auth',
+      JSON.stringify({ accessToken, refreshToken, expiresAt })
+    );
+  }
+
+  private clearTokens() {
+    localStorage.removeItem('nanosiem_auth');
+  }
+
+  /**
+   * Attempt to refresh the access token using the refresh token.
+   * Returns true if successful, false if refresh failed (user needs to re-login).
+   */
+  private async attemptTokenRefresh(): Promise<boolean> {
+    const refreshToken = this.getRefreshToken();
+    if (!refreshToken) {
+      return false;
+    }
+
+    try {
+      const response = await fetch(`${this.baseUrl}/api/auth/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      });
+
+      if (!response.ok) {
+        return false;
+      }
+
+      const data = await response.json();
+      this.storeTokens(data.access_token, data.refresh_token, data.expires_in);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Process all queued requests after a successful token refresh.
+   */
+  private async processQueue() {
+    const queue = [...this.refreshQueue];
+    this.refreshQueue = [];
+
+    for (const { resolve, reject, endpoint, options } of queue) {
+      try {
+        const result = await this.request(endpoint, options, true);
+        resolve(result);
+      } catch (error) {
+        reject(error);
+      }
+    }
+  }
+
+  /**
+   * Reject all queued requests after a failed token refresh.
+   */
+  private rejectQueue(error: Error) {
+    const queue = [...this.refreshQueue];
+    this.refreshQueue = [];
+
+    for (const { reject } of queue) {
+      reject(error);
+    }
+  }
+
+  private async request<T>(
+    endpoint: string,
+    options: RequestInit = {},
+    isRetry = false
+  ): Promise<T> {
+    // Use service-aware routing for microservices architecture
+    const serviceUrl = getServiceUrl(endpoint);
+    const url = `${serviceUrl}${endpoint}`;
+    const headers: HeadersInit = {
+      'Content-Type': 'application/json',
+      ...options.headers,
+    };
+
+    // Add Authorization header if we have a token
+    const token = this.getAccessToken();
+    if (token) {
+      (headers as Record<string, string>)['Authorization'] = `Bearer ${token}`;
+    }
+
+    const response = await fetch(url, {
+      ...options,
+      headers,
+    });
+
+    // Handle 401 Unauthorized - attempt token refresh
+    if (response.status === 401 && !isRetry) {
+      // Skip refresh for auth endpoints (login, refresh itself, etc.)
+      const isAuthEndpoint = endpoint.startsWith('/api/auth/');
+      if (!isAuthEndpoint) {
+        return this.handleUnauthorized(endpoint, options);
+      }
+    }
+
+    if (!response.ok) {
+      const errorBody = await response.json().catch(() => ({
+        error: {
+          code: 'UNKNOWN_ERROR',
+          message: response.statusText,
+        }
+      }));
+      const error = errorBody.error || errorBody;
+      throw new ApiClientError(error.message || 'Request failed', error.code, error.details);
+    }
+
+    return response.json();
+  }
+
+  /**
+   * Handle 401 response by attempting token refresh and retrying the request.
+   */
+  private async handleUnauthorized<T>(
+    endpoint: string,
+    options: RequestInit
+  ): Promise<T> {
+    // If already refreshing, queue this request
+    if (this.isRefreshing) {
+      return new Promise<T>((resolve, reject) => {
+        this.refreshQueue.push({ resolve: resolve as (value: unknown) => void, reject, endpoint, options });
+      });
+    }
+
+    // Start refresh process
+    this.isRefreshing = true;
+
+    try {
+      const refreshed = await this.attemptTokenRefresh();
+
+      if (refreshed) {
+        // Refresh succeeded - retry this request and process queue
+        this.isRefreshing = false;
+        this.processQueue();
+        return this.request<T>(endpoint, options, true);
+      } else {
+        // Refresh failed - clear auth and trigger logout
+        this.isRefreshing = false;
+        this.clearTokens();
+        this.rejectQueue(new ApiClientError('Session expired', 'SESSION_EXPIRED'));
+
+        // Trigger logout callback if set
+        if (this.onAuthFailure) {
+          this.onAuthFailure();
+        }
+
+        throw new ApiClientError('Session expired. Please log in again.', 'SESSION_EXPIRED');
+      }
+    } catch (error) {
+      this.isRefreshing = false;
+      this.clearTokens();
+      this.rejectQueue(error instanceof Error ? error : new Error('Token refresh failed'));
+
+      if (this.onAuthFailure) {
+        this.onAuthFailure();
+      }
+
+      throw error;
+    }
+  }
+
+  // Health check
+  async healthCheck(): Promise<{ status: string }> {
+    return this.request('/health');
+  }
+
+  // Search endpoints
+  async search(request: SearchRequest): Promise<SearchResponse> {
+    return this.request('/api/search', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async searchSql(request: RawSqlRequest): Promise<SearchResponse> {
+    return this.request('/api/search/sql', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async explainQuery(query: string, timeRange: TimeRange): Promise<{ sql: string }> {
+    return this.request('/api/search/explain', {
+      method: 'POST',
+      body: JSON.stringify({ query, time_range: timeRange }),
+    });
+  }
+
+  /**
+   * Get prevalence artifacts for a search query.
+   * This extracts distinct domains, hashes, and IPs from logs matching the query
+   * and returns their prevalence data for visualization.
+   */
+  async getPrevalenceArtifactsForQuery(request: SearchRequest): Promise<PrevalenceScatterDataResponse> {
+    return this.request('/api/search/prevalence-artifacts', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  // Saved searches
+  async listSavedSearches(): Promise<SavedSearch[]> {
+    return this.request('/api/search/saved');
+  }
+
+  async createSavedSearch(request: CreateSavedSearchRequest): Promise<SavedSearch> {
+    return this.request('/api/search/saved', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async getSavedSearch(id: string): Promise<SavedSearch> {
+    return this.request(`/api/search/saved/${id}`);
+  }
+
+  async updateSavedSearch(id: string, request: Partial<CreateSavedSearchRequest>): Promise<SavedSearch> {
+    return this.request(`/api/search/saved/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async deleteSavedSearch(id: string): Promise<void> {
+    return this.request(`/api/search/saved/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  // Shared searches (short URLs)
+  async createSharedSearch(request: CreateSharedSearchRequest): Promise<CreateSharedSearchResponse> {
+    return this.request('/api/search/share', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async getSharedSearch(id: string): Promise<SharedSearchResponse> {
+    return this.request(`/api/search/shared/${id}`);
+  }
+
+  // Query explanations (AI reasoning cache)
+  async storeQueryExplanation(request: StoreQueryExplanationRequest): Promise<QueryExplanationResponse> {
+    return this.request('/api/search/explanation', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async getQueryExplanation(query: string): Promise<QueryExplanationResponse> {
+    const params = new URLSearchParams({ q: query });
+    return this.request(`/api/search/explanation?${params.toString()}`);
+  }
+
+  // Detection rules
+  async listDetections(params?: {
+    severity?: string;
+    mode?: string;
+    enabled?: boolean;
+    search?: string;
+  }): Promise<DetectionRule[]> {
+    const searchParams = new URLSearchParams();
+    if (params?.severity) searchParams.set('severity', params.severity);
+    if (params?.mode) searchParams.set('mode', params.mode);
+    if (params?.enabled !== undefined) searchParams.set('enabled', String(params.enabled));
+    if (params?.search) searchParams.set('search', params.search);
+    
+    const query = searchParams.toString();
+    return this.request(`/api/detections${query ? `?${query}` : ''}`);
+  }
+
+  async getDetection(id: string): Promise<DetectionRule> {
+    return this.request(`/api/detections/${id}`);
+  }
+
+  async createDetection(request: CreateDetectionRequest): Promise<DetectionResponse> {
+    return this.request('/api/detections', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async updateDetection(id: string, request: UpdateDetectionRequest): Promise<DetectionResponse> {
+    return this.request(`/api/detections/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async deleteDetection(id: string): Promise<void> {
+    return this.request(`/api/detections/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async enableDetection(id: string): Promise<DetectionRule> {
+    return this.request(`/api/detections/${id}/enable`, {
+      method: 'POST',
+    });
+  }
+
+  async disableDetection(id: string): Promise<DetectionRule> {
+    return this.request(`/api/detections/${id}/disable`, {
+      method: 'POST',
+    });
+  }
+
+  async testDetection(id: string, days: number = 7): Promise<TestDetectionResult> {
+    return this.request(`/api/detections/${id}/test`, {
+      method: 'POST',
+      body: JSON.stringify({ days }),
+    });
+  }
+
+  async testQuery(query: string, options?: { days?: number; timeRange?: TimeRange }): Promise<TestDetectionResult> {
+    const body: Record<string, unknown> = { query };
+    if (options?.timeRange) {
+      body.time_range = options.timeRange;
+    } else {
+      body.days = options?.days ?? 7;
+    }
+    return this.request('/api/detections/test', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+  }
+
+  async formatQuery(query: string): Promise<{ formatted_query: string }> {
+    return this.request('/api/detections/format', {
+      method: 'POST',
+      body: JSON.stringify({ query }),
+    });
+  }
+
+  async promoteDetection(id: string): Promise<DetectionRule> {
+    return this.request(`/api/detections/${id}/promote`, {
+      method: 'POST',
+    });
+  }
+
+  async demoteDetection(id: string): Promise<DetectionRule> {
+    return this.request(`/api/detections/${id}/demote`, {
+      method: 'POST',
+    });
+  }
+
+  async getDetectionStats(days: number = 28): Promise<Record<string, DailyStat[]>> {
+    return this.request(`/api/detections/stats?days=${days}`);
+  }
+
+  async getTodayCounts(): Promise<Record<string, number>> {
+    return this.request('/api/detections/today-counts');
+  }
+
+  async getDetectionMatches(
+    id: string, 
+    params?: {
+      limit?: number;
+      offset?: number;
+      start_time?: string;
+      end_time?: string;
+    }
+  ): Promise<DetectionMatchesResponse> {
+    const searchParams = new URLSearchParams();
+    if (params?.limit) searchParams.set('limit', String(params.limit));
+    if (params?.offset) searchParams.set('offset', String(params.offset));
+    if (params?.start_time) searchParams.set('start_time', params.start_time);
+    if (params?.end_time) searchParams.set('end_time', params.end_time);
+    
+    const query = searchParams.toString();
+    return this.request(`/api/detections/${id}/matches${query ? `?${query}` : ''}`);
+  }
+
+  async importDetections(data: string, format: 'yaml' | 'json'): Promise<{ imported: number }> {
+    return this.request('/api/detections/import', {
+      method: 'POST',
+      body: JSON.stringify({ data, format }),
+    });
+  }
+
+  async exportDetections(format: 'yaml' | 'json'): Promise<string> {
+    return this.request(`/api/detections/export?format=${format}`);
+  }
+
+  // Alerts
+  async listAlerts(params?: {
+    status?: string;
+    severity?: string;
+    rule_id?: string;
+    limit?: number;
+    offset?: number;
+  }): Promise<Alert[]> {
+    const searchParams = new URLSearchParams();
+    if (params?.status) searchParams.set('status', params.status);
+    if (params?.severity) searchParams.set('severity', params.severity);
+    if (params?.rule_id) searchParams.set('rule_id', params.rule_id);
+    if (params?.limit) searchParams.set('limit', String(params.limit));
+    if (params?.offset) searchParams.set('offset', String(params.offset));
+    
+    const query = searchParams.toString();
+    return this.request(`/api/alerts${query ? `?${query}` : ''}`);
+  }
+
+  async getAlert(id: string): Promise<Alert> {
+    return this.request(`/api/alerts/${id}`);
+  }
+
+  async getAlertCounts(): Promise<AlertCounts> {
+    return this.request('/api/alerts/counts');
+  }
+
+  async acknowledgeAlert(id: string): Promise<Alert> {
+    return this.request(`/api/alerts/${id}/acknowledge`, {
+      method: 'POST',
+    });
+  }
+
+  async closeAlert(id: string, request: CloseAlertRequest): Promise<Alert> {
+    return this.request(`/api/alerts/${id}/close`, {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async assignAlert(id: string, assignedTo: string): Promise<Alert> {
+    return this.request(`/api/alerts/${id}/assign`, {
+      method: 'POST',
+      body: JSON.stringify({ assigned_to: assignedTo }),
+    });
+  }
+
+  async bulkAlerts(request: BulkAlertRequest): Promise<{ updated: number }> {
+    return this.request('/api/alerts/bulk', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  // ============================================================================
+  // Cases
+  // ============================================================================
+
+  async listCases(params?: CaseFilter): Promise<CaseWithDetails[]> {
+    const searchParams = new URLSearchParams();
+    if (params?.status) searchParams.set('status', params.status.join(','));
+    if (params?.severity) searchParams.set('severity', params.severity.join(','));
+    if (params?.assigned_to) searchParams.set('assigned_to', params.assigned_to);
+    if (params?.search) searchParams.set('search', params.search);
+    if (params?.tags) searchParams.set('tags', params.tags.join(','));
+    if (params?.created_after) searchParams.set('created_after', params.created_after);
+    if (params?.created_before) searchParams.set('created_before', params.created_before);
+    if (params?.limit) searchParams.set('limit', String(params.limit));
+    if (params?.offset) searchParams.set('offset', String(params.offset));
+
+    const query = searchParams.toString();
+    return this.request(`/api/cases${query ? `?${query}` : ''}`);
+  }
+
+  async getMyCases(limit?: number): Promise<CaseSummary[]> {
+    const params = limit ? `?limit=${limit}` : '';
+    return this.request(`/api/cases/my${params}`);
+  }
+
+  async getCaseStats(): Promise<CaseStats> {
+    return this.request('/api/cases/stats');
+  }
+
+  async createCase(request: CreateCaseRequest): Promise<{ case: Case; message: string }> {
+    return this.request('/api/cases', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async getCase(id: string): Promise<CaseFullResponse> {
+    return this.request(`/api/cases/${id}`);
+  }
+
+  async updateCase(id: string, request: UpdateCaseRequest): Promise<Case> {
+    return this.request(`/api/cases/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async deleteCase(id: string): Promise<{ message: string }> {
+    return this.request(`/api/cases/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async addAlertToCase(caseId: string, request: AddAlertToCaseRequest): Promise<{ message: string }> {
+    return this.request(`/api/cases/${caseId}/alerts`, {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async removeAlertFromCase(caseId: string, alertId: string): Promise<{ message: string }> {
+    return this.request(`/api/cases/${caseId}/alerts/${alertId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async getCaseWall(caseId: string, limit?: number, offset?: number): Promise<CaseWallEntry[]> {
+    const searchParams = new URLSearchParams();
+    if (limit) searchParams.set('limit', String(limit));
+    if (offset) searchParams.set('offset', String(offset));
+
+    const query = searchParams.toString();
+    return this.request(`/api/cases/${caseId}/wall${query ? `?${query}` : ''}`);
+  }
+
+  async addCaseWallEntry(caseId: string, request: AddWallEntryRequest): Promise<CaseWallEntry> {
+    return this.request(`/api/cases/${caseId}/wall`, {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async assignCase(caseId: string, assignedTo: string | null): Promise<Case> {
+    return this.request(`/api/cases/${caseId}/assign`, {
+      method: 'POST',
+      body: JSON.stringify({ assigned_to: assignedTo }),
+    });
+  }
+
+  async changeCaseStatus(caseId: string, request: ChangeCaseStatusRequest): Promise<Case> {
+    return this.request(`/api/cases/${caseId}/status`, {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async getRelatedCases(caseId: string): Promise<RelatedCaseSummary[]> {
+    return this.request(`/api/cases/${caseId}/related`);
+  }
+
+  // Case Grouping Rules
+  async listGroupingRules(): Promise<CaseGroupingRule[]> {
+    return this.request('/api/settings/case-grouping');
+  }
+
+  async createGroupingRule(request: CreateGroupingRuleRequest): Promise<CaseGroupingRule> {
+    return this.request('/api/settings/case-grouping', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async updateGroupingRule(id: string, request: UpdateGroupingRuleRequest): Promise<CaseGroupingRule> {
+    return this.request(`/api/settings/case-grouping/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async deleteGroupingRule(id: string): Promise<{ message: string }> {
+    return this.request(`/api/settings/case-grouping/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  // Case Settings (global auto-grouping config)
+  async getCaseSettings(): Promise<CaseSettings> {
+    return this.request('/api/settings/cases');
+  }
+
+  async updateCaseSettings(request: UpdateCaseSettingsRequest): Promise<CaseSettings> {
+    return this.request('/api/settings/cases', {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  // Fields
+  async listFields(): Promise<FieldInfo[]> {
+    return this.request('/api/fields');
+  }
+
+  async getFieldValues(name: string, limit: number = 10): Promise<[string, number][]> {
+    return this.request(`/api/fields/${encodeURIComponent(name)}/values?limit=${limit}`);
+  }
+
+  async getSourceTypes(): Promise<[string, number][]> {
+    return this.request('/api/source-types');
+  }
+
+  // Ingestion
+  async ingestEvent(event: Record<string, unknown>): Promise<{ success: boolean; count: number; alerts_generated?: number }> {
+    return this.request('/api/ingest', {
+      method: 'POST',
+      body: JSON.stringify(event),
+    });
+  }
+
+  // Enrichment
+  async listEnrichmentSources(): Promise<EnrichmentSource[]> {
+    const response = await this.request<{ sources: EnrichmentSource[] }>('/api/enrichment/sources');
+    return response.sources;
+  }
+
+  async configureIpinfo(downloadUrl: string): Promise<{ success: boolean; message: string }> {
+    return this.request('/api/enrichment/ipinfo/configure', {
+      method: 'POST',
+      body: JSON.stringify({ download_url: downloadUrl }),
+    });
+  }
+
+  async syncIpinfo(): Promise<EnrichmentSyncResult> {
+    return this.request('/api/enrichment/ipinfo/sync', {
+      method: 'POST',
+    });
+  }
+
+  async enableEnrichmentSource(sourceId: string): Promise<{ success: boolean; message: string }> {
+    return this.request(`/api/enrichment/sources/${sourceId}/enable`, {
+      method: 'POST',
+    });
+  }
+
+  async disableEnrichmentSource(sourceId: string): Promise<{ success: boolean; message: string }> {
+    return this.request(`/api/enrichment/sources/${sourceId}/disable`, {
+      method: 'POST',
+    });
+  }
+
+  async getEnrichmentStats(): Promise<EnrichmentStats> {
+    return this.request('/api/enrichment/stats');
+  }
+
+  async lookupIp(ip: string): Promise<IpLookupResult> {
+    return this.request(`/api/enrichment/lookup/${encodeURIComponent(ip)}`);
+  }
+
+  async getAutoSyncConfig(sourceId: string): Promise<AutoSyncConfig> {
+    return this.request(`/api/enrichment/sources/${sourceId}/auto-sync`);
+  }
+
+  async configureAutoSync(sourceId: string, enabled: boolean, intervalHours: number = 24): Promise<AutoSyncConfig> {
+    return this.request(`/api/enrichment/sources/${sourceId}/auto-sync`, {
+      method: 'POST',
+      body: JSON.stringify({ enabled, interval_hours: intervalHours }),
+    });
+  }
+
+  // Feeds (sourcetypes)
+  async listFeeds(): Promise<Feed[]> {
+    return this.request('/api/feeds');
+  }
+
+  async getFeed(id: string): Promise<Feed> {
+    return this.request(`/api/feeds/${id}`);
+  }
+
+  async createFeed(request: CreateFeedRequest): Promise<Feed> {
+    return this.request('/api/feeds', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async updateFeed(id: string, request: UpdateFeedRequest): Promise<Feed> {
+    return this.request(`/api/feeds/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async deleteFeed(id: string): Promise<void> {
+    return this.request(`/api/feeds/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async enableFeed(id: string): Promise<Feed> {
+    return this.request(`/api/feeds/${id}/enable`, {
+      method: 'POST',
+    });
+  }
+
+  async disableFeed(id: string): Promise<Feed> {
+    return this.request(`/api/feeds/${id}/disable`, {
+      method: 'POST',
+    });
+  }
+
+  async getFeedStats(): Promise<FeedStats[]> {
+    return this.request('/api/feeds/stats');
+  }
+
+  async getFeedHealth(id: string): Promise<FeedHealthMetrics> {
+    return this.request(`/api/feeds/${id}/health`);
+  }
+
+  async getFeedHistory(id: string): Promise<FeedHistoryPoint[]> {
+    return this.request(`/api/feeds/${id}/history`);
+  }
+
+  async discoverSourcetypes(): Promise<DiscoveredSourcetype[]> {
+    return this.request('/api/feeds/discover');
+  }
+
+  // Parsers
+  async listParsers(): Promise<Parser[]> {
+    return this.request('/api/parsers');
+  }
+
+  async getParser(id: string): Promise<Parser> {
+    return this.request(`/api/parsers/${id}`);
+  }
+
+  async createParser(request: CreateParserRequest): Promise<Parser> {
+    return this.request('/api/parsers', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async updateParser(id: string, request: UpdateParserRequest): Promise<Parser> {
+    return this.request(`/api/parsers/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async deleteParser(id: string): Promise<void> {
+    return this.request(`/api/parsers/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async enableParser(id: string): Promise<Parser> {
+    return this.request(`/api/parsers/${id}/enable`, {
+      method: 'POST',
+    });
+  }
+
+  async disableParser(id: string): Promise<Parser> {
+    return this.request(`/api/parsers/${id}/disable`, {
+      method: 'POST',
+    });
+  }
+
+  async validateVrl(vrlCode: string): Promise<VrlValidationResult> {
+    return this.request('/api/parsers/validate', {
+      method: 'POST',
+      body: JSON.stringify({ vrl_code: vrlCode }),
+    });
+  }
+
+  async testParser(vrlCode: string, sampleInput: string): Promise<ParserTestResult> {
+    return this.request('/api/parsers/test', {
+      method: 'POST',
+      body: JSON.stringify({ vrl_code: vrlCode, sample_input: sampleInput }),
+    });
+  }
+
+  async getParserVectorConfig(id: string): Promise<VectorConfigResponse> {
+    return this.request(`/api/parsers/${id}/config`);
+  }
+
+  async deployParsers(): Promise<DeployParsersResponse> {
+    return this.request('/api/parsers/deploy', {
+      method: 'POST',
+    });
+  }
+
+  // Parser Library endpoints
+  async listLibraryParsers(category?: string): Promise<ParserLibraryEntry[]> {
+    const params = category ? `?category=${encodeURIComponent(category)}` : '';
+    return this.request(`/api/parsers/library${params}`);
+  }
+
+  async getLibraryParser(id: string): Promise<ParserLibraryEntry> {
+    return this.request(`/api/parsers/library/${id}`);
+  }
+
+  async deployLibraryParser(id: string): Promise<EnhancedDeploymentResponse> {
+    return this.request(`/api/parsers/library/${id}/deploy`, {
+      method: 'POST',
+    });
+  }
+
+  async deploySingleParser(id: string): Promise<EnhancedDeploymentResponse> {
+    return this.request(`/api/parsers/${id}/deploy`, {
+      method: 'POST',
+    });
+  }
+
+  async undeployParser(id: string): Promise<EnhancedDeploymentResponse> {
+    return this.request(`/api/parsers/${id}/undeploy`, {
+      method: 'POST',
+    });
+  }
+
+  async getParserDeploymentHistory(id: string): Promise<ParserDeployment[]> {
+    return this.request(`/api/parsers/${id}/deployments`);
+  }
+
+  // Log Sources (unified feeds + parsers)
+  async listLogSources(): Promise<LogSource[]> {
+    return this.request('/api/log-sources');
+  }
+
+  async getLogSource(id: string): Promise<LogSource> {
+    return this.request(`/api/log-sources/${id}`);
+  }
+
+  async createLogSource(request: NewLogSource): Promise<LogSource> {
+    return this.request('/api/log-sources', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async updateLogSource(id: string, request: UpdateLogSource): Promise<LogSource> {
+    return this.request(`/api/log-sources/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async deleteLogSource(id: string): Promise<{ deleted: boolean }> {
+    return this.request(`/api/log-sources/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async toggleLogSource(id: string, enabled: boolean): Promise<LogSource> {
+    return this.request(`/api/log-sources/${id}/toggle`, {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    });
+  }
+
+  async validateLogSource(id: string): Promise<LogSourceVrlValidationResult> {
+    return this.request(`/api/log-sources/${id}/validate`, {
+      method: 'POST',
+    });
+  }
+
+  async validateLogSourceVrl(vrlCode: string): Promise<LogSourceVrlValidationResult> {
+    return this.request('/api/log-sources/validate-vrl', {
+      method: 'POST',
+      body: JSON.stringify({ vrl_code: vrlCode }),
+    });
+  }
+
+  async testLogSourceVrl(vrlCode: string, sampleLog: string): Promise<LogSourceTestResult> {
+    return this.request('/api/log-sources/test-vrl', {
+      method: 'POST',
+      body: JSON.stringify({ vrl_code: vrlCode, sample_log: sampleLog }),
+    });
+  }
+
+  async deployLogSource(id: string): Promise<EnhancedDeploymentResponse> {
+    return this.request(`/api/log-sources/${id}/deploy`, {
+      method: 'POST',
+    });
+  }
+
+  async undeployLogSource(id: string): Promise<EnhancedDeploymentResponse> {
+    return this.request(`/api/log-sources/${id}/undeploy`, {
+      method: 'POST',
+    });
+  }
+
+  async deployAllLogSources(): Promise<{ deployed: boolean }> {
+    return this.request('/api/log-sources/deploy-all', {
+      method: 'POST',
+    });
+  }
+
+  async getLogSourceDeployments(id: string): Promise<LogSourceDeployment[]> {
+    return this.request(`/api/log-sources/${id}/deployments`);
+  }
+
+  async getLogSourceHealth(id: string): Promise<LogSourceHealth> {
+    return this.request(`/api/log-sources/${id}/health`);
+  }
+
+  // Cloud Credentials
+  async listCredentials(): Promise<CredentialListResponse> {
+    return this.request('/api/credentials');
+  }
+
+  async getCredential(id: string): Promise<CloudCredential> {
+    return this.request(`/api/credentials/${id}`);
+  }
+
+  async createCredential(request: CreateCloudCredentialRequest): Promise<CloudCredential> {
+    return this.request('/api/credentials', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async updateCredential(id: string, request: UpdateCloudCredentialRequest): Promise<CloudCredential> {
+    return this.request(`/api/credentials/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async deleteCredential(id: string): Promise<{ deleted: boolean; id: string }> {
+    return this.request(`/api/credentials/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async listCredentialsByProvider(provider: 'aws_s3' | 'azure_blob'): Promise<CredentialListResponse> {
+    return this.request(`/api/credentials/provider/${provider}`);
+  }
+
+  // meloD Settings
+  async getMelodConfig(): Promise<MelodConfig> {
+    return this.request('/api/settings/melod');
+  }
+
+  async updateMelodConfig(request: UpdateMelodConfigRequest): Promise<MelodConfig> {
+    return this.request('/api/settings/melod', {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async updateMelodCredentials(request: UpdateMelodCredentialsRequest): Promise<{ success: boolean; message: string }> {
+    return this.request('/api/settings/melod/credentials', {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async validateMelodConnection(): Promise<MelodConnectionStatus> {
+    return this.request('/api/settings/melod/validate', {
+      method: 'POST',
+    });
+  }
+
+  async getMelodStatus(): Promise<MelodConnectionStatus> {
+    return this.request('/api/settings/melod/status');
+  }
+
+  // Organizational Context (Custom Prompt Data)
+  async getOrganizationalContext(): Promise<OrganizationalContext> {
+    return this.request('/api/settings/organizational-context');
+  }
+
+  async updateOrganizationalContext(request: UpdateOrganizationalContextRequest): Promise<OrganizationalContext> {
+    return this.request('/api/settings/organizational-context', {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  // AI Failures Debug
+  async getAiFailures(params?: {
+    agent_type?: AiAgentType;
+    limit?: number;
+    offset?: number;
+  }): Promise<GetAiFailuresResponse> {
+    const searchParams = new URLSearchParams();
+    if (params?.agent_type) searchParams.set('agent_type', params.agent_type);
+    if (params?.limit) searchParams.set('limit', params.limit.toString());
+    if (params?.offset) searchParams.set('offset', params.offset.toString());
+    const query = searchParams.toString();
+    return this.request(`/api/melod/failures${query ? `?${query}` : ''}`);
+  }
+
+  // Retention Settings
+  async getRetentionConfig(): Promise<RetentionConfig> {
+    return this.request('/api/settings/retention');
+  }
+
+  async updateRetentionConfig(request: UpdateRetentionRequest): Promise<RetentionConfig> {
+    return this.request('/api/settings/retention', {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async getStorageStats(): Promise<StorageStats> {
+    return this.request('/api/settings/storage');
+  }
+
+  async runRetentionNow(): Promise<{ success: boolean; chunks_dropped: number }> {
+    return this.request('/api/settings/retention/run', {
+      method: 'POST',
+    });
+  }
+
+  // Storage Overview (both PostgreSQL and ClickHouse)
+  async getStorageOverview(): Promise<StorageOverview> {
+    return this.request('/api/settings/storage/overview');
+  }
+
+  // ClickHouse Storage
+  async getClickHouseStorageStats(): Promise<ClickHouseStorageStats> {
+    return this.request('/api/settings/storage/clickhouse');
+  }
+
+  async updateClickHouseRetention(request: UpdateClickHouseRetentionRequest): Promise<{ success: boolean; retention_days: number; message: string }> {
+    return this.request('/api/settings/storage/clickhouse/retention', {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async runClickHouseRetentionNow(): Promise<{ success: boolean; rows_deleted: number }> {
+    return this.request('/api/settings/storage/clickhouse/retention/run', {
+      method: 'POST',
+    });
+  }
+
+  // Storage Tiering
+  async getTieringConfig(): Promise<TieringConfig> {
+    return this.request('/api/settings/tiering');
+  }
+
+  async updateTieringConfig(request: UpdateTieringRequest): Promise<TieringConfig> {
+    return this.request('/api/settings/tiering', {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async setTieringCredentials(request: SetTieringCredentialsRequest): Promise<{ success: boolean; message: string }> {
+    return this.request('/api/settings/tiering/credentials', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async testTieringConnection(): Promise<TieringConnectionTestResult> {
+    return this.request('/api/settings/tiering/test', {
+      method: 'POST',
+    });
+  }
+
+  async applyTieringConfig(): Promise<{ success: boolean; message: string }> {
+    return this.request('/api/settings/tiering/apply', {
+      method: 'POST',
+    });
+  }
+
+  async getTierStats(): Promise<TierStats> {
+    return this.request('/api/settings/tiering/stats');
+  }
+
+  // Risk Settings
+  async getRiskConfig(): Promise<RiskConfig> {
+    return this.request('/api/settings/risk');
+  }
+
+  async updateRiskConfig(request: UpdateRiskConfigRequest): Promise<RiskConfig> {
+    return this.request('/api/settings/risk', {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  // Risk Decay Configuration
+  async getRiskDecayConfig(): Promise<RiskDecayConfig> {
+    return this.request('/api/settings/risk-decay');
+  }
+
+  async updateRiskDecayConfig(request: UpdateRiskDecayConfigRequest): Promise<RiskDecayConfig> {
+    return this.request('/api/settings/risk-decay', {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  // Risk Analytics
+  async getRiskyEntities(params?: RiskEntitiesQuery): Promise<RiskEntitiesResponse> {
+    const searchParams = new URLSearchParams();
+    if (params?.window) searchParams.set('window', params.window);
+    if (params?.entity_type) searchParams.set('entity_type', params.entity_type);
+    if (params?.min_score !== undefined) searchParams.set('min_score', String(params.min_score));
+    if (params?.limit !== undefined) searchParams.set('limit', String(params.limit));
+    if (params?.offset !== undefined) searchParams.set('offset', String(params.offset));
+    
+    const query = searchParams.toString();
+    return this.request(`/api/risk/entities${query ? `?${query}` : ''}`);
+  }
+
+  async getRiskOverview(): Promise<RiskOverviewResponse> {
+    return this.request('/api/risk/overview');
+  }
+
+  async getTimeWindowedRiskScores(params?: TimeWindowedRiskQuery): Promise<TimeWindowedRiskResponse> {
+    const searchParams = new URLSearchParams();
+    if (params?.min_score_24h !== undefined) searchParams.set('min_score_24h', String(params.min_score_24h));
+    if (params?.min_score_7d !== undefined) searchParams.set('min_score_7d', String(params.min_score_7d));
+    if (params?.limit !== undefined) searchParams.set('limit', String(params.limit));
+
+    const query = searchParams.toString();
+    return this.request(`/api/risk/time-windowed${query ? `?${query}` : ''}`);
+  }
+
+  async clearEntityRisk(request: ClearEntityRiskRequest): Promise<ClearRiskResponse> {
+    return this.request('/api/risk/clear', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async clearAllRiskScores(): Promise<ClearRiskResponse> {
+    return this.request('/api/risk/clear-all', {
+      method: 'POST',
+    });
+  }
+
+  // meloD Agent endpoints
+  async melodChat(request: MelodChatRequest): Promise<MelodApiResponse> {
+    return this.request('/api/melod/chat', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async melodCreateParser(request: MelodCreateParserRequest): Promise<MelodApiResponse> {
+    return this.request('/api/melod/parser', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  /**
+   * Create a parser with streaming progress events
+   * Returns an EventSource that emits progress events
+   */
+  melodCreateParserStreaming(
+    request: MelodCreateParserRequest,
+    onProgress: (event: ParserProgressEvent) => void,
+    onComplete: (parser: GeneratedParser | null, error?: string) => void
+  ): AbortController {
+    const controller = new AbortController();
+    
+    // Get auth token
+    const token = this.getAccessToken();
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+    
+    fetch(`${this.baseUrl}/api/melod/parser/stream`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(request),
+      signal: controller.signal,
+    }).then(async (response) => {
+      if (!response.ok) {
+        const error = await response.text();
+        onComplete(null, error);
+        return;
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) {
+        onComplete(null, 'No response body');
+        return;
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6);
+            if (data === '') continue;
+            
+            try {
+              const event = JSON.parse(data) as ParserProgressEvent;
+              onProgress(event);
+              
+              // Check for completion
+              if (event.type === 'completed' && event.success) {
+                // The message might be a JSON parser object or a simple success message
+                // Try to parse it as JSON first
+                if (event.message) {
+                  try {
+                    const parser = JSON.parse(event.message) as GeneratedParser;
+                    // Only call onComplete if we got a valid parser with vrl_code
+                    if (parser && parser.vrl_code) {
+                      onComplete(parser);
+                      return;
+                    }
+                  } catch {
+                    // Not JSON, that's okay - it's just a status message
+                    // The actual parser will come in a subsequent completed event
+                    console.log('Progress completed:', event.message);
+                  }
+                }
+              } else if (event.type === 'error') {
+                onComplete(null, event.message);
+              }
+            } catch (e) {
+              console.error('Failed to parse SSE event:', e);
+            }
+          }
+        }
+      }
+    }).catch((error) => {
+      if (error.name !== 'AbortError') {
+        onComplete(null, error.message);
+      }
+    });
+
+    return controller;
+  }
+
+  async melodBuildQuery(request: MelodBuildQueryRequest): Promise<MelodApiResponse> {
+    return this.request('/api/melod/query', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async melodCreateDetection(request: MelodCreateDetectionRequest): Promise<MelodApiResponse> {
+    return this.request('/api/melod/detection', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async melodTuneDetection(request: MelodTuneDetectionRequest): Promise<MelodApiResponse> {
+    return this.request('/api/melod/detection/tune', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async melodSummarize(request: MelodSummarizeRequest): Promise<SearchSummary> {
+    return this.request('/api/melod/summarize', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async melodEditParser(request: MelodEditParserRequest): Promise<MelodEditParserResponse> {
+    return this.request('/api/melod/parser/edit', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  // Dashboard generation (async job pattern)
+  async melodGenerateDashboard(
+    request: GenerateDashboardRequest
+  ): Promise<DashboardJobStartResponse> {
+    return this.request('/api/melod/dashboard/generate', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async melodGetDashboardJob(jobId: string): Promise<DashboardJobStatusResponse> {
+    return this.request(`/api/melod/dashboard/jobs/${jobId}`);
+  }
+
+  async melodRefineDashboard(
+    request: RefineDashboardRequest
+  ): Promise<GenerateDashboardResponse> {
+    return this.request('/api/melod/dashboard/refine', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  // System metrics
+  async getSystemOverview(hours?: number): Promise<SystemOverview> {
+    const params = hours ? `?hours=${hours}` : '';
+    return this.request(`/api/system/overview${params}`);
+  }
+
+  // Tuning endpoints
+  async getTuningSettings(ruleId: string): Promise<TuningSettings> {
+    return this.request(`/api/tuning/settings/${ruleId}`);
+  }
+
+  async updateTuningSettings(ruleId: string, settings: TuningSettings): Promise<TuningSettings> {
+    return this.request(`/api/tuning/settings/${ruleId}`, {
+      method: 'PUT',
+      body: JSON.stringify(settings),
+    });
+  }
+
+  // News feed endpoint
+  async getNews(): Promise<NewsResponse> {
+    return this.request('/api/news');
+  }
+
+  // Upload endpoints
+  async uploadLogs(file: File, config: UploadConfig, onProgress?: (progress: number) => void): Promise<UploadResponse> {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('config', JSON.stringify(config));
+
+    const url = `${this.baseUrl}/api/upload/logs`;
+    const token = this.getAccessToken();
+    
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      
+      if (onProgress) {
+        xhr.upload.addEventListener('progress', (event) => {
+          if (event.lengthComputable) {
+            const progress = Math.round((event.loaded / event.total) * 100);
+            onProgress(progress);
+          }
+        });
+      }
+      
+      xhr.addEventListener('load', () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(JSON.parse(xhr.responseText));
+        } else {
+          try {
+            const errorBody = JSON.parse(xhr.responseText);
+            reject(new ApiClientError(errorBody.message || 'Upload failed', errorBody.code));
+          } catch {
+            reject(new ApiClientError('Upload failed', 'UPLOAD_ERROR'));
+          }
+        }
+      });
+      
+      xhr.addEventListener('error', () => {
+        reject(new ApiClientError('Network error during upload', 'NETWORK_ERROR'));
+      });
+      
+      xhr.addEventListener('abort', () => {
+        reject(new ApiClientError('Upload cancelled', 'UPLOAD_CANCELLED'));
+      });
+      
+      xhr.open('POST', url);
+      if (token) {
+        xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+      }
+      xhr.send(formData);
+    });
+  }
+
+  async previewUpload(file: File, config?: Partial<UploadConfig>, limit?: number): Promise<PreviewResult> {
+    const formData = new FormData();
+    formData.append('file', file);
+    if (config) {
+      formData.append('config', JSON.stringify(config));
+    }
+    if (limit) {
+      formData.append('limit', String(limit));
+    }
+
+    // Get auth token
+    const token = this.getAccessToken();
+    const headers: Record<string, string> = {};
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    const response = await fetch(`${this.baseUrl}/api/upload/preview`, {
+      method: 'POST',
+      headers,
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.json().catch(() => ({ message: 'Preview failed' }));
+      throw new ApiClientError(errorBody.message || 'Preview failed', errorBody.code);
+    }
+
+    return response.json();
+  }
+
+  async getUploadHistory(filter?: UploadHistoryFilter): Promise<UploadRecord[]> {
+    const params = new URLSearchParams();
+    if (filter?.destination_type) params.set('destination_type', filter.destination_type);
+    if (filter?.destination_name) params.set('destination_name', filter.destination_name);
+    if (filter?.status) params.set('status', filter.status);
+    if (filter?.start_date) params.set('start_date', filter.start_date);
+    if (filter?.end_date) params.set('end_date', filter.end_date);
+    if (filter?.limit) params.set('limit', String(filter.limit));
+    if (filter?.offset) params.set('offset', String(filter.offset));
+
+    const query = params.toString();
+    return this.request(`/api/upload/history${query ? `?${query}` : ''}`);
+  }
+
+  // Lookup table endpoints
+  async createLookupTable(file: File, config: CreateLookupTableConfig, onProgress?: (progress: number) => void): Promise<CreateLookupTableResponse> {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('config', JSON.stringify(config));
+
+    const url = `${this.baseUrl}/api/lookup/tables`;
+    const token = this.getAccessToken();
+    
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      
+      if (onProgress) {
+        xhr.upload.addEventListener('progress', (event) => {
+          if (event.lengthComputable) {
+            const progress = Math.round((event.loaded / event.total) * 100);
+            onProgress(progress);
+          }
+        });
+      }
+      
+      xhr.addEventListener('load', () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(JSON.parse(xhr.responseText));
+        } else {
+          try {
+            const errorBody = JSON.parse(xhr.responseText);
+            reject(new ApiClientError(errorBody.message || 'Failed to create lookup table', errorBody.code));
+          } catch {
+            reject(new ApiClientError('Failed to create lookup table', 'LOOKUP_ERROR'));
+          }
+        }
+      });
+      
+      xhr.addEventListener('error', () => {
+        reject(new ApiClientError('Network error', 'NETWORK_ERROR'));
+      });
+      
+      xhr.open('POST', url);
+      if (token) {
+        xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+      }
+      xhr.send(formData);
+    });
+  }
+
+  async listLookupTables(): Promise<LookupTable[]> {
+    return this.request('/api/lookup/tables');
+  }
+
+  async getLookupTable(name: string): Promise<LookupTable> {
+    return this.request(`/api/lookup/tables/${encodeURIComponent(name)}`);
+  }
+
+  async deleteLookupTable(name: string): Promise<{ success: boolean }> {
+    return this.request(`/api/lookup/tables/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async lookupQuery(query: LookupQueryRequest): Promise<LookupResult | BatchLookupResult> {
+    return this.request('/api/lookup/query', {
+      method: 'POST',
+      body: JSON.stringify(query),
+    });
+  }
+
+  // Scheduled job endpoints
+  async createScheduledJob(job: NewScheduledJob): Promise<ScheduledJob> {
+    return this.request('/api/scheduled-jobs', {
+      method: 'POST',
+      body: JSON.stringify(job),
+    });
+  }
+
+  async listScheduledJobs(filter?: JobFilter): Promise<ScheduledJob[]> {
+    const params = new URLSearchParams();
+    if (filter?.enabled !== undefined) params.set('enabled', String(filter.enabled));
+    if (filter?.destination_type) params.set('destination_type', filter.destination_type);
+    if (filter?.limit) params.set('limit', String(filter.limit));
+    if (filter?.offset) params.set('offset', String(filter.offset));
+
+    const query = params.toString();
+    return this.request(`/api/scheduled-jobs${query ? `?${query}` : ''}`);
+  }
+
+  async getScheduledJob(id: string): Promise<ScheduledJob> {
+    return this.request(`/api/scheduled-jobs/${id}`);
+  }
+
+  async updateScheduledJob(id: string, update: UpdateScheduledJob): Promise<ScheduledJob> {
+    return this.request(`/api/scheduled-jobs/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(update),
+    });
+  }
+
+  async deleteScheduledJob(id: string): Promise<{ success: boolean }> {
+    return this.request(`/api/scheduled-jobs/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async triggerScheduledJob(id: string): Promise<JobExecution> {
+    return this.request(`/api/scheduled-jobs/${id}/trigger`, {
+      method: 'POST',
+    });
+  }
+
+  async enableScheduledJob(id: string): Promise<ScheduledJob> {
+    return this.request(`/api/scheduled-jobs/${id}/enable`, {
+      method: 'POST',
+    });
+  }
+
+  async disableScheduledJob(id: string): Promise<ScheduledJob> {
+    return this.request(`/api/scheduled-jobs/${id}/disable`, {
+      method: 'POST',
+    });
+  }
+
+  async getSchedulerStats(): Promise<JobStats> {
+    return this.request('/api/scheduled-jobs/stats');
+  }
+
+  // Dashboard endpoints
+  async listDashboards(filter: 'my' | 'all' = 'my'): Promise<DashboardSummary[]> {
+    return this.request(`/api/dashboards?filter=${filter}`);
+  }
+
+  async getDashboard(id: string): Promise<Dashboard> {
+    return this.request(`/api/dashboards/${id}`);
+  }
+
+  async createDashboard(request: CreateDashboardRequest): Promise<Dashboard> {
+    return this.request('/api/dashboards', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async updateDashboard(id: string, request: UpdateDashboardRequest): Promise<Dashboard> {
+    return this.request(`/api/dashboards/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async deleteDashboard(id: string): Promise<{ success: boolean }> {
+    return this.request(`/api/dashboards/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async panelQuery(request: PanelQueryRequest): Promise<PanelQueryResponse> {
+    return this.request('/api/dashboards/panel/query', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async exportDashboard(id: string): Promise<DashboardExport> {
+    return this.request(`/api/dashboards/export/${id}`, {
+      method: 'POST',
+    });
+  }
+
+  async importDashboard(request: ImportDashboardRequest): Promise<Dashboard> {
+    return this.request('/api/dashboards/import', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async validateCron(request: ValidateCronRequest): Promise<ValidateCronResponse> {
+    return this.request('/api/scheduled-jobs/validate-cron', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  // ============================================================================
+  // Authentication endpoints
+  // ============================================================================
+
+  async login(email: string, password: string): Promise<AuthResponse> {
+    return this.request('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+    });
+  }
+
+  async logout(refreshToken: string): Promise<void> {
+    return this.request('/api/auth/logout', {
+      method: 'POST',
+      body: JSON.stringify({ refresh_token: refreshToken }),
+    });
+  }
+
+  async refreshToken(refreshToken: string): Promise<TokenPairResponse> {
+    return this.request('/api/auth/refresh', {
+      method: 'POST',
+      body: JSON.stringify({ refresh_token: refreshToken }),
+    });
+  }
+
+  async getCurrentUser(): Promise<CurrentUser> {
+    return this.request('/api/auth/me');
+  }
+
+  async requestPasswordReset(email: string): Promise<{ message: string }> {
+    return this.request('/api/auth/password/reset-request', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    });
+  }
+
+  async resetPassword(token: string, newPassword: string): Promise<{ message: string }> {
+    return this.request('/api/auth/password/reset', {
+      method: 'POST',
+      body: JSON.stringify({ token, new_password: newPassword }),
+    });
+  }
+
+  // OIDC endpoints
+  async getOidcProviders(): Promise<OidcProviderInfo[]> {
+    return this.request('/api/auth/oidc/providers');
+  }
+
+  async getOidcAuthUrl(providerSlug: string, redirectUri: string): Promise<OidcAuthUrlResponse> {
+    return this.request(`/api/auth/oidc/${providerSlug}/authorize?redirect_uri=${encodeURIComponent(redirectUri)}`);
+  }
+
+  async handleOidcCallback(
+    providerSlug: string,
+    code: string,
+    state: string,
+    redirectUri: string,
+    codeVerifier: string,
+    nonce: string
+  ): Promise<OidcCallbackResponse> {
+    return this.request(`/api/auth/oidc/${providerSlug}/callback`, {
+      method: 'POST',
+      body: JSON.stringify({
+        code,
+        state,
+        redirect_uri: redirectUri,
+        code_verifier: codeVerifier,
+        nonce,
+      }),
+    });
+  }
+
+  // OIDC Provider Management endpoints (admin)
+  async listOidcProviders(): Promise<OidcProviderListResponse> {
+    return this.request('/api/settings/oidc');
+  }
+
+  async getOidcProvider(id: string): Promise<OidcProviderSummary> {
+    return this.request(`/api/settings/oidc/${id}`);
+  }
+
+  async createOidcProvider(request: CreateOidcProviderRequest): Promise<OidcProviderSummary> {
+    return this.request('/api/settings/oidc', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async updateOidcProvider(id: string, request: UpdateOidcProviderRequest): Promise<OidcProviderSummary> {
+    return this.request(`/api/settings/oidc/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async deleteOidcProvider(id: string): Promise<void> {
+    return this.request(`/api/settings/oidc/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async enableOidcProvider(id: string): Promise<OidcProviderSummary> {
+    return this.request(`/api/settings/oidc/${id}/enable`, {
+      method: 'POST',
+    });
+  }
+
+  async disableOidcProvider(id: string): Promise<OidcProviderSummary> {
+    return this.request(`/api/settings/oidc/${id}/disable`, {
+      method: 'POST',
+    });
+  }
+
+  async getOidcGroupMappings(providerId: string): Promise<OidcGroupMappingsResponse> {
+    return this.request(`/api/settings/oidc/${providerId}/mappings`);
+  }
+
+  async updateOidcGroupMappings(providerId: string, request: UpdateOidcGroupMappingsRequest): Promise<OidcGroupMappingsResponse> {
+    return this.request(`/api/settings/oidc/${providerId}/mappings`, {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  // User management endpoints
+  async listUsers(): Promise<UserListResponse> {
+    return this.request('/api/users');
+  }
+
+  async getUser(id: string): Promise<UserDetail> {
+    return this.request(`/api/users/${id}`);
+  }
+
+  async createUser(request: CreateUserRequest): Promise<UserDetail> {
+    return this.request('/api/users', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async updateUser(id: string, request: UpdateUserRequest): Promise<UserDetail> {
+    return this.request(`/api/users/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async deleteUser(id: string): Promise<void> {
+    return this.request(`/api/users/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async unlockUser(id: string): Promise<UserDetail> {
+    return this.request(`/api/users/${id}/unlock`, {
+      method: 'POST',
+    });
+  }
+
+  async disableUser(id: string): Promise<UserDetail> {
+    return this.request(`/api/users/${id}/disable`, {
+      method: 'POST',
+    });
+  }
+
+  async enableUser(id: string): Promise<UserDetail> {
+    return this.request(`/api/users/${id}/enable`, {
+      method: 'POST',
+    });
+  }
+
+  // Group management endpoints
+  async listGroups(): Promise<GroupListResponse> {
+    return this.request('/api/groups');
+  }
+
+  async getGroup(id: string): Promise<GroupDetail> {
+    return this.request(`/api/groups/${id}`);
+  }
+
+  async createGroup(request: CreateGroupRequest): Promise<GroupDetail> {
+    return this.request('/api/groups', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async updateGroup(id: string, request: UpdateGroupRequest): Promise<GroupDetail> {
+    return this.request(`/api/groups/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async deleteGroup(id: string): Promise<void> {
+    return this.request(`/api/groups/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  // Role management endpoints
+  async listRoles(): Promise<RoleListResponse> {
+    return this.request('/api/roles');
+  }
+
+  async getRole(id: string): Promise<RoleDetail> {
+    return this.request(`/api/roles/${id}`);
+  }
+
+  async createRole(request: CreateRoleRequest): Promise<RoleDetail> {
+    return this.request('/api/roles', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async updateRole(id: string, request: UpdateRoleRequest): Promise<RoleDetail> {
+    return this.request(`/api/roles/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async deleteRole(id: string): Promise<void> {
+    return this.request(`/api/roles/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async listPermissions(): Promise<PermissionInfo[]> {
+    const response = await this.request<{ permissions: PermissionInfo[] }>('/api/permissions');
+    return response.permissions;
+  }
+
+  // API Key management endpoints
+  async listApiKeys(): Promise<ApiKeyListResponse> {
+    return this.request('/api/api-keys');
+  }
+
+  async createApiKey(request: CreateApiKeyRequest): Promise<ApiKeyCreatedResponse> {
+    return this.request('/api/api-keys', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async deleteApiKey(id: string): Promise<void> {
+    return this.request(`/api/api-keys/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async enableApiKey(id: string): Promise<ApiKeySummary> {
+    return this.request(`/api/api-keys/${id}/enable`, {
+      method: 'POST',
+    });
+  }
+
+  async disableApiKey(id: string): Promise<ApiKeySummary> {
+    return this.request(`/api/api-keys/${id}/disable`, {
+      method: 'POST',
+    });
+  }
+
+  // Session management endpoints
+  async listAllSessions(): Promise<SessionListResponse> {
+    return this.request('/api/sessions');
+  }
+
+  async listMySessions(): Promise<SessionListResponse> {
+    return this.request('/api/sessions/me');
+  }
+
+  async terminateSession(id: string): Promise<void> {
+    return this.request(`/api/sessions/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  // Audit log endpoints
+  async queryAuditLogs(params?: AuditLogQuery): Promise<AuditLogResponse> {
+    const searchParams = new URLSearchParams();
+    if (params?.user_id) searchParams.set('user_id', params.user_id);
+    if (params?.action) searchParams.set('action', params.action);
+    if (params?.start_time) searchParams.set('start_time', params.start_time);
+    if (params?.end_time) searchParams.set('end_time', params.end_time);
+    if (params?.limit) searchParams.set('limit', String(params.limit));
+    if (params?.offset) searchParams.set('offset', String(params.offset));
+    
+    const query = searchParams.toString();
+    return this.request(`/api/audit${query ? `?${query}` : ''}`);
+  }
+
+  // ============================================================================
+  // Prevalence Tracking Endpoints
+  // ============================================================================
+
+  async getHashPrevalence(hash: string, window?: string): Promise<PrevalenceResponse> {
+    const params = new URLSearchParams();
+    if (window) params.set('window', window);
+    const query = params.toString();
+    return this.request(`/api/prevalence/hash/${encodeURIComponent(hash)}${query ? `?${query}` : ''}`);
+  }
+
+  async getDomainPrevalence(domain: string, window?: string): Promise<PrevalenceResponse> {
+    const params = new URLSearchParams();
+    if (window) params.set('window', window);
+    const query = params.toString();
+    return this.request(`/api/prevalence/domain/${encodeURIComponent(domain)}${query ? `?${query}` : ''}`);
+  }
+
+  async getBulkPrevalence(request: BulkPrevalenceRequest): Promise<BulkPrevalenceResponse> {
+    return this.request('/api/prevalence/bulk', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async getRareArtifacts(params?: RareArtifactsQuery): Promise<ArtifactListResponse> {
+    const searchParams = new URLSearchParams();
+    if (params?.window) searchParams.set('window', params.window);
+    if (params?.type) searchParams.set('type', params.type);
+    if (params?.limit) searchParams.set('limit', String(params.limit));
+    if (params?.offset) searchParams.set('offset', String(params.offset));
+    const query = searchParams.toString();
+    return this.request(`/api/prevalence/rare${query ? `?${query}` : ''}`);
+  }
+
+  async getNewArtifacts(params?: NewArtifactsQuery): Promise<ArtifactListResponse> {
+    const searchParams = new URLSearchParams();
+    if (params?.since) searchParams.set('since', params.since);
+    if (params?.type) searchParams.set('type', params.type);
+    if (params?.limit) searchParams.set('limit', String(params.limit));
+    if (params?.offset) searchParams.set('offset', String(params.offset));
+    const query = searchParams.toString();
+    return this.request(`/api/prevalence/new${query ? `?${query}` : ''}`);
+  }
+
+  async getPrevalenceScatterData(request: ScatterPlotRequest): Promise<PrevalenceScatterDataResponse> {
+    return this.request('/api/prevalence/scatter', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async getPrevalenceSettings(): Promise<PrevalenceSettingsResponse> {
+    return this.request('/api/settings/prevalence');
+  }
+
+  async updatePrevalenceSettings(request: UpdatePrevalenceSettingsRequest): Promise<PrevalenceSettingsResponse> {
+    return this.request('/api/settings/prevalence', {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  // Notebook endpoints
+  async listNotebooks(filter: 'my' | 'shared' | 'all' = 'my', status: string = 'all'): Promise<NotebookSummary[]> {
+    return this.request(`/api/notebooks?filter=${filter}&status=${status}`);
+  }
+
+  async getNotebook(id: string): Promise<NotebookResponse> {
+    return this.request(`/api/notebooks/${id}`);
+  }
+
+  async getActiveNotebook(): Promise<NotebookWithOwner | null> {
+    return this.request('/api/notebooks/active');
+  }
+
+  async createNotebook(request: CreateNotebookRequest): Promise<Notebook> {
+    return this.request('/api/notebooks', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async updateNotebook(id: string, request: UpdateNotebookRequest): Promise<Notebook> {
+    return this.request(`/api/notebooks/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async deleteNotebook(id: string): Promise<{ success: boolean }> {
+    return this.request(`/api/notebooks/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async getNotebookEntries(notebookId: string, limit?: number, offset?: number): Promise<NotebookEntryWithCreator[]> {
+    const params = new URLSearchParams();
+    if (limit) params.set('limit', String(limit));
+    if (offset) params.set('offset', String(offset));
+    return this.request(`/api/notebooks/${notebookId}/entries?${params}`);
+  }
+
+  async addNotebookEntry(notebookId: string, request: AddEntryRequest): Promise<NotebookEntry> {
+    return this.request(`/api/notebooks/${notebookId}/entries`, {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async deleteNotebookEntry(notebookId: string, entryId: string): Promise<{ success: boolean }> {
+    return this.request(`/api/notebooks/${notebookId}/entries/${entryId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async getNotebookShares(notebookId: string): Promise<NotebookShareWithNames[]> {
+    return this.request(`/api/notebooks/${notebookId}/shares`);
+  }
+
+  async addNotebookShare(notebookId: string, request: AddShareRequest): Promise<NotebookShareWithNames> {
+    return this.request(`/api/notebooks/${notebookId}/shares`, {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async deleteNotebookShare(notebookId: string, shareId: string): Promise<{ success: boolean }> {
+    return this.request(`/api/notebooks/${notebookId}/shares/${shareId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async getNotebookReferences(notebookId: string): Promise<NotebookReference[]> {
+    return this.request(`/api/notebooks/${notebookId}/references`);
+  }
+
+  async addNotebookReference(notebookId: string, request: AddReferenceRequest): Promise<NotebookReference> {
+    return this.request(`/api/notebooks/${notebookId}/references`, {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  async deleteNotebookReference(notebookId: string, referenceId: string): Promise<{ success: boolean }> {
+    return this.request(`/api/notebooks/${notebookId}/references/${referenceId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async findNotebooksByReference(referenceType: string, referenceId: string): Promise<NotebookSummary[]> {
+    return this.request(`/api/notebooks/by-reference?reference_type=${referenceType}&reference_id=${referenceId}`);
+  }
+
+  // Notebook AI summarization
+  async summarizeNotebook(
+    notebookId: string,
+    entries: Array<{ entry_type: string; content: Record<string, unknown>; created_at: string }>
+  ): Promise<NotebookAISummary> {
+    return this.request('/api/melod/notebook/summarize', {
+      method: 'POST',
+      body: JSON.stringify({ notebook_id: notebookId, entries }),
+    });
+  }
+
+  // ==================== Case Notebooks ====================
+
+  // Get the notebook linked to a case
+  async getCaseNotebook(caseId: string): Promise<NotebookWithOwner | null> {
+    return this.request(`/api/cases/${caseId}/notebook`);
+  }
+
+  // Link an existing notebook to a case
+  async linkNotebookToCase(caseId: string, notebookId: string): Promise<Notebook> {
+    return this.request(`/api/cases/${caseId}/notebook`, {
+      method: 'POST',
+      body: JSON.stringify({ notebook_id: notebookId }),
+    });
+  }
+
+  // Unlink notebook from case
+  async unlinkNotebookFromCase(caseId: string): Promise<{ success: boolean }> {
+    return this.request(`/api/cases/${caseId}/notebook`, {
+      method: 'DELETE',
+    });
+  }
+
+  // Get notebooks related to a case (by shared entities)
+  async getRelatedNotebooksForCase(caseId: string): Promise<RelatedNotebook[]> {
+    const response = await this.request<{ notebooks: RelatedNotebook[]; message: string }>(`/api/cases/${caseId}/related-notebooks`);
+    return response.notebooks;
+  }
+
+  // Merge a notebook into the case's notebook
+  async mergeNotebookIntoCase(caseId: string, sourceNotebookId: string): Promise<{ message: string; entries_merged: number }> {
+    return this.request(`/api/cases/${caseId}/notebook/merge`, {
+      method: 'POST',
+      body: JSON.stringify({ source_notebook_id: sourceNotebookId }),
+    });
+  }
+
+  // Generate query suggestions from sample events
+  async generateQuerySuggestions(request: {
+    context_type: 'alert' | 'detection';
+    context_id: string;
+    rule_name: string;
+    rule_query?: string;
+    severity?: string;
+    sample_events: Record<string, unknown>[];
+  }): Promise<NotebookQuerySuggestions> {
+    return this.request('/api/melod/notebook/suggest-queries', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  // Analyze a manual note and suggest relevant queries
+  async analyzeNoteForQueries(request: {
+    note_text: string;
+    recent_context?: Array<{ entry_type: string; summary: string }>;
+  }): Promise<NotebookQuerySuggestions> {
+    return this.request('/api/melod/notebook/analyze-note', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  // Generate investigation timeline from notebook entries
+  async generateInvestigationTimeline(request: {
+    notebook_id: string;
+    entries: Array<{
+      id: string;
+      entry_type: string;
+      content: Record<string, unknown>;
+      created_at: string;
+    }>;
+  }): Promise<InvestigationTimelineResponse> {
+    return this.request('/api/melod/notebook/generate-timeline', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  // ============================================================
+  // Feedback endpoints
+  // ============================================================
+
+  // Create new feedback
+  async createFeedback(request: CreateFeedbackRequest): Promise<FeedbackResponse> {
+    return this.request('/api/feedback', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  // List all feedback (admin view)
+  async listFeedback(query?: {
+    category?: FeedbackCategory;
+    status?: FeedbackStatus;
+    limit?: number;
+    offset?: number;
+  }): Promise<FeedbackListResponse> {
+    const params = new URLSearchParams();
+    if (query?.category) params.set('category', query.category);
+    if (query?.status) params.set('status', query.status);
+    if (query?.limit) params.set('limit', query.limit.toString());
+    if (query?.offset) params.set('offset', query.offset.toString());
+    const queryString = params.toString();
+    return this.request(`/api/feedback${queryString ? `?${queryString}` : ''}`);
+  }
+
+  // List current user's feedback
+  async listMyFeedback(limit?: number): Promise<MyFeedbackResponse> {
+    const params = new URLSearchParams();
+    if (limit) params.set('limit', limit.toString());
+    const queryString = params.toString();
+    return this.request(`/api/feedback/me${queryString ? `?${queryString}` : ''}`);
+  }
+
+  // Get single feedback by ID
+  async getFeedback(id: string): Promise<FeedbackResponse> {
+    return this.request(`/api/feedback/${id}`);
+  }
+
+  // Update feedback (admin: status and notes)
+  async updateFeedback(id: string, request: UpdateFeedbackRequest): Promise<FeedbackResponse> {
+    return this.request(`/api/feedback/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  // Delete feedback
+  async deleteFeedback(id: string): Promise<void> {
+    return this.request(`/api/feedback/${id}`, {
+      method: 'DELETE',
+    });
+  }
+
+  // ============================================================
+  // Agent Enrichment endpoints (AI-powered threat intelligence)
+  // ============================================================
+
+  // List all configured agent enrichment providers
+  async listAgentEnrichmentProviders(): Promise<ListAgentEnrichmentProvidersResponse> {
+    return this.request('/api/settings/agent-enrichments');
+  }
+
+  // Get a specific agent enrichment provider
+  async getAgentEnrichmentProvider(providerId: string): Promise<AgentEnrichmentProvider> {
+    return this.request(`/api/settings/agent-enrichments/${providerId}`);
+  }
+
+  // Create a new agent enrichment provider
+  async createAgentEnrichmentProvider(request: CreateAgentEnrichmentProviderRequest): Promise<AgentEnrichmentProvider> {
+    return this.request('/api/settings/agent-enrichments', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  // Update an agent enrichment provider
+  async updateAgentEnrichmentProvider(providerId: string, request: UpdateAgentEnrichmentProviderRequest): Promise<AgentEnrichmentProvider> {
+    return this.request(`/api/settings/agent-enrichments/${providerId}`, {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    });
+  }
+
+  // Delete an agent enrichment provider
+  async deleteAgentEnrichmentProvider(providerId: string): Promise<{ success: boolean; message: string; cache_entries_cleared: number }> {
+    return this.request(`/api/settings/agent-enrichments/${providerId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  // Update agent enrichment provider credentials (API key)
+  async updateAgentEnrichmentCredentials(providerId: string, request: UpdateAgentEnrichmentCredentialsRequest): Promise<{ success: boolean; message: string }> {
+    return this.request(`/api/settings/agent-enrichments/${providerId}/credentials`, {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  // Test agent enrichment provider connection
+  async testAgentEnrichmentConnection(providerId: string): Promise<TestAgentEnrichmentConnectionResponse> {
+    return this.request(`/api/settings/agent-enrichments/${providerId}/test`, {
+      method: 'POST',
+    });
+  }
+
+  // Get agent enrichment provider usage statistics
+  async getAgentEnrichmentUsage(providerId: string): Promise<AgentEnrichmentUsageStats> {
+    return this.request(`/api/settings/agent-enrichments/${providerId}/usage`);
+  }
+
+  // ============================================================================
+  // Alert Triage API Methods
+  // ============================================================================
+
+  // Initiate AI triage for an alert (synchronous - returns full result)
+  async triageAlertSync(alertId: string, config?: TriageConfig): Promise<TriageResult> {
+    return this.request(`/api/alerts/${alertId}/triage/sync`, {
+      method: 'POST',
+      body: JSON.stringify(config ? { config } : {}),
+    });
+  }
+
+  // Initiate AI triage for an alert with SSE streaming
+  // Uses fetch with ReadableStream for POST requests (EventSource only supports GET)
+  triageAlertStreaming(
+    alertId: string, 
+    config?: TriageConfig,
+    onProgress?: (event: TriageProgressEvent) => void,
+    onComplete?: (sessionId: string | null, error?: string) => void
+  ): AbortController {
+    const controller = new AbortController();
+    
+    // Get auth token
+    const token = this.getAccessToken();
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Accept': 'text/event-stream',
+    };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+    
+    fetch(`${this.baseUrl}/api/alerts/${alertId}/triage`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ config }),
+      signal: controller.signal,
+    }).then(async (response) => {
+      if (!response.ok) {
+        const error = await response.text();
+        onComplete?.(null, error);
+        return;
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) {
+        onComplete?.(null, 'No response body');
+        return;
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let sessionId: string | null = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            // Handle event type line
+            continue;
+          }
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6);
+            if (data === '') continue;
+            
+            try {
+              // Check if it's a session ID (first event)
+              if (!sessionId && !data.startsWith('{')) {
+                sessionId = data;
+                console.log('[SSE] Session ID:', sessionId);
+                continue;
+              }
+              
+              const event = JSON.parse(data) as TriageProgressEvent;
+              console.log('[SSE] Event received:', event.type, event.agent);
+              onProgress?.(event);
+              
+              // Check for completion
+              if (event.type === 'triage_completed') {
+                onComplete?.(sessionId, undefined);
+                return;
+              } else if (event.type === 'triage_failed') {
+                onComplete?.(null, event.error || 'Triage failed');
+                return;
+              }
+            } catch (e) {
+              console.error('Failed to parse SSE event:', e, data);
+            }
+          }
+        }
+      }
+      
+      // Stream ended without explicit completion
+      onComplete?.(sessionId, undefined);
+    }).catch((error) => {
+      if (error.name !== 'AbortError') {
+        onComplete?.(null, error.message);
+      }
+    });
+
+    return controller;
+  }
+
+  // Get triage result by session ID
+  async getTriageResult(alertId: string, sessionId: string): Promise<TriageResult> {
+    return this.request(`/api/alerts/${alertId}/triage/${sessionId}`);
+  }
+
+  // Get the latest triage result for an alert
+  async getLatestTriageResult(alertId: string): Promise<TriageResult> {
+    return this.request(`/api/alerts/${alertId}/triage/latest`);
+  }
+
+  // Cancel a running triage session
+  async cancelTriage(alertId: string, sessionId: string): Promise<{ success: boolean; message: string }> {
+    return this.request(`/api/alerts/${alertId}/triage/${sessionId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  // Get triage session status
+  async getTriageStatus(alertId: string, sessionId: string): Promise<{ session_id: string; alert_id: string; status: string }> {
+    return this.request(`/api/alerts/${alertId}/triage/${sessionId}/status`);
+  }
+
+  // =============================================================================
+  // Case-Level Triage API Methods (Multi-Alert Analysis)
+  // =============================================================================
+
+  // Initiate AI triage for a case (all alerts analyzed together)
+  // Uses SSE streaming with keepalive support for long-running analysis
+  triageCaseStreaming(
+    caseId: string,
+    config?: CaseTriageConfig,
+    onProgress?: (event: CaseTriageProgressEvent) => void,
+    onComplete?: (sessionId: string | null, error?: string) => void
+  ): AbortController {
+    const controller = new AbortController();
+
+    // Get auth token
+    const token = this.getAccessToken();
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'Accept': 'text/event-stream',
+    };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    fetch(`${this.baseUrl}/api/cases/${caseId}/triage`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ config }),
+      signal: controller.signal,
+    }).then(async (response) => {
+      if (!response.ok) {
+        const error = await response.text();
+        onComplete?.(null, error);
+        return;
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) {
+        onComplete?.(null, 'No response body');
+        return;
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let sessionId: string | null = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          // Skip SSE comments (keepalives)
+          if (line.startsWith(':')) {
+            console.log('[SSE] Keepalive received');
+            continue;
+          }
+          if (line.startsWith('event: ')) {
+            // Handle event type line
+            continue;
+          }
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6);
+            if (data === '') continue;
+
+            try {
+              // Check if it's a session ID (first event)
+              if (!sessionId && !data.startsWith('{')) {
+                sessionId = data;
+                console.log('[SSE] Case triage session ID:', sessionId);
+                continue;
+              }
+
+              const event = JSON.parse(data) as CaseTriageProgressEvent;
+              console.log('[SSE] Case triage event received:', event.type);
+
+              // Skip keepalive events from calling onProgress
+              if (event.type === 'keepalive') {
+                continue;
+              }
+
+              onProgress?.(event);
+
+              // Check for completion
+              if (event.type === 'case_triage_completed') {
+                onComplete?.(sessionId, undefined);
+                return;
+              } else if (event.type === 'case_triage_failed') {
+                onComplete?.(null, event.error || 'Case triage failed');
+                return;
+              }
+            } catch (e) {
+              console.error('Failed to parse SSE event:', e, data);
+            }
+          }
+        }
+      }
+
+      // Stream ended without explicit completion
+      onComplete?.(sessionId, undefined);
+    }).catch((error) => {
+      if (error.name !== 'AbortError') {
+        onComplete?.(null, error.message);
+      }
+    });
+
+    return controller;
+  }
+
+  // Get case triage result by session ID
+  async getCaseTriageResult(caseId: string, sessionId: string): Promise<CaseTriageResult> {
+    return this.request(`/api/cases/${caseId}/triage/${sessionId}`);
+  }
+
+  // Get the latest case triage result
+  async getLatestCaseTriageResult(caseId: string): Promise<CaseTriageResult> {
+    return this.request(`/api/cases/${caseId}/triage/latest`);
+  }
+
+  // Cancel a running case triage session
+  async cancelCaseTriage(caseId: string, sessionId: string): Promise<{ success: boolean; message: string }> {
+    return this.request(`/api/cases/${caseId}/triage/${sessionId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  // ==================== Notifications ====================
+
+  // Get notifications for current user
+  async getNotifications(limit?: number, unreadOnly?: boolean): Promise<NotificationListResponse> {
+    const params = new URLSearchParams();
+    if (limit) params.set('limit', String(limit));
+    if (unreadOnly) params.set('unread_only', 'true');
+    const query = params.toString();
+    return this.request(`/api/notifications${query ? `?${query}` : ''}`);
+  }
+
+  // Get unread notification count
+  async getUnreadNotificationCount(): Promise<UnreadCountResponse> {
+    return this.request('/api/notifications/unread-count');
+  }
+
+  // Mark a notification as read
+  async markNotificationRead(id: string): Promise<Notification> {
+    const response = await this.request<{ notification: Notification }>(`/api/notifications/${id}/read`, {
+      method: 'POST',
+    });
+    return response.notification;
+  }
+
+  // Mark all notifications as read
+  async markAllNotificationsRead(): Promise<MarkAllReadResponse> {
+    return this.request('/api/notifications/read-all', {
+      method: 'POST',
+    });
+  }
+}
+
+export class ApiClientError extends Error {
+  code: string;
+  details?: Record<string, unknown>;
+
+  constructor(message: string, code: string = 'UNKNOWN_ERROR', details?: Record<string, unknown>) {
+    super(message);
+    this.name = 'ApiClientError';
+    this.code = code;
+    this.details = details;
+  }
+}
+
+// Export singleton instance
+export const api = new ApiClient();
+
+// Export class for custom instances
+export { ApiClient };

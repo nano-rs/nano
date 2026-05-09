@@ -1,0 +1,209 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! Migration tracking: recording applied migrations and seeding baselines.
+
+use super::{ClickHouseMigrateError, ClickHouseMigrator, Migration};
+use std::collections::HashSet;
+
+impl ClickHouseMigrator {
+    /// Ensure the _migrations table exists
+    pub(super) async fn ensure_migrations_table(&self) -> Result<(), ClickHouseMigrateError> {
+        let (on_cluster, engine) = if let Some(Some(ref cluster)) = self.cluster {
+            let zoo_path = format!("/clickhouse/tables/{{shard}}/{}/_migrations", self.database);
+            (
+                format!(" ON CLUSTER '{}'", cluster),
+                format!("ReplicatedMergeTree('{}', '{{replica}}')", zoo_path),
+            )
+        } else {
+            (String::new(), "MergeTree".to_string())
+        };
+
+        let sql = format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS {}._migrations{}
+            (
+                `version` String,
+                `name` String,
+                `applied_at` DateTime64(6, 'UTC') DEFAULT now64(6),
+                `checksum` String DEFAULT ''
+            )
+            ENGINE = {}
+            ORDER BY (version)
+            SETTINGS index_granularity = 8192
+            "#,
+            self.database, on_cluster, engine
+        );
+
+        self.client
+            .query(&sql)
+            .execute()
+            .await
+            .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Get list of already applied migration versions
+    pub(super) async fn get_applied_migrations(
+        &self,
+    ) -> Result<HashSet<String>, ClickHouseMigrateError> {
+        let sql = format!(
+            "SELECT version FROM {}._migrations ORDER BY version",
+            self.database
+        );
+
+        let rows: Vec<String> = self
+            .client
+            .query(&sql)
+            .fetch_all()
+            .await
+            .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
+
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Get applied migrations with their stored content checksums.
+    /// Empty checksums (default) come from rows seeded by `seed_baseline_migrations`
+    /// or from migrations applied before NAN-607 added checksum tracking; callers
+    /// should treat empty checksums as "skip content verification" since there's
+    /// no recorded hash to compare against.
+    pub(super) async fn get_applied_migration_checksums(
+        &self,
+    ) -> Result<std::collections::HashMap<String, String>, ClickHouseMigrateError> {
+        // `_migrations` is plain MergeTree with no unique constraint on version.
+        // If concurrent applies (or a DELETE-then-reapply) leave duplicate rows,
+        // use the latest one by `applied_at`. argMax handles both single-row and
+        // duplicate-row cases correctly.
+        let sql = format!(
+            "SELECT version, argMax(checksum, applied_at) FROM {}._migrations GROUP BY version",
+            self.database
+        );
+
+        let rows: Vec<(String, String)> = self
+            .client
+            .query(&sql)
+            .fetch_all()
+            .await
+            .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
+
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Record a migration as applied. Stores a SHA-256 hash of the migration
+    /// SQL content so `check_schema_up_to_date` can detect post-apply edits to
+    /// migration files (which would otherwise pass the version-presence check
+    /// while leaving the schema diverged from the file content).
+    pub(super) async fn record_migration(
+        &self,
+        migration: &Migration,
+    ) -> Result<(), ClickHouseMigrateError> {
+        use sha2::{Digest, Sha256};
+        let checksum = hex::encode(Sha256::digest(migration.sql.as_bytes()));
+
+        let sql = format!(
+            "INSERT INTO {}._migrations (version, name, checksum) VALUES ('{}', '{}', '{}')",
+            self.database,
+            migration.version.replace('\'', "''"),
+            migration.name.replace('\'', "''"),
+            checksum
+        );
+
+        self.client
+            .query(&sql)
+            .execute()
+            .await
+            .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// All migration versions baked into init.sql.
+    /// When init.sql creates a fresh schema, these are seeded into `_migrations`
+    /// so the runner doesn't try to re-apply them.
+    pub(super) const BASELINE_MIGRATIONS: &'static [(&'static str, &'static str)] = &[
+        ("001", "init_clickhouse"),
+        ("002", "rename_raw_content_to_message"),
+        ("003", "add_enrich_time"),
+        ("004", "add_source_column"),
+        ("005", "ip_prevalence_table"),
+        ("006", "ip_prevalence_mv"),
+        ("007", "ioc_enrichment_columns"),
+        ("008", "add_missing_enrichment_columns"),
+        ("075", "create_identity_observations"),
+        ("075a", "create_identity_mv"),
+        ("075b", "create_nat_detection"),
+        ("076", "add_identity_source_priority"),
+        ("078", "full_text_search_index"),
+        ("079", "add_namespace_column"),
+        ("079a", "update_identity_mv_namespace"),
+        ("080", "custom_enrichment_results"),
+        ("081", "custom_enrichment_dictionary"),
+        ("082", "add_process_guids"),
+        ("083", "grant_dictionary_permissions"),
+        ("084", "add_geo_enrichment_columns"),
+        ("085", "add_sample_by_key"),
+        ("086", "cim_alignment_and_indexes"),
+        ("087", "add_query_projections"),
+        ("088", "extend_identity_ttl"),
+        ("089", "log_deduplication"),
+        ("090", "entity_time_range_mv"),
+        ("091", "restore_geo_enrichment_defaults"),
+        ("092", "cloud_user_activity_mv"),
+        ("093", "ipv6_enrichment_fix"),
+        ("094", "storage_optimization"),
+        ("095", "drop_message_search_column"),
+        ("097", "user_registry_dictionary"),
+        ("098", "identity_enrichment_columns"),
+        ("103", "flexible_enrichment_columns"),
+        // 104-108 baseline names match the original /migrations/clickhouse/
+        // history applied to existing tenants by the pre-NAN-606 runner.
+        // Seeding by version number is what the runner dedupes on, so the
+        // exact name strings here are informational — they just need to be
+        // recognizable in `_migrations` rows.
+        ("104", "drop_log_hash_uuid_v7"),
+        ("105", "remove_hardcoded_ttl"),
+        ("106", "rename_process_to_command_line"),
+        ("107", "logs_ttl_hard_cap"),
+        ("108", "prevalence_min_inline_default"),
+        // 109-112 are the post-108 migrations whose effects are now in
+        // init.sql (109/110/111 already; 112 folded in for NAN-606). On
+        // a fresh deploy init.sql creates the post-state, so we seed these
+        // versions to stop the runner from re-applying their files.
+        ("109", "drop_windowed_prevalence_dicts"),
+        ("110", "prevalence_summary_tables"),
+        ("111", "filter_internal_tlds_domain_prevalence"),
+        ("112", "fix_prevalence_dict_layout"),
+    ];
+
+    /// Seed all baseline migration versions into `_migrations`.
+    /// Called after init.sql on a fresh deployment so the runner won't re-apply them.
+    pub(super) async fn seed_baseline_migrations(&self) -> Result<usize, ClickHouseMigrateError> {
+        let applied = self.get_applied_migrations().await?;
+        if !applied.is_empty() {
+            tracing::debug!(
+                "Migrations table already has {} entries, skipping baseline seed",
+                applied.len()
+            );
+            return Ok(0);
+        }
+
+        let mut seeded = 0;
+        for (version, name) in Self::BASELINE_MIGRATIONS {
+            let sql = format!(
+                "INSERT INTO {}._migrations (version, name) VALUES ('{}', '{}')",
+                self.database,
+                version.replace('\'', "''"),
+                name.replace('\'', "''")
+            );
+            self.client
+                .query(&sql)
+                .execute()
+                .await
+                .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
+            seeded += 1;
+        }
+
+        tracing::info!("Seeded {} baseline migration records", seeded);
+        Ok(seeded)
+    }
+}

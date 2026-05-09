@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<clickhouse>
+    <!-- Allow connections from any host (required for Docker networking) -->
+    <listen_host>0.0.0.0</listen_host>
+</clickhouse>

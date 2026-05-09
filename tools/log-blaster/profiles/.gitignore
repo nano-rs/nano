@@ -1,0 +1,3 @@
+# Raw sample exports from lab ClickHouse — too large for git
+# Use the export script to regenerate from the Ludus lab
+sample_*.json

@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<!--
+  Local Development Override
+
+  Drastically reduces resource usage for laptop/dev environments.
+  Delete this file or exclude from volume mount for production deployments.
+-->
+<clickhouse>
+    <!-- Cap memory at 4GB instead of 90% of system RAM -->
+    <max_server_memory_usage>4294967296</max_server_memory_usage>
+
+    <!-- Shrink caches from 28GB total to ~512MB total -->
+    <mark_cache_size>134217728</mark_cache_size>                 <!-- 128MB (was 10GB) -->
+    <uncompressed_cache_size>134217728</uncompressed_cache_size>  <!-- 128MB (was 8GB) -->
+    <index_mark_cache_size>67108864</index_mark_cache_size>       <!-- 64MB (was 5GB) -->
+    <index_uncompressed_cache_size>67108864</index_uncompressed_cache_size> <!-- 64MB (was 5GB) -->
+    <compiled_expression_cache_size>33554432</compiled_expression_cache_size> <!-- 32MB (was 128MB) -->
+    <query_condition_cache_size>67108864</query_condition_cache_size> <!-- 64MB (was 256MB) -->
+
+    <!-- Minimal background threads (was 32/128/8/8/16/16/16) -->
+    <background_pool_size>2</background_pool_size>
+    <background_merges_mutations_concurrency_ratio>2</background_merges_mutations_concurrency_ratio>
+    <background_schedule_pool_size>4</background_schedule_pool_size>
+    <background_fetches_pool_size>1</background_fetches_pool_size>
+    <background_move_pool_size>1</background_move_pool_size>
+    <background_common_pool_size>2</background_common_pool_size>
+    <background_buffer_flush_schedule_pool_size>2</background_buffer_flush_schedule_pool_size>
+    <background_message_broker_schedule_pool_size>2</background_message_broker_schedule_pool_size>
+
+    <!-- Sane local concurrency (was 500/200/300) -->
+    <max_concurrent_queries>50</max_concurrent_queries>
+    <max_concurrent_insert_queries>20</max_concurrent_insert_queries>
+    <max_concurrent_select_queries>30</max_concurrent_select_queries>
+
+    <!-- Reduce async insert threads (was 8) -->
+    <async_insert_threads>2</async_insert_threads>
+
+    <!-- Reduce connections (was 4096) -->
+    <max_connections>100</max_connections>
+
+    <!-- All must be less than background_pool_size * concurrency_ratio (2*2=4) -->
+    <merge_tree>
+        <number_of_free_entries_in_pool_to_execute_mutation>1</number_of_free_entries_in_pool_to_execute_mutation>
+        <number_of_free_entries_in_pool_to_lower_max_size_of_merge>1</number_of_free_entries_in_pool_to_lower_max_size_of_merge>
+        <number_of_free_entries_in_pool_to_execute_optimize_entire_partition>1</number_of_free_entries_in_pool_to_execute_optimize_entire_partition>
+    </merge_tree>
+</clickhouse>

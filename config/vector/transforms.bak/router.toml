@@ -1,0 +1,873 @@
+# Source Type Router for NanoSIEM
+#
+# This configuration routes logs to appropriate parsers based on source type.
+# Source type is determined from:
+# 1. X-Source-Type header (highest priority)
+# 2. source_type field in request body
+# 3. Default to generic parser when unspecified
+#
+# Requirements: 5.1, 5.2, 5.3
+
+# =============================================================================
+# Source Type Extraction Transform
+# =============================================================================
+# Extracts and normalizes source type from headers or body
+# Runs after request validation to ensure authenticated, validated requests
+
+[transforms.source_type_extract]
+type = "remap"
+inputs = ["request_validation"]
+source = '''
+# =============================================================================
+# Step 1: Extract Source Type from Headers (Priority 1)
+# =============================================================================
+# Requirement 5.1: Route based on X-Source-Type header
+
+source_type = "unknown"
+
+# Check X-Source-Type header (case-insensitive)
+if exists(."X-Source-Type") {
+    source_type = downcase(to_string(."X-Source-Type") ?? "unknown")
+} else if exists(."x-source-type") {
+    source_type = downcase(to_string(."x-source-type") ?? "unknown")
+} else if is_object(.headers) {
+    if exists(.headers."X-Source-Type") {
+        source_type = downcase(to_string(.headers."X-Source-Type") ?? "unknown")
+    } else if exists(.headers."x-source-type") {
+        source_type = downcase(to_string(.headers."x-source-type") ?? "unknown")
+    }
+}
+
+# =============================================================================
+# Step 2: Fall Back to Body Field (Priority 2)
+# =============================================================================
+# Requirement 5.2: Use source_type field in body if no header present
+
+if source_type == "unknown" {
+    # Check top-level source_type field
+    if exists(.source_type) && is_string(.source_type) {
+        source_type = downcase(to_string(.source_type) ?? "unknown")
+    }
+    # Check in message object (for nested JSON)
+    else if is_object(.message) && exists(.message.source_type) {
+        source_type = downcase(to_string(.message.source_type) ?? "unknown")
+    }
+    # Check in data object (common wrapper)
+    else if is_object(.data) && exists(.data.source_type) {
+        source_type = downcase(to_string(.data.source_type) ?? "unknown")
+    }
+    # Check in log object
+    else if is_object(.log) && exists(.log.source_type) {
+        source_type = downcase(to_string(.log.source_type) ?? "unknown")
+    }
+}
+
+# =============================================================================
+# Step 3: Normalize Source Type
+# =============================================================================
+# Map common aliases to canonical source types
+
+# Windows Event Log aliases
+if source_type == "winlog" || source_type == "windows" || source_type == "winevt" {
+    source_type = "windows_event"
+}
+
+# Apache aliases
+if source_type == "apache_access" || source_type == "httpd" {
+    source_type = "apache"
+}
+
+# AWS CloudTrail aliases
+if source_type == "cloudtrail" || source_type == "aws_ct" {
+    source_type = "aws_cloudtrail"
+}
+
+# Syslog aliases
+if source_type == "rsyslog" || source_type == "syslog-ng" {
+    source_type = "syslog"
+}
+
+# Firewall aliases
+if source_type == "pan" || source_type == "panos" {
+    source_type = "palo_alto"
+}
+if source_type == "asa" || source_type == "cisco_firewall" {
+    source_type = "cisco_asa"
+}
+if source_type == "fortigate" || source_type == "fgt" {
+    source_type = "fortinet"
+}
+
+# Set the normalized source type
+.source_type = source_type
+
+# Add routing metadata
+.routing_timestamp = now()
+.routing_source = "source_type_extract"
+'''
+
+# =============================================================================
+# Source Type Router
+# =============================================================================
+# Routes logs to appropriate parsers based on source type
+# Requirement 5.3: Default to generic parser when unspecified
+
+[transforms.source_router]
+type = "route"
+inputs = ["source_type_extract"]
+
+[transforms.source_router.route]
+# Endpoint category parsers
+windows_event = '.source_type == "windows_event"'
+sysmon = '.source_type == "sysmon"'
+
+# Network category parsers
+palo_alto = '.source_type == "palo_alto"'
+fortinet = '.source_type == "fortinet"'
+cisco_asa = '.source_type == "cisco_asa"'
+syslog = '.source_type == "syslog"'
+
+# Cloud category parsers
+aws_cloudtrail = '.source_type == "aws_cloudtrail"'
+aws_guardduty = '.source_type == "aws_guardduty"'
+azure_activity = '.source_type == "azure_activity"'
+azure_signin = '.source_type == "azure_signin"'
+
+# Identity category parsers
+okta = '.source_type == "okta"'
+
+# Application category parsers
+apache = '.source_type == "apache"'
+nginx = '.source_type == "nginx"'
+
+# Generic/default route for unknown source types
+# Requirement 5.3: Default to generic parser when unspecified
+generic = 'true'
+
+# =============================================================================
+# Generic Parser (Default)
+# =============================================================================
+# Handles logs with unknown or unspecified source types
+# Requirement 5.3: Default to generic parser when unspecified
+
+[transforms.generic_parser]
+type = "remap"
+inputs = ["source_router.generic"]
+source = '''
+# =============================================================================
+# Generic Log Parser
+# =============================================================================
+# Processes logs that don't match any specific parser
+# Attempts basic field extraction and UDM normalization
+
+# Store raw content
+.raw_content = to_string(.message) ?? to_string(encode_json(.))
+
+# Initialize metadata
+.metadata = {}
+
+# Try to parse message as JSON if it looks like JSON
+if is_string(.message) && starts_with(.message, "{") {
+    parsed, err = parse_json(.message)
+    if err == null {
+        .metadata = parsed
+    }
+} else if is_object(.message) {
+    .metadata = .message
+}
+
+# Initialize UDM fields
+.udm = {}
+
+# =============================================================================
+# Basic UDM Field Extraction
+# =============================================================================
+
+# Source IP - check common field names
+.udm.src_ip = .metadata.src_ip ?? .metadata.source_ip ?? .metadata.src ?? 
+              .metadata.client_ip ?? .metadata.clientip ?? .metadata.remote_addr ?? null
+
+# Destination IP
+.udm.dest_ip = .metadata.dest_ip ?? .metadata.destination_ip ?? .metadata.dst ?? 
+               .metadata.server_ip ?? .metadata.serverip ?? null
+
+# Source Host
+.udm.src_host = .metadata.src_host ?? .metadata.source_host ?? .metadata.hostname ?? 
+                .metadata.host ?? null
+
+# Destination Host
+.udm.dest_host = .metadata.dest_host ?? .metadata.destination_host ?? null
+
+# Source Port
+src_port = .metadata.src_port ?? .metadata.source_port ?? null
+if is_string(src_port) { src_port = to_int(src_port) ?? null }
+.udm.src_port = src_port
+
+# Destination Port
+dest_port = .metadata.dest_port ?? .metadata.destination_port ?? null
+if is_string(dest_port) { dest_port = to_int(dest_port) ?? null }
+.udm.dest_port = dest_port
+
+# Protocol
+.udm.protocol = .metadata.protocol ?? .metadata.proto ?? null
+
+# User
+.udm.user = .metadata.user ?? .metadata.username ?? .metadata.user_name ?? null
+
+# Action
+.udm.action = .metadata.action ?? .metadata.event_type ?? .metadata.event ?? null
+
+# Status
+.udm.status = .metadata.status ?? .metadata.result ?? .metadata.outcome ?? null
+
+# Process fields
+.udm.process_name = .metadata.process_name ?? .metadata.program ?? .metadata.appname ?? null
+.udm.process_id = .metadata.process_id ?? .metadata.pid ?? null
+.udm.command_line = .metadata.command_line ?? .metadata.cmdline ?? null
+
+# File fields
+.udm.file_path = .metadata.file_path ?? .metadata.path ?? null
+.udm.file_name = .metadata.file_name ?? .metadata.filename ?? null
+.udm.file_hash = .metadata.file_hash ?? .metadata.hash ?? null
+
+# Timestamp
+ts = .metadata.timestamp ?? .metadata."@timestamp" ?? .metadata.time ?? .timestamp ?? now()
+if is_string(ts) {
+    parsed_ts, err = parse_timestamp(ts, "%+")
+    if err == null {
+        ts = parsed_ts
+    }
+}
+.udm.timestamp = to_string(to_timestamp(ts) ?? now())
+
+# Mark as generically parsed
+.metadata.parser_type = "generic"
+.metadata.original_source_type = .source_type
+.source_type = "generic"
+'''
+
+# =============================================================================
+# Generic Parser Output
+# =============================================================================
+# Formats generic parser output for the sink
+
+[transforms.generic_output]
+type = "remap"
+inputs = ["generic_parser"]
+source = '''
+# Flatten for PostgreSQL - standard NanoSIEM format
+. = {
+    "timestamp": .udm.timestamp ?? to_string(now()),
+    "raw_content": .raw_content,
+    "metadata": encode_json(.metadata ?? {}),
+    "source_type": .source_type ?? "generic",
+    "src_ip": .udm.src_ip,
+    "dest_ip": .udm.dest_ip,
+    "src_host": .udm.src_host,
+    "dest_host": .udm.dest_host,
+    "src_port": .udm.src_port,
+    "dest_port": .udm.dest_port,
+    "protocol": .udm.protocol,
+    "user": .udm.user,
+    "action": .udm.action,
+    "status": .udm.status,
+    "process_name": .udm.process_name,
+    "process_id": .udm.process_id,
+    "command_line": .udm.command_line,
+    "file_path": .udm.file_path,
+    "file_name": .udm.file_name,
+    "file_hash": .udm.file_hash
+}
+'''
+
+# =============================================================================
+# Placeholder Parsers for Routed Source Types
+# =============================================================================
+# These transforms handle routed logs until specific parsers are deployed
+# They pass through to the generic parser with source type preserved
+
+[transforms.windows_event_placeholder]
+type = "remap"
+inputs = ["source_router.windows_event"]
+source = '''
+# Placeholder for Windows Event parser
+# Will be replaced by deployed parser
+.metadata.awaiting_parser = "windows_event"
+'''
+
+[transforms.sysmon_placeholder]
+type = "remap"
+inputs = ["source_router.sysmon"]
+source = '''
+.metadata.awaiting_parser = "sysmon"
+'''
+
+[transforms.palo_alto_placeholder]
+type = "remap"
+inputs = ["source_router.palo_alto"]
+source = '''
+.metadata.awaiting_parser = "palo_alto"
+'''
+
+[transforms.fortinet_placeholder]
+type = "remap"
+inputs = ["source_router.fortinet"]
+source = '''
+.metadata.awaiting_parser = "fortinet"
+'''
+
+[transforms.cisco_asa_placeholder]
+type = "remap"
+inputs = ["source_router.cisco_asa"]
+source = '''
+.metadata.awaiting_parser = "cisco_asa"
+'''
+
+[transforms.syslog_placeholder]
+type = "remap"
+inputs = ["source_router.syslog"]
+source = '''
+.metadata.awaiting_parser = "syslog"
+'''
+
+[transforms.aws_cloudtrail_placeholder]
+type = "remap"
+inputs = ["source_router.aws_cloudtrail"]
+source = '''
+.metadata.awaiting_parser = "aws_cloudtrail"
+'''
+
+[transforms.aws_guardduty_placeholder]
+type = "remap"
+inputs = ["source_router.aws_guardduty"]
+source = '''
+.metadata.awaiting_parser = "aws_guardduty"
+'''
+
+[transforms.azure_activity_placeholder]
+type = "remap"
+inputs = ["source_router.azure_activity"]
+source = '''
+.metadata.awaiting_parser = "azure_activity"
+'''
+
+[transforms.azure_signin_placeholder]
+type = "remap"
+inputs = ["source_router.azure_signin"]
+source = '''
+.metadata.awaiting_parser = "azure_signin"
+'''
+
+[transforms.okta_placeholder]
+type = "remap"
+inputs = ["source_router.okta"]
+source = '''
+.metadata.awaiting_parser = "okta"
+'''
+
+# Apache placeholder disabled - real parser deployed in sources/parsers/apache.toml
+# [transforms.apache_placeholder]
+# type = "remap"
+# inputs = ["source_router.apache"]
+# source = '''
+# .metadata.awaiting_parser = "apache"
+# '''
+
+[transforms.nginx_placeholder]
+type = "remap"
+inputs = ["source_router.nginx"]
+source = '''
+.metadata.awaiting_parser = "nginx"
+'''
+
+# =============================================================================
+# Placeholder Combiner
+# =============================================================================
+# Combines all placeholder outputs and routes to generic parser
+
+[transforms.placeholder_combiner]
+type = "remap"
+inputs = [
+    "windows_event_placeholder",
+    "sysmon_placeholder",
+    "palo_alto_placeholder",
+    "fortinet_placeholder",
+    "cisco_asa_placeholder",
+    "syslog_placeholder",
+    "aws_cloudtrail_placeholder",
+    "aws_guardduty_placeholder",
+    "azure_activity_placeholder",
+    "azure_signin_placeholder",
+    "okta_placeholder",
+    # "apache_placeholder",  # Disabled - real parser deployed
+    "nginx_placeholder"
+]
+source = '''
+# Route placeholder logs through generic parser
+# Preserve original source type for tracking
+.metadata.routed_source_type = .source_type
+'''
+
+# =============================================================================
+# Routed Output Combiner
+# =============================================================================
+# Combines generic parser output with placeholder outputs
+# This feeds into the main pipeline
+
+[transforms.routed_output]
+type = "remap"
+inputs = ["generic_output", "placeholder_combiner"]
+source = '''
+# If coming from placeholder, process through generic parser logic
+if exists(.metadata.awaiting_parser) {
+    # Store raw content
+    .raw_content = to_string(.message) ?? to_string(encode_json(.))
+    
+    # Initialize metadata if not present
+    if !is_object(.metadata) {
+        .metadata = {}
+    }
+    
+    # Try to parse message as JSON
+    if is_string(.message) && starts_with(.message, "{") {
+        parsed, err = parse_json(.message)
+        if err == null {
+            # Merge parsed content into metadata
+            for_each(object!(parsed)) -> |key, value| {
+                .metadata = set!(.metadata, [key], value)
+            }
+        }
+    } else if is_object(.message) {
+        for_each(object!(.message)) -> |key, value| {
+            .metadata = set!(.metadata, [key], value)
+        }
+    }
+    
+    # Initialize UDM fields
+    .udm = {}
+    
+    # Basic field extraction
+    .udm.src_ip = .metadata.src_ip ?? .metadata.source_ip ?? null
+    .udm.dest_ip = .metadata.dest_ip ?? .metadata.destination_ip ?? null
+    .udm.src_host = .metadata.src_host ?? .metadata.hostname ?? null
+    .udm.dest_host = .metadata.dest_host ?? null
+    .udm.src_port = .metadata.src_port ?? null
+    .udm.dest_port = .metadata.dest_port ?? null
+    .udm.protocol = .metadata.protocol ?? null
+    .udm.user = .metadata.user ?? .metadata.username ?? null
+    .udm.action = .metadata.action ?? .metadata.event_type ?? null
+    .udm.status = .metadata.status ?? .metadata.result ?? null
+    .udm.process_name = .metadata.process_name ?? null
+    .udm.process_id = .metadata.process_id ?? null
+    .udm.command_line = .metadata.command_line ?? null
+    .udm.file_path = .metadata.file_path ?? null
+    .udm.file_name = .metadata.file_name ?? null
+    .udm.file_hash = .metadata.file_hash ?? null
+    .udm.timestamp = to_string(.metadata.timestamp ?? now())
+    
+    # Flatten for output
+    . = {
+        "timestamp": .udm.timestamp ?? to_string(now()),
+        "raw_content": .raw_content,
+        "metadata": encode_json(.metadata ?? {}),
+        "source_type": .source_type ?? "unknown",
+        "src_ip": .udm.src_ip,
+        "dest_ip": .udm.dest_ip,
+        "src_host": .udm.src_host,
+        "dest_host": .udm.dest_host,
+        "src_port": .udm.src_port,
+        "dest_port": .udm.dest_port,
+        "protocol": .udm.protocol,
+        "user": .udm.user,
+        "action": .udm.action,
+        "status": .udm.status,
+        "process_name": .udm.process_name,
+        "process_id": .udm.process_id,
+        "command_line": .udm.command_line,
+        "file_path": .udm.file_path,
+        "file_name": .udm.file_name,
+        "file_hash": .udm.file_hash
+    }
+}
+# Events from generic_output are already in the correct format
+'''
+
+
+# =============================================================================
+# Parser Failure Passthrough
+# =============================================================================
+# Requirement 5.5: When a parser fails to process a log, pass the raw log
+# to the Ingestion API with source_type indicating parse failure
+#
+# This transform handles logs that fail parsing in any specific parser.
+# It preserves the raw content and marks the log as a parse failure.
+
+[transforms.parse_failure_handler]
+type = "remap"
+inputs = []  # Will be connected by specific parsers on failure
+drop_on_abort = false
+drop_on_error = false
+source = '''
+# =============================================================================
+# Parser Failure Passthrough
+# =============================================================================
+# Requirement 5.5: Log the error and pass the raw log to the Ingestion_API
+
+# Preserve raw content - try multiple sources
+raw = ""
+if exists(.raw_content) && is_string(.raw_content) {
+    raw = .raw_content
+} else if exists(.message) && is_string(.message) {
+    raw = .message
+} else {
+    raw = encode_json(.)
+}
+
+# Extract original source type if available
+original_source_type = .source_type ?? .metadata.original_source_type ?? "unknown"
+
+# Extract parse error if available
+parse_error = .parse_error ?? .error ?? .metadata.parse_error ?? "Unknown parse error"
+
+# Log the parse failure
+log("Parser failure for source_type=" + original_source_type + ": " + to_string(parse_error), level: "warn")
+
+# Build failure metadata
+failure_metadata = {
+    "parse_failure": true,
+    "original_source_type": original_source_type,
+    "parse_error": to_string(parse_error),
+    "failure_timestamp": to_string(now())
+}
+
+# Merge with existing metadata if present
+if is_object(.metadata) {
+    for_each(object!(.metadata)) -> |key, value| {
+        failure_metadata = set!(failure_metadata, [key], value)
+    }
+}
+
+# Output in standard format with parse_failure source type
+. = {
+    "timestamp": to_string(now()),
+    "raw_content": raw,
+    "metadata": encode_json(failure_metadata),
+    "source_type": "parse_failure",
+    "src_ip": .udm.src_ip ?? .metadata.src_ip ?? null,
+    "dest_ip": .udm.dest_ip ?? .metadata.dest_ip ?? null,
+    "src_host": .udm.src_host ?? .metadata.src_host ?? null,
+    "dest_host": .udm.dest_host ?? .metadata.dest_host ?? null,
+    "src_port": .udm.src_port ?? .metadata.src_port ?? null,
+    "dest_port": .udm.dest_port ?? .metadata.dest_port ?? null,
+    "protocol": .udm.protocol ?? .metadata.protocol ?? null,
+    "user": .udm.user ?? .metadata.user ?? null,
+    "action": "parse_failure",
+    "status": "error",
+    "process_name": null,
+    "process_id": null,
+    "command_line": null,
+    "file_path": null,
+    "file_name": null,
+    "file_hash": null
+}
+'''
+
+# =============================================================================
+# Safe Parser Wrapper Template
+# =============================================================================
+# This template shows how to wrap a parser with error handling
+# Specific parsers should use this pattern to catch failures
+#
+# Example usage for a custom parser:
+#
+# [transforms.my_parser_safe]
+# type = "remap"
+# inputs = ["source_router.my_source_type"]
+# drop_on_abort = false
+# drop_on_error = false
+# source = '''
+# # Attempt parsing
+# result, err = parse_my_format(.message)
+# 
+# if err != null {
+#     # Mark as parse failure
+#     .parse_error = err
+#     .source_type = "parse_failure"
+#     .metadata.original_source_type = "my_source_type"
+# } else {
+#     # Normal parsing logic
+#     .udm = result
+# }
+# '''
+
+# =============================================================================
+# Generic Parser with Error Handling
+# =============================================================================
+# Enhanced generic parser that catches errors and routes to failure handler
+
+[transforms.generic_parser_safe]
+type = "remap"
+inputs = ["source_router._unmatched"]
+drop_on_abort = false
+drop_on_error = false
+source = '''
+# =============================================================================
+# Safe Generic Log Parser
+# =============================================================================
+# Processes logs with error handling - never drops logs
+
+parse_success = true
+parse_error = null
+
+# Store raw content first (always succeeds)
+raw = ""
+if is_string(.message) {
+    raw = .message
+} else {
+    raw, encode_err = encode_json(.)
+    if encode_err != null {
+        raw = to_string(.) ?? "Unable to encode log"
+    }
+}
+.raw_content = raw
+
+# Initialize metadata
+.metadata = {}
+
+# Try to parse message as JSON if it looks like JSON
+if is_string(.message) && starts_with(.message, "{") {
+    parsed, err = parse_json(.message)
+    if err != null {
+        # JSON parse failed - not necessarily an error, could be plain text
+        .metadata.json_parse_attempted = true
+        .metadata.json_parse_error = to_string(err)
+    } else {
+        .metadata = parsed
+    }
+} else if is_object(.message) {
+    .metadata = .message
+}
+
+# Initialize UDM fields
+.udm = {}
+
+# =============================================================================
+# Basic UDM Field Extraction (with error handling)
+# =============================================================================
+
+# Source IP
+src_ip = null
+src_ip = .metadata.src_ip ?? src_ip
+src_ip = .metadata.source_ip ?? src_ip
+src_ip = .metadata.src ?? src_ip
+src_ip = .metadata.client_ip ?? src_ip
+src_ip = .metadata.clientip ?? src_ip
+src_ip = .metadata.remote_addr ?? src_ip
+.udm.src_ip = src_ip
+
+# Destination IP
+dest_ip = null
+dest_ip = .metadata.dest_ip ?? dest_ip
+dest_ip = .metadata.destination_ip ?? dest_ip
+dest_ip = .metadata.dst ?? dest_ip
+dest_ip = .metadata.server_ip ?? dest_ip
+.udm.dest_ip = dest_ip
+
+# Source Host
+.udm.src_host = .metadata.src_host ?? .metadata.source_host ?? .metadata.hostname ?? .metadata.host ?? null
+
+# Destination Host
+.udm.dest_host = .metadata.dest_host ?? .metadata.destination_host ?? null
+
+# Source Port (with type conversion)
+src_port = .metadata.src_port ?? .metadata.source_port ?? null
+if is_string(src_port) {
+    converted, conv_err = to_int(src_port)
+    src_port = if conv_err == null { converted } else { null }
+}
+.udm.src_port = src_port
+
+# Destination Port (with type conversion)
+dest_port = .metadata.dest_port ?? .metadata.destination_port ?? null
+if is_string(dest_port) {
+    converted, conv_err = to_int(dest_port)
+    dest_port = if conv_err == null { converted } else { null }
+}
+.udm.dest_port = dest_port
+
+# Protocol
+.udm.protocol = .metadata.protocol ?? .metadata.proto ?? null
+
+# User
+.udm.user = .metadata.user ?? .metadata.username ?? .metadata.user_name ?? null
+
+# Action
+.udm.action = .metadata.action ?? .metadata.event_type ?? .metadata.event ?? null
+
+# Status
+.udm.status = .metadata.status ?? .metadata.result ?? .metadata.outcome ?? null
+
+# Process fields
+.udm.process_name = .metadata.process_name ?? .metadata.program ?? .metadata.appname ?? null
+process_id = .metadata.process_id ?? .metadata.pid ?? null
+if is_string(process_id) {
+    converted, conv_err = to_int(process_id)
+    process_id = if conv_err == null { converted } else { null }
+}
+.udm.process_id = process_id
+.udm.command_line = .metadata.command_line ?? .metadata.cmdline ?? null
+
+# File fields
+.udm.file_path = .metadata.file_path ?? .metadata.path ?? null
+.udm.file_name = .metadata.file_name ?? .metadata.filename ?? null
+.udm.file_hash = .metadata.file_hash ?? .metadata.hash ?? null
+
+# Timestamp (with error handling)
+ts = .metadata.timestamp ?? .metadata."@timestamp" ?? .metadata.time ?? .timestamp ?? now()
+if is_string(ts) {
+    parsed_ts, ts_err = parse_timestamp(ts, "%+")
+    if ts_err != null {
+        # Try ISO format
+        parsed_ts, ts_err = parse_timestamp(ts, "%Y-%m-%dT%H:%M:%S%.fZ")
+    }
+    if ts_err != null {
+        # Try common format
+        parsed_ts, ts_err = parse_timestamp(ts, "%Y-%m-%d %H:%M:%S")
+    }
+    if ts_err == null {
+        ts = parsed_ts
+    } else {
+        ts = now()
+        .metadata.timestamp_parse_error = to_string(ts_err)
+    }
+}
+.udm.timestamp = to_string(to_timestamp(ts) ?? now())
+
+# Mark as generically parsed
+.metadata.parser_type = "generic"
+.metadata.original_source_type = .source_type ?? "unknown"
+.source_type = "generic"
+'''
+
+# =============================================================================
+# Safe Generic Parser Output
+# =============================================================================
+# Formats safe generic parser output for the sink
+
+[transforms.generic_output_safe]
+type = "remap"
+inputs = ["generic_parser_safe"]
+source = '''
+# Flatten for PostgreSQL - standard NanoSIEM format
+. = {
+    "timestamp": .udm.timestamp ?? to_string(now()),
+    "raw_content": .raw_content,
+    "metadata": encode_json(.metadata ?? {}),
+    "source_type": .source_type ?? "generic",
+    "src_ip": .udm.src_ip,
+    "dest_ip": .udm.dest_ip,
+    "src_host": .udm.src_host,
+    "dest_host": .udm.dest_host,
+    "src_port": .udm.src_port,
+    "dest_port": .udm.dest_port,
+    "protocol": .udm.protocol,
+    "user": .udm.user,
+    "action": .udm.action,
+    "status": .udm.status,
+    "process_name": .udm.process_name,
+    "process_id": .udm.process_id,
+    "command_line": .udm.command_line,
+    "file_path": .udm.file_path,
+    "file_name": .udm.file_name,
+    "file_hash": .udm.file_hash
+}
+'''
+
+# =============================================================================
+# Final Routed Output with Failure Handling
+# =============================================================================
+# Combines all routed outputs including parse failures
+
+[transforms.routed_output_final]
+type = "remap"
+inputs = ["generic_output_safe", "placeholder_combiner", "parse_failure_handler"]
+source = '''
+# If coming from placeholder, process through generic parser logic
+if exists(.metadata.awaiting_parser) {
+    # Store raw content
+    raw = ""
+    if is_string(.message) {
+        raw = .message
+    } else {
+        raw, _ = encode_json(.)
+        if raw == null { raw = to_string(.) ?? "" }
+    }
+    .raw_content = raw
+    
+    # Initialize metadata if not present
+    if !is_object(.metadata) {
+        .metadata = {}
+    }
+    
+    # Try to parse message as JSON
+    if is_string(.message) && starts_with(.message, "{") {
+        parsed, err = parse_json(.message)
+        if err == null {
+            for_each(object!(parsed)) -> |key, value| {
+                .metadata = set!(.metadata, [key], value)
+            }
+        }
+    } else if is_object(.message) {
+        for_each(object!(.message)) -> |key, value| {
+            .metadata = set!(.metadata, [key], value)
+        }
+    }
+    
+    # Initialize UDM fields
+    .udm = {}
+    
+    # Basic field extraction
+    .udm.src_ip = .metadata.src_ip ?? .metadata.source_ip ?? null
+    .udm.dest_ip = .metadata.dest_ip ?? .metadata.destination_ip ?? null
+    .udm.src_host = .metadata.src_host ?? .metadata.hostname ?? null
+    .udm.dest_host = .metadata.dest_host ?? null
+    .udm.src_port = .metadata.src_port ?? null
+    .udm.dest_port = .metadata.dest_port ?? null
+    .udm.protocol = .metadata.protocol ?? null
+    .udm.user = .metadata.user ?? .metadata.username ?? null
+    .udm.action = .metadata.action ?? .metadata.event_type ?? null
+    .udm.status = .metadata.status ?? .metadata.result ?? null
+    .udm.process_name = .metadata.process_name ?? null
+    .udm.process_id = .metadata.process_id ?? null
+    .udm.command_line = .metadata.command_line ?? null
+    .udm.file_path = .metadata.file_path ?? null
+    .udm.file_name = .metadata.file_name ?? null
+    .udm.file_hash = .metadata.file_hash ?? null
+    .udm.timestamp = to_string(.metadata.timestamp ?? now())
+    
+    # Flatten for output
+    . = {
+        "timestamp": .udm.timestamp ?? to_string(now()),
+        "raw_content": .raw_content,
+        "metadata": encode_json(.metadata ?? {}),
+        "source_type": .source_type ?? "unknown",
+        "src_ip": .udm.src_ip,
+        "dest_ip": .udm.dest_ip,
+        "src_host": .udm.src_host,
+        "dest_host": .udm.dest_host,
+        "src_port": .udm.src_port,
+        "dest_port": .udm.dest_port,
+        "protocol": .udm.protocol,
+        "user": .udm.user,
+        "action": .udm.action,
+        "status": .udm.status,
+        "process_name": .udm.process_name,
+        "process_id": .udm.process_id,
+        "command_line": .udm.command_line,
+        "file_path": .udm.file_path,
+        "file_name": .udm.file_name,
+        "file_hash": .udm.file_hash
+    }
+}
+# Events from generic_output_safe and parse_failure_handler are already in the correct format
+'''

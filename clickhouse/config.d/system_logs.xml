@@ -1,0 +1,83 @@
+<?xml version="1.0"?>
+<!--
+  System log tables TTL configuration
+  Prevents system tables from growing unbounded and causing CPU-intensive merges
+-->
+<clickhouse>
+    <!-- Trace log - DISABLED: generates excessive memory samples (47k+/min)
+         causing CPU spikes from constant merges. Not needed for SIEM operations. -->
+    <trace_log remove="1"/>
+
+    <!-- Query log - executed queries -->
+    <query_log>
+        <database>system</database>
+        <table>query_log</table>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        <ttl>event_date + INTERVAL 3 DAY</ttl>
+    </query_log>
+
+    <!-- Query thread log -->
+    <query_thread_log>
+        <database>system</database>
+        <table>query_thread_log</table>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        <ttl>event_date + INTERVAL 1 DAY</ttl>
+    </query_thread_log>
+
+    <!-- Query views log -->
+    <query_views_log>
+        <database>system</database>
+        <table>query_views_log</table>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        <ttl>event_date + INTERVAL 1 DAY</ttl>
+    </query_views_log>
+
+    <!-- Part log - merge/mutation history -->
+    <part_log>
+        <database>system</database>
+        <table>part_log</table>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        <ttl>event_date + INTERVAL 3 DAY</ttl>
+    </part_log>
+
+    <!-- Metric log - internal metrics at 1s intervals -->
+    <metric_log>
+        <database>system</database>
+        <table>metric_log</table>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        <collect_interval_milliseconds>10000</collect_interval_milliseconds>
+        <ttl>event_date + INTERVAL 1 DAY</ttl>
+    </metric_log>
+
+    <!-- Asynchronous metric log -->
+    <asynchronous_metric_log>
+        <database>system</database>
+        <table>asynchronous_metric_log</table>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        <ttl>event_date + INTERVAL 1 DAY</ttl>
+    </asynchronous_metric_log>
+
+    <!-- Text log - server text logs -->
+    <text_log>
+        <database>system</database>
+        <table>text_log</table>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        <level>warning</level>
+        <ttl>event_date + INTERVAL 3 DAY</ttl>
+    </text_log>
+
+    <!-- Processors profile log - DISABLED: contributes to CPU overhead
+         from constant merges. Not needed for production SIEM. -->
+    <processors_profile_log remove="1"/>
+
+    <!-- OpenTelemetry span log - disable if not using OTel -->
+    <opentelemetry_span_log remove="1"/>
+
+    <!-- Crash log -->
+    <crash_log>
+        <database>system</database>
+        <table>crash_log</table>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        <ttl>event_date + INTERVAL 30 DAY</ttl>
+    </crash_log>
+</clickhouse>

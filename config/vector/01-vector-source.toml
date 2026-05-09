@@ -1,0 +1,70 @@
+# Vector Native Source
+# Receives events from upstream Vector instances (aggregators, forwarders)
+# Port 6000 is the standard Vector-to-Vector port
+#
+# Use case: On-premise Vector aggregator forwarding to cloud SIEM
+# Events arrive pre-structured, minimal processing needed
+
+[sources.vector_native]
+type = "vector"
+address = "0.0.0.0:6000"
+version = "2"  # Vector protocol version
+
+# Acknowledgements ensure upstream Vector knows events were received
+acknowledgements.enabled = true
+
+# =============================================================================
+# Vector Native Auth & Normalization
+# Events from Vector are already structured, but we normalize for consistency
+# =============================================================================
+[transforms.vector_auth]
+type = "remap"
+inputs = ["vector_native"]
+source = '''
+# Vector-to-Vector typically uses shared token auth at the sink level
+# Mark as authenticated (upstream already validated)
+.auth_status = "vector_forwarded"
+
+# Ensure source_type exists
+if !exists(.source_type) || !is_string(.source_type) {
+    .source_type = "unknown"
+}
+
+# Normalize source_type to lowercase
+.source_type = downcase(to_string(.source_type) ?? "unknown")
+
+# Ensure message exists
+if !exists(.message) {
+    if exists(.log) {
+        .message = to_string(.log) ?? ""
+    } else {
+        .message = encode_json(.)
+    }
+}
+
+# Set routing timestamp
+.routing_timestamp = now()
+
+# Ensure metadata exists
+if !exists(.metadata) || !is_object(.metadata) {
+    .metadata = {}
+}
+
+# Mark as forwarded from Vector
+.metadata.forwarded_via = "vector_native"
+'''
+
+# =============================================================================
+# Merge Vector events into main pipeline
+# Skips HTTP-specific parsing, goes directly to source type extraction
+# =============================================================================
+[transforms.vector_merge]
+type = "remap"
+inputs = ["vector_auth"]
+source = '''
+# Preserve all fields, just ensure consistent structure
+.content_format = "vector"
+
+# Source type aliasing is handled dynamically by the router via match_values
+# on each parser — no hardcoded aliases needed here.
+'''

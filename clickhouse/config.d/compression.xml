@@ -1,0 +1,58 @@
+<?xml version="1.0"?>
+<!--
+  Compression Configuration for SIEM Workloads
+
+  Strategy:
+  - Recent/hot data: LZ4 (fast decompression for queries)
+  - Older/cold data: ZSTD (better compression ratio for storage)
+  - Column-specific codecs are defined in schema (see migration)
+
+  Note: This configures default compression. Column-level CODEC()
+  specifications in the schema take precedence.
+-->
+<clickhouse>
+    <compression>
+        <!-- =================================================================
+             HOT DATA (Recent, frequently queried)
+             Parts < 1GB are typically recent and queried often
+             Use LZ4 for fastest decompression
+             ================================================================= -->
+        <case>
+            <max_part_size>1073741824</max_part_size> <!-- < 1GB -->
+            <method>lz4</method>
+        </case>
+
+        <!-- =================================================================
+             WARM DATA (Moderate age, occasional queries)
+             Parts 1GB - 10GB get balanced compression
+             ZSTD level 3 is good balance of speed and ratio
+             ================================================================= -->
+        <case>
+            <min_part_size>1073741824</min_part_size> <!-- >= 1GB -->
+            <max_part_size>10737418240</max_part_size> <!-- < 10GB -->
+            <method>zstd</method>
+            <level>3</level>
+        </case>
+
+        <!-- =================================================================
+             COLD DATA (Older, rarely queried)
+             Parts >= 10GB are typically older data
+             ZSTD level 5 for better compression ratio
+             ================================================================= -->
+        <case>
+            <min_part_size>10737418240</min_part_size> <!-- >= 10GB -->
+            <method>zstd</method>
+            <level>5</level>
+        </case>
+
+        <!-- =================================================================
+             DEFAULT
+             Fallback for any parts not matching above rules
+             ================================================================= -->
+        <case>
+            <method>zstd</method>
+            <level>3</level>
+        </case>
+    </compression>
+
+</clickhouse>

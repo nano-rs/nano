@@ -1,0 +1,68 @@
+[package]
+name = "nanosiem-api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "REST API server for NanoSIEM"
+
+[lib]
+name = "nanosiem_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nanosiem-api"
+path = "src/main.rs"
+
+[[bin]]
+name = "nanosiem-jobs"
+path = "src/bin/jobs.rs"
+
+[[bin]]
+name = "clickhouse_migrator"
+path = "src/bin/clickhouse_migrator.rs"
+
+[dependencies]
+nanosiem-core = { path = "../nanosiem-core" }
+nanosiem-api-lib = { path = "../nanosiem-api-lib" }
+nanosiem-search = { path = "../nanosiem-search" }
+tokio.workspace = true
+sqlx.workspace = true
+clickhouse.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+sqlparser.workspace = true
+regex = "1.12"
+async-stream = "0.3"
+async-trait = "0.1"
+dashmap = "6.1"
+futures = "0.3.32"
+reqwest = { version = "0.13", features = ["json"] }
+scraper = "0.26"
+axum-prometheus = "0.10"
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+feed-rs.workspace = true
+once_cell = "1.20"
+base64 = "0.22.1"
+utoipa.workspace = true
+utoipa-axum.workspace = true
+utoipa-swagger-ui.workspace = true
+
+[features]
+default = []
+[dev-dependencies]
+proptest.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("enterprise"))'] }

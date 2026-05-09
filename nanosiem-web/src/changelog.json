@@ -1,0 +1,15 @@
+[
+  {
+    "version": "0.1.0",
+    "date": "2026-03-09",
+    "title": "Initial Release",
+    "changes": [
+      "Core SIEM search and detection engine",
+      "ClickHouse-powered log storage and querying",
+      "AI-assisted threat detection and rule tuning",
+      "Detection rule editor with diff review",
+      "Notebook sidebar for investigation workflows",
+      "Grafana dashboards for system monitoring"
+    ]
+  }
+]

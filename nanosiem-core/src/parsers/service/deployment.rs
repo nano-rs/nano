@@ -1,0 +1,388 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! Parser deployment lifecycle (deploy, undeploy, rollback)
+
+use uuid::Uuid;
+
+use super::ParserService;
+use super::ParserServiceError;
+use crate::parsers::types::{
+    DeploymentAction, DeploymentResult, DeploymentStatus, ParserDeployment, ValidationResult,
+};
+use crate::parsers::vector_config::redact_config_snapshot;
+
+impl ParserService {
+    /// Deploy all enabled parsers to Vector
+    pub async fn deploy_to_vector(&self) -> Result<(), ParserServiceError> {
+        let parsers = self.list().await?;
+        // Inject credentials for cloud sources before deployment
+        let parsers_with_creds = self.inject_credentials_for_all(&parsers).await?;
+        self.vector_config
+            .deploy_and_reload(&parsers_with_creds)
+            .await?;
+        Ok(())
+    }
+
+    /// Deploy a single parser with full validation pipeline
+    ///
+    /// This method implements a safe deployment process:
+    /// 1. Validate VRL syntax first
+    /// 2. Stage config and run vector validate
+    /// 3. Backup current config, promote staged, reload Vector
+    /// 4. Rollback on any failure
+    ///
+    /// Requirements: 4.1, 4.2, 4.4, 4.7, 4.8, 4.10
+    pub async fn deploy_parser(
+        &self,
+        parser_id: Uuid,
+    ) -> Result<DeploymentResult, ParserServiceError> {
+        let parser = self.repository().find_by_id(parser_id).await?;
+        // Redact secrets at the source — `config_snapshot` is persisted to
+        // `log_source_deployments` and returned by GET /api/log-sources/{id}/deployments
+        // (gated only on `log_sources:view`). The on-disk Vector TOML written
+        // later in this method still uses real values; only this in-memory
+        // snapshot variable is sanitised. NAN-690.
+        let config_snapshot =
+            redact_config_snapshot(&self.vector_config.generate_parser_config_string(&parser));
+
+        tracing::info!(
+            "Starting deployment for parser '{}' ({})",
+            parser.name,
+            parser_id
+        );
+
+        // Step 1: Validate VRL syntax
+        let vrl_result = self
+            .vrl_validator
+            .validate_vrl(&parser.parser_vrl)
+            .await
+            .map_err(|e| ParserServiceError::VrlValidationFailed(e.to_string()))?;
+
+        if !vrl_result.valid {
+            let error_msg = vrl_result
+                .error
+                .clone()
+                .unwrap_or_else(|| "Unknown VRL error".to_string());
+            tracing::warn!(
+                "VRL validation failed for parser '{}': {}",
+                parser.name,
+                error_msg
+            );
+
+            // Record failed deployment
+            let _ = self
+                .repository()
+                .record_deployment(
+                    parser_id,
+                    DeploymentAction::Deploy.as_str(),
+                    DeploymentStatus::Failed.as_str(),
+                    Some(&error_msg),
+                    Some(&config_snapshot),
+                )
+                .await;
+
+            // Mark parser as failed
+            self.repository()
+                .mark_deployment_failed(parser_id, &error_msg)
+                .await?;
+
+            return Ok(DeploymentResult {
+                success: false,
+                parser_id,
+                action: DeploymentAction::Deploy.as_str().to_string(),
+                message: format!("VRL validation failed: {}", error_msg),
+                validation_result: Some(ValidationResult {
+                    success: false,
+                    errors: vec![error_msg],
+                    warnings: vrl_result.warnings,
+                    raw_output: String::new(),
+                }),
+                deployment_id: None,
+            });
+        }
+
+        tracing::info!("VRL validation passed for parser '{}'", parser.name);
+
+        // Step 2: Stage config and run vector validate
+        // First, get all parsers and create a list with this parser enabled
+        let mut all_parsers = self.list().await?;
+        for p in &mut all_parsers {
+            if p.id == parser_id {
+                p.enabled = true;
+            }
+        }
+
+        // Inject credentials for cloud sources before staging
+        let all_parsers_with_creds = self.inject_credentials_for_all(&all_parsers).await?;
+
+        // Stage all enabled parsers including this one
+        if let Err(e) = self
+            .vector_config
+            .stage_parsers(&all_parsers_with_creds)
+            .await
+        {
+            let error_msg = format!("Failed to stage config: {}", e);
+            tracing::error!("{}", error_msg);
+
+            let _ = self
+                .repository()
+                .record_deployment(
+                    parser_id,
+                    DeploymentAction::Deploy.as_str(),
+                    DeploymentStatus::Failed.as_str(),
+                    Some(&error_msg),
+                    Some(&config_snapshot),
+                )
+                .await;
+
+            return Ok(DeploymentResult {
+                success: false,
+                parser_id,
+                action: DeploymentAction::Deploy.as_str().to_string(),
+                message: error_msg,
+                validation_result: None,
+                deployment_id: None,
+            });
+        }
+
+        // Run vector validate on staged config
+        let validate_result = match self.vector_config.validate_staged_config().await {
+            Ok(result) => result,
+            Err(e) => {
+                let error_msg = format!("Vector validation error: {}", e);
+                tracing::error!("{}", error_msg);
+
+                // Cleanup staging
+                let _ = self.vector_config.cleanup_staging().await;
+
+                let _ = self
+                    .repository()
+                    .record_deployment(
+                        parser_id,
+                        DeploymentAction::Deploy.as_str(),
+                        DeploymentStatus::Failed.as_str(),
+                        Some(&error_msg),
+                        Some(&config_snapshot),
+                    )
+                    .await;
+
+                return Ok(DeploymentResult {
+                    success: false,
+                    parser_id,
+                    action: DeploymentAction::Deploy.as_str().to_string(),
+                    message: error_msg,
+                    validation_result: None,
+                    deployment_id: None,
+                });
+            }
+        };
+
+        if !validate_result.success {
+            let error_msg = validate_result.errors.join("; ");
+            tracing::warn!(
+                "Vector validation failed for parser '{}': {}",
+                parser.name,
+                error_msg
+            );
+
+            // Cleanup staging
+            let _ = self.vector_config.cleanup_staging().await;
+
+            let _ = self
+                .repository()
+                .record_deployment(
+                    parser_id,
+                    DeploymentAction::Deploy.as_str(),
+                    DeploymentStatus::Failed.as_str(),
+                    Some(&error_msg),
+                    Some(&config_snapshot),
+                )
+                .await;
+
+            self.repository()
+                .mark_deployment_failed(parser_id, &error_msg)
+                .await?;
+
+            return Ok(DeploymentResult {
+                success: false,
+                parser_id,
+                action: DeploymentAction::Deploy.as_str().to_string(),
+                message: format!("Vector validation failed: {}", error_msg),
+                validation_result: Some(validate_result),
+                deployment_id: None,
+            });
+        }
+
+        tracing::info!("Vector validation passed for parser '{}'", parser.name);
+
+        // Step 3: Promote staged config to active
+        if let Err(e) = self.vector_config.promote_staged().await {
+            let error_msg = format!("Failed to promote staged config: {}", e);
+            tracing::error!("{}", error_msg);
+
+            let _ = self
+                .repository()
+                .record_deployment(
+                    parser_id,
+                    DeploymentAction::Deploy.as_str(),
+                    DeploymentStatus::Failed.as_str(),
+                    Some(&error_msg),
+                    Some(&config_snapshot),
+                )
+                .await;
+
+            return Ok(DeploymentResult {
+                success: false,
+                parser_id,
+                action: DeploymentAction::Deploy.as_str().to_string(),
+                message: error_msg,
+                validation_result: Some(validate_result),
+                deployment_id: None,
+            });
+        }
+
+        // Step 4: Deploy with health verification and auto-rollback
+        // This: backs up config, writes all files atomically, reloads Vector,
+        // polls health for 10s, and auto-rolls back if Vector becomes unhealthy.
+        if let Err(e) = self
+            .vector_config
+            .deploy_and_verify(&all_parsers_with_creds)
+            .await
+        {
+            let error_msg = format!("{}", e);
+            tracing::error!("Deploy failed for parser '{}': {}", parser.name, error_msg);
+
+            // Record rollback if it happened
+            let _ = self
+                .repository()
+                .record_deployment(
+                    parser_id,
+                    DeploymentAction::Rollback.as_str(),
+                    DeploymentStatus::RolledBack.as_str(),
+                    Some(&error_msg),
+                    Some(&config_snapshot),
+                )
+                .await;
+
+            self.repository()
+                .mark_deployment_failed(parser_id, &error_msg)
+                .await?;
+
+            return Ok(DeploymentResult {
+                success: false,
+                parser_id,
+                action: DeploymentAction::Deploy.as_str().to_string(),
+                message: error_msg,
+                validation_result: Some(validate_result),
+                deployment_id: None,
+            });
+        }
+
+        // Step 6: Update parser status in DB
+        self.repository().mark_deployed(parser_id).await?;
+
+        // Record successful deployment
+        let deployment = self
+            .repository()
+            .record_deployment(
+                parser_id,
+                DeploymentAction::Deploy.as_str(),
+                DeploymentStatus::Success.as_str(),
+                None,
+                Some(&config_snapshot),
+            )
+            .await?;
+
+        tracing::info!(
+            "Successfully deployed parser '{}' ({})",
+            parser.name,
+            parser_id
+        );
+
+        Ok(DeploymentResult {
+            success: true,
+            parser_id,
+            action: DeploymentAction::Deploy.as_str().to_string(),
+            message: format!("Parser '{}' deployed successfully", parser.name),
+            validation_result: Some(validate_result),
+            deployment_id: Some(deployment.id),
+        })
+    }
+
+    /// Undeploy a parser (disable and remove from Vector config)
+    pub async fn undeploy_parser(
+        &self,
+        parser_id: Uuid,
+    ) -> Result<DeploymentResult, ParserServiceError> {
+        let parser = self.repository().find_by_id(parser_id).await?;
+
+        tracing::info!("Undeploying parser '{}' ({})", parser.name, parser_id);
+
+        // Disable the parser in the database
+        self.repository().disable(parser_id).await?;
+
+        // Redeploy all parsers (this will exclude the disabled one)
+        if let Err(e) = self.deploy_to_vector().await {
+            let error_msg = format!("Failed to undeploy: {}", e);
+
+            let _ = self
+                .repository()
+                .record_deployment(
+                    parser_id,
+                    DeploymentAction::Undeploy.as_str(),
+                    DeploymentStatus::Failed.as_str(),
+                    Some(&error_msg),
+                    None,
+                )
+                .await;
+
+            return Ok(DeploymentResult {
+                success: false,
+                parser_id,
+                action: DeploymentAction::Undeploy.as_str().to_string(),
+                message: error_msg,
+                validation_result: None,
+                deployment_id: None,
+            });
+        }
+
+        // Record successful undeploy
+        let deployment = self
+            .repository()
+            .record_deployment(
+                parser_id,
+                DeploymentAction::Undeploy.as_str(),
+                DeploymentStatus::Success.as_str(),
+                None,
+                None,
+            )
+            .await?;
+
+        tracing::info!(
+            "Successfully undeployed parser '{}' ({})",
+            parser.name,
+            parser_id
+        );
+
+        Ok(DeploymentResult {
+            success: true,
+            parser_id,
+            action: DeploymentAction::Undeploy.as_str().to_string(),
+            message: format!("Parser '{}' undeployed successfully", parser.name),
+            validation_result: None,
+            deployment_id: Some(deployment.id),
+        })
+    }
+
+    /// Get deployment history for a parser
+    pub async fn get_deployment_history(
+        &self,
+        parser_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<ParserDeployment>, ParserServiceError> {
+        Ok(self
+            .repository()
+            .get_deployment_history(parser_id, limit)
+            .await?)
+    }
+}

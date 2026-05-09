@@ -1,0 +1,67 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Node.js
+node_modules/
+dist/
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Claude Code session state
+.claude/worktrees/
+.claude/launch.json
+
+# deepsec review tool workspace
+.deepsec/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Terraform
+*.tfstate
+*.tfstate.*
+
+# Credentials and secrets
+*.creds
+*.pem
+*.api-key
+.test-api-key
+config/vector/credentials/
+.wrangler/
+
+# K8s secrets (plaintext)
+deploy/k8s/**/secrets.yaml
+
+# Kubeconfigs (contain bearer tokens)
+deploy/k8s/**/nanos-*.yaml
+
+# Rendered ClickHouse CRDs (contain credentials from templates)
+deploy/k8s/*-db/clickhouse.yaml
+
+# Local env files with credentials
+deploy/k8s/**/.env
+
+# Runtime data (cloned enrichment repos, etc.)
+data/
+
+# Build artifacts
+*.log
+*.tmp
+
+# Backups
+website-backup-*.tar.gz
+*.zip
+ludus/secrets/
+ludus/roles/nanosiem_stack/files/gcr-key.json

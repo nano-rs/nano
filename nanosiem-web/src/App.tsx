@@ -1,0 +1,989 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+import { BrowserRouter, Routes, Route, useLocation, Navigate, useParams, Link } from 'react-router-dom';
+import { useTier, TierProvider } from '@/hooks/use-tier';
+import { useState, useEffect, lazy, Suspense, ComponentType } from 'react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { ThemeProvider } from '@/components/theme-provider';
+
+// Helper to handle chunk load failures after deployments
+// When a new version is deployed, old chunk files may no longer exist
+// This wrapper auto-refreshes the page to load the new bundle
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function lazyWithRetry<T extends ComponentType<any>>(
+  importFn: () => Promise<{ default: T }>
+): React.LazyExoticComponent<T> {
+  return lazy(() =>
+    importFn().catch(() => {
+      // Chunk failed to load - likely a new deployment
+      // Refresh to get the new bundle
+      window.location.reload();
+      // Return a never-resolving promise to prevent error flash
+      return new Promise(() => {});
+    })
+  );
+}
+
+// Variant for named exports
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function lazyWithRetryNamed<T extends ComponentType<any>>(
+  importFn: () => Promise<{ [key: string]: T }>,
+  namedExport: string
+): React.LazyExoticComponent<T> {
+  return lazy(() =>
+    importFn()
+      .then((module) => ({ default: module[namedExport] as T }))
+      .catch(() => {
+        window.location.reload();
+        return new Promise(() => {});
+      })
+  );
+}
+
+// Create a QueryClient instance for React Query
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 1000 * 60, // 1 minute
+      retry: 1,
+    },
+  },
+});
+
+// Context providers and core components - keep eager
+import { AuthProvider, useAuth } from '@/contexts/AuthContext';
+import { UserPreferencesProvider, useUserPreferences } from '@/contexts/UserPreferencesContext';
+import { useOnboardingProgress } from '@/hooks/use-api';
+import { NotebookProvider } from '@/enterprise/contexts/NotebookContext';
+import { LayoutProvider } from '@/contexts/LayoutContext';
+import { CapabilitiesProvider } from '@/contexts/CapabilitiesProvider';
+import { ProtectedRoute } from '@/components/auth/ProtectedRoute';
+import { AppLayout } from '@/components/layout/AppLayout';
+import { PageContextProvider } from '@/contexts/PageContext';
+import { Toaster } from '@/components/ui/sonner';
+// Loading fallbacks
+import {
+  PageLoadingFallback,
+  EditorLoadingFallback,
+  ChartPageLoadingFallback,
+  ListPageLoadingFallback,
+  SettingsLoadingFallback,
+  DetailPageLoadingFallback,
+  WizardLoadingFallback,
+} from '@/components/lazy/LoadingFallbacks';
+
+// ============================================================================
+// EAGER IMPORTS - Essential for initial load (public routes + core pages)
+// ============================================================================
+import { Login } from '@/pages/Login';
+import { MfaSetup } from '@/pages/MfaSetup';
+import { Demo } from '@/enterprise/pages/Demo';
+import { DemoClaim } from '@/enterprise/pages/DemoClaim';
+import { Setup } from '@/pages/Setup';
+import { AuthCallback } from '@/enterprise/pages/AuthCallback';
+import Denied from '@/pages/Denied';
+
+// Dashboard and Search are lazy-loaded — they pull in heavy visualization deps
+// (recharts, @xyflow/react, react-markdown) that would bloat the main bundle
+const Dashboard = lazyWithRetryNamed(() => import('@/pages/Dashboard'), 'Dashboard');
+const Search = lazyWithRetryNamed(() => import('@/pages/Search'), 'Search');
+
+// ============================================================================
+// LAZY IMPORTS - Tier 1: CodeMirror pages (highest impact ~500KB)
+// ============================================================================
+// NAN-484 — `/rules/editor/:id` is the redesigned editor. The pre-redesign
+// `RuleEditor` is retired here alongside its docked RuleTesterInline,
+// RulesListPanel, etc. Legacy `/rules/editor-legacy/*` routes are gone.
+const RuleEditorRedesign = lazyWithRetryNamed(() => import('@/pages/RuleEditorRedesign'), 'RuleEditorRedesign');
+const CustomEnrichmentWizard = lazyWithRetryNamed(() => import('@/enterprise/pages/CustomEnrichmentWizard'), 'CustomEnrichmentWizard');
+
+// ============================================================================
+// LAZY IMPORTS - Tier 2: Large pages (1000+ lines)
+// ============================================================================
+const AddFeed = lazyWithRetryNamed(() => import('@/pages/AddFeed'), 'AddFeed');
+const LogSourceDetail = lazyWithRetryNamed(() => import('@/pages/LogSourceDetail'), 'LogSourceDetail');
+const CaseDetail = lazyWithRetryNamed(() => import('@/enterprise/pages/CaseDetail'), 'CaseDetail');
+// NAN-437: /inbox route renders the workspace shell without a selected case.
+const CaseInvestigate = lazyWithRetryNamed(() => import('@/enterprise/pages/CaseInvestigate'), 'CaseInvestigate');
+const AlertDetail = lazyWithRetryNamed(() => import('@/pages/AlertDetail'), 'AlertDetail');
+// NAN-746: open-core triage list page
+const Alerts = lazyWithRetryNamed(() => import('@/pages/Alerts'), 'Alerts');
+const NotebookDetail = lazyWithRetryNamed(() => import('@/enterprise/pages/NotebookDetail'), 'NotebookDetail');
+
+// ============================================================================
+// LAZY IMPORTS - Tier 3: Chart/visualization pages (Recharts ~400KB)
+// ============================================================================
+// NAN-482: new Rules dashboard replaces pre-redesign Detections list. The old
+// page is kept importable for the sunset PR; /rules renders Rules.
+// NAN-483: redesigned per-rule Matches page replaces pre-redesign DetectionMatches.
+const Rules = lazyWithRetryNamed(() => import('@/pages/Rules'), 'Rules');
+const Matches = lazyWithRetryNamed(() => import('@/pages/Matches'), 'Matches');
+const LogSources = lazyWithRetryNamed(() => import('@/pages/LogSources'), 'LogSources');
+const Risk = lazyWithRetryNamed(() => import('@/enterprise/pages/Risk'), 'Risk');
+const Prevalence = lazyWithRetryNamed(() => import('@/pages/Prevalence'), 'Prevalence');
+const Dashboards = lazyWithRetryNamed(() => import('@/pages/Dashboards'), 'Dashboards');
+const DashboardView = lazyWithRetryNamed(() => import('@/pages/DashboardView'), 'DashboardView');
+const TuningDashboard = lazyWithRetryNamed(() => import('@/enterprise/pages/TuningDashboard'), 'TuningDashboard');
+const TuningDetail = lazyWithRetryNamed(() => import('@/enterprise/pages/TuningDetail'), 'TuningDetail');
+const MitreCoverage = lazyWithRetryNamed(() => import('@/pages/MitreCoverage'), 'MitreCoverage');
+const RuleRepositories = lazyWithRetryNamed(() => import('@/pages/RuleRepositories'), 'RuleRepositories');
+const ParserRepositories = lazyWithRetryNamed(() => import('@/pages/ParserRepositories'), 'ParserRepositories');
+
+// ============================================================================
+// LAZY IMPORTS - Tier 4: All other pages
+// ============================================================================
+const OnboardingWizard = lazyWithRetryNamed(() => import('@/pages/OnboardingWizard'), 'OnboardingWizard');
+const EntityPage = lazyWithRetryNamed(() => import('@/enterprise/pages/EntityPage'), 'EntityPage');
+const Cases = lazyWithRetryNamed(() => import('@/enterprise/pages/Cases'), 'Cases');
+// NAN-443: Playbooks library (read-only surface)
+const Playbooks = lazyWithRetryNamed(() => import('@/enterprise/pages/Playbooks'), 'Playbooks');
+// NAN-444: Playbook authoring wizard (three-phase: Start / Build / Review)
+const PlaybookNew = lazyWithRetryNamed(() => import('@/enterprise/pages/PlaybookNew'), 'PlaybookNew');
+// NAN-470: Playbook repositories admin page (Settings → Playbook Repositories)
+const PlaybookRepositories = lazyWithRetryNamed(() => import('@/enterprise/pages/PlaybookRepositories'), 'PlaybookRepositories');
+const Marketplace = lazyWithRetryNamed(() => import('@/pages/Marketplace'), 'Marketplace');
+const EnrichmentDetail = lazyWithRetryNamed(() => import('@/pages/Settings/EnrichmentDetail'), 'EnrichmentDetail');
+const AgentEnrichmentDetail = lazyWithRetryNamed(() => import('@/enterprise/pages/AgentEnrichmentDetail'), 'AgentEnrichmentDetail');
+const Credentials = lazyWithRetryNamed(() => import('@/pages/Credentials'), 'Credentials');
+const Upload = lazyWithRetryNamed(() => import('@/pages/Upload'), 'Upload');
+const LookupTables = lazyWithRetryNamed(() => import('@/pages/LookupTables'), 'LookupTables');
+const LookupTableCreate = lazyWithRetryNamed(() => import('@/pages/LookupTableCreate'), 'LookupTableCreate');
+const LookupTableView = lazyWithRetryNamed(() => import('@/pages/LookupTableView'), 'LookupTableView');
+const Notebooks = lazyWithRetryNamed(() => import('@/enterprise/pages/Notebooks'), 'Notebooks');
+const Placeholder = lazyWithRetryNamed(() => import('@/pages/Placeholder'), 'Placeholder');
+const SiemHealth = lazyWithRetryNamed(() => import('@/pages/SiemHealth'), 'SiemHealth');
+const SourceConfigurations = lazyWithRetry(() => import('@/pages/SourceConfigurations'));
+const SourceConfigurationDetail = lazyWithRetry(() => import('@/pages/SourceConfigurationDetail'));
+
+// ============================================================================
+// LAZY IMPORTS - Settings pages
+// ============================================================================
+const SettingsLandingPage = lazyWithRetryNamed(() => import('@/pages/Settings/SettingsLanding'), 'SettingsLanding');
+const SettingsComingSoon = lazyWithRetryNamed(() => import('@/pages/Settings/SettingsComingSoon'), 'SettingsComingSoon');
+const MelodSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/MelodSettings'), 'MelodSettings');
+const RetentionSettings = lazyWithRetryNamed(() => import('@/pages/Settings/RetentionSettings'), 'RetentionSettings');
+const RiskSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/RiskSettings'), 'RiskSettings');
+const OidcProvidersPage = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/OidcProviders'), 'OidcProvidersPage');
+const ApiKeysPage = lazyWithRetryNamed(() => import('@/pages/Settings/ApiKeys'), 'ApiKeysPage');
+const SessionsPage = lazyWithRetryNamed(() => import('@/pages/Settings/Sessions'), 'SessionsPage');
+const AuditLogPage = lazyWithRetryNamed(() => import('@/pages/Settings/AuditLog'), 'AuditLogPage');
+const UsersPage = lazyWithRetryNamed(() => import('@/pages/Settings/Users'), 'UsersPage');
+const GroupsPage = lazyWithRetryNamed(() => import('@/pages/Settings/Groups'), 'GroupsPage');
+const RolesPage = lazyWithRetryNamed(() => import('@/pages/Settings/Roles'), 'RolesPage');
+const AccessControlPage = lazyWithRetryNamed(() => import('@/pages/Settings/AccessControl'), 'AccessControlPage');
+const GroupForm = lazyWithRetryNamed(() => import('@/pages/Settings/GroupForm'), 'GroupForm');
+const RoleForm = lazyWithRetryNamed(() => import('@/pages/Settings/RoleForm'), 'RoleForm');
+const ApiKeyForm = lazyWithRetryNamed(() => import('@/pages/Settings/ApiKeyForm'), 'ApiKeyForm');
+const PrevalenceSettings = lazyWithRetryNamed(() => import('@/pages/Settings/PrevalenceSettings'), 'PrevalenceSettings');
+const CaseSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/CaseSettings'), 'CaseSettings');
+const QueueSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/QueueSettings'), 'QueueSettings');
+const UserSettings = lazyWithRetryNamed(() => import('@/pages/Settings/UserSettings'), 'UserSettings');
+const WebhookSettings = lazyWithRetryNamed(() => import('@/pages/Settings/WebhookSettings'), 'WebhookSettings');
+const SearchSettings = lazyWithRetryNamed(() => import('@/pages/Settings/SearchSettings'), 'SearchSettings');
+const GdprAnonymization = lazyWithRetryNamed(() => import('@/pages/Settings/GdprAnonymization'), 'GdprAnonymizationPage');
+
+const API_BASE_URL = import.meta.env.VITE_API_URL ?? '';
+
+interface SetupStatus {
+  initialized: boolean;
+  has_users: boolean;
+}
+
+// Component to check setup status and redirect if needed
+function SetupRedirect({ children }: { children: React.ReactNode }) {
+  const [isChecking, setIsChecking] = useState(true);
+  const [needsSetup, setNeedsSetup] = useState(false);
+  const location = useLocation();
+
+  useEffect(() => {
+    // Skip check if already on setup page
+    if (location.pathname === '/setup') {
+      setIsChecking(false);
+      return;
+    }
+
+    const checkSetupStatus = async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/setup/status`);
+        if (response.ok) {
+          const status: SetupStatus = await response.json();
+          // Need setup if not initialized AND no users exist
+          setNeedsSetup(!status.initialized && !status.has_users);
+        }
+      } catch {
+        // If we can't check, assume setup is done
+        setNeedsSetup(false);
+      } finally {
+        setIsChecking(false);
+      }
+    };
+
+    checkSetupStatus();
+  }, [location.pathname]);
+
+  if (isChecking) {
+    return (
+      <div className="min-h-screen bg-background flex items-center justify-center">
+        <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
+
+  if (needsSetup && location.pathname !== '/setup') {
+    return <Navigate to="/setup" replace />;
+  }
+
+  return <>{children}</>;
+}
+
+// Helper component to wrap routes with permission checks
+function PermissionRoute({
+  element,
+  permission,
+  anyPermission
+}: {
+  element: React.ReactNode;
+  permission?: string;
+  anyPermission?: string[];
+}) {
+  return (
+    <ProtectedRoute permission={permission} anyPermission={anyPermission}>
+      {element}
+    </ProtectedRoute>
+  );
+}
+
+function NotFoundPage() {
+  const location = useLocation();
+  return (
+    <div className="flex flex-col items-center justify-center h-full text-center px-8 select-none">
+      <div className="relative mb-8">
+        <span className="text-[10rem] font-black leading-none tracking-tighter bg-gradient-to-b from-muted-foreground/40 to-muted-foreground/10 bg-clip-text text-transparent">
+          404
+        </span>
+        <div className="absolute inset-0 flex items-center justify-center">
+          <div className="p-4 rounded-2xl bg-primary/10 backdrop-blur-sm">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="w-10 h-10 text-primary">
+              <circle cx="11" cy="11" r="8" />
+              <path d="m21 21-4.3-4.3" />
+              <path d="M8 11h6" />
+            </svg>
+          </div>
+        </div>
+      </div>
+      <h1 className="text-2xl font-bold text-foreground mb-2">Nothing here, detective</h1>
+      <p className="text-muted-foreground mb-1 max-w-md">
+        The page you're looking for doesn't exist or has been moved.
+      </p>
+      <code className="text-xs text-muted-foreground/60 font-mono mb-8">{location.pathname}</code>
+      <Link
+        to="/"
+        className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-primary text-primary-foreground font-medium text-sm hover:bg-primary/90 transition-colors"
+      >
+        Back to Home
+      </Link>
+    </div>
+  );
+}
+
+// Redirect /rules/:id to /rules/editor/:id
+function RuleRedirect() {
+  const { id } = useParams();
+  return <Navigate to={`/rules/editor/${id}`} replace />;
+}
+
+// Legacy form route → right-side flyout on the SSO list (NAN-557).
+function SsoEditRedirect() {
+  const { id } = useParams();
+  return <Navigate to={`/settings/access-control?tab=sso&provider=${encodeURIComponent(id ?? '')}`} replace />;
+}
+
+// Redirect to user's preferred landing page (or onboarding for first-time users)
+function ExternalRedirect({ url }: { url: string }) {
+  useEffect(() => { window.location.href = url; }, [url]);
+  return null;
+}
+
+function LandingPageRedirect() {
+  const { landingPage } = useUserPreferences();
+  const { isDemoUser } = useAuth();
+  const { data: onboardingProgress, loading: onboardingLoading } = useOnboardingProgress();
+
+  // While loading onboarding state, show nothing to avoid flash
+  if (onboardingLoading && !isDemoUser) return null;
+
+  // Skip onboarding wizard for demo users — they get demo-specific hints instead.
+  // Only redirect on first visit (no progress record yet) and only once per session.
+  // sessionStorage flag prevents redirect loops when the user navigates back from
+  // getting-started without taking any action (which would leave progress null).
+  if (!isDemoUser && !onboardingProgress && !onboardingLoading) {
+    const seen = sessionStorage.getItem('onboarding_seen');
+    if (!seen) {
+      sessionStorage.setItem('onboarding_seen', '1');
+      return <Navigate to="/getting-started" replace />;
+    }
+  }
+
+  switch (landingPage) {
+    case 'search':
+      return <Navigate to="/search" replace />;
+    case 'cases':
+      return <Navigate to="/inbox" replace />;
+    case 'dashboards':
+      return <Navigate to="/dashboards" replace />;
+    case 'rules':
+      return <Navigate to="/rules" replace />;
+    case 'home':
+    default:
+      return <Suspense fallback={<ChartPageLoadingFallback />}><Dashboard /></Suspense>;
+  }
+}
+
+// Protected app routes with layout - uses useAuth so must be inside AuthProvider
+function ProtectedAppRoutes() {
+  const location = useLocation();
+  const resetKey = (location.state as { resetKey?: number } | null)?.resetKey;
+  const tierResult = useTier();
+
+  return (
+    <TierProvider value={tierResult}>
+    <NotebookProvider>
+      <LayoutProvider>
+      <PageContextProvider>
+      <AppLayout>
+        <Routes>
+          {/* Landing page - redirects based on user preference (default: home) */}
+          <Route path="/" element={
+            <PermissionRoute anyPermission={['dashboards:view', 'search:view']} element={<LandingPageRedirect />} />
+          } />
+
+          {/* Onboarding Wizard */}
+          <Route path="/getting-started" element={
+            <Suspense fallback={<WizardLoadingFallback />}>
+              <OnboardingWizard />
+            </Suspense>
+          } />
+
+          {/* Dashboards */}
+          <Route path="/dashboards" element={
+            <PermissionRoute permission="dashboards:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <Dashboards key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/dashboards/:id" element={
+            <PermissionRoute permission="dashboards:view" element={
+              <Suspense fallback={<ChartPageLoadingFallback />}>
+                <DashboardView key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          {/* Search */}
+          <Route path="/search" element={
+            <PermissionRoute permission="search:view" element={
+              <Suspense fallback={<PageLoadingFallback />}>
+                <Search key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          {/* Rules */}
+          <Route path="/rules" element={
+            <PermissionRoute permission="detections:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <Rules key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/rules/editor" element={
+            <PermissionRoute permission="detections:create" element={
+              <Suspense fallback={<EditorLoadingFallback />}>
+                <RuleEditorRedesign key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/rules/editor/new" element={
+            <PermissionRoute permission="detections:create" element={
+              <Suspense fallback={<EditorLoadingFallback />}>
+                <RuleEditorRedesign key={`new-${resetKey ?? ''}`} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/rules/editor/:id" element={
+            <PermissionRoute permission="detections:edit" element={
+              <Suspense fallback={<EditorLoadingFallback />}>
+                <RuleEditorRedesign key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/rules/:id/matches" element={
+            <PermissionRoute permission="detections:view" element={
+              <Suspense fallback={<ChartPageLoadingFallback />}>
+                <Matches key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          {/* Redirect /rules/:id to /rules/editor/:id */}
+          <Route path="/rules/:id" element={<RuleRedirect />} />
+
+          {/* MITRE ATT&CK Coverage */}
+          <Route path="/rules/coverage" element={
+            <PermissionRoute permission="detections:view" element={
+              <Suspense fallback={<ChartPageLoadingFallback />}>
+                <MitreCoverage />
+              </Suspense>
+            } />
+          } />
+
+          {/* Rule Repositories */}
+          <Route path="/rules/repositories" element={
+            <PermissionRoute permission="detections:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <RuleRepositories />
+              </Suspense>
+            } />
+          } />
+
+          {/* Parser Repositories */}
+          <Route path="/ingestion/log-sources/repositories" element={
+            <PermissionRoute permission="parsers:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <ParserRepositories />
+              </Suspense>
+            } />
+          } />
+
+          {/* AI Detection Tuning */}
+          <Route path="/rules/tuning" element={
+            <PermissionRoute permission="detections:view" element={
+              <Suspense fallback={<ChartPageLoadingFallback />}>
+                <TuningDashboard key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/rules/tuning/:id" element={
+            <PermissionRoute permission="detections:view" element={
+              <Suspense fallback={<DetailPageLoadingFallback />}>
+                <TuningDetail key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          {/* Risk */}
+          <Route path="/risk" element={
+            <PermissionRoute permission="risk:view" element={
+              <Suspense fallback={<ChartPageLoadingFallback />}>
+                <Risk key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/settings/risk" element={
+            <PermissionRoute permission="risk:configure" element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <RiskSettings key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          {/* SIEM Health */}
+          <Route path="/platform/health" element={
+            <PermissionRoute permission="settings:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <SiemHealth key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          {/* Entity */}
+          <Route path="/entities/:type/:value" element={
+            <PermissionRoute permission="search:view" element={
+              <Suspense fallback={<DetailPageLoadingFallback />}>
+                <EntityPage key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          {/* Prevalence */}
+          <Route path="/prevalence" element={
+            <PermissionRoute permission="prevalence:view" element={
+              <Suspense fallback={<ChartPageLoadingFallback />}>
+                <Prevalence key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/settings/prevalence" element={
+            <PermissionRoute permission="prevalence:configure" element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <PrevalenceSettings key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          {/* Alerts — NAN-746 Phase 5 Stream B: open-core triage list. */}
+          <Route path="/alerts" element={
+            <PermissionRoute permission="alerts:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <Alerts key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/alerts/:id" element={
+            <Suspense fallback={<DetailPageLoadingFallback />}>
+              <AlertDetail key={resetKey} />
+            </Suspense>
+          } />
+
+          {/* Cases */}
+          {/* NAN-437: /inbox lands on the investigation workspace with
+              SignalInbox visible + an empty Thread pane. /cases stays as
+              the table/kanban surface, reachable via the Browse-all link. */}
+          <Route path="/inbox" element={
+            <PermissionRoute permission="cases:view" element={
+              <Suspense fallback={<DetailPageLoadingFallback />}>
+                <CaseInvestigate />
+              </Suspense>
+            } />
+          } />
+          <Route path="/cases" element={
+            <PermissionRoute permission="cases:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <Cases key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          {/* NAN-443: Playbooks library (Phase 2 — read-only) */}
+          <Route path="/playbooks" element={
+            <PermissionRoute permission="playbooks:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <Playbooks key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          {/* NAN-444: Playbook authoring wizard — /playbooks/new (Phase 3). */}
+          <Route path="/playbooks/new" element={
+            <PermissionRoute permission="playbooks:manage" element={
+              <Suspense fallback={<DetailPageLoadingFallback />}>
+                <PlaybookNew key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          {/* NAN-470: Playbook Repositories admin page. */}
+          <Route path="/playbooks/repositories" element={
+            <PermissionRoute permission="playbooks:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <PlaybookRepositories />
+              </Suspense>
+            } />
+          } />
+
+          <Route path="/settings/cases" element={
+            <PermissionRoute permission="settings:system" element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <CaseSettings key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/settings/cases/queues" element={
+            <PermissionRoute permission="settings:system" element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <QueueSettings key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/cases/:id" element={
+            <PermissionRoute permission="cases:view" element={
+              <Suspense fallback={<DetailPageLoadingFallback />}>
+                <CaseDetail key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          {/* Notebooks */}
+          <Route path="/notebooks" element={
+            <PermissionRoute permission="notebooks:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <Notebooks key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/notebooks/:id" element={
+            <PermissionRoute permission="notebooks:view" element={
+              <Suspense fallback={<DetailPageLoadingFallback />}>
+                <NotebookDetail key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          {/* Marketplace (top-level) */}
+          <Route path="/marketplace" element={
+            <PermissionRoute permission="enrichments:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <Marketplace key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          {/* Legacy /enrichments → /marketplace; deep-link routes (/enrichments/:id, /enrichments/agent/:id, /enrichments/custom/*) preserved below. */}
+          <Route path="/enrichments" element={<Navigate to="/marketplace" replace />} />
+          <Route path="/enrichments/:id" element={
+            <PermissionRoute permission="enrichments:view" element={
+              <Suspense fallback={<DetailPageLoadingFallback />}>
+                <EnrichmentDetail key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          {/* Agent Enrichments */}
+          <Route path="/enrichments/agent/:id" element={
+            <PermissionRoute permission="enrichments:view" element={
+              <Suspense fallback={<DetailPageLoadingFallback />}>
+                <AgentEnrichmentDetail key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          {/* Custom Enrichments */}
+          <Route path="/enrichments/custom/new" element={
+            <PermissionRoute permission="enrichments:custom:create" element={
+              <Suspense fallback={<EditorLoadingFallback />}>
+                <CustomEnrichmentWizard key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/enrichments/custom/:id" element={
+            <PermissionRoute permission="enrichments:view" element={
+              <Suspense fallback={<EditorLoadingFallback />}>
+                <CustomEnrichmentWizard key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          {/* Log Sources */}
+          <Route path="/ingestion/log-sources" element={
+            <PermissionRoute permission="log_sources:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <LogSources key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/ingestion/log-sources/new" element={
+            <PermissionRoute permission="log_sources:create" element={
+              <Suspense fallback={<WizardLoadingFallback />}>
+                <AddFeed key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/ingestion/log-sources/wizard" element={
+            <PermissionRoute permission="log_sources:create" element={
+              <Suspense fallback={<WizardLoadingFallback />}>
+                <AddFeed key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/ingestion/log-sources/:id" element={
+            <PermissionRoute permission="log_sources:view" element={
+              <Suspense fallback={<DetailPageLoadingFallback />}>
+                <LogSourceDetail key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          {/* Cloud Credentials — single consolidated page; legacy /new and /:id
+              routes redirect into it via query params. */}
+          <Route path="/ingestion/credentials" element={
+            <PermissionRoute permission="credentials:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <Credentials key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/ingestion/credentials/new" element={
+            <Navigate to="/ingestion/credentials?add=aws_s3" replace />
+          } />
+          <Route path="/ingestion/credentials/:id" element={
+            <PermissionRoute permission="credentials:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <Credentials key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          {/* Upload & Lookup */}
+          <Route path="/upload" element={
+            <PermissionRoute anyPermission={['search:execute', 'lookup:create']} element={
+              <Suspense fallback={<PageLoadingFallback />}>
+                <Upload key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/rules/lookup-tables" element={
+            <PermissionRoute permission="lookup:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <LookupTables key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/rules/lookup-tables/new" element={
+            <PermissionRoute permission="lookup:create" element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <LookupTableCreate key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/rules/lookup-tables/:name" element={
+            <PermissionRoute permission="lookup:view" element={
+              <Suspense fallback={<DetailPageLoadingFallback />}>
+                <LookupTableView key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          {/* Settings — landing page for the dedicated /settings shell (NAN-537).
+              Visible to anyone with at least one settings:* permission. */}
+          <Route path="/settings" element={
+            <PermissionRoute anyPermission={['settings:view', 'settings:system', 'settings:ai', 'settings:retention', 'settings:webhooks', 'users:view', 'groups:view', 'roles:view', 'apikeys:view', 'audit:view']} element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <SettingsLandingPage key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          {/* Sections with a rail entry but no real page yet — render a stub. */}
+          <Route path="/settings/notifications" element={
+            <PermissionRoute permission="settings:system" element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <SettingsComingSoon key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/settings/search" element={
+            <PermissionRoute permission="settings:system" element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <SearchSettings key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/settings/storage" element={
+            <PermissionRoute permission="settings:retention" element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <RetentionSettings key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/settings/ai" element={
+            <PermissionRoute permission="settings:ai" element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <MelodSettings key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/settings/webhooks" element={
+            <PermissionRoute permission="settings:webhooks" element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <WebhookSettings key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/settings/gdpr" element={
+            <PermissionRoute permission="gdpr:anonymize" element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <GdprAnonymization key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          {/* Access Control - requires user management permissions */}
+          <Route path="/settings/access-control" element={
+            <PermissionRoute anyPermission={['users:view', 'groups:view', 'roles:view']} element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <AccessControlPage key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          {/* Access Control Form Pages */}
+          <Route path="/settings/access-control/groups/new" element={
+            <PermissionRoute permission="groups:create" element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <GroupForm key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/settings/access-control/groups/:id" element={
+            <PermissionRoute permission="groups:edit" element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <GroupForm key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/settings/access-control/roles/new" element={
+            <PermissionRoute permission="roles:create" element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <RoleForm key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/settings/access-control/roles/:id" element={
+            <PermissionRoute permission="roles:edit" element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <RoleForm key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          {/* Legacy form routes redirect into the right-side flyout (NAN-557). */}
+          <Route path="/settings/access-control/sso/new" element={
+            <Navigate to="/settings/access-control?tab=sso&provider=new" replace />
+          } />
+          <Route path="/settings/access-control/sso/:id" element={
+            <SsoEditRedirect />
+          } />
+          <Route path="/settings/access-control/api-keys/new" element={
+            <PermissionRoute permission="apikeys:create" element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <ApiKeyForm key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/settings/access-control/api-keys/:id" element={
+            <PermissionRoute permission="apikeys:create" element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <ApiKeyForm key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          <Route path="/settings/users" element={
+            <PermissionRoute permission="users:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <UsersPage key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/settings/groups" element={
+            <PermissionRoute permission="groups:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <GroupsPage key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/settings/roles" element={
+            <PermissionRoute permission="roles:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <RolesPage key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/settings/oidc" element={
+            <PermissionRoute permission="settings:system" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <OidcProvidersPage key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/settings/api-keys" element={
+            <PermissionRoute permission="apikeys:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <ApiKeysPage key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/settings/sessions" element={
+            <PermissionRoute permission="users:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <SessionsPage key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/settings/audit" element={
+            <PermissionRoute permission="audit:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <AuditLogPage key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          {/* Source Configurations - infrastructure + routing */}
+          <Route path="/ingestion/source-configurations" element={
+            <PermissionRoute permission="source_configs:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <SourceConfigurations key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/ingestion/source-configurations/:id" element={
+            <PermissionRoute permission="source_configs:view" element={
+              <Suspense fallback={<DetailPageLoadingFallback />}>
+                <SourceConfigurationDetail key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          {/* User Settings - accessible to all authenticated users */}
+          <Route path="/settings/user" element={
+            <Suspense fallback={<SettingsLoadingFallback />}>
+              <UserSettings key={resetKey} />
+            </Suspense>
+          } />
+
+          {/* Docs - redirect to external docs site */}
+          <Route path="/docs" element={
+            <ExternalRedirect url="https://nano.rs/docs/" />
+          } />
+          <Route path="/help" element={
+            <Suspense fallback={<PageLoadingFallback />}>
+              <Placeholder key={resetKey} title="Help" description="Documentation and support" />
+            </Suspense>
+          } />
+
+          {/* 404 catch-all */}
+          <Route path="*" element={<NotFoundPage />} />
+        </Routes>
+      </AppLayout>
+      </PageContextProvider>
+      </LayoutProvider>
+    </NotebookProvider>
+    </TierProvider>
+  );
+}
+
+function App() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <ThemeProvider>
+        <BrowserRouter>
+          <CapabilitiesProvider>
+          <AuthProvider>
+            <UserPreferencesProvider>
+              <SetupRedirect>
+                <Routes>
+                {/* Public routes - outside ProtectedRoute */}
+                <Route path="/login" element={<Login />} />
+                <Route path="/mfa-setup" element={<MfaSetup />} />
+                <Route path="/demo" element={<Demo />} />
+                <Route path="/d/:token" element={<DemoClaim />} />
+                <Route path="/denied" element={<Denied />} />
+                <Route path="/setup" element={<Setup />} />
+                <Route path="/auth/callback/:provider" element={<AuthCallback />} />
+
+                {/* Protected routes - require authentication */}
+                <Route
+                  path="/*"
+                  element={
+                    <ProtectedRoute>
+                      <ProtectedAppRoutes />
+                    </ProtectedRoute>
+                  }
+                />
+              </Routes>
+              </SetupRedirect>
+              <Toaster />
+            </UserPreferencesProvider>
+          </AuthProvider>
+          </CapabilitiesProvider>
+        </BrowserRouter>
+      </ThemeProvider>
+    </QueryClientProvider>
+  );
+}
+
+export default App;

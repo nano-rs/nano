@@ -1,0 +1,46 @@
+<?xml version="1.0"?>
+<!--
+  MergeTree Engine Defaults for SIEM Workloads
+  These are server-level defaults applied to all MergeTree tables.
+-->
+<clickhouse>
+    <merge_tree>
+        <!-- Merge size thresholds -->
+        <max_bytes_to_merge_at_min_space_in_pool>1073741824</max_bytes_to_merge_at_min_space_in_pool>
+        <max_bytes_to_merge_at_max_space_in_pool>161061273600</max_bytes_to_merge_at_max_space_in_pool>
+        <number_of_free_entries_in_pool_to_lower_max_size_of_merge>8</number_of_free_entries_in_pool_to_lower_max_size_of_merge>
+
+        <!-- Vertical merge (better for wide tables) -->
+        <enable_vertical_merge_algorithm>1</enable_vertical_merge_algorithm>
+        <vertical_merge_algorithm_min_rows_to_activate>131072</vertical_merge_algorithm_min_rows_to_activate>
+        <vertical_merge_algorithm_min_columns_to_activate>11</vertical_merge_algorithm_min_columns_to_activate>
+
+        <!-- Part format thresholds -->
+        <min_bytes_for_wide_part>10485760</min_bytes_for_wide_part>
+        <min_rows_for_wide_part>0</min_rows_for_wide_part>
+
+        <!-- Compression block sizes -->
+        <min_compress_block_size>65536</min_compress_block_size>
+        <max_compress_block_size>1048576</max_compress_block_size>
+
+        <!-- Index granularity -->
+        <index_granularity>8192</index_granularity>
+        <index_granularity_bytes>10485760</index_granularity_bytes>
+
+        <!-- TTL enforcement -->
+        <ttl_only_drop_parts>1</ttl_only_drop_parts>
+        <merge_with_ttl_timeout>14400</merge_with_ttl_timeout>
+        <merge_with_recompression_ttl_timeout>86400</merge_with_recompression_ttl_timeout>
+
+        <!-- Part lifecycle -->
+        <old_parts_lifetime>480</old_parts_lifetime>
+        <temporary_directories_lifetime>86400</temporary_directories_lifetime>
+
+        <!-- Deduplication (for replication) -->
+        <replicated_deduplication_window>1000</replicated_deduplication_window>
+        <replicated_deduplication_window_seconds>604800</replicated_deduplication_window_seconds>
+
+        <!-- Max parts to merge at once -->
+        <max_parts_to_merge_at_once>100</max_parts_to_merge_at_once>
+    </merge_tree>
+</clickhouse>

@@ -1,0 +1,118 @@
+# NanoSIEM Alert Rules
+groups:
+  - name: nanosiem_api
+    rules:
+      # High API error rate
+      - alert: HighAPIErrorRate
+        expr: |
+          (
+            sum(rate(http_requests_total{job="nanosiem-api", status=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{job="nanosiem-api"}[5m]))
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High API error rate"
+          description: "API error rate is above 5% for the last 5 minutes (current: {{ $value | humanizePercentage }})"
+
+      # High API latency (P95)
+      - alert: HighAPILatency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket{job="nanosiem-api"}[5m])) by (le)
+          ) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High API latency"
+          description: "P95 API latency is above 2 seconds (current: {{ $value | humanizeDuration }})"
+
+      # API down
+      - alert: APIDown
+        expr: up{job="nanosiem-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "NanoSIEM API is down"
+          description: "The NanoSIEM API has been unreachable for more than 1 minute"
+
+  - name: nanosiem_databases
+    rules:
+      # PostgreSQL connection pool exhaustion
+      - alert: PostgresPoolExhaustion
+        expr: |
+          (pg_stat_activity_count{job="postgres"} / pg_settings_max_connections{job="postgres"}) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL connection pool near exhaustion"
+          description: "PostgreSQL connection usage is above 80% (current: {{ $value | humanizePercentage }})"
+
+      # PostgreSQL down
+      - alert: PostgresDown
+        expr: up{job="postgres"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL exporter is down"
+          description: "Cannot reach PostgreSQL metrics exporter"
+
+      # ClickHouse down
+      - alert: ClickHouseDown
+        expr: up{job="clickhouse"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "ClickHouse exporter is down"
+          description: "Cannot reach ClickHouse metrics exporter"
+
+      # ClickHouse high memory usage
+      - alert: ClickHouseHighMemory
+        expr: clickhouse_asynchronous_metrics_MemoryTracking > 8e9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ClickHouse high memory usage"
+          description: "ClickHouse memory usage is above 8GB (current: {{ $value | humanize1024 }}B)"
+
+  - name: nanosiem_vector
+    rules:
+      # Vector down
+      - alert: VectorDown
+        expr: up{job="vector"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Vector is down"
+          description: "Vector ingestion pipeline has been unreachable for more than 1 minute"
+
+      # Vector buffer filling up
+      - alert: VectorBufferHigh
+        expr: |
+          (vector_buffer_events{job="vector"} / vector_buffer_max_events{job="vector"}) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Vector buffer filling up"
+          description: "Vector buffer usage is above 80% (current: {{ $value | humanizePercentage }})"
+
+      # High event drop rate
+      - alert: VectorHighDropRate
+        expr: |
+          rate(vector_events_discarded_total{job="vector"}[5m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High event drop rate in Vector"
+          description: "Vector is dropping more than 100 events per second"

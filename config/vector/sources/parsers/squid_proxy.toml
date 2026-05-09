@@ -1,0 +1,240 @@
+# Auto-generated Vector configuration for parser: Squid Proxy
+# DO NOT EDIT - changes will be overwritten
+# Generated at: 2026-04-18T01:38:14.986381+00:00
+
+
+[transforms.squid_proxy_parse]
+type = "remap"
+inputs = ["source_router.squid_proxy"]
+source = '''
+# Squid Proxy Access Log Parser
+# Extended format: timestamp duration client_ip result/status bytes method url user hierarchy content_type "referrer"
+
+# Get raw log content
+raw_log = string!(.message)
+
+# Initialize UDM and metadata
+.udm = {}
+.metadata = {}
+
+# Trim leading/trailing whitespace, then compact multiple spaces to single space
+raw_log = strip_whitespace(raw_log)
+raw_log = replace(raw_log, r'\s+', " ")
+
+# Split the log line by single space
+parts = split(raw_log, " ")
+
+# Squid logs have at least 10 fields
+if length(parts) >= 10 {
+    # Field 0: Unix timestamp with milliseconds
+    ts_str = to_string(parts[0])
+    ts_float = to_float(ts_str) ?? 0.0
+    ts_secs = to_int(floor(ts_float))
+    ts_obj = from_unix_timestamp(ts_secs, "seconds") ?? now()
+    .udm.timestamp = format_timestamp!(ts_obj, format: "%Y-%m-%d %H:%M:%S")
+
+    # Field 1: Duration in milliseconds
+    .udm.duration = to_int(parts[1]) ?? 0
+
+    # Field 2: Client IP address
+    .udm.src_ip = to_string(parts[2])
+
+    # Field 3: Result code/HTTP status
+    result_status = to_string(parts[3])
+    result_parts = split(result_status, "/")
+    if length(result_parts) >= 2 {
+        squid_result = to_string(result_parts[0])
+        http_status = to_int(result_parts[1]) ?? 0
+
+        .udm.action = if contains(squid_result, "HIT") {
+            "cache_hit"
+        } else if contains(squid_result, "MISS") {
+            "cache_miss"
+        } else if contains(squid_result, "DENIED") {
+            "denied"
+        } else if contains(squid_result, "REFRESH") {
+            "cache_refresh"
+        } else if contains(squid_result, "TUNNEL") {
+            "tunnel"
+        } else {
+            "proxy_request"
+        }
+
+        .udm.http_status_code = http_status
+        .metadata.squid_result_code = squid_result
+    }
+
+    # Field 4: Response size in bytes
+    .udm.bytes_out = to_int(parts[4]) ?? 0
+
+    # Field 5: HTTP method
+    http_method = to_string(parts[5])
+    .udm.http_method = http_method
+
+    if http_method == "CONNECT" && .udm.action != "denied" {
+        .udm.action = "tunnel_connect"
+    }
+
+    # Field 6: Request URL
+    request_url = to_string(parts[6])
+    .udm.url = request_url
+
+    if http_method == "CONNECT" {
+        connect_match = parse_regex(request_url, r'^(?P<host>[^:]+):(?P<port>\d+)$') ?? {}
+        if connect_match.host != null {
+            connect_host = string!(connect_match.host)
+            .udm.dest_host = connect_host
+            if match(connect_host, r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$') {
+                .udm.dest_ip = connect_host
+            } else {
+                .udm.url_domain = connect_host
+            }
+        }
+        if connect_match.port != null {
+            .udm.dest_port = to_int(connect_match.port) ?? null
+        }
+    } else {
+        url_match = parse_regex(request_url, r'^(?:(?P<scheme>https?|ftp)://)?(?P<host>[^:/]+)(?::(?P<port>\d+))?(?P<path>/.*)?$') ?? {}
+        if url_match.host != null {
+            host_str = string!(url_match.host)
+            .udm.dest_host = host_str
+            if match(host_str, r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$') {
+                .udm.dest_ip = host_str
+            } else {
+                .udm.url_domain = host_str
+            }
+        }
+        if url_match.port != null {
+            .udm.dest_port = to_int(url_match.port) ?? null
+        }
+        if url_match.scheme != null {
+            scheme = string!(url_match.scheme)
+            .udm.protocol = if scheme == "https" {
+                "HTTPS"
+            } else if scheme == "http" {
+                "HTTP"
+            } else if scheme == "ftp" {
+                "FTP"
+            } else {
+                upcase(scheme)
+            }
+        }
+        if url_match.path != null {
+            .udm.uri_path = string!(url_match.path)
+        }
+    }
+
+    # Field 7: Username
+    username = to_string(parts[7])
+    if username != "-" {
+        .udm.user = username
+    }
+
+    # Field 8: Hierarchy code/peer host
+    hierarchy = to_string(parts[8])
+    hierarchy_parts = split(hierarchy, "/")
+    if length(hierarchy_parts) >= 2 {
+        hierarchy_code = to_string(hierarchy_parts[0])
+        peer_host = to_string(hierarchy_parts[1])
+        .metadata.hierarchy_code = hierarchy_code
+        if peer_host != "-" {
+            .metadata.peer_host = peer_host
+        }
+    }
+
+    # Field 9: Content type
+    content_type = to_string(parts[9])
+    if content_type != "-" {
+        .udm.http_content_type = content_type
+    }
+
+    # Field 10 (optional): Referrer in quotes
+    referrer_match = parse_regex(raw_log, r'"(?P<referrer>[^"]*)"$') ?? {}
+    if referrer_match.referrer != null {
+        referrer_val = string!(referrer_match.referrer)
+        if referrer_val != "-" && referrer_val != "" {
+            .udm.http_referrer = referrer_val
+        }
+    }
+
+} else {
+    .metadata.parse_error = "Insufficient fields in log line"
+    .udm.timestamp = format_timestamp!(now(), format: "%Y-%m-%d %H:%M:%S")
+}
+
+.message = raw_log
+
+'''
+
+[transforms.squid_proxy_output]
+type = "remap"
+inputs = ["squid_proxy_parse"]
+source = '''
+# Flatten for ClickHouse - standard NanoSIEM format
+# Spread all .udm fields to top level, preserve .ext
+# The clickhouse_mapping transform handles final column assignment and ext capture
+
+# Handle timestamp - use udm.timestamp if set, otherwise now()
+ts_val = .udm.timestamp
+if ts_val == null {
+ts_val = now()
+}
+
+# Handle metadata - ensure it's an object
+meta_val = .metadata
+if meta_val == null {
+meta_val = {}
+}
+
+# Handle ext - preserve source-specific queryable fields
+# Parser sets fields like .ext.principal_id, .ext.bucket_name
+ext_val = .ext
+if ext_val == null {
+ext_val = {}
+}
+
+# Handle source_type - use .source_type if set, otherwise default
+st_val = .source_type
+if st_val == null {
+st_val = "squid_proxy"
+}
+
+# Preserve message and udm object
+msg_val = .message
+udm_val = .udm
+if udm_val == null {
+udm_val = {}
+}
+
+# Start with base fields
+. = {
+"timestamp": ts_val,
+"message": msg_val,
+"metadata": encode_json(meta_val),
+"ext": ext_val,
+"source_type": st_val
+}
+
+# Inject vendor, product, and category from log_sources metadata
+# These are configured in the UI and don't require parser VRL to set them
+.vendor = "Squid Project"
+.product = "Squid Proxy"
+.vendor_product = "Squid Project Squid Proxy"
+.category = "network"
+.namespace = "default"
+
+# Spread ALL .udm fields to top level for clickhouse_mapping
+# This includes src_ip, action, user, category, user_type, etc.
+# Note: category from udm will override the default if parser sets it
+udm_keys, err = keys(udm_val)
+if err == null {
+for_each(udm_keys) -> |_idx, key| {
+if key != "timestamp" && key != "message" {
+val, get_err = get(udm_val, [key])
+if get_err == null && val != null {
+. = set!(., [key], val)
+}
+}
+}
+}
+'''

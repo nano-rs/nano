@@ -1,0 +1,487 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:18
+    container_name: nanosiem-postgres
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      POSTGRES_USER: nanosiem
+      POSTGRES_PASSWORD: nanosiem
+      POSTGRES_DB: nanosiem
+    ports:
+      - "5432:5432"
+    volumes:
+      - nanosiem-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nanosiem -d nanosiem"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # =============================================================================
+  # ClickHouse schema migrator (one-shot)
+  # =============================================================================
+  # Runs init.sql + numbered migrations + distributed tables, then exits 0.
+  # api/search/jobs gate on its successful completion via
+  # `depends_on: { condition: service_completed_successfully }`. Running
+  # migrations as a separate one-shot keeps DDL out of the api startup hot
+  # path — see NAN-607 (saturn crash-loop incident).
+  clickhouse-migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+    image: nanosiem-api:latest
+    container_name: nanosiem-clickhouse-migrate
+    command: ["clickhouse_migrator"]
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      DATABASE_URL: postgres://nanosiem:nanosiem@postgres:5432/nanosiem
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: nanosiem
+      CLICKHOUSE_USER: nanosiem
+      CLICKHOUSE_PASSWORD: nanosiem
+      CLICKHOUSE_ADMIN_USER: nanosiem_admin
+      CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD:-nanosiem_admin_secret}
+      CLICKHOUSE_SELF_USER: nanosiem
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  nanosiem-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+    image: nanosiem-api:latest
+    container_name: nanosiem-api
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=100m
+    # Run as host user to match volume permissions (avoids permission denied on config writes)
+    user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
+    volumes:
+      # Vector config directory for dynamic parser deployment (API writes, Vector reads)
+      - ./config/vector:/etc/vector
+    environment:
+      # Vector config directory (must match volume mount)
+      VECTOR_CONFIG_DIR: /etc/vector
+      # PostgreSQL connection
+      DATABASE_URL: postgres://nanosiem:nanosiem@postgres:5432/nanosiem
+      # ClickHouse connection (runtime user - no DDL permissions for security)
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: nanosiem
+      CLICKHOUSE_USER: nanosiem
+      CLICKHOUSE_PASSWORD: nanosiem
+      # ClickHouse admin credentials (for migrations only - has DDL permissions)
+      CLICKHOUSE_ADMIN_USER: nanosiem_admin
+      CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD:-nanosiem_admin_secret}
+      # ClickHouse self-referencing dictionary user (must exist — 'default' is removed)
+      CLICKHOUSE_SELF_USER: nanosiem
+      # Authentication
+      JWT_SECRET: ${JWT_SECRET:-nanosiem-dev-secret-change-in-production}
+      AUTH_ENABLED: ${AUTH_ENABLED:-true}
+      # Encryption (required in production, set NANOSIEM_DEV_MODE=true for dev)
+      NANOSIEM_ENCRYPTION_KEY: ${NANOSIEM_ENCRYPTION_KEY:-}
+      NANOSIEM_DEV_MODE: ${NANOSIEM_DEV_MODE:-false}
+      NRT_LAG_BUFFER_SECS: ${NRT_LAG_BUFFER_SECS:-60}
+      NRT_MAX_BATCH_SIZE: ${NRT_MAX_BATCH_SIZE:-100000}
+      NRT_MAX_CONCURRENT_RULES: ${NRT_MAX_CONCURRENT_RULES:-10}
+      NRT_JITTER_MAX_SECS: ${NRT_JITTER_MAX_SECS:-30}
+      # API server settings
+      API_HOST: 0.0.0.0
+      API_PORT: 3000
+      # CORS: Set CORS_ORIGINS in .env for production (e.g., https://your-domain.com)
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:3000}
+      RUST_LOG: ${RUST_LOG:-info}
+      # Cloudflare AI Gateway (for multi-provider AI support)
+      CLOUDFLARE_AI_GATEWAY_URL: ${CLOUDFLARE_AI_GATEWAY_URL:-}
+      CF_AIG_AUTH_TOKEN: ${CF_AIG_AUTH_TOKEN:-}
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      clickhouse-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # =============================================================================
+  # Search Service - Handles /api/search endpoints
+  # =============================================================================
+  nanosiem-search:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: search
+    image: nanosiem-search:latest
+    container_name: nanosiem-search
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=100m
+    environment:
+      # PostgreSQL connection
+      DATABASE_URL: postgres://nanosiem:nanosiem@postgres:5432/nanosiem
+      # ClickHouse connection
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: nanosiem
+      CLICKHOUSE_USER: nanosiem
+      CLICKHOUSE_PASSWORD: nanosiem
+      # Authentication (same as API)
+      JWT_SECRET: ${JWT_SECRET:-nanosiem-dev-secret-change-in-production}
+      AUTH_ENABLED: ${AUTH_ENABLED:-true}
+      # Encryption (required in production, set NANOSIEM_DEV_MODE=true for dev)
+      NANOSIEM_ENCRYPTION_KEY: ${NANOSIEM_ENCRYPTION_KEY:-}
+      NANOSIEM_DEV_MODE: ${NANOSIEM_DEV_MODE:-false}
+      # Search service settings
+      SEARCH_PORT: 3002
+      # CORS: Set CORS_ORIGINS in .env for production (e.g., https://your-domain.com)
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:3000}
+      RUST_LOG: ${RUST_LOG:-info}
+      # AI Pipe agent (optional — queries with | ai require Cloudflare AI Gateway)
+      CLOUDFLARE_AI_GATEWAY_URL: ${CLOUDFLARE_AI_GATEWAY_URL:-}
+      CF_AIG_AUTH_TOKEN: ${CF_AIG_AUTH_TOKEN:-}
+      # Dragonfly/Redis cache for search result caching (optional — graceful degradation)
+      REDIS_URL: redis://dragonfly:6379
+    ports:
+      - "3002:3002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      dragonfly:
+        condition: service_healthy
+      clickhouse-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3002/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # =============================================================================
+  # Jobs Service - Background tasks (detection, enrichment, tuning, cleanup)
+  # =============================================================================
+  nanosiem-jobs:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: jobs
+    image: nanosiem-jobs:latest
+    container_name: nanosiem-jobs
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=100m
+    user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
+    environment:
+      DATABASE_URL: postgres://nanosiem:nanosiem@postgres:5432/nanosiem
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: nanosiem
+      CLICKHOUSE_USER: nanosiem
+      CLICKHOUSE_PASSWORD: nanosiem
+      CLICKHOUSE_ADMIN_USER: nanosiem_admin
+      CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD:-nanosiem_admin_secret}
+      CLICKHOUSE_SELF_USER: nanosiem
+      JWT_SECRET: ${JWT_SECRET:-nanosiem-dev-secret-change-in-production}
+      AUTH_ENABLED: ${AUTH_ENABLED:-true}
+      NANOSIEM_ENCRYPTION_KEY: ${NANOSIEM_ENCRYPTION_KEY:-}
+      NANOSIEM_DEV_MODE: ${NANOSIEM_DEV_MODE:-false}
+      CLOUDFLARE_AI_GATEWAY_URL: ${CLOUDFLARE_AI_GATEWAY_URL:-}
+      CF_AIG_AUTH_TOKEN: ${CF_AIG_AUTH_TOKEN:-}
+      JOBS_PORT: 3003
+      LEADER_ELECTION_ENABLED: "true"
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "3003:3003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      clickhouse-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3003/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  vector:
+    image: timberio/vector:latest-alpine
+    container_name: nanosiem-vector
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      # Authentication token for HTTP ingestion endpoint
+      VECTOR_AUTH_TOKEN: ${VECTOR_AUTH_TOKEN:-nanosiem-default-token}
+      # Vector data directory (used for disk buffer persistence)
+      VECTOR_DATA_DIR: /var/lib/vector
+      # ClickHouse connection settings (for direct ClickHouse ingestion)
+      # NOTE: Hardcoded to Docker network hostname - do NOT use env var substitution
+      # as shell environment can override and break Docker-internal networking
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-nanosiem}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-nanosiem}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-nanosiem}
+    ports:
+      # Single HTTP ingestion endpoint - auto-detects format from Content-Type
+      # Production: Map to 443 with TLS termination (e.g., via ALB/nginx)
+      # Development: Port 8080 without TLS
+      - "8080:8080"
+      # Vector internal metrics (Prometheus format)
+      # Exposes buffer metrics: buffer_byte_size, buffer_events, buffer_max_size
+      - "9598:9598"
+      # Vector API for config reload (optional, enable in config)
+      - "8686:8686"
+      # =============================================================================
+      # Log ingestion ports for various source types
+      # =============================================================================
+      # Syslog (UDP and TCP) - standard port 514
+      - "514:514/udp"
+      - "514:514/tcp"
+      # Splunk HTTP Event Collector (HEC) - standard port 8088
+      - "8088:8088"
+      # OpenTelemetry Protocol (OTLP)
+      - "4317:4317"   # gRPC
+      - "4318:4318"   # HTTP
+      # Fluent Forward protocol (Fluentd/Fluent Bit) - standard port 24224
+      - "24224:24224"
+    volumes:
+      # Mount Vector configuration directory (base configs are read-only)
+      - ./config/vector:/etc/vector:ro
+      # Parsers directory must be writable for dynamic parser deployment via API
+      - ./config/vector/sources/parsers:/etc/vector/sources/parsers
+      # Source configs directory for cloud pull sources (GCP Pub/Sub, AWS S3, Kafka, etc.)
+      - ./config/vector/sources/configs:/etc/vector/sources/configs
+      # Persist disk buffer for durability across restarts
+      # Requirement 2.5: Buffer survives Vector restarts without data loss
+      - vector-data:/var/lib/vector
+      # Mount TLS certificates (optional, create if needed)
+      - ./config/vector/certs:/etc/vector/certs:ro
+    # Use --config-dir to automatically load all .toml files from the config directory
+    # This enables dynamic parser deployment without manual config updates
+    # Files are loaded in alphabetical order, so use prefixes for ordering:
+    #   00-base.toml, 10-transforms.toml, 20-parsers.toml, etc.
+    # Note: --config-dir doesn't recurse, so we need to specify subdirectories explicitly
+    # --watch-config enables automatic reload when config files change (no SIGHUP needed)
+    command: ["--config-dir", "/etc/vector", "--config-dir", "/etc/vector/sources/parsers", "--config-dir", "/etc/vector/sources/configs", "--config-dir", "/etc/vector/sinks", "--watch-config"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # Health check via metrics endpoint
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9598/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.3
+    container_name: nanosiem-clickhouse
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      CLICKHOUSE_DB: nanosiem
+      # Users managed via users.d/default-user.xml (not env vars)
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      # Native protocol (for clickhouse-rs client)
+      - "9000:9000"
+      # HTTP interface (for debugging/admin)
+      - "8123:8123"
+      # Prometheus metrics endpoint (configured in config.d/monitoring.xml)
+      - "9363:9363"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - clickhouse-logs:/var/log/clickhouse-server
+      # init.sql is now run by the API via run_init_sql() on startup (not docker-entrypoint)
+      # Dynamic config directory for storage tiering policies (generated by API)
+      - ./clickhouse/config.d:/etc/clickhouse-server/config.d:ro
+      # User profiles and query limits (writable - entrypoint needs to create default-user.xml)
+      - ./clickhouse/users.d:/etc/clickhouse-server/users.d
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--user", "nanosiem", "--password", "nanosiem", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # =============================================================================
+  # Cache (Dragonfly — Redis-compatible, used for search result caching)
+  # =============================================================================
+
+  dragonfly:
+    image: docker.dragonflydb.io/dragonflydb/dragonfly
+    container_name: nanosiem-dragonfly
+    command: ["--maxmemory", "512mb", "--proactor_threads", "2"]
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "6379:6379"
+    ulimits:
+      memlock: -1
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # =============================================================================
+  # Monitoring Stack
+  # =============================================================================
+
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: nanosiem-prometheus
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./config/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+      - '--web.enable-admin-api'
+    depends_on:
+      - postgres
+      - clickhouse
+      - vector
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: nanosiem-grafana
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-nanosiem}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: grafana-piechart-panel
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-https://nano.qsi.net/grafana/}
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./config/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: nanosiem-postgres-exporter
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    environment:
+      DATA_SOURCE_NAME: "postgresql://nanosiem:nanosiem@postgres:5432/nanosiem?sslmode=disable"
+    ports:
+      - "9187:9187"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  node-exporter:
+    image: prom/node-exporter:v1.7.0
+    container_name: nanosiem-node-exporter
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    command:
+      - '--path.rootfs=/host'
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host:ro,rslave
+    pid: host
+    restart: unless-stopped
+
+  # =============================================================================
+  # Documentation (Fumadocs - Next.js static export)
+  # =============================================================================
+
+  docs:
+    build:
+      context: .
+      dockerfile: Dockerfile.docs
+    image: nanosiem-docs:latest
+    container_name: nanosiem-docs
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=50m
+    ports:
+      - "8001:8000"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  nanosiem-data:
+  vector-data:
+  clickhouse-data:
+  clickhouse-logs:
+  prometheus-data:
+  grafana-data:
