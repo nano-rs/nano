@@ -47,6 +47,27 @@ This repository is the open-core engine, licensed under **AGPL-3.0**. Hosted
 plans, the pivt AI assistant, Cases, incidents, and risk scoring are
 available from [nano.rs](https://nano.rs).
 
+## Install
+
+One command on any host with Docker:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nano-rs/nano/main/install.sh | bash
+```
+
+The installer clones this repo to `~/nano`, generates secrets, pulls the
+prebuilt images from `ghcr.io/nano-rs`, brings up the stack
+(postgres + clickhouse + api/search/jobs/web + vector + nginx), and walks
+you through creating the first admin account. Open `http://localhost`
+when it finishes.
+
+**Prereqs:** Docker, docker compose v2, git, openssl, curl.
+
+For non-interactive installs, pre-set `NANO_ADMIN_EMAIL`,
+`NANO_ADMIN_NAME`, `NANO_ADMIN_PASSWORD`, and `NANO_BASE_URL` before
+piping. See [`.env.opensource.example`](./.env.opensource.example) for
+the full env-var surface.
+
 ## What's in the box
 
 - **Ingestion** — Vector-based collectors with VRL parsers (HTTP push,
@@ -87,10 +108,10 @@ available from [nano.rs](https://nano.rs).
   <em>Marketplace — out-of-the-box enrichment catalog (threat intel, identity, asset inventory, geolocation). Coverage indicator tracks which UDM fields have a provider behind them.</em>
 </p>
 
-## Quick start
+## Develop from source
 
-A polished one-command install path is in flight. To run nano locally
-**today**:
+The [Install](#install) flow above is the right path if you just want
+to run nano. To hack on the engine itself:
 
 - Prereqs: Rust stable, Node 20+, PostgreSQL 18+, ClickHouse 24+
 - Bring up Postgres + ClickHouse via your usual local tooling
@@ -98,9 +119,8 @@ A polished one-command install path is in flight. To run nano locally
   `nanosiem-search` (3002), and `nanosiem-jobs` with sane local defaults
 - `cd nanosiem-web && npm install && npm run dev` (port 5173)
 
-The first request to `/api/setup` runs migrations and seeds an initial
-admin user. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the day-to-day
-dev workflow and what env vars to override.
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for the day-to-day dev workflow
+and what env vars to override.
 
 Full documentation: **[nano.rs/docs](https://nano.rs/docs/getting-started/first-feed/)**.
 
@@ -184,7 +204,6 @@ Self-hosting nano with these features requires a commercial license —
 
 ## Roadmap
 
-- One-command install via Docker Compose + prebuilt GHCR images
 - Public detection-rule library (community-contributed)
 - OpenTelemetry log/trace ingestion
 - Parser SDK for community-authored VRL parsers
