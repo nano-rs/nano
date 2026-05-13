@@ -134,7 +134,7 @@ function FolderIcon({ kind, slug }: { kind: FolderKind; slug?: string }) {
 type RuleRowProps = {
   name: string;
   severity: string;
-  modeKey: 'live' | 'shadow' | 'paused' | 'unsaved';
+  modeKey: 'live' | 'staging' | 'paused' | 'unsaved';
   focused: boolean;
   onClick: () => void;
   onDragStart?: (e: React.DragEvent<HTMLButtonElement>) => void;

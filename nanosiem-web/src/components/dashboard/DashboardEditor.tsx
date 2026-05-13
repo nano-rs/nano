@@ -536,6 +536,7 @@ export function DashboardEditor({
         onDuplicate={() => handleDuplicatePanel(panel)}
         onDelete={() => handleDeletePanel(panel.id)}
         onRefresh={() => fetchPanelData(panel)}
+        hasRunOnce
       >
         {data?.status === 'success' && data.data && (
           <VisualizationRenderer
@@ -623,10 +624,13 @@ export function DashboardEditor({
         {isEditing && (
           <>
             <div
-              className="[&_button]:h-[28px] [&_button]:text-[12px]"
+              className="flex items-center gap-2 [&_button]:h-[28px] [&_button]:text-[12px]"
               title="Default time range applied when this dashboard is opened"
             >
               <DateTimeRangePicker value={timeRange} onChange={setTimeRange} />
+              <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground/70 whitespace-nowrap">
+                saves as dashboard default
+              </span>
             </div>
 
             <Button size="sm" className="h-[28px] gap-1.5" onClick={handleAddPanel}>

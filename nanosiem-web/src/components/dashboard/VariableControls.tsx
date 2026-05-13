@@ -211,17 +211,23 @@ export function VariableControls({
                   <Loader2 className="w-[12px] h-[12px] animate-spin text-muted-foreground" />
                 </div>
               ) : queryCache[variable.name]?.error ? (
-                // NAN-710: hover to see the full diagnostic (field name + which
-                // columns are actually available). Most common cause: the
-                // variable's `queryField` doesn't match the column name returned
-                // by the query — typically because the variable was authored
-                // with the display label instead of the snake_case column.
-                <span
-                  className="font-mono text-[10.5px] text-rose-400 border border-rose-500/30 rounded px-1.5 py-0.5 cursor-help"
-                  title={queryCache[variable.name]?.error}
-                >
-                  load error
-                </span>
+                // NAN-775: surface the full diagnostic inline next to the pill
+                // (the message is also kept on `title=` for hover when the
+                // text truncates). Most common cause: the variable's
+                // `queryField` doesn't match the column name returned by the
+                // query — typically because the variable was authored with
+                // the display label instead of the snake_case column.
+                <div className="inline-flex items-center gap-1.5 max-w-[420px]">
+                  <span className="font-mono text-[10.5px] text-rose-400 border border-rose-500/30 rounded px-1.5 py-0.5 shrink-0">
+                    load error
+                  </span>
+                  <span
+                    className="font-mono text-[10.5px] text-rose-300/80 truncate"
+                    title={queryCache[variable.name]?.error}
+                  >
+                    {queryCache[variable.name]?.error}
+                  </span>
+                </div>
               ) : (
                 <Select
                   value={values[variable.name] || variable.defaultValue || ''}

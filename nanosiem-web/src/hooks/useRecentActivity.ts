@@ -187,8 +187,9 @@ export function useRecordActivity() {
           item_metadata: itemMetadata,
         });
       } catch (err) {
-        // Silent fail - activity tracking shouldn't break the app
-        console.warn('Failed to record activity:', err);
+        // Activity tracking shouldn't break the app, but errors must be visible —
+        // a silent warn is how the typeid mismatch (NAN-776) hid for so long.
+        console.error(`recordActivity failed for ${itemType} ${itemId}:`, err);
       }
     },
     []

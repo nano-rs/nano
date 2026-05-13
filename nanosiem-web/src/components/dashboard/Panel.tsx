@@ -104,6 +104,14 @@ export interface PanelProps {
   onDelete?: () => void;
   onDrilldown?: (filter: DrilldownFilter) => void;
   onRefresh: () => void;
+  /**
+   * NAN-780: true once the user has clicked Run at least once for this
+   * dashboard. Until then, panels render a calm "Run query to show
+   * results" idle state instead of the loading skeleton — otherwise
+   * `panelData` is `undefined` on first paint and panels look like
+   * they're actively loading when nothing is fetching.
+   */
+  hasRunOnce: boolean;
   children?: React.ReactNode;
 }
 
@@ -131,6 +139,7 @@ export function Panel({
   onDelete,
   onDrilldown,
   onRefresh,
+  hasRunOnce,
   children,
 }: PanelProps) {
   const [showQueryDialog, setShowQueryDialog] = useState(false);
@@ -249,7 +258,12 @@ export function Panel({
 
         {/* Panel content */}
         <div className="flex-1 min-h-0 p-3 overflow-hidden">
-          <PanelContent data={data} config={config} onDrilldown={onDrilldown}>
+          <PanelContent
+            data={data}
+            config={config}
+            onDrilldown={onDrilldown}
+            hasRunOnce={hasRunOnce}
+          >
             {children}
           </PanelContent>
         </div>
@@ -361,6 +375,7 @@ export function Panel({
               data={data}
               config={config}
               onDrilldown={onDrilldown}
+              hasRunOnce={hasRunOnce}
             >
               {children}
             </FullscreenPanelContent>
@@ -507,10 +522,25 @@ interface PanelContentProps {
   config: PanelConfig;
   onDrilldown?: (filter: DrilldownFilter) => void;
   isFullscreen?: boolean;
+  hasRunOnce: boolean;
   children?: React.ReactNode;
 }
 
-function PanelContent({ data, config, children }: PanelContentProps) {
+function PanelContent({ data, config, hasRunOnce, children }: PanelContentProps) {
+  // Pre-first-run idle state. Without this, undefined panelData falls through
+  // to the skeleton path and panels look like they're actively loading when
+  // nothing has fetched yet (NAN-780).
+  if (!hasRunOnce && (!data || data.status === 'loading')) {
+    return (
+      <div className="h-full flex flex-col items-center justify-center text-center px-4 gap-2">
+        <RefreshCw className="w-4 h-4 text-muted-foreground/60" />
+        <p className="text-[12px] text-muted-foreground">
+          Run query to show results
+        </p>
+      </div>
+    );
+  }
+
   // Loading state — skeleton matched to the viz type
   if (!data || data.status === 'loading') {
     return getSkeletonForType(config.visualizationType);
@@ -591,10 +621,25 @@ interface FullscreenPanelContentProps {
   data?: PanelDataState;
   config: PanelConfig;
   onDrilldown?: (filter: DrilldownFilter) => void;
+  hasRunOnce: boolean;
   children?: React.ReactNode;
 }
 
-function FullscreenPanelContent({ data, config, children }: FullscreenPanelContentProps) {
+function FullscreenPanelContent({ data, config, hasRunOnce, children }: FullscreenPanelContentProps) {
+  // Pre-first-run idle state. Without this, undefined panelData falls through
+  // to the skeleton path and panels look like they're actively loading when
+  // nothing has fetched yet (NAN-780).
+  if (!hasRunOnce && (!data || data.status === 'loading')) {
+    return (
+      <div className="h-full flex flex-col items-center justify-center text-center px-4 gap-2">
+        <RefreshCw className="w-4 h-4 text-muted-foreground/60" />
+        <p className="text-[12px] text-muted-foreground">
+          Run query to show results
+        </p>
+      </div>
+    );
+  }
+
   // Loading state - show skeleton based on visualization type
   if (!data || data.status === 'loading') {
     return (

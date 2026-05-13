@@ -161,6 +161,30 @@ export function TestDrawer({
   const runRef = useRef<() => Promise<void>>(null);
   const wasOpenRef = useRef(false);
 
+  // Drawer height as a percentage of the editor row. Resets to 64% on each
+  // open — persistence is a follow-up. Drag handle at the top edge mutates
+  // this via pointer events; clamp to 25–90% so the drawer can neither
+  // collapse to a sliver nor swallow the editor entirely.
+  const [heightPct, setHeightPct] = useState(64);
+  const dragRef = useRef<{ startY: number; startPct: number } | null>(null);
+
+  const onResizeDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    dragRef.current = { startY: e.clientY, startPct: heightPct };
+  };
+  const onResizeMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragRef.current) return;
+    const parent = e.currentTarget.parentElement as HTMLElement | null;
+    const containerH = parent?.clientHeight ?? window.innerHeight;
+    const deltaPct = ((dragRef.current.startY - e.clientY) / containerH) * 100;
+    const next = Math.max(25, Math.min(90, dragRef.current.startPct + deltaPct));
+    setHeightPct(next);
+  };
+  const onResizeUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+    dragRef.current = null;
+  };
+
   // Seed the working copy on open — a closed→open transition pulls whatever
   // the editor currently has. While open, edits to `query` (e.g., the author
   // typed in CODE) don't clobber the drawer; `Reset to editor` does that.
@@ -222,20 +246,9 @@ export function TestDrawer({
 
   runRef.current = runOnce;
 
-  // Auto-run on open (if no results yet) + when window changes.
-  useEffect(() => {
-    if (!open) return;
-    if (!run || run.time_range == null) {
-      void runOnce();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
-
-  useEffect(() => {
-    if (!open) return;
-    void runOnce();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [timeRange]);
+  // No auto-run: opening the drawer or changing the time range should NOT
+  // fire a query. The user picks a window and clicks Run. Live mode below
+  // is opt-in. (NAN-781)
 
   // Live polling — 20s interval.
   useEffect(() => {
@@ -282,11 +295,20 @@ export function TestDrawer({
             ? 'translate-y-0 border-t-2 border-[var(--primary)]/60 shadow-[0_-2px_8px_-4px_rgba(0,0,0,0.12)]'
             : 'translate-y-full pointer-events-none border-t-0',
         )}
-        style={{ height: '64%' }}
+        style={{ height: `${heightPct}%` }}
         role="dialog"
         aria-label="Test rule drawer"
         aria-hidden={!open}
       >
+      <div
+        className="h-1.5 cursor-ns-resize bg-border/50 hover:bg-primary/40 transition-colors shrink-0"
+        onPointerDown={onResizeDown}
+        onPointerMove={onResizeMove}
+        onPointerUp={onResizeUp}
+        role="separator"
+        aria-orientation="horizontal"
+        aria-label="Resize test drawer"
+      />
       <TestDrawerHeader
         timeRange={timeRange}
         onTimeRangeChange={setTimeRange}

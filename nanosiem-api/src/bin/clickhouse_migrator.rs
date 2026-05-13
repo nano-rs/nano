@@ -18,7 +18,9 @@
 //! startup-probe budget).
 //!
 //! Environment variables (same as nanosiem-api):
-//! - `DATABASE_URL`              — required (parsed for symmetry; not used here)
+//! - `DATABASE_URL`              — required; PG migrations are applied first
+//!   (NAN-789) so CH dictionary sources can resolve their PG tables before
+//!   `CREATE TABLE nanosiem.logs` validates materialized-column dict refs.
 //! - `CLICKHOUSE_URL`            — required
 //! - `CLICKHOUSE_DATABASE`       — defaults to `nanosiem`
 //! - `CLICKHOUSE_USER`           — runtime user (fallback for migrations)
@@ -33,7 +35,7 @@
 //!   overlays land in this directory (NAN-747 Phase 6).
 
 use anyhow::{Context, Result};
-use nanosiem_core::db::{ClickHouseMigrator, DualPoolConfig};
+use nanosiem_core::db::{ClickHouseMigrator, Database, DualPoolConfig};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -58,6 +60,43 @@ async fn run() -> Result<()> {
 
     let config =
         DualPoolConfig::from_env().context("loading DualPool configuration from environment")?;
+
+    // NAN-789: apply PostgreSQL migrations BEFORE any ClickHouse work. CH 26.3
+    // eagerly validates dictionary sources during `CREATE TABLE nanosiem.logs`
+    // (because materialized columns call `dictGet(...)`), so the PG tables
+    // those dicts source from must exist by the time init.sql runs. Without
+    // this preflight, fresh deploys deadlock: CH migrator fails on the
+    // missing PG schema, api/jobs depend on the migrator to complete, and
+    // PG migrations (which live in those binaries) never run.
+    //
+    // api/jobs still call `run_postgres_migrations` themselves on startup —
+    // sqlx checks `_sqlx_migrations` and skips already-applied work, so the
+    // canonical-and-redundant ordering is safe and keeps those binaries
+    // resilient when run without this one-shot (e.g., local dev).
+    tracing::info!("Applying PostgreSQL migrations before ClickHouse work");
+    let pg_db = Database::connect(&config.postgres_url)
+        .await
+        .context("connecting to PostgreSQL for migration preflight")?;
+    let pg_pool = pg_db.pool();
+    nanosiem_core::db::run_postgres_migrations(pg_pool)
+        .await
+        .context("running PostgreSQL migrations")?;
+    #[cfg(feature = "enterprise")]
+    {
+        tracing::info!("Applying enterprise PostgreSQL overlay migrations");
+        let mut overlay_migrator = sqlx::migrate!("../migrations/postgres-enterprise");
+        // ignore_missing(true) so the overlay's validator tolerates the
+        // open history's applied rows that already sit in _sqlx_migrations.
+        // Matches the same call in nanosiem-api/src/state/constructors.rs.
+        overlay_migrator.set_ignore_missing(true);
+        overlay_migrator
+            .run(pg_pool)
+            .await
+            .context("running enterprise PostgreSQL overlay migrations")?;
+    }
+    pg_db.close().await;
+    tracing::info!("PostgreSQL migrations complete");
+
     let (admin_client, is_admin) = config.create_admin_clickhouse_client();
     if !is_admin {
         tracing::warn!(

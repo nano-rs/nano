@@ -142,8 +142,17 @@ pub async fn record_activity(
     let item_type = parse_item_type(&request.item_type)
         .ok_or_else(|| ApiError::BadRequest(format!("Invalid item_type: {}", request.item_type)))?;
 
-    // Decode TypeID-prefixed string to raw UUID
-    let item_uuid = nanosiem_core::typeid::decode_suffix(&request.item_id)
+    // Decode TypeID-prefixed string to raw UUID. The expected prefix mirrors
+    // the encoding side in `From<RecentActivityItem>` above.
+    let expected_prefix = match request.item_type.as_str() {
+        "detection" => "rule",
+        "alert" => "alert",
+        "case" => "case",
+        "dashboard" => "dash",
+        // parse_item_type above already rejected anything else
+        _ => unreachable!(),
+    };
+    let item_uuid = nanosiem_core::typeid::decode(expected_prefix, &request.item_id)
         .map_err(|e| ApiError::BadRequest(format!("Invalid item_id: {}", e)))?;
 
     repo.record(

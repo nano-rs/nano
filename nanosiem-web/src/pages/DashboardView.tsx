@@ -79,9 +79,6 @@ export function DashboardView() {
   useBreadcrumbTitle(dashboard?.name);
 
   const [timeRange, setTimeRange] = useState<TimeRangeValue>(DEFAULT_DASHBOARD_TIME_RANGE);
-  // Hydrated dashboard ID we've already seeded from. Prevents a refetch from
-  // clobbering the user's manually-chosen range while they're viewing.
-  const seededDashboardIdRef = useRef<string | null>(null);
   const [autoRefresh, setAutoRefresh] = useState<AutoRefreshInterval>('off');
   const [panelData, setPanelData] = useState<Map<string, PanelDataState>>(new Map());
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -116,13 +113,15 @@ export function DashboardView() {
     }
   }, [id, dashboard, isEditMode, addRecentDashboard, recordView]);
 
-  // Seed time range from dashboard's saved default the first time we see it.
+  // Seed (and re-seed after save) the toolbar time range from the saved
+  // default. Skip while in edit mode because DashboardEditor owns its own
+  // range state. After save: edit mode flips off AND defaultTimeRange has
+  // updated, so this fires once and the toolbar matches the new default.
   useEffect(() => {
     if (!dashboard?.id) return;
-    if (seededDashboardIdRef.current === dashboard.id) return;
-    seededDashboardIdRef.current = dashboard.id;
+    if (isEditMode) return;
     setTimeRange(hydrateDashboardTimeRange(dashboard.layout?.defaultTimeRange));
-  }, [dashboard?.id, dashboard?.layout?.defaultTimeRange]);
+  }, [dashboard?.id, dashboard?.layout?.defaultTimeRange, isEditMode]);
 
   // Initialize variable values from dashboard defaults (variables are in layout)
   useEffect(() => {
@@ -616,7 +615,10 @@ export function DashboardView() {
           <VariableControls
             variables={dashboard.layout.variables}
             values={variableValues}
-            onChange={setVariableValues}
+            onChange={(next) => {
+              setVariableValues(next);
+              if (!hasRunOnce) setHasRunOnce(true);
+            }}
             timeRange={toApiTimeRange(timeRange)}
           />
         </div>
@@ -658,6 +660,7 @@ export function DashboardView() {
               onRefreshPanel={fetchPanelData}
               timeRange={timeRange}
               onDrilldown={handleDrilldown}
+              hasRunOnce={hasRunOnce}
             />
           </div>
         )}
@@ -768,16 +771,18 @@ interface DashboardGridProps {
   isEditing?: boolean;
   onLayoutChange?: (layout: LayoutItem[]) => void;
   onDrilldown?: (filter: DrilldownFilter) => void;
+  hasRunOnce?: boolean;
 }
 
-function DashboardGrid({ 
-  dashboard, 
-  panelData, 
+function DashboardGrid({
+  dashboard,
+  panelData,
   onRefreshPanel,
   timeRange,
   isEditing = false,
   onLayoutChange,
   onDrilldown,
+  hasRunOnce = false,
 }: DashboardGridProps) {
   const { layout, panels } = dashboard;
   
@@ -803,6 +808,7 @@ function DashboardGrid({
         isEditing={isEditing}
         onRefresh={() => onRefreshPanel(panel)}
         onDrilldown={drilldownEnabled ? onDrilldown : undefined}
+        hasRunOnce={hasRunOnce}
       >
         {data?.status === 'success' && data.data && (
           <VisualizationRenderer
@@ -814,7 +820,7 @@ function DashboardGrid({
         )}
       </Panel>
     );
-  }, [panelData, onRefreshPanel, timeRange, isEditing, onDrilldown]);
+  }, [panelData, onRefreshPanel, timeRange, isEditing, onDrilldown, hasRunOnce]);
 
   return (
     <GridLayout

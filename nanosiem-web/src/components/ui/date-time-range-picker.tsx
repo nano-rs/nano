@@ -672,9 +672,23 @@ function DateTimeField({ label, date, time, onDateChange, onTimeChange }: DateTi
   const dateVal = date
     ? `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
     : '';
-  // The mockup shows HH:MM; our internal state is HH:mm:ss. Display the leading
-  // HH:MM slice for parity and keep the seconds in state.
   const timeHm = time.slice(0, 5);
+
+  // Local draft so partial typing ("2", "23:", "23:4") doesn't get padded
+  // back into "02:00" mid-keystroke. Commit on blur / Enter.
+  const [timeDraft, setTimeDraft] = React.useState(timeHm);
+  React.useEffect(() => { setTimeDraft(timeHm); }, [timeHm]);
+
+  const commitTime = React.useCallback(() => {
+    const m = timeDraft.match(/^(\d{1,2}):?(\d{0,2})$/);
+    if (!m) { setTimeDraft(timeHm); return; }
+    const hh = m[1].padStart(2, '0').slice(0, 2);
+    const mm = (m[2] || '').padStart(2, '0').slice(0, 2);
+    const next = `${hh}:${mm}:00`;
+    if (next !== time) onTimeChange(next);
+    else setTimeDraft(timeHm);
+  }, [timeDraft, time, timeHm, onTimeChange]);
+
   return (
     <div className="flex flex-col gap-1 min-w-0">
       <span className="text-muted-foreground/70 text-[9.5px] uppercase tracking-[0.14em] font-mono font-semibold">
@@ -696,15 +710,19 @@ function DateTimeField({ label, date, time, onDateChange, onTimeChange }: DateTi
         <span className="w-px h-4 bg-border-2" />
         <input
           type="text"
-          value={timeHm}
+          value={timeDraft}
           onChange={(e) => {
             const v = e.target.value;
             if (!/^\d{0,2}:?\d{0,2}$/.test(v)) return;
-            // Pad to HH:mm:ss for internal state
-            const parts = v.split(':');
-            const hh = (parts[0] ?? '00').padStart(2, '0').slice(0, 2);
-            const mm = (parts[1] ?? '00').padStart(2, '0').slice(0, 2);
-            onTimeChange(`${hh}:${mm}:00`);
+            setTimeDraft(v);
+          }}
+          onBlur={commitTime}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              commitTime();
+              (e.currentTarget as HTMLInputElement).blur();
+            }
           }}
           maxLength={5}
           placeholder="HH:MM"

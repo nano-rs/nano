@@ -6,6 +6,37 @@ use super::ClickHouseMigrator;
 use regex::Regex;
 
 impl ClickHouseMigrator {
+    /// Strip `--` line comments from SQL.
+    ///
+    /// NAN-788: must run **before** any credential substitution. After
+    /// substitution, a generated password containing `--` (legitimate in
+    /// base64url alphabets) would otherwise look like a comment start and
+    /// eat the rest of the line — including the closing `'` of the
+    /// surrounding string literal — turning the next line into mid-string
+    /// content and tripping a "Single quoted string is not closed" parse
+    /// error in ClickHouse 26.3+.
+    ///
+    /// The source SQL we control has no `--` inside string literals, so a
+    /// naive line-by-line strip is safe pre-substitution.
+    pub(super) fn strip_sql_line_comments(sql: &str) -> String {
+        sql.lines()
+            .map(|line| match line.find("--") {
+                Some(pos) => &line[..pos],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Escape a value for use inside a single-quoted ClickHouse string literal.
+    ///
+    /// CH treats `\` as an escape character inside `'...'` strings, so a
+    /// backslash in a substituted value can escape the closing quote and
+    /// break the literal. Double `\` first, then double `'`. NAN-788.
+    fn escape_for_string_literal(value: &str) -> String {
+        value.replace('\\', "\\\\").replace('\'', "''")
+    }
+
     /// Substitute `{clickhouse_self_*}` placeholders in dictionary SOURCE blocks
     /// that reference the local CH instance.
     ///
@@ -19,6 +50,10 @@ impl ClickHouseMigrator {
     ///
     /// Now both code paths share this helper so the same placeholder semantics
     /// apply everywhere.
+    ///
+    /// NAN-788: host/user/password are spliced into `'...'` string literals in
+    /// the source SQL, so `'` and `\` in those values are SQL-escaped before
+    /// substitution. Port is numeric and not escaped.
     pub(super) fn substitute_clickhouse_self_vars(sql: &str) -> String {
         let ch_self_host =
             std::env::var("CLICKHOUSE_SELF_HOST").unwrap_or_else(|_| "localhost".into());
@@ -30,10 +65,49 @@ impl ClickHouseMigrator {
         let ch_self_password = std::env::var("CLICKHOUSE_SELF_PASSWORD")
             .or_else(|_| std::env::var("CLICKHOUSE_PASSWORD"))
             .unwrap_or_default();
-        sql.replace("{clickhouse_self_host}", &ch_self_host)
-            .replace("{clickhouse_self_port}", &ch_self_port)
-            .replace("{clickhouse_self_user}", &ch_self_user)
-            .replace("{clickhouse_self_password}", &ch_self_password)
+        Self::substitute_clickhouse_self_vars_with(
+            sql,
+            &ch_self_host,
+            &ch_self_port,
+            &ch_self_user,
+            &ch_self_password,
+        )
+    }
+
+    /// Env-free variant exposed for tests so escape/substitute behavior can be
+    /// exercised deterministically without `cargo test`'s parallel env races.
+    ///
+    /// NAN-788 follow-up: `port` is validated as a u16 because it's spliced
+    /// naked (no surrounding quotes) into the SQL. A non-numeric value would
+    /// produce a confusing CH parse error far from the configuration site;
+    /// panicking here surfaces the misconfiguration at migrator startup with
+    /// a clear message.
+    pub(super) fn substitute_clickhouse_self_vars_with(
+        sql: &str,
+        host: &str,
+        port: &str,
+        user: &str,
+        password: &str,
+    ) -> String {
+        if port.parse::<u16>().is_err() {
+            panic!(
+                "CLICKHOUSE_SELF_PORT must be a valid u16 (1-65535), got {:?}",
+                port
+            );
+        }
+        sql.replace(
+            "{clickhouse_self_host}",
+            &Self::escape_for_string_literal(host),
+        )
+        .replace("{clickhouse_self_port}", port)
+        .replace(
+            "{clickhouse_self_user}",
+            &Self::escape_for_string_literal(user),
+        )
+        .replace(
+            "{clickhouse_self_password}",
+            &Self::escape_for_string_literal(password),
+        )
     }
 
     /// Substitute PostgreSQL connection details in dictionary SOURCE blocks.
@@ -48,6 +122,19 @@ impl ClickHouseMigrator {
         let pg_password = std::env::var("POSTGRES_DICT_PASSWORD")
             .or_else(|_| std::env::var("POSTGRES_PASSWORD"))
             .unwrap_or_else(|_| "nanosiem".into());
+        Self::substitute_postgres_vars_with(sql, &pg_host, &pg_password)
+    }
+
+    /// Env-free variant exposed for tests. See `substitute_postgres_vars`.
+    pub(super) fn substitute_postgres_vars_with(
+        sql: &str,
+        host: &str,
+        password: &str,
+    ) -> String {
+        // NAN-788: pg_host/pg_password are spliced into `'...'` literals;
+        // SQL-escape `'` and `\` so a generated password can't break the literal.
+        let pg_host = Self::escape_for_string_literal(host);
+        let pg_password = Self::escape_for_string_literal(password);
 
         // Replace the hardcoded values in SOURCE(POSTGRESQL(...)) blocks
         let re_host =

@@ -547,4 +547,206 @@ mod tests {
         assert!(result.contains("HOST 'localhost'"), "host: {}", result);
         assert!(result.contains("PORT 9000"), "port: {}", result);
     }
+
+    /// NAN-788: strip_sql_line_comments must remove `--` line comments, but
+    /// the order in runner.rs is what matters most — comments are stripped
+    /// before credentials are substituted, so a password containing `--`
+    /// can never be mistaken for a comment start.
+    #[test]
+    fn strip_sql_line_comments_removes_full_line_and_trailing_comments() {
+        let sql = "-- header comment\nSELECT 1; -- trailing\nSELECT 2;";
+        let stripped = ClickHouseMigrator::strip_sql_line_comments(sql);
+        assert_eq!(stripped, "\nSELECT 1; \nSELECT 2;");
+    }
+
+    /// NAN-788 repro: before the fix, `--` in a substituted password ate the
+    /// rest of the line including the closing `'`, turning the next line into
+    /// mid-string content and tripping CH 26.3's parser. After the fix
+    /// (strip-comments-first), the password literal survives intact.
+    ///
+    /// Uses the env-free `_with` helper so this doesn't race with other
+    /// tests that mutate `CLICKHOUSE_SELF_PASSWORD`.
+    #[test]
+    fn nan_788_password_with_double_dash_survives_pipeline() {
+        let password = "EBLYDBRzEjytXINQ6--XXXXXXXXXXXXX";
+        let sql =
+            "    PASSWORD '{clickhouse_self_password}'\n    DB 'nanosiem'\n    QUERY 'SELECT 1'";
+
+        // Production order: strip → substitute.
+        let stripped = ClickHouseMigrator::strip_sql_line_comments(sql);
+        let result = ClickHouseMigrator::substitute_clickhouse_self_vars_with(
+            &stripped, "localhost", "9000", "default", password,
+        );
+
+        assert!(
+            result.contains("PASSWORD 'EBLYDBRzEjytXINQ6--XXXXXXXXXXXXX'"),
+            "password literal lost its `--` or closing quote: {}",
+            result
+        );
+        assert!(
+            result.contains("DB 'nanosiem'"),
+            "next-line clause was eaten: {}",
+            result
+        );
+        assert!(
+            result.contains("QUERY 'SELECT 1'"),
+            "subsequent clause was eaten: {}",
+            result
+        );
+        let quote_count = result.chars().filter(|&c| c == '\'').count();
+        assert_eq!(
+            quote_count % 2,
+            0,
+            "unbalanced single quotes after pipeline: {} (count={})",
+            result,
+            quote_count
+        );
+    }
+
+    /// NAN-788: confirms the *wrong* order (substitute first, then strip) is
+    /// what produces the original bug — locks in the failure mode so a future
+    /// refactor that re-introduces the wrong order is caught.
+    #[test]
+    fn nan_788_substitute_then_strip_is_the_buggy_order() {
+        let password = "EBLYDBRzEjytXINQ6--XXXXXXXXXXXXX";
+        let sql =
+            "    PASSWORD '{clickhouse_self_password}'\n    DB 'nanosiem'\n    QUERY 'SELECT 1'";
+
+        // The buggy order: substitute → strip.
+        let substituted = ClickHouseMigrator::substitute_clickhouse_self_vars_with(
+            sql, "localhost", "9000", "default", password,
+        );
+        let result = ClickHouseMigrator::strip_sql_line_comments(&substituted);
+
+        // The closing quote and the `DB 'nanosiem'` line get eaten because
+        // `--` is mid-literal. This proves the order is load-bearing.
+        assert!(
+            !result.contains("PASSWORD 'EBLYDBRzEjytXINQ6--XXXXXXXXXXXXX'"),
+            "buggy order should have lost the closing quote: {}",
+            result
+        );
+    }
+
+    /// NAN-788: passwords containing `'` must be SQL-escaped at substitution
+    /// time so they can't close the surrounding literal early.
+    #[test]
+    fn nan_788_password_with_single_quote_is_escaped() {
+        let result = ClickHouseMigrator::substitute_clickhouse_self_vars_with(
+            "PASSWORD '{clickhouse_self_password}' DB 'nanosiem'",
+            "localhost",
+            "9000",
+            "default",
+            "foo'bar",
+        );
+
+        assert!(
+            result.contains("PASSWORD 'foo''bar'"),
+            "single quote not escaped: {}",
+            result
+        );
+        let quote_count = result.chars().filter(|&c| c == '\'').count();
+        assert_eq!(
+            quote_count % 2,
+            0,
+            "unbalanced single quotes: {} (count={})",
+            result,
+            quote_count
+        );
+    }
+
+    /// NAN-788: backslashes are CH's in-string escape char and must be doubled
+    /// before splicing so a value like `foo\` can't escape the closing quote.
+    #[test]
+    fn nan_788_password_with_backslash_is_escaped() {
+        let result = ClickHouseMigrator::substitute_clickhouse_self_vars_with(
+            "PASSWORD '{clickhouse_self_password}' DB 'nanosiem'",
+            "localhost",
+            "9000",
+            "default",
+            "foo\\bar",
+        );
+
+        assert!(
+            result.contains("PASSWORD 'foo\\\\bar'"),
+            "backslash not doubled: {}",
+            result
+        );
+    }
+
+    /// NAN-788: combined pathological password (`--` + `'` + `\`) — the
+    /// pipeline (strip → substitute) must produce a literal that is both
+    /// quote-balanced and preserves every character of the original password.
+    #[test]
+    fn nan_788_password_with_dash_quote_and_backslash() {
+        let sql =
+            "    PASSWORD '{clickhouse_self_password}'\n    DB 'nanosiem'\n    QUERY 'SELECT 1'";
+        let stripped = ClickHouseMigrator::strip_sql_line_comments(sql);
+        let result = ClickHouseMigrator::substitute_clickhouse_self_vars_with(
+            &stripped,
+            "localhost",
+            "9000",
+            "default",
+            "a--b'c\\d",
+        );
+
+        // After escape: `'` → `''`, `\` → `\\`; `--` survives because
+        // comments were stripped before substitution.
+        assert!(
+            result.contains("PASSWORD 'a--b''c\\\\d'"),
+            "combined-escape password mangled: {}",
+            result
+        );
+        assert!(
+            result.contains("DB 'nanosiem'") && result.contains("QUERY 'SELECT 1'"),
+            "subsequent clauses lost: {}",
+            result
+        );
+    }
+
+    /// NAN-788 follow-up: port is spliced naked (no surrounding quotes) into
+    /// the SQL, so a non-numeric value would produce an opaque CH parse
+    /// failure. Panic loudly at the substitution site instead.
+    #[test]
+    #[should_panic(expected = "CLICKHOUSE_SELF_PORT must be a valid u16")]
+    fn nan_788_port_must_parse_as_u16() {
+        ClickHouseMigrator::substitute_clickhouse_self_vars_with(
+            "PORT {clickhouse_self_port}",
+            "localhost",
+            "9000; DROP TABLE x",
+            "default",
+            "pw",
+        );
+    }
+
+    /// Sanity: valid numeric port passes through unchanged.
+    #[test]
+    fn nan_788_port_valid_passes_through() {
+        let result = ClickHouseMigrator::substitute_clickhouse_self_vars_with(
+            "PORT {clickhouse_self_port}",
+            "localhost",
+            "9001",
+            "default",
+            "pw",
+        );
+        assert!(result.contains("PORT 9001"), "{}", result);
+    }
+
+    /// NAN-788: same fix applied to `substitute_postgres_vars`. A pg password
+    /// containing `'` or `\` must be escaped at substitution time so the
+    /// dictionary's `password '...'` literal stays balanced.
+    #[test]
+    fn nan_788_postgres_password_with_special_chars_is_escaped() {
+        let sql = "SOURCE(POSTGRESQL(host 'postgres' port 5432 user 'nanosiem' password 'nanosiem' db 'nanosiem'))";
+        let result = ClickHouseMigrator::substitute_postgres_vars_with(
+            sql,
+            "pg.svc",
+            "pw'with\\stuff",
+        );
+
+        assert!(
+            result.contains("password 'pw''with\\\\stuff'"),
+            "pg password not escaped: {}",
+            result
+        );
+    }
 }

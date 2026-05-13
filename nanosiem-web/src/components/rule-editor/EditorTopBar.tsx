@@ -118,7 +118,7 @@ function ModePill({ mode }: { mode: string }) {
         background:
           display === 'live'
             ? 'color-mix(in srgb, var(--success) 15%, transparent)'
-            : display === 'shadow'
+            : display === 'staging'
               ? 'color-mix(in srgb, var(--primary) 15%, transparent)'
               : 'color-mix(in srgb, var(--foreground) 10%, transparent)',
       }}

@@ -25,9 +25,15 @@ impl ClickHouseMigrator {
         is_cloud: bool,
         cluster_name: Option<&str>,
     ) -> Result<(), ClickHouseMigrateError> {
+        // NAN-788: order matters. Strip `--` line comments BEFORE substituting
+        // any credentials — a generated password containing `--` (legitimate
+        // base64url) would otherwise look like a comment start and eat the
+        // closing `'` of the surrounding literal, corrupting the SQL.
+        let migration_sql = Self::strip_sql_line_comments(&migration.sql);
+
         // Substitute PostgreSQL dictionary connection details from env vars.
         // Defaults match Docker Compose (host='postgres', password='nanosiem').
-        let migration_sql = Self::substitute_postgres_vars(&migration.sql);
+        let migration_sql = Self::substitute_postgres_vars(&migration_sql);
 
         // NAN-707: Substitute `{clickhouse_self_*}` placeholders in dict source
         // blocks that reference the local CH instance. Without this, a migration
@@ -44,21 +50,6 @@ impl ClickHouseMigrator {
         } else {
             migration_sql
         };
-
-        // Strip SQL line comments before splitting on semicolons.
-        // This prevents semicolons inside comments from creating bogus statements.
-        // (ClickHouse doesn't support multiple statements in one query)
-        let migration_sql: String = migration_sql
-            .lines()
-            .map(|line| {
-                if let Some(pos) = line.find("--") {
-                    &line[..pos]
-                } else {
-                    line
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
 
         // Collect SET key=value pairs to append as SETTINGS clause to DDL queries
         let mut settings: Vec<(String, String)> = Vec::new();
@@ -210,10 +201,15 @@ impl ClickHouseMigrator {
 
         tracing::info!("Running init.sql{}", mode_label);
 
+        // NAN-788: strip `--` line comments BEFORE substitution so a generated
+        // password containing `--` can't be misread as a comment start. See
+        // sql_transform::strip_sql_line_comments for the full rationale.
+        let sql = Self::strip_sql_line_comments(init_sql);
+
         // Substitute placeholders that point at the local CH instance and the
         // platform PostgreSQL. NAN-707 lifted the CH-self substitution out of
         // this function so numbered migrations share the same helper.
-        let sql = Self::substitute_clickhouse_self_vars(init_sql);
+        let sql = Self::substitute_clickhouse_self_vars(&sql);
         let sql = Self::substitute_postgres_vars(&sql);
 
         // Sanitize for cloud if needed
@@ -222,19 +218,6 @@ impl ClickHouseMigrator {
         } else {
             sql
         };
-
-        // Strip SQL line comments before splitting on semicolons.
-        let sql: String = sql
-            .lines()
-            .map(|line| {
-                if let Some(pos) = line.find("--") {
-                    &line[..pos]
-                } else {
-                    line
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
 
         let mut settings: Vec<(String, String)> = Vec::new();
 

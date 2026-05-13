@@ -155,7 +155,9 @@ function formatFieldLines(fieldList, indent = '  ') {
   return lines.join('\n');
 }
 
-const tsOutput = `/**
+const tsOutput = `// SPDX-License-Identifier: AGPL-3.0-or-later
+
+/**
  * UDM (Unified Data Model) field definitions
  *
  * AUTO-GENERATED — do not edit manually.

@@ -154,11 +154,19 @@ function PulseStrip() {
 
   const forYouCount = (myCases?.length ?? 0) + (health?.needs_tuning ?? 0);
 
-  const ingestStatus: Tone = siemHealth?.overall_status === 'healthy' ? 'good'
-    : siemHealth?.overall_status === 'degraded' ? 'warn'
-    : siemHealth?.overall_status ? 'danger' : 'neutral';
+  const scoreToTone = (s?: number | null): Tone =>
+    s == null ? 'neutral' : s >= 80 ? 'good' : s >= 50 ? 'warn' : 'danger';
 
-  const detStatus: Tone = (health?.noisy_count ?? 0) + (health?.silent_count ?? 0) > 0 ? 'warn' : 'good';
+  const scoreToLabel = (s?: number | null): string =>
+    s == null ? '—' : s >= 80 ? 'Healthy' : s >= 50 ? 'Warning' : 'Critical';
+
+  const ingestStatus: Tone = scoreToTone(siemHealth?.ingestion_score);
+
+  const detTuneCount = (health?.noisy_count ?? 0) + (health?.silent_count ?? 0);
+  const detStatus: Tone =
+    detTuneCount === 0 ? 'good'
+    : detTuneCount >= 10 ? 'danger'
+    : 'warn';
 
   // MITRE coverage roll-up: count tactics with at least one uncovered
   // technique + techniques with zero rules. Tone is `good` when fully
@@ -206,9 +214,7 @@ function PulseStrip() {
     {
       id: 'ingest',
       label: 'Ingest',
-      value: siemHealth?.overall_status
-        ? siemHealth.overall_status.charAt(0).toUpperCase() + siemHealth.overall_status.slice(1)
-        : '—',
+      value: scoreToLabel(siemHealth?.ingestion_score),
       status: ingestStatus,
       delta: siemHealth ? `${Math.round(siemHealth.ingestion_score)}% ingestion score` : '—',
       hint: 'log source health',

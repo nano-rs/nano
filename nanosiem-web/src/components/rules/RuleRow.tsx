@@ -28,6 +28,12 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip';
 import { useDetectionMatches } from '@/hooks/use-api';
 import { useAuth } from '@/contexts/AuthContext';
 import {
@@ -98,31 +104,63 @@ export function Chk({ checked, indeterminate, onChange, onClick, ariaLabel }: Ch
   );
 }
 
-// 28-day heat strip — each cell = 1 day.
+// 28-day heat strip — each cell = 1 day, rightmost = today.
+const ACTIVITY_DATE_FORMATTER = new Intl.DateTimeFormat(undefined, {
+  weekday: 'short',
+  month: 'short',
+  day: 'numeric',
+});
+
 function ActivityStrip({ data }: { data: number[] }) {
   const max = Math.max(...data, 1);
+  // Anchor "today" once per render so all bars share the same reference date.
+  // Use setDate() arithmetic (not millisecond subtraction) so DST transitions
+  // can't slip a bar onto the wrong calendar day.
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
   return (
-    <div className="flex items-center gap-[2px]">
-      {data.map((v, i) => {
-        const intensity = v === 0 ? 0 : 0.25 + (v / max) * 0.75;
-        const today = i === data.length - 1;
-        return (
-          <div
-            key={i}
-            title={`${data.length - 1 - i}d ago · ${v} hit${v === 1 ? '' : 's'}`}
-            className="w-[5px] h-[14px] rounded-[1px]"
-            style={{
-              background:
-                v === 0
-                  ? 'color-mix(in srgb, var(--foreground) 5%, transparent)'
-                  : `color-mix(in srgb, var(--primary) ${intensity * 100}%, transparent)`,
-              outline: today && v > 0 ? '1px solid var(--primary)' : 'none',
-              outlineOffset: '0.5px',
-            }}
-          />
-        );
-      })}
-    </div>
+    <TooltipProvider delayDuration={80}>
+      <div className="flex items-center gap-[2px]">
+        {data.map((v, i) => {
+          const intensity = v === 0 ? 0 : 0.25 + (v / max) * 0.75;
+          const isToday = i === data.length - 1;
+          const daysAgo = data.length - 1 - i;
+          const dayDate = new Date(today);
+          dayDate.setDate(dayDate.getDate() - daysAgo);
+          const dateLabel = ACTIVITY_DATE_FORMATTER.format(dayDate);
+          return (
+            <Tooltip key={i}>
+              <TooltipTrigger asChild>
+                <div
+                  className="w-[5px] h-[14px] rounded-[1px]"
+                  style={{
+                    background:
+                      v === 0
+                        ? 'color-mix(in srgb, var(--foreground) 5%, transparent)'
+                        : `color-mix(in srgb, var(--primary) ${intensity * 100}%, transparent)`,
+                    outline: isToday && v > 0 ? '1px solid var(--primary)' : 'none',
+                    outlineOffset: '0.5px',
+                  }}
+                />
+              </TooltipTrigger>
+              <TooltipContent className="text-[11px] font-mono leading-snug px-2 py-1">
+                <div className="flex items-baseline gap-1.5">
+                  <span className="text-foreground">{dateLabel}</span>
+                  {isToday ? (
+                    <span className="text-muted-foreground">today</span>
+                  ) : (
+                    <span className="text-muted-foreground">{daysAgo}d ago</span>
+                  )}
+                </div>
+                <div className="text-muted-foreground">
+                  {v.toLocaleString()} hit{v === 1 ? '' : 's'}
+                </div>
+              </TooltipContent>
+            </Tooltip>
+          );
+        })}
+      </div>
+    </TooltipProvider>
   );
 }
 

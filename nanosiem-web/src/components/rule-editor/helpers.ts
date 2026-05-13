@@ -8,7 +8,7 @@ import type { DetectionRule } from '@/lib/api/types';
 
 export type SeverityKey = 'critical' | 'high' | 'medium' | 'low' | 'informational';
 export type ModeKey = 'staging' | 'live' | 'alerting' | 'paused';
-export type DisplayModeKey = 'live' | 'shadow' | 'paused';
+export type DisplayModeKey = 'live' | 'staging' | 'paused';
 
 // Severity → token color. Matches the oklch palette used by the /rules list.
 export const SEV_COLOR: Record<SeverityKey, string> = {
@@ -37,18 +37,18 @@ export function normalizeSeverity(raw: DetectionRule['severity'] | string | unde
   return 'medium';
 }
 
-// The design uses live/shadow/paused; the API uses staging/live/alerting/paused.
-// Map:   staging → shadow,   alerting → live,   live → live,   paused → paused.
+// The design uses live/staging/paused; the API uses staging/live/alerting/paused.
+// Map:   staging → staging,   alerting → live,   live → live,   paused → paused.
 export function displayMode(mode: string | undefined | null): DisplayModeKey {
   if (mode === 'paused') return 'paused';
-  if (mode === 'staging') return 'shadow';
+  if (mode === 'staging') return 'staging';
   if (mode === 'alerting' || mode === 'live') return 'live';
-  return 'shadow';
+  return 'staging';
 }
 
 export const MODE_META: Record<DisplayModeKey, { label: string; dotVar: string; tone: string }> = {
   live: { label: 'LIVE', dotVar: 'var(--success)', tone: 'text-[var(--success)]' },
-  shadow: { label: 'SHADOW', dotVar: 'var(--primary)', tone: 'text-[var(--primary)]' },
+  staging: { label: 'STAGING', dotVar: 'var(--primary)', tone: 'text-[var(--primary)]' },
   paused: { label: 'PAUSED', dotVar: 'var(--muted-foreground)', tone: 'text-muted-foreground' },
 };
 

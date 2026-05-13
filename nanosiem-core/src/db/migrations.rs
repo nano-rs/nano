@@ -16,8 +16,13 @@
 //! | State                | `_sqlx_migrations` | What runs here                                              |
 //! |----------------------|--------------------|-------------------------------------------------------------|
 //! | Legacy tenant        | populated 1..N     | `sqlx::migrate!("../migrations/postgres")` (unchanged path) |
-//! | Fresh open install   | absent             | snapshot → backfill 1..175 → migrator no-op for 1..175      |
+//! | Fresh open install   | absent             | snapshot → backfill 1..=baseline → migrator runs 176+ only  |
 //! | Fresh enterprise     | absent             | same as fresh open; caller layers the enterprise overlay    |
+//!
+//! The "baseline" cutoff is [`OPEN_INIT_BASELINE_VERSION`] — versions
+//! at or below it are pre-applied via the snapshot and only need their
+//! `_sqlx_migrations` row backfilled; versions above it must run normally
+//! or their bodies are silently swallowed (NAN-791).
 //!
 //! Safety: misdetecting a legacy DB as fresh would be catastrophic. Three
 //! independent layers guard against it:
@@ -46,6 +51,21 @@ use tracing::{info, warn};
 const OPEN_INIT_SNAPSHOT: &str =
     include_str!("../../../migrations/postgres-open/000_open_init.sql");
 
+/// Highest legacy migration version baked into the open-init snapshot.
+///
+/// Versions `<=` this constant are pre-applied via DDL in
+/// `000_open_init.sql` and need their `_sqlx_migrations` row backfilled
+/// (with `execution_time = -1`) so that the subsequent `migrator.run()`
+/// treats them as no-ops. Versions `>` this constant are **NOT** in the
+/// snapshot and MUST run normally — backfilling them would silently swallow
+/// their bodies (NAN-791: this exact bug silently broke fresh-tenant signup
+/// after NAN-790 shipped the first post-baseline data migration).
+///
+/// Bump this only when the snapshot is regenerated (see
+/// `tools/nan749_split_open_overlay.py`) and the new high-water mark of
+/// migrations folded into the snapshot is known.
+pub const OPEN_INIT_BASELINE_VERSION: i64 = 175;
+
 /// Errors emitted by [`run_postgres_migrations`].
 #[derive(Debug, Error)]
 pub enum MigrationError {
@@ -53,9 +73,9 @@ pub enum MigrationError {
     #[error("open-init snapshot apply failed: {0}")]
     SnapshotFailed(#[source] sqlx::Error),
 
-    /// Backfilling `_sqlx_migrations` with rows for the legacy 1..175 history
-    /// failed. Rare; usually only fires if the DB privilege model blocks
-    /// INSERT into `_sqlx_migrations`.
+    /// Backfilling `_sqlx_migrations` with rows for the legacy
+    /// 1..=[`OPEN_INIT_BASELINE_VERSION`] history failed. Rare; usually only
+    /// fires if the DB privilege model blocks INSERT into `_sqlx_migrations`.
     #[error("legacy migration history backfill failed: {0}")]
     BackfillFailed(#[source] sqlx::Error),
 
@@ -112,7 +132,7 @@ impl MigrationMode {
 /// In either case we want to err on the side of "legacy" — false-positive
 /// fresh detection is the dangerous failure mode (it would try to apply
 /// the snapshot's `IF NOT EXISTS` no-ops, then backfill `_sqlx_migrations`
-/// with 175 rows, leaving the DB in a confused state). False-negative is
+/// with `OPEN_INIT_BASELINE_VERSION` rows, leaving the DB in a confused state). False-negative is
 /// safe: legacy path is what we did before NAN-749 anyway.
 pub async fn is_fresh_database(pool: &PgPool) -> Result<bool, sqlx::Error> {
     let has_sqlx_table: bool = sqlx::query_scalar(
@@ -135,16 +155,25 @@ pub async fn is_fresh_database(pool: &PgPool) -> Result<bool, sqlx::Error> {
     Ok(!has_known_table)
 }
 
-/// Insert one row per migration in `migrator` into `_sqlx_migrations`,
-/// marking each as already-applied with the actual checksum from the
-/// embedded migration source. After this call, `migrator.run()` sees the
-/// rows, validates checksums (they match — same source), and is a no-op
-/// for those versions; only NEW migrations added later will execute.
+/// Insert one row per migration in `migrator` whose version is
+/// `<= OPEN_INIT_BASELINE_VERSION` into `_sqlx_migrations`, marking each as
+/// already-applied with the actual checksum from the embedded migration
+/// source. After this call, `migrator.run()` sees those rows, validates
+/// checksums (they match — same source), and is a no-op for those versions;
+/// versions ABOVE the baseline are deliberately NOT backfilled so that
+/// `migrator.run()` executes them normally.
 ///
 /// `execution_time = -1` is the sqlx convention for "never actually ran"
 /// and matches the upstream INSERT in `sqlx-postgres-0.8.6/src/migrate.rs`.
 /// `ON CONFLICT (version) DO NOTHING` makes this safe even if Layer 1
 /// detection somehow misfires on a partially-populated DB.
+///
+/// NAN-791: the cutoff is load-bearing. Before this guard, every migration
+/// the binary knew about got pre-marked applied, so post-baseline data
+/// migrations (e.g. NAN-790's `176_seed_baseline_fresh_deploy.sql`) had
+/// their bodies silently swallowed on fresh tenants. The
+/// `migrations_to_backfill` helper isolates the filter so it can be
+/// unit-tested without a real PG.
 async fn backfill_legacy_migration_history(
     pool: &PgPool,
     migrator: &Migrator,
@@ -167,7 +196,7 @@ async fn backfill_legacy_migration_history(
     .await?;
 
     let mut count = 0usize;
-    for migration in migrator.iter() {
+    for migration in migrations_to_backfill(migrator) {
         sqlx::query(
             "INSERT INTO public._sqlx_migrations \
                (version, description, success, checksum, execution_time) \
@@ -181,8 +210,27 @@ async fn backfill_legacy_migration_history(
         .await?;
         count += 1;
     }
-    info!(rows = count, "Backfilled legacy migration history");
+    info!(
+        rows = count,
+        baseline = OPEN_INIT_BASELINE_VERSION,
+        "Backfilled legacy migration history"
+    );
     Ok(())
+}
+
+/// Pure filter: which migrations in `migrator` should be backfilled into
+/// `_sqlx_migrations` because they're already applied via the open-init
+/// snapshot. Anything strictly above [`OPEN_INIT_BASELINE_VERSION`] is left
+/// alone so the migrator runs it normally.
+///
+/// Extracted so the cutoff logic can be unit-tested without a real PG
+/// (NAN-791).
+fn migrations_to_backfill(
+    migrator: &Migrator,
+) -> impl Iterator<Item = &sqlx::migrate::Migration> {
+    migrator
+        .iter()
+        .filter(|m| m.version <= OPEN_INIT_BASELINE_VERSION)
 }
 
 /// Run open-tier PostgreSQL migrations.
@@ -289,5 +337,68 @@ mod tests {
         assert_eq!(MigrationMode::from_env(), MigrationMode::Auto);
 
         std::env::remove_var("NANOSIEM_MIGRATION_MODE");
+    }
+
+    /// NAN-791: the backfill must skip migrations strictly above
+    /// `OPEN_INIT_BASELINE_VERSION`. Otherwise post-baseline migrations
+    /// get pre-marked applied and their bodies are silently swallowed on
+    /// fresh tenants (originally surfaced as NAN-790's seed data being
+    /// AWOL after deploy).
+    #[test]
+    fn migrations_to_backfill_excludes_post_baseline_versions() {
+        let migrator = sqlx::migrate!("../migrations/postgres");
+
+        for migration in migrations_to_backfill(&migrator) {
+            assert!(
+                migration.version <= OPEN_INIT_BASELINE_VERSION,
+                "version {} leaked past baseline {} — backfill would swallow its body on fresh deploys",
+                migration.version,
+                OPEN_INIT_BASELINE_VERSION
+            );
+        }
+    }
+
+    /// NAN-791: the cutoff is only meaningful if there's at least one
+    /// migration above the baseline. If this assertion fires, either the
+    /// constant is stale (a snapshot regeneration absorbed everything) or
+    /// the migrations directory is in a degenerate state.
+    #[test]
+    fn at_least_one_migration_lives_above_the_baseline() {
+        let migrator = sqlx::migrate!("../migrations/postgres");
+
+        let past_baseline = migrator
+            .iter()
+            .filter(|m| m.version > OPEN_INIT_BASELINE_VERSION)
+            .count();
+
+        assert!(
+            past_baseline > 0,
+            "no migrations past baseline {} — bump OPEN_INIT_BASELINE_VERSION to the new snapshot high-water mark, or this guard is the only thing keeping the filter honest",
+            OPEN_INIT_BASELINE_VERSION
+        );
+    }
+
+    /// NAN-791: every migration `<= OPEN_INIT_BASELINE_VERSION` that the
+    /// binary embeds must be selected for backfill — a fresh tenant relies
+    /// on those rows landing so `migrator.run()` treats the DDL the
+    /// snapshot already applied as a no-op rather than re-running it and
+    /// hitting "relation already exists" errors.
+    #[test]
+    fn migrations_to_backfill_covers_full_pre_baseline_range() {
+        let migrator = sqlx::migrate!("../migrations/postgres");
+
+        let expected: Vec<i64> = migrator
+            .iter()
+            .filter(|m| m.version <= OPEN_INIT_BASELINE_VERSION)
+            .map(|m| m.version)
+            .collect();
+        let actual: Vec<i64> = migrations_to_backfill(&migrator)
+            .map(|m| m.version)
+            .collect();
+
+        assert_eq!(
+            expected, actual,
+            "backfill set diverged from pre-baseline range — filter is wrong"
+        );
     }
 }

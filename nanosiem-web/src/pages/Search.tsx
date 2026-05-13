@@ -246,6 +246,7 @@ interface CachedSearchResult {
   costScore: number | null;
   executedQuery: string;
   isAggregateQuery: boolean;
+  peakRowsScanned: number;
   cachedAt: number;
 }
 
@@ -445,6 +446,11 @@ export function Search() {
   // Pagination state
   const [currentPage, setCurrentPage] = useState(1);
   const [totalCount, setTotalCount] = useState(0);
+  // Peak `rows_scanned` from streaming `onProgress` SSE events. Tracked so
+  // the >1M-row warning can fire on aggregate queries, whose `total_count`
+  // is the post-aggregation output size (e.g. 20 rows from `head 20`) and
+  // never crosses the 1M threshold on its own.
+  const [peakRowsScanned, setPeakRowsScanned] = useState(0);
   const [limitWarningDismissed, setLimitWarningDismissed] = useState(false);
   const [pageSize] = useState(50);
 
@@ -1098,6 +1104,7 @@ export function Search() {
       costScore: response.cost_score ?? null,
       executedQuery: currentQuery,
       isAggregateQuery: isAggregate,
+      peakRowsScanned: 0,
       cachedAt: Date.now(),
     };
     searchResultCache.set(cacheKey, cacheEntry);
@@ -1287,6 +1294,9 @@ export function Search() {
     let rowBatch: SearchResult[] = [];
     let rafPending = false;
     let cumulativeRows = 0;
+    // Tracked locally so `onCompleted` can persist the peak with the cache
+    // entry without racing React's async state flush.
+    let streamedPeakRowsScanned = 0;
 
     // Capture metadata from onMetadata so onCompleted can use it in cache
     let streamedMetadata: {
@@ -1331,6 +1341,11 @@ export function Search() {
       },
       onProgress: (data) => {
         setAsyncJobProgress(data);
+        const scanned = data.rows_scanned || 0;
+        if (scanned > streamedPeakRowsScanned) {
+          streamedPeakRowsScanned = scanned;
+          setPeakRowsScanned(scanned);
+        }
       },
       onRows: (data) => {
         const newRows = (data.rows || [])
@@ -1421,6 +1436,7 @@ export function Search() {
             costScore: streamedMetadata.costScore,
             executedQuery: currentQuery,
             isAggregateQuery: isAggregate,
+            peakRowsScanned: streamedPeakRowsScanned,
             cachedAt: Date.now(),
           };
           searchResultCache.set(cacheKey, cacheEntry);
@@ -1535,6 +1551,7 @@ export function Search() {
     if (!append) {
       setSearchResults([]);
       setServerFieldStats(null);
+      setPeakRowsScanned(0);
       // Don't clear histogram here - keep showing previous data while loading
       // New histogram will be set when API response arrives
       setCurrentPage(1);
@@ -1736,6 +1753,7 @@ export function Search() {
           costScore: response.cost_score ?? null,
           executedQuery: currentQuery,
           isAggregateQuery: isAggregate,
+          peakRowsScanned: 0,
           cachedAt: Date.now(),
         };
         searchResultCache.set(cacheKey, cacheEntry);
@@ -2859,6 +2877,7 @@ export function Search() {
           setQueryCostScore(cached.costScore);
           setExecutedQuery(cached.executedQuery);
           setIsAggregateQuery(cached.isAggregateQuery);
+          setPeakRowsScanned(cached.peakRowsScanned ?? 0);
           setFieldsPanelExpanded(!cached.isAggregateQuery);
           userToggledFieldsPanel.current = false;
           setHasSearched(true);
@@ -2875,7 +2894,26 @@ export function Search() {
           }, 50);
         }
       } else {
-        // If no query or was natural language, just mark as restored from history but don't search
+        // Back-navigated to an empty /search (or a natural-language URL we
+        // can't replay). Without this, the URL reverts but the previously
+        // rendered results stick on screen, so users need a second back click
+        // to escape the page.
+        setSearchResults([]);
+        setHistogramData([]);
+        setServerFieldStats(null);
+        setTotalCount(0);
+        setPeakRowsScanned(0);
+        setExecutionTimeMs(null);
+        setDisplayType(undefined);
+        setColumnOrder(undefined);
+        setGeneratedSql(null);
+        setQueryCostScore(null);
+        setExecutedQuery('');
+        setIsAggregateQuery(false);
+        setHasSearched(false);
+        setSearchError(null);
+        setLimitWarningDismissed(false);
+        setCachedResultsTimestamp(null);
         setTimeout(() => {
           isRestoringFromHistory.current = false;
         }, 50);
@@ -2919,6 +2957,14 @@ export function Search() {
     return () => { if (abortControllerRef.current) abortControllerRef.current.abort(); };
   }, []);
 
+  // Threshold for the "narrow your query" warning. For aggregate queries
+  // `totalCount` is the post-aggregation output size, so we fall back to the
+  // peak `rows_scanned` reported by streaming progress events.
+  const warningRowCount = isAggregateQuery ? peakRowsScanned : totalCount;
+  const showLimitWarning =
+    warningRowCount >= 1_000_000 && !isSearching && hasSearched && !limitWarningDismissed;
+  const showErrorOrWarning = !!searchError || showLimitWarning;
+
   return (
     <div className="search-console-page flex flex-col gap-2.5 w-full min-w-0 overflow-x-hidden md:[overflow-x:clip]">
       {/* Demo onboarding: sample queries */}
@@ -2933,7 +2979,7 @@ export function Search() {
           ? 'bg-gradient-to-r from-ai-bg to-ai-bg-subtle border-ai-border'
           : 'bg-card border-border'
       } ${
-        (searchError || (totalCount >= 1000000 && !isSearching && hasSearched && !limitWarningDismissed))
+        showErrorOrWarning
           ? 'rounded-t-lg rounded-b-none'
           : 'rounded-lg'
       }`}>
@@ -3646,8 +3692,8 @@ export function Search() {
       <div
         className="grid transition-[grid-template-rows,opacity] duration-300 ease-out"
         style={{
-          gridTemplateRows: (searchError || (totalCount >= 1000000 && !isSearching && hasSearched && !limitWarningDismissed)) ? '1fr' : '0fr',
-          opacity: (searchError || (totalCount >= 1000000 && !isSearching && hasSearched && !limitWarningDismissed)) ? 1 : 0,
+          gridTemplateRows: showErrorOrWarning ? '1fr' : '0fr',
+          opacity: showErrorOrWarning ? 1 : 0,
         }}
       >
         <div className="overflow-hidden min-h-0">
@@ -3743,6 +3789,11 @@ export function Search() {
                   );
                 })()}
               </>
+            ) : isAggregateQuery ? (
+              <span className="text-sm text-muted-foreground">
+                <span className="text-amber-400 font-medium">{peakRowsScanned.toLocaleString()}+ rows scanned</span>
+                {' '}&mdash; consider narrowing your time range or adding filters before the aggregate.
+              </span>
             ) : (
               <span className="text-sm text-muted-foreground">
                 <span className="text-amber-400 font-medium">{totalCount.toLocaleString()}+ hits</span>
