@@ -50,13 +50,7 @@ pub async fn get_hash_prevalence(
         )
     })?;
 
-    // Check if ClickHouse is enabled
-    let dual_pool = state.dual_pool().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Prevalence tracking requires ClickHouse".to_string(),
-        )
-    })?;
+    let dual_pool = state.dual_pool();
 
     // Create service with database config for hot-reload support (Requirement 8.5)
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
@@ -113,13 +107,7 @@ pub async fn get_domain_prevalence(
         )
     })?;
 
-    // Check if ClickHouse is enabled
-    let dual_pool = state.dual_pool().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Prevalence tracking requires ClickHouse".to_string(),
-        )
-    })?;
+    let dual_pool = state.dual_pool();
 
     // Create service with database config for hot-reload support (Requirement 8.5)
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
@@ -186,13 +174,7 @@ pub async fn get_bulk_prevalence(
         ));
     }
 
-    // Check if ClickHouse is enabled
-    let dual_pool = state.dual_pool().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Prevalence tracking requires ClickHouse".to_string(),
-        )
-    })?;
+    let dual_pool = state.dual_pool();
 
     // Create service with database config for hot-reload support (Requirement 8.5)
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(

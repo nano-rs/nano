@@ -79,6 +79,12 @@ impl SearchService {
         // Parse the cleaned query
         let parsed = parse_query(&cleaned_query).map_err(|e| convert_parse_error(e))?;
 
+        // NAN-806: keep `explain` honest — the executed query has implicit
+        // top-N sorting injected after a trailing `stats … by …`, and the
+        // explained SQL should reflect that.
+        let (parsed, auto_sort_decision) =
+            crate::search::query_processing::apply_auto_sort(parsed);
+
         // Extract post-prevalence commands to determine if we need to strip them
         let post_prevalence = extract_post_prevalence_commands(&parsed);
 
@@ -145,6 +151,22 @@ impl SearchService {
         // Add a note about AI commands if any were stripped
         if has_ai {
             sql.push_str("\n\n-- Note: | ai command will enrich results with LLM classification in post-processing");
+        }
+
+        // Disclose the implicit auto-sort so the explained SQL is self-documenting.
+        match auto_sort_decision {
+            crate::search::query_processing::AutoSortDecision::Applied { field } => {
+                sql.push_str(&format!(
+                    "\n\n-- Note: implicit `| sort -{}` injected so the outer LIMIT keeps top-N (NAN-806)",
+                    field
+                ));
+            }
+            crate::search::query_processing::AutoSortDecision::SkippedNonNumeric => {
+                sql.push_str(
+                    "\n\n-- Note: trailing stats has only non-numeric aggregations; result-set truncation may be arbitrary. Add `| sort` to control ordering.",
+                );
+            }
+            _ => {}
         }
 
         Ok(sql)

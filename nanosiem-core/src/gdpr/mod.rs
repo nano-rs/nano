@@ -106,9 +106,6 @@ pub enum AnonymizationError {
     #[error("Request is not in pending status")]
     NotPending,
 
-    #[error("ClickHouse is not available")]
-    ClickHouseUnavailable,
-
     #[error("GDPR salt not configured")]
     SaltNotConfigured,
 

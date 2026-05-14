@@ -80,9 +80,6 @@ fn map_err(err: AnonymizationError) -> (StatusCode, Json<GdprApiError>) {
     let (status, error_type) = match &err {
         AnonymizationError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
         AnonymizationError::NotPending => (StatusCode::CONFLICT, "not_pending"),
-        AnonymizationError::ClickHouseUnavailable => {
-            (StatusCode::SERVICE_UNAVAILABLE, "clickhouse_unavailable")
-        }
         AnonymizationError::SaltNotConfigured => {
             (StatusCode::INTERNAL_SERVER_ERROR, "salt_not_configured")
         }
@@ -115,7 +112,6 @@ fn map_err(err: AnonymizationError) -> (StatusCode, Json<GdprApiError>) {
         (status = 201, description = "Anonymization request created", body = AnonymizationPreview),
         (status = 400, description = "Invalid identifier", body = GdprApiError),
         (status = 403, description = "Forbidden — missing gdpr:anonymize permission", body = GdprApiError),
-        (status = 503, description = "ClickHouse unavailable", body = GdprApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -230,7 +226,6 @@ pub async fn get_anonymization_request(
         (status = 403, description = "Forbidden", body = GdprApiError),
         (status = 404, description = "Request not found", body = GdprApiError),
         (status = 409, description = "Request not in pending status", body = GdprApiError),
-        (status = 503, description = "ClickHouse unavailable", body = GdprApiError),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]

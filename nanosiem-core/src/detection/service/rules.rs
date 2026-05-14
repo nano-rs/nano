@@ -67,9 +67,7 @@ impl DetectionService {
     pub async fn create_rule_with_mode(
         &self,
         rule: NewDetectionRule,
-        materialized_view_generator: Option<
-            &super::super::materialized_view::MaterializedViewGenerator,
-        >,
+        materialized_view_generator: &super::super::materialized_view::MaterializedViewGenerator,
     ) -> Result<DetectionRule, DetectionError> {
         use crate::models::detection_rule::DetectionMode;
 
@@ -101,38 +99,30 @@ impl DetectionService {
                 // Create the rule in the database first
                 let created_rule = self.rule_repo.create(&rule).await?;
 
-                // Create materialized view if generator is provided
-                if let Some(generator) = materialized_view_generator {
-                    match generator.create_view(&created_rule).await {
-                        Ok(view_name) => {
-                            info!(
-                                "Created materialized view {} for real-time rule {}",
-                                view_name, created_rule.name
-                            );
+                // Create materialized view
+                match materialized_view_generator.create_view(&created_rule).await {
+                    Ok(view_name) => {
+                        info!(
+                            "Created materialized view {} for real-time rule {}",
+                            view_name, created_rule.name
+                        );
 
-                            // Update the rule with the materialized view name
-                            let update = crate::models::UpdateDetectionRule {
-                                materialized_view_name: Some(Some(view_name)),
-                                ..Default::default()
-                            };
-                            Ok(self.rule_repo.update(created_rule.id, &update).await?)
-                        }
-                        Err(e) => {
-                            // If materialized view creation fails, delete the rule and return error
-                            error!(
-                                "Failed to create materialized view for rule {}: {}",
-                                created_rule.name, e
-                            );
-                            let _ = self.rule_repo.delete(created_rule.id).await;
-                            return Err(DetectionError::MaterializedViewError(e.to_string()));
-                        }
+                        // Update the rule with the materialized view name
+                        let update = crate::models::UpdateDetectionRule {
+                            materialized_view_name: Some(Some(view_name)),
+                            ..Default::default()
+                        };
+                        Ok(self.rule_repo.update(created_rule.id, &update).await?)
                     }
-                } else {
-                    warn!(
-                        "No materialized view generator provided for real-time rule {}",
-                        created_rule.name
-                    );
-                    Ok(created_rule)
+                    Err(e) => {
+                        // If materialized view creation fails, delete the rule and return error
+                        error!(
+                            "Failed to create materialized view for rule {}: {}",
+                            created_rule.name, e
+                        );
+                        let _ = self.rule_repo.delete(created_rule.id).await;
+                        Err(DetectionError::MaterializedViewError(e.to_string()))
+                    }
                 }
             }
             DetectionMode::Scheduled => {
@@ -270,9 +260,7 @@ impl DetectionService {
         &self,
         id: Uuid,
         update: UpdateDetectionRule,
-        materialized_view_generator: Option<
-            &super::super::materialized_view::MaterializedViewGenerator,
-        >,
+        materialized_view_generator: &super::super::materialized_view::MaterializedViewGenerator,
         created_by: Option<Uuid>,
     ) -> Result<DetectionRule, DetectionError> {
         use crate::models::detection_rule::DetectionMode;
@@ -370,50 +358,42 @@ impl DetectionService {
             (DetectionMode::RealTime, DetectionMode::RealTime) => {
                 // If staying in real-time mode and query changed, recreate materialized view
                 if update.query.is_some() {
-                    if let Some(generator) = materialized_view_generator {
-                        // Update the rule first
-                        let updated_rule = self.rule_repo.update(id, &update).await?;
+                    // Update the rule first
+                    let updated_rule = self.rule_repo.update(id, &update).await?;
 
-                        // Recreate materialized view
-                        match generator.recreate_view(&updated_rule).await {
-                            Ok(view_name) => {
-                                info!(
-                                    "Recreated materialized view {} for updated real-time rule {}",
-                                    view_name, updated_rule.name
-                                );
-                                // Update the rule with the new view name (should be the same)
-                                let view_update = crate::models::UpdateDetectionRule {
-                                    materialized_view_name: Some(Some(view_name)),
-                                    ..Default::default()
-                                };
-                                let final_rule =
-                                    self.rule_repo.update(updated_rule.id, &view_update).await?;
+                    // Recreate materialized view
+                    match materialized_view_generator.recreate_view(&updated_rule).await {
+                        Ok(view_name) => {
+                            info!(
+                                "Recreated materialized view {} for updated real-time rule {}",
+                                view_name, updated_rule.name
+                            );
+                            // Update the rule with the new view name (should be the same)
+                            let view_update = crate::models::UpdateDetectionRule {
+                                materialized_view_name: Some(Some(view_name)),
+                                ..Default::default()
+                            };
+                            let final_rule =
+                                self.rule_repo.update(updated_rule.id, &view_update).await?;
 
-                                // Create version entry
-                                self.create_version_entry(
-                                    &final_rule,
-                                    created_by,
-                                    "manual_edit",
-                                    None,
-                                )
-                                .await;
-
-                                Ok(final_rule)
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Failed to recreate materialized view for rule {}: {}",
-                                    updated_rule.name, e
-                                );
-                                Err(DetectionError::MaterializedViewError(e.to_string()))
-                            }
-                        }
-                    } else {
-                        // No generator provided, just update the rule
-                        let updated_rule = self.rule_repo.update(id, &update).await?;
-                        self.create_version_entry(&updated_rule, created_by, "manual_edit", None)
+                            // Create version entry
+                            self.create_version_entry(
+                                &final_rule,
+                                created_by,
+                                "manual_edit",
+                                None,
+                            )
                             .await;
-                        Ok(updated_rule)
+
+                            Ok(final_rule)
+                        }
+                        Err(e) => {
+                            error!(
+                                "Failed to recreate materialized view for rule {}: {}",
+                                updated_rule.name, e
+                            );
+                            Err(DetectionError::MaterializedViewError(e.to_string()))
+                        }
                     }
                 } else {
                     // No query change, just update
@@ -444,71 +424,57 @@ impl DetectionService {
                 let updated_rule = self.rule_repo.update(id, &update).await?;
 
                 // Create materialized view
-                if let Some(generator) = materialized_view_generator {
-                    match generator.create_view(&updated_rule).await {
-                        Ok(view_name) => {
-                            info!(
-                                "Created materialized view {} for rule {} (transitioned to real-time)",
-                                view_name, updated_rule.name
-                            );
-                            // Update the rule with the view name
-                            let view_update = crate::models::UpdateDetectionRule {
-                                materialized_view_name: Some(Some(view_name)),
-                                ..Default::default()
-                            };
-                            let final_rule =
-                                self.rule_repo.update(updated_rule.id, &view_update).await?;
+                match materialized_view_generator.create_view(&updated_rule).await {
+                    Ok(view_name) => {
+                        info!(
+                            "Created materialized view {} for rule {} (transitioned to real-time)",
+                            view_name, updated_rule.name
+                        );
+                        // Update the rule with the view name
+                        let view_update = crate::models::UpdateDetectionRule {
+                            materialized_view_name: Some(Some(view_name)),
+                            ..Default::default()
+                        };
+                        let final_rule =
+                            self.rule_repo.update(updated_rule.id, &view_update).await?;
 
-                            // Create version entry
-                            self.create_version_entry(
-                                &final_rule,
-                                created_by,
-                                "mode_change_to_realtime",
-                                None,
-                            )
-                            .await;
+                        // Create version entry
+                        self.create_version_entry(
+                            &final_rule,
+                            created_by,
+                            "mode_change_to_realtime",
+                            None,
+                        )
+                        .await;
 
-                            Ok(final_rule)
-                        }
-                        Err(e) => {
-                            error!(
-                                "Failed to create materialized view for rule {}: {}",
-                                updated_rule.name, e
-                            );
-                            Err(DetectionError::MaterializedViewError(e.to_string()))
-                        }
+                        Ok(final_rule)
                     }
-                } else {
-                    // Create version entry even without materialized view
-                    self.create_version_entry(
-                        &updated_rule,
-                        created_by,
-                        "mode_change_to_realtime",
-                        None,
-                    )
-                    .await;
-                    Ok(updated_rule)
+                    Err(e) => {
+                        error!(
+                            "Failed to create materialized view for rule {}: {}",
+                            updated_rule.name, e
+                        );
+                        Err(DetectionError::MaterializedViewError(e.to_string()))
+                    }
                 }
             }
 
             // Transitioning FROM Real-Time
             (DetectionMode::RealTime, DetectionMode::Scheduled) => {
                 // Drop materialized view
-                if let Some(generator) = materialized_view_generator {
-                    if let Some(ref view_name) = existing_rule.materialized_view_name {
-                        match generator.drop_view(view_name).await {
-                            Ok(_) => {
-                                info!(
-                                    "Dropped materialized view {} for rule {} (transitioned from real-time)",
-                                    view_name, existing_rule.name
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to drop materialized view {} for rule {}: {}",
-                                    view_name, existing_rule.name, e
-                                );
-                            }
+                if let Some(ref view_name) = existing_rule.materialized_view_name {
+                    match materialized_view_generator.drop_view(view_name).await {
+                        Ok(_) => {
+                            info!(
+                                "Dropped materialized view {} for rule {} (transitioned from real-time)",
+                                view_name, existing_rule.name
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to drop materialized view {} for rule {}: {}",
+                                view_name, existing_rule.name, e
+                            );
                         }
                     }
                 }
@@ -553,9 +519,7 @@ impl DetectionService {
     pub async fn delete_rule_with_mode(
         &self,
         id: Uuid,
-        materialized_view_generator: Option<
-            &super::super::materialized_view::MaterializedViewGenerator,
-        >,
+        materialized_view_generator: &super::super::materialized_view::MaterializedViewGenerator,
     ) -> Result<(), DetectionError> {
         use crate::models::detection_rule::DetectionMode;
 
@@ -571,22 +535,20 @@ impl DetectionService {
         match rule.detection_mode {
             DetectionMode::RealTime => {
                 // Drop materialized view
-                if let Some(generator) = materialized_view_generator {
-                    if let Some(ref view_name) = rule.materialized_view_name {
-                        match generator.drop_view(view_name).await {
-                            Ok(_) => {
-                                info!(
-                                    "Dropped materialized view {} for deleted rule {}",
-                                    view_name, rule.name
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to drop materialized view {} for rule {}: {}",
-                                    view_name, rule.name, e
-                                );
-                                // Continue with deletion even if view drop fails
-                            }
+                if let Some(ref view_name) = rule.materialized_view_name {
+                    match materialized_view_generator.drop_view(view_name).await {
+                        Ok(_) => {
+                            info!(
+                                "Dropped materialized view {} for deleted rule {}",
+                                view_name, rule.name
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to drop materialized view {} for rule {}: {}",
+                                view_name, rule.name, e
+                            );
+                            // Continue with deletion even if view drop fails
                         }
                     }
                 }

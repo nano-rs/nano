@@ -24,13 +24,12 @@ use nanosiem_core::onboarding::OnboardingRepository;
 use nanosiem_core::prevalence::PrevalenceService;
 use nanosiem_core::tuning::{NotificationService, TuningRepository};
 use nanosiem_core::{
-    Database, DetectionService, DiskPressureConfig, DiskPressureService, FeedService,
-    IngestionService, IpAllowlistService, LogSourceService, LogTelemetryService, ParserService,
-    QueryLibraryRepository, SearchService, SourceConfigService, db::TableNames, generate_node_id,
+    DetectionService, DiskPressureConfig, DiskPressureService, FeedService, IpAllowlistService,
+    LogSourceService, LogTelemetryService, ParserService, QueryLibraryRepository, SearchService,
+    SourceConfigService, generate_node_id,
 };
 #[cfg(feature = "enterprise")]
 use nanosiem_enterprise::risk::RiskAnalyticsService;
-use sqlx::PgPool;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio::sync::RwLock;
@@ -38,149 +37,9 @@ use tokio::sync::RwLock;
 use crate::config::ApiConfig;
 
 impl AppState {
-    /// Create a new application state with PostgreSQL only (legacy mode)
-    ///
-    /// This constructor is for backward compatibility when ClickHouse is not available.
-    pub fn new(pool: PgPool, config: ApiConfig) -> Self {
-        let enrichment_repo = EnrichmentRepository::new(pool.clone());
-        let enrichment_service = EnrichmentService::with_defaults(enrichment_repo);
-
-        // Create identity sync service
-        let identity_repo = IdentityRepository::new(pool.clone());
-        let identity_service = Arc::new(IdentitySyncService::new(identity_repo));
-
-        // Create lookup service for search enrichment
-        let lookup_repo = LookupRepository::new(pool.clone());
-        let lookup_service = LookupService::new(lookup_repo);
-
-        // Initialize auth services
-        let (
-            auth_service,
-            token_service,
-            api_key_service,
-            session_service,
-            permission_service,
-            user_repo,
-            group_repo,
-            role_repo,
-            audit_repo,
-            auth_enabled,
-        ) = Self::init_auth_services(pool.clone(), &config);
-
-        // Create OIDC repository and service
-        let oidc_repo = OidcRepository::new(pool.clone());
-        let oidc_service = Arc::new(OidcService::new(
-            oidc_repo.clone(),
-            user_repo.clone(),
-            group_repo.clone(),
-            (*audit_repo).clone(),
-        ));
-
-        // Create notification service for tuning alerts
-        let notification_service = Arc::new(NotificationService::new(pool.clone()));
-
-        // Create tuning repository for proposal management
-        let tuning_repository = Arc::new(TuningRepository::new(pool.clone()));
-
-        // Create inputlookup service for URL-based enrichment
-        let inputlookup_service = InputLookupService::new(InputLookupConfig::default());
-
-        // Create search service and add inputlookup
-        let mut search_service = SearchService::with_lookup(pool.clone(), lookup_service);
-        search_service.set_inputlookup_service(inputlookup_service);
-
-        let node_id = generate_node_id();
-        #[cfg(feature = "enterprise")]
-        let (case_events_tx, _) = tokio::sync::broadcast::channel(256);
-
-        Self {
-            search_service,
-            detection_service: DetectionService::new(pool.clone()),
-            distributed_scheduler: Arc::new(RwLock::new(None)),
-            node_id,
-            realtime_evaluator: Arc::new(RealtimeEvaluator::new(pool.clone())),
-            ingestion: Arc::new(IngestionService::with_defaults(pool.clone())),
-            enrichment: Arc::new(RwLock::new(enrichment_service)),
-            feed_service: FeedService::new(pool.clone()),
-            parser_service: ParserService::with_vector_config_dir(
-                pool.clone(),
-                get_vector_config_dir(),
-            ),
-            log_source_service: LogSourceService::with_vector_config_dir(
-                pool.clone(),
-                get_vector_config_dir(),
-            ),
-            // PostgreSQL-only mode — no ClickHouse client, so the rollup
-            // service returns Ok(None) for every read and callers degrade
-            // gracefully (per CLAUDE.md "Graceful degradation").
-            log_telemetry_service: LogTelemetryService::new(None, TableNames::new(false)),
-            source_config_service: SourceConfigService::with_vector_config_dir(
-                pool.clone(),
-                get_vector_config_dir(),
-            ),
-            #[cfg(feature = "enterprise")]
-            melod_service: Arc::new(RwLock::new(None)),
-            #[cfg(feature = "enterprise")]
-            risk_service: RiskAnalyticsService::new(pool.clone()),
-            query_library: QueryLibraryRepository::new(pool.clone()),
-            dual_pool: None,
-            materialized_view_generator: None,
-            #[cfg(feature = "enterprise")]
-            melod_job_repo: MelodJobRepository::new(pool.clone()),
-            #[cfg(feature = "enterprise")]
-            wizard_session_repo: WizardSessionRepository::new(pool.clone()),
-            #[cfg(feature = "enterprise")]
-            melod_session_repo: MelodSessionRepository::new(pool.clone()),
-            ip_allowlist_service: Arc::new(IpAllowlistService::new(pool.clone())),
-            onboarding_repo: OnboardingRepository::new(pool.clone()),
-            pool,
-            config: Arc::new(config),
-            // Auth services
-            auth_service,
-            token_service,
-            api_key_service,
-            session_service,
-            permission_service,
-            user_repo,
-            group_repo,
-            role_repo,
-            audit_repo,
-            oidc_repo,
-            oidc_service,
-            auth_enabled,
-            notification_service,
-            tuning_repository,
-            task_handles: Arc::new(RwLock::new(Vec::new())),
-            // No audit emitter/query in PostgreSQL-only mode (requires DualPool for ClickHouse)
-            audit_emitter: None,
-            audit_query_service: None,
-            // Agent config registry initialized in reload_melod_service
-            #[cfg(feature = "enterprise")]
-            agent_config_registry: Arc::new(RwLock::new(None)),
-            // Signal processor requires DualPool, not available in PostgreSQL-only mode
-            signal_processor: None,
-            // Disk pressure requires ClickHouse, not available in PostgreSQL-only mode
-            disk_pressure_service: None,
-            ingestion_paused: Arc::new(AtomicBool::new(false)),
-            identity_service,
-            demo_service: None,
-            license_status: Arc::new(RwLock::new(nanosiem_core::license::LicenseStatus::default())),
-            encryption_service: Arc::new(nanosiem_core::crypto::EncryptionService::from_env()),
-            #[cfg(feature = "enterprise")]
-            case_events_tx,
-            #[cfg(feature = "enterprise")]
-            presence_tracker: Arc::new(nanosiem_enterprise::PresenceTracker::new()),
-            marketplace_coverage_cache: Arc::new(
-                nanosiem_core::marketplace::MarketplaceCoverageCache::new(),
-            ),
-            search_result_cache: None,
-            rule_test_in_flight: Arc::new(dashmap::DashMap::new()),
-        }
-    }
-
     /// Create a new application state with DualPool (ClickHouse + PostgreSQL)
     ///
-    /// This is the preferred constructor for production use:
+    /// Both pools are required:
     /// - ClickHouse is used for log storage and queries
     /// - PostgreSQL is used for metadata, configuration, and AI-related data
     ///
@@ -331,7 +190,6 @@ impl AppState {
             // Services using DualPool for ClickHouse log queries
             search_service,
             detection_service,
-            ingestion: Arc::new(IngestionService::with_defaults_dual_pool(dual_pool.clone())),
             realtime_evaluator: Arc::new(realtime_evaluator),
             feed_service: FeedService::with_dual_pool(&dual_pool),
 
@@ -352,7 +210,7 @@ impl AppState {
             // the `_distributed` wrapper automatically in cluster mode (see
             // `DISTRIBUTED_TABLE_SET` in `nanosiem-core/src/db/dual_pool.rs`).
             log_telemetry_service: LogTelemetryService::new(
-                Some(dual_pool.clickhouse().clone()),
+                dual_pool.clickhouse().clone(),
                 dual_pool.table_names(),
             ),
             source_config_service: SourceConfigService::with_vector_config_dir(
@@ -376,8 +234,8 @@ impl AppState {
             ip_allowlist_service: Arc::new(IpAllowlistService::new(pg_pool.clone())),
             onboarding_repo: OnboardingRepository::new(pg_pool.clone()),
             pool: pg_pool,
-            dual_pool: Some(dual_pool),
-            materialized_view_generator: Some(Arc::new(mv_generator)),
+            dual_pool,
+            materialized_view_generator: Arc::new(mv_generator),
             config: Arc::new(config),
 
             // Auth services
@@ -397,15 +255,15 @@ impl AppState {
             tuning_repository,
             task_handles: Arc::new(RwLock::new(Vec::new())),
             // Audit emitter and query service for ClickHouse audit logging
-            audit_emitter: Some(audit_emitter),
-            audit_query_service: Some(audit_query_service),
+            audit_emitter,
+            audit_query_service,
             // Agent config registry initialized in reload_melod_service
             #[cfg(feature = "enterprise")]
             agent_config_registry,
             // Signal processor for bridging ClickHouse signals to PostgreSQL alerts
-            signal_processor: Some(signal_processor),
+            signal_processor,
             // Disk pressure service for automatic partition eviction
-            disk_pressure_service: Some(disk_pressure_service),
+            disk_pressure_service,
             ingestion_paused,
             identity_service,
             demo_service: None,
@@ -425,8 +283,8 @@ impl AppState {
 
     /// Try to create application state with DualPool from environment
     ///
-    /// Attempts to initialize DualPool from environment variables.
-    /// Falls back to PostgreSQL-only mode if ClickHouse is not configured.
+    /// Both ClickHouse and PostgreSQL are required — boot fails fast if either is
+    /// unavailable. The PG-only fallback was removed in NAN-800.
     ///
     /// Requirements: 1.1, 1.2, 1.3, 1.5
     pub async fn try_with_dual_pool(config: ApiConfig) -> Result<Self, DualPoolError> {
@@ -596,10 +454,5 @@ impl AppState {
         }
 
         Ok(state)
-    }
-
-    /// Create application state from database (PostgreSQL only, legacy)
-    pub fn from_database(db: &Database, config: ApiConfig) -> Self {
-        Self::new(db.pool().clone(), config)
     }
 }

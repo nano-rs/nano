@@ -1017,10 +1017,9 @@ pub async fn refresh_coverage(
 /// Construct a coverage service wired to the shared cache. Factored out so
 /// the GET and refresh handlers can't drift apart on which cache they use.
 fn build_coverage_service(state: &AppState) -> MarketplaceCoverageService {
-    let ch_client = state.dual_pool.as_ref().map(|d| d.clickhouse().clone());
     MarketplaceCoverageService::new_with_cache(
         state.pool.clone(),
-        ch_client,
+        state.dual_pool.clickhouse().clone(),
         (*state.marketplace_coverage_cache).clone(),
     )
 }

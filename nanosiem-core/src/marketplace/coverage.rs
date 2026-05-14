@@ -209,17 +209,11 @@ async fn fetch_counts(ch: &ChClient) -> CoverageCounts {
 #[derive(Clone)]
 pub struct MarketplaceCoverageService {
     pool: PgPool,
-    ch_client: Option<ChClient>,
+    ch_client: ChClient,
     cache: MarketplaceCoverageCache,
 }
 
 impl MarketplaceCoverageService {
-    /// Construct a service with no shared cache — every call hits Postgres
-    /// + ClickHouse fresh. Used in tests and as the legacy entry point.
-    pub fn new(pool: PgPool, ch_client: Option<ChClient>) -> Self {
-        Self::new_with_cache(pool, ch_client, MarketplaceCoverageCache::new())
-    }
-
     /// Construct a service that consults `cache` before recomputing. In
     /// production the cache is Dragonfly-backed (see
     /// [`MarketplaceCoverageCache::with_redis`]), so a slow recompute on
@@ -227,7 +221,7 @@ impl MarketplaceCoverageService {
     /// 6 hours.
     pub fn new_with_cache(
         pool: PgPool,
-        ch_client: Option<ChClient>,
+        ch_client: ChClient,
         cache: MarketplaceCoverageCache,
     ) -> Self {
         Self {
@@ -275,12 +269,8 @@ impl MarketplaceCoverageService {
         .fetch_all(&self.pool)
         .await?;
 
-        // 2. Fan one query at ClickHouse (or zero everything if it's not
-        // available — we return a valid response so the UI can still render).
-        let counts = match &self.ch_client {
-            Some(ch) => fetch_counts(ch).await,
-            None => CoverageCounts::default(),
-        };
+        // 2. Fan one query at ClickHouse.
+        let counts = fetch_counts(&self.ch_client).await;
 
         // 3. Project each artifact row using the counts + installed set + the
         // recommended map.

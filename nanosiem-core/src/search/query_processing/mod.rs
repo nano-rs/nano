@@ -2,6 +2,7 @@
 
 //! Query processing utilities for command extraction and manipulation
 
+pub mod auto_sort;
 pub mod command_extraction;
 pub mod query_manipulation;
 
@@ -19,6 +20,7 @@ pub use command_extraction::{
     LateralCommandInfo, LookupCommandInfo, OomRisk, PanelBlockedCommand, PrevalenceCommandInfo,
     TreeCommandInfo, FUNNEL_DROPPER_FIELDS, HEAVY_TIME_RANGE_DAYS,
 };
+pub use auto_sort::{apply_auto_sort, auto_sort_warning, AutoSortDecision};
 pub use query_manipulation::{
     enforce_non_audit_query, enforce_source_type_exclusion, strip_ai_and_after,
     strip_inputlookup_and_after, strip_lateral_and_after, strip_post_prevalence_commands,

@@ -155,13 +155,7 @@ async fn check_service_health(url: &str, request_id: Option<&str>) -> ServiceHea
     security(())
 )]
 pub async fn health_check(State(state): State<AppState>) -> Json<PublicHealthResponse> {
-    // Simple check - just verify we can reach the database
-    let is_healthy = if let Some(dual_pool) = state.dual_pool() {
-        let health_status = dual_pool.health_check().await;
-        health_status.is_healthy()
-    } else {
-        sqlx::query("SELECT 1").fetch_one(&state.pool).await.is_ok()
-    };
+    let is_healthy = state.dual_pool().health_check().await.is_healthy();
 
     Json(PublicHealthResponse {
         status: if is_healthy {
@@ -227,125 +221,62 @@ pub async fn health_check_detailed(
         search: search_health,
     };
 
-    // Check if we're in dual pool mode
-    if let Some(dual_pool) = state.dual_pool() {
-        // Use DualPool health check for comprehensive status
-        let health_status = dual_pool.health_check().await;
+    // Use DualPool health check for comprehensive status
+    let health_status = state.dual_pool().health_check().await;
 
-        // Check overall health first before moving values
-        let is_healthy = health_status.is_healthy();
-        let postgres_healthy = health_status.postgres_healthy;
-        let clickhouse_healthy = health_status.clickhouse_healthy;
+    let is_healthy = health_status.is_healthy();
+    let postgres_healthy = health_status.postgres_healthy;
+    let clickhouse_healthy = health_status.clickhouse_healthy;
 
-        let postgres_health = DatabaseHealth {
-            status: if postgres_healthy {
-                "connected"
-            } else {
-                "error"
-            }
-            .to_string(),
-            latency_ms: health_status.postgres_latency_ms,
-            error: health_status.postgres_error,
-        };
+    let postgres_health = DatabaseHealth {
+        status: if postgres_healthy { "connected" } else { "error" }.to_string(),
+        latency_ms: health_status.postgres_latency_ms,
+        error: health_status.postgres_error,
+    };
 
-        let clickhouse_health = DatabaseHealth {
-            status: if clickhouse_healthy {
-                "connected"
-            } else {
-                "error"
-            }
-            .to_string(),
-            latency_ms: health_status.clickhouse_latency_ms,
-            error: health_status.clickhouse_error,
-        };
+    let clickhouse_health = DatabaseHealth {
+        status: if clickhouse_healthy { "connected" } else { "error" }.to_string(),
+        latency_ms: health_status.clickhouse_latency_ms,
+        error: health_status.clickhouse_error,
+    };
 
-        // Check downstream service health
-        let ingest_ok = services_health.ingest.status == "healthy";
-        let search_ok = services_health.search.status == "healthy";
+    let ingest_ok = services_health.ingest.status == "healthy";
+    let search_ok = services_health.search.status == "healthy";
 
-        // Overall status considers databases and optionally downstream services
-        // Main API is "healthy" if databases are OK
-        // Main API is "degraded" if databases are OK but downstream services are not
-        let overall_status = if is_healthy {
-            if ingest_ok && search_ok {
-                "ok"
-            } else if services_health.ingest.status == "unavailable"
-                && services_health.search.status == "unavailable"
-            {
-                // Services not deployed yet
-                "ok"
-            } else {
-                "degraded"
-            }
+    let overall_status = if is_healthy {
+        if ingest_ok && search_ok {
+            "ok"
+        } else if services_health.ingest.status == "unavailable"
+            && services_health.search.status == "unavailable"
+        {
+            // Services not deployed yet
+            "ok"
         } else {
-            "unhealthy"
-        };
-
-        let database_status = if is_healthy {
-            "all connected".to_string()
-        } else if postgres_healthy {
-            "clickhouse error".to_string()
-        } else if clickhouse_healthy {
-            "postgres error".to_string()
-        } else {
-            "both databases error".to_string()
-        };
-
-        Ok(Json(DualHealthResponse {
-            status: overall_status.to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            database: database_status,
-            postgres: postgres_health,
-            clickhouse: Some(clickhouse_health),
-            dual_mode_enabled: true,
-            services: Some(services_health),
-        }))
+            "degraded"
+        }
     } else {
-        // PostgreSQL-only mode
-        let start = std::time::Instant::now();
-        let pg_result = sqlx::query("SELECT 1").fetch_one(&state.pool).await;
-        let latency_ms = start.elapsed().as_millis() as u64;
+        "unhealthy"
+    };
 
-        let (pg_status, pg_error) = match pg_result {
-            Ok(_) => ("connected".to_string(), None),
-            Err(e) => ("error".to_string(), Some(e.to_string())),
-        };
+    let database_status = if is_healthy {
+        "all connected".to_string()
+    } else if postgres_healthy {
+        "clickhouse error".to_string()
+    } else if clickhouse_healthy {
+        "postgres error".to_string()
+    } else {
+        "both databases error".to_string()
+    };
 
-        let postgres_health = DatabaseHealth {
-            status: pg_status.clone(),
-            latency_ms,
-            error: pg_error,
-        };
-
-        // Check downstream service health
-        let ingest_ok = services_health.ingest.status == "healthy";
-        let search_ok = services_health.search.status == "healthy";
-
-        let overall_status = if pg_status == "connected" {
-            if ingest_ok && search_ok {
-                "ok"
-            } else if services_health.ingest.status == "unavailable"
-                && services_health.search.status == "unavailable"
-            {
-                // Services not deployed yet - this is OK for Main API
-                "ok"
-            } else {
-                "degraded"
-            }
-        } else {
-            "unhealthy"
-        };
-
-        Ok(Json(DualHealthResponse {
-            status: overall_status.to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            database: pg_status,
-            postgres: postgres_health,
-            clickhouse: None,
-            dual_mode_enabled: false,
-            services: Some(services_health),
-        }))
-    }
+    Ok(Json(DualHealthResponse {
+        status: overall_status.to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        database: database_status,
+        postgres: postgres_health,
+        clickhouse: Some(clickhouse_health),
+        dual_mode_enabled: true,
+        services: Some(services_health),
+    }))
 }
 
 #[derive(utoipa::OpenApi)]

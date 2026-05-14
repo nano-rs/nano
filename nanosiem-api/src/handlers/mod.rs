@@ -96,7 +96,6 @@ pub mod recent_activity;
 pub use nanosiem_enterprise::handlers::risk;
 pub mod roles;
 pub mod rule_repositories;
-pub mod scheduler;
 pub mod search;
 pub mod search_history;
 pub mod sessions;
@@ -139,8 +138,6 @@ pub use recent_activity::*;
 // route bindings reference items as `handlers::risk::*` so a wildcard
 // re-export here is unnecessary.
 pub use roles::*;
-// Scheduled job handlers kept for backwards compat but no longer routed.
-// New ingestion endpoints are in handlers::lookup::ingestion.
 pub use search::*;
 pub use search_history::*;
 pub use sessions::*;
@@ -154,32 +151,30 @@ pub use users::*;
 
 impl AuditExt for AppState {
     fn emit_audit(&self, event: AuditEvent) {
-        if let Some(ref emitter) = self.audit_emitter {
-            let emitter = emitter.clone();
-            let user_repo = self.user_repo.clone();
-            tokio::spawn(async move {
-                // Resolve actor name if we have an actor_id but no name
-                let event = if event.actor_id.is_some() && event.actor_name.is_none() {
-                    let mut enriched = event;
-                    if let Some(actor_id) = enriched.actor_id {
-                        if let Ok(user) = user_repo.get_user_by_id(actor_id).await {
-                            enriched.actor_name = Some(user.name);
-                        }
+        let emitter = self.audit_emitter.clone();
+        let user_repo = self.user_repo.clone();
+        tokio::spawn(async move {
+            // Resolve actor name if we have an actor_id but no name
+            let event = if event.actor_id.is_some() && event.actor_name.is_none() {
+                let mut enriched = event;
+                if let Some(actor_id) = enriched.actor_id {
+                    if let Ok(user) = user_repo.get_user_by_id(actor_id).await {
+                        enriched.actor_name = Some(user.name);
                     }
-                    enriched
-                } else {
-                    event
-                };
-
-                if let Err(e) = emitter.emit(&event).await {
-                    tracing::warn!(
-                        source = %event.source,
-                        action = %event.action,
-                        error = %e,
-                        "Failed to emit audit event"
-                    );
                 }
-            });
-        }
+                enriched
+            } else {
+                event
+            };
+
+            if let Err(e) = emitter.emit(&event).await {
+                tracing::warn!(
+                    source = %event.source,
+                    action = %event.action,
+                    error = %e,
+                    "Failed to emit audit event"
+                );
+            }
+        });
     }
 }

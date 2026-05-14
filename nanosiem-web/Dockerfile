@@ -29,6 +29,13 @@ RUN npm run build
 # Production stage - serve with nginx
 FROM nginx:alpine
 
+LABEL org.opencontainers.image.source="https://github.com/nano-rs/nano" \
+      org.opencontainers.image.url="https://nano.rs" \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later" \
+      org.opencontainers.image.vendor="nano" \
+      org.opencontainers.image.title="nano-web" \
+      org.opencontainers.image.description="nano web UI — React SPA for the open-core SIEM"
+
 # Copy built assets
 COPY --from=builder /app/dist /usr/share/nginx/html
 

@@ -202,28 +202,7 @@ async fn get_event_count(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<i64, ApiError> {
-    // Try ClickHouse first if dual_pool is available
-    if let Some(ref dual_pool) = state.dual_pool {
-        let ch_client = dual_pool.clickhouse();
-        return get_event_count_clickhouse(ch_client, start, end).await;
-    }
-
-    // Fallback to PostgreSQL
-    let sql = r#"
-        SELECT COUNT(*) as count
-        FROM logs
-        WHERE timestamp >= $1 AND timestamp < $2
-    "#;
-
-    let row = sqlx::query(sql)
-        .bind(start)
-        .bind(end)
-        .fetch_one(&state.pool)
-        .await
-        .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
-
-    let count: i64 = row.get("count");
-    Ok(count)
+    get_event_count_clickhouse(state.dual_pool.clickhouse(), start, end).await
 }
 
 /// Get event count from ClickHouse using system.parts for fast approximate counts
@@ -332,80 +311,31 @@ async fn get_activity_timeline(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<Vec<ActivityPoint>, ApiError> {
-    // Read from the rollup when ClickHouse is available (NAN-736).
-    // Replaces an un-scoped `count(*) * 10 SAMPLE 0.1 FROM logs` per page load
-    // with a fixed-cost read against the per-source 5-minute rollup. The
-    // dashboard timeline is always a recent window (24h max for the dashboard
-    // call site), well within the rollup's 7-day TTL.
-    if state.dual_pool.is_some() {
-        let window_hours = (end - start).num_hours().max(1);
-        match timeout(
-            TokioDuration::from_secs(DASHBOARD_QUERY_TIMEOUT_SECS),
-            state
-                .log_telemetry_service
-                .buckets_all(window_hours, nanosiem_core::LogTelemetryBucketSize::Hour),
-        )
-        .await
-        {
-            Ok(Ok(Some(points))) => {
-                return Ok(points
-                    .into_iter()
-                    .map(|p| ActivityPoint {
-                        time: p.bucket_start.to_rfc3339(),
-                        event_count: p.events as i64,
-                        alert_count: 0,
-                    })
-                    .collect());
-            }
-            Ok(Ok(None)) => {
-                // ClickHouse not configured — fall through to PG path.
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    error = %e,
-                    "rollup activity timeline read failed; falling back to PostgreSQL"
-                );
-            }
-            Err(_) => {
-                return Err(ApiError::Timeout(
-                    "Dashboard activity timeline query timed out".to_string(),
-                ));
-            }
-        }
-    }
+    // Read from the per-source 5-minute rollup (NAN-736). Replaces an
+    // un-scoped `count(*) * 10 SAMPLE 0.1 FROM logs` per page load with a
+    // fixed-cost rollup read. The dashboard timeline is always a recent window
+    // (24h max for the dashboard call site), well within the rollup's 7-day TTL.
+    let window_hours = (end - start).num_hours().max(1);
+    let points = timeout(
+        TokioDuration::from_secs(DASHBOARD_QUERY_TIMEOUT_SECS),
+        state
+            .log_telemetry_service
+            .buckets_all(window_hours, nanosiem_core::LogTelemetryBucketSize::Hour),
+    )
+    .await
+    .map_err(|_| {
+        ApiError::Timeout("Dashboard activity timeline query timed out".to_string())
+    })?
+    .map_err(|e| ApiError::InternalError(e.to_string()))?;
 
-    // Fallback to PostgreSQL when ClickHouse is unavailable or the rollup
-    // isn't configured for this deployment.
-    let sql = r#"
-        SELECT
-            date_trunc('hour', timestamp) as hour,
-            COUNT(*) as event_count
-        FROM logs
-        WHERE timestamp >= $1 AND timestamp < $2
-        GROUP BY date_trunc('hour', timestamp)
-        ORDER BY hour
-    "#;
-
-    let rows = sqlx::query(sql)
-        .bind(start)
-        .bind(end)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
-
-    let mut activity = Vec::new();
-    for row in rows {
-        let hour: DateTime<Utc> = row.get("hour");
-        let event_count: i64 = row.get("event_count");
-
-        activity.push(ActivityPoint {
-            time: hour.to_rfc3339(),
-            event_count,
+    Ok(points
+        .into_iter()
+        .map(|p| ActivityPoint {
+            time: p.bucket_start.to_rfc3339(),
+            event_count: p.events as i64,
             alert_count: 0,
-        });
-    }
-
-    Ok(activity)
+        })
+        .collect())
 }
 
 /// OpenAPI documentation for system endpoints

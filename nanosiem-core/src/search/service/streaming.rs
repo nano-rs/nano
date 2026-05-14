@@ -76,6 +76,15 @@ impl SearchService {
             }
         };
 
+        // NAN-806: apply implicit sort after a trailing `stats`/`chart` with a
+        // `by` clause so the outer LIMIT returns top-N groups instead of an
+        // arbitrary hash-bucket slice. Streamable queries aren't aggregations,
+        // so this only changes behavior on the buffered-aggregate path.
+        // Warning emission for the streaming path is deferred (would require a
+        // dedicated stream event) — the table-view `search()` endpoint already
+        // surfaces it.
+        let (query, _auto_sort_decision) = apply_auto_sort(query);
+
         // Pre-execution guardrail: reject queries that would cause unbounded memory usage (OOM)
         if let Some(risk) = detect_oom_risk(&query) {
             send_event!(SearchStreamEvent::Error {

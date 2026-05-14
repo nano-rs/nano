@@ -188,14 +188,10 @@ async fn enrich_list_with_rollup(
         return Ok(());
     }
 
-    let stats = match state
+    let stats = state
         .log_telemetry_service
         .stats_by_source_type(&union, 24)
-        .await?
-    {
-        Some(map) => map,
-        None => return Ok(()), // ClickHouse not configured.
-    };
+        .await?;
 
     for cfg in configs.iter_mut() {
         let Some(rules) = rules_by_config.get(&cfg.id) else {
@@ -261,14 +257,10 @@ async fn enrich_full_with_rollup(
         return Ok(());
     }
 
-    let stats = match state
+    let stats = state
         .log_telemetry_service
         .stats_by_source_type(&source_types, 24)
-        .await?
-    {
-        Some(map) => map,
-        None => return Ok(()),
-    };
+        .await?;
 
     // Config-level: events + bytes + last_event_at across distinct
     // target_source_types.

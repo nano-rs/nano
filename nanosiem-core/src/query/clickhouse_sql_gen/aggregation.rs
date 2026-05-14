@@ -130,27 +130,9 @@ impl ClickHouseSqlGenerator {
                     }
                 };
 
-                // Determine the alias:
-                // 1. Use explicit alias if provided
-                // 2. For count(*), default to "count"
-                // 3. For values/list with a field, use "values_field" or "list_field" to avoid conflicts
-                // 4. For other aggregations, use the function name (e.g., "dc", "sum", "avg")
-                let alias_name = if let Some(a) = agg.alias.as_ref() {
-                    a.clone()
-                } else if agg.field.is_none() && agg.func == AggFunc::Count {
-                    "count".to_string()
-                } else if matches!(agg.func, AggFunc::Values | AggFunc::List) {
-                    // For values() and list(), include field name in alias to avoid conflicts
-                    // when multiple values() calls are used
-                    if let Some(field) = agg.field.as_ref() {
-                        format!("{}_{}", agg.func.as_str(), field)
-                    } else {
-                        agg.func.as_str().to_string()
-                    }
-                } else {
-                    // Use function name as default alias for aggregations
-                    agg.func.as_str().to_string()
-                };
+                // Output column name. The scheme lives on `Aggregation::output_alias`
+                // so downstream rewrites (auto-sort) can reference the same name.
+                let alias_name = agg.output_alias();
 
                 // Detect alias-shadows-field conflicts: e.g. `min(timestamp) AS timestamp`
                 // ClickHouse inlines CTEs and expands aliases, so a downstream CTE

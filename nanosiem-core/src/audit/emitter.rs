@@ -15,29 +15,17 @@ use crate::ingestion::ClickHouseLogRow;
 /// This writes audit events directly to ClickHouse as searchable logs
 /// with source_type='audit'.
 pub struct AuditEmitter {
-    dual_pool: Option<DualPool>,
+    dual_pool: DualPool,
 }
 
 impl AuditEmitter {
     /// Create a new audit emitter with DualPool for ClickHouse storage
     pub fn new(dual_pool: DualPool) -> Self {
-        Self {
-            dual_pool: Some(dual_pool),
-        }
-    }
-
-    /// Create a no-op audit emitter (for testing or when ClickHouse is disabled)
-    pub fn noop() -> Self {
-        Self { dual_pool: None }
+        Self { dual_pool }
     }
 
     /// Emit an audit event to ClickHouse
     pub async fn emit(&self, event: &AuditEvent) -> Result<(), AuditEmitError> {
-        let dual_pool = match &self.dual_pool {
-            Some(pool) => pool,
-            None => return Ok(()), // No-op mode
-        };
-
         let parsed_log = event.to_parsed_log();
         let ingest_time = Utc::now();
 
@@ -45,7 +33,7 @@ impl AuditEmitter {
         let row = ClickHouseLogRow::from_parsed_log(&parsed_log, ingest_time);
 
         // Insert into ClickHouse
-        let client = dual_pool.clickhouse();
+        let client = self.dual_pool.clickhouse();
         let mut insert = client
             .insert::<ClickHouseLogRow>("logs")
             .await
@@ -76,11 +64,6 @@ impl AuditEmitter {
             return Ok(());
         }
 
-        let dual_pool = match &self.dual_pool {
-            Some(pool) => pool,
-            None => return Ok(()), // No-op mode
-        };
-
         let ingest_time = Utc::now();
 
         // Convert all events to ClickHouse rows
@@ -93,7 +76,7 @@ impl AuditEmitter {
             .collect();
 
         // Insert into ClickHouse
-        let client = dual_pool.clickhouse();
+        let client = self.dual_pool.clickhouse();
         let mut insert = client
             .insert::<ClickHouseLogRow>("logs")
             .await

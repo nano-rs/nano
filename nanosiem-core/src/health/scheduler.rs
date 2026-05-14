@@ -5,7 +5,6 @@
 //! Background task that periodically checks AI provider and feed health,
 //! creates notifications for issues, and tracks issue resolution.
 
-use clickhouse::Client as ClickHouseClient;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
@@ -32,35 +31,7 @@ pub struct HealthScheduler {
 }
 
 impl HealthScheduler {
-    /// Create a new scheduler with PostgreSQL only
-    pub fn new(pool: PgPool, config: HealthSchedulerConfig) -> Self {
-        Self {
-            config,
-            health_repo: HealthRepository::new(pool.clone()),
-            notification_repo: NotificationRepository::new(pool.clone()),
-            ai_monitor: AiMonitor::new(pool.clone()),
-            feed_monitor: FeedMonitor::new(pool),
-            audit_emitter: AuditEmitter::noop(),
-        }
-    }
-
-    /// Create a new scheduler with ClickHouse support (legacy - prefer with_dual_pool)
-    pub fn with_clickhouse(
-        pool: PgPool,
-        ch_client: ClickHouseClient,
-        config: HealthSchedulerConfig,
-    ) -> Self {
-        Self {
-            config,
-            health_repo: HealthRepository::new(pool.clone()),
-            notification_repo: NotificationRepository::new(pool.clone()),
-            ai_monitor: AiMonitor::new(pool.clone()),
-            feed_monitor: FeedMonitor::with_clickhouse(pool, ch_client),
-            audit_emitter: AuditEmitter::noop(),
-        }
-    }
-
-    /// Create a new scheduler with DualPool support (recommended)
+    /// Create a new scheduler with DualPool support
     pub fn with_dual_pool(
         pool: PgPool,
         dual_pool: DualPool,
@@ -248,7 +219,7 @@ impl HealthScheduler {
                     "The {} AI provider is not responding{}",
                     status.provider_name, error_detail
                 )),
-                link: Some("/melod".to_string()),
+                link: Some("/settings/ai".to_string()),
                 metadata: serde_json::json!({
                     "provider_type": status.provider_type,
                     "provider_name": status.provider_name,

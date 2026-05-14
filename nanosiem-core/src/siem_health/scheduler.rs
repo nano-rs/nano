@@ -26,7 +26,7 @@ const INITIAL_DELAY_SECS: u64 = 5 * 60;
 
 pub fn start(
     pool: PgPool,
-    ch_client: Option<ClickHouseClient>,
+    ch_client: ClickHouseClient,
     is_clustered: bool,
     ai_analyzer: Arc<dyn SiemHealthAiAnalyzer>,
 ) -> tokio::task::JoinHandle<()> {
@@ -48,7 +48,7 @@ pub fn start(
         loop {
             run_health_check(
                 &pool,
-                ch_client.as_ref(),
+                &ch_client,
                 is_clustered,
                 ai_analyzer.as_ref(),
                 &repo,
@@ -68,7 +68,7 @@ pub fn start(
 /// in that case.
 pub async fn run_health_check(
     pool: &PgPool,
-    ch_client: Option<&ClickHouseClient>,
+    ch_client: &ClickHouseClient,
     is_clustered: bool,
     ai_analyzer: &dyn SiemHealthAiAnalyzer,
     repo: &SiemHealthRepository,
@@ -79,7 +79,7 @@ pub async fn run_health_check(
 /// Run a health check, optionally recording who triggered it.
 pub async fn run_health_check_with_trigger(
     pool: &PgPool,
-    ch_client: Option<&ClickHouseClient>,
+    ch_client: &ClickHouseClient,
     is_clustered: bool,
     ai_analyzer: &dyn SiemHealthAiAnalyzer,
     repo: &SiemHealthRepository,

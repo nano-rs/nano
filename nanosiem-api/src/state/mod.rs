@@ -33,7 +33,7 @@ use nanosiem_core::onboarding::OnboardingRepository;
 use nanosiem_core::tuning::{NotificationService, TuningRepository};
 use nanosiem_core::{
     DetectionService, DiskPressureService, DistributedDetectionScheduler, FeedService,
-    IngestionService, IpAllowlistService, LogSourceService, LogTelemetryService, ParserService,
+    IpAllowlistService, LogSourceService, LogTelemetryService, ParserService,
     QueryLibraryRepository, SearchService, SourceConfigService,
 };
 #[cfg(feature = "enterprise")]
@@ -59,15 +59,15 @@ fn get_vector_config_dir() -> String {
 
 /// Shared application state
 ///
-/// Supports two modes:
-/// - PostgreSQL-only mode (legacy): Uses PostgreSQL for all data
-/// - DualPool mode: Uses ClickHouse for logs, PostgreSQL for metadata
+/// Dual-database architecture: ClickHouse for logs, PostgreSQL for metadata.
+/// Both pools are required — boot fails fast if ClickHouse is unreachable
+/// (the PG-only "degraded" fallback was removed in NAN-800).
 #[derive(Clone)]
 pub struct AppState {
-    /// PostgreSQL connection pool (always available)
+    /// PostgreSQL connection pool
     pub pool: PgPool,
-    /// Optional DualPool for ClickHouse + PostgreSQL
-    pub dual_pool: Option<DualPool>,
+    /// DualPool for ClickHouse + PostgreSQL
+    pub dual_pool: DualPool,
     /// Search service
     pub search_service: SearchService,
     /// Detection service
@@ -79,8 +79,6 @@ pub struct AppState {
     pub node_id: String,
     /// Real-time evaluator for incoming events
     pub realtime_evaluator: Arc<RealtimeEvaluator>,
-    /// Ingestion service
-    pub ingestion: Arc<IngestionService>,
     /// Enrichment service
     pub enrichment: Arc<RwLock<EnrichmentService>>,
     /// Feed service
@@ -103,8 +101,8 @@ pub struct AppState {
     pub risk_service: RiskAnalyticsService,
     /// Query library repository
     pub query_library: QueryLibraryRepository,
-    /// Materialized view generator (optional, only available with DualPool)
-    pub materialized_view_generator: Option<Arc<MaterializedViewGenerator>>,
+    /// Materialized view generator
+    pub materialized_view_generator: Arc<MaterializedViewGenerator>,
     /// API configuration
     pub config: Arc<ApiConfig>,
     // Authentication and RBAC services
@@ -147,17 +145,17 @@ pub struct AppState {
     /// PostgreSQL-backed repository for meloD AI session persistence
     #[cfg(feature = "enterprise")]
     pub melod_session_repo: MelodSessionRepository,
-    /// Unified audit emitter for ClickHouse (optional, requires DualPool)
-    pub audit_emitter: Option<Arc<AuditEmitter>>,
+    /// Unified audit emitter for ClickHouse
+    pub audit_emitter: Arc<AuditEmitter>,
     /// Audit query service for reading audit events from ClickHouse
-    pub audit_query_service: Option<AuditQueryService>,
+    pub audit_query_service: AuditQueryService,
     /// Agent configuration registry for per-agent model settings
     #[cfg(feature = "enterprise")]
     pub agent_config_registry: Arc<RwLock<Option<Arc<AgentConfigRegistry>>>>,
-    /// Signal processor for bridging ClickHouse signals to PostgreSQL alerts (optional, requires DualPool)
-    pub signal_processor: Option<Arc<SignalProcessor>>,
-    /// Disk pressure service for automatic partition eviction (optional, requires DualPool)
-    pub disk_pressure_service: Option<Arc<DiskPressureService>>,
+    /// Signal processor for bridging ClickHouse signals to PostgreSQL alerts
+    pub signal_processor: Arc<SignalProcessor>,
+    /// Disk pressure service for automatic partition eviction
+    pub disk_pressure_service: Arc<DiskPressureService>,
     /// Shared flag: set to true by disk pressure service to pause ingestion
     pub ingestion_paused: Arc<AtomicBool>,
     /// Identity sync service for provider management and user directory
@@ -331,14 +329,9 @@ impl AppState {
         )
     }
 
-    /// Check if ClickHouse is enabled (DualPool mode)
-    pub fn is_clickhouse_enabled(&self) -> bool {
-        self.dual_pool.is_some()
-    }
-
-    /// Get a reference to the DualPool if available
-    pub fn dual_pool(&self) -> Option<&DualPool> {
-        self.dual_pool.as_ref()
+    /// Get a reference to the DualPool
+    pub fn dual_pool(&self) -> &DualPool {
+        &self.dual_pool
     }
 
     /// Set the meloD service
@@ -520,8 +513,8 @@ impl nanosiem_enterprise::handlers::custom_enrichment::CustomEnrichmentAppState 
     fn pool(&self) -> &PgPool {
         &self.pool
     }
-    fn dual_pool(&self) -> Option<&nanosiem_core::db::DualPool> {
-        self.dual_pool.as_ref()
+    fn dual_pool(&self) -> &nanosiem_core::db::DualPool {
+        &self.dual_pool
     }
     fn agent_config_registry(&self) -> &Arc<RwLock<Option<Arc<AgentConfigRegistry>>>> {
         &self.agent_config_registry
@@ -554,8 +547,8 @@ impl nanosiem_enterprise::handlers::cases::CasesAppState for AppState {
     fn pool(&self) -> &PgPool {
         &self.pool
     }
-    fn dual_pool(&self) -> Option<&nanosiem_core::db::DualPool> {
-        self.dual_pool.as_ref()
+    fn dual_pool(&self) -> &nanosiem_core::db::DualPool {
+        &self.dual_pool
     }
     fn user_repo(&self) -> &UserRepository {
         &self.user_repo

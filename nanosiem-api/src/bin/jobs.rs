@@ -11,7 +11,7 @@ use anyhow::Result;
 use nanosiem_api::{ApiConfig, AppMetrics, AppState};
 use nanosiem_core::leader::lock_ids;
 use nanosiem_core::license::checker::LicenseCheckerConfig;
-use nanosiem_core::{Database, LeaderElection, LicenseChecker};
+use nanosiem_core::{LeaderElection, LicenseChecker};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -24,35 +24,19 @@ async fn main() -> Result<()> {
     let config = ApiConfig::from_env();
     tracing::info!("Configuration loaded");
 
-    // Initialize AppState (DualPool or PG-only). SchemaBehind is a hard
-    // failure — refuse to start rather than degrading silently. (NAN-607)
+    // Initialize AppState with DualPool. Both ClickHouse and PostgreSQL are
+    // required; the historical PG-only fallback was removed in NAN-800.
+    // SchemaBehind is a hard failure — refuse to start rather than risking
+    // corruption against an out-of-date schema. (NAN-607)
     let mut state = match AppState::try_with_dual_pool(config.clone()).await {
-        Ok(state) => {
-            tracing::info!("DualPool mode enabled - using ClickHouse for log storage");
-            state
-        }
+        Ok(state) => state,
         Err(nanosiem_core::db::DualPoolError::SchemaBehind(msg)) => {
             tracing::error!("Refusing to start: {}", msg);
             return Err(anyhow::anyhow!("{}", msg));
         }
         Err(e) => {
-            tracing::info!(
-                "DualPool not available ({}), falling back to PostgreSQL-only mode",
-                e
-            );
-            let db = Database::connect(&config.database_url).await?;
-            let pg_pool: &sqlx::PgPool = db.pool();
-            // Open-tier migrations via the shared helper (handles fresh-init
-            // detection + snapshot + backfill per NAN-749).
-            nanosiem_core::db::run_postgres_migrations(pg_pool).await?;
-            #[cfg(feature = "enterprise")]
-            {
-                let mut overlay_migrator =
-                    sqlx::migrate!("../migrations/postgres-enterprise");
-                overlay_migrator.set_ignore_missing(true);
-                overlay_migrator.run(pg_pool).await?;
-            }
-            AppState::from_database(&db, config.clone())
+            tracing::error!("Refusing to start: DualPool initialization failed: {}", e);
+            return Err(anyhow::anyhow!("DualPool initialization failed: {}", e));
         }
     };
 

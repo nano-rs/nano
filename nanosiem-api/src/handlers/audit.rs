@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use nanosiem_core::audit::{ClickHouseAuditEntry, ClickHouseAuditQuery};
-use nanosiem_core::auth::{permissions, AuditLogQuery, AuditLogWithNames, AuditRepositoryError};
+use nanosiem_core::auth::{permissions, AuditLogWithNames, AuditRepositoryError};
 
 use crate::middleware::{check_permission, AuthContext};
 use crate::state::AppState;
@@ -194,54 +194,11 @@ pub async fn query_audit_logs(
     let limit = query.limit.unwrap_or(50).min(1000);
     let offset = query.offset.unwrap_or(0);
 
-    // Try ClickHouse first, fall back to PostgreSQL
-    if let Some(ref audit_query_service) = state.audit_query_service {
-        let ch_query = ClickHouseAuditQuery {
-            actor_id: effective_user_id,
-            action: query.action,
-            source: query.source,
-            resource_type: query.resource_type,
-            start_time: query.start_time,
-            end_time: query.end_time,
-            success: query.success,
-            limit: Some(limit),
-            offset: Some(offset),
-        };
-
-        let logs = audit_query_service.query(&ch_query).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(AuditApiError::new("query_error", &e.to_string())),
-            )
-        })?;
-
-        let count_query = ClickHouseAuditQuery {
-            limit: None,
-            offset: None,
-            ..ch_query
-        };
-        let total = audit_query_service.count(&count_query).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(AuditApiError::new("query_error", &e.to_string())),
-            )
-        })?;
-
-        let entries: Vec<AuditLogEntry> = logs.into_iter().map(AuditLogEntry::from).collect();
-
-        return Ok(Json(AuditLogListResponse {
-            logs: entries,
-            total: total as i64,
-            limit,
-            offset,
-        }));
-    }
-
-    // Fallback to PostgreSQL
-    let audit_query = AuditLogQuery {
-        user_id: effective_user_id,
-        action: query.action.clone(),
-        resource_type: query.resource_type.clone(),
+    let ch_query = ClickHouseAuditQuery {
+        actor_id: effective_user_id,
+        action: query.action,
+        source: query.source,
+        resource_type: query.resource_type,
         start_time: query.start_time,
         end_time: query.end_time,
         success: query.success,
@@ -249,40 +206,30 @@ pub async fn query_audit_logs(
         offset: Some(offset),
     };
 
-    let logs = state
-        .audit_repo
-        .query_logs(&audit_query)
-        .await
-        .map_err(|e| {
-            let (status, err) = AuditApiError::from_repo_error(&e);
-            (status, Json(err))
-        })?;
+    let logs = state.audit_query_service.query(&ch_query).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AuditApiError::new("query_error", &e.to_string())),
+        )
+    })?;
 
-    let count_query = AuditLogQuery {
-        user_id: effective_user_id,
-        action: query.action,
-        resource_type: query.resource_type,
-        start_time: query.start_time,
-        end_time: query.end_time,
-        success: query.success,
+    let count_query = ClickHouseAuditQuery {
         limit: None,
         offset: None,
+        ..ch_query
     };
-
-    let total = state
-        .audit_repo
-        .count_logs(&count_query)
-        .await
-        .map_err(|e| {
-            let (status, err) = AuditApiError::from_repo_error(&e);
-            (status, Json(err))
-        })?;
+    let total = state.audit_query_service.count(&count_query).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AuditApiError::new("query_error", &e.to_string())),
+        )
+    })?;
 
     let entries: Vec<AuditLogEntry> = logs.into_iter().map(AuditLogEntry::from).collect();
 
     Ok(Json(AuditLogListResponse {
         logs: entries,
-        total,
+        total: total as i64,
         limit,
         offset,
     }))
@@ -348,53 +295,26 @@ pub async fn export_audit_logs(
     let limit = query.limit.unwrap_or(10000).min(100000);
     let format = query.format.unwrap_or_default();
 
-    // Try ClickHouse first
-    let entries: Vec<AuditLogEntry> =
-        if let Some(ref audit_query_service) = state.audit_query_service {
-            let ch_query = ClickHouseAuditQuery {
-                actor_id: effective_user_id,
-                action: query.action,
-                source: query.source,
-                resource_type: query.resource_type,
-                start_time: query.start_time,
-                end_time: query.end_time,
-                success: query.success,
-                limit: Some(limit),
-                offset: Some(0),
-            };
+    let ch_query = ClickHouseAuditQuery {
+        actor_id: effective_user_id,
+        action: query.action,
+        source: query.source,
+        resource_type: query.resource_type,
+        start_time: query.start_time,
+        end_time: query.end_time,
+        success: query.success,
+        limit: Some(limit),
+        offset: Some(0),
+    };
 
-            let logs = audit_query_service.query(&ch_query).await.map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(AuditApiError::new("query_error", &e.to_string())),
-                )
-            })?;
+    let logs = state.audit_query_service.query(&ch_query).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(AuditApiError::new("query_error", &e.to_string())),
+        )
+    })?;
 
-            logs.into_iter().map(AuditLogEntry::from).collect()
-        } else {
-            // Fallback to PostgreSQL
-            let audit_query = AuditLogQuery {
-                user_id: effective_user_id,
-                action: query.action,
-                resource_type: query.resource_type,
-                start_time: query.start_time,
-                end_time: query.end_time,
-                success: query.success,
-                limit: Some(limit),
-                offset: Some(0),
-            };
-
-            let logs = state
-                .audit_repo
-                .query_logs(&audit_query)
-                .await
-                .map_err(|e| {
-                    let (status, err) = AuditApiError::from_repo_error(&e);
-                    (status, Json(err))
-                })?;
-
-            logs.into_iter().map(AuditLogEntry::from).collect()
-        };
+    let entries: Vec<AuditLogEntry> = logs.into_iter().map(AuditLogEntry::from).collect();
 
     match format {
         ExportFormat::Json => {
@@ -504,23 +424,16 @@ pub async fn get_action_types(
     check_permission(&auth, permissions::AUDIT_VIEW)
         .map_err(|(s, j)| (s, Json(AuditApiError::new(&j.error, &j.message))))?;
 
-    if let Some(ref audit_query_service) = state.audit_query_service {
-        let actions = audit_query_service
-            .get_distinct_actions()
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(AuditApiError::new("query_error", &e.to_string())),
-                )
-            })?;
-        return Ok(Json(actions));
-    }
-
-    let actions = state.audit_repo.get_action_types().await.map_err(|e| {
-        let (status, err) = AuditApiError::from_repo_error(&e);
-        (status, Json(err))
-    })?;
+    let actions = state
+        .audit_query_service
+        .get_distinct_actions()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(AuditApiError::new("query_error", &e.to_string())),
+            )
+        })?;
 
     Ok(Json(actions))
 }
@@ -547,25 +460,18 @@ pub async fn get_resource_types(
     check_permission(&auth, permissions::AUDIT_VIEW)
         .map_err(|(s, j)| (s, Json(AuditApiError::new(&j.error, &j.message))))?;
 
-    if let Some(ref audit_query_service) = state.audit_query_service {
-        let sources = audit_query_service
-            .get_distinct_sources()
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(AuditApiError::new("query_error", &e.to_string())),
-                )
-            })?;
-        return Ok(Json(sources));
-    }
+    let sources = state
+        .audit_query_service
+        .get_distinct_sources()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(AuditApiError::new("query_error", &e.to_string())),
+            )
+        })?;
 
-    let types = state.audit_repo.get_resource_types().await.map_err(|e| {
-        let (status, err) = AuditApiError::from_repo_error(&e);
-        (status, Json(err))
-    })?;
-
-    Ok(Json(types))
+    Ok(Json(sources))
 }
 
 /// OpenAPI documentation for audit log endpoints

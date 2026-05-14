@@ -7,6 +7,7 @@ impl SearchService {
     ///
     /// This generates a single SQL query that JOINs logs with prevalence tables,
     /// allowing ClickHouse to filter efficiently at the database level.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn search_with_prevalence_join(
         &self,
         query: &Query,
@@ -22,6 +23,7 @@ impl SearchService {
         limit: usize,
         offset: usize,
         start_time: Instant,
+        auto_sort_decision: &crate::search::query_processing::AutoSortDecision,
     ) -> Result<SearchResponse, SearchError> {
         // Get the time window from prevalence command
         let time_window = prevalence_commands
@@ -247,24 +249,33 @@ impl SearchService {
 
         // Analyze query cost and generate warnings
         let cost_analysis = analyze_query_cost(query);
-        let (warnings, cost_score) = if cost_analysis.warnings.is_empty() {
+        let mut warnings_output: Vec<QueryWarningOutput> = cost_analysis
+            .warnings
+            .iter()
+            .map(|w| QueryWarningOutput {
+                severity: match w.severity {
+                    WarningSeverity::Info => "info".to_string(),
+                    WarningSeverity::Warning => "warning".to_string(),
+                    WarningSeverity::Error => "error".to_string(),
+                },
+                code: w.code.clone(),
+                message: w.message.clone(),
+                suggestion: w.suggestion.clone(),
+                impact: w.impact.clone(),
+            })
+            .collect();
+
+        // NAN-806: surface the implicit auto-sort decision here too — the
+        // prevalence-join path bypasses the standard merge in `search()`.
+        if let Some(w) =
+            crate::search::query_processing::auto_sort_warning(auto_sort_decision)
+        {
+            warnings_output.push(w);
+        }
+
+        let (warnings, cost_score) = if warnings_output.is_empty() {
             (None, None)
         } else {
-            let warnings_output: Vec<QueryWarningOutput> = cost_analysis
-                .warnings
-                .iter()
-                .map(|w| QueryWarningOutput {
-                    severity: match w.severity {
-                        WarningSeverity::Info => "info".to_string(),
-                        WarningSeverity::Warning => "warning".to_string(),
-                        WarningSeverity::Error => "error".to_string(),
-                    },
-                    code: w.code.clone(),
-                    message: w.message.clone(),
-                    suggestion: w.suggestion.clone(),
-                    impact: w.impact.clone(),
-                })
-                .collect();
             (Some(warnings_output), Some(cost_analysis.estimated_cost))
         };
 

@@ -329,7 +329,7 @@ pub async fn import_rule(
         merge_to_single_source_type: req.merge_to_single_source_type,
     };
 
-    let mv_gen = state.materialized_view_generator.as_deref();
+    let mv_gen = state.materialized_view_generator.as_ref();
 
     let (detection_rule_id, _outcome) = service
         .import_rule(*id, &path, import_request, Some(auth.user_id()), mv_gen)

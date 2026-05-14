@@ -15,7 +15,7 @@ use crate::db::TableNames;
 /// Collect all health metrics from ClickHouse and PostgreSQL
 pub async fn collect_metrics(
     pool: &PgPool,
-    ch_client: Option<&ClickHouseClient>,
+    ch_client: &ClickHouseClient,
     is_clustered: bool,
 ) -> CollectedMetrics {
     let ingestion = collect_ingestion_metrics(ch_client, is_clustered).await;
@@ -36,22 +36,9 @@ pub async fn collect_metrics(
 
 /// Collect ingestion health metrics from ClickHouse
 async fn collect_ingestion_metrics(
-    ch_client: Option<&ClickHouseClient>,
+    ch: &ClickHouseClient,
     is_clustered: bool,
 ) -> IngestionMetrics {
-    let ch = match ch_client {
-        Some(ch) => ch,
-        None => {
-            warn!("ClickHouse unavailable, returning empty ingestion metrics");
-            return IngestionMetrics {
-                source_volumes: vec![],
-                total_events_24h: 0,
-                total_events_prior_24h: 0,
-                silent_sources: vec![],
-            };
-        }
-    };
-
     // Get per-source-type volumes for last 24h and prior 24h
     let logs_table = TableNames::new(is_clustered).read("logs");
     let sql = format!(
@@ -122,20 +109,9 @@ async fn collect_ingestion_metrics(
 
 /// Collect parsing health metrics from ClickHouse
 async fn collect_parsing_metrics(
-    ch_client: Option<&ClickHouseClient>,
+    ch: &ClickHouseClient,
     is_clustered: bool,
 ) -> ParsingMetrics {
-    let ch = match ch_client {
-        Some(ch) => ch,
-        None => {
-            warn!("ClickHouse unavailable, returning empty parsing metrics");
-            return ParsingMetrics {
-                field_coverage: vec![],
-                high_ext_sources: vec![],
-            };
-        }
-    };
-
     // Field coverage: percentage of events where key fields are populated
     let logs_table = TableNames::new(is_clustered).read("logs");
     let coverage_sql = build_field_coverage_sql(&logs_table);
@@ -201,7 +177,7 @@ async fn collect_parsing_metrics(
 /// columns over the last 24h, plus a per-source coverage breakdown for the
 /// top sources by event volume.
 async fn collect_enrichment_metrics(
-    ch_client: Option<&ClickHouseClient>,
+    ch: &ClickHouseClient,
     is_clustered: bool,
 ) -> EnrichmentMetrics {
     let empty = EnrichmentMetrics {
@@ -211,13 +187,6 @@ async fn collect_enrichment_metrics(
         ioc_hit_pct: 0.0,
         identity_fill_pct: 0.0,
         per_source_coverage: vec![],
-    };
-    let ch = match ch_client {
-        Some(ch) => ch,
-        None => {
-            warn!("ClickHouse unavailable, returning empty enrichment metrics");
-            return empty;
-        }
     };
 
     let logs_table = TableNames::new(is_clustered).read("logs");

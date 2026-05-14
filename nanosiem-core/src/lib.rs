@@ -149,7 +149,7 @@ pub use auth::{
     },
     types::{
         builtin_groups, builtin_roles, config_defaults, config_keys, ApiKey, ApiKeyCreated,
-        AuditLog, AuditLogQuery, AuditLogWithNames, AuthResponse, CreateApiKeyRequest,
+        AuditLog, AuditLogWithNames, AuthResponse, CreateApiKeyRequest,
         CreateGroupRequest, CreateOidcProviderRequest, CreateRoleRequest, CreateUserRequest, Group,
         GroupSummary, GroupWithDetails, LoginRequest, OidcGroupMapping, OidcProvider,
         PasswordResetCompletion, PasswordResetRequest, Permission, RefreshTokenRequest, Role,
@@ -183,7 +183,7 @@ pub use gdpr::{
     AnonymizationError, AnonymizationPreview, AnonymizationRequest, AnonymizationService,
     AnonymizationStatus, IdentifierType,
 };
-pub use ingestion::{IngestionConfig, IngestionError, IngestionService, LogParser, ParsedLog};
+pub use ingestion::{LogParser, ParsedLog};
 pub use inputlookup::{
     InputLookupConfig, InputLookupError, InputLookupFormat, InputLookupParams, InputLookupService,
     SsrfConfig, SsrfError, SsrfValidator, UrlTemplate,

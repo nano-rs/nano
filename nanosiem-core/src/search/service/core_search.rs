@@ -388,6 +388,14 @@ impl SearchService {
             Err(e) => return Err(convert_parse_error(e)),
         };
 
+        // NAN-806: a bare `… | stats count by x` runs aggregation over the full
+        // event set but the executor's outer `LIMIT N` would trim the GROUP BY
+        // result in ClickHouse hash-bucket order — analysts would see a random
+        // slice of groups instead of the largest ones. Inject an implicit
+        // `| sort -<first-numeric-agg>` after the trailing stats/chart so the
+        // outer LIMIT keeps the actual top-N.
+        let (query, auto_sort_decision) = apply_auto_sort(query);
+
         // Pre-execution guardrail: reject queries that would cause unbounded memory usage (OOM)
         // Covers: eventstats/streamstats, dedup, reverse, transaction, values()/list(), high-cardinality GROUP BY
         if let Some(risk) = detect_oom_risk(&query) {
@@ -591,6 +599,7 @@ impl SearchService {
                     limit,
                     offset,
                     start_time,
+                    &auto_sort_decision,
                 )
                 .await;
         }
@@ -782,7 +791,10 @@ impl SearchService {
             total_count
         );
 
-        // Collect runtime warnings from post-processing (e.g. group cap reached)
+        // Collect runtime warnings from post-processing (e.g. group cap reached).
+        // These get the `POST_PROCESSING_TRUNCATED` warning code at merge time —
+        // the auto-sort warning has its own code and is emitted separately at
+        // the merge point below to keep the labelling honest.
         let mut runtime_warnings: Vec<String> = Vec::new();
 
         // Strip internal lookup fields used for SQL JOINs (these are implementation details)
@@ -1083,6 +1095,12 @@ impl SearchService {
                 impact: w.impact.clone(),
             })
             .collect();
+
+        // NAN-806: surface the implicit auto-sort decision with its own code
+        // so the UI can label it correctly (it isn't a truncation event).
+        if let Some(w) = crate::search::query_processing::auto_sort_warning(&auto_sort_decision) {
+            all_warnings.push(w);
+        }
 
         // Add runtime warnings (e.g. stats group cap reached)
         for msg in &runtime_warnings {

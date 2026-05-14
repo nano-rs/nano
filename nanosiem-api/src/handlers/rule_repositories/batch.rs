@@ -59,7 +59,7 @@ pub async fn batch_import_rules(
     let service = get_rule_repo_service(&state)?;
     let repo = service.get_repository(*id).await?;
 
-    let mv_gen = state.materialized_view_generator.as_deref();
+    let mv_gen = state.materialized_view_generator.as_ref();
 
     let mut imported = 0usize;
     let mut updated = 0usize;
@@ -176,7 +176,7 @@ pub async fn remove_all_imported(
     let mut failed = Vec::new();
 
     // Get materialized view generator for proper cleanup
-    let mv_gen = state.materialized_view_generator.as_deref();
+    let mv_gen = state.materialized_view_generator.as_ref();
 
     for import in &imports {
         // Delete the detection rule (with mode-based cleanup)

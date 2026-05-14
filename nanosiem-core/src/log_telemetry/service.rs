@@ -25,28 +25,26 @@ pub struct LogTelemetryService {
 }
 
 impl LogTelemetryService {
-    pub fn new(client: Option<ClickHouseClient>, table_names: TableNames) -> Self {
+    pub fn new(client: ClickHouseClient, table_names: TableNames) -> Self {
         Self {
             repo: LogTelemetryRepository::new(client, table_names),
         }
     }
 
     /// Returns rollup stats for each requested source_type, summed over the
-    /// last `window_hours` hours. `Ok(None)` indicates ClickHouse is not
-    /// configured; callers should leave their telemetry fields as `None` and
-    /// continue (graceful degradation).
+    /// last `window_hours` hours.
     pub async fn stats_by_source_type(
         &self,
         source_types: &[String],
         window_hours: i64,
-    ) -> Result<Option<HashMap<String, SourceTypeStats>>, LogTelemetryError> {
+    ) -> Result<HashMap<String, SourceTypeStats>, LogTelemetryError> {
         Ok(self.repo.stats_by_source_type(source_types, window_hours).await?)
     }
 
     pub async fn stats_all(
         &self,
         window_hours: i64,
-    ) -> Result<Option<HashMap<String, SourceTypeStats>>, LogTelemetryError> {
+    ) -> Result<HashMap<String, SourceTypeStats>, LogTelemetryError> {
         Ok(self.repo.stats_all(window_hours).await?)
     }
 
@@ -55,7 +53,7 @@ impl LogTelemetryService {
         source_types: &[String],
         window_hours: i64,
         bucket: BucketSize,
-    ) -> Result<Option<Vec<HourlyPoint>>, LogTelemetryError> {
+    ) -> Result<Vec<HourlyPoint>, LogTelemetryError> {
         Ok(self.repo.buckets(source_types, window_hours, bucket).await?)
     }
 
@@ -65,13 +63,13 @@ impl LogTelemetryService {
         &self,
         window_hours: i64,
         bucket: BucketSize,
-    ) -> Result<Option<Vec<HourlyPoint>>, LogTelemetryError> {
+    ) -> Result<Vec<HourlyPoint>, LogTelemetryError> {
         Ok(self.repo.buckets_all(window_hours, bucket).await?)
     }
 
     /// Cluster-wide total event count for the window. Used by dashboard
     /// headline numbers.
-    pub async fn total_events(&self, window_hours: i64) -> Result<Option<i64>, LogTelemetryError> {
+    pub async fn total_events(&self, window_hours: i64) -> Result<i64, LogTelemetryError> {
         Ok(self.repo.total_events(window_hours).await?)
     }
 }

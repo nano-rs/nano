@@ -59,6 +59,27 @@ impl Aggregation {
             field_expr: None,
         }
     }
+
+    /// The output column name this aggregation will emit in the SELECT clause.
+    ///
+    /// Must stay in sync with the alias scheme in
+    /// `clickhouse_sql_gen/aggregation.rs`. Downstream commands (e.g. the
+    /// auto-sort rewrite in `search/query_processing/auto_sort.rs`) reference
+    /// this name when building `SortField`s.
+    pub fn output_alias(&self) -> String {
+        if let Some(a) = &self.alias {
+            return a.clone();
+        }
+        if self.field.is_none() && self.func == AggFunc::Count {
+            return "count".to_string();
+        }
+        if matches!(self.func, AggFunc::Values | AggFunc::List) {
+            if let Some(field) = &self.field {
+                return format!("{}_{}", self.func.as_str(), field);
+            }
+        }
+        self.func.as_str().to_string()
+    }
 }
 
 /// Aggregation functions
@@ -131,6 +152,29 @@ impl AggFunc {
             AggFunc::Mode => "mode",
             AggFunc::Sparkline => "sparkline",
         }
+    }
+
+    /// Whether descending sort on this aggregation's output gives an analyst
+    /// a useful "biggest first" view — i.e. whether it's a reasonable default
+    /// for implicit top-N ordering.
+    ///
+    /// Note: this is about *meaning*, not type. `min(string_field)` is
+    /// technically lexically sortable but a desc sort on it surfaces "the
+    /// alphabetically highest single value per group", which is rarely what
+    /// the analyst wants. The exclusions below capture aggregations where
+    /// descending order is either type-ambiguous (`mode`, `first`, `last`)
+    /// or structurally non-comparable (`values`, `list`, `sparkline` — these
+    /// produce arrays/concatenated strings).
+    pub fn is_meaningful_for_top_n(&self) -> bool {
+        !matches!(
+            self,
+            AggFunc::Values
+                | AggFunc::List
+                | AggFunc::Sparkline
+                | AggFunc::Mode
+                | AggFunc::First
+                | AggFunc::Last
+        )
     }
 }
 

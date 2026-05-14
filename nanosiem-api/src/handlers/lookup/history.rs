@@ -142,46 +142,44 @@ pub async fn get_lookup_table_ingestion_history(
     // doesn't support filtering on `resource_name` directly; the volume of
     // lookup-source audit events is low so a Rust-side filter is fine.
     // ---------------------------------------------------------------------
-    if let Some(ref audit_query_service) = state.audit_query_service {
-        // We pull a buffer of audit events (4× the caller's limit) before
-        // Rust-side filtering by `resource_name`, since the audit query
-        // service can't filter on that field directly. Capped at the
-        // service's own 1000-row hard limit.
-        let ch_audit_limit = (limit.saturating_mul(4)).min(1000);
-        let ch_query = ClickHouseAuditQuery {
-            source: Some("lookup".to_string()),
-            start_time: Some(Utc::now() - chrono::Duration::days(AUDIT_LOOKBACK_DAYS)),
-            limit: Some(ch_audit_limit),
-            ..Default::default()
-        };
+    // We pull a buffer of audit events (4× the caller's limit) before
+    // Rust-side filtering by `resource_name`, since the audit query
+    // service can't filter on that field directly. Capped at the
+    // service's own 1000-row hard limit.
+    let ch_audit_limit = (limit.saturating_mul(4)).min(1000);
+    let ch_query = ClickHouseAuditQuery {
+        source: Some("lookup".to_string()),
+        start_time: Some(Utc::now() - chrono::Duration::days(AUDIT_LOOKBACK_DAYS)),
+        limit: Some(ch_audit_limit),
+        ..Default::default()
+    };
 
-        match audit_query_service.query(&ch_query).await {
-            Ok(rows) => {
-                for row in rows {
-                    if row.resource_name.as_deref() != Some(name.as_str()) {
-                        continue;
-                    }
-                    let action = row.action.as_deref().unwrap_or("");
-                    let Some(kind) = classify_audit_action(action) else {
-                        continue;
-                    };
-                    entries.push(LookupHistoryEntry {
-                        when: row.timestamp,
-                        actor: row.user.unwrap_or_else(|| "system".to_string()),
-                        kind,
-                        note: humanize_audit_action(action),
-                    });
+    match state.audit_query_service.query(&ch_query).await {
+        Ok(rows) => {
+            for row in rows {
+                if row.resource_name.as_deref() != Some(name.as_str()) {
+                    continue;
                 }
+                let action = row.action.as_deref().unwrap_or("");
+                let Some(kind) = classify_audit_action(action) else {
+                    continue;
+                };
+                entries.push(LookupHistoryEntry {
+                    when: row.timestamp,
+                    actor: row.user.unwrap_or_else(|| "system".to_string()),
+                    kind,
+                    note: humanize_audit_action(action),
+                });
             }
-            Err(e) => {
-                // Don't fail the whole endpoint if ClickHouse is briefly
-                // unavailable — refresh entries (from PG) are still useful.
-                tracing::warn!(
-                    lookup_table = %name,
-                    error = %e,
-                    "Failed to query audit log for lookup history; returning refresh-only history",
-                );
-            }
+        }
+        Err(e) => {
+            // Don't fail the whole endpoint if ClickHouse is briefly
+            // unavailable — refresh entries (from PG) are still useful.
+            tracing::warn!(
+                lookup_table = %name,
+                error = %e,
+                "Failed to query audit log for lookup history; returning refresh-only history",
+            );
         }
     }
 

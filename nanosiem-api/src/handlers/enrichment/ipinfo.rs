@@ -137,8 +137,8 @@ pub async fn sync_ipinfo(
                         "IPinfo Lite sync completed successfully"
                     );
                     // Reload ClickHouse dictionary so new enrichment data takes effect immediately
-                    if let Some(ref dp) = dual_pool {
-                        if let Err(e) = dp
+                    {
+                        if let Err(e) = dual_pool
                             .clickhouse()
                             .query("SYSTEM RELOAD DICTIONARY nanosiem.ip_enrichment_dict")
                             .execute()

@@ -182,12 +182,8 @@ pub async fn trigger_health_check(
 
     let repo = SiemHealthRepository::new(state.pool.clone());
 
-    // Get ClickHouse client from DualPool (if available)
-    let ch_client = state.dual_pool().map(|dp| dp.clickhouse().clone());
-    let is_clustered = state
-        .dual_pool()
-        .map(|dp| dp.table_names().is_clustered())
-        .unwrap_or(false);
+    let ch_client = state.dual_pool().clickhouse().clone();
+    let is_clustered = state.dual_pool().table_names().is_clustered();
 
     // Construct the SiemHealthAiAnalyzer for this trigger. Enterprise builds
     // wrap the live meloD AI client; open-core builds use the noop analyzer,
@@ -219,7 +215,7 @@ pub async fn trigger_health_check(
 
     let report_id = nanosiem_core::siem_health::scheduler::run_health_check_with_trigger(
         &state.pool,
-        ch_client.as_ref(),
+        &ch_client,
         is_clustered,
         ai_analyzer.as_ref(),
         &repo,

@@ -271,17 +271,11 @@ impl AppState {
 
     /// Helper to create the data access layer
     pub fn create_data_access_layer(&self) -> DataAccessLayer {
-        if let Some(dual_pool) = &self.dual_pool {
-            tracing::debug!("Creating DataAccessLayer with ClickHouse support");
-            DataAccessLayer::with_clickhouse_clustered(
-                self.pool.clone(),
-                dual_pool.clickhouse().clone(),
-                dual_pool.table_names(),
-            )
-        } else {
-            tracing::debug!("Creating DataAccessLayer with PostgreSQL only (legacy mode)");
-            DataAccessLayer::new(self.pool.clone())
-        }
+        DataAccessLayer::with_clickhouse_clustered(
+            self.pool.clone(),
+            self.dual_pool.clickhouse().clone(),
+            self.dual_pool.table_names(),
+        )
     }
 
     /// Start the meloD config poller for multi-pod sync

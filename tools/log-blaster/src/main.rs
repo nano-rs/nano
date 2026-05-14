@@ -1,12 +1,19 @@
 //! Log Blaster - Profile-driven SIEM log generator
 //!
 //! Generates realistic Sysmon, Windows Event, and proxy logs using real
-//! telemetry data exported from the Ludus lab. Supports normal mode
-//! (steady rate) and blast mode (high-throughput stress testing).
+//! telemetry data exported from the Ludus lab. Supports three modes:
+//! - **Normal** — steady rate (events per minute).
+//! - **Blast** — flat high-throughput stress testing.
+//! - **Spike** — multi-rhythm corporate traffic shape driven by a profile
+//!   JSON (login surges, AV scans, alert storms, lunch dips).
 //!
 //! Usage:
-//!   log-blaster --vector http://localhost:8080 --rate 30          # Normal mode
-//!   log-blaster --vector http://localhost:8080 --blast --eps 50000  # Blast mode
+//!   log-blaster --vector http://localhost:8080 --rate 30                       # Normal mode
+//!   log-blaster --vector http://localhost:8080 --blast --eps 50000             # Blast mode
+//!   log-blaster --vector http://localhost:8080 --spike \
+//!     --spike-profile tools/log-blaster/profiles/spike_corporate.json          # Spike mode
+
+mod spike;
 
 use anyhow::Result;
 use chrono::Utc;
@@ -47,6 +54,15 @@ struct Args {
     /// Enable blast mode for stress testing
     #[arg(long)]
     blast: bool,
+
+    /// Enable spike mode (multi-rhythm corporate traffic shape).
+    /// Requires --spike-profile.
+    #[arg(long, requires = "spike_profile")]
+    spike: bool,
+
+    /// Path to a SpikeProfile JSON (required when --spike is set)
+    #[arg(long)]
+    spike_profile: Option<std::path::PathBuf>,
 
     /// Events per second target (blast mode)
     #[arg(long, default_value = "50000")]
@@ -166,7 +182,9 @@ async fn main() -> Result<()> {
         None
     };
 
-    let result = if args.blast {
+    let result = if args.spike {
+        run_spike_mode(args, world).await
+    } else if args.blast {
         run_blast_mode(args, world).await
     } else {
         run_normal_mode(args, world).await
@@ -262,14 +280,10 @@ async fn run_chain_emitter(
     }
 }
 
-/// Generate a single event with realistic source type distribution.
-///
-/// Distribution:
-/// - 60% windows_sysmon (EDR endpoint telemetry dominates)
-/// - 10% windows_event (auth/security events)
-/// - 12% conduit_proxy (web traffic)
-/// - 10% apache_access (web server logs)
-/// - 8%  aws_cloudtrail (cloud management plane)
+/// Generate a single event, sampling source type from `mix` (assumed
+/// normalized — caller is responsible). The historical fixed distribution
+/// (60/10/12/10/8) lives in [`spike::DEFAULT_MIX`].
+#[allow(clippy::too_many_arguments)]
 fn generate_event(
     timestamp: chrono::DateTime<Utc>,
     entity: &event_core::entity::Entity,
@@ -279,20 +293,27 @@ fn generate_event(
     proxy_gen: &ProxyGenerator,
     apache_gen: &ApacheGenerator,
     cloudtrail_gen: &CloudTrailGenerator,
+    mix: &spike::SourceMix,
     rng: &mut impl Rng,
 ) -> Event {
     let r: f64 = rng.random();
-    if r < 0.60 {
-        sysmon_gen.generate(timestamp, entity, rng)
-    } else if r < 0.70 {
-        winevt_gen.generate(timestamp, entity, all_entities, rng)
-    } else if r < 0.82 {
-        proxy_gen.generate(timestamp, entity, rng)
-    } else if r < 0.92 {
-        apache_gen.generate(timestamp, entity, rng)
-    } else {
-        cloudtrail_gen.generate(timestamp, entity, rng)
+    let mut cum = mix.sysmon;
+    if r < cum {
+        return sysmon_gen.generate(timestamp, entity, rng);
     }
+    cum += mix.winevt;
+    if r < cum {
+        return winevt_gen.generate(timestamp, entity, all_entities, rng);
+    }
+    cum += mix.proxy;
+    if r < cum {
+        return proxy_gen.generate(timestamp, entity, rng);
+    }
+    cum += mix.apache;
+    if r < cum {
+        return apache_gen.generate(timestamp, entity, rng);
+    }
+    cloudtrail_gen.generate(timestamp, entity, rng)
 }
 
 async fn run_normal_mode(args: Args, world: Arc<parking_lot::RwLock<WorldState>>) -> Result<()> {
@@ -341,6 +362,7 @@ async fn run_normal_mode(args: Args, world: Arc<parking_lot::RwLock<WorldState>>
                 &proxy_gen,
                 &apache_gen,
                 &cloudtrail_gen,
+                &spike::DEFAULT_MIX,
                 &mut rng,
             )
         };
@@ -504,6 +526,7 @@ async fn run_blast_mode(args: Args, world: Arc<parking_lot::RwLock<WorldState>>)
                             &proxy_gen,
                             &apache_gen,
                             &cloudtrail_gen,
+                            &spike::DEFAULT_MIX,
                             &mut rng,
                         );
                         batch.push(event);
@@ -574,6 +597,241 @@ async fn run_blast_mode(args: Args, world: Arc<parking_lot::RwLock<WorldState>>)
     for handle in handles {
         handle.await?;
     }
+    stats_handle.abort();
+
+    let total = events_sent.load(Ordering::Relaxed);
+    info!("Total events sent: {}", total);
+
+    Ok(())
+}
+
+/// Spike mode: profile-driven multi-rhythm traffic.
+///
+/// Architecture is similar to blast mode (N worker threads, semaphore-bounded
+/// inflight sends, async batch dispatch), but a single scheduler task ticks
+/// at 1Hz, advances rhythm state, and publishes the current target EPS and
+/// source-type mix to all workers via `Arc<parking_lot::RwLock<...>>`.
+///
+/// Each worker recomputes its per-thread EPS from the shared target on every
+/// batch, so a ramp-up from 500 → 15000 EPS over 30s is reflected in worker
+/// sleep intervals within ~250ms of each tick.
+async fn run_spike_mode(args: Args, world: Arc<parking_lot::RwLock<WorldState>>) -> Result<()> {
+    // Clap's `requires = "spike_profile"` on the --spike flag guarantees this
+    // is set before we reach this function.
+    let profile_path = args
+        .spike_profile
+        .as_ref()
+        .expect("clap requires guarantees --spike-profile is present");
+    let profile = spike::SpikeProfile::load(profile_path)?;
+
+    info!(
+        "SPIKE MODE: baseline {:.0} EPS, {} rhythms (profile: {})",
+        profile.baseline_eps,
+        profile.rhythms.len(),
+        profile_path.display()
+    );
+    for r in &profile.rhythms {
+        info!(
+            "  rhythm '{}' peak={:.0} eps shape={}+{}+{}s",
+            r.name,
+            r.peak_eps,
+            r.envelope.ramp_up_secs,
+            r.envelope.plateau_secs,
+            r.envelope.ramp_down_secs
+        );
+    }
+
+    // Shared spike state — scheduler writes, workers + stats read.
+    let target_state = Arc::new(parking_lot::RwLock::new(spike::Snapshot {
+        effective_eps: profile.baseline_eps.max(0.0),
+        mix: profile
+            .baseline_mix
+            .unwrap_or(spike::DEFAULT_MIX)
+            .normalized(),
+        active: Vec::new(),
+    }));
+
+    let events_sent = Arc::new(AtomicU64::new(0));
+    let running = Arc::new(AtomicBool::new(true));
+
+    // Scheduler tick — 1Hz is fine; envelope curves resolve at sub-1s
+    // granularity through worker EPS recomputation.
+    let sched_state = target_state.clone();
+    let sched_running = running.clone();
+    let sched_handle = tokio::spawn(async move {
+        let mut rng = rand::rngs::StdRng::from_os_rng();
+        let mut scheduler = spike::Scheduler::new(profile, Utc::now(), &mut rng);
+        let mut tick = interval(TokioDuration::from_secs(1));
+        while sched_running.load(Ordering::Relaxed) {
+            tick.tick().await;
+            let snap = scheduler.tick(Utc::now(), &mut rng);
+            *sched_state.write() = snap;
+        }
+    });
+
+    let inflight_per_thread: usize = 4;
+    // Workers refresh target EPS every ~250ms.
+    let worker_period_ms: u64 = 250;
+    // Cap each HTTP POST at args.batch_size; split a tick's events across
+    // multiple sends if needed. Mirrors blast-mode's batch sizing so a
+    // profile with extreme peak_eps doesn't produce oversized payloads.
+    let batch_size_cap = args.batch_size.max(1);
+    let mut handles = Vec::new();
+    for thread_id in 0..args.threads {
+        let url = args.vector.clone();
+        let token = args.token.clone();
+        let events_sent = events_sent.clone();
+        let running = running.clone();
+        let worker_world = world.clone();
+        let target_state = target_state.clone();
+        let max_inflight = inflight_per_thread;
+        let thread_count = args.threads.max(1);
+
+        let handle = tokio::spawn(async move {
+            let client = Client::builder()
+                .pool_max_idle_per_host(max_inflight + 2)
+                .connect_timeout(TokioDuration::from_secs(10))
+                .timeout(TokioDuration::from_secs(30))
+                .build()
+                .expect("Failed to create HTTP client");
+
+            let sysmon_gen = SysmonGenerator::new();
+            let winevt_gen = WindowsEventGenerator::new();
+            let proxy_gen = ProxyGenerator::new();
+            let apache_gen = ApacheGenerator::new();
+            let cloudtrail_gen = CloudTrailGenerator::new();
+            let mut rng = rand::rngs::StdRng::from_os_rng();
+
+            let sem = Arc::new(tokio::sync::Semaphore::new(max_inflight));
+
+            while running.load(Ordering::Relaxed) {
+                let (target_eps, mix) = {
+                    let s = target_state.read();
+                    (s.effective_eps, s.mix)
+                };
+                // Target events for this thread for one worker_period_ms slice.
+                let per_thread_eps = target_eps / thread_count as f64;
+                let events_this_tick =
+                    ((per_thread_eps * worker_period_ms as f64) / 1000.0).round() as usize;
+
+                if events_this_tick == 0 {
+                    tokio::time::sleep(TokioDuration::from_millis(worker_period_ms)).await;
+                    continue;
+                }
+
+                let mut remaining = events_this_tick;
+                while remaining > 0 && running.load(Ordering::Relaxed) {
+                    let chunk = remaining.min(batch_size_cap);
+                    remaining -= chunk;
+
+                    let permit = match sem.clone().acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    };
+
+                    let sim_time = Utc::now();
+                    let mut batch = Vec::with_capacity(chunk);
+                    {
+                        let w = worker_world.read();
+                        for _ in 0..chunk {
+                            let entity = w.random_entity();
+                            let event = generate_event(
+                                sim_time,
+                                entity,
+                                w.entities(),
+                                &sysmon_gen,
+                                &winevt_gen,
+                                &proxy_gen,
+                                &apache_gen,
+                                &cloudtrail_gen,
+                                &mix,
+                                &mut rng,
+                            );
+                            batch.push(event);
+                        }
+                    }
+
+                    let batch_len = batch.len() as u64;
+                    let client = client.clone();
+                    let url = url.clone();
+                    let token = token.clone();
+                    let events_sent = events_sent.clone();
+                    tokio::spawn(async move {
+                        match send_batch_with_retry(&client, &url, &batch, token.as_deref(), 3)
+                            .await
+                        {
+                            Ok(()) => {
+                                events_sent.fetch_add(batch_len, Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Thread {}: Error sending spike batch after retries: {}",
+                                    thread_id, e
+                                );
+                            }
+                        }
+                        drop(permit);
+                    });
+                }
+
+                tokio::time::sleep(TokioDuration::from_millis(worker_period_ms)).await;
+            }
+        });
+        handles.push(handle);
+    }
+
+    // Stats reporter — shows baseline, active rhythms, target vs actual EPS.
+    let stats_events = events_sent.clone();
+    let stats_running = running.clone();
+    let stats_target = target_state.clone();
+    let stats_handle = tokio::spawn(async move {
+        let mut tick = interval(TokioDuration::from_secs(1));
+        let mut last_count = 0u64;
+        let start = Instant::now();
+        while stats_running.load(Ordering::Relaxed) {
+            tick.tick().await;
+            let current = stats_events.load(Ordering::Relaxed);
+            let delta = current - last_count;
+            let elapsed = start.elapsed().as_secs_f64();
+            // `interval` fires immediately on the first tick, so elapsed
+            // can be ~0 — `current / elapsed` would render as `inf`. Show
+            // the instantaneous delta until we have at least one full second.
+            let avg_eps = if elapsed >= 1.0 {
+                current as f64 / elapsed
+            } else {
+                delta as f64
+            };
+            let snap = stats_target.read().clone();
+            let active = if snap.active.is_empty() {
+                "idle".to_string()
+            } else {
+                snap.active
+                    .iter()
+                    .map(|a| format!("{}:{:+.0}", a.name, a.contribution_eps))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            info!(
+                "target={:.0} eps | actual={} eps (avg {:.0}) | rhythms=[{}] | total={}",
+                snap.effective_eps, delta, avg_eps, active, current
+            );
+            last_count = current;
+        }
+    });
+
+    if args.duration > 0 {
+        tokio::time::sleep(TokioDuration::from_secs(args.duration * 60)).await;
+        running.store(false, Ordering::Relaxed);
+    } else {
+        tokio::signal::ctrl_c().await?;
+        info!("Shutting down...");
+        running.store(false, Ordering::Relaxed);
+    }
+
+    for handle in handles {
+        handle.await?;
+    }
+    sched_handle.abort();
     stats_handle.abort();
 
     let total = events_sent.load(Ordering::Relaxed);

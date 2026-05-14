@@ -24,9 +24,6 @@ struct SourceTypeRow {
 
 #[derive(Debug, Error)]
 pub enum CoverageAnalyzerError {
-    #[error("ClickHouse not available")]
-    ClickHouseUnavailable,
-
     #[error("Query error: {0}")]
     Query(String),
 
@@ -36,7 +33,7 @@ pub enum CoverageAnalyzerError {
 
 /// Analyzer for checking rule coverage against available log sources
 pub struct CoverageAnalyzer {
-    dual_pool: Option<DualPool>,
+    dual_pool: DualPool,
     /// Cache of available fields per source type
     available_fields: HashMap<String, HashSet<String>>,
 }
@@ -45,27 +42,14 @@ impl CoverageAnalyzer {
     /// Create a new coverage analyzer with DualPool
     pub fn new(dual_pool: DualPool) -> Self {
         Self {
-            dual_pool: Some(dual_pool),
-            available_fields: HashMap::new(),
-        }
-    }
-
-    /// Create a coverage analyzer without ClickHouse (limited functionality)
-    pub fn new_without_clickhouse() -> Self {
-        Self {
-            dual_pool: None,
+            dual_pool,
             available_fields: HashMap::new(),
         }
     }
 
     /// Get available source types from logs (all time)
     pub async fn refresh_available_fields(&mut self) -> Result<(), CoverageAnalyzerError> {
-        let dual_pool = self
-            .dual_pool
-            .as_ref()
-            .ok_or(CoverageAnalyzerError::ClickHouseUnavailable)?;
-
-        let ch_client = dual_pool.clickhouse();
+        let ch_client = self.dual_pool.clickhouse();
 
         // Query all distinct source types (no time filter)
         let query = r#"

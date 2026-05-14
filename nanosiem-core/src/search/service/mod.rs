@@ -38,7 +38,7 @@ use super::processing::{
     apply_post_prevalence_commands_with_limit,
 };
 use super::query_processing::{
-    detect_oom_risk, extract_ai_command, extract_asset_command,
+    apply_auto_sort, detect_oom_risk, extract_ai_command, extract_asset_command,
     extract_asset_identifier_from_query, extract_base_query, extract_cloud_command,
     extract_inputlookup_commands, extract_lateral_command, extract_lookup_commands,
     extract_post_ai_commands, extract_post_inputlookup_commands, extract_post_lateral_commands,

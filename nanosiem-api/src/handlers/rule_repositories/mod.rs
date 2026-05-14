@@ -38,16 +38,9 @@ use crate::{error::ApiError, state::AppState};
 
 /// Create a RuleRepositoryService from app state
 pub(crate) fn get_rule_repo_service(state: &AppState) -> Result<RuleRepositoryService, ApiError> {
-    if let Some(ref dual_pool) = state.dual_pool {
-        let service = RuleRepositoryService::with_dual_pool(dual_pool);
-        // Wire up the detection service
-        let detection_service = std::sync::Arc::new(state.detection_service.clone());
-        Ok(service.with_detection_service(detection_service))
-    } else {
-        let service = RuleRepositoryService::new(state.pool.clone());
-        let detection_service = std::sync::Arc::new(state.detection_service.clone());
-        Ok(service.with_detection_service(detection_service))
-    }
+    let service = RuleRepositoryService::with_dual_pool(&state.dual_pool);
+    let detection_service = std::sync::Arc::new(state.detection_service.clone());
+    Ok(service.with_detection_service(detection_service))
 }
 
 // Note: `From<RuleRepositoryError> for ApiError` lifted to nanosiem-api-lib

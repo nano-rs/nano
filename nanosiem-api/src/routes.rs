@@ -2133,7 +2133,7 @@ pub fn create_router(state: AppState) -> Router {
             "/api/lookup-tables/{name}/rows/{row_id}",
             delete(handlers::delete_lookup_row),
         )
-        // Lookup table ingestion endpoints (replaces /api/scheduled-jobs)
+        // Lookup table ingestion endpoints
         .route(
             "/api/lookup-tables/validate-cron",
             post(handlers::lookup::ingestion::validate_cron_expression),

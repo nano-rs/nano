@@ -16,14 +16,9 @@ impl AppState {
     /// The signal processor polls ClickHouse for new signals (from materialized views)
     /// and creates alerts in PostgreSQL, completing the real-time detection pipeline.
     pub async fn init_signal_processor(&self) -> anyhow::Result<()> {
-        if let Some(ref processor) = self.signal_processor {
-            let handle = processor.start().await?;
-            self.add_task_handle(handle).await;
-            Ok(())
-        } else {
-            tracing::debug!("Signal processor not available (requires DualPool mode)");
-            Ok(())
-        }
+        let handle = self.signal_processor.start().await?;
+        self.add_task_handle(handle).await;
+        Ok(())
     }
 
     /// Configure the enrichment service with IPinfo URL
@@ -68,15 +63,11 @@ impl AppState {
 
         let config = HealthSchedulerConfig::default();
 
-        let scheduler = if let Some(dual_pool) = &self.dual_pool {
-            Arc::new(HealthScheduler::with_dual_pool(
-                self.pool.clone(),
-                dual_pool.clone(),
-                config,
-            ))
-        } else {
-            Arc::new(HealthScheduler::new(self.pool.clone(), config))
-        };
+        let scheduler = Arc::new(HealthScheduler::with_dual_pool(
+            self.pool.clone(),
+            self.dual_pool.clone(),
+            config,
+        ));
 
         scheduler.start()
     }
@@ -265,16 +256,12 @@ impl AppState {
 
         // Signal processor (bridges ClickHouse signals to PostgreSQL alerts)
         // Must be single-leader: serial watermark processing
-        if self.is_clickhouse_enabled() {
-            if let Some(ref processor) = self.signal_processor {
-                match processor.start().await {
-                    Ok(handle) => {
-                        handles.push(handle);
-                        tracing::info!("Signal processor started (leader-only)");
-                    }
-                    Err(e) => tracing::error!("Failed to start signal processor: {}", e),
-                }
+        match self.signal_processor.start().await {
+            Ok(handle) => {
+                handles.push(handle);
+                tracing::info!("Signal processor started (leader-only)");
             }
+            Err(e) => tracing::error!("Failed to start signal processor: {}", e),
         }
 
         // Enrichment auto-sync scheduler (low-frequency singleton)
@@ -316,19 +303,13 @@ impl AppState {
             tracing::info!("Model catalog auto-sync scheduler started (leader-only)");
         }
 
-        // Tuning scheduler (only in DualPool mode, low-frequency singleton)
-        if self.is_clickhouse_enabled() {
-            handles.extend(self.start_tuning_scheduler());
-            tracing::info!("Tuning scheduler started (leader-only)");
-        } else {
-            tracing::info!("Tuning scheduler requires ClickHouse. Skipping.");
-        }
+        // Tuning scheduler (low-frequency singleton)
+        handles.extend(self.start_tuning_scheduler());
+        tracing::info!("Tuning scheduler started (leader-only)");
 
-        // Disk pressure scheduler (only in DualPool mode)
-        if let Some(ref dp_service) = self.disk_pressure_service {
-            handles.push(Arc::clone(dp_service).start());
-            tracing::info!("Disk pressure scheduler started (leader-only)");
-        }
+        // Disk pressure scheduler
+        handles.push(Arc::clone(&self.disk_pressure_service).start());
+        tracing::info!("Disk pressure scheduler started (leader-only)");
 
         // SIEM health check (AI-driven data quality analysis, every 12 hours)
         handles.push(self.start_siem_health_check_scheduler());

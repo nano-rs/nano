@@ -86,6 +86,16 @@ RUN if [ "$EDITION" = "enterprise" ]; then \
 # -----------------------------------------------------------------------------
 FROM debian:bookworm-slim AS api
 
+# OCI image metadata. The `image.source` label is what binds the GHCR package
+# to the nano-rs/nano open-core repo so it appears on the repo's Packages tab
+# and on package pages. Only the open edition is published to GHCR (see workflow).
+LABEL org.opencontainers.image.source="https://github.com/nano-rs/nano" \
+      org.opencontainers.image.url="https://nano.rs" \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later" \
+      org.opencontainers.image.vendor="nano" \
+      org.opencontainers.image.title="nano-api" \
+      org.opencontainers.image.description="nano API server — REST API for the open-core SIEM"
+
 WORKDIR /app
 
 # Install runtime dependencies
@@ -143,6 +153,13 @@ CMD ["nanosiem-api"]
 # -----------------------------------------------------------------------------
 FROM debian:bookworm-slim AS search
 
+LABEL org.opencontainers.image.source="https://github.com/nano-rs/nano" \
+      org.opencontainers.image.url="https://nano.rs" \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later" \
+      org.opencontainers.image.vendor="nano" \
+      org.opencontainers.image.title="nano-search" \
+      org.opencontainers.image.description="nano search microservice — query execution against ClickHouse"
+
 WORKDIR /app
 
 # Install runtime dependencies
@@ -175,6 +192,13 @@ CMD ["nanosiem-search"]
 # Stage 5: Jobs Runtime (background tasks: detection, enrichment, tuning, cleanup)
 # -----------------------------------------------------------------------------
 FROM debian:bookworm-slim AS jobs
+
+LABEL org.opencontainers.image.source="https://github.com/nano-rs/nano" \
+      org.opencontainers.image.url="https://nano.rs" \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later" \
+      org.opencontainers.image.vendor="nano" \
+      org.opencontainers.image.title="nano-jobs" \
+      org.opencontainers.image.description="nano background jobs — detection, enrichment, tuning, cleanup"
 
 WORKDIR /app
 

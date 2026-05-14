@@ -621,9 +621,7 @@ pub async fn resolve_identity_ip(
         None => Utc::now(),
     };
 
-    let Some(dual_pool) = state.dual_pool() else {
-        return Ok(Json(IdentityResolveResponse { ip, r#match: None }));
-    };
+    let dual_pool = state.dual_pool();
 
     let identity_table = dual_pool.table_names().read("identity_observations");
     let sql = format!(

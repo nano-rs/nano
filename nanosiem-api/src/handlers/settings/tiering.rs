@@ -132,9 +132,7 @@ impl From<TieringTestResult> for TieringConnectionTestResponse {
 
 /// Helper to get tiering service
 fn get_tiering_service(state: &AppState) -> Result<TieringService, ApiError> {
-    let dual_pool = state
-        .dual_pool()
-        .ok_or_else(|| ApiError::BadRequest("ClickHouse is not enabled".to_string()))?;
+    let dual_pool = state.dual_pool();
 
     // Get config directory - default to ./clickhouse/config.d relative to working dir
     let config_dir = std::env::var("CLICKHOUSE_CONFIG_DIR")

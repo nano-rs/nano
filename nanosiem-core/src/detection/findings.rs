@@ -315,25 +315,18 @@ impl FindingEvent {
 #[derive(Clone)]
 pub struct FindingLogger {
     pg_pool: PgPool,
-    dual_pool: Option<DualPool>,
+    dual_pool: DualPool,
     enabled: bool,
 }
 
 impl FindingLogger {
-    /// Create a new finding logger with PostgreSQL only
-    pub fn new(pool: PgPool) -> Self {
-        Self {
-            pg_pool: pool,
-            dual_pool: None,
-            enabled: true,
-        }
-    }
-
-    /// Create a new finding logger with DualPool (ClickHouse + PostgreSQL)
+    /// Create a new finding logger backed by a DualPool. ClickHouse is the
+    /// findings log store; PostgreSQL is used for the entity-risk-score
+    /// rollup table.
     pub fn with_dual_pool(dual_pool: &DualPool) -> Self {
         Self {
             pg_pool: dual_pool.postgres().clone(),
-            dual_pool: Some(dual_pool.clone()),
+            dual_pool: dual_pool.clone(),
             enabled: true,
         }
     }
@@ -360,13 +353,8 @@ impl FindingLogger {
         let message = finding.message();
         let timestamp = finding.detected_at;
 
-        // Log to ClickHouse if available, otherwise PostgreSQL
-        if let Some(ref dual_pool) = self.dual_pool {
-            self.log_to_clickhouse(dual_pool, &message, &metadata, timestamp)
-                .await?;
-        } else {
-            self.log_to_postgres(&message, &metadata, timestamp).await?;
-        }
+        self.log_to_clickhouse(&self.dual_pool, &message, &metadata, timestamp)
+            .await?;
 
         // Update entity risk score if we have a valid entity and risk score
         if finding.risk_score > 0
@@ -601,42 +589,6 @@ impl FindingLogger {
         Ok(())
     }
 
-    /// Log to PostgreSQL (fallback)
-    async fn log_to_postgres(
-        &self,
-        message: &str,
-        metadata: &serde_json::Value,
-        timestamp: DateTime<Utc>,
-    ) -> Result<(), FindingLogError> {
-        let signal_type = metadata
-            .get("signal_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let severity = metadata
-            .get("severity")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-
-        sqlx::query(
-            r#"
-            INSERT INTO logs (
-                timestamp, message, metadata, source_type,
-                action, status, ingest_time
-            ) VALUES ($1, $2, $3, 'findings', $4, $5, NOW())
-            "#,
-        )
-        .bind(timestamp)
-        .bind(message)
-        .bind(metadata)
-        .bind(signal_type)
-        .bind(severity)
-        .execute(&self.pg_pool)
-        .await
-        .map_err(FindingLogError::DatabaseError)?;
-
-        debug!("Finding logged to PostgreSQL");
-        Ok(())
-    }
 }
 
 /// Errors that can occur during finding logging

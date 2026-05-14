@@ -555,21 +555,6 @@ pub struct AuditLogWithNames {
     pub api_key_name: Option<String>,
 }
 
-/// Request to query audit logs
-#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
-pub struct AuditLogQuery {
-    #[serde(default, with = "typeid::user::opt")]
-    #[schema(value_type = Option<String>)]
-    pub user_id: Option<Uuid>,
-    pub action: Option<String>,
-    pub resource_type: Option<String>,
-    pub start_time: Option<DateTime<Utc>>,
-    pub end_time: Option<DateTime<Utc>>,
-    pub success: Option<bool>,
-    pub limit: Option<i64>,
-    pub offset: Option<i64>,
-}
-
 /// JWT token claims
 /// Requirements: 2.5
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]

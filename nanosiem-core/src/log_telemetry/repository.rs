@@ -21,15 +21,13 @@ const ROLLUP_TABLE: &str = "logs_per_source_5m";
 
 #[derive(Clone)]
 pub struct LogTelemetryRepository {
-    /// `None` when the deployment is PostgreSQL-only — every public method
-    /// returns `Ok(None)` so callers can degrade gracefully (per CLAUDE.md
-    /// "Graceful degradation").
-    client: Option<ClickHouseClient>,
+    /// ClickHouse client used to read the `logs_per_source_5m` rollup table.
+    client: ClickHouseClient,
     table_names: TableNames,
 }
 
 impl LogTelemetryRepository {
-    pub fn new(client: Option<ClickHouseClient>, table_names: TableNames) -> Self {
+    pub fn new(client: ClickHouseClient, table_names: TableNames) -> Self {
         Self {
             client,
             table_names,
@@ -45,25 +43,21 @@ impl LogTelemetryRepository {
     /// pre-normalize. Unsafe values (anything not `[A-Za-z0-9_-]`) are
     /// rejected at SQL-build time.
     ///
-    /// `Ok(None)` means ClickHouse is not configured. `Ok(Some(map))` may
-    /// be a partial map — source_types with no rollup rows in the window
-    /// simply don't appear (caller treats them as zero).
+    /// The returned map may be partial — source_types with no rollup rows in
+    /// the window simply don't appear (caller treats them as zero).
     pub async fn stats_by_source_type(
         &self,
         source_types: &[String],
         window_hours: i64,
-    ) -> Result<Option<HashMap<String, SourceTypeStats>>, RepoError> {
-        let Some(client) = self.client.as_ref() else {
-            return Ok(None);
-        };
+    ) -> Result<HashMap<String, SourceTypeStats>, RepoError> {
         let table = self.table_names.read(ROLLUP_TABLE);
         let safe = sanitize_source_types(source_types);
         let Some(sql) = build_stats_sql(&table, &safe, window_hours) else {
             // Empty input or every entry rejected — nothing to ask about.
-            return Ok(Some(HashMap::new()));
+            return Ok(HashMap::new());
         };
-        let rows = run_jsoneachrow(client, &sql).await?;
-        Ok(Some(parse_stats_rows(&rows)))
+        let rows = run_jsoneachrow(&self.client, &sql).await?;
+        Ok(parse_stats_rows(&rows))
     }
 
     /// Returns rollup stats for **every** source_type seen in the window.
@@ -73,14 +67,11 @@ impl LogTelemetryRepository {
     pub async fn stats_all(
         &self,
         window_hours: i64,
-    ) -> Result<Option<HashMap<String, SourceTypeStats>>, RepoError> {
-        let Some(client) = self.client.as_ref() else {
-            return Ok(None);
-        };
+    ) -> Result<HashMap<String, SourceTypeStats>, RepoError> {
         let table = self.table_names.read(ROLLUP_TABLE);
         let sql = build_stats_all_sql(&table, window_hours);
-        let rows = run_jsoneachrow(client, &sql).await?;
-        Ok(Some(parse_stats_rows(&rows)))
+        let rows = run_jsoneachrow(&self.client, &sql).await?;
+        Ok(parse_stats_rows(&rows))
     }
 
     /// Returns per-(source_type, bucket) event counts for the ingestion
@@ -91,17 +82,14 @@ impl LogTelemetryRepository {
         source_types: &[String],
         window_hours: i64,
         bucket: BucketSize,
-    ) -> Result<Option<Vec<HourlyPoint>>, RepoError> {
-        let Some(client) = self.client.as_ref() else {
-            return Ok(None);
-        };
+    ) -> Result<Vec<HourlyPoint>, RepoError> {
         let table = self.table_names.read(ROLLUP_TABLE);
         let safe = sanitize_source_types(source_types);
         let Some(sql) = build_buckets_sql(&table, &safe, window_hours, bucket) else {
-            return Ok(Some(Vec::new()));
+            return Ok(Vec::new());
         };
-        let rows = run_jsoneachrow(client, &sql).await?;
-        Ok(Some(parse_bucket_rows(&rows)))
+        let rows = run_jsoneachrow(&self.client, &sql).await?;
+        Ok(parse_bucket_rows(&rows))
     }
 
     /// Returns cluster-wide per-bucket totals (no source_type filter). Used by
@@ -111,26 +99,20 @@ impl LogTelemetryRepository {
         &self,
         window_hours: i64,
         bucket: BucketSize,
-    ) -> Result<Option<Vec<HourlyPoint>>, RepoError> {
-        let Some(client) = self.client.as_ref() else {
-            return Ok(None);
-        };
+    ) -> Result<Vec<HourlyPoint>, RepoError> {
         let table = self.table_names.read(ROLLUP_TABLE);
         let sql = build_buckets_all_sql(&table, window_hours, bucket);
-        let rows = run_jsoneachrow(client, &sql).await?;
-        Ok(Some(parse_bucket_all_rows(&rows)))
+        let rows = run_jsoneachrow(&self.client, &sql).await?;
+        Ok(parse_bucket_all_rows(&rows))
     }
 
     /// Returns the cluster-wide total event count for a window. Used by the
     /// dashboard's "events_24h / events_1h" headline numbers.
-    pub async fn total_events(&self, window_hours: i64) -> Result<Option<i64>, RepoError> {
-        let Some(client) = self.client.as_ref() else {
-            return Ok(None);
-        };
+    pub async fn total_events(&self, window_hours: i64) -> Result<i64, RepoError> {
         let table = self.table_names.read(ROLLUP_TABLE);
         let sql = build_total_events_sql(&table, window_hours);
-        let rows = run_jsoneachrow(client, &sql).await?;
-        Ok(Some(parse_total_events(&rows)))
+        let rows = run_jsoneachrow(&self.client, &sql).await?;
+        Ok(parse_total_events(&rows))
     }
 }
 

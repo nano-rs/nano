@@ -8,7 +8,7 @@ use sqlx::PgPool;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::auth::types::{AuditLog, AuditLogQuery, AuditLogWithNames};
+use crate::auth::types::{AuditLog, AuditLogWithNames};
 
 #[derive(Error, Debug)]
 pub enum AuditRepositoryError {
@@ -151,49 +151,6 @@ impl AuditRepository {
         Ok(log)
     }
 
-    /// Query audit logs with filtering
-    /// Requirements: 9.5
-    pub async fn query_logs(
-        &self,
-        query: &AuditLogQuery,
-    ) -> Result<Vec<AuditLogWithNames>, AuditRepositoryError> {
-        let limit = query.limit.unwrap_or(100);
-        let offset = query.offset.unwrap_or(0);
-
-        let logs = sqlx::query_as::<_, AuditLogWithNames>(
-            r#"
-            SELECT 
-                al.*,
-                u.name as user_name,
-                u.email as user_email,
-                ak.name as api_key_name
-            FROM audit_logs al
-            LEFT JOIN users u ON al.user_id = u.id
-            LEFT JOIN api_keys ak ON al.api_key_id = ak.id
-            WHERE ($1::uuid IS NULL OR al.user_id = $1)
-              AND ($2::text IS NULL OR al.action = $2)
-              AND ($3::text IS NULL OR al.resource_type = $3)
-              AND ($4::timestamptz IS NULL OR al.timestamp >= $4)
-              AND ($5::timestamptz IS NULL OR al.timestamp <= $5)
-              AND ($6::bool IS NULL OR al.success = $6)
-            ORDER BY al.timestamp DESC
-            LIMIT $7 OFFSET $8
-            "#,
-        )
-        .bind(query.user_id)
-        .bind(&query.action)
-        .bind(&query.resource_type)
-        .bind(query.start_time)
-        .bind(query.end_time)
-        .bind(query.success)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(logs)
-    }
-
     /// Get a single audit log entry
     pub async fn get_log(&self, id: Uuid) -> Result<AuditLog, AuditRepositoryError> {
         sqlx::query_as::<_, AuditLog>("SELECT * FROM audit_logs WHERE id = $1")
@@ -201,32 +158,6 @@ impl AuditRepository {
             .fetch_optional(&self.pool)
             .await?
             .ok_or(AuditRepositoryError::NotFound(id))
-    }
-
-    /// Count audit logs matching query
-    pub async fn count_logs(&self, query: &AuditLogQuery) -> Result<i64, AuditRepositoryError> {
-        let count = sqlx::query_scalar::<_, i64>(
-            r#"
-            SELECT COUNT(*)
-            FROM audit_logs
-            WHERE ($1::uuid IS NULL OR user_id = $1)
-              AND ($2::text IS NULL OR action = $2)
-              AND ($3::text IS NULL OR resource_type = $3)
-              AND ($4::timestamptz IS NULL OR timestamp >= $4)
-              AND ($5::timestamptz IS NULL OR timestamp <= $5)
-              AND ($6::bool IS NULL OR success = $6)
-            "#,
-        )
-        .bind(query.user_id)
-        .bind(&query.action)
-        .bind(&query.resource_type)
-        .bind(query.start_time)
-        .bind(query.end_time)
-        .bind(query.success)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(count)
     }
 
     /// Get recent audit logs for a user
@@ -305,27 +236,6 @@ impl AuditRepository {
         Ok(total_deleted)
     }
 
-    /// Get distinct action types
-    pub async fn get_action_types(&self) -> Result<Vec<String>, AuditRepositoryError> {
-        let actions = sqlx::query_scalar::<_, String>(
-            "SELECT DISTINCT action FROM audit_logs ORDER BY action",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(actions)
-    }
-
-    /// Get distinct resource types
-    pub async fn get_resource_types(&self) -> Result<Vec<String>, AuditRepositoryError> {
-        let types = sqlx::query_scalar::<_, String>(
-            "SELECT DISTINCT resource_type FROM audit_logs WHERE resource_type IS NOT NULL ORDER BY resource_type"
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(types)
-    }
 }
 
 // Implement FromRow for AuditLogWithNames manually since it has nested fields

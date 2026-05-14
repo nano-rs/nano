@@ -85,14 +85,13 @@ async fn rollup_matches_raw_logs_for_inserted_rows() {
     // 10 s for the MV to fire — the MV runs synchronously on insert but the
     // AggregatingMergeTree target may buffer briefly before the row is
     // visible. Polling avoids the flakiness of a fixed sleep.
-    let svc = LogTelemetryService::new(Some(ch.clone()), TableNames::new(pool.is_clustered()));
+    let svc = LogTelemetryService::new(ch.clone(), TableNames::new(pool.is_clustered()));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let row = loop {
         let stats = svc
             .stats_by_source_type(&[unique.clone()], 1)
             .await
-            .expect("rollup read should succeed")
-            .expect("ClickHouse should be configured");
+            .expect("rollup read should succeed");
         if let Some(row) = stats.get(&unique).cloned() {
             break row;
         }

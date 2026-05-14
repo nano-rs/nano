@@ -1,0 +1,65 @@
+{
+  "_comment": "Multi-rhythm corporate traffic profile for log-blaster --spike. Baseline is the steady background EPS; each rhythm contributes an envelope of additional (or negative) EPS over its window. Schedules use system-local time for daily entries.",
+  "baseline_eps": 500,
+  "baseline_mix": null,
+  "rhythms": [
+    {
+      "name": "morning_login_surge",
+      "schedule": { "type": "daily", "hh": 9, "mm": 0 },
+      "envelope": { "ramp_up_secs": 600, "plateau_secs": 1800, "ramp_down_secs": 600 },
+      "peak_eps": 7500,
+      "mix": {
+        "sysmon": 0.35,
+        "winevt": 0.45,
+        "proxy": 0.10,
+        "apache": 0.05,
+        "cloudtrail": 0.05
+      }
+    },
+    {
+      "name": "av_scan",
+      "schedule": { "type": "periodic", "interval_secs": 3600, "jitter": 0.15 },
+      "envelope": { "ramp_up_secs": 30, "plateau_secs": 120, "ramp_down_secs": 30 },
+      "peak_eps": 3000,
+      "mix": {
+        "sysmon": 0.92,
+        "winevt": 0.05,
+        "proxy": 0.0,
+        "apache": 0.0,
+        "cloudtrail": 0.03
+      }
+    },
+    {
+      "name": "lunch_dip",
+      "schedule": { "type": "daily", "hh": 12, "mm": 0 },
+      "envelope": { "ramp_up_secs": 300, "plateau_secs": 1800, "ramp_down_secs": 300 },
+      "peak_eps": -300
+    },
+    {
+      "name": "evening_logoff",
+      "schedule": { "type": "daily", "hh": 17, "mm": 0 },
+      "envelope": { "ramp_up_secs": 300, "plateau_secs": 1200, "ramp_down_secs": 600 },
+      "peak_eps": 4500,
+      "mix": {
+        "sysmon": 0.30,
+        "winevt": 0.55,
+        "proxy": 0.05,
+        "apache": 0.05,
+        "cloudtrail": 0.05
+      }
+    },
+    {
+      "name": "alert_storm",
+      "schedule": { "type": "poisson", "mean_interval_secs": 1800 },
+      "envelope": { "ramp_up_secs": 5, "plateau_secs": 30, "ramp_down_secs": 60 },
+      "peak_eps": 12000,
+      "mix": {
+        "sysmon": 0.70,
+        "winevt": 0.20,
+        "proxy": 0.05,
+        "apache": 0.03,
+        "cloudtrail": 0.02
+      }
+    }
+  ]
+}

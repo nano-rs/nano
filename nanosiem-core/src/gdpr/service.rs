@@ -23,16 +23,13 @@ use crate::db::DualPool;
 #[derive(Clone)]
 pub struct AnonymizationService {
     pool: PgPool,
-    dual_pool: Option<DualPool>,
+    dual_pool: DualPool,
     table_names: TableNames,
 }
 
 impl AnonymizationService {
-    pub fn new(pool: PgPool, dual_pool: Option<DualPool>) -> Self {
-        let table_names = dual_pool
-            .as_ref()
-            .map(|dp| dp.table_names())
-            .unwrap_or_else(|| TableNames::new(false));
+    pub fn new(pool: PgPool, dual_pool: DualPool) -> Self {
+        let table_names = dual_pool.table_names();
         Self {
             pool,
             dual_pool,
@@ -63,19 +60,13 @@ impl AnonymizationService {
     }
 
     /// Get the ClickHouse client for read-only queries (estimates)
-    fn clickhouse(&self) -> Result<&clickhouse::Client, AnonymizationError> {
-        self.dual_pool
-            .as_ref()
-            .map(|dp| dp.clickhouse())
-            .ok_or(AnonymizationError::ClickHouseUnavailable)
+    fn clickhouse(&self) -> &clickhouse::Client {
+        self.dual_pool.clickhouse()
     }
 
     /// Get the ClickHouse admin client for DDL operations (ALTER TABLE UPDATE/DELETE)
-    fn clickhouse_admin(&self) -> Result<&clickhouse::Client, AnonymizationError> {
-        self.dual_pool
-            .as_ref()
-            .map(|dp| dp.clickhouse_admin())
-            .ok_or(AnonymizationError::ClickHouseUnavailable)
+    fn clickhouse_admin(&self) -> &clickhouse::Client {
+        self.dual_pool.clickhouse_admin()
     }
 
     /// Submit a new anonymization request.
@@ -100,7 +91,7 @@ impl AnonymizationService {
 
         let salt = self.load_salt().await?;
         let identifier_hash = Self::salted_hash(trimmed, &salt);
-        let ch = self.clickhouse()?;
+        let ch = self.clickhouse();
 
         // Estimate affected rows per table
         let logs_affected = self.estimate_logs(ch, identifier_type, trimmed).await?;
@@ -165,7 +156,7 @@ impl AnonymizationService {
         &self,
         request_id: Uuid,
     ) -> Result<AnonymizationRequest, AnonymizationError> {
-        let ch = self.clickhouse_admin()?;
+        let ch = self.clickhouse_admin();
         let salt = self.load_salt().await?;
 
         // Atomically claim the request — only one caller can transition pending → running

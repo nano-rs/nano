@@ -1,9 +1,0 @@
-# Auto-generated combiner for all DB parsers
-# DO NOT EDIT - changes will be overwritten
-
-[transforms.db_parsers_combined]
-type = "remap"
-inputs = ["squid_proxy_output"]
-source = '''
-. = .
-'''

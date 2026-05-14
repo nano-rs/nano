@@ -258,16 +258,10 @@ pub async fn create_detection(
         );
     }
 
-    // Get materialized view generator if available (for real-time rules)
-    let mv_generator = state
-        .materialized_view_generator
-        .as_ref()
-        .map(|g| g.as_ref());
-
     // Create rule with mode-based routing
     let rule = state
         .detection_service
-        .create_rule_with_mode(request, mv_generator)
+        .create_rule_with_mode(request, state.materialized_view_generator.as_ref())
         .await?;
 
     // Persist next_run_at for distributed scheduling
@@ -403,16 +397,15 @@ pub async fn update_detection(
         }
     }
 
-    // Get materialized view generator if available (for real-time rules)
-    let mv_generator = state
-        .materialized_view_generator
-        .as_ref()
-        .map(|g| g.as_ref());
-
     // Update rule with mode-based routing
     let rule = state
         .detection_service
-        .update_rule_with_mode(*id, request, mv_generator, Some(auth.user_id()))
+        .update_rule_with_mode(
+            *id,
+            request,
+            state.materialized_view_generator.as_ref(),
+            Some(auth.user_id()),
+        )
         .await?;
 
     // Recompute next_run_at for distributed scheduling (sets or clears based on rule state)
@@ -556,16 +549,10 @@ pub async fn delete_detection(
         .map(|r| r.name)
         .unwrap_or_else(|_| "unknown".to_string());
 
-    // Get materialized view generator if available (for real-time rules)
-    let mv_generator = state
-        .materialized_view_generator
-        .as_ref()
-        .map(|g| g.as_ref());
-
     // Delete rule with mode-based cleanup (row deletion clears next_run_at)
     state
         .detection_service
-        .delete_rule_with_mode(*id, mv_generator)
+        .delete_rule_with_mode(*id, state.materialized_view_generator.as_ref())
         .await?;
 
     // Remove from real-time evaluator (legacy real-time detection)

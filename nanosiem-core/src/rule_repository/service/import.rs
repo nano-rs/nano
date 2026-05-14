@@ -35,9 +35,7 @@ impl RuleRepositoryService {
         path: &str,
         req: ImportRequest,
         user_id: Option<Uuid>,
-        materialized_view_generator: Option<
-            &crate::detection::materialized_view::MaterializedViewGenerator,
-        >,
+        materialized_view_generator: &crate::detection::materialized_view::MaterializedViewGenerator,
     ) -> Result<(Uuid, ImportOutcome), RuleRepositoryError> {
         let detection_service = self.detection_service.as_ref().ok_or_else(|| {
             RuleRepositoryError::Internal("Detection service not configured".to_string())

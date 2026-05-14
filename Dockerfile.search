@@ -18,13 +18,9 @@ COPY nanosiem-core ./nanosiem-core
 COPY nanosiem-search ./nanosiem-search
 # Copy other workspace members (needed for workspace resolution)
 COPY nanosiem-api/Cargo.toml ./nanosiem-api/Cargo.toml
-COPY nanosiem-cli/Cargo.toml ./nanosiem-cli/Cargo.toml
-COPY nanosiem-ingest/Cargo.toml ./nanosiem-ingest/Cargo.toml
 
 # Create dummy source files for other workspace members
 RUN mkdir -p nanosiem-api/src && echo "fn main() {}" > nanosiem-api/src/main.rs
-RUN mkdir -p nanosiem-cli/src && echo "fn main() {}" > nanosiem-cli/src/main.rs
-RUN mkdir -p nanosiem-ingest/src && echo "fn main() {}" > nanosiem-ingest/src/main.rs
 
 # Build only the search service
 RUN cargo build --release --package nanosiem-search

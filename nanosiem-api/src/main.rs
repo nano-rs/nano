@@ -8,7 +8,6 @@
 
 use anyhow::Result;
 use nanosiem_api::{create_router, ApiConfig, AppMetrics, AppState};
-use nanosiem_core::Database;
 use std::net::SocketAddr;
 
 #[tokio::main]
@@ -25,46 +24,19 @@ async fn main() -> Result<()> {
         config.port
     );
 
-    // Try to initialize with DualPool (ClickHouse + PostgreSQL).
-    // Falls back to PostgreSQL-only if ClickHouse is not configured/reachable.
-    // SchemaBehind is *not* a fallback case — ClickHouse is reachable but
-    // missing migrations, which means the deploy bypassed the pre-deploy
-    // migrator. Refuse to start rather than silently degrading. (NAN-607)
+    // Initialize with DualPool (ClickHouse + PostgreSQL). Both are required;
+    // the historical PG-only fallback was removed in NAN-800. SchemaBehind
+    // means ClickHouse is reachable but missing migrations — refuse to start
+    // rather than risk corruption against an out-of-date schema. (NAN-607)
     let mut state = match AppState::try_with_dual_pool(config.clone()).await {
-        Ok(state) => {
-            tracing::info!("DualPool mode enabled - using ClickHouse for log storage");
-            state
-        }
+        Ok(state) => state,
         Err(nanosiem_core::db::DualPoolError::SchemaBehind(msg)) => {
             tracing::error!("Refusing to start: {}", msg);
             return Err(anyhow::anyhow!("{}", msg));
         }
         Err(e) => {
-            tracing::info!(
-                "DualPool not available ({}), falling back to PostgreSQL-only mode",
-                e
-            );
-
-            // Initialize database connection (PostgreSQL only)
-            tracing::info!("Connecting to PostgreSQL database...");
-            let db = Database::connect(&config.database_url).await?;
-            tracing::info!("PostgreSQL database connected");
-
-            // Run PostgreSQL migrations via the shared helper (handles
-            // fresh-init detection + snapshot + backfill per NAN-749).
-            let pg_pool: &sqlx::PgPool = db.pool();
-            nanosiem_core::db::run_postgres_migrations(pg_pool).await?;
-            #[cfg(feature = "enterprise")]
-            {
-                tracing::info!("Running enterprise PostgreSQL overlay migrations...");
-                let mut overlay_migrator =
-                    sqlx::migrate!("../migrations/postgres-enterprise");
-                overlay_migrator.set_ignore_missing(true);
-                overlay_migrator.run(pg_pool).await?;
-                tracing::info!("Enterprise PostgreSQL overlay complete");
-            }
-
-            AppState::from_database(&db, config.clone())
+            tracing::error!("Refusing to start: DualPool initialization failed: {}", e);
+            return Err(anyhow::anyhow!("DualPool initialization failed: {}", e));
         }
     };
 
@@ -76,12 +48,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Log which mode we're running in
-    if state.is_clickhouse_enabled() {
-        tracing::info!("Running in DualPool mode (ClickHouse + PostgreSQL)");
-    } else {
-        tracing::info!("Running in PostgreSQL-only mode");
-    }
+    tracing::info!("Running in dual-mode (ClickHouse + PostgreSQL)");
 
     // Initialize meloD AI service if configured. The reload path lives in
     // the enterprise crate; open-core builds simply skip AI initialization.

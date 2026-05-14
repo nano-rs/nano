@@ -76,21 +76,6 @@ pub struct RuleRepositoryService {
 }
 
 impl RuleRepositoryService {
-    /// Create a new service with PostgreSQL only
-    pub fn new(pool: PgPool) -> Self {
-        Self {
-            repo_repository: RuleRepositoryRepository::new(pool.clone()),
-            rules_repository: RepositoryRulesRepository::new(pool.clone()),
-            imports_repository: RuleImportsRepository::new(pool.clone()),
-            github_client: GitHubClient::new(),
-            coverage_analyzer: Arc::new(RwLock::new(CoverageAnalyzer::new_without_clickhouse())),
-            detection_service: None,
-            config: RuleRepositoryServiceConfig::default(),
-            pg_pool: pool,
-            syncing_repos: Arc::new(RwLock::new(std::collections::HashSet::new())),
-        }
-    }
-
     /// Create a new service with DualPool (includes ClickHouse for coverage analysis)
     pub fn with_dual_pool(dual_pool: &DualPool) -> Self {
         let pg_pool = dual_pool.postgres().clone();

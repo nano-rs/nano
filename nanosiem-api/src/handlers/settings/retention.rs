@@ -321,79 +321,52 @@ pub async fn get_storage_overview(
     check_permission(&auth, permissions::SETTINGS_VIEW)
         .map_err(|_| ApiError::Forbidden("Missing permission: settings:view".to_string()))?;
 
-    let clickhouse_enabled = state.is_clickhouse_enabled();
+    let dual_pool = state.dual_pool();
+    let settings =
+        DualSystemSettings::new(dual_pool.postgres().clone(), dual_pool.clickhouse().clone());
 
-    // Get PostgreSQL stats (metadata in dual mode, everything in legacy mode)
-    let postgres_stats = if let Some(dual_pool) = state.dual_pool() {
-        // Dual mode - get PostgreSQL metadata stats
-        let settings =
-            DualSystemSettings::new(dual_pool.postgres().clone(), dual_pool.clickhouse().clone());
-        match settings.get_pg_storage_stats().await {
-            Ok(stats) => Some(StorageStatsResponse::from(stats)),
-            Err(e) => {
-                tracing::error!("Failed to get PostgreSQL storage stats: {}", e);
-                None
-            }
-        }
-    } else {
-        // Legacy mode - PostgreSQL stores everything
-        let settings = SystemSettings::new(state.pool.clone());
-        match settings.get_storage_stats().await {
-            Ok(stats) => Some(StorageStatsResponse::from(stats)),
-            Err(e) => {
-                tracing::error!("Failed to get PostgreSQL storage stats: {}", e);
-                None
-            }
+    let postgres_stats = match settings.get_pg_storage_stats().await {
+        Ok(stats) => Some(StorageStatsResponse::from(stats)),
+        Err(e) => {
+            tracing::error!("Failed to get PostgreSQL storage stats: {}", e);
+            None
         }
     };
 
-    // Get ClickHouse stats (logs)
-    let clickhouse_stats = if let Some(dual_pool) = state.dual_pool() {
-        let settings =
-            DualSystemSettings::new(dual_pool.postgres().clone(), dual_pool.clickhouse().clone());
-        match settings.get_clickhouse_storage_stats().await {
-            Ok(stats) => {
-                tracing::debug!("ClickHouse storage stats retrieved successfully");
-                Some(ClickHouseStorageStatsResponse::from(stats))
-            }
-            Err(e) => {
-                tracing::error!("Failed to get ClickHouse storage stats: {:?}", e);
-                None
-            }
+    let clickhouse_stats = match settings.get_clickhouse_storage_stats().await {
+        Ok(stats) => {
+            tracing::debug!("ClickHouse storage stats retrieved successfully");
+            Some(ClickHouseStorageStatsResponse::from(stats))
         }
-    } else {
-        tracing::debug!("ClickHouse not enabled, skipping stats");
-        None
+        Err(e) => {
+            tracing::error!("Failed to get ClickHouse storage stats: {:?}", e);
+            None
+        }
     };
 
-    // Get disk pressure status if available
-    let disk_pressure = if let Some(ref dp_service) = state.disk_pressure_service {
-        match dp_service.get_status().await {
-            Ok(status) => Some(DiskPressureStatusResponse {
-                usage_fraction: status.usage_fraction,
-                total_bytes: status.total_bytes,
-                used_bytes: status.used_bytes,
-                free_bytes: status.free_bytes,
-                level: status.level.to_string(),
-                estimated_retention_days: status.estimated_retention_days,
-                partitions_dropped: status.partitions_dropped,
-                ingestion_paused: status.ingestion_paused,
-                high_watermark: status.high_watermark,
-                low_watermark: status.low_watermark,
-                critical_threshold: status.critical_threshold,
-                emergency_threshold: status.emergency_threshold,
-            }),
-            Err(e) => {
-                tracing::warn!("Failed to get disk pressure status: {}", e);
-                None
-            }
+    let disk_pressure = match state.disk_pressure_service.get_status().await {
+        Ok(status) => Some(DiskPressureStatusResponse {
+            usage_fraction: status.usage_fraction,
+            total_bytes: status.total_bytes,
+            used_bytes: status.used_bytes,
+            free_bytes: status.free_bytes,
+            level: status.level.to_string(),
+            estimated_retention_days: status.estimated_retention_days,
+            partitions_dropped: status.partitions_dropped,
+            ingestion_paused: status.ingestion_paused,
+            high_watermark: status.high_watermark,
+            low_watermark: status.low_watermark,
+            critical_threshold: status.critical_threshold,
+            emergency_threshold: status.emergency_threshold,
+        }),
+        Err(e) => {
+            tracing::warn!("Failed to get disk pressure status: {}", e);
+            None
         }
-    } else {
-        None
     };
 
     Ok(Json(StorageOverviewResponse {
-        clickhouse_enabled,
+        clickhouse_enabled: true,
         postgres: postgres_stats,
         clickhouse: clickhouse_stats,
         disk_pressure,
@@ -424,10 +397,7 @@ pub async fn get_clickhouse_storage_stats(
     check_permission(&auth, permissions::SETTINGS_VIEW)
         .map_err(|_| ApiError::Forbidden("Missing permission: settings:view".to_string()))?;
 
-    let dual_pool = state
-        .dual_pool()
-        .ok_or_else(|| ApiError::BadRequest("ClickHouse is not enabled".to_string()))?;
-
+    let dual_pool = state.dual_pool();
     let settings =
         DualSystemSettings::new(dual_pool.postgres().clone(), dual_pool.clickhouse().clone());
 
@@ -462,9 +432,7 @@ pub async fn update_clickhouse_retention(
     check_permission(&auth, permissions::SETTINGS_RETENTION)
         .map_err(|_| ApiError::Forbidden("Missing permission: settings:retention".to_string()))?;
 
-    let dual_pool = state
-        .dual_pool()
-        .ok_or_else(|| ApiError::BadRequest("ClickHouse is not enabled".to_string()))?;
+    let dual_pool = state.dual_pool();
 
     if request.retention_days < 1 {
         return Err(ApiError::ValidationError(
@@ -525,9 +493,7 @@ pub async fn run_clickhouse_retention_now(
     check_permission(&auth, permissions::SETTINGS_RETENTION)
         .map_err(|_| ApiError::Forbidden("Missing permission: settings:retention".to_string()))?;
 
-    let dual_pool = state
-        .dual_pool()
-        .ok_or_else(|| ApiError::BadRequest("ClickHouse is not enabled".to_string()))?;
+    let dual_pool = state.dual_pool();
 
     let settings =
         DualSystemSettings::new(dual_pool.postgres().clone(), dual_pool.clickhouse().clone());

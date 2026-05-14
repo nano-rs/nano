@@ -81,11 +81,8 @@ impl AppState {
     /// and syncs them if they're due for an update.
     pub fn start_enrichment_scheduler(&self) -> tokio::task::JoinHandle<()> {
         let enrichment_repo = EnrichmentRepository::new(self.pool.clone());
-        let mut scheduler =
-            EnrichmentScheduler::with_defaults(self.enrichment.clone(), enrichment_repo);
-        if let Some(ref dp) = self.dual_pool {
-            scheduler = scheduler.with_clickhouse(dp.clickhouse().clone());
-        }
+        let scheduler = EnrichmentScheduler::with_defaults(self.enrichment.clone(), enrichment_repo)
+            .with_clickhouse(self.dual_pool.clickhouse().clone());
         let scheduler = Arc::new(scheduler);
         scheduler.start()
     }
@@ -94,12 +91,10 @@ impl AppState {
     /// schedules) — enterprise only after Phase 3.3 of NAN-744.
     #[cfg(feature = "enterprise")]
     pub fn start_custom_enrichment_scheduler(&self) -> tokio::task::JoinHandle<()> {
-        let ch_client: Option<clickhouse::Client> =
-            self.dual_pool.as_ref().map(|dp| dp.clickhouse().clone());
         let encryption = Some(Arc::new(EncryptionService::from_env()));
         let scheduler = Arc::new(CustomEnrichmentScheduler::new(
             self.pool.clone(),
-            ch_client,
+            self.dual_pool.clickhouse().clone(),
             encryption,
         ));
         let poll_interval: u64 = std::env::var("CUSTOM_ENRICHMENT_POLL_INTERVAL_SECS")
@@ -210,6 +205,7 @@ impl AppState {
         use nanosiem_core::rule_repository::RuleRepositoryRepository;
 
         let pool = self.pool.clone();
+        let dual_pool = self.dual_pool.clone();
         let poll_secs: u64 = std::env::var("RULE_REPO_SYNC_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -220,7 +216,7 @@ impl AppState {
             tokio::time::sleep(std::time::Duration::from_secs(1200)).await;
 
             let repo_repository = RuleRepositoryRepository::new(pool.clone());
-            let service = RuleRepositoryService::new(pool.clone());
+            let service = RuleRepositoryService::with_dual_pool(&dual_pool);
 
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(poll_secs));
 
@@ -282,19 +278,10 @@ impl AppState {
         #[cfg(feature = "enterprise")]
         use nanosiem_enterprise::tuning::orchestrator::TuningOrchestrator;
 
-        // Check if we have ClickHouse available (required for metrics collection).
         // The pool is only used by the enterprise AI orchestrator path; in
-        // open mode we just confirm the mode is correct and otherwise drop it.
+        // open mode we just bind it for symmetry and drop it.
         #[cfg_attr(not(feature = "enterprise"), allow(unused_variables))]
-        let dual_pool = match &self.dual_pool {
-            Some(dual_pool) => dual_pool.clone(),
-            None => {
-                tracing::warn!(
-                    "Tuning scheduler requires ClickHouse (DualPool mode). Skipping tuning scheduler."
-                );
-                return Vec::new();
-            }
-        };
+        let dual_pool = self.dual_pool.clone();
 
         // Create tuning services
         let metrics_collector = MetricsCollector::new(self.pool.clone());
@@ -379,12 +366,8 @@ impl AppState {
         #[cfg(not(feature = "enterprise"))]
         use nanosiem_core::extensions::NoopSiemHealthAiAnalyzer;
 
-        let ch_client = self.dual_pool.as_ref().map(|dp| dp.clickhouse().clone());
-        let is_clustered = self
-            .dual_pool
-            .as_ref()
-            .map(|dp| dp.table_names().is_clustered())
-            .unwrap_or(false);
+        let ch_client = self.dual_pool.clickhouse().clone();
+        let is_clustered = self.dual_pool.table_names().is_clustered();
 
         // Enterprise builds wrap the live meloD AI client in
         // `AiPoweredSiemHealthAnalyzer`; open-core builds use the noop

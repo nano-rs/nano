@@ -158,10 +158,8 @@ pub async fn get_source_types(
 
     let time_range = query.time_range();
 
-    // Check if we have a dual pool (ClickHouse enabled)
-    if let Some(ref dual_pool) = state.dual_pool {
-        // Query ClickHouse for source types
-        let ch_client = dual_pool.clickhouse();
+    {
+        let ch_client = state.dual_pool.clickhouse();
 
         let sql = format!(
             r#"
@@ -201,26 +199,6 @@ pub async fn get_source_types(
                 Some((source_type, count))
             })
             .collect();
-
-        Ok(Json(rows))
-    } else {
-        // Fallback to PostgreSQL
-        let rows: Vec<(String, i64)> = sqlx::query_as::<_, (String, i64)>(
-            r#"
-            SELECT source_type, COUNT(*) as count
-            FROM logs
-            WHERE timestamp >= $1 AND timestamp < $2
-              AND source_type IS NOT NULL
-              AND source_type != ''
-            GROUP BY source_type
-            ORDER BY count DESC
-            "#,
-        )
-        .bind(time_range.start)
-        .bind(time_range.end)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(|e: sqlx::Error| ApiError::DatabaseError(e.to_string()))?;
 
         Ok(Json(rows))
     }

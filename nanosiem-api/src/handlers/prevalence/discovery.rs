@@ -57,13 +57,7 @@ pub async fn get_rare_artifacts(
         )
     })?;
 
-    // Check if ClickHouse is enabled
-    let dual_pool = state.dual_pool().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Prevalence tracking requires ClickHouse".to_string(),
-        )
-    })?;
+    let dual_pool = state.dual_pool();
 
     // Create service with database config for hot-reload support (Requirement 8.5)
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
@@ -136,13 +130,7 @@ pub async fn get_new_artifacts(
         )
     })?;
 
-    // Check if ClickHouse is enabled
-    let dual_pool = state.dual_pool().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Prevalence tracking requires ClickHouse".to_string(),
-        )
-    })?;
+    let dual_pool = state.dual_pool();
 
     // Create service with database config for hot-reload support (Requirement 8.5)
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
@@ -221,12 +209,7 @@ pub async fn get_artifact_explorer(
         )
     })?;
 
-    let dual_pool = state.dual_pool().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Prevalence tracking requires ClickHouse".to_string(),
-        )
-    })?;
+    let dual_pool = state.dual_pool();
 
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
         dual_pool.clickhouse().clone(),
@@ -289,12 +272,7 @@ pub async fn get_artifact_detail(
         )
     })?;
 
-    let dual_pool = state.dual_pool().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Prevalence tracking requires ClickHouse".to_string(),
-        )
-    })?;
+    let dual_pool = state.dual_pool();
 
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
         dual_pool.clickhouse().clone(),
@@ -363,13 +341,7 @@ pub async fn get_scatter_data(
         ));
     }
 
-    // Check if ClickHouse is enabled
-    let dual_pool = state.dual_pool().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Prevalence tracking requires ClickHouse".to_string(),
-        )
-    })?;
+    let dual_pool = state.dual_pool();
 
     // Create service with database config for hot-reload support (Requirement 8.5)
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
@@ -433,13 +405,7 @@ pub async fn get_query_artifacts(
         )
     })?;
 
-    // Check if ClickHouse is enabled
-    let dual_pool = state.dual_pool().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Prevalence tracking requires ClickHouse".to_string(),
-        )
-    })?;
+    let dual_pool = state.dual_pool();
 
     // Create prevalence service with database config
     let prevalence_service = nanosiem_core::prevalence::PrevalenceService::with_database_config(
@@ -486,10 +452,7 @@ pub async fn get_query_artifacts(
                 match extract_search_expr(&parsed_query) {
                     Some(search_expr) => {
                         // Generate WHERE clause directly from the search expression
-                        let logs_table = state
-                            .dual_pool()
-                            .map(|dp| dp.table_names().read("logs"))
-                            .unwrap_or_else(|| "nanosiem.logs".to_string());
+                        let logs_table = state.dual_pool().table_names().read("logs");
                         let sql_gen = ClickHouseSqlGenerator::with_table(&logs_table);
                         match sql_gen.generate_search_expr(search_expr) {
                             Ok(where_clause) => {

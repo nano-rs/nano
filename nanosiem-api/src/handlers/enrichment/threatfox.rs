@@ -154,8 +154,8 @@ pub async fn sync_threatfox(
                         duration_ms = result.duration_ms,
                         "ThreatFox sync completed successfully"
                     );
-                    if let Some(ref dp) = dual_pool {
-                        if let Err(e) = dp
+                    {
+                        if let Err(e) = dual_pool
                             .clickhouse()
                             .query("SYSTEM RELOAD DICTIONARY nanosiem.ioc_enrichment_dict")
                             .execute()

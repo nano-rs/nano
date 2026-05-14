@@ -54,42 +54,6 @@ pub struct RealtimeEvaluator {
 }
 
 impl RealtimeEvaluator {
-    /// Create a new real-time evaluator with PostgreSQL only (legacy mode)
-    pub fn new(pool: sqlx::PgPool) -> Self {
-        let finding_logger = FindingLogger::new(pool.clone());
-        Self {
-            rule_repo: DetectionRuleRepository::new(pool.clone()),
-            alert_repo: AlertRepository::new(pool.clone()),
-            finding_logger: Some(finding_logger),
-            config: RealtimeConfig::default(),
-            compiled_rules: Arc::new(RwLock::new(HashMap::new())),
-            cumulative_risk_rules: Arc::new(RwLock::new(Vec::new())),
-            pg_pool: pool,
-            case_grouping: Arc::new(NoopCaseGroupingHook),
-            shadow_investigation: Arc::new(NoopShadowInvestigationHook),
-        }
-    }
-
-    /// Create a new real-time evaluator with custom configuration (PostgreSQL only)
-    pub fn with_config(pool: sqlx::PgPool, config: RealtimeConfig) -> Self {
-        let finding_logger = if config.signal_logging_enabled {
-            Some(FindingLogger::new(pool.clone()))
-        } else {
-            None
-        };
-        Self {
-            rule_repo: DetectionRuleRepository::new(pool.clone()),
-            alert_repo: AlertRepository::new(pool.clone()),
-            finding_logger,
-            config,
-            compiled_rules: Arc::new(RwLock::new(HashMap::new())),
-            cumulative_risk_rules: Arc::new(RwLock::new(Vec::new())),
-            pg_pool: pool,
-            case_grouping: Arc::new(NoopCaseGroupingHook),
-            shadow_investigation: Arc::new(NoopShadowInvestigationHook),
-        }
-    }
-
     /// Create a new real-time evaluator with DualPool
     ///
     /// Uses PostgreSQL from the DualPool for rule and alert storage. Case
@@ -102,26 +66,6 @@ impl RealtimeEvaluator {
             alert_repo: AlertRepository::new(dual_pool.postgres().clone()),
             finding_logger: Some(finding_logger),
             config: RealtimeConfig::default(),
-            compiled_rules: Arc::new(RwLock::new(HashMap::new())),
-            cumulative_risk_rules: Arc::new(RwLock::new(Vec::new())),
-            pg_pool: dual_pool.postgres().clone(),
-            case_grouping: Arc::new(NoopCaseGroupingHook),
-            shadow_investigation: Arc::new(NoopShadowInvestigationHook),
-        }
-    }
-
-    /// Create a new real-time evaluator with DualPool and custom configuration
-    pub fn with_dual_pool_and_config(dual_pool: &DualPool, config: RealtimeConfig) -> Self {
-        let finding_logger = if config.signal_logging_enabled {
-            Some(FindingLogger::with_dual_pool(dual_pool))
-        } else {
-            None
-        };
-        Self {
-            rule_repo: DetectionRuleRepository::new(dual_pool.postgres().clone()),
-            alert_repo: AlertRepository::new(dual_pool.postgres().clone()),
-            finding_logger,
-            config,
             compiled_rules: Arc::new(RwLock::new(HashMap::new())),
             cumulative_risk_rules: Arc::new(RwLock::new(Vec::new())),
             pg_pool: dual_pool.postgres().clone(),

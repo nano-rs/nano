@@ -99,12 +99,11 @@ When parsers are deployed, Vector reloads its configuration:
 - **No data loss** - Incoming data is buffered during reload
 - **Automatic** - Triggered via Vector API on port 8686
 
-## Backup Files
+## Disabled Files
 
-Files ending in `.bak` or `.disabled` are not loaded by Vector. These contain:
-- Previous monolithic configs (`vector-minimal.toml.bak`)
-- Alternative sink configurations (`sinks/*.bak`, `sinks/*.disabled`)
-- Disabled source configurations (`sources/*.disabled`)
+Files ending in `.disabled` are not loaded by Vector. These contain
+alternative sink and source configurations (`sinks/*.disabled`,
+`sources/*.disabled`) that can be re-enabled by renaming.
 
 ## Sink Options
 
