@@ -73,7 +73,12 @@ services:
       - no-new-privileges:true
     environment:
       CLICKHOUSE_DB: nanosiem
-      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+      # NAN-809: do NOT set CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT here. The upstream
+      # entrypoint reacts to that env by writing a generated default-user.xml into
+      # /etc/clickhouse-server/users.d/, which conflicts with our :ro bind mount and
+      # puts the container in a restart loop. Our users.d/default-user.xml already
+      # sets <access_management>1</access_management> directly, so the env is
+      # redundant.
       # Pass per-deployment passwords into users.d/*.xml via from_env="..." (NAN-807 bug #2).
       CLICKHOUSE_NANOSIEM_PASSWORD: ${CLICKHOUSE_PASSWORD}
       CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD}
