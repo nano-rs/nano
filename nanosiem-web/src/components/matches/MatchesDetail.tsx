@@ -224,6 +224,11 @@ function Chip({
   );
 }
 
+// NAN-814 — above this many distinct source IPs we swap the swim-lane viz for
+// a temporal histogram + top-N leaderboard. At one row per IP a 859-event
+// match produced a ~12,000px scrolling wall of dots.
+const SWIMLANE_MAX_IPS = 12;
+
 function EventTimeline({
   view,
   onEventHover,
@@ -237,24 +242,16 @@ function EventTimeline({
   const last = view.lastSeen.getTime();
   const range = Math.max(last - first, 1000);
 
-  // Distinct IPs become swim-lane rows.
-  const ips = useMemo(() => {
-    const s: string[] = [];
-    const seen = new Set<string>();
+  const ipCounts = useMemo(() => {
+    const counts = new Map<string, number>();
     for (const e of view.events) {
-      const ip = extractIp(e);
-      if (ip && !seen.has(ip)) {
-        seen.add(ip);
-        s.push(ip);
-      }
+      const ip = extractIp(e) || '—';
+      counts.set(ip, (counts.get(ip) || 0) + 1);
     }
-    if (s.length === 0) s.push('—');
-    return s;
+    return counts;
   }, [view.events]);
 
-  const ipRow = (ip: string | undefined) => Math.max(0, ips.indexOf(ip || '—'));
-  const rowH = 14;
-  const chartH = ips.length * rowH + 12;
+  const useSwimLanes = ipCounts.size <= SWIMLANE_MAX_IPS;
 
   return (
     <div
@@ -266,7 +263,7 @@ function EventTimeline({
           Event timeline
         </span>
         <span className="font-mono text-[10px] text-muted-foreground">
-          {view.events.length} events · {ips.length} source IP{ips.length !== 1 ? 's' : ''}
+          {view.events.length} events · {ipCounts.size} source IP{ipCounts.size !== 1 ? 's' : ''}
         </span>
         <span className="ml-auto font-mono text-[10px] text-muted-foreground tabular-nums">
           {absTime(view.firstSeen)} → {absTime(view.lastSeen)}
@@ -274,62 +271,198 @@ function EventTimeline({
           <span className="text-foreground">{(range / 60000).toFixed(1)}m</span>
         </span>
       </div>
-      <div className="px-3 py-2 overflow-y-auto" style={{ maxHeight: 320 }}>
-        <div className="relative" style={{ height: chartH + 20 }}>
-          {/* Row labels */}
-          <div className="absolute left-3 top-2 flex flex-col" style={{ gap: '2px' }}>
-            {ips.map((ip) => (
-              <div
-                key={ip}
-                className="font-mono text-[9px] text-muted-foreground/70 tabular-nums"
-                style={{ height: rowH, lineHeight: `${rowH}px` }}
-              >
-                {ip}
-              </div>
-            ))}
-          </div>
-          {/* Events */}
-          <div className="absolute top-2 right-3" style={{ left: 100, height: chartH }}>
+      {useSwimLanes ? (
+        <EventTimelineSwimLanes
+          view={view}
+          ips={Array.from(ipCounts.keys())}
+          onEventHover={onEventHover}
+          hoveredEventId={hoveredEventId}
+        />
+      ) : (
+        <EventTimelineDensity view={view} ipCounts={ipCounts} />
+      )}
+    </div>
+  );
+}
+
+function EventTimelineSwimLanes({
+  view,
+  ips,
+  onEventHover,
+  hoveredEventId,
+}: {
+  view: MatchView;
+  ips: string[];
+  onEventHover: (id: string | null) => void;
+  hoveredEventId: string | null;
+}) {
+  const first = view.firstSeen.getTime();
+  const last = view.lastSeen.getTime();
+  const range = Math.max(last - first, 1000);
+  const ipRow = (ip: string | undefined) => Math.max(0, ips.indexOf(ip || '—'));
+  const rowH = 14;
+  const chartH = ips.length * rowH + 12;
+
+  return (
+    <div className="px-3 py-2">
+      <div className="relative" style={{ height: chartH + 20 }}>
+        {/* Row labels */}
+        <div className="absolute left-3 top-2 flex flex-col" style={{ gap: '2px' }}>
+          {ips.map((ip) => (
             <div
-              className="absolute left-0 right-0 bottom-2 h-px"
-              style={{ background: 'color-mix(in srgb, var(--foreground) 8%, transparent)' }}
-            />
-            {view.events.map((e, i) => {
-              const t = extractEventTime(e);
-              if (!t) return null;
-              const x = ((t.getTime() - first) / range) * 100;
-              const ip = extractIp(e);
-              const y = ipRow(ip) * rowH + rowH / 2 - 3;
-              const raw = e as Record<string, unknown>;
-              const eventId = typeof raw.id === 'string' ? raw.id : `ev_${i}`;
-              const hovered = hoveredEventId === eventId;
-              return (
-                <div
-                  key={eventId}
-                  onMouseEnter={() => onEventHover(eventId)}
-                  onMouseLeave={() => onEventHover(null)}
-                  className="absolute cursor-pointer"
-                  style={{
-                    left: `calc(${x}% - 3px)`,
-                    top: y,
-                    width: 6,
-                    height: 6,
-                    borderRadius: 2,
-                    background: hovered ? 'var(--destructive)' : 'var(--warning)',
-                    outline: hovered ? '2px solid color-mix(in srgb, var(--destructive) 30%, transparent)' : 'none',
-                    transition: 'outline 120ms',
-                  }}
-                  title={`${absTime(t)} · ${extractAction(e) || 'event'}`}
-                />
-              );
-            })}
-            <div className="absolute left-0 right-0 bottom-[-14px] flex justify-between font-mono text-[9px] text-muted-foreground/70 tabular-nums">
-              <span>{absTime(view.firstSeen)}</span>
-              <span>{absTime(new Date((first + last) / 2))}</span>
-              <span>{absTime(view.lastSeen)}</span>
+              key={ip}
+              className="font-mono text-[9px] text-muted-foreground/70 tabular-nums"
+              style={{ height: rowH, lineHeight: `${rowH}px` }}
+            >
+              {ip}
             </div>
+          ))}
+        </div>
+        {/* Events */}
+        <div className="absolute top-2 right-3" style={{ left: 100, height: chartH }}>
+          <div
+            className="absolute left-0 right-0 bottom-2 h-px"
+            style={{ background: 'color-mix(in srgb, var(--foreground) 8%, transparent)' }}
+          />
+          {view.events.map((e, i) => {
+            const t = extractEventTime(e);
+            if (!t) return null;
+            const x = ((t.getTime() - first) / range) * 100;
+            const ip = extractIp(e);
+            const y = ipRow(ip) * rowH + rowH / 2 - 3;
+            const raw = e as Record<string, unknown>;
+            const eventId = typeof raw.id === 'string' ? raw.id : `ev_${i}`;
+            const hovered = hoveredEventId === eventId;
+            return (
+              <div
+                key={eventId}
+                onMouseEnter={() => onEventHover(eventId)}
+                onMouseLeave={() => onEventHover(null)}
+                className="absolute cursor-pointer"
+                style={{
+                  left: `calc(${x}% - 3px)`,
+                  top: y,
+                  width: 6,
+                  height: 6,
+                  borderRadius: 2,
+                  background: hovered ? 'var(--destructive)' : 'var(--warning)',
+                  outline: hovered ? '2px solid color-mix(in srgb, var(--destructive) 30%, transparent)' : 'none',
+                  transition: 'outline 120ms',
+                }}
+                title={`${absTime(t)} · ${extractAction(e) || 'event'}`}
+              />
+            );
+          })}
+          <div className="absolute left-0 right-0 bottom-[-14px] flex justify-between font-mono text-[9px] text-muted-foreground/70 tabular-nums">
+            <span>{absTime(view.firstSeen)}</span>
+            <span>{absTime(new Date((first + last) / 2))}</span>
+            <span>{absTime(view.lastSeen)}</span>
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function EventTimelineDensity({
+  view,
+  ipCounts,
+}: {
+  view: MatchView;
+  ipCounts: Map<string, number>;
+}) {
+  const first = view.firstSeen.getTime();
+  const last = view.lastSeen.getTime();
+  const range = Math.max(last - first, 1000);
+
+  const BIN_COUNT = 30;
+  const TOP_N = 10;
+
+  const bins = useMemo(() => {
+    const buckets = new Array(BIN_COUNT).fill(0);
+    const binWidth = range / BIN_COUNT;
+    for (const e of view.events) {
+      const t = extractEventTime(e);
+      if (!t) continue;
+      const idx = Math.min(BIN_COUNT - 1, Math.max(0, Math.floor((t.getTime() - first) / binWidth)));
+      buckets[idx]++;
+    }
+    return buckets;
+  }, [view.events, first, range]);
+
+  const binMax = Math.max(...bins, 1);
+  const binWidth = range / BIN_COUNT;
+
+  const topIps = useMemo(
+    () =>
+      Array.from(ipCounts.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, TOP_N),
+    [ipCounts],
+  );
+  const tailCount = ipCounts.size - topIps.length;
+  const topMax = topIps[0]?.[1] ?? 1;
+
+  return (
+    <div className="p-3 flex flex-col gap-3">
+      <div>
+        <div
+          className="flex items-end gap-[2px]"
+          style={{ height: 80, borderBottom: '1px solid color-mix(in srgb, var(--foreground) 8%, transparent)' }}
+        >
+          {bins.map((count, i) => {
+            const h = count === 0 ? 0 : Math.max(2, (count / binMax) * 80);
+            const binStart = new Date(first + i * binWidth);
+            const binEnd = new Date(first + (i + 1) * binWidth);
+            return (
+              <div
+                key={i}
+                className="flex-1 min-w-0"
+                style={{
+                  height: h,
+                  background: 'var(--warning)',
+                  borderRadius: 1,
+                }}
+                title={`${absTime(binStart)} → ${absTime(binEnd)} · ${count} event${count !== 1 ? 's' : ''}`}
+              />
+            );
+          })}
+        </div>
+        <div className="mt-1 flex justify-between font-mono text-[9px] text-muted-foreground/70 tabular-nums">
+          <span>{absTime(view.firstSeen)}</span>
+          <span>{absTime(new Date((first + last) / 2))}</span>
+          <span>{absTime(view.lastSeen)}</span>
+        </div>
+      </div>
+
+      <div className="border-t border-border/60 pt-2.5">
+        <div className="font-mono text-[9.5px] uppercase tracking-[0.12em] text-muted-foreground font-semibold mb-1.5">
+          Top source IPs
+        </div>
+        <div className="flex flex-col gap-1">
+          {topIps.map(([ip, count]) => (
+            <div key={ip} className="flex items-center gap-2 text-[11px]">
+              <span className="font-mono text-foreground flex-1 truncate tabular-nums">{ip}</span>
+              <div
+                className="w-[120px] h-[4px] rounded-full overflow-hidden"
+                style={{ background: 'color-mix(in srgb, var(--foreground) 6%, transparent)' }}
+              >
+                <div
+                  className="h-full rounded-full"
+                  style={{ width: `${(count / topMax) * 100}%`, background: 'var(--warning)' }}
+                />
+              </div>
+              <span className="font-mono text-[10.5px] text-foreground tabular-nums w-[40px] text-right">
+                {count}
+              </span>
+            </div>
+          ))}
+        </div>
+        {tailCount > 0 && (
+          <div className="mt-1.5 font-mono text-[10px] text-muted-foreground">
+            + {tailCount.toLocaleString()} more IP{tailCount !== 1 ? 's' : ''}
+          </div>
+        )}
       </div>
     </div>
   );
