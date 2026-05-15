@@ -41,6 +41,8 @@ import {
   useSystemConfig,
 } from '@/hooks/use-api';
 import { useTierContext } from '@/hooks/use-tier';
+import { useCapabilities } from '@/hooks/use-capabilities';
+import type { Capabilities } from '@/hooks/use-capabilities';
 import type { OnboardingStep, OnboardingStatus } from '@/lib/api/onboarding';
 import { cn } from '@/lib/utils';
 
@@ -53,6 +55,8 @@ interface SetupStep {
   statusKey: keyof OnboardingStatus;
   doneLabel: string;
   todoLabel: string;
+  /** Build-time capability gate — open-core builds drop enterprise steps. */
+  capability?: keyof Capabilities;
 }
 
 const STEPS: SetupStep[] = [
@@ -65,6 +69,7 @@ const STEPS: SetupStep[] = [
     statusKey: 'has_ai_provider',
     doneLabel: 'Provider configured',
     todoLabel: 'Not configured',
+    capability: 'melod',
   },
   {
     key: 'org_context',
@@ -75,6 +80,7 @@ const STEPS: SetupStep[] = [
     statusKey: 'has_org_context',
     doneLabel: 'Context set',
     todoLabel: 'Not configured',
+    capability: 'melod',
   },
   {
     key: 'team_setup',
@@ -95,6 +101,7 @@ const STEPS: SetupStep[] = [
     statusKey: 'has_sso',
     doneLabel: 'SSO configured',
     todoLabel: 'Not configured',
+    capability: 'sso',
   },
   {
     key: 'first_feed',
@@ -140,11 +147,15 @@ export function OnboardingWizard() {
   const { data: status } = useOnboardingStatus();
   const { data: systemConfig } = useSystemConfig();
   const { hasSso } = useTierContext();
+  const { capabilities } = useCapabilities();
   const isManaged = systemConfig?.deployment_mode === 'managed';
 
   const steps = useMemo(() => {
-    if (!isManaged) return STEPS;
-    return STEPS.map((step) =>
+    // Build-time capability gate — open-core builds drop enterprise-only steps
+    // (AI setup, org context, SSO) so we don't route users to upsell paywalls.
+    const enabled = STEPS.filter((step) => !step.capability || capabilities[step.capability]);
+    if (!isManaged) return enabled;
+    return enabled.map((step) =>
       step.key === 'ai_setup'
         ? {
             ...step,
@@ -154,7 +165,7 @@ export function OnboardingWizard() {
           }
         : step,
     );
-  }, [isManaged]);
+  }, [isManaged, capabilities]);
 
   const { mutate: completeStep } = useCompleteOnboardingStep();
   const { mutate: skipStep } = useSkipOnboardingStep();

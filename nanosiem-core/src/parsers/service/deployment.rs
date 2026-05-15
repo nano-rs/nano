@@ -145,35 +145,52 @@ impl ParserService {
             });
         }
 
-        // Run vector validate on staged config
-        let validate_result = match self.vector_config.validate_staged_config().await {
-            Ok(result) => result,
-            Err(e) => {
-                let error_msg = format!("Vector validation error: {}", e);
-                tracing::error!("{}", error_msg);
+        // Run vector validate on staged config (can be skipped via env var when
+        // the api container has no docker CLI to shell into the vector container —
+        // see log_sources/service/deployment.rs for the mirror knob). NAN-807
+        // bug #15a.
+        let skip_vector_validation = std::env::var("SKIP_VECTOR_VALIDATION")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
 
-                // Cleanup staging
-                let _ = self.vector_config.cleanup_staging().await;
+        let validate_result = if skip_vector_validation {
+            tracing::info!("Skipping vector validate (SKIP_VECTOR_VALIDATION=true)");
+            crate::parsers::ValidationResult {
+                success: true,
+                errors: vec![],
+                warnings: vec!["Vector config validation skipped".to_string()],
+                raw_output: String::new(),
+            }
+        } else {
+            match self.vector_config.validate_staged_config().await {
+                Ok(result) => result,
+                Err(e) => {
+                    let error_msg = format!("Vector validation error: {}", e);
+                    tracing::error!("{}", error_msg);
 
-                let _ = self
-                    .repository()
-                    .record_deployment(
+                    // Cleanup staging
+                    let _ = self.vector_config.cleanup_staging().await;
+
+                    let _ = self
+                        .repository()
+                        .record_deployment(
+                            parser_id,
+                            DeploymentAction::Deploy.as_str(),
+                            DeploymentStatus::Failed.as_str(),
+                            Some(&error_msg),
+                            Some(&config_snapshot),
+                        )
+                        .await;
+
+                    return Ok(DeploymentResult {
+                        success: false,
                         parser_id,
-                        DeploymentAction::Deploy.as_str(),
-                        DeploymentStatus::Failed.as_str(),
-                        Some(&error_msg),
-                        Some(&config_snapshot),
-                    )
-                    .await;
-
-                return Ok(DeploymentResult {
-                    success: false,
-                    parser_id,
-                    action: DeploymentAction::Deploy.as_str().to_string(),
-                    message: error_msg,
-                    validation_result: None,
-                    deployment_id: None,
-                });
+                        action: DeploymentAction::Deploy.as_str().to_string(),
+                        message: error_msg,
+                        validation_result: None,
+                        deployment_id: None,
+                    });
+                }
             }
         };
 

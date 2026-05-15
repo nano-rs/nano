@@ -7594,3 +7594,234 @@ ALTER TABLE ONLY public.webhook_delivery_log
 EXCEPTION WHEN duplicate_object OR duplicate_table OR duplicate_function OR invalid_table_definition THEN
     RAISE NOTICE 'idempotent skip (already exists): %', SQLERRM;
 END $$;
+
+-- =============================================================================
+-- NAN-807: tables/columns missing from the original v175 snapshot
+-- Added as idempotent appends so existing fresh installs converge without
+-- needing the full regenerate-from-pg_dump dance. Will fold into the next
+-- regular snapshot regeneration. See migrations/postgres-open/README.md.
+-- =============================================================================
+
+-- From migrations/postgres/059_user_oidc_groups.sql
+ALTER TABLE public.users ADD COLUMN IF NOT EXISTS last_oidc_groups TEXT[];
+
+DO $$ BEGIN
+    EXECUTE 'COMMENT ON COLUMN public.users.last_oidc_groups IS ''Groups from the most recent OIDC login token, for debugging group mappings''';
+EXCEPTION WHEN undefined_column OR undefined_table THEN
+    RAISE NOTICE 'idempotent skip (column missing): %', SQLERRM;
+END $$;
+
+-- From migrations/postgres/017_alert_triage_results.sql
+CREATE TABLE IF NOT EXISTS public.alert_triage_results (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    alert_id UUID NOT NULL REFERENCES public.alerts(id) ON DELETE CASCADE,
+    session_id VARCHAR(100) NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL,
+    completed_at TIMESTAMPTZ,
+    status VARCHAR(20) DEFAULT 'running',
+    initial_triage JSONB,
+    correlation JSONB,
+    enrichment JSONB,
+    context JSONB,
+    risk_assessment JSONB,
+    verdict JSONB,
+    verdict_type VARCHAR(50),
+    confidence FLOAT,
+    error_message TEXT,
+    triggered_by UUID REFERENCES public.users(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_triage_alert
+    ON public.alert_triage_results(alert_id);
+
+CREATE INDEX IF NOT EXISTS idx_triage_session
+    ON public.alert_triage_results(session_id);
+
+CREATE INDEX IF NOT EXISTS idx_triage_status
+    ON public.alert_triage_results(status)
+    WHERE status = 'running';
+
+CREATE INDEX IF NOT EXISTS idx_triage_alert_created
+    ON public.alert_triage_results(alert_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_triage_user
+    ON public.alert_triage_results(triggered_by, created_at DESC);
+
+DO $$ BEGIN
+    EXECUTE 'COMMENT ON TABLE public.alert_triage_results IS ''Stores AI-generated triage analysis results for alerts''';
+    EXECUTE 'COMMENT ON COLUMN public.alert_triage_results.session_id IS ''Unique session identifier for tracking progress via SSE''';
+    EXECUTE 'COMMENT ON COLUMN public.alert_triage_results.status IS ''Triage status: running, completed, failed, cancelled''';
+    EXECUTE 'COMMENT ON COLUMN public.alert_triage_results.initial_triage IS ''Results from initial triage agent (entity extraction, hypothesis)''';
+    EXECUTE 'COMMENT ON COLUMN public.alert_triage_results.correlation IS ''Results from correlation agent (related alerts, patterns)''';
+    EXECUTE 'COMMENT ON COLUMN public.alert_triage_results.enrichment IS ''Results from enrichment agent (VT, threat intel)''';
+    EXECUTE 'COMMENT ON COLUMN public.alert_triage_results.context IS ''Results from context agent (surrounding events, timeline)''';
+    EXECUTE 'COMMENT ON COLUMN public.alert_triage_results.risk_assessment IS ''Results from risk agent (entity risk scores, signals)''';
+    EXECUTE 'COMMENT ON COLUMN public.alert_triage_results.verdict IS ''Final verdict from verdict agent (classification, recommendations)''';
+    EXECUTE 'COMMENT ON COLUMN public.alert_triage_results.verdict_type IS ''Quick access to verdict classification''';
+    EXECUTE 'COMMENT ON COLUMN public.alert_triage_results.confidence IS ''Confidence score for the verdict (0.0 - 1.0)''';
+EXCEPTION WHEN undefined_column OR undefined_table THEN
+    RAISE NOTICE 'idempotent skip (table/column missing): %', SQLERRM;
+END $$;
+
+-- From migrations/postgres/109_onboarding_progress.sql
+CREATE TABLE IF NOT EXISTS public.onboarding_progress (
+    user_id UUID PRIMARY KEY REFERENCES public.users(id) ON DELETE CASCADE,
+    current_step VARCHAR(50) NOT NULL DEFAULT 'ai_setup',
+    completed_steps JSONB NOT NULL DEFAULT '[]'::jsonb,
+    skipped_steps JSONB NOT NULL DEFAULT '[]'::jsonb,
+    step_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+    dismissed BOOLEAN NOT NULL DEFAULT FALSE,
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- From migrations/postgres/135_siem_health_reports.sql
+CREATE TABLE IF NOT EXISTS public.siem_health_reports (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    overall_score INTEGER NOT NULL,
+    overall_status VARCHAR(20) NOT NULL,
+    ingestion_score INTEGER NOT NULL,
+    parsing_score INTEGER NOT NULL,
+    detection_score INTEGER NOT NULL,
+    summary TEXT NOT NULL,
+    metrics JSONB NOT NULL DEFAULT '{}',
+    recommendations JSONB NOT NULL DEFAULT '[]',
+    dimension_details JSONB NOT NULL DEFAULT '{}',
+    triggered_by UUID REFERENCES public.users(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    duration_ms INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_siem_health_reports_created_at
+    ON public.siem_health_reports (created_at DESC);
+
+-- From migrations/postgres/041_health_notifications.sql (health_issue_tracker portion)
+CREATE TABLE IF NOT EXISTS public.health_issue_tracker (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    issue_type VARCHAR(50) NOT NULL,
+    issue_key VARCHAR(255) NOT NULL,
+    first_detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolved_at TIMESTAMPTZ,
+    notification_sent BOOLEAN DEFAULT false,
+    UNIQUE(issue_type, issue_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_health_issue_active
+    ON public.health_issue_tracker(issue_type, issue_key)
+    WHERE resolved_at IS NULL;
+
+-- From migrations/postgres/001_init_postgres.sql (detection_rule_baselines portion)
+CREATE TABLE IF NOT EXISTS public.detection_rule_baselines (
+    rule_id uuid NOT NULL,
+    established_at timestamp with time zone NOT NULL,
+    last_updated timestamp with time zone NOT NULL,
+    mean_alerts_per_hour double precision NOT NULL,
+    std_dev_alerts_per_hour double precision NOT NULL,
+    percentile_95 double precision NOT NULL,
+    percentile_99 double precision NOT NULL,
+    threshold_breach_level double precision NOT NULL,
+    data_points integer NOT NULL,
+    baseline_data jsonb DEFAULT '{}'::jsonb NOT NULL
+);
+
+DO $$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'detection_rule_baselines_pkey'
+    ) THEN
+        ALTER TABLE public.detection_rule_baselines
+            ADD CONSTRAINT detection_rule_baselines_pkey PRIMARY KEY (rule_id);
+    END IF;
+EXCEPTION WHEN duplicate_object OR duplicate_table OR duplicate_function OR invalid_table_definition THEN
+    RAISE NOTICE 'idempotent skip (already exists): %', SQLERRM;
+END $$;
+
+DO $$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'detection_rule_baselines_rule_id_fkey'
+    ) THEN
+        ALTER TABLE public.detection_rule_baselines
+            ADD CONSTRAINT detection_rule_baselines_rule_id_fkey
+            FOREIGN KEY (rule_id) REFERENCES public.detection_rules(id) ON DELETE CASCADE;
+    END IF;
+EXCEPTION WHEN duplicate_object OR duplicate_table OR duplicate_function OR invalid_table_definition THEN
+    RAISE NOTICE 'idempotent skip (already exists): %', SQLERRM;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_baselines_last_updated
+    ON public.detection_rule_baselines USING btree (last_updated DESC);
+
+DO $$ BEGIN
+    EXECUTE 'COMMENT ON TABLE public.detection_rule_baselines IS ''Statistical baselines for detection rules to identify anomalous behavior''';
+    EXECUTE 'COMMENT ON COLUMN public.detection_rule_baselines.threshold_breach_level IS ''Calculated as mean + 2 * std_dev''';
+EXCEPTION WHEN undefined_column OR undefined_table THEN
+    RAISE NOTICE 'idempotent skip (table/column missing): %', SQLERRM;
+END $$;
+
+-- From migrations/postgres/100_identity_providers.sql (identity_providers portion only;
+-- user_registry + update_identity_providers_updated_at() function already in snapshot)
+CREATE TABLE IF NOT EXISTS public.identity_providers (
+    id VARCHAR(50) PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    provider_type VARCHAR(50) NOT NULL,
+    enabled BOOLEAN DEFAULT false,
+    credentials_encrypted BYTEA,
+    config JSONB DEFAULT '{}',
+    sync_status VARCHAR(20) DEFAULT 'idle',
+    last_sync_at TIMESTAMPTZ,
+    last_sync_error TEXT,
+    last_sync_duration_ms BIGINT,
+    user_count INTEGER DEFAULT 0,
+    delta_link TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+DO $$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgname = 'trigger_identity_providers_updated_at'
+    ) THEN
+        CREATE TRIGGER trigger_identity_providers_updated_at
+            BEFORE UPDATE ON public.identity_providers
+            FOR EACH ROW
+            EXECUTE FUNCTION public.update_identity_providers_updated_at();
+    END IF;
+EXCEPTION WHEN duplicate_object OR duplicate_table OR duplicate_function OR invalid_table_definition THEN
+    RAISE NOTICE 'idempotent skip (already exists): %', SQLERRM;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_identity_providers_type
+    ON public.identity_providers(provider_type);
+CREATE INDEX IF NOT EXISTS idx_identity_providers_enabled
+    ON public.identity_providers(enabled) WHERE enabled = true;
+
+DO $$ BEGIN
+    EXECUTE 'COMMENT ON TABLE public.identity_providers IS ''Configuration for identity providers synced to the user registry''';
+    EXECUTE 'COMMENT ON COLUMN public.identity_providers.credentials_encrypted IS ''AES-256-GCM encrypted credentials (tenant_id, client_id, client_secret, etc.)''';
+    EXECUTE 'COMMENT ON COLUMN public.identity_providers.delta_link IS ''Opaque token for incremental/delta sync from the IdP''';
+EXCEPTION WHEN undefined_column OR undefined_table THEN
+    RAISE NOTICE 'idempotent skip (table/column missing): %', SQLERRM;
+END $$;
+
+-- From migrations/postgres/172_oidc_auth_transactions.sql
+-- Adaptation: the source references public.oidc_providers(id) for the
+-- provider_id FK, but oidc_providers is not present in the open snapshot.
+-- The FK is dropped here (provider_id retained as a UUID column) — the
+-- snapshot's purpose is to make queries succeed, not enforce FKs.
+CREATE TABLE IF NOT EXISTS public.oidc_auth_transactions (
+    state            TEXT        PRIMARY KEY,
+    provider_id      UUID        NOT NULL,
+    nonce            TEXT        NOT NULL,
+    code_verifier    TEXT        NOT NULL,
+    redirect_uri     TEXT        NOT NULL,
+    expires_at       TIMESTAMPTZ NOT NULL,
+    consumed_at      TIMESTAMPTZ,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_oidc_auth_transactions_expires_at
+    ON public.oidc_auth_transactions (expires_at);
+
+CREATE INDEX IF NOT EXISTS idx_oidc_auth_transactions_provider_id
+    ON public.oidc_auth_transactions (provider_id);

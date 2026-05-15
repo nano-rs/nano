@@ -1,10 +1,14 @@
 <clickhouse>
   <!-- Docs: <https://clickhouse.com/docs/operations/settings/settings_users/> -->
+  <!--
+    NAN-807 bug #1: do NOT delete the default user before the entrypoint runs.
+    The clickhouse-server entrypoint's CREATE DATABASE step uses
+    `clickhouse-client -u default`; removing the user here would fire during
+    init, fail that step with AUTHENTICATION_FAILED, and leave the `nanosiem`
+    database uncreated. We only override the password (to empty, matching
+    the upstream image default).
+  -->
   <users>
-    <!-- Remove default user -->
-    <default remove="remove">
-    </default>
-
     <default>
       <profile>default</profile>
       <networks>

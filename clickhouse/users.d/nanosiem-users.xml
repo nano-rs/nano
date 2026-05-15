@@ -1,17 +1,19 @@
 <clickhouse>
   <!-- Docs: <https://clickhouse.com/docs/operations/settings/settings_users/> -->
+  <!--
+    NAN-807 bug #2: passwords are sourced from env vars passed into the
+    container (CLICKHOUSE_NANOSIEM_PASSWORD / CLICKHOUSE_ADMIN_PASSWORD) so
+    each deployment gets per-install random secrets without baking creds
+    into version-controlled XML.
+  -->
   <users>
-    <!-- Remove default user -->
-    <default remove="remove">
-    </default>
-
     <!-- Admin user for migrations (DDL enabled) -->
     <nanosiem_admin>
       <profile>admin</profile>
       <networks>
         <ip>::/0</ip>
       </networks>
-      <password><![CDATA[nanosiem_admin_secret]]></password>
+      <password from_env="CLICKHOUSE_ADMIN_PASSWORD"/>
       <quota>default</quota>
       <access_management>1</access_management>
       <allow_ddl>1</allow_ddl>
@@ -23,7 +25,7 @@
       <networks>
         <ip>::/0</ip>
       </networks>
-      <password><![CDATA[nanosiem]]></password>
+      <password from_env="CLICKHOUSE_NANOSIEM_PASSWORD"/>
       <quota>default</quota>
       <access_management>0</access_management>
       <allow_ddl>0</allow_ddl>

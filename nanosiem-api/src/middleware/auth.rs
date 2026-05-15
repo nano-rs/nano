@@ -48,6 +48,12 @@ const PUBLIC_ENDPOINTS: &[&str] = &[
     "/api/auth/oidc/providers",
     "/api/setup/status",
     "/api/setup/initialize",
+    // The SPA fetches /api/capabilities pre-auth to decide which edition
+    // features to surface. Requiring auth here would 401 the boot fetch
+    // and pin the SPA on the FALLBACK_CAPABILITIES (which assume
+    // enterprise), leaking Risk/Cases/Notebooks nav into open-core
+    // deployments. NAN-807 bug #10.
+    "/api/capabilities",
     "/api/auth/mfa/challenge",
     // Forced-MFA enrolment: a user bounced by the global `Require MFA`
     // policy holds only a 5-minute `mfa_challenge` token, not a session.
