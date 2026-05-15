@@ -72,7 +72,13 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
-      CLICKHOUSE_DB: nanosiem
+      # NAN-810: do NOT set CLICKHOUSE_DB here. The upstream entrypoint reacts
+      # to it by running `clickhouse-client -u default -q "CREATE DATABASE …"`,
+      # which fails against our default-profile users (allow_ddl=0 in
+      # users.d/query_limits.xml). clickhouse/init.sql already creates the
+      # nanosiem database via the clickhouse-migrate service, which runs as
+      # the admin user — the entrypoint's create is redundant.
+      #
       # NAN-809: do NOT set CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT here. The upstream
       # entrypoint reacts to that env by writing a generated default-user.xml into
       # /etc/clickhouse-server/users.d/, which conflicts with our :ro bind mount and
