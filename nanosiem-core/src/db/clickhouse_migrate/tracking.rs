@@ -8,6 +8,29 @@ use std::collections::HashSet;
 impl ClickHouseMigrator {
     /// Ensure the _migrations table exists
     pub(super) async fn ensure_migrations_table(&self) -> Result<(), ClickHouseMigrateError> {
+        // NAN-811: ensure the target database exists before any statement that
+        // references it. Pre-NAN-810 the CH entrypoint pre-created the database
+        // via `CLICKHOUSE_DB`; that path was always brittle (it ran the DDL as
+        // the `default` user, whose profile sets allow_ddl=0 — see
+        // clickhouse/users.d/query_limits.xml), and was removed in NAN-810. The
+        // migrator now owns DB creation.
+        //
+        // `self.client` is constructed with `.with_database(&self.database)`,
+        // which embeds `?database=<self.database>` into every request URL — CH
+        // rejects the session with UNKNOWN_DATABASE before any statement runs
+        // when that database doesn't exist yet. Clone the client and swap to
+        // the always-present `default` database just for this one statement.
+        // The CREATE DATABASE itself is idempotent and safe in all modes:
+        // cloud already has a Replicated target DB (no-op); cluster mode
+        // creates per-node, matching the per-node pattern we use for the
+        // _migrations table itself below.
+        let bootstrap_client = self.client.clone().with_database("default");
+        bootstrap_client
+            .query(&format!("CREATE DATABASE IF NOT EXISTS {}", self.database))
+            .execute()
+            .await
+            .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
+
         let (on_cluster, engine) = if let Some(Some(ref cluster)) = self.cluster {
             let zoo_path = format!("/clickhouse/tables/{{shard}}/{}/_migrations", self.database);
             (

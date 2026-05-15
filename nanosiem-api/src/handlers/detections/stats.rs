@@ -117,15 +117,18 @@ pub async fn get_detection_stats(
     Ok(Json(serde_json::json!(result)))
 }
 
-/// Get today's match counts for all detection rules
-/// Returns the actual match counts from when rules were executed (from daily_stats table)
-/// This shows real detection activity, not arbitrary query results
+/// Get today's detection firing counts per rule
+///
+/// Returns the number of detection_matches rows recorded today (UTC) for each rule.
+/// One row per Grouped-mode firing, one row per event for PerEvent rules — this
+/// matches what the rule-detail "Today · hour by hour" strip shows, rather than
+/// the summed underlying event count tracked in detection_daily_stats (NAN-812).
 #[utoipa::path(
     get,
     path = "/api/rules/today-counts",
     tag = "detections",
     responses(
-        (status = 200, description = "Today's match counts per rule", body = inline(HashMap<String, i64>)),
+        (status = 200, description = "Today's firing counts per rule", body = inline(HashMap<String, i64>)),
         (status = 403, description = "Missing permission: detections:view", body = ErrorResponse),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
@@ -137,28 +140,29 @@ pub async fn get_today_counts(
     check_permission(&auth, permissions::DETECTIONS_VIEW)
         .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
 
-    use chrono::Utc;
+    use chrono::{NaiveTime, Utc};
 
-    // Get today's date
-    let today = Utc::now().date_naive();
+    let today_start = Utc::now()
+        .date_naive()
+        .and_time(NaiveTime::MIN)
+        .and_utc();
 
-    // Query the daily_stats table for today's actual match counts
-    // This shows what the detection system actually detected, not arbitrary query results
     let rows = sqlx::query_as::<_, (uuid::Uuid, i64)>(
         r#"
-        SELECT rule_id, match_count
-        FROM detection_daily_stats
-        WHERE date = $1
+        SELECT rule_id, COUNT(*)::bigint AS firings
+        FROM detection_matches
+        WHERE detected_at >= $1
+        GROUP BY rule_id
         "#,
     )
-    .bind(today)
+    .bind(today_start)
     .fetch_all(&state.pool)
     .await?;
 
     let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
 
-    for (rule_id, match_count) in rows {
-        counts.insert(nanosiem_core::typeid::encode("rule", &rule_id), match_count);
+    for (rule_id, firings) in rows {
+        counts.insert(nanosiem_core::typeid::encode("rule", &rule_id), firings);
     }
 
     Ok(Json(counts))

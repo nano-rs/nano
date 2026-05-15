@@ -141,16 +141,37 @@ impl DetectionRuleRepository {
         Ok(results)
     }
 
-    /// Get daily stats for all rules (for the detections list page)
+    /// Get daily stats for all rules (for the detections list page sparkline).
+    ///
+    /// `match_count` is the per-day count of detection firings (rows in
+    /// `detection_matches`), matching what the rules list "today" badge and
+    /// rule-detail hour-by-hour strip show. `alert_count` continues to come
+    /// from `detection_daily_stats` (NAN-812).
     pub async fn get_all_daily_stats(
         &self,
         days: i32,
     ) -> Result<Vec<(Uuid, DailyStat)>, DetectionRuleRepositoryError> {
         let results = sqlx::query_as::<_, (Uuid, NaiveDate, i64, i64)>(
             r#"
-            SELECT rule_id, date, match_count, alert_count
-            FROM detection_daily_stats
-            WHERE date >= CURRENT_DATE - $1::integer
+            SELECT
+                COALESCE(m.rule_id, d.rule_id) AS rule_id,
+                COALESCE(m.date, d.date) AS date,
+                COALESCE(m.match_count, 0)::bigint AS match_count,
+                COALESCE(d.alert_count, 0)::bigint AS alert_count
+            FROM (
+                SELECT
+                    rule_id,
+                    (detected_at AT TIME ZONE 'UTC')::date AS date,
+                    COUNT(*)::bigint AS match_count
+                FROM detection_matches
+                WHERE detected_at >= (CURRENT_DATE - $1::integer)::timestamptz
+                GROUP BY rule_id, (detected_at AT TIME ZONE 'UTC')::date
+            ) m
+            FULL OUTER JOIN (
+                SELECT rule_id, date, alert_count
+                FROM detection_daily_stats
+                WHERE date >= CURRENT_DATE - $1::integer
+            ) d ON m.rule_id = d.rule_id AND m.date = d.date
             ORDER BY rule_id, date ASC
             "#,
         )
