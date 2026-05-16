@@ -787,14 +787,25 @@ export function MatchesDetail({
               </span>
             </div>
             <h2 className="mt-2 text-[17px] font-semibold text-foreground tracking-[-0.01em] leading-[1.25]">
-              {hasMultipleEvents ? (
+              {view.isAggregate ? (
+                <>Aggregate match against <span className="font-mono text-primary">{view.entity.label}</span></>
+              ) : hasMultipleEvents ? (
                 <>Detection fired against <span className="font-mono text-primary">{view.entity.label}</span></>
               ) : (
                 <>Single-event match: <span className="font-mono">{view.topActionName || '—'}</span></>
               )}
             </h2>
             <p className="mt-1 text-[12px] text-muted-foreground leading-[1.55]">
-              {hasMultipleEvents ? (
+              {view.isAggregate ? (
+                <>
+                  A <span className="text-foreground font-medium">stats</span> aggregate
+                  matched all rule filters
+                  {view.topActionName && (
+                    <> — <span className="font-mono text-foreground">{view.topActionName}</span></>
+                  )}
+                  .
+                </>
+              ) : hasMultipleEvents ? (
                 <>
                   This entity generated{' '}
                   <span className="text-foreground font-medium">{view.events.length}</span> contributing

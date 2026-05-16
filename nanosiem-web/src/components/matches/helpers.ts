@@ -31,6 +31,10 @@ export interface MatchView {
   durationMs: number;
   topActionName?: string;
   region?: string;
+  /** True when every event in the match is a stats-aggregate row. Drives the
+   *  "Aggregate match against {entity}" framing on the detail pane and is
+   *  why `topActionName` may be a derived label (e.g. "1,582 denied count"). */
+  isAggregate: boolean;
   events: Record<string, unknown>[];
 }
 
@@ -131,11 +135,48 @@ export function extractIp(e: Record<string, unknown>): string | undefined {
     || stringField(e, 'dest_ip');
 }
 
+// Whether the event came from a `stats … by …` aggregation rather than a raw
+// log row. The stats engine injects `_first_seen` / `_last_seen` window
+// bounds on every aggregate result, so their presence is a reliable marker.
+export function isAggregateRow(e: Record<string, unknown>): boolean {
+  return typeof e._first_seen === 'string' || typeof e._last_seen === 'string';
+}
+
+// Derive a human label for a stats-aggregate row. Aggregates don't carry
+// `eventName` / `action` / etc., so the existing extractAction returns
+// undefined and the UI renders `—`. Prefer a user-aliased summary string
+// (e.g. comma-separated action list), then fall back to the largest numeric
+// `*_count` field as a `"<n> <field>"` summary, then a generic label.
+function aggregateLabel(e: Record<string, unknown>): string | undefined {
+  if (!isAggregateRow(e)) return undefined;
+
+  const summary = stringField(e, 'actions_attempted')
+    || stringField(e, 'action_summary')
+    || stringField(e, 'top_action');
+  if (summary) return summary;
+
+  let bestCount = -Infinity;
+  let bestKey: string | undefined;
+  for (const [k, v] of Object.entries(e)) {
+    if (k.startsWith('_')) continue;
+    if (typeof v !== 'number' || !Number.isFinite(v)) continue;
+    if (!/(^count$|_count$)/.test(k)) continue;
+    if (v > bestCount) {
+      bestCount = v;
+      bestKey = k;
+    }
+  }
+  if (bestKey) return `${bestCount.toLocaleString()} ${bestKey.replace(/_/g, ' ')}`;
+
+  return 'stats aggregate';
+}
+
 export function extractAction(e: Record<string, unknown>): string | undefined {
   return stringField(e, 'eventName')
     || stringField(e, 'event_type')
     || stringField(e, 'action')
-    || stringField(e, 'event_id');
+    || stringField(e, 'event_id')
+    || aggregateLabel(e);
 }
 
 export function extractRegion(e: Record<string, unknown>): string | undefined {
@@ -237,6 +278,8 @@ export function buildMatchView(m: DetectionMatch): MatchView {
     if (c > topCount) { topCount = c; topActionName = a; }
   }
 
+  const isAggregate = events.length > 0 && events.every(isAggregateRow);
+
   return {
     id: m.id,
     raw: m,
@@ -250,6 +293,7 @@ export function buildMatchView(m: DetectionMatch): MatchView {
     durationMs: Math.max(0, lastSeen.getTime() - firstSeen.getTime()),
     topActionName,
     region,
+    isAggregate,
     events,
   };
 }
