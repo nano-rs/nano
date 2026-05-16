@@ -73,6 +73,8 @@ when it finishes.
 
 **Prereqs:** Docker, docker compose v2, git, openssl, curl.
 
+**Minimum host:** 2 vCPU, 4 GB RAM — the lowest stable spec, suitable for up to ~10 GB/day of ingest. Below this, ClickHouse and the API will OOM under load.
+
 For non-interactive installs, pre-set `NANO_ADMIN_EMAIL`,
 `NANO_ADMIN_NAME`, `NANO_ADMIN_PASSWORD`, and `NANO_BASE_URL` before
 piping. See [`.env.opensource.example`](./.env.opensource.example) for

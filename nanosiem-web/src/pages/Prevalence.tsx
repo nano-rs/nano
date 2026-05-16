@@ -228,7 +228,9 @@ export function Prevalence() {
   useBreadcrumbTitle('Prevalence');
 
   const navigate = useNavigate();
-  const [timeWindow, setTimeWindow] = useState<TimeWindow>('24h');
+  // Default to 1h — narrows the per-load aggregate scan to the most useful
+  // triage window. 24h / 7d / 30d are still selectable from the dropdown.
+  const [timeWindow, setTimeWindow] = useState<TimeWindow>('1h');
   const [artifactTypeFilter, setArtifactTypeFilter] = useState<ArtifactTypeFilter>('all');
   const [riskFilter, setRiskFilter] = useState<RiskFilter>('all');
   const [searchQuery, setSearchQuery] = useState('');
