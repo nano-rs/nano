@@ -16,6 +16,7 @@
 
 pub mod distributed_scheduler;
 pub mod error;
+pub mod event_envelope;
 pub mod findings;
 pub mod materialized_view;
 pub mod prevalence;
@@ -25,6 +26,8 @@ pub mod risk;
 pub mod scheduler;
 pub mod service;
 pub mod signal_processor;
+
+pub use event_envelope::normalize_match_event;
 
 pub use distributed_scheduler::{
     generate_node_id, DistributedDetectionScheduler, DistributedSchedulerConfig,

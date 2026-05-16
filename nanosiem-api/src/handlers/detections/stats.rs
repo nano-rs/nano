@@ -307,8 +307,10 @@ pub async fn get_detection_matches(
                 // rule output shapes. Stored data stays untouched —
                 // normalization runs on every serialize, so heuristic
                 // improvements are immediate without a migration.
+                // NAN-831: normalizer lives in nanosiem-core so the
+                // test-rule analysis path can call it too.
                 for event in &mut events {
-                    super::event_envelope::normalize_match_event(event);
+                    nanosiem_core::detection::normalize_match_event(event);
                 }
 
                 DetectionMatch {

@@ -136,14 +136,23 @@ impl DetectionService {
 
         let execution_time_ms = start_time.elapsed().as_millis() as u64;
 
+        // NAN-831: normalize sample events through the canonical envelope so
+        // the rule-editor test drawer renders aggregate-row labels the same
+        // way the matches list does (NAN-830).
+        let mut sample_events = response.results;
+        for ev in &mut sample_events {
+            crate::detection::normalize_match_event(ev);
+        }
+        let total_matches = sample_events.len() as u64;
+
         Ok(HistoricalAnalysisResult {
             rule_id: rule.id,
             rule_name: rule.name,
             time_range,
             // Use actual result count after all post-processing (stats, where, etc.)
             // not total_count which is from SQL execution before in-memory processing
-            total_matches: response.results.len() as u64,
-            sample_events: response.results,
+            total_matches,
+            sample_events,
             matches_by_day,
             matches_by_bucket,
             bucket_size_seconds,
@@ -335,10 +344,13 @@ impl DetectionService {
                         bucket_start,
                         count,
                     });
-                    for row in rows {
+                    for mut row in rows {
                         if sample_events.len() >= max_samples {
                             break;
                         }
+                        // NAN-831: canonical envelope so the test drawer
+                        // renders aggregate-row labels uniformly.
+                        crate::detection::normalize_match_event(&mut row);
                         sample_events.push(row);
                     }
                 }
@@ -424,14 +436,21 @@ impl DetectionService {
 
         let execution_time_ms = start_time.elapsed().as_millis() as u64;
 
+        // NAN-831: canonical envelope (see analyze_rule_historical above).
+        let mut sample_events = response.results;
+        for ev in &mut sample_events {
+            crate::detection::normalize_match_event(ev);
+        }
+        let total_matches = sample_events.len() as u64;
+
         Ok(HistoricalAnalysisResult {
             rule_id: Uuid::nil(), // No rule ID for ad-hoc query
             rule_name: "Ad-hoc Query".to_string(),
             time_range,
             // Use actual result count after all post-processing (stats, where, etc.)
             // not total_count which is from SQL execution before in-memory processing
-            total_matches: response.results.len() as u64,
-            sample_events: response.results,
+            total_matches,
+            sample_events,
             matches_by_day,
             matches_by_bucket,
             bucket_size_seconds,
