@@ -55,14 +55,6 @@ One command on any host with Docker:
 curl -fsSL https://raw.githubusercontent.com/nano-rs/nano/main/install.sh | bash
 ```
 
-<p align="center">
-  <video src="./docs/img/install-demo.mp4" controls muted preload="metadata" width="900"></video>
-</p>
-
-<p align="center">
-  <em>One command. 45 seconds. Working nano instance.</em>
-</p>
-
 The installer clones this repo to `~/nano`, generates secrets, pulls the
 prebuilt images from `ghcr.io/nano-rs`, brings up the stack
 (postgres + clickhouse + api/search/jobs/web + vector + nginx), and walks
