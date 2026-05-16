@@ -430,16 +430,12 @@ impl Default for ExportFormat {
     }
 }
 
-/// Single day's artifact activity count for heatmap display
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct ArtifactDailyCount {
-    /// Date in YYYY-MM-DD format
-    pub date: String,
-    /// Number of occurrences on this day
-    pub count: u64,
-}
-
-/// Extended artifact data with daily breakdown for explorer view
+/// Extended artifact data with daily breakdown for explorer view.
+///
+/// `daily_counts` is a packed, dense array of per-day counts in chronological
+/// order; index 0 corresponds to `daily_start`, index `N-1` to today. Days with
+/// no activity are 0. This replaces the prior `[{date, count}, ...]` shape to
+/// roughly halve the wire size on large pages (50 artifacts × 30 days).
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ArtifactExplorerItem {
     /// The artifact value (hash, domain, or IP)
@@ -458,15 +454,19 @@ pub struct ArtifactExplorerItem {
     pub is_rare: bool,
     /// Prevalence score (0-100, lower = rarer)
     pub prevalence_score: u8,
-    /// Daily activity breakdown for heatmap rendering
-    pub daily_counts: Vec<ArtifactDailyCount>,
+    /// Packed daily counts, oldest first; index `i` corresponds to
+    /// `daily_start + i` days.
+    pub daily_counts: Vec<u64>,
+    /// Date of `daily_counts[0]` in YYYY-MM-DD format
+    pub daily_start: String,
 }
 
 impl ArtifactExplorerItem {
-    /// Create from PrevalenceData with daily counts
+    /// Create from PrevalenceData with a packed daily-counts array.
     pub fn from_prevalence_data(
         data: PrevalenceData,
-        daily_counts: Vec<ArtifactDailyCount>,
+        daily_counts: Vec<u64>,
+        daily_start: String,
     ) -> Self {
         Self {
             artifact: data.artifact,
@@ -478,6 +478,7 @@ impl ArtifactExplorerItem {
             is_rare: data.is_rare,
             prevalence_score: data.prevalence_score,
             daily_counts,
+            daily_start,
         }
     }
 }

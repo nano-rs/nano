@@ -8,6 +8,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip';
 import type { ArtifactExplorerItem } from '@/lib/api/types';
+import { expandPackedDaily } from '@/lib/date-utils';
 
 interface PrevalenceExplorerHeatmapProps {
   artifacts: ArtifactExplorerItem[];
@@ -50,7 +51,8 @@ export function PrevalenceExplorerHeatmap({
     let max = 1;
     const rows = artifacts.map((artifact) => {
       const countMap = new Map<string, number>();
-      for (const dc of artifact.daily_counts) {
+      // daily_counts is now a packed dense array keyed off daily_start.
+      for (const dc of expandPackedDaily(artifact.daily_counts, artifact.daily_start)) {
         countMap.set(dc.date, dc.count);
       }
       const cells = cols.map((col) => {

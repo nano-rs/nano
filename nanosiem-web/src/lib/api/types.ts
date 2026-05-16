@@ -3074,11 +3074,6 @@ export interface PrevalenceSettingsResponse {
 // Artifact Explorer Types
 // ============================================================================
 
-export interface ArtifactDailyCount {
-  date: string;
-  count: number;
-}
-
 export interface ArtifactExplorerItem {
   artifact: string;
   artifact_type: PrevalenceArtifactType;
@@ -3088,7 +3083,10 @@ export interface ArtifactExplorerItem {
   last_seen: string;
   is_rare: boolean;
   prevalence_score: number;
-  daily_counts: ArtifactDailyCount[];
+  /** Packed dense daily counts, oldest first. Index `i` is `daily_start + i` days. */
+  daily_counts: number[];
+  /** Date of `daily_counts[0]` in YYYY-MM-DD format. */
+  daily_start: string;
 }
 
 export interface ArtifactExplorerResponse {

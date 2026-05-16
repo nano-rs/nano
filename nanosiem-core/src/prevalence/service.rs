@@ -1013,9 +1013,13 @@ impl PrevalenceService {
             }
         }
 
-        // The prevalence UI renders a fixed historical heatmap/sparkline window.
-        // Keep daily counts at 30 days until the frontend is made window-aware.
+        // The prevalence heatmap renders a fixed 30-day historical view, so
+        // we always fetch 30 days of daily counts regardless of the requested
+        // `time_window` for the artifact aggregation above. The wire saving
+        // comes from the packed-array shape, not from narrowing the window.
         let daily_window = TimeWindow::ThirtyDays;
+        let n_days: usize = 30;
+
         let (hash_daily, domain_daily, ip_daily) = tokio::join!(
             self.repository
                 .get_hash_daily_counts(&hash_artifacts, daily_window),
@@ -1025,18 +1029,19 @@ impl PrevalenceService {
                 .get_ip_daily_counts(&ip_artifacts, daily_window),
         );
 
-        // Build daily counts lookup maps
-        let mut daily_map: HashMap<String, Vec<ArtifactDailyCount>> = HashMap::new();
+        // Build a sparse {artifact → {day → count}} map from the daily rows,
+        // then expand into dense `Vec<u64>` of length `n_days` keyed by the
+        // span [daily_start, today]. Zero-filling lives server-side so the
+        // frontend can read the array by index without date arithmetic per
+        // cell.
+        let mut daily_map: HashMap<String, HashMap<String, u64>> = HashMap::new();
 
         if let Ok(rows) = hash_daily {
             for row in rows {
                 daily_map
                     .entry(row.file_hash.to_lowercase())
                     .or_default()
-                    .push(ArtifactDailyCount {
-                        date: row.day,
-                        count: row.daily_count,
-                    });
+                    .insert(row.day, row.daily_count);
             }
         }
         if let Ok(rows) = domain_daily {
@@ -1044,10 +1049,7 @@ impl PrevalenceService {
                 daily_map
                     .entry(row.domain.clone())
                     .or_default()
-                    .push(ArtifactDailyCount {
-                        date: row.day,
-                        count: row.daily_count,
-                    });
+                    .insert(row.day, row.daily_count);
             }
         }
         if let Ok(rows) = ip_daily {
@@ -1055,14 +1057,24 @@ impl PrevalenceService {
                 daily_map
                     .entry(row.ip.clone())
                     .or_default()
-                    .push(ArtifactDailyCount {
-                        date: row.day,
-                        count: row.daily_count,
-                    });
+                    .insert(row.day, row.daily_count);
             }
         }
 
-        // Convert to explorer items
+        // Precompute the span of `n_days` ending today (in YYYY-MM-DD).
+        let today = Utc::now().date_naive();
+        let span_start = today - chrono::Duration::days((n_days as i64) - 1);
+        let day_keys: Vec<String> = (0..n_days)
+            .map(|i| {
+                (span_start + chrono::Duration::days(i as i64))
+                    .format("%Y-%m-%d")
+                    .to_string()
+            })
+            .collect();
+        let daily_start = day_keys.first().cloned().unwrap_or_default();
+
+        // Convert to explorer items, expanding each artifact's sparse map into
+        // a dense Vec aligned to `day_keys`.
         let artifacts: Vec<ArtifactExplorerItem> = paginated
             .into_iter()
             .map(|data| {
@@ -1071,8 +1083,12 @@ impl PrevalenceService {
                 } else {
                     data.artifact.clone()
                 };
-                let daily_counts = daily_map.remove(&key).unwrap_or_default();
-                ArtifactExplorerItem::from_prevalence_data(data, daily_counts)
+                let sparse = daily_map.remove(&key).unwrap_or_default();
+                let packed: Vec<u64> = day_keys
+                    .iter()
+                    .map(|d| sparse.get(d).copied().unwrap_or(0))
+                    .collect();
+                ArtifactExplorerItem::from_prevalence_data(data, packed, daily_start.clone())
             })
             .collect();
 

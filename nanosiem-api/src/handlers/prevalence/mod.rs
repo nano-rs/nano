@@ -82,7 +82,6 @@ impl utoipa::OpenApi for PrevalenceApiDoc {
                 ArtifactListResponse,
                 nanosiem_core::prevalence::ArtifactExplorerResponse,
                 nanosiem_core::prevalence::ArtifactExplorerItem,
-                nanosiem_core::prevalence::ArtifactDailyCount,
                 nanosiem_core::prevalence::ArtifactDetailResponse,
                 nanosiem_core::prevalence::ArtifactHostEntry,
                 nanosiem_core::prevalence::ArtifactUserEntry,

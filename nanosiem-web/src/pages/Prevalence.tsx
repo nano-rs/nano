@@ -53,7 +53,7 @@ import {
   Grid as GridIcon,
 } from 'lucide-react';
 import { useArtifactExplorer, useArtifactDetail } from '@/hooks/use-api';
-import { formatUTCCompact, formatRelativeCompact, buildHeatmapDays } from '@/lib/date-utils';
+import { formatUTCCompact, formatRelativeCompact, buildHeatmapDays, expandPackedDaily } from '@/lib/date-utils';
 import { PrevalenceExplorerHeatmap } from '@/components/prevalence';
 import { RuleActivityHeatmap } from '@/components/detection/RuleActivityHeatmap';
 import type { ArtifactExplorerItem } from '@/lib/api/types';
@@ -565,7 +565,10 @@ function ArtifactRow({
   onToggle: () => void;
   onDrilldown: (artifact: ArtifactExplorerItem) => void;
 }) {
-  const heatmapDays = useMemo(() => buildHeatmapDays(artifact.daily_counts), [artifact.daily_counts]);
+  const heatmapDays = useMemo(
+    () => buildHeatmapDays(expandPackedDaily(artifact.daily_counts, artifact.daily_start)),
+    [artifact.daily_counts, artifact.daily_start],
+  );
   const isNew = useMemo(() => {
     const ageMs = Date.now() - new Date(artifact.first_seen).getTime();
     return ageMs < NEW_ARTIFACT_WINDOW_MS;

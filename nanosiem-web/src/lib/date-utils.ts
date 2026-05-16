@@ -176,6 +176,29 @@ export function buildHeatmapDays(
 }
 
 /**
+ * Expand a packed dense daily-counts array (oldest first, one entry per day
+ * starting at `start`) into the `{date, count}[]` shape expected by
+ * `buildHeatmapDays`. Used by Prevalence explorer items whose wire shape is
+ * `daily_counts: number[]` + `daily_start: string` to halve network payload.
+ */
+export function expandPackedDaily(
+  counts: number[] | undefined,
+  start: string | undefined,
+): { date: string; count: number }[] {
+  if (!counts || !start || counts.length === 0) return [];
+  // `start` is YYYY-MM-DD; treat as UTC midnight so day arithmetic is DST-safe.
+  const base = new Date(`${start}T00:00:00Z`);
+  if (Number.isNaN(base.getTime())) return [];
+  const out: { date: string; count: number }[] = [];
+  for (let i = 0; i < counts.length; i++) {
+    const d = new Date(base);
+    d.setUTCDate(d.getUTCDate() + i);
+    out.push({ date: d.toISOString().slice(0, 10), count: counts[i] });
+  }
+  return out;
+}
+
+/**
  * Format bytes in human-readable format (B, KB, MB, GB, TB)
  */
 export function formatBytes(bytes: number | null | undefined): string {
