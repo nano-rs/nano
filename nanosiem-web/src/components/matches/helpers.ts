@@ -97,11 +97,19 @@ const ISO_TIMESTAMP_SHAPE = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/;
 // rows (NAN-739) where users alias their own time columns (`last_seen`,
 // `bucket_end`, etc.) — `_`-prefixed fields are skipped so system-injected
 // times like `_nano_detected_at` don't masquerade as the event time.
+//
+// `_last_seen` / `_first_seen` (NAN-822) are a deliberate exception: the
+// stats engine emits them as the aggregation window bounds and they're
+// exactly what should show as the event time on aggregate rows. We pull them
+// in as canonical lookups (after raw-event fields) so they win over the loose
+// scan without re-enabling the broader `_`-prefix swallow.
 export function extractEventTime(e: Record<string, unknown>): Date | undefined {
   const direct = stringField(e, 'timestamp')
     || stringField(e, 'eventTime')
     || stringField(e, 'ingest_time')
-    || stringField(e, '_time');
+    || stringField(e, '_time')
+    || stringField(e, '_last_seen')
+    || stringField(e, '_first_seen');
   if (direct) return parseUTCTimestamp(direct);
 
   let best: Date | undefined;
