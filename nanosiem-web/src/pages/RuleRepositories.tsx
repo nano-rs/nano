@@ -430,7 +430,7 @@ export function RuleRepositories() {
                 onClick={() =>
                   createMutation.mutate({
                     name: 'nano rules',
-                    url: 'https://github.com/nanos-sh/rules',
+                    url: 'https://github.com/nano-rs/rules',
                     description: 'Official nano detection rules in native nPL format',
                     branch: 'main',
                     rules_path: '',

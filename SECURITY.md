@@ -20,7 +20,7 @@ mail and we'll respond with it.
 
 ## Scope
 
-This repository (`nanos-sh/nano`) is the open-core engine —
+This repository (`nano-rs/nano`) is the open-core engine —
 ingestion, ClickHouse / Postgres data layer, search, detection,
 alerting, web UI shell.
 

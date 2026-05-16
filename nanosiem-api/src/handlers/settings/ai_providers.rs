@@ -1733,7 +1733,7 @@ pub async fn get_model_catalog_status(
     let row = sqlx::query(
         r#"
         SELECT
-            COALESCE(model_catalog_url, 'https://github.com/nanos-sh/models') as url,
+            COALESCE(model_catalog_url, 'https://github.com/nano-rs/models') as url,
             COALESCE(model_catalog_branch, 'main') as branch,
             model_catalog_last_synced_at,
             model_catalog_last_sync_status,
@@ -1760,7 +1760,7 @@ pub async fn get_model_catalog_status(
             last_sync_error: r.get("model_catalog_last_sync_error"),
         },
         None => ModelCatalogStatusResponse {
-            url: "https://github.com/nanos-sh/models".to_string(),
+            url: "https://github.com/nano-rs/models".to_string(),
             branch: "main".to_string(),
             last_synced_at: None,
             last_sync_status: None,

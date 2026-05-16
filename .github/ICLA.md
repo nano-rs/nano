@@ -44,7 +44,7 @@ available to the public under the GNU Affero General Public License version
 3.0 (or a successor license at least as permissive in the same family),
 even if the Company changes the license of new versions of the engine. The
 Company further commits that the public engine repository
-(`nanos-sh/nano` or any successor) shall remain publicly available
+(`nano-rs/nano` or any successor) shall remain publicly available
 under such a license. Except for the licenses granted herein to the Company
 and recipients of software distributed by the Company, You reserve all
 right, title, and interest in and to Your Contributions.

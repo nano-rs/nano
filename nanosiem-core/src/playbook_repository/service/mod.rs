@@ -22,7 +22,7 @@ use super::repository::{
 };
 
 /// Allowed playbook repository sources (owner/repo format, lowercase).
-const ALLOWED_REPOSITORIES: &[&str] = &["nanos-sh/playbooks"];
+const ALLOWED_REPOSITORIES: &[&str] = &["nano-rs/playbooks"];
 
 /// Configuration for the playbook repository service.
 #[derive(Debug, Clone)]

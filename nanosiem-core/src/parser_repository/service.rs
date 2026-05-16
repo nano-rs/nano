@@ -27,7 +27,7 @@ use super::repository::{
 use super::yaml_parser::parse_parser_yaml;
 
 /// Allowed parser repository sources (owner/repo format, lowercase)
-const ALLOWED_REPOSITORIES: &[&str] = &["nanos-sh/parsers"];
+const ALLOWED_REPOSITORIES: &[&str] = &["nano-rs/parsers"];
 
 /// Configuration for the parser repository service
 #[derive(Debug, Clone)]

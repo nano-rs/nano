@@ -558,7 +558,7 @@ export function ParserRepositories() {
                 onClick={() =>
                   createMutation.mutate({
                     name: 'nano parsers',
-                    url: 'https://github.com/nanos-sh/parsers',
+                    url: 'https://github.com/nano-rs/parsers',
                     description: 'Official nano parsers for common log sources',
                     branch: 'main',
                     parsers_path: 'parsers/',

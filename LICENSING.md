@@ -39,7 +39,7 @@ AGPL licensing of the rest of the codebase. AGPL permits other code in the
 same source tree under different licenses, provided the AGPL portions
 themselves remain AGPL-licensed. The proprietary paths above are excluded
 from the open-core distribution by the sync-mirror workflow that publishes
-the AGPL portions to the public `nanos-sh/nano` repository.
+the AGPL portions to the public `nano-rs/nano` repository.
 
 ## Commercial licensing
 

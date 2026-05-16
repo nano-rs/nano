@@ -35,7 +35,7 @@ use super::repository::{
 
 /// Allowed repository sources (owner/repo format, lowercase for comparison)
 /// Only these repositories can be added - prevents arbitrary external code sync
-const ALLOWED_REPOSITORIES: &[&str] = &["nanos-sh/rules", "sigmahq/sigma"];
+const ALLOWED_REPOSITORIES: &[&str] = &["nano-rs/rules", "sigmahq/sigma"];
 
 /// Configuration for the rule repository service
 #[derive(Debug, Clone)]

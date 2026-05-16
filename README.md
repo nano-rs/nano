@@ -183,16 +183,16 @@ Full documentation: **[nano.rs/docs](https://nano.rs/docs/getting-started/first-
 The engine works on its own, but a small set of companion repos ships
 the content layer most teams want on day one:
 
-- **[nano-enrichments](https://github.com/nanos-sh/nano-enrichments)** —
+- **[nano-enrichments](https://github.com/nano-rs/nano-enrichments)** —
   threat-intel feeds, identity providers, and asset-inventory adapters
   wired into the in-app marketplace
-- **[parsers](https://github.com/nanos-sh/parsers)** — Vector + VRL
+- **[parsers](https://github.com/nano-rs/parsers)** — Vector + VRL
   parsers for common log sources (proxy, EDR, cloud audit, Windows)
-- **[rules](https://github.com/nanos-sh/rules)** — curated detection
+- **[rules](https://github.com/nano-rs/rules)** — curated detection
   rules, importable into nano via the rule library
-- **[nanodac](https://github.com/nanos-sh/nanodac)** —
+- **[nanodac](https://github.com/nano-rs/nanodac)** —
   detection-as-code: define rules in Git, sync to nano via GitOps
-- **[models](https://github.com/nanos-sh/models)** — LiteLLM model
+- **[models](https://github.com/nano-rs/models)** — LiteLLM model
   catalog backing pivt's AI features
 
 ## What's open vs. hosted
@@ -218,7 +218,7 @@ Self-hosting nano with these features requires a commercial license —
 - OpenTelemetry log/trace ingestion
 - Parser SDK for community-authored VRL parsers
 - Saved-query API + CLI client
-- See [open issues](https://github.com/nanos-sh/nano/issues) for the
+- See [open issues](https://github.com/nano-rs/nano/issues) for the
   active backlog
 
 ## Community
@@ -226,9 +226,9 @@ Self-hosting nano with these features requires a commercial license —
 - **Star this repo** if nano is useful to you — it helps others find it
 - **[Discord](https://discord.gg/5rk8bwmkj7)** — questions, design
   discussions, show-and-tell
-- **[Good first issues](https://github.com/nanos-sh/nano/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)** —
+- **[Good first issues](https://github.com/nano-rs/nano/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)** —
   curated entry points for new contributors
-- **[Discussions](https://github.com/nanos-sh/nano/discussions)** —
+- **[Discussions](https://github.com/nano-rs/nano/discussions)** —
   longer-form Q&A and proposals
 
 ## Contributing

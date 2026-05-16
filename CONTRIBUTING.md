@@ -39,7 +39,7 @@ Prerequisites:
 Bare-host setup:
 
 ```bash
-git clone https://github.com/nanos-sh/nano.git
+git clone https://github.com/nano-rs/nano.git
 cd nanosiem
 
 # Run migrations against your local Postgres + ClickHouse
