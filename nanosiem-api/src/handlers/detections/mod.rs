@@ -14,6 +14,7 @@ mod aggregates;
 mod bulk;
 mod crud;
 mod dispositions;
+mod event_envelope;
 mod import_export;
 mod lifecycle;
 mod predicates;

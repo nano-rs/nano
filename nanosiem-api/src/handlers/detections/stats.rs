@@ -296,11 +296,20 @@ pub async fn get_detection_matches(
         .into_iter()
         .map(
             |(match_id, detected_at, severity, status, matched_events, reviewed_at)| {
-                let events = if let serde_json::Value::Array(arr) = matched_events {
+                let mut events = if let serde_json::Value::Array(arr) = matched_events {
                     arr
                 } else {
                     vec![]
                 };
+
+                // NAN-830: inject the canonical `_match_*` envelope on each
+                // event so the frontend doesn't have to guess at user-defined
+                // rule output shapes. Stored data stays untouched —
+                // normalization runs on every serialize, so heuristic
+                // improvements are immediate without a migration.
+                for event in &mut events {
+                    super::event_envelope::normalize_match_event(event);
+                }
 
                 DetectionMatch {
                     id: match_id,

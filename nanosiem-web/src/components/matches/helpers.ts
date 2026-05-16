@@ -95,19 +95,16 @@ export function extractEntity(events: Record<string, unknown>[]): MatchEntity {
 // `parseUTCTimestamp` and pretend to be timestamps.
 const ISO_TIMESTAMP_SHAPE = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/;
 
-// Event time fields — try canonical raw-event names first, then fall back to
-// scanning the row for any non-underscore string field that parses as a UTC
-// timestamp and pick the latest. The fallback handles `stats … by …` aggregate
-// rows (NAN-739) where users alias their own time columns (`last_seen`,
-// `bucket_end`, etc.) — `_`-prefixed fields are skipped so system-injected
-// times like `_nano_detected_at` don't masquerade as the event time.
-//
-// `_last_seen` / `_first_seen` (NAN-822) are a deliberate exception: the
-// stats engine emits them as the aggregation window bounds and they're
-// exactly what should show as the event time on aggregate rows. We pull them
-// in as canonical lookups (after raw-event fields) so they win over the loose
-// scan without re-enabling the broader `_`-prefix swallow.
+// Event time — NAN-830 moved this inference server-side. The API injects
+// `_match_event_time` on every event in `DetectionMatch.events` so we read
+// that directly. The legacy heuristics below stay as a fallback for any
+// envelope misses (older deployments, weird shapes the normalizer hasn't
+// learned yet) — improvements to the picker should land in the Rust
+// `event_envelope` module, not here.
 export function extractEventTime(e: Record<string, unknown>): Date | undefined {
+  const canonical = stringField(e, '_match_event_time');
+  if (canonical) return parseUTCTimestamp(canonical);
+
   const direct = stringField(e, 'timestamp')
     || stringField(e, 'eventTime')
     || stringField(e, 'ingest_time')
@@ -135,11 +132,15 @@ export function extractIp(e: Record<string, unknown>): string | undefined {
     || stringField(e, 'dest_ip');
 }
 
-// Whether the event came from a `stats … by …` aggregation rather than a raw
-// log row. The stats engine injects `_first_seen` / `_last_seen` window
-// bounds on every aggregate result, so their presence is a reliable marker.
+// Aggregate detection — NAN-830 moved this server-side via `_match_kind`.
+// The local heuristic is now belt-and-suspenders for envelope misses.
 export function isAggregateRow(e: Record<string, unknown>): boolean {
-  return typeof e._first_seen === 'string' || typeof e._last_seen === 'string';
+  if (e._match_kind === 'aggregate') return true;
+  if (e._match_kind === 'raw') return false;
+  if (typeof e._first_seen === 'string' || typeof e._last_seen === 'string') return true;
+  if (typeof e.first_seen === 'string' && typeof e.last_seen === 'string') return true;
+  if (typeof e.actions_attempted === 'string') return true;
+  return false;
 }
 
 // Derive a human label for a stats-aggregate row. Aggregates don't carry
@@ -172,6 +173,11 @@ function aggregateLabel(e: Record<string, unknown>): string | undefined {
 }
 
 export function extractAction(e: Record<string, unknown>): string | undefined {
+  // Server-injected canonical label (NAN-830) wins — improvements live in
+  // the Rust `event_envelope` module so we stop chasing rule shapes here.
+  const canonical = stringField(e, '_match_event_label');
+  if (canonical) return canonical;
+
   return stringField(e, 'eventName')
     || stringField(e, 'event_type')
     || stringField(e, 'action')
