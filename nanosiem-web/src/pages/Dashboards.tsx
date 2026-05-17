@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import {
   Box,
@@ -326,7 +326,18 @@ export function Dashboards() {
     setSearchParams(params);
   };
 
-  const { data: dashboards, loading, refetch } = useDashboards(dashboardFilter);
+  // NAN-833: fetch both lists so the tab counts are independent.
+  // useDashboards is server-filtered; if we only fetched the visible tab's
+  // list, both counts would always read the same number (the visible one).
+  const myQuery = useDashboards('my');
+  const allQuery = useDashboards('all');
+  const activeQuery = dashboardFilter === 'my' ? myQuery : allQuery;
+  const dashboards = activeQuery.data;
+  const loading = activeQuery.loading;
+  const refetch = useCallback(() => {
+    myQuery.refetch();
+    allQuery.refetch();
+  }, [myQuery, allQuery]);
   const { mutate: createDashboard, loading: creating } = useCreateDashboard();
   const { mutate: deleteDashboard } = useDeleteDashboard();
   const { mutate: importDashboard, loading: importing } = useImportDashboard();
@@ -551,10 +562,10 @@ export function Dashboards() {
     }
   };
 
-  const counts = useMemo(() => {
-    const all = dashboards?.length ?? 0;
-    return { my: all, all };
-  }, [dashboards]);
+  const counts = useMemo(() => ({
+    my: myQuery.data?.length ?? 0,
+    all: allQuery.data?.length ?? 0,
+  }), [myQuery.data, allQuery.data]);
 
   return (
     <div className="flex-1 overflow-auto p-4 flex flex-col gap-4">
