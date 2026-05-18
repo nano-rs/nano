@@ -121,6 +121,92 @@ impl IocRepository {
         ))
     }
 
+    /// Lookup all enabled-source matches for a single IOC value.
+    ///
+    /// Sibling of `lookup_ioc`, which caps with `LIMIT 1` (highest-confidence)
+    /// because the ingestion path only needs one verdict to stamp on a log.
+    /// The prevalence threat-intel surface wants the full multi-source view
+    /// (ThreatFox + VirusTotal + AbuseIPDB can all flag the same artifact),
+    /// so this variant drops the limit and returns every row, ordered by
+    /// confidence DESC.
+    #[instrument(skip(self))]
+    pub async fn lookup_ioc_all_sources(
+        &self,
+        value: &str,
+        ioc_type: Option<IocType>,
+    ) -> Result<Vec<IocLookupResult>, IocRepositoryError> {
+        if value.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let normalized_value = value.to_lowercase();
+
+        let rows = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<i32>,
+                Option<DateTime<Utc>>,
+                Option<DateTime<Utc>>,
+                Vec<String>,
+            ),
+        >(
+            r#"
+            SELECT
+                ie.source_id,
+                ie.ioc_type::text,
+                ie.threat_type,
+                ie.malware,
+                ie.confidence_level,
+                ie.first_seen_at,
+                ie.last_seen_at,
+                ie.tags
+            FROM ioc_enrichments ie
+            JOIN enrichment_sources es ON ie.source_id = es.id
+            WHERE ie.ioc_value = $1
+              AND ($2::text IS NULL OR ie.ioc_type::text = $2)
+              AND es.enabled = true
+              AND ie.expires_at > NOW()
+            ORDER BY ie.confidence_level DESC NULLS LAST, ie.source_id
+            "#,
+        )
+        .bind(&normalized_value)
+        .bind(ioc_type.map(|t| t.as_str()))
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    source_id,
+                    ioc_type,
+                    threat_type,
+                    malware,
+                    confidence,
+                    first_seen,
+                    last_seen,
+                    tags,
+                )| {
+                    IocLookupResult {
+                        found: true,
+                        source_id: Some(source_id),
+                        ioc_type: Some(ioc_type),
+                        threat_type,
+                        malware,
+                        confidence_level: confidence,
+                        first_seen_at: first_seen.map(|t| t.to_rfc3339()),
+                        last_seen_at: last_seen.map(|t| t.to_rfc3339()),
+                        tags,
+                    }
+                },
+            )
+            .collect())
+    }
+
     /// Bulk lookup IOCs (for batch ingestion enrichment)
     /// Returns a map of ioc_value -> lookup result
     #[instrument(skip(self, values))]

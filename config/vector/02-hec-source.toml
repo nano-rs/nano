@@ -41,14 +41,12 @@ if exists(.sourcetype) {
 # see the same shape as HTTP-ingested events.
 if exists(.event) {
     if is_object(.event) {
-        event_keys, key_err = keys(object!(.event))
-        if key_err == null {
-            for_each(event_keys) -> |_idx, key| {
-                if key != "message" {
-                    val, get_err = get(.event, [key])
-                    if get_err == null && val != null {
-                        . = set!(., [key], val)
-                    }
+        event_keys = keys(object!(.event))
+        for_each(event_keys) -> |_idx, key| {
+            if key != "message" {
+                val, get_err = get(.event, [key])
+                if get_err == null && val != null {
+                    . = set!(., [key], val)
                 }
             }
         }

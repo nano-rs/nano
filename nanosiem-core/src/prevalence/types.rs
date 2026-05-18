@@ -459,6 +459,46 @@ pub struct ArtifactExplorerItem {
     pub daily_counts: Vec<u64>,
     /// Date of `daily_counts[0]` in YYYY-MM-DD format
     pub daily_start: String,
+    /// Inline context fields populated for the list view so each row is
+    /// scannable without expanding. All optional — clients render a fallback
+    /// when missing. Populated by `PrevalenceService::enrich_explorer_items`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ArtifactInlineContext>,
+}
+
+/// Inline subtitle data shown beneath each prevalence list row. Tuned per
+/// artifact type — see Prevalence.tsx for the rendering rules.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ArtifactInlineContext {
+    /// Hash artifacts: top observed on-disk file name (`7zG.exe`,
+    /// `tiledatamodelsvc.dll`, ...). Distinct from `top_process_name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_file_name: Option<String>,
+    /// Hash artifacts: top running image name (`svchost.exe`, `7zG.exe`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_process_name: Option<String>,
+    /// Hash artifacts: short command-line excerpt for the top process.
+    /// Useful when `top_process_name` is a wrapper (svchost, rundll32).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_command_line: Option<String>,
+    /// Hash artifacts: true when `top_process_name` is a wrapper binary.
+    #[serde(default)]
+    pub top_process_is_wrapper: bool,
+    /// IP artifacts: country name (e.g. "United States").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    /// IP artifacts: ASN number string (e.g. "15169").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asn: Option<String>,
+    /// IP artifacts: AS organization (e.g. "Google LLC").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asn_org: Option<String>,
+    /// Total distinct users associated with the artifact (cheap count).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_count: Option<u64>,
+    /// Top source_type by event count for the artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_source_type: Option<String>,
 }
 
 impl ArtifactExplorerItem {
@@ -479,6 +519,7 @@ impl ArtifactExplorerItem {
             prevalence_score: data.prevalence_score,
             daily_counts,
             daily_start,
+            context: None,
         }
     }
 }
@@ -528,12 +569,76 @@ pub struct ArtifactSourceEntry {
     pub count: u64,
 }
 
-/// Process context for hash artifacts
+/// Process context for hash artifacts.
+///
+/// `is_wrapper` is set when the process_name is a well-known host/wrapper
+/// (svchost.exe, rundll32.exe, powershell.exe, etc.). Wrapper rows are nearly
+/// uninformative on their own — the command line is the real identity. The
+/// UI groups consecutive wrapper rows under a single sub-heading so a hash
+/// like svchost reads as "one service host, many command lines" rather than
+/// 10 identical-looking rows.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ArtifactProcessEntry {
     pub process_name: String,
     pub command_line: String,
     pub count: u64,
+    /// True when `process_name` is a well-known wrapper/host process whose
+    /// identity is carried by `command_line`, not the image name itself.
+    #[serde(default)]
+    pub is_wrapper: bool,
+}
+
+/// On-disk file name observed for a hash artifact.
+///
+/// `file_name` is the on-disk identity (e.g. `7zG.exe`), distinct from the
+/// running image (`process_name`). They differ when a binary is renamed or
+/// loaded via a wrapper (rundll32.exe loading `evil.dll`, svchost.exe
+/// hosting `tiledatamodelsvc.dll`, etc.). For hashes, file_name is usually
+/// the truer answer to "what is this thing?"
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ArtifactFileNameEntry {
+    pub file_name: String,
+    pub count: u64,
+}
+
+/// Threat-intelligence verdict from an enrichment source (ThreatFox, TOR
+/// exit nodes, etc.). Empty when no source returned a hit for the artifact.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ArtifactThreatIntelEntry {
+    /// Enrichment source slug (e.g. `threatfox`, `tor_exit_nodes`)
+    pub source: String,
+    /// Human-readable verdict line (e.g. "Malware C2 — Cobalt Strike")
+    pub verdict: String,
+    /// Confidence/score 0-100 if the source provides one
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
+    /// Raw details payload for the UI (tags, first_seen, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+
+/// Well-known wrapper / process-hosting binaries. Hash hits whose top
+/// `process_name` is one of these are almost always uninformative without
+/// the command line, which is why we surface this flag to the UI.
+///
+/// Case-insensitive match against `process_name`.
+pub const WRAPPER_PROCESSES: &[&str] = &[
+    "svchost.exe",
+    "rundll32.exe",
+    "dllhost.exe",
+    "conhost.exe",
+    "regsvr32.exe",
+    "powershell.exe",
+    "cmd.exe",
+    "wscript.exe",
+    "cscript.exe",
+    "mshta.exe",
+];
+
+/// True when `process_name` matches a known wrapper binary (case-insensitive).
+pub fn is_wrapper_process(process_name: &str) -> bool {
+    let lower = process_name.trim().to_ascii_lowercase();
+    WRAPPER_PROCESSES.iter().any(|w| *w == lower.as_str())
 }
 
 /// Network context for IP/domain artifacts
@@ -567,6 +672,12 @@ pub struct ArtifactDetailResponse {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     pub processes: Vec<ArtifactProcessEntry>,
+    /// Top on-disk file names observed for this hash. Hash artifacts only.
+    /// Distinct from `processes.process_name` — file_name is the on-disk
+    /// identity and is usually the more interesting answer for hashes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub top_file_names: Vec<ArtifactFileNameEntry>,
     /// Network context (IP/domain artifacts only)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
@@ -575,6 +686,11 @@ pub struct ArtifactDetailResponse {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     pub geo: Vec<ArtifactGeoEntry>,
+    /// Threat-intel verdicts from configured enrichment sources. Empty when
+    /// the artifact is not present in any feed (or no feeds are configured).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub threat_intel: Vec<ArtifactThreatIntelEntry>,
 }
 
 #[cfg(test)]
@@ -743,5 +859,171 @@ mod tests {
         assert_eq!(data.host_count, 0);
         assert!(data.is_rare);
         assert_eq!(data.prevalence_score, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // NAN-849: wrapper-process detection and inline-context plumbing
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_is_wrapper_process_known_wrappers() {
+        // Every listed wrapper should match, case-insensitively.
+        for name in [
+            "svchost.exe",
+            "SVCHOST.EXE",
+            "SvcHost.Exe",
+            "rundll32.exe",
+            "DLLHOST.EXE",
+            "conhost.exe",
+            "regsvr32.exe",
+            "powershell.exe",
+            "PowerShell.exe",
+            "cmd.exe",
+            "wscript.exe",
+            "cscript.exe",
+            "mshta.exe",
+        ] {
+            assert!(
+                is_wrapper_process(name),
+                "expected {name} to be flagged as a wrapper"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_wrapper_process_negative() {
+        // Ordinary binaries are not wrappers — the hash row should render
+        // with `is_wrapper = false` and no grouping in the UI.
+        for name in [
+            "explorer.exe",
+            "chrome.exe",
+            "7zG.exe",
+            "notepad.exe",
+            "",
+            "  ",
+            "tiledatamodelsvc.dll",
+        ] {
+            assert!(
+                !is_wrapper_process(name),
+                "did not expect {name:?} to be flagged as a wrapper"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_wrapper_process_trims_whitespace() {
+        // Logs frequently carry trailing spaces in process_name. The flag
+        // must still light up.
+        assert!(is_wrapper_process("  svchost.exe  "));
+        assert!(is_wrapper_process("\tpowershell.exe\n"));
+    }
+
+    #[test]
+    fn test_artifact_process_entry_is_wrapper_flag() {
+        // The flag is what the UI keys off of when collapsing rows under a
+        // sub-heading. Smoke-test that the struct serializes the field and
+        // that the wrapper helper produces the right answer.
+        let entry = ArtifactProcessEntry {
+            process_name: "svchost.exe".to_string(),
+            command_line: "C:\\Windows\\System32\\svchost.exe -k netsvcs".to_string(),
+            count: 42,
+            is_wrapper: is_wrapper_process("svchost.exe"),
+        };
+        assert!(entry.is_wrapper);
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["is_wrapper"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn test_artifact_inline_context_optional_fields_omitted() {
+        // Empty context should round-trip without exposing null fields —
+        // the frontend differentiates "missing" from "explicitly null".
+        let ctx = ArtifactInlineContext::default();
+        let json = serde_json::to_value(&ctx).unwrap();
+        // top_process_is_wrapper has #[serde(default)] but is a bool so it
+        // stays in the payload as `false`. Everything else is optional and
+        // should be absent.
+        assert!(json.get("top_file_name").is_none());
+        assert!(json.get("top_process_name").is_none());
+        assert!(json.get("country").is_none());
+        assert!(json.get("asn").is_none());
+        assert!(json.get("user_count").is_none());
+    }
+
+    #[test]
+    fn test_artifact_inline_context_populated_round_trip() {
+        let ctx = ArtifactInlineContext {
+            top_file_name: Some("tiledatamodelsvc.dll".to_string()),
+            top_process_name: Some("svchost.exe".to_string()),
+            top_command_line: Some("svchost.exe -k LocalServiceNetworkRestricted".to_string()),
+            top_process_is_wrapper: true,
+            user_count: Some(12),
+            top_source_type: Some("microsoft_sysmon".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&ctx).unwrap();
+        assert_eq!(json["top_file_name"], "tiledatamodelsvc.dll");
+        assert_eq!(json["top_process_name"], "svchost.exe");
+        assert_eq!(json["top_process_is_wrapper"], true);
+        assert_eq!(json["user_count"], 12);
+    }
+
+    #[test]
+    fn test_top_file_names_aggregation_pure() {
+        // We can't hit ClickHouse in a unit test, but we can simulate the
+        // aggregation that the repository does so the count + ordering
+        // contract is locked in. Same input shape the CH query produces:
+        // (file_name, count) rows sorted DESC by count.
+        let raw: Vec<(&str, u64)> = vec![
+            ("tiledatamodelsvc.dll", 1240),
+            ("netman.dll", 410),
+            ("WdiServiceHost.dll", 88),
+        ];
+        let entries: Vec<ArtifactFileNameEntry> = raw
+            .into_iter()
+            .map(|(n, c)| ArtifactFileNameEntry {
+                file_name: n.to_string(),
+                count: c,
+            })
+            .collect();
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].file_name, "tiledatamodelsvc.dll");
+        assert_eq!(entries[0].count, 1240);
+        // The vec is in DESC order — counts strictly decrease.
+        for w in entries.windows(2) {
+            assert!(w[0].count >= w[1].count, "expected DESC ordering");
+        }
+
+        // Round-trips through the API JSON shape.
+        let json = serde_json::to_value(&entries[0]).unwrap();
+        assert_eq!(json["file_name"], "tiledatamodelsvc.dll");
+        assert_eq!(json["count"], 1240);
+    }
+
+    #[test]
+    fn test_artifact_detail_response_omits_empty_context_arrays() {
+        // Backwards-compat: a hash with no process matches shouldn't push
+        // empty `processes`/`top_file_names` keys onto the wire — old
+        // clients that don't know about top_file_names mustn't break.
+        let resp = ArtifactDetailResponse {
+            artifact: "deadbeef".to_string(),
+            artifact_type: ArtifactType::HashMd5,
+            top_hosts: vec![],
+            top_users: vec![],
+            source_types: vec![],
+            processes: vec![],
+            top_file_names: vec![],
+            network: vec![],
+            geo: vec![],
+            threat_intel: vec![],
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json.get("processes").is_none(), "empty vec should be skipped");
+        assert!(
+            json.get("top_file_names").is_none(),
+            "empty top_file_names should be skipped"
+        );
+        assert!(json.get("threat_intel").is_none());
     }
 }

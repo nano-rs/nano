@@ -283,10 +283,7 @@ export function Rules() {
         silentCount={silentCount}
         alerts24h={alertCounts?.total ?? 0}
         fleetHealth={fleetHealth}
-        onReviewSilent={() => {
-          // TODO: persist filter intent — for now just scroll silent band open.
-          setOpenBands((o) => ({ ...o, silent: true }));
-        }}
+        onReviewSilent={() => navigate('/rules/tuning?tab=silent')}
       />
 
       {/* Tactic chips */}

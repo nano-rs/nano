@@ -814,7 +814,9 @@ impl EnrichmentService {
         }
     }
 
-    /// Lookup IOC enrichment for a single value (IP, domain, or hash)
+    /// Lookup IOC enrichment for a single value (IP, domain, or hash).
+    /// Returns the highest-confidence verdict across all enabled sources.
+    /// Used by the ingestion path where one verdict per log row is enough.
     #[instrument(skip(self))]
     pub async fn lookup_ioc(
         &self,
@@ -825,6 +827,24 @@ impl EnrichmentService {
         let ioc_repo = IocRepository::new(self.repository.pool().clone());
         ioc_repo
             .lookup_ioc(value, None)
+            .await
+            .map_err(|e| EnrichmentError::RepositoryError(e.into()))
+    }
+
+    /// Lookup all enabled-source IOC verdicts for a single value.
+    /// Used by the prevalence threat-intel surface (NAN-849) which wants
+    /// the full multi-source view (ThreatFox + VirusTotal + AbuseIPDB can
+    /// all flag the same artifact), not just the highest-confidence one.
+    #[instrument(skip(self))]
+    pub async fn lookup_ioc_all_sources(
+        &self,
+        value: &str,
+    ) -> Result<Vec<super::ioc::IocLookupResult>, EnrichmentError> {
+        use super::ioc::IocRepository;
+
+        let ioc_repo = IocRepository::new(self.repository.pool().clone());
+        ioc_repo
+            .lookup_ioc_all_sources(value, None)
             .await
             .map_err(|e| EnrichmentError::RepositoryError(e.into()))
     }

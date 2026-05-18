@@ -303,7 +303,7 @@ export function SearchQueryInput({
       <div className="relative">
         <div className={`search-console-input-shell relative border rounded-md min-h-[34px] resize-y overflow-hidden transition-colors duration-300 ease-out ${
           aiMode
-            ? 'bg-ai-bg-subtle border-ai-border ring-1 ring-ai/25 focus-within:border-ai focus-within:ring-ai/35'
+            ? 'pt-1.5 bg-ai-bg-subtle border-ai-border ring-1 ring-ai/25 focus-within:border-ai focus-within:ring-ai/35'
             : 'bg-background border-border focus-within:border-primary/50 focus-within:ring-1 focus-within:ring-primary/25'
         }`}>
         <SearchQueryEditor

@@ -1120,6 +1120,58 @@ impl PrevalenceService {
             .map_err(PrevalenceError::ClickHouse)
     }
 
+    /// Enrich a batch of explorer items with inline-subtitle context
+    /// (top file_name, top process_name + is_wrapper, user_count, top
+    /// source_type). Mutates the `context` field on each item in-place.
+    ///
+    /// Single-batch design: one CH pass per artifact-type bucket, so cost
+    /// is bounded regardless of page size. Empty input is a no-op.
+    pub async fn enrich_explorer_items(
+        &self,
+        items: &mut [ArtifactExplorerItem],
+        logs_table: &str,
+        time_window: TimeWindow,
+    ) {
+        if items.is_empty() {
+            return;
+        }
+
+        let mut hash_artifacts = Vec::new();
+        let mut ip_artifacts = Vec::new();
+        let mut domain_artifacts = Vec::new();
+        for item in items.iter() {
+            if item.artifact_type.is_hash() {
+                hash_artifacts.push(item.artifact.to_lowercase());
+            } else if item.artifact_type.is_ip() {
+                ip_artifacts.push(item.artifact.clone());
+            } else if item.artifact_type.is_domain() {
+                domain_artifacts.push(item.artifact.clone());
+            }
+        }
+
+        let ctx_map = self
+            .repository
+            .bulk_artifact_inline_context(
+                &hash_artifacts,
+                &ip_artifacts,
+                &domain_artifacts,
+                logs_table,
+                time_window,
+            )
+            .await;
+
+        for item in items.iter_mut() {
+            let key = if item.artifact_type.is_hash() {
+                item.artifact.to_lowercase()
+            } else {
+                item.artifact.clone()
+            };
+            if let Some(ctx) = ctx_map.get(&key) {
+                item.context = Some(ctx.clone());
+            }
+        }
+    }
+
     /// Extract parent domain from a subdomain
     ///
     /// Examples:

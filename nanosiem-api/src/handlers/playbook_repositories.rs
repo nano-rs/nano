@@ -25,6 +25,23 @@ use uuid::Uuid;
 use crate::middleware::{check_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
+// NAN-845: hardcoded URL allowlist for the only repo we sync from. The
+// frontend reshape (drop add/edit dialogs) makes this unreachable via the UI,
+// but the API stays callable directly — guard the surface so direct callers
+// can't register an arbitrary repo and silently leak playbook content.
+const ALLOWED_REPO_URLS: &[&str] = &["https://github.com/nano-rs/playbooks"];
+
+fn validate_repo_url(url: &str) -> Result<(), ApiError> {
+    if ALLOWED_REPO_URLS.iter().any(|allowed| *allowed == url) {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(format!(
+            "Repository URL not on allowlist (only nano-rs/playbooks is permitted): {}",
+            url
+        )))
+    }
+}
+
 // =============================================================================
 // Request/Response Types
 // =============================================================================
@@ -206,6 +223,7 @@ pub async fn create_playbook_repository(
     check_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_MANAGE).map_err(|_| {
         ApiError::Forbidden("Missing permission: playbook_repositories:manage".to_string())
     })?;
+    validate_repo_url(&req.url)?;
     let service = get_service(&state);
     let new_repo = NewPlaybookRepository {
         name: req.name,
@@ -684,3 +702,25 @@ pub async fn sync_and_import_repository(
     ))
 )]
 pub struct PlaybookRepositoriesApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_repo_url_accepts_official() {
+        assert!(validate_repo_url("https://github.com/nano-rs/playbooks").is_ok());
+    }
+
+    #[test]
+    fn validate_repo_url_rejects_arbitrary() {
+        let err = validate_repo_url("https://github.com/attacker/evil").unwrap_err();
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn validate_repo_url_rejects_off_by_trailing_slash() {
+        // Strict equality — trailing-slash variants are not allowed.
+        assert!(validate_repo_url("https://github.com/nano-rs/playbooks/").is_err());
+    }
+}

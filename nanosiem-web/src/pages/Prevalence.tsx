@@ -51,12 +51,19 @@ import {
   MapPin,
   Filter,
   Grid as GridIcon,
+  FileText,
+  ShieldCheck,
+  Store,
 } from 'lucide-react';
 import { useArtifactExplorer, useArtifactDetail } from '@/hooks/use-api';
 import { formatUTCCompact, formatRelativeCompact, buildHeatmapDays, expandPackedDaily } from '@/lib/date-utils';
 import { PrevalenceExplorerHeatmap } from '@/components/prevalence';
 import { RuleActivityHeatmap } from '@/components/detection/RuleActivityHeatmap';
-import type { ArtifactExplorerItem } from '@/lib/api/types';
+import type {
+  ArtifactExplorerItem,
+  ArtifactInlineContext,
+  ArtifactProcessEntry,
+} from '@/lib/api/types';
 import { cn } from '@/lib/utils';
 
 type TimeWindow = '1h' | '24h' | '7d' | '30d';
@@ -223,6 +230,80 @@ function TypePill({ artifactType }: { artifactType: string }) {
   );
 }
 
+// ============================================================================
+// NAN-849 — inline subtitle rendering
+//
+// Every prevalence row now carries an optional `context` payload populated by
+// the backend in a single bulk pass (see PrevalenceService::enrich_explorer_items).
+// We render a single muted line beneath the artifact value so the row is
+// scannable without expanding. Format varies by artifact_type — see the
+// per-type helpers below. Missing fields degrade gracefully.
+// ============================================================================
+
+function truncate(s: string, max = 80): string {
+  if (s.length <= max) return s;
+  return s.slice(0, max - 1) + '…';
+}
+
+function formatHostsUsersSummary(
+  hosts: number,
+  users: number | undefined,
+): string {
+  const hostStr = `${hosts.toLocaleString()} ${hosts === 1 ? 'host' : 'hosts'}`;
+  if (users == null || users === 0) return hostStr;
+  return `${hostStr} · ${users.toLocaleString()} ${users === 1 ? 'user' : 'users'}`;
+}
+
+/** Build the inline subtitle for a prevalence row. Returns null when there
+ *  is no meaningful context to surface — the row renders without a subtitle
+ *  rather than reserving empty vertical space. */
+function buildSubtitle(artifact: ArtifactExplorerItem): string | null {
+  const ctx: ArtifactInlineContext | undefined = artifact.context;
+  const hostCount = artifact.host_count;
+
+  // Hash artifacts: top file_name is the truer identity than process_name.
+  // When the top process is a wrapper (svchost et al.), promote the
+  // process+command-line summary because the file_name will repeat the
+  // wrapper's DLL host name many times.
+  if (artifact.artifact_type.startsWith('hash')) {
+    if (ctx?.top_process_is_wrapper && ctx.top_process_name) {
+      const cmd = ctx.top_command_line ? ` (${truncate(ctx.top_command_line, 48)})` : '';
+      return `${ctx.top_process_name}${cmd} · ${formatHostsUsersSummary(hostCount, ctx.user_count)}`;
+    }
+    if (ctx?.top_file_name) {
+      return `${ctx.top_file_name} · ${formatHostsUsersSummary(hostCount, ctx.user_count)}`;
+    }
+    return null;
+  }
+
+  // IP artifacts: country + ASN org. Fall back gracefully when partial.
+  if (artifact.artifact_type.startsWith('ip_address')) {
+    const parts: string[] = [];
+    if (ctx?.country) parts.push(ctx.country);
+    if (ctx?.asn || ctx?.asn_org) {
+      const asnLabel = ctx.asn ? `AS${ctx.asn}` : '';
+      const org = ctx.asn_org ?? '';
+      parts.push([asnLabel, org].filter(Boolean).join(' ').trim());
+    }
+    if (parts.length === 0) {
+      // Private IPs commonly have no geo — at least surface host/user counts.
+      return formatHostsUsersSummary(hostCount, ctx?.user_count);
+    }
+    return parts.join(' · ');
+  }
+
+  // Domain / subdomain.
+  if (artifact.artifact_type === 'domain' || artifact.artifact_type === 'subdomain') {
+    const left = formatHostsUsersSummary(hostCount, ctx?.user_count);
+    return ctx?.top_source_type ? `${left} · ${ctx.top_source_type}` : left;
+  }
+
+  // User / host / asset (fallthrough) — count + top source_type.
+  return ctx?.top_source_type
+    ? `${formatHostsUsersSummary(hostCount, ctx?.user_count)} · ${ctx.top_source_type}`
+    : formatHostsUsersSummary(hostCount, ctx?.user_count);
+}
+
 export function Prevalence() {
   useDocumentTitle('Prevalence');
   useBreadcrumbTitle('Prevalence');
@@ -255,11 +336,6 @@ export function Prevalence() {
     limit: PAGE_SIZE,
     offset: page * PAGE_SIZE,
   });
-
-  useEffect(() => {
-    const interval = setInterval(() => refetch(), 60_000);
-    return () => clearInterval(interval);
-  }, [refetch]);
 
   const handleDrilldown = useCallback(
     (artifact: ArtifactExplorerItem) => {
@@ -311,18 +387,13 @@ export function Prevalence() {
           </p>
         </div>
         <span className="flex-1" />
-        <div className="flex items-center gap-2 font-mono text-[10.5px] text-muted-foreground">
-          <span className={cn('h-1.5 w-1.5 rounded-full', loading ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400 animate-pulse')} />
-          <span>{loading ? 'refreshing' : 'indexing live'}</span>
-          {data && (
-            <>
-              <span className="text-muted-foreground/40">·</span>
-              <span>
-                <span className="tabular-nums text-foreground">{total.toLocaleString()}</span> indicators
-              </span>
-            </>
-          )}
-        </div>
+        {data && (
+          <div className="flex items-center gap-2 font-mono text-[10.5px] text-muted-foreground">
+            <span>
+              <span className="tabular-nums text-foreground">{total.toLocaleString()}</span> indicators
+            </span>
+          </div>
+        )}
       </div>
 
       {/* KPI strip */}
@@ -575,6 +646,9 @@ function ArtifactRow({
     const ageMs = Date.now() - new Date(artifact.first_seen).getTime();
     return ageMs < NEW_ARTIFACT_WINDOW_MS;
   }, [artifact.first_seen]);
+  // NAN-849: single-line scannable subtitle. Built from the bulk `context`
+  // shipped with each list row — no per-row fetch.
+  const subtitle = useMemo(() => buildSubtitle(artifact), [artifact]);
 
   return (
     <div
@@ -593,28 +667,35 @@ function ArtifactRow({
       <div className="px-2 py-2 text-muted-foreground">
         <ChevronDown className={cn('h-3 w-3 transition-transform', isExpanded ? '' : '-rotate-90')} />
       </div>
-      <div className="flex min-w-0 items-center gap-2 px-2 py-2">
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <span className="truncate font-mono text-[12px] text-foreground">{artifact.artifact}</span>
-          </TooltipTrigger>
-          <TooltipContent side="top" align="start">
-            <p className="max-w-[500px] break-all font-mono text-[11px]">{artifact.artifact}</p>
-          </TooltipContent>
-        </Tooltip>
-        {artifact.is_rare && <TagChip kind="rare" />}
-        {isNew && <TagChip kind="new" />}
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            onDrilldown(artifact);
-          }}
-          aria-label="Search events"
-          className="rounded-sm opacity-0 transition-opacity focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary group-hover:opacity-100"
-        >
-          <Search className="h-3 w-3 text-muted-foreground hover:text-foreground" />
-        </button>
+      <div className="flex min-w-0 flex-col justify-center gap-0.5 px-2 py-1.5">
+        <div className="flex min-w-0 items-center gap-2">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="truncate font-mono text-[12px] text-foreground">{artifact.artifact}</span>
+            </TooltipTrigger>
+            <TooltipContent side="top" align="start">
+              <p className="max-w-[500px] break-all font-mono text-[11px]">{artifact.artifact}</p>
+            </TooltipContent>
+          </Tooltip>
+          {artifact.is_rare && <TagChip kind="rare" />}
+          {isNew && <TagChip kind="new" />}
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onDrilldown(artifact);
+            }}
+            aria-label="Search events"
+            className="rounded-sm opacity-0 transition-opacity focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary group-hover:opacity-100"
+          >
+            <Search className="h-3 w-3 text-muted-foreground hover:text-foreground" />
+          </button>
+        </div>
+        {subtitle && (
+          <div className="truncate text-[10.5px] text-muted-foreground/80" title={subtitle}>
+            {subtitle}
+          </div>
+        )}
       </div>
       <div className="px-2 py-2">
         <TypePill artifactType={artifact.artifact_type} />
@@ -729,6 +810,22 @@ function ExpandedArtifactDetail({
 
   const cards: React.ReactNode[] = [];
 
+  // NAN-849: for hashes, top_file_names is rendered FIRST because file_name
+  // is the on-disk identity (`tiledatamodelsvc.dll`) — the truer answer for
+  // "what is this thing?" than the running image, which is frequently a
+  // wrapper like svchost.exe.
+  if (isHash && detail.top_file_names && detail.top_file_names.length > 0) {
+    cards.push(
+      <FacetCard
+        key="file-names"
+        icon={FileText}
+        title={`File names (${detail.top_file_names.length})`}
+        rows={detail.top_file_names.map((f) => ({ name: f.file_name, value: f.count }))}
+        mono
+      />,
+    );
+  }
+
   if (detail.top_hosts.length > 0) {
     cards.push(
       <FacetCard
@@ -765,19 +862,14 @@ function ExpandedArtifactDetail({
     );
   }
 
+  // NAN-849: process context with wrapper-grouping. When the top process is
+  // a wrapper (svchost et al.) we render the rows under a sub-heading like
+  // "svchost.exe — split by command line" so that a hash with 10 svchost
+  // entries reads as "one host, many services" rather than 10 identical-
+  // looking rows.
   if (isHash && detail.processes && detail.processes.length > 0) {
     cards.push(
-      <FacetCard
-        key="processes"
-        icon={Cpu}
-        title={`Process context (${detail.processes.length})`}
-        rows={detail.processes.map((p) => ({
-          name: p.process_name,
-          meta: p.command_line,
-          value: p.count,
-        }))}
-        mono
-      />,
+      <ProcessContextCard key="processes" processes={detail.processes} />,
     );
   }
 
@@ -811,6 +903,32 @@ function ExpandedArtifactDetail({
     );
   }
 
+  // NAN-849: threat-intel from configured IOC enrichments. When nothing is
+  // returned we surface a small marketplace promotion below the cards
+  // (rendered separately so it doesn't compete with real cards for layout).
+  const hasThreatIntel = (detail.threat_intel?.length ?? 0) > 0;
+  if (hasThreatIntel) {
+    cards.push(
+      <FacetCard
+        key="threat-intel"
+        icon={ShieldCheck}
+        title={`Threat intelligence (${detail.threat_intel!.length})`}
+        rows={detail.threat_intel!.map((t) => ({
+          name: t.verdict,
+          meta: t.source + (t.score != null ? ` · confidence ${t.score}` : ''),
+          value: 1,
+        }))}
+        mono
+      />,
+    );
+  }
+
+  // NAN-849: marketplace promotion when no threat-intel verdict is
+  // attached. The data-path is wired — empty just means "no feed matched"
+  // or "no relevant feed is configured for this artifact_type". The link
+  // to /marketplace is the actionable next step.
+  const showMarketplacePromo = !hasThreatIntel;
+
   return (
     <div className="space-y-3">
       {cards.length === 0 ? (
@@ -823,6 +941,18 @@ function ExpandedArtifactDetail({
           {cards}
         </div>
       )}
+      {showMarketplacePromo && (
+        <a
+          href="/marketplace"
+          className="flex items-center gap-2 rounded-md border border-dashed border-border bg-card/40 px-3 py-2 text-[11.5px] text-muted-foreground transition-colors hover:border-border hover:bg-card/70 hover:text-foreground"
+        >
+          <Store className="h-3.5 w-3.5 text-muted-foreground/80" />
+          <span className="flex-1 truncate">
+            Connect AbuseIPDB / GreyNoise / VirusTotal in the marketplace to see reputation for this artifact
+          </span>
+          <ChevronRight className="h-3 w-3 text-muted-foreground/70" />
+        </a>
+      )}
       <button
         type="button"
         onClick={(e) => {
@@ -834,6 +964,84 @@ function ExpandedArtifactDetail({
         <Search className="h-3 w-3" />
         Search events
       </button>
+    </div>
+  );
+}
+
+// ============================================================================
+// NAN-849 — ProcessContextCard
+//
+// Renders the per-hash process rows. Wrapper rows (svchost.exe, rundll32.exe,
+// powershell.exe, etc.) are grouped under a single sub-heading so that 10
+// `svchost.exe` rows read as "one host, many services" rather than 10
+// identical-looking entries. Non-wrapper rows render flat the same way they
+// always have.
+// ============================================================================
+
+function ProcessContextCard({ processes }: { processes: ArtifactProcessEntry[] }) {
+  // Group consecutive wrapper-process rows that share the same image name.
+  // The CH query orders rows DESC by count, so wrappers cluster naturally
+  // when present.
+  type Group =
+    | { kind: 'flat'; row: ArtifactProcessEntry }
+    | { kind: 'wrapper'; processName: string; rows: ArtifactProcessEntry[] };
+
+  const groups: Group[] = [];
+  for (const p of processes) {
+    if (p.is_wrapper) {
+      const last = groups[groups.length - 1];
+      if (last && last.kind === 'wrapper' && last.processName.toLowerCase() === p.process_name.toLowerCase()) {
+        last.rows.push(p);
+        continue;
+      }
+      groups.push({ kind: 'wrapper', processName: p.process_name, rows: [p] });
+    } else {
+      groups.push({ kind: 'flat', row: p });
+    }
+  }
+
+  return (
+    <div className="rounded-md border border-border bg-card">
+      <div className="flex items-center gap-1.5 border-b border-border px-2.5 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/80">
+        <Cpu className="h-[11px] w-[11px]" />
+        Process context ({processes.length})
+      </div>
+      <div className="max-h-[260px] overflow-y-auto px-2 py-1.5">
+        {groups.map((g, i) =>
+          g.kind === 'flat' ? (
+            <ProcessRow key={`flat-${i}`} row={g.row} />
+          ) : (
+            <div key={`wrap-${i}`} className="my-1 first:mt-0">
+              <div className="px-1 pb-0.5 font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground/60">
+                {g.processName} — split by command line ({g.rows.length})
+              </div>
+              <div className="border-l border-border/60 pl-2">
+                {g.rows.map((r, j) => (
+                  <ProcessRow key={`wrap-${i}-${j}`} row={r} />
+                ))}
+              </div>
+            </div>
+          ),
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ProcessRow({ row }: { row: ArtifactProcessEntry }) {
+  return (
+    <div className="flex items-center gap-2 py-0.5">
+      <div className="min-w-0 flex-1">
+        <div className="truncate font-mono text-[11.5px] text-foreground">{row.process_name}</div>
+        {row.command_line && (
+          <div className="truncate font-mono text-[10px] text-muted-foreground/70" title={row.command_line}>
+            {row.command_line}
+          </div>
+        )}
+      </div>
+      <span className="shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground">
+        {row.count.toLocaleString()}
+      </span>
     </div>
   );
 }

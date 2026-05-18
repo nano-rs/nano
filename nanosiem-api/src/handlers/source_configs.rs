@@ -23,6 +23,7 @@ use axum::{
     Extension, Json,
 };
 use chrono::{DateTime, Utc};
+use nanosiem_core::log_telemetry::repository::is_safe_source_type;
 use nanosiem_core::audit::{
     AuditEvent, AuditSource, ClientContext, ROUTING_RULE_CREATED, ROUTING_RULE_DELETED,
     ROUTING_RULE_REORDERED, ROUTING_RULE_UPDATED, SOURCE_CONFIG_CREATED, SOURCE_CONFIG_DELETED,
@@ -136,10 +137,17 @@ pub async fn list_source_configs(
 /// Collect the deduped, lowercase `target_source_type`s referenced by a
 /// slice of routing rules. Used to scope the rollup IN-clause query to only
 /// the source_types this config actually consumes.
+///
+/// Unsafe values (anything outside `is_safe_source_type`'s allow-list — e.g.
+/// the legacy `${source_type}` sentinel) are filtered out here so they never
+/// reach the rollup sanitizer and fire its WARN. Write-time validation
+/// rejects new unsafe rows; this filter handles stragglers from old DB state.
 fn collect_target_source_types(rules: &[RoutingRule]) -> Vec<String> {
     let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
     for r in rules {
-        set.insert(r.target_source_type.to_lowercase());
+        if is_safe_source_type(&r.target_source_type) {
+            set.insert(r.target_source_type.to_lowercase());
+        }
     }
     set.into_iter().collect()
 }
@@ -153,7 +161,9 @@ fn collect_target_source_types_for_configs(
     let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
     for rules in rules_by_config.values() {
         for r in rules {
-            set.insert(r.target_source_type.to_lowercase());
+            if is_safe_source_type(&r.target_source_type) {
+                set.insert(r.target_source_type.to_lowercase());
+            }
         }
     }
     set.into_iter().collect()

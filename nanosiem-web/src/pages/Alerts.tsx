@@ -438,13 +438,56 @@ export function Alerts() {
         </div>
       </div>
 
-      {/* Stat tiles */}
+      {/* Stat tiles — click reveals the alerts behind each number by setting
+          status + expanding the time range to all-time. The counts come from
+          a lifetime-totals endpoint, so the default 24h window otherwise hides
+          everything the tile is advertising. */}
       {counts && (
         <div className="grid gap-2 md:grid-cols-4">
-          <StatTile label="Total" value={counts.total} icon={AlertTriangle} tint="text-muted-foreground" />
-          <StatTile label="New" value={counts.new} icon={AlertTriangle} tint="text-destructive" />
-          <StatTile label="Acknowledged" value={counts.acknowledged} icon={Clock} tint="text-accent-yellow" />
-          <StatTile label="Closed" value={counts.closed} icon={CircleCheck} tint="text-accent-green" />
+          <StatTile
+            label="Total"
+            value={counts.total}
+            icon={AlertTriangle}
+            tint="text-muted-foreground"
+            onClick={() => {
+              setStatusFilter('all');
+              setTimeRangeFilter('all');
+            }}
+            ariaLabel="Show all alerts (all time)"
+          />
+          <StatTile
+            label="New"
+            value={counts.new}
+            icon={AlertTriangle}
+            tint="text-destructive"
+            onClick={() => {
+              setStatusFilter('new');
+              setTimeRangeFilter('all');
+            }}
+            ariaLabel="Show new alerts (all time)"
+          />
+          <StatTile
+            label="Acknowledged"
+            value={counts.acknowledged}
+            icon={Clock}
+            tint="text-accent-yellow"
+            onClick={() => {
+              setStatusFilter('acknowledged');
+              setTimeRangeFilter('all');
+            }}
+            ariaLabel="Show acknowledged alerts (all time)"
+          />
+          <StatTile
+            label="Closed"
+            value={counts.closed}
+            icon={CircleCheck}
+            tint="text-accent-green"
+            onClick={() => {
+              setStatusFilter('closed');
+              setTimeRangeFilter('all');
+            }}
+            ariaLabel="Show closed alerts (all time)"
+          />
         </div>
       )}
 
@@ -839,14 +882,18 @@ function StatTile({
   value,
   icon: Icon,
   tint,
+  onClick,
+  ariaLabel,
 }: {
   label: string;
   value: string | number;
   icon: typeof AlertTriangle;
   tint: string;
+  onClick?: () => void;
+  ariaLabel?: string;
 }) {
-  return (
-    <div className="flex items-center justify-between rounded-md border border-border bg-card px-3 py-2.5">
+  const body = (
+    <>
       <div>
         <div className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-muted-foreground">
           {label}
@@ -856,6 +903,29 @@ function StatTile({
         </div>
       </div>
       <Icon className={cn('h-4 w-4', tint)} />
+    </>
+  );
+
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        onClick={onClick}
+        aria-label={ariaLabel}
+        className={cn(
+          'flex w-full items-center justify-between rounded-md border border-border bg-card px-3 py-2.5 text-left',
+          'transition-colors hover:border-foreground/25 hover:bg-[var(--card-2)]',
+          'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring',
+        )}
+      >
+        {body}
+      </button>
+    );
+  }
+
+  return (
+    <div className="flex items-center justify-between rounded-md border border-border bg-card px-3 py-2.5">
+      {body}
     </div>
   );
 }

@@ -16,7 +16,8 @@ use super::types::{
     SourceConfigDeployment, SourceConfiguration, SourceConfigurationWithRules, UpdateRoutingRule,
     UpdateSourceConfiguration,
 };
-use crate::parsers::{redact_config_snapshot, CredentialRepository};
+use crate::log_telemetry::repository::is_safe_source_type;
+use crate::parsers::{base_router_inputs, redact_config_snapshot, CredentialRepository};
 
 /// Reduce a Pub/Sub subscription value to its bare name. Vector's `gcp_pubsub`
 /// source builds `projects/<p>/subscriptions/<n>` itself, so a fully-qualified
@@ -593,6 +594,17 @@ impl SourceConfigService {
         match_value: Option<&str>,
         target_source_type: &str,
     ) -> Result<(), SourceConfigServiceError> {
+        // target_source_type is interpolated into VRL string literals AND used
+        // as the value compared against `.source_type` for routing — both at
+        // ClickHouse query time (rollup IN clauses, sanitized but warns) and
+        // at parser routing time. Restrict to the same allow-list the rollup
+        // sanitizer uses so we reject the same values everywhere.
+        if !is_safe_source_type(target_source_type) {
+            return Err(SourceConfigServiceError::InvalidConfig(format!(
+                "target_source_type {target_source_type:?} contains characters \
+                 outside [A-Za-z0-9_-] or is empty"
+            )));
+        }
         if let Some(c) = target_source_type
             .chars()
             .find(|c| Self::is_unsafe_scalar_char(*c))
@@ -759,31 +771,72 @@ impl SourceConfigService {
     // Deployment
     // ========================================================================
 
+    /// For config types whose ingest source is already running OOTB
+    /// (declared in `config/vector/*.toml`), returns the upstream Vector
+    /// transform name that the per-config routing transform should consume
+    /// from. `None` for config types that own their own ingest source.
+    ///
+    /// `http` / `vector` → `source_type_extract` (HTTP /ingest + Vector→Vector
+    /// share the source_type_extract pipeline tail).
+    /// `splunk_hec` → `hec_normalize` (`splunk_hec_ingest` on :8088 is OOTB
+    /// per NAN-836; redeclaring the source would claim the same port twice
+    /// and abort Vector reload).
+    fn system_intermediary_source(config_type: &str) -> Option<&'static str> {
+        match config_type {
+            "http" | "vector" => Some("source_type_extract"),
+            "splunk_hec" => Some("hec_normalize"),
+            _ => None,
+        }
+    }
+
+    /// Whether a system-level source config has rules worth emitting to disk.
+    ///
+    /// HTTP/Vector default rules are passthrough no-ops (the routing transform
+    /// emits `# passthrough — keep existing .source_type`), so a config with
+    /// only defaults adds nothing — we skip the file write entirely.
+    ///
+    /// HEC inverts this: hec_normalize already set `.source_type` from the
+    /// envelope's `sourcetype`, and the user's default rule's `target` is
+    /// meant to override that. Even a single default rule is meaningful.
+    fn has_meaningful_routing_rules(config: &SourceConfigurationWithRules) -> bool {
+        if config.config.config_type == "splunk_hec" {
+            !config.routing_rules.is_empty()
+        } else {
+            config
+                .routing_rules
+                .iter()
+                .any(|r| r.match_type != "default")
+        }
+    }
+
     /// Deploy a source configuration to Vector
     pub async fn deploy(&self, id: Uuid) -> Result<DeploymentResult, SourceConfigServiceError> {
         let config_with_rules = self.repository.get_with_rules(id).await?;
         let config = &config_with_rules.config;
 
-        // HTTP and Vector are system-level sources handled by base config files
-        // (00-base.toml for HTTP, 01-vector-source.toml for Vector)
-        // They don't need a Vector source block, but if they have routing rules
-        // that rewrite source_type, we still need to deploy a routing transform.
-        if config.config_type == "http" || config.config_type == "vector" {
-            // Check if routing rules need a source_type rewrite
-            let has_rewrite_rules = config_with_rules
-                .routing_rules
-                .iter()
-                .any(|r| r.match_type != "default");
+        // System-level sources (http, vector, splunk_hec) have their ingest
+        // source declared in `config/vector/*.toml` and always running. We
+        // don't generate a new source block — that would collide with the
+        // OOTB one — only a routing transform that consumes from the upstream
+        // intermediary (source_type_extract or hec_normalize).
+        if let Some(intermediary_source) = Self::system_intermediary_source(&config.config_type) {
+            let has_meaningful_rules = Self::has_meaningful_routing_rules(&config_with_rules);
 
-            let vector_config = if has_rewrite_rules {
+            // HTTP/Vector use passthrough-default semantics: default rules
+            // preserve the inbound .source_type. HEC inverts this — the
+            // default rule's target is authoritative, so we pass
+            // system_level=false to make `generate_routing_transform` emit it
+            // as an unconditional assignment.
+            let routing_default_passthrough = config.config_type != "splunk_hec";
+
+            let vector_config = if has_meaningful_rules {
                 let safe_name = Self::safe_name(&config.name);
                 let route_name = format!("{}_route", safe_name);
-                // For system-level sources, the routing transform reads from source_type_extract
                 let routing_block = Self::generate_routing_transform(
                     &config_with_rules,
-                    "source_type_extract",
+                    intermediary_source,
                     &route_name,
-                    true, // system-level: passthrough unmatched events
+                    routing_default_passthrough,
                 );
                 let config_content = format!(
                     "# Auto-generated routing rules for system-level source: {}\n\
@@ -850,7 +903,7 @@ impl SourceConfigService {
                 "Deployed {} source configuration '{}' (system-level{})",
                 config.config_type,
                 config.name,
-                if has_rewrite_rules {
+                if has_meaningful_rules {
                     ", with routing rules"
                 } else {
                     ""
@@ -865,7 +918,7 @@ impl SourceConfigService {
                     "Deployed '{}' successfully (system-level {} source{})",
                     config.name,
                     config.config_type,
-                    if has_rewrite_rules {
+                    if has_meaningful_rules {
                         " with routing rules"
                     } else {
                         ""
@@ -949,8 +1002,10 @@ impl SourceConfigService {
     pub async fn undeploy(&self, id: Uuid) -> Result<DeploymentResult, SourceConfigServiceError> {
         let config = self.repository.get(id).await?;
 
-        // HTTP and Vector are system-level — remove routing config file if it was deployed
-        if config.config_type == "http" || config.config_type == "vector" {
+        // System-level sources (http, vector, splunk_hec) — remove the
+        // routing config file if it was deployed; the OOTB source itself
+        // keeps running. See `system_intermediary_source` for rationale.
+        if Self::system_intermediary_source(&config.config_type).is_some() {
             let config_file = self.get_config_file_path(&config.name);
             if config_file.exists() {
                 tokio::fs::remove_file(&config_file).await?;
@@ -1137,17 +1192,18 @@ impl SourceConfigService {
             None
         };
 
+        // System-level sources have their ingest declared in `config/vector/*.toml`
+        // and don't need a per-config source block. See `system_intermediary_source`.
+        if Self::system_intermediary_source(&config.config.config_type).is_some() {
+            return Ok(String::new());
+        }
+
         let source_block = match config.config.config_type.as_str() {
-            // HTTP and Vector are system-level sources handled by base config
-            // (00-base.toml, 01-vector-source.toml). We don't generate a new
-            // source, just document routing rules.
-            "http" | "vector" => return Ok(String::new()),
             "kafka" => Self::generate_kafka_source(&source_name, conn, creds.as_ref()),
             "aws_s3" => Self::generate_aws_s3_source(&source_name, conn, creds.as_ref()),
             "gcp_pubsub" => {
                 Self::generate_gcp_pubsub_source(&source_name, conn, gcp_creds_path.as_deref())
             }
-            "splunk_hec" => Self::generate_splunk_hec_source(&source_name, conn),
             _ => {
                 return Err(SourceConfigServiceError::InvalidConfig(format!(
                     "Unknown config type: {}",
@@ -1289,29 +1345,6 @@ impl SourceConfigService {
         );
         if let Some(path) = credentials_path {
             source.insert("credentials_path".into(), path.into());
-        }
-
-        Self::wrap_source_table(source_name, source)
-    }
-
-    /// Build the `[sources.<name>]` block for a Splunk HEC source.
-    /// See `generate_kafka_source` for the structured-emission rationale (NAN-689).
-    fn generate_splunk_hec_source(source_name: &str, conn: &serde_json::Value) -> String {
-        let address = conn["address"].as_str().unwrap_or("0.0.0.0:8088");
-
-        let mut source = toml::Table::new();
-        source.insert("type".into(), "splunk_hec".into());
-        source.insert("address".into(), address.into());
-
-        // Add valid tokens
-        if let Some(tokens) = conn["valid_tokens"].as_array() {
-            let token_list: Vec<toml::Value> = tokens
-                .iter()
-                .filter_map(|v| v.as_str().map(|s| toml::Value::String(s.to_string())))
-                .collect();
-            if !token_list.is_empty() {
-                source.insert("valid_tokens".into(), toml::Value::Array(token_list));
-            }
         }
 
         Self::wrap_source_table(source_name, source)
@@ -1559,6 +1592,57 @@ impl SourceConfigService {
         out
     }
 
+    /// Build the ordered `inputs = [...]` list for the source_router transform.
+    ///
+    /// Pure function over deployed source configs; takes a closure for the
+    /// filesystem check so it stays testable without touching disk.
+    /// `is_system_route_deployed_on_disk` returns true when a system-level
+    /// (http/vector/splunk_hec) config has its routing TOML present — only
+    /// then does it contribute a route and suppress its corresponding
+    /// always-on channel from base inputs.
+    fn compute_router_inputs<F>(
+        deployed_configs: &[SourceConfiguration],
+        is_system_route_deployed_on_disk: F,
+    ) -> Vec<String>
+    where
+        F: Fn(&str) -> bool,
+    {
+        let mut source_type_extract_covered = false;
+        let mut hec_normalize_covered = false;
+        let mut source_config_routes: Vec<String> = Vec::new();
+
+        for config in deployed_configs {
+            // System-level configs only contribute a route to source_router
+            // inputs when their routing TOML actually exists on disk. Without
+            // this guard, a `mark_deployed` row whose file got skipped would
+            // reference a transform that doesn't exist and abort Vector reload.
+            if let Some(intermediary) = Self::system_intermediary_source(&config.config_type) {
+                if !is_system_route_deployed_on_disk(&config.name) {
+                    continue;
+                }
+                // The per-config route intermediates this always-on channel
+                // (consumes from it, feeds source_router). Suppress the
+                // channel from base inputs so events don't reach source_router
+                // twice — once via the direct base input, once via the route.
+                match intermediary {
+                    "source_type_extract" => source_type_extract_covered = true,
+                    "hec_normalize" => hec_normalize_covered = true,
+                    _ => {}
+                }
+            }
+            let safe_name = Self::safe_name(&config.name);
+            source_config_routes.push(format!("{}_route", safe_name));
+        }
+
+        let mut router_inputs: Vec<String> =
+            base_router_inputs(source_type_extract_covered, hec_normalize_covered)
+                .into_iter()
+                .map(String::from)
+                .collect();
+        router_inputs.extend(source_config_routes);
+        router_inputs
+    }
+
     /// Update the dynamic router to include all source configuration routes
     async fn update_dynamic_router(&self) -> Result<(), SourceConfigServiceError> {
         // Get all deployed source configs
@@ -1570,39 +1654,18 @@ impl SourceConfigService {
             }))
             .await?;
 
-        // Build the full inputs list: base sources + deployed source config routes.
-        // System-level sources (http, vector) consume from source_type_extract and act as
-        // intermediaries. When any exist, source_type_extract must NOT also be a direct input
-        // to source_router, or every event gets duplicated.
-        let mut has_system_level_route = false;
-        let mut source_config_routes = Vec::new();
+        let router_inputs = Self::compute_router_inputs(&deployed_configs, |name| {
+            self.get_config_file_path(name).exists()
+        });
 
-        for config in &deployed_configs {
-            // System-level sources (http, vector) only generate route transforms
-            // if they have a routing config file deployed (i.e., they have rewrite rules)
-            if config.config_type == "http" || config.config_type == "vector" {
-                let config_file = self.get_config_file_path(&config.name);
-                if !config_file.exists() {
-                    continue;
-                }
-                has_system_level_route = true;
-            }
-            let safe_name = Self::safe_name(&config.name);
-            source_config_routes.push(format!("\"{}_route\"", safe_name));
-        }
-
-        let mut router_inputs = if has_system_level_route {
-            // System-level routes already consume from source_type_extract
-            vec!["\"vector_merge\"".to_string()]
-        } else {
-            vec![
-                "\"source_type_extract\"".to_string(),
-                "\"vector_merge\"".to_string(),
-            ]
-        };
-        router_inputs.extend(source_config_routes);
-
-        let new_inputs_line = format!("inputs = [{}]", router_inputs.join(", "));
+        let new_inputs_line = format!(
+            "inputs = [{}]",
+            router_inputs
+                .iter()
+                .map(|s| format!("\"{}\"", s))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
 
         // Read the current dynamic router config (in parsers dir for S3/GCS sync)
         let router_path = self
@@ -2120,21 +2183,6 @@ mod tests {
         );
     }
 
-    /// Same defense for the Splunk HEC generator: a malicious `address`
-    /// value gets escaped, not interpreted as a new TOML table.
-    #[test]
-    fn splunk_hec_generator_neutralises_address_toml_injection() {
-        let payload = "0.0.0.0:8088\"\n[transforms.evil]\nsource = \"\"";
-        let conn = serde_json::json!({ "address": payload });
-        let out = SourceConfigService::generate_splunk_hec_source("test", &conn);
-        let parsed: toml::Value = toml::from_str(&out).expect("must parse");
-        assert!(!parsed_has_unexpected_top_level_tables(&parsed), "{out}");
-        assert_eq!(
-            parsed["sources"]["test"]["address"].as_str().unwrap(),
-            payload,
-        );
-    }
-
     /// AWS S3 generator: malicious region must not break out into new tables.
     #[test]
     fn aws_s3_generator_neutralises_region_toml_injection() {
@@ -2450,6 +2498,53 @@ mod tests {
     // these checks cover the cases it can't (control chars + regex `'`).
     // ------------------------------------------------------------------
 
+    /// NAN-858: target_source_type must conform to the same allow-list the
+    /// rollup IN-clause sanitizer uses. Reject the `${source_type}` sentinel
+    /// at write time so it never gets persisted (and the WARN it caused on
+    /// every `GET /api/source-configurations` stays gone).
+    #[test]
+    fn validate_routing_rule_values_rejects_passthrough_sentinel_target() {
+        let err = SourceConfigService::validate_routing_rule_values(
+            "default",
+            None,
+            "${source_type}",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("target_source_type"),
+            "expected target_source_type error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_routing_rule_values_rejects_empty_target() {
+        let err =
+            SourceConfigService::validate_routing_rule_values("default", None, "").unwrap_err();
+        assert!(err.to_string().contains("target_source_type"));
+    }
+
+    #[test]
+    fn validate_routing_rule_values_rejects_dot_in_target() {
+        let err = SourceConfigService::validate_routing_rule_values(
+            "exact",
+            Some("v"),
+            "some.dotted.value",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("target_source_type"));
+    }
+
+    /// Counterpart: typical valid values still pass.
+    #[test]
+    fn validate_routing_rule_values_accepts_safe_targets() {
+        for target in ["apache_access", "aws-cloudtrail", "Sysmon", "unknown", "x"] {
+            SourceConfigService::validate_routing_rule_values("default", None, target)
+                .unwrap_or_else(|e| {
+                    panic!("expected {target:?} to be accepted, got error: {e}")
+                });
+        }
+    }
+
     #[test]
     fn validate_routing_rule_values_rejects_newline_in_match_value() {
         let err = SourceConfigService::validate_routing_rule_values(
@@ -2501,12 +2596,16 @@ mod tests {
     }
 
     #[test]
-    fn validate_routing_rule_values_allows_quotes_and_backslashes() {
-        // vrl_escape handles these; reject would block legitimate values.
+    fn validate_routing_rule_values_allows_quotes_and_backslashes_in_match_value() {
+        // match_value gets vrl_escape'd before interpolation, so quotes and
+        // backslashes are legitimate (e.g. matching a command_line substring
+        // that contains them). target_source_type is *not* a free-form string
+        // though — NAN-858 restricts it to [A-Za-z0-9_-] so the rollup IN
+        // clause stays clean.
         SourceConfigService::validate_routing_rule_values(
             "exact",
             Some("a\"b\\c"),
-            "tgt\"x",
+            "safe_target",
         )
         .unwrap();
     }
@@ -2669,4 +2768,270 @@ mod tests {
     // and is unit-tested there. The wiring assertion that the source-config
     // deploy path actually invokes it is best validated end-to-end against a
     // real database (out of scope for this unit module).
+
+    fn bare_config(name: &str, config_type: &str) -> SourceConfiguration {
+        let now = Utc::now();
+        SourceConfiguration {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            description: None,
+            config_type: config_type.to_string(),
+            connection_config: serde_json::json!({}),
+            credential_id: None,
+            enabled: true,
+            deployed: true,
+            deployed_at: Some(now),
+            created_at: now,
+            updated_at: now,
+            events_24h: None,
+            bytes_per_day_24h: None,
+            last_event_at: None,
+        }
+    }
+
+    /// Guards against the NAN-852 regression: any source-config mutation
+    /// rebuilds the router inputs and `hec_normalize` must never be dropped.
+    #[test]
+    fn compute_router_inputs_always_contains_hec_normalize() {
+        let scenarios: Vec<Vec<SourceConfiguration>> = vec![
+            vec![],
+            vec![bare_config("kafka_audit", "kafka")],
+            vec![bare_config("http_main", "http")],
+            vec![bare_config("vec_relay", "vector"), bare_config("s3_logs", "s3")],
+        ];
+
+        for configs in scenarios {
+            let inputs = SourceConfigService::compute_router_inputs(&configs, |_| true);
+            assert!(
+                inputs.iter().any(|s| s == "hec_normalize"),
+                "hec_normalize missing from inputs for configs={:?}",
+                configs.iter().map(|c| &c.name).collect::<Vec<_>>()
+            );
+            assert!(
+                inputs.iter().any(|s| s == "vector_merge"),
+                "vector_merge missing from inputs for configs={:?}",
+                configs.iter().map(|c| &c.name).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn compute_router_inputs_appends_non_system_routes_after_base() {
+        let configs = vec![bare_config("kafka_audit", "kafka")];
+        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| false);
+        assert_eq!(
+            inputs,
+            vec!["source_type_extract", "vector_merge", "hec_normalize", "kafka_audit_route"]
+        );
+    }
+
+    #[test]
+    fn compute_router_inputs_drops_source_type_extract_when_system_route_on_disk() {
+        let configs = vec![bare_config("http_main", "http")];
+        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| true);
+        assert_eq!(inputs, vec!["vector_merge", "hec_normalize", "http_main_route"]);
+    }
+
+    #[test]
+    fn compute_router_inputs_skips_system_route_when_no_file_on_disk() {
+        let configs = vec![bare_config("http_main", "http")];
+        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| false);
+        assert_eq!(inputs, vec!["source_type_extract", "vector_merge", "hec_normalize"]);
+    }
+
+    #[test]
+    fn system_intermediary_source_maps_http_and_vector_to_source_type_extract() {
+        assert_eq!(
+            SourceConfigService::system_intermediary_source("http"),
+            Some("source_type_extract")
+        );
+        assert_eq!(
+            SourceConfigService::system_intermediary_source("vector"),
+            Some("source_type_extract")
+        );
+    }
+
+    /// Guards NAN-853: splunk_hec deploys must route via `hec_normalize`,
+    /// not declare a new `[sources.*]` on :8088 that collides with the OOTB
+    /// splunk_hec_ingest source.
+    #[test]
+    fn system_intermediary_source_maps_splunk_hec_to_hec_normalize() {
+        assert_eq!(
+            SourceConfigService::system_intermediary_source("splunk_hec"),
+            Some("hec_normalize")
+        );
+    }
+
+    #[test]
+    fn system_intermediary_source_is_none_for_owned_source_types() {
+        for ty in ["kafka", "aws_s3", "gcp_pubsub", "unknown"] {
+            assert_eq!(
+                SourceConfigService::system_intermediary_source(ty),
+                None,
+                "{ty} owns its source and must not be treated as system-level"
+            );
+        }
+    }
+
+    /// End-to-end shape of the generated routing TOML for a splunk_hec deploy:
+    /// transform-only, consumes from `hec_normalize`, no `[sources.*]` block.
+    #[test]
+    fn splunk_hec_routing_transform_consumes_hec_normalize_with_no_source_block() {
+        let intermediary = SourceConfigService::system_intermediary_source("splunk_hec")
+            .expect("splunk_hec must be system-level");
+        let cfg = make_config(
+            "splunk_hec",
+            vec![make_rule(
+                10,
+                "sourcetype",
+                "exact",
+                Some("access_combined"),
+                "apache_access",
+            )],
+        );
+
+        let routing = SourceConfigService::generate_routing_transform(
+            &cfg,
+            intermediary,
+            "splunk_hec_test_route",
+            true,
+        );
+
+        assert!(
+            !routing.contains("[sources."),
+            "routing transform must not declare a Vector source — would collide with OOTB \
+             splunk_hec_ingest on :8088. got:\n{routing}"
+        );
+        assert!(
+            routing.contains("inputs = [\"hec_normalize\"]"),
+            "routing transform must consume from hec_normalize, got:\n{routing}"
+        );
+        assert!(
+            routing.contains("[transforms.splunk_hec_test_route]"),
+            "routing transform name must be present, got:\n{routing}"
+        );
+    }
+
+    /// Guards NAN-856: a splunk_hec config with only a default rule
+    /// (the most common UI flow) must produce an unconditional
+    /// `.source_type = "<target>"` VRL, not a passthrough that ignores
+    /// the user's target.
+    #[test]
+    fn splunk_hec_default_only_rule_emits_unconditional_source_type_set() {
+        let cfg = make_config(
+            "splunk_hec",
+            vec![make_rule(1000, "source_type", "default", None, "apache_access")],
+        );
+
+        // Matches what deploy() passes for splunk_hec post-NAN-856:
+        // intermediary=hec_normalize, system_level=false (so default target is authoritative).
+        let routing = SourceConfigService::generate_routing_transform(
+            &cfg,
+            "hec_normalize",
+            "splunk_hec_test_route",
+            false,
+        );
+
+        assert!(
+            routing.contains(".source_type = \"apache_access\""),
+            "user's default target must be emitted as unconditional assignment, got:\n{routing}"
+        );
+        assert!(
+            !routing.contains("passthrough"),
+            "default rule must not coalesce to passthrough for HEC, got:\n{routing}"
+        );
+    }
+
+    /// Guards NAN-856 defense-in-depth: compute_router_inputs must skip
+    /// system-level configs (http/vector/splunk_hec) whose routing TOML is
+    /// not on disk, even if marked deployed in DB. Otherwise source_router
+    /// gets an input pointing at a non-existent transform and Vector aborts.
+    #[test]
+    fn compute_router_inputs_skips_splunk_hec_when_no_file_on_disk() {
+        let configs = vec![bare_config("hec_main", "splunk_hec")];
+        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| false);
+        assert!(
+            !inputs.iter().any(|s| s == "hec_main_route"),
+            "splunk_hec route must not be in inputs when no file on disk, got: {inputs:?}"
+        );
+        // hec_normalize must still be present unconditionally.
+        assert!(inputs.iter().any(|s| s == "hec_normalize"));
+    }
+
+    /// HEC with no rules at all: nothing to deploy. has_meaningful_rules
+    /// must return false so deploy() skips the file write — without that, the
+    /// generator would emit `.source_type = "unknown"` (the fallback when
+    /// system_level=false and no default rule), wiping out hec_normalize's
+    /// envelope-derived value for every HEC event.
+    #[test]
+    fn has_meaningful_routing_rules_false_for_splunk_hec_with_empty_rules() {
+        let cfg = make_config("splunk_hec", vec![]);
+        assert!(!SourceConfigService::has_meaningful_routing_rules(&cfg));
+    }
+
+    /// HEC with a single default rule: deploy() must write the file. Without
+    /// this, _router.toml references splunk_hec_route while the transform
+    /// itself doesn't exist on disk — Vector aborts reload. (NAN-856 root cause)
+    #[test]
+    fn has_meaningful_routing_rules_true_for_splunk_hec_with_default_only() {
+        let cfg = make_config(
+            "splunk_hec",
+            vec![make_rule(1000, "source_type", "default", None, "apache_access")],
+        );
+        assert!(SourceConfigService::has_meaningful_routing_rules(&cfg));
+    }
+
+    /// HTTP/Vector with a default-only rule: existing behavior must be
+    /// preserved — default rules are passthrough no-ops, so the file is
+    /// skipped. Guards against accidental regression of the
+    /// http/vector deploy semantics during NAN-856.
+    #[test]
+    fn has_meaningful_routing_rules_false_for_http_with_default_only() {
+        let cfg = make_config(
+            "http",
+            vec![make_rule(1000, "source_type", "default", None, "something")],
+        );
+        assert!(!SourceConfigService::has_meaningful_routing_rules(&cfg));
+    }
+
+    #[test]
+    fn has_meaningful_routing_rules_true_for_http_with_non_default_rule() {
+        let cfg = make_config(
+            "http",
+            vec![make_rule(10, "host", "exact", Some("web1"), "apache_access")],
+        );
+        assert!(SourceConfigService::has_meaningful_routing_rules(&cfg));
+    }
+
+    /// NAN-857: when a splunk_hec route IS on disk, `hec_normalize` must be
+    /// suppressed from base inputs — the route consumes hec_normalize and
+    /// feeds source_router, so keeping hec_normalize as a direct base input
+    /// would double-ingest every HEC event (once direct → source_type=unknown,
+    /// once via the route → user-configured source_type). And — separately —
+    /// splunk_hec must NOT suppress source_type_extract; HEC and HTTP are
+    /// independent channels.
+    #[test]
+    fn compute_router_inputs_suppresses_hec_normalize_when_splunk_hec_route_on_disk() {
+        let configs = vec![bare_config("hec_main", "splunk_hec")];
+        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| true);
+        assert_eq!(
+            inputs,
+            vec!["source_type_extract", "vector_merge", "hec_main_route"],
+            "hec_normalize must be intermediated by the splunk_hec route, not also direct"
+        );
+    }
+
+    /// Both intermediaries covered: only vector_merge + the two routes.
+    #[test]
+    fn compute_router_inputs_suppresses_both_intermediaries_when_both_routes_on_disk() {
+        let configs = vec![
+            bare_config("http_main", "http"),
+            bare_config("hec_main", "splunk_hec"),
+        ];
+        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| true);
+        assert_eq!(
+            inputs,
+            vec!["vector_merge", "http_main_route", "hec_main_route"]
+        );
+    }
 }

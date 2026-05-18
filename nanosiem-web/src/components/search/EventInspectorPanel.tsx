@@ -341,19 +341,21 @@ export function EventInspectorPanel({
 
   // Group fields by category for the Fields tab
   const fieldCategories = React.useMemo(() => {
-    // Category labels render in neutral muted grey by default; keep the field
-    // grouping logic (and tooltips) but drop the per-category coloring.
+    // Core (base UDM columns) stays neutral; everything else — derived /
+    // enriched / extended data — shares one subtle brand accent so a reader
+    // can tell at a glance which fields are "added on top" of the base event.
     const NEUTRAL = 'text-muted-foreground';
+    const ACCENT = 'text-primary/80';
     const categories: { label: string; color: string; tooltip: string; fields: [string, unknown][] }[] = [
       { label: 'Core', color: NEUTRAL, tooltip: 'Indexed UDM columns with bloom filters for fast search', fields: [] },
-      { label: 'Risk', color: NEUTRAL, tooltip: 'Risk scores and factors from detection rules', fields: [] },
-      { label: 'IOC', color: NEUTRAL, tooltip: 'Indicators of compromise from threat intelligence feeds', fields: [] },
-      { label: 'Identity', color: NEUTRAL, tooltip: 'Identity resolution fields (NAT detection, user mapping)', fields: [] },
-      { label: 'Prevalence', color: NEUTRAL, tooltip: 'Rarity metrics — how common this artifact is across your environment', fields: [] },
-      { label: 'Lookup', color: NEUTRAL, tooltip: 'Enrichments from lookup tables', fields: [] },
-      { label: 'Enrichment', color: NEUTRAL, tooltip: 'Auto-enriched fields (geo, ASN, reputation)', fields: [] },
-      { label: 'Metadata', color: NEUTRAL, tooltip: 'Parser metadata and processing info', fields: [] },
-      { label: 'Extended', color: NEUTRAL, tooltip: 'Additional fields from the ext JSON column', fields: [] },
+      { label: 'Risk', color: ACCENT, tooltip: 'Risk scores and factors from detection rules', fields: [] },
+      { label: 'IOC', color: ACCENT, tooltip: 'Indicators of compromise from threat intelligence feeds', fields: [] },
+      { label: 'Identity', color: ACCENT, tooltip: 'Identity resolution fields (NAT detection, user mapping)', fields: [] },
+      { label: 'Prevalence', color: ACCENT, tooltip: 'Rarity metrics — how common this artifact is across your environment', fields: [] },
+      { label: 'Lookup', color: ACCENT, tooltip: 'Enrichments from lookup tables', fields: [] },
+      { label: 'Enrichment', color: ACCENT, tooltip: 'Auto-enriched fields (geo, ASN, reputation)', fields: [] },
+      { label: 'Metadata', color: ACCENT, tooltip: 'Parser metadata and processing info', fields: [] },
+      { label: 'Extended', color: ACCENT, tooltip: 'Additional fields from the ext JSON column', fields: [] },
     ];
 
     for (const field of flattenedFields) {

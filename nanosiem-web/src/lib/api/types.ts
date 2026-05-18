@@ -3087,6 +3087,32 @@ export interface ArtifactExplorerItem {
   daily_counts: number[];
   /** Date of `daily_counts[0]` in YYYY-MM-DD format. */
   daily_start: string;
+  /** Inline-subtitle context (NAN-849). Optional — older API responses omit it. */
+  context?: ArtifactInlineContext;
+}
+
+/** Inline subtitle data populated on every prevalence list row (NAN-849).
+ *  Fields are tuned per artifact_type; renderers fall back gracefully when
+ *  any individual field is missing. */
+export interface ArtifactInlineContext {
+  /** Hash artifacts: top observed on-disk file name. */
+  top_file_name?: string;
+  /** Hash artifacts: top running image name. */
+  top_process_name?: string;
+  /** Hash artifacts: short command-line excerpt for the top process. */
+  top_command_line?: string;
+  /** Hash artifacts: true when top_process_name is a wrapper binary. */
+  top_process_is_wrapper?: boolean;
+  /** IP artifacts: country name. */
+  country?: string;
+  /** IP artifacts: ASN number string. */
+  asn?: string;
+  /** IP artifacts: AS organization. */
+  asn_org?: string;
+  /** Total distinct users associated with the artifact. */
+  user_count?: number;
+  /** Top source_type by event count. */
+  top_source_type?: string;
 }
 
 export interface ArtifactExplorerResponse {
@@ -3121,6 +3147,23 @@ export interface ArtifactProcessEntry {
   process_name: string;
   command_line: string;
   count: number;
+  /** NAN-849: true when process_name matches a known wrapper binary. */
+  is_wrapper?: boolean;
+}
+
+/** On-disk file name observed for a hash artifact (NAN-849). */
+export interface ArtifactFileNameEntry {
+  file_name: string;
+  count: number;
+}
+
+/** Threat-intel verdict from an enrichment source (NAN-849). */
+export interface ArtifactThreatIntelEntry {
+  source: string;
+  verdict: string;
+  score?: number;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  details?: any;
 }
 
 export interface ArtifactNetworkEntry {
@@ -3142,8 +3185,12 @@ export interface ArtifactDetailResponse {
   top_users: ArtifactUserEntry[];
   source_types: ArtifactSourceEntry[];
   processes?: ArtifactProcessEntry[];
+  /** NAN-849: top on-disk file names for hash artifacts. */
+  top_file_names?: ArtifactFileNameEntry[];
   network?: ArtifactNetworkEntry[];
   geo?: ArtifactGeoEntry[];
+  /** NAN-849: threat-intel verdicts from configured enrichment sources. */
+  threat_intel?: ArtifactThreatIntelEntry[];
 }
 
 export interface ArtifactExplorerQuery {
@@ -3994,6 +4041,8 @@ export interface NotebookChatRequest {
   message: string;
   thread_id?: string;
   time_range?: TimeRange;
+  /** NAN-859: explicit @mention user_ids picked from the case Thread composer's popover. */
+  mentioned_user_ids?: string[];
 }
 
 export interface NotebookChatSuggestion {

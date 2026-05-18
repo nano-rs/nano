@@ -9,7 +9,7 @@ use std::path::Path;
 
 use tokio::fs;
 
-use super::router::BUILTIN_TYPES;
+use super::router::{base_router_inputs, BUILTIN_TYPES};
 use super::VectorConfigError;
 use super::VectorConfigManager;
 use crate::parsers::types::Parser;
@@ -128,19 +128,13 @@ impl VectorConfigManager {
             .filter(|p| p.enabled && (p.source_type == "routed" || p.source_type == "vector"))
             .collect();
 
-        // Build inputs list: base sources + source configuration routes.
-        // Exclude source_type_extract when system-level routes exist (they act as intermediaries).
-        // hec_normalize is the Splunk HEC ingest channel and is always present.
-        let has_system_routes = self.has_system_level_source_config_routes().await;
-        let mut router_inputs = if has_system_routes {
-            vec!["vector_merge".to_string(), "hec_normalize".to_string()]
-        } else {
-            vec![
-                "source_type_extract".to_string(),
-                "vector_merge".to_string(),
-                "hec_normalize".to_string(),
-            ]
-        };
+        let (source_type_extract_covered, hec_normalize_covered) =
+            self.source_config_intermediary_coverage().await;
+        let mut router_inputs: Vec<String> =
+            base_router_inputs(source_type_extract_covered, hec_normalize_covered)
+                .into_iter()
+                .map(String::from)
+                .collect();
         let source_config_routes = self.get_source_config_routes().await;
         router_inputs.extend(source_config_routes);
         let inputs_formatted = router_inputs

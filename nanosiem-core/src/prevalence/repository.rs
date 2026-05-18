@@ -1099,7 +1099,7 @@ impl PrevalenceRepository {
         let prewhere_filter = format!("timestamp >= toDateTime('{}')", cutoff_str);
 
         // Run all detail queries concurrently
-        let (hosts_r, users_r, sources_r, processes_r, network_r, geo_r) = tokio::join!(
+        let (hosts_r, users_r, sources_r, processes_r, file_names_r, network_r, geo_r) = tokio::join!(
             // Top hosts
             async {
                 #[derive(Debug, Row, Deserialize)]
@@ -1168,7 +1168,10 @@ impl PrevalenceRepository {
                         .collect::<Vec<_>>()
                 })
             },
-            // Process context (hashes only)
+            // Process context (hashes only). The `is_wrapper` flag lets the
+            // UI collapse consecutive svchost/rundll32/powershell rows into
+            // a single group so a hash like svchost reads as "one host, many
+            // command lines" instead of 10 near-identical rows.
             async {
                 if !artifact_type.is_hash() {
                     return Ok(Vec::new());
@@ -1187,9 +1190,42 @@ impl PrevalenceRepository {
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
-                        .map(|r| ArtifactProcessEntry {
-                            process_name: r.process_name,
-                            command_line: r.command_line,
+                        .map(|r| {
+                            let is_wrapper = is_wrapper_process(&r.process_name);
+                            ArtifactProcessEntry {
+                                process_name: r.process_name,
+                                command_line: r.command_line,
+                                count: r.cnt,
+                                is_wrapper,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+            },
+            // Top on-disk file names (hashes only). Aggregated from the same
+            // events as `processes`, but pivoted on `file_name` instead of
+            // `process_name`. For svchost-style hashes, file_name is the
+            // truer identity (`tiledatamodelsvc.dll`) — the running image is
+            // always svchost.exe.
+            async {
+                if !artifact_type.is_hash() {
+                    return Ok(Vec::new());
+                }
+                #[derive(Debug, Row, Deserialize)]
+                struct R {
+                    file_name: String,
+                    cnt: u64,
+                }
+                let q = format!(
+                    "SELECT file_name, count() AS cnt \
+                     FROM {} PREWHERE {} WHERE {} AND file_name != '' \
+                     GROUP BY file_name ORDER BY cnt DESC LIMIT 5",
+                    logs_table, prewhere_filter, where_clause
+                );
+                self.client.query(&q).fetch_all::<R>().await.map(|rows| {
+                    rows.into_iter()
+                        .map(|r| ArtifactFileNameEntry {
+                            file_name: r.file_name,
                             count: r.cnt,
                         })
                         .collect::<Vec<_>>()
@@ -1260,9 +1296,241 @@ impl PrevalenceRepository {
             top_users: users_r.unwrap_or_default(),
             source_types: sources_r.unwrap_or_default(),
             processes: processes_r.unwrap_or_default(),
+            top_file_names: file_names_r.unwrap_or_default(),
             network: network_r.unwrap_or_default(),
             geo: geo_r.unwrap_or_default(),
+            // Populated at the service layer where the EnrichmentService
+            // handle is available — the repository only knows about CH.
+            threat_intel: Vec::new(),
         })
+    }
+
+    /// Bulk fetch inline-subtitle context for a batch of artifacts.
+    ///
+    /// Returns a `(value, ArtifactInlineContext)` map. For each artifact this
+    /// pulls in *one* row's worth of summary data — top file_name (hashes),
+    /// top process_name + command_line + is_wrapper (hashes), user_count,
+    /// top source_type. Geo/ASN for IPs comes from the PG enrichment table
+    /// and is layered on at the service level.
+    ///
+    /// Each call issues two CH queries that group by (artifact, …) so the
+    /// scan cost is one pass per call regardless of artifact count, bounded
+    /// by `prewhere_filter` (which is the same time window as the list).
+    ///
+    /// Per-bucket size is capped at `MAX_BULK_INLINE_CONTEXT` to keep the
+    /// inlined `IN (...)` list well under ClickHouse's 262 KB `max_query_size`
+    /// — see the constant for the rationale. Today the handler caps `limit`
+    /// at 200, so this is belt-and-suspenders for a future caller that
+    /// raises or skips that cap.
+    #[instrument(skip(self, hash_artifacts, ip_artifacts, domain_artifacts))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn bulk_artifact_inline_context(
+        &self,
+        hash_artifacts: &[String],
+        ip_artifacts: &[String],
+        domain_artifacts: &[String],
+        logs_table: &str,
+        time_window: TimeWindow,
+    ) -> std::collections::HashMap<String, ArtifactInlineContext> {
+        use std::collections::HashMap;
+        let mut out: HashMap<String, ArtifactInlineContext> = HashMap::new();
+
+        // Defensive cap on the inlined IN-list size. Each artifact value is
+        // ~70 bytes worst case (SHA-256 hex + quoting + comma); 1000 entries
+        // is ~70 KB, still well under CH's default `max_query_size = 262144`.
+        // Truncate-with-warn rather than panic so a future caller that
+        // accidentally passes more doesn't break the page.
+        fn cap<'a>(slice: &'a [String], bucket: &'static str) -> &'a [String] {
+            const MAX_BULK_INLINE_CONTEXT: usize = 1000;
+            if slice.len() > MAX_BULK_INLINE_CONTEXT {
+                tracing::warn!(
+                    bucket,
+                    requested = slice.len(),
+                    cap = MAX_BULK_INLINE_CONTEXT,
+                    "bulk_artifact_inline_context: truncating IN-list",
+                );
+                &slice[..MAX_BULK_INLINE_CONTEXT]
+            } else {
+                slice
+            }
+        }
+        let hash_artifacts = cap(hash_artifacts, "hash");
+        let ip_artifacts = cap(ip_artifacts, "ip");
+        let domain_artifacts = cap(domain_artifacts, "domain");
+
+        let cutoff = Self::get_cutoff_time(time_window);
+        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
+        let prewhere_filter = format!("timestamp >= toDateTime('{}')", cutoff_str);
+
+        // --- Hashes: top file_name, top process_name+command_line, user_count, top source_type ---
+        if !hash_artifacts.is_empty() {
+            let escaped: Vec<String> = hash_artifacts
+                .iter()
+                .map(|h| format!("'{}'", h.replace('\'', "''").to_lowercase()))
+                .collect();
+            let hash_list = escaped.join(",");
+
+            // Top file_name per hash (argMax on count). Single pass.
+            #[derive(Debug, Row, Deserialize)]
+            struct FRow {
+                hash: String,
+                top_file_name: String,
+                user_count: u64,
+                top_source_type: String,
+            }
+            let q_files = format!(
+                "SELECT lower(file_hash) AS hash, \
+                        argMax(file_name, file_name_cnt) AS top_file_name, \
+                        any(distinct_users) AS user_count, \
+                        argMax(source_type, src_cnt) AS top_source_type \
+                 FROM ( \
+                    SELECT lower(file_hash) AS hash_lc, file_name, count() AS file_name_cnt, \
+                           uniqExact(user) AS distinct_users, source_type, count() AS src_cnt \
+                    FROM {logs} \
+                    PREWHERE {pre} \
+                    WHERE lower(file_hash) IN ({hashes}) \
+                    GROUP BY hash_lc, file_name, source_type \
+                 ) \
+                 GROUP BY lower(file_hash)",
+                logs = logs_table,
+                pre = prewhere_filter,
+                hashes = hash_list,
+            );
+            if let Ok(rows) = self.client.query(&q_files).fetch_all::<FRow>().await {
+                for r in rows {
+                    let entry = out.entry(r.hash.clone()).or_default();
+                    if !r.top_file_name.is_empty() {
+                        entry.top_file_name = Some(r.top_file_name);
+                    }
+                    entry.user_count = Some(r.user_count);
+                    if !r.top_source_type.is_empty() {
+                        entry.top_source_type = Some(r.top_source_type);
+                    }
+                }
+            }
+
+            // Top (process_name, command_line) per hash. Separate query so the
+            // file_name aggregation above stays a single group-by per hash.
+            #[derive(Debug, Row, Deserialize)]
+            struct PRow {
+                hash: String,
+                top_process_name: String,
+                top_command_line: String,
+            }
+            let q_procs = format!(
+                "SELECT lower(file_hash) AS hash, \
+                        argMax(process_name, cnt) AS top_process_name, \
+                        argMax(command_line, cnt) AS top_command_line \
+                 FROM ( \
+                    SELECT lower(file_hash) AS hash_lc, process_name, command_line, count() AS cnt \
+                    FROM {logs} \
+                    PREWHERE {pre} \
+                    WHERE lower(file_hash) IN ({hashes}) AND process_name != '' \
+                    GROUP BY hash_lc, process_name, command_line \
+                 ) \
+                 GROUP BY lower(file_hash)",
+                logs = logs_table,
+                pre = prewhere_filter,
+                hashes = hash_list,
+            );
+            if let Ok(rows) = self.client.query(&q_procs).fetch_all::<PRow>().await {
+                for r in rows {
+                    let is_wrapper = is_wrapper_process(&r.top_process_name);
+                    let entry = out.entry(r.hash.clone()).or_default();
+                    if !r.top_process_name.is_empty() {
+                        entry.top_process_is_wrapper = is_wrapper;
+                        entry.top_process_name = Some(r.top_process_name);
+                    }
+                    if !r.top_command_line.is_empty() {
+                        entry.top_command_line = Some(r.top_command_line);
+                    }
+                }
+            }
+        }
+
+        // --- IPs: user_count + top source_type (geo/ASN comes from PG later) ---
+        if !ip_artifacts.is_empty() {
+            let escaped: Vec<String> = ip_artifacts
+                .iter()
+                .map(|v| format!("'{}'", v.replace('\'', "''")))
+                .collect();
+            let ip_list = escaped.join(",");
+
+            #[derive(Debug, Row, Deserialize)]
+            struct IRow {
+                ip: String,
+                user_count: u64,
+                top_source_type: String,
+            }
+            let q = format!(
+                "SELECT dest_ip AS ip, \
+                        uniqExact(user) AS user_count, \
+                        argMax(source_type, src_cnt) AS top_source_type \
+                 FROM ( \
+                    SELECT dest_ip, user, source_type, count() AS src_cnt \
+                    FROM {logs} \
+                    PREWHERE {pre} \
+                    WHERE dest_ip IN ({ips}) \
+                    GROUP BY dest_ip, user, source_type \
+                 ) \
+                 GROUP BY dest_ip",
+                logs = logs_table,
+                pre = prewhere_filter,
+                ips = ip_list,
+            );
+            if let Ok(rows) = self.client.query(&q).fetch_all::<IRow>().await {
+                for r in rows {
+                    let entry = out.entry(r.ip.clone()).or_default();
+                    entry.user_count = Some(r.user_count);
+                    if !r.top_source_type.is_empty() {
+                        entry.top_source_type = Some(r.top_source_type);
+                    }
+                }
+            }
+        }
+
+        // --- Domains: user_count + top source_type ---
+        if !domain_artifacts.is_empty() {
+            let escaped: Vec<String> = domain_artifacts
+                .iter()
+                .map(|v| format!("'{}'", v.replace('\'', "''")))
+                .collect();
+            let dom_list = escaped.join(",");
+
+            #[derive(Debug, Row, Deserialize)]
+            struct DRow {
+                domain: String,
+                user_count: u64,
+                top_source_type: String,
+            }
+            let q = format!(
+                "SELECT dest_host AS domain, \
+                        uniqExact(user) AS user_count, \
+                        argMax(source_type, src_cnt) AS top_source_type \
+                 FROM ( \
+                    SELECT dest_host, user, source_type, count() AS src_cnt \
+                    FROM {logs} \
+                    PREWHERE {pre} \
+                    WHERE dest_host IN ({doms}) \
+                    GROUP BY dest_host, user, source_type \
+                 ) \
+                 GROUP BY dest_host",
+                logs = logs_table,
+                pre = prewhere_filter,
+                doms = dom_list,
+            );
+            if let Ok(rows) = self.client.query(&q).fetch_all::<DRow>().await {
+                for r in rows {
+                    let entry = out.entry(r.domain.clone()).or_default();
+                    entry.user_count = Some(r.user_count);
+                    if !r.top_source_type.is_empty() {
+                        entry.top_source_type = Some(r.top_source_type);
+                    }
+                }
+            }
+        }
+
+        out
     }
 
     /// Calculate prevalence score (0-100, lower = rarer)

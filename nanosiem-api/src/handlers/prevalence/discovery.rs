@@ -224,6 +224,7 @@ pub async fn get_artifact_explorer(
     let search = params.search.as_deref();
     let limit = params.limit.unwrap_or(50).min(200);
     let offset = params.offset.unwrap_or(0).max(0);
+    let logs_table = dual_pool.table_names().read("logs");
 
     match prevalence_service
         .get_artifact_explorer(
@@ -236,10 +237,80 @@ pub async fn get_artifact_explorer(
         )
         .await
     {
-        Ok(response) => Ok(Json(response)),
+        Ok(mut response) => {
+            // NAN-849: enrich each row with inline-subtitle context so the
+            // list view is scannable without expanding every row. One CH
+            // pass per artifact-type bucket, bounded by `limit`.
+            prevalence_service
+                .enrich_explorer_items(&mut response.artifacts, &logs_table, time_window)
+                .await;
+
+            // IP-only: layer geo/ASN onto the inline context from the PG
+            // ipinfo_lite enrichment table. Falls back silently when the
+            // tenant hasn't synced an enrichment.
+            enrich_ips_with_geo(&state, &mut response.artifacts).await;
+
+            Ok(Json(response))
+        }
         Err(e) => {
             error!("Failed to get artifact explorer data: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
+    }
+}
+
+/// Layer PG-side IP enrichment (country, ASN, AS org) onto explorer items
+/// whose `artifact_type` is an IP. Best-effort: missing enrichment data
+/// simply leaves the fields `None` and the UI falls back gracefully.
+async fn enrich_ips_with_geo(
+    state: &AppState,
+    items: &mut [nanosiem_core::prevalence::ArtifactExplorerItem],
+) {
+    use nanosiem_core::prevalence::{ArtifactInlineContext, ArtifactType};
+
+    let mut ips: Vec<&str> = Vec::new();
+    for item in items.iter() {
+        if matches!(
+            item.artifact_type,
+            ArtifactType::IpAddress | ArtifactType::IpAddressPrivate
+        ) {
+            ips.push(item.artifact.as_str());
+        }
+    }
+    if ips.is_empty() {
+        return;
+    }
+
+    // EnrichmentService is held behind an RwLock; release the read guard as
+    // soon as we have the lookup map.
+    let enrichment = state.enrichment.read().await;
+    let map = match enrichment.lookup_ips_bulk(&ips).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!("IP enrichment lookup failed (best-effort): {}", e);
+            return;
+        }
+    };
+    drop(enrichment);
+
+    for item in items.iter_mut() {
+        if !matches!(
+            item.artifact_type,
+            ArtifactType::IpAddress | ArtifactType::IpAddressPrivate
+        ) {
+            continue;
+        }
+        if let Some(geo) = map.get(&item.artifact) {
+            let ctx = item.context.get_or_insert_with(ArtifactInlineContext::default);
+            if ctx.country.is_none() && geo.country.is_some() {
+                ctx.country.clone_from(&geo.country);
+            }
+            if ctx.asn.is_none() && geo.asn.is_some() {
+                ctx.asn.clone_from(&geo.asn);
+            }
+            if ctx.asn_org.is_none() && geo.as_name.is_some() {
+                ctx.asn_org.clone_from(&geo.as_name);
+            }
         }
     }
 }
@@ -289,10 +360,108 @@ pub async fn get_artifact_detail(
         .get_artifact_detail(&params.artifact, &artifact_type, &logs_table, time_window)
         .await
     {
-        Ok(response) => Ok(Json(response)),
+        Ok(mut response) => {
+            // NAN-849: layer in threat-intel (IOC) verdicts from configured
+            // enrichment sources. Best-effort — missing/empty when no feeds
+            // are configured or the artifact isn't present.
+            populate_threat_intel(&state, &mut response).await;
+
+            // For IPs, also surface PG-side geo/ASN inside the existing
+            // `geo` array so the expanded card has a clear country + ASN
+            // line even when no CH log row contained `enriched_*` columns.
+            if response.artifact_type.is_ip() {
+                populate_ip_geo_detail(&state, &mut response).await;
+            }
+
+            Ok(Json(response))
+        }
         Err(e) => {
             error!("Failed to get artifact detail: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
+    }
+}
+
+/// Look the artifact up in every configured IOC enrichment source and
+/// attach one verdict per source to `response.threat_intel`. Errors are
+/// logged at debug level — the rest of the response still renders.
+///
+/// Uses `lookup_ioc_all_sources` (drops the LIMIT-1 cap that the ingestion
+/// `lookup_ioc` uses) so ThreatFox + VirusTotal + AbuseIPDB hits on the
+/// same artifact each show up as their own row in the UI.
+async fn populate_threat_intel(
+    state: &AppState,
+    response: &mut nanosiem_core::prevalence::ArtifactDetailResponse,
+) {
+    use nanosiem_core::prevalence::ArtifactThreatIntelEntry;
+
+    let enrichment = state.enrichment.read().await;
+    let hits = match enrichment.lookup_ioc_all_sources(&response.artifact).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!("IOC lookup failed (best-effort): {}", e);
+            return;
+        }
+    };
+    drop(enrichment);
+
+    for hit in hits {
+        // Build a compact human-readable verdict line; the raw fields ride
+        // along in `details` so the UI can break them out per-source.
+        let verdict = match (&hit.threat_type, &hit.malware) {
+            (Some(t), Some(m)) => format!("{t} — {m}"),
+            (Some(t), None) => t.clone(),
+            (None, Some(m)) => m.clone(),
+            (None, None) => "Known indicator".to_string(),
+        };
+        let score = hit.confidence_level.map(|c| c as f32);
+        let details = serde_json::to_value(&hit).ok();
+        response.threat_intel.push(ArtifactThreatIntelEntry {
+            source: hit.source_id.unwrap_or_else(|| "enrichment".to_string()),
+            verdict,
+            score,
+            details,
+        });
+    }
+}
+
+/// Populate the `geo` array for an IP artifact from the PG enrichment
+/// table when no log row provided enriched_dest_country. Idempotent —
+/// existing CH-sourced rows take precedence.
+async fn populate_ip_geo_detail(
+    state: &AppState,
+    response: &mut nanosiem_core::prevalence::ArtifactDetailResponse,
+) {
+    use nanosiem_core::prevalence::ArtifactGeoEntry;
+
+    if !response.geo.is_empty() {
+        return;
+    }
+
+    let enrichment = state.enrichment.read().await;
+    let lookup = match enrichment.lookup_ip(&response.artifact).await {
+        Ok(opt) => opt,
+        Err(e) => {
+            tracing::debug!("IP geo lookup failed (best-effort): {}", e);
+            return;
+        }
+    };
+    drop(enrichment);
+
+    if let Some(geo) = lookup {
+        let country = geo.country.unwrap_or_default();
+        let asn = match (geo.asn, geo.as_name) {
+            (Some(a), Some(n)) if !a.is_empty() && !n.is_empty() => format!("{a} {n}"),
+            (Some(a), _) => a,
+            (_, Some(n)) => n,
+            _ => String::new(),
+        };
+        if !country.is_empty() || !asn.is_empty() {
+            response.geo.push(ArtifactGeoEntry {
+                country,
+                asn,
+                count: 0,
+            });
         }
     }
 }

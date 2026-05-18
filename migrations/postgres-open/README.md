@@ -59,8 +59,33 @@ docker exec nan749-snap-pg bash -c '
 docker exec nan749-snap-pg pg_dump -U test -d test \
   --schema-only --no-owner --no-acl > /tmp/nan749_full_schema.sql
 
+# 3b. NAN-851: dump seed data for whitelisted seed tables. Without this
+#     step every regen drops the INSERTs from migrations 1..175 and the
+#     fresh-deploy snapshot ships missing rows (providers, agents, GDPR
+#     salt, queues, permissions, etc.) — the exact drift NAN-850 patched
+#     after the fact. The whitelist mirrors `SEED_TABLES` in the splitter;
+#     update both together when seeding a new table.
+docker exec nan749-snap-pg pg_dump -U test -d test \
+  --data-only --column-inserts --no-owner --no-acl \
+  --table=permissions --table=role_permissions \
+  --table=roles --table=groups --table=group_roles \
+  --table=namespaces \
+  --table=marketplace_catalog --table=enrichment_marketplace_repos --table=enrichment_sources \
+  --table=provider_credentials \
+  --table=source_configurations --table=routing_rules \
+  --table=system_settings --table=prevalence_settings \
+  --table=signal_processor_watermarks --table=license_status \
+  --table=users \
+  --table=queues --table=queue_routing_rules \
+  --table=melod_settings --table=agent_model_config --table=case_grouping_rules \
+  --table=playbook_repositories \
+  > /tmp/nan749_seed_data.sql
+
 # 4. Run the splitter — produces /tmp/nan749_open_init.sql
-#    and /tmp/nan749_enterprise_init.sql
+#    and /tmp/nan749_enterprise_init.sql. Reads both /tmp/nan749_full_schema.sql
+#    (schema) and /tmp/nan749_seed_data.sql (data) and routes each block to
+#    the appropriate output by table classification. Seed INSERTs are
+#    rewritten with `ON CONFLICT DO NOTHING` for idempotency.
 python3 tools/nan749_split_open_overlay.py
 
 # 5. Schema parity gate (must show only cosmetic diffs)

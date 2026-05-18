@@ -13,6 +13,39 @@ use super::VectorConfigError;
 use super::VectorConfigManager;
 use crate::parsers::types::Parser;
 
+/// Base inputs for the `[transforms.source_router]` transform, before any
+/// per-source-config routes are appended.
+///
+/// Each `*_covered` flag indicates that a user-deployed source-config route
+/// intermediates the corresponding always-on channel (consumes from it and
+/// then feeds `source_router`). When covered, the channel is omitted here so
+/// events don't reach `source_router` twice — once via the intermediary and
+/// once via the direct base input.
+///
+/// - `source_type_extract_covered`: an http/vector routing config is deployed
+/// - `hec_normalize_covered`: a splunk_hec routing config is deployed
+///
+/// `vector_merge` has no per-config intermediary (the Vector-native protocol
+/// is always direct), so it stays unconditionally present.
+///
+/// Single source of truth for all writers of `_router.toml` (full rewrite,
+/// staging, and the surgical line-replacer in `source_configs::service`) so
+/// the list cannot drift between them.
+pub fn base_router_inputs(
+    source_type_extract_covered: bool,
+    hec_normalize_covered: bool,
+) -> Vec<&'static str> {
+    let mut inputs = Vec::with_capacity(3);
+    if !source_type_extract_covered {
+        inputs.push("source_type_extract");
+    }
+    inputs.push("vector_merge");
+    if !hec_normalize_covered {
+        inputs.push("hec_normalize");
+    }
+    inputs
+}
+
 /// Built-in source types that get placeholder routes when no parser is deployed.
 pub(super) const BUILTIN_TYPES: [&str; 12] = [
     "windows_event",
@@ -65,15 +98,19 @@ impl VectorConfigManager {
         routes
     }
 
-    /// Check if any deployed source config routes are system-level (consume from source_type_extract).
+    /// Detect which always-on intermediary channels are covered by a
+    /// deployed source-config routing transform. Returns
+    /// `(source_type_extract_covered, hec_normalize_covered)`.
     ///
-    /// System-level routes (http, vector) act as intermediaries between source_type_extract
-    /// and source_router. When they exist, source_type_extract must NOT also be a direct
-    /// input to source_router, or every event will be duplicated.
-    pub(super) async fn has_system_level_source_config_routes(&self) -> bool {
+    /// When a channel is covered, the per-config route consumes it and feeds
+    /// `source_router`, so the base router inputs must NOT also include the
+    /// channel directly — otherwise events arrive at `source_router` twice.
+    pub(super) async fn source_config_intermediary_coverage(&self) -> (bool, bool) {
         let configs_dir = self.source_configs_dir();
+        let mut source_type_extract = false;
+        let mut hec_normalize = false;
         if !configs_dir.exists() {
-            return false;
+            return (source_type_extract, hec_normalize);
         }
 
         if let Ok(mut entries) = fs::read_dir(&configs_dir).await {
@@ -81,16 +118,21 @@ impl VectorConfigManager {
                 let path = entry.path();
                 if path.extension().map(|e| e == "toml").unwrap_or(false) {
                     if let Ok(content) = fs::read_to_string(&path).await {
-                        // System-level routes consume directly from source_type_extract
                         if content.contains("inputs = [\"source_type_extract\"]") {
-                            return true;
+                            source_type_extract = true;
+                        }
+                        if content.contains("inputs = [\"hec_normalize\"]") {
+                            hec_normalize = true;
+                        }
+                        if source_type_extract && hec_normalize {
+                            return (true, true);
                         }
                     }
                 }
             }
         }
 
-        false
+        (source_type_extract, hec_normalize)
     }
 
     /// Write the dynamic router config based on deployed parsers
@@ -193,22 +235,13 @@ impl VectorConfigManager {
         // Rewrite the router section with all routes
         config.clear();
 
-        // Build inputs list: base sources + source configuration routes.
-        // If system-level routes exist (http/vector configs that consume from source_type_extract),
-        // exclude source_type_extract from direct inputs to avoid duplicate events — those routes
-        // act as intermediaries and already feed into source_router.
-        // hec_normalize is the Splunk HEC ingest channel and is always present
-        // alongside vector_merge in OOTB open-core deployments.
-        let has_system_routes = self.has_system_level_source_config_routes().await;
-        let mut router_inputs = if has_system_routes {
-            vec!["vector_merge".to_string(), "hec_normalize".to_string()]
-        } else {
-            vec![
-                "source_type_extract".to_string(),
-                "vector_merge".to_string(),
-                "hec_normalize".to_string(),
-            ]
-        };
+        let (source_type_extract_covered, hec_normalize_covered) =
+            self.source_config_intermediary_coverage().await;
+        let mut router_inputs: Vec<String> =
+            base_router_inputs(source_type_extract_covered, hec_normalize_covered)
+                .into_iter()
+                .map(String::from)
+                .collect();
         let source_config_routes = self.get_source_config_routes().await;
         router_inputs.extend(source_config_routes);
         let inputs_formatted = router_inputs
@@ -336,5 +369,56 @@ impl VectorConfigManager {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `vector_merge` has no per-config intermediary — always direct.
+    #[test]
+    fn base_router_inputs_always_includes_vector_merge() {
+        for src_covered in [true, false] {
+            for hec_covered in [true, false] {
+                assert!(
+                    base_router_inputs(src_covered, hec_covered).contains(&"vector_merge"),
+                    "vector_merge missing for ({src_covered}, {hec_covered})"
+                );
+            }
+        }
+    }
+
+    /// HEC OOTB invariant (NAN-836): when no splunk_hec route is deployed,
+    /// `hec_normalize` must feed `source_router` directly so HEC events on
+    /// :8088 reach the router.
+    #[test]
+    fn base_router_inputs_includes_hec_normalize_when_uncovered() {
+        assert!(base_router_inputs(false, false).contains(&"hec_normalize"));
+        assert!(base_router_inputs(true, false).contains(&"hec_normalize"));
+    }
+
+    /// NAN-857: when a splunk_hec route is deployed, `hec_normalize` must NOT
+    /// be in base inputs — the route already intermediates it. Otherwise
+    /// every HEC event reaches source_router twice (once direct, once via
+    /// the route) and lands in CH duplicated.
+    #[test]
+    fn base_router_inputs_excludes_hec_normalize_when_covered() {
+        assert!(!base_router_inputs(false, true).contains(&"hec_normalize"));
+        assert!(!base_router_inputs(true, true).contains(&"hec_normalize"));
+    }
+
+    /// Symmetric invariant for http/vector: when an http/vector route is
+    /// deployed, `source_type_extract` must be suppressed from base inputs.
+    #[test]
+    fn base_router_inputs_excludes_source_type_extract_when_covered() {
+        assert!(!base_router_inputs(true, false).contains(&"source_type_extract"));
+        assert!(!base_router_inputs(true, true).contains(&"source_type_extract"));
+    }
+
+    #[test]
+    fn base_router_inputs_includes_source_type_extract_when_uncovered() {
+        assert!(base_router_inputs(false, false).contains(&"source_type_extract"));
+        assert!(base_router_inputs(false, true).contains(&"source_type_extract"));
     }
 }

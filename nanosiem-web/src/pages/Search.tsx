@@ -3110,11 +3110,11 @@ export function Search() {
 
           {/* AI Thinking Panel - shows when AI is processing or has response */}
           {(aiLoading || aiResponse || aiError) && (
-            <div className={`-mx-5 -mb-4 mt-2 border-t ${aiError ? 'border-red-500/20 bg-red-500/5' : 'border-ai-border bg-ai-bg-subtle'}`}>
+            <div className={`mt-1 rounded-md border ${aiError ? 'border-red-500/20 bg-red-500/5' : 'border-ai-border/60 bg-ai-bg-subtle'}`}>
               {/* Collapsed header */}
               <button
                 onClick={() => setShowAiThinking(!showAiThinking)}
-                className={`w-full px-5 py-2.5 flex items-center justify-between text-xs ${aiError ? 'text-red-400 hover:bg-red-500/10' : 'text-ai hover:bg-ai-bg'} transition-colors`}
+                className={`w-full px-3 py-2 flex items-center justify-between text-xs ${aiError ? 'text-red-400 hover:bg-red-500/10' : 'text-ai hover:bg-ai-bg/60'} ${showAiThinking ? 'rounded-t-md' : 'rounded-md'} transition-colors`}
               >
                 <div className="flex items-center gap-2">
                   <PivtIcon className="w-3.5 h-3.5" />
@@ -3128,7 +3128,7 @@ export function Search() {
 
               {/* Expanded content */}
               {showAiThinking && (
-                <div className={`px-5 pb-4 ${aiError ? '' : ''}`}>
+                <div className={`px-3 pb-3 ${aiError ? '' : ''}`}>
                   {aiLoading ? (
                     <div className="space-y-2 pt-2">
                       <div className="text-xs text-foreground/70 space-y-1">
@@ -3239,59 +3239,49 @@ export function Search() {
                           )}
                         </div>
                       )}
+
+                      {/* Refinement input — final section of the panel, blends into the parent container */}
+                      <div className="border-t border-ai-border/40 pt-3 mt-1">
+                        <div className="flex items-center gap-2 mb-2">
+                          <MessageSquare className="w-3.5 h-3.5 text-ai" />
+                          <span className="text-xs font-medium text-ai">Refine your query</span>
+                          {aiConversationHistory.length > 1 && (
+                            <span className="text-[10px] text-muted-foreground ml-auto">
+                              {aiConversationHistory.length} turns
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2 p-2 bg-background/60 rounded-md border border-ai-border/40 focus-within:border-ai/70 focus-within:ring-1 focus-within:ring-ai/20 transition-all">
+                          <input
+                            type="text"
+                            value={refinementQuery}
+                            onChange={(e) => setRefinementQuery(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter' && refinementQuery.trim()) {
+                                handleAskMelod(refinementQuery, true);
+                              }
+                            }}
+                            placeholder="e.g., &quot;now show stats by hour&quot; or &quot;filter to just errors&quot;..."
+                            className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none"
+                          />
+                          <button
+                            onClick={() => refinementQuery.trim() && handleAskMelod(refinementQuery, true)}
+                            disabled={!refinementQuery.trim()}
+                            className={`px-3 py-1.5 text-xs rounded-md transition-all flex items-center gap-1.5 ${
+                              refinementQuery.trim()
+                                ? 'bg-ai text-ai-foreground hover:bg-ai/90 shadow-sm'
+                                : 'bg-muted text-muted-foreground cursor-not-allowed'
+                            }`}
+                          >
+                            <CornerDownLeft className="w-3 h-3" />
+                            Refine
+                          </button>
+                        </div>
+                      </div>
                     </div>
                   ) : null}
                 </div>
               )}
-            </div>
-          )}
-
-          {/* AI Refinement Input - distinct drop-out box below the thinking panel (only when expanded) */}
-          {aiResponse && showAiThinking && (
-            <div className="mt-3 -mx-5 -mb-4">
-              {/* Visual separator */}
-              <div className="h-px bg-gradient-to-r from-transparent via-ai-border to-transparent" />
-
-              {/* Refinement box with distinct styling */}
-              <div className="px-5 py-3 bg-ai-bg/50">
-                <div className="flex items-center gap-2 mb-2">
-                  <MessageSquare className="w-3.5 h-3.5 text-ai" />
-                  <span className="text-xs font-medium text-ai">Refine your query</span>
-                  {aiConversationHistory.length > 1 && (
-                    <span className="text-[10px] text-muted-foreground ml-auto">
-                      {aiConversationHistory.length} turns
-                    </span>
-                  )}
-                </div>
-
-                {/* Input with distinct styling */}
-                <div className="flex items-center gap-2 p-2.5 bg-background/80 rounded-lg border border-ai-border/50 focus-within:border-ai focus-within:ring-1 focus-within:ring-ai/20 transition-all">
-                  <input
-                    type="text"
-                    value={refinementQuery}
-                    onChange={(e) => setRefinementQuery(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && refinementQuery.trim()) {
-                        handleAskMelod(refinementQuery, true);
-                      }
-                    }}
-                    placeholder="e.g., &quot;now show stats by hour&quot; or &quot;filter to just errors&quot;..."
-                    className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none"
-                  />
-                  <button
-                    onClick={() => refinementQuery.trim() && handleAskMelod(refinementQuery, true)}
-                    disabled={!refinementQuery.trim()}
-                    className={`px-3 py-1.5 text-xs rounded-md transition-all flex items-center gap-1.5 ${
-                      refinementQuery.trim()
-                        ? 'bg-ai text-ai-foreground hover:bg-ai/90 shadow-sm'
-                        : 'bg-muted text-muted-foreground cursor-not-allowed'
-                    }`}
-                  >
-                    <CornerDownLeft className="w-3 h-3" />
-                    Refine
-                  </button>
-                </div>
-              </div>
             </div>
           )}
 
