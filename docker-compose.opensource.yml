@@ -200,9 +200,8 @@ services:
     ports:
       # HTTP ingestion (auto-detects format from Content-Type)
       - "8080:8080"
-      # Syslog
-      - "514:514/udp"
-      - "514:514/tcp"
+      # Vector → Vector native protocol (for on-prem aggregators / syslog relays)
+      - "6000:6000"
       # Splunk HEC
       - "8088:8088"
       # OpenTelemetry

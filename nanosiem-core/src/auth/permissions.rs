@@ -415,9 +415,21 @@ pub const DEMO_PERMISSIONS: &[&str] = &[
     RULE_REPOSITORIES_VIEW,
     // Parser repos — view only
     PARSER_REPOSITORIES_VIEW,
+    // Playbooks — full CRUD (scoped to session), matching Notebooks/Detections/Cases.
+    // NAN-841: prospects should be able to evaluate authoring + running playbooks.
+    PLAYBOOKS_VIEW,
+    PLAYBOOKS_MANAGE,
+    PLAYBOOKS_RUN,
+    PLAYBOOKS_PUBLISH,
+    PLAYBOOK_REPOSITORIES_VIEW,
     // Settings — AI provider read access (needed to detect meloD availability
     // for natural language search; write endpoints are blocked by managed mode)
     SETTINGS_AI,
+    // Settings — umbrella view for the /settings index. NAN-841: makes the
+    // Settings nav entry visible to demo users so they can see the surface
+    // exists; sub-page handlers stay blocked by demo_guard's BLOCKED_PREFIXES
+    // until NAN-842 ships the secret-masking audit + per-area read access.
+    SETTINGS_VIEW,
 ];
 
 /// Permission categories

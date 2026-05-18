@@ -352,8 +352,10 @@ impl EnrichmentService {
             .no_gzip()
             // SSRF: a public download URL that 302-redirects to 127.0.0.1 or
             // 169.254.169.254 would bypass our pre-fetch DNS check, since the
-            // check only inspects the saved URL. Match webhooks/service.rs
-            // and refuse to follow redirects at all.
+            // check only inspects the saved URL. We refuse reqwest-driven
+            // redirects entirely; `fetch_with_validated_redirects` follows
+            // 3xx responses manually so each hop re-runs the SSRF check and
+            // gets a freshly pinned client for the new host.
             .redirect(reqwest::redirect::Policy::none());
 
         // SSRF: pin to the validated SocketAddrs. Empty slice means the URL
@@ -369,6 +371,108 @@ impl EnrichmentService {
         })
     }
 
+    /// GET `initial_url`, manually following up to `MAX_REDIRECTS` 3xx hops
+    /// with full SSRF re-validation on every hop.
+    ///
+    /// reqwest's built-in redirect policy can't be used here: it would do a
+    /// fresh DNS lookup for the redirect target without our rebinding-safe
+    /// validation + `resolve_to_addrs` pin, re-introducing the bypass that
+    /// `validate_with_dns` closes. So each hop re-runs the validator and
+    /// builds a brand-new client pinned to the new host's resolved addrs.
+    ///
+    /// Background: IPinfo started returning 302s in May 2026 —
+    /// `ipinfo.io/data/ipinfo_lite.csv.gz?token=...` redirects to a
+    /// per-request signed URL on `dl.assets.ipinfo.io`.
+    async fn fetch_with_validated_redirects(
+        &self,
+        initial_url: &str,
+        config: &DownloadConfig,
+    ) -> Result<reqwest::Response, EnrichmentError> {
+        const MAX_REDIRECTS: usize = 5;
+        let mut current_url = initial_url.to_string();
+        let mut redirects_followed = 0usize;
+
+        loop {
+            let (parsed_url, pinned_addrs) =
+                validate_and_resolve_ipinfo_url(&current_url).await?;
+            let pin_host = parsed_url
+                .host_str()
+                .ok_or_else(|| EnrichmentError::DownloadError("URL missing host".to_string()))?
+                .to_string();
+
+            let client = Self::build_http_client(config, &pin_host, &pinned_addrs)?;
+
+            let response = client
+                .get(parsed_url.as_str())
+                .send()
+                .await
+                .map_err(|e| EnrichmentError::DownloadError(format!("Request failed: {}", e)))?;
+
+            let status = response.status();
+
+            if status.is_redirection() {
+                if redirects_followed >= MAX_REDIRECTS {
+                    return Err(EnrichmentError::DownloadError(format!(
+                        "Exceeded {} redirect hops while fetching enrichment data",
+                        MAX_REDIRECTS
+                    )));
+                }
+
+                let location_header = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .ok_or_else(|| {
+                        EnrichmentError::DownloadError(format!(
+                            "HTTP {} redirect missing Location header",
+                            status
+                        ))
+                    })?
+                    .to_str()
+                    .map_err(|e| {
+                        EnrichmentError::DownloadError(format!(
+                            "Location header not valid UTF-8: {}",
+                            e
+                        ))
+                    })?
+                    .to_string();
+
+                // `Url::join` handles both absolute and relative Location
+                // values per RFC 3986; the result is SSRF-validated at the
+                // top of the next iteration.
+                let next_url = parsed_url.join(&location_header).map_err(|e| {
+                    EnrichmentError::DownloadError(format!(
+                        "Could not resolve redirect target: {}",
+                        e
+                    ))
+                })?;
+
+                // Log hosts only — the original URL carries the IPinfo API
+                // token in the query string and the redirect target carries
+                // a signed `verify=` token. Hosts are enough for diagnostics.
+                info!(
+                    from_host = parsed_url.host_str().unwrap_or(""),
+                    to_host = next_url.host_str().unwrap_or(""),
+                    hop = redirects_followed + 1,
+                    "Following enrichment download redirect with SSRF re-validation"
+                );
+
+                current_url = next_url.to_string();
+                redirects_followed += 1;
+                continue;
+            }
+
+            if !status.is_success() {
+                return Err(EnrichmentError::DownloadError(format!(
+                    "HTTP {}: {}",
+                    status,
+                    status.canonical_reason().unwrap_or("Unknown")
+                )));
+            }
+
+            return Ok(response);
+        }
+    }
+
     /// Stream HTTP → gzip decode → CSV parse → batched DB insert
     ///
     /// Memory stays bounded: only one batch of records (~10k) is in memory at a time.
@@ -382,33 +486,11 @@ impl EnrichmentService {
     ) -> Result<u64, EnrichmentError> {
         const BATCH_SIZE: usize = 10_000;
 
-        // SSRF defense-in-depth: re-validate the URL with DNS resolution
-        // immediately before fetch *and* pin the validated SocketAddrs into
-        // the reqwest client. The configure-time check can be defeated by
-        // DNS rebinding between save and sync, by saved URLs that pre-date
-        // the DNS-aware validator, and (without pinning) by rebinding
-        // between our resolution and reqwest's connect-time resolution.
-        let (parsed_url, pinned_addrs) = validate_and_resolve_ipinfo_url(url).await?;
-        let pin_host = parsed_url
-            .host_str()
-            .ok_or_else(|| EnrichmentError::DownloadError("URL missing host".to_string()))?
-            .to_string();
-
-        let client = Self::build_http_client(config, &pin_host, &pinned_addrs)?;
-
-        let response = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| EnrichmentError::DownloadError(format!("Request failed: {}", e)))?;
-
-        if !response.status().is_success() {
-            return Err(EnrichmentError::DownloadError(format!(
-                "HTTP {}: {}",
-                response.status(),
-                response.status().canonical_reason().unwrap_or("Unknown")
-            )));
-        }
+        // SSRF defense-in-depth: every hop (initial + each redirect) is
+        // re-validated with DNS resolution and dialed against a freshly
+        // pinned client. See `fetch_with_validated_redirects` for the
+        // rebinding-bypass we're closing.
+        let response = self.fetch_with_validated_redirects(url, config).await?;
 
         let content_length = response.content_length();
         info!(content_length = ?content_length, "Response received, starting streaming pipeline");

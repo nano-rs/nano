@@ -73,7 +73,7 @@ export function ParserRepoPreview({
   const linkedLogSourceId = parser.raw.linked_log_source_id ?? preview?.existing_log_source_id ?? null;
 
   return (
-    <div className="h-full flex flex-col border-l border-border bg-card/30">
+    <div className="h-full min-h-0 flex flex-col border-l border-border bg-card/30">
       {/* Header */}
       <div className="px-4 pt-3 pb-0 shrink-0">
         <div className="flex items-start gap-2.5">
@@ -157,7 +157,7 @@ export function ParserRepoPreview({
       </div>
 
       {/* Content */}
-      <div className="flex-1 overflow-auto border-t border-border">
+      <div className="flex-1 min-h-0 overflow-auto border-t border-border">
         {tab === 'overview' && <OverviewPane parser={parser} onViewDiff={onViewDiff} />}
         {tab === 'vrl' && <VrlPane parser={parser} />}
         {tab === 'schema' && <SchemaPane parser={parser} />}

@@ -130,13 +130,15 @@ impl VectorConfigManager {
 
         // Build inputs list: base sources + source configuration routes.
         // Exclude source_type_extract when system-level routes exist (they act as intermediaries).
+        // hec_normalize is the Splunk HEC ingest channel and is always present.
         let has_system_routes = self.has_system_level_source_config_routes().await;
         let mut router_inputs = if has_system_routes {
-            vec!["vector_merge".to_string()]
+            vec!["vector_merge".to_string(), "hec_normalize".to_string()]
         } else {
             vec![
                 "source_type_extract".to_string(),
                 "vector_merge".to_string(),
+                "hec_normalize".to_string(),
             ]
         };
         let source_config_routes = self.get_source_config_routes().await;

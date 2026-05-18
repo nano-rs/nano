@@ -1248,11 +1248,19 @@ CREATE TABLE IF NOT EXISTS public.detection_rules (
     claimed_at timestamp with time zone,
     last_tuned_at timestamp with time zone,
     case_assigned_group uuid,
+    -- NAN-840: playbook_selector_mode + playbook_id added by migration 158;
+    -- previously omitted from snapshot, restored as part of drift repair.
+    -- No FK to playbooks(id) here — playbooks is enterprise-only; the
+    -- enterprise overlay adds the FK separately for enterprise tenants.
+    playbook_selector_mode text DEFAULT 'none'::text NOT NULL,
+    playbook_id uuid,
     CONSTRAINT check_alert_mode CHECK ((alert_mode = ANY (ARRAY['grouped'::text, 'per_event'::text]))),
     CONSTRAINT check_detection_mode CHECK ((detection_mode = ANY (ARRAY['real-time'::text, 'near-real-time'::text, 'scheduled'::text]))),
     CONSTRAINT detection_rules_auto_tuning_min_confidence_check CHECK (((auto_tuning_min_confidence >= (0.0)::double precision) AND (auto_tuning_min_confidence <= (1.0)::double precision))),
     CONSTRAINT detection_rules_case_visibility_check CHECK (((case_visibility)::text = ANY ((ARRAY['public'::character varying, 'group'::character varying, 'private'::character varying])::text[]))),
     CONSTRAINT detection_rules_mode_check CHECK ((mode = ANY (ARRAY['staging'::text, 'live'::text, 'alerting'::text, 'paused'::text]))),
+    CONSTRAINT detection_rules_playbook_selector_mode_check CHECK ((playbook_selector_mode = ANY (ARRAY['none'::text, 'specific'::text, 'adaptive'::text]))),
+    CONSTRAINT detection_rules_playbook_id_mode_check CHECK (((playbook_selector_mode = 'specific'::text AND playbook_id IS NOT NULL) OR (playbook_selector_mode = ANY (ARRAY['none'::text, 'adaptive'::text]) AND playbook_id IS NULL))),
     CONSTRAINT detection_rules_risk_score_check CHECK (((risk_score >= 0) AND (risk_score <= 100))),
     CONSTRAINT detection_rules_severity_check CHECK ((severity = ANY (ARRAY['critical'::text, 'high'::text, 'medium'::text, 'low'::text, 'informational'::text])))
 );
@@ -7685,6 +7693,10 @@ CREATE TABLE IF NOT EXISTS public.siem_health_reports (
     ingestion_score INTEGER NOT NULL,
     parsing_score INTEGER NOT NULL,
     detection_score INTEGER NOT NULL,
+    -- NAN-840: enrichment_score + alerting_score added by migration 166;
+    -- previously omitted from snapshot, restored as part of drift repair.
+    enrichment_score INTEGER,
+    alerting_score INTEGER,
     summary TEXT NOT NULL,
     metrics JSONB NOT NULL DEFAULT '{}',
     recommendations JSONB NOT NULL DEFAULT '[]',

@@ -124,17 +124,19 @@ impl VectorConfigManager {
         config.push_str("\n\n");
 
         // Generate the route section
-        // Accepts input from both HTTP pipeline (source_type_extract) and Vector native (vector_merge)
+        // Accepts input from HTTP pipeline (source_type_extract), Vector native
+        // (vector_merge), and Splunk HEC (hec_normalize). Note: this block is
+        // discarded and rebuilt below — kept consistent for diff readability.
         config.push_str(
             "# =============================================================================\n\
              # Dynamic Source Type Router\n\
              # =============================================================================\n\
              # Routes logs to deployed parsers based on source type.\n\
-             # Accepts input from HTTP pipeline and Vector native protocol.\n\
+             # Accepts input from HTTP pipeline, Vector native, and Splunk HEC.\n\
              # Unknown source types fall through to the generic parser.\n\n\
              [transforms.source_router]\n\
              type = \"route\"\n\
-             inputs = [\"source_type_extract\", \"vector_merge\"]\n\n\
+             inputs = [\"source_type_extract\", \"vector_merge\", \"hec_normalize\"]\n\n\
              [transforms.source_router.route]\n",
         );
 
@@ -195,13 +197,16 @@ impl VectorConfigManager {
         // If system-level routes exist (http/vector configs that consume from source_type_extract),
         // exclude source_type_extract from direct inputs to avoid duplicate events — those routes
         // act as intermediaries and already feed into source_router.
+        // hec_normalize is the Splunk HEC ingest channel and is always present
+        // alongside vector_merge in OOTB open-core deployments.
         let has_system_routes = self.has_system_level_source_config_routes().await;
         let mut router_inputs = if has_system_routes {
-            vec!["vector_merge".to_string()]
+            vec!["vector_merge".to_string(), "hec_normalize".to_string()]
         } else {
             vec![
                 "source_type_extract".to_string(),
                 "vector_merge".to_string(),
+                "hec_normalize".to_string(),
             ]
         };
         let source_config_routes = self.get_source_config_routes().await;

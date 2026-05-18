@@ -1,0 +1,79 @@
+# Splunk HEC Source
+# Accepts events on the Splunk HTTP Event Collector wire format so existing
+# Splunk forwarders / agents can be repointed at nano without rewriting their
+# config. Port 8088 is the standard HEC port.
+#
+# Auth: shares VECTOR_AUTH_TOKEN with the HTTP and Vector-native ingest paths.
+# (One token to rotate for ops simplicity in OOTB open-core deployments.)
+
+[sources.splunk_hec_ingest]
+type = "splunk_hec"
+address = "0.0.0.0:8088"
+valid_tokens = ["${VECTOR_AUTH_TOKEN}"]
+acknowledgements.enabled = true
+
+# =============================================================================
+# HEC Normalization
+# Splunk HEC events arrive with structure:
+#   { "event": <object|string>, "sourcetype": "...", "source": "...",
+#     "host": "...", "time": <epoch>, "index": "...", "fields": {...} }
+# We flatten this into the same shape the rest of the pipeline expects.
+# =============================================================================
+[transforms.hec_normalize]
+type = "remap"
+inputs = ["splunk_hec_ingest"]
+source = '''
+# valid_tokens on the source already enforced auth — mark and move on.
+.auth_status = "authenticated"
+
+# Pull Splunk's sourcetype into our canonical source_type field.
+source_type = "unknown"
+if exists(.sourcetype) {
+    st = to_string(.sourcetype) ?? ""
+    if st != "" {
+        source_type = downcase(st)
+    }
+}
+.source_type = source_type
+
+# Splunk's .event holds the actual log payload. Lift it into .message
+# (raw forms) or merge its keys (structured forms) so downstream parsers
+# see the same shape as HTTP-ingested events.
+if exists(.event) {
+    if is_object(.event) {
+        event_keys, key_err = keys(object!(.event))
+        if key_err == null {
+            for_each(event_keys) -> |_idx, key| {
+                if key != "message" {
+                    val, get_err = get(.event, [key])
+                    if get_err == null && val != null {
+                        . = set!(., [key], val)
+                    }
+                }
+            }
+        }
+        if exists(.event.message) && is_string(.event.message) {
+            .message = to_string!(.event.message)
+        } else {
+            .message = encode_json(.event)
+        }
+    } else if is_string(.event) {
+        .message = to_string!(.event)
+    } else {
+        .message = encode_json(.event)
+    }
+    del(.event)
+}
+
+if !exists(.message) {
+    .message = ""
+}
+
+.content_format = "splunk_hec"
+.routing_timestamp = now()
+
+if !is_object(.metadata) {
+    .metadata = {}
+}
+.metadata.forwarded_via = "splunk_hec"
+'''

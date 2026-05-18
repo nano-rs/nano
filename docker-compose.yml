@@ -310,8 +310,13 @@ services:
       - no-new-privileges:true
     environment:
       CLICKHOUSE_DB: nanosiem
-      # Users managed via users.d/default-user.xml (not env vars)
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+      # NAN-839: users.d/nanosiem-users.xml resolves these via from_env;
+      # missing them resolves the passwords to "" and breaks every migrator
+      # / healthcheck auth. Defaults match scripts/start-microservices-dev.sh
+      # and the healthcheck below.
+      CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD:-nanosiem_admin_secret}
+      CLICKHOUSE_NANOSIEM_PASSWORD: ${CLICKHOUSE_NANOSIEM_PASSWORD:-nanosiem}
     ports:
       # Native protocol (for clickhouse-rs client)
       - "9000:9000"

@@ -1027,8 +1027,9 @@ function MainAppShell({ children }: AppLayoutProps) {
           )}
 
           {/* Settings — single top-level link into the dedicated /settings shell (NAN-537).
-               Hidden for demo users; visible to anyone with at least one settings permission. */}
-          {!isDemoUser && filteredSettingsNavigation.length > 0 && (
+               NAN-841: now visible to demo users too (SETTINGS_VIEW is in DEMO_PERMISSIONS).
+               Sub-page handlers are still blocked by demo_guard until NAN-842 lands. */}
+          {filteredSettingsNavigation.length > 0 && (
             <div className="mt-2 border-t border-border/40 pt-3">
               <Link
                 to="/settings"
@@ -1368,8 +1369,8 @@ function MainAppShell({ children }: AppLayoutProps) {
               </div>
             )}
 
-            {/* Settings — single top-level link to /settings (NAN-537). */}
-            {!isDemoUser && filteredSettingsNavigation.length > 0 && (
+            {/* Settings — single top-level link to /settings (NAN-537). NAN-841: demo users see it too. */}
+            {filteredSettingsNavigation.length > 0 && (
               <div className="pt-2">
                 <Link
                   to="/settings"
