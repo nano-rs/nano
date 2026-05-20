@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useState } from 'react';
-import { X, Plus, Radio } from 'lucide-react';
+import { X, Plus, Radio, Zap } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
@@ -71,13 +71,7 @@ export function SourceConfigForm({
       );
 
     case 'splunk_hec':
-      return (
-        <SplunkHecConfigForm
-          config={config}
-          onChange={onConfigChange}
-          disabled={disabled}
-        />
-      );
+      return <SplunkHecConfigForm />;
 
     case 'vector':
       return (
@@ -399,88 +393,25 @@ function GcpPubSubConfigForm({ config, onChange, credentialId, onCredentialChang
   );
 }
 
-function SplunkHecConfigForm({ config, onChange, disabled }: FormProps) {
-  const [tokenInput, setTokenInput] = useState('');
-  const tokens = (config.valid_tokens as string[]) || [];
-
-  const addToken = () => {
-    const trimmed = tokenInput.trim();
-    if (trimmed && !tokens.includes(trimmed)) {
-      onChange({ ...config, valid_tokens: [...tokens, trimmed] });
-      setTokenInput('');
-    }
-  };
-
-  const removeToken = (token: string) => {
-    onChange({ ...config, valid_tokens: tokens.filter(t => t !== token) });
-  };
-
+// NAN-883 / NAN-855: HEC is served by the OOTB `splunk_hec_ingest` listener
+// (config/vector/02-hec-source.toml, :8088, shared `${VECTOR_AUTH_TOKEN}`).
+// A user HEC source config is a routing profile only — `address`,
+// `valid_tokens`, `permit_origin`, and `tls` no longer have any effect at
+// deploy time, so the form has nothing per-config to ask for.
+function SplunkHecConfigForm() {
   return (
-    <div className="space-y-3">
-      <div className="space-y-1.5">
-        <Label className={FIELD_LABEL}>Listen Address</Label>
-        <Input
-          value={(config.address as string) || ''}
-          onChange={(e) => onChange({ ...config, address: e.target.value })}
-          placeholder="0.0.0.0:8088"
-          disabled={disabled}
-          className={INPUT_MONO}
-        />
-        <p className={HELP_TEXT}>Standard Splunk HEC port is 8088</p>
-      </div>
-
-      <div className="space-y-1.5">
-        <Label className={FIELD_LABEL}>Valid HEC Tokens *</Label>
-        <div className="flex gap-2">
-          <Input
-            value={tokenInput}
-            onChange={(e) => setTokenInput(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && (e.preventDefault(), addToken())}
-            placeholder="Enter HEC token..."
-            type="password"
-            disabled={disabled}
-            className={`flex-1 ${INPUT_MONO}`}
-          />
-          <Button
-            type="button"
-            variant="outline"
-            size="icon"
-            onClick={addToken}
-            disabled={disabled}
-            className="h-8 w-8"
-          >
-            <Plus className="w-3.5 h-3.5" />
-          </Button>
-        </div>
-        <p className={HELP_TEXT}>At least one token required for authentication</p>
-        {tokens.length > 0 && (
-          <div className="flex flex-wrap gap-1.5 pt-1">
-            {tokens.map((token, i) => (
-              <div
-                key={i}
-                className="flex items-center gap-1 px-1.5 py-0.5 bg-muted rounded-[4px] text-[11px] font-mono"
-              >
-                {token.slice(0, 8)}...
-                <button type="button" onClick={() => removeToken(token)} disabled={disabled}>
-                  <X className="w-3 h-3 hover:text-red-400" />
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      <IpAllowlistInput
-        value={(config.permit_origin as string[]) || []}
-        onChange={(ips) => onChange({ ...config, permit_origin: ips.length > 0 ? ips : undefined })}
-        disabled={disabled}
-      />
-
-      <TlsConfigSection
-        value={config.tls as TlsSourceConfig | undefined}
-        onChange={(tls) => onChange({ ...config, tls })}
-        disabled={disabled}
-      />
+    <div className="p-4 bg-muted/30 rounded-md text-center text-muted-foreground">
+      <Zap className="w-8 h-8 mx-auto mb-2 opacity-50" />
+      <p className="text-[12px]">
+        Splunk HEC events arrive on the platform-managed listener.
+      </p>
+      <p className="text-[10.5px] mt-2 leading-relaxed">
+        No per-config connection settings. Events are accepted on{' '}
+        <code className="font-mono bg-muted px-1 rounded">:8088</code> with the shared{' '}
+        <code className="font-mono bg-muted px-1 rounded">VECTOR_AUTH_TOKEN</code> and routed
+        by the rules on this page based on the in-band{' '}
+        <code className="font-mono bg-muted px-1 rounded">sourcetype</code> field.
+      </p>
     </div>
   );
 }

@@ -140,7 +140,12 @@ const CANONICAL_MATCH_FIELD: Partial<Record<SourceConfigType, { field: string; h
 // today's UI exactly. Backend `is_pull_source` is the source of truth via
 // the /types endpoint, but we hardcode the same set here so we can render
 // before that query resolves.
-const PULL_SOURCE_TYPES: SourceConfigType[] = ['kafka', 'aws_s3', 'gcp_pubsub', 'splunk_hec'];
+//
+// NAN-883: HEC is push, not pull — events arrive on the shared OOTB
+// `splunk_hec_ingest` listener (:8088) with `sourcetype` in the JSON
+// envelope. A user `splunk_hec` source config is a routing profile, not a
+// new socket, so it shares HTTP's "one config, N rules" model.
+const PULL_SOURCE_TYPES: SourceConfigType[] = ['kafka', 'aws_s3', 'gcp_pubsub'];
 const isPullSource = (t: string): boolean =>
   PULL_SOURCE_TYPES.includes(t as SourceConfigType);
 
@@ -170,13 +175,15 @@ const BINDING_CALLOUT: Partial<
     multipleHint:
       'To split objects from one queue into multiple source types, switch to Multiple-source-types mode below (e.g. by bucket or key prefix).',
   },
-  splunk_hec: {
-    binding:
-      'This Splunk HEC source binds to a single listener endpoint. To accept HEC traffic on a different port or with different tokens, create a separate Source Configuration.',
-    multipleHint:
-      'To route different sourcetypes to different parsers, switch to Multiple-source-types mode below.',
-  },
 };
+
+// NAN-883: HEC ships with a single OOTB listener (`splunk_hec_ingest` on
+// :8088, shared `${VECTOR_AUTH_TOKEN}`). User HEC source configs are
+// routing profiles only — they emit a transform consuming `hec_normalize`,
+// not a new socket. Only one HEC routing config is expected per
+// deployment; backend rejects duplicates with 409.
+const HEC_BINDING_CALLOUT =
+  'Splunk HEC events arrive on the platform-managed listener (:8088, shared token). This config decides how each event is routed based on its sourcetype. Only one HEC routing config is supported per deployment.';
 
 const ROUTING_MODEL_DOCS_URL = 'https://nano.rs/docs/integrations/routing-model';
 
@@ -476,10 +483,16 @@ export default function SourceConfigurationDetail() {
   // ----- Handlers -----
 
   const handleSaveBasicInfo = () => {
+    // NAN-855: HEC connection_config is non-configurable per source — the
+    // OOTB `splunk_hec_ingest` listener is shared. Always normalise to `{}`
+    // so any legacy `address` / `valid_tokens` values in storage get cleared
+    // on the next save (backend rejects non-empty vestigial fields).
+    const normalizedConn =
+      config?.config_type === 'splunk_hec' ? {} : connectionConfig;
     updateMutation.mutate({
       name: name.trim() || undefined,
       description: description.trim() || undefined,
-      connection_config: connectionConfig,
+      connection_config: normalizedConn,
       credential_id: credentialId ?? undefined,
     });
     setEditConnectionOpen(false);
@@ -613,6 +626,13 @@ export default function SourceConfigurationDetail() {
             canEdit={canEdit}
             onModeChange={setPullMode}
           />
+        )}
+
+        {/* NAN-883: HEC is push (routing profile over shared OOTB listener),
+            not pull. Surface the binding model so users don't expect per-config
+            ports / tokens. */}
+        {config.config_type === 'splunk_hec' && (
+          <HecBindingCallout />
         )}
 
         {showSingleMode ? (
@@ -2205,6 +2225,22 @@ function PullSourceBindingHeader({
             onClick={() => onModeChange('multi')}
           />
         </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * NAN-883: push-side HEC explanatory bar. HEC is not a per-config socket —
+ * it consumes from the shared `splunk_hec_ingest` listener (:8088) with the
+ * platform `${VECTOR_AUTH_TOKEN}`. This rules table is just the routing
+ * profile for that shared stream.
+ */
+function HecBindingCallout() {
+  return (
+    <div className="shrink-0 border-b border-border bg-foreground/[0.02] px-4 py-2.5">
+      <div className="text-[11.5px] text-foreground/85 leading-relaxed max-w-[860px]">
+        {HEC_BINDING_CALLOUT}
       </div>
     </div>
   );

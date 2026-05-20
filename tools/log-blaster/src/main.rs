@@ -12,6 +12,8 @@
 //!   log-blaster --vector http://localhost:8080 --blast --eps 50000             # Blast mode
 //!   log-blaster --vector http://localhost:8080 --spike \
 //!     --spike-profile tools/log-blaster/profiles/spike_corporate.json          # Spike mode
+//!   log-blaster --hec --rate 30                                                # Splunk HEC (default :8088)
+//!   log-blaster --hec --vector http://hec.example:8088 --blast --eps 50000    # HEC at custom URL
 
 mod spike;
 
@@ -32,20 +34,30 @@ use event_core::generators::{
     ApacheGenerator, CloudTrailGenerator, LateralChainGenerator, ProxyGenerator, SysmonGenerator,
     WindowsEventGenerator,
 };
-use event_core::http::{send_batch_with_retry, send_event};
+use event_core::http::{send_batch_with_retry, send_event, Transport};
 use event_core::profiles;
 
 #[derive(Parser, Debug)]
 #[command(name = "log-blaster")]
 #[command(about = "Profile-driven SIEM log generator using real telemetry data")]
 struct Args {
-    /// Vector HTTP endpoint
+    /// Vector HTTP endpoint (or HEC base URL when `--hec` is set).
+    /// HEC default: `http://localhost:8088`. Path suffix is auto-appended:
+    /// `/ingest` (Vector dev mode) or `/services/collector/event` (HEC).
     #[arg(long, default_value = "http://localhost:8080")]
     vector: String,
 
-    /// Vector auth token (Bearer)
+    /// Auth token. Vector uses Bearer; HEC uses `Authorization: Splunk <token>`.
+    /// Falls back to `VECTOR_AUTH_TOKEN` env var, then a dev default.
     #[arg(long)]
     token: Option<String>,
+
+    /// Send events via Splunk HEC instead of Vector HTTP. Targets the OOTB
+    /// `splunk_hec_ingest` listener on :8088 with line-delimited JSON
+    /// envelopes and the Splunk auth scheme. Use to validate the HEC
+    /// routing-rule UI and the hec_normalize transform end-to-end.
+    #[arg(long)]
+    hec: bool,
 
     /// Events per minute (normal mode)
     #[arg(long, default_value = "30")]
@@ -114,25 +126,51 @@ async fn main() -> Result<()> {
         .init();
 
     let mut args = Args::parse();
-    // In dev mode, append `/ingest` to the Vector URL unless the user already
-    // supplied a path. Matches the python log generators' convention of
-    // `--vector http://localhost:8080` + implicit `/ingest`.
-    if args.dev {
-        let trimmed = args.vector.trim_end_matches('/').to_string();
-        if !trimmed.ends_with("/ingest") {
-            args.vector = format!("{}/ingest", trimmed);
-            info!("Dev mode: Vector URL resolved to {}", args.vector);
-        }
+
+    // HEC and Vector use different default ports / path suffixes. When
+    // `--hec` is set and `--vector` was left at its default, switch the
+    // base URL to the HEC standard `:8088`. Users who explicitly pass
+    // `--vector http://hec.example:8088` keep their override.
+    const VECTOR_DEFAULT: &str = "http://localhost:8080";
+    const HEC_DEFAULT_BASE: &str = "http://localhost:8088";
+    if args.hec && args.vector == VECTOR_DEFAULT {
+        args.vector = HEC_DEFAULT_BASE.to_string();
     }
+
+    // Resolve the wire-format-specific path suffix. Idempotent — bails if
+    // the user already passed a fully-qualified URL.
+    let trimmed = args.vector.trim_end_matches('/').to_string();
+    args.vector = if args.hec {
+        if trimmed.ends_with("/services/collector/event")
+            || trimmed.ends_with("/services/collector/raw")
+        {
+            trimmed
+        } else {
+            format!("{trimmed}/services/collector/event")
+        }
+    } else if args.dev && !trimmed.ends_with("/ingest") {
+        format!("{trimmed}/ingest")
+    } else {
+        trimmed
+    };
+    info!(
+        "Transport: {} → {}",
+        if args.hec { "HEC" } else { "Vector" },
+        args.vector
+    );
 
     // Auth token resolution (matches scripts/generate-*.py convention):
     //   --token flag  >  VECTOR_AUTH_TOKEN env  >  "nanosiem-default-token"
-    // Only applied when --vector is in use; prod deployments that front
-    // Vector with a different auth layer should pass --token explicitly.
+    // The token field is shared across both transports — the OOTB HEC
+    // listener also reads `VECTOR_AUTH_TOKEN` (one token to rotate).
     if args.token.is_none() {
         let resolved = std::env::var("VECTOR_AUTH_TOKEN")
             .unwrap_or_else(|_| "nanosiem-default-token".to_string());
-        info!("Using Vector auth token: ***{}", tail4(&resolved));
+        info!(
+            "Using {} auth token: ***{}",
+            if args.hec { "HEC" } else { "Vector" },
+            tail4(&resolved)
+        );
         args.token = Some(resolved);
     }
 
@@ -144,6 +182,21 @@ async fn main() -> Result<()> {
         p.file_hashes.len(),
         p.proxy_patterns.len()
     );
+
+    // Build the wire-format-specific transport once. Cheap-to-clone
+    // (`Clone`) so each spawned worker carries its own copy without
+    // sharing locks.
+    let transport = if args.hec {
+        // NAN-919: HEC requires the X-Splunk-Request-Channel header when
+        // the receiving source has ACK enabled (nano's OOTB config does).
+        // `new_hec` generates a fresh per-process UUID for it.
+        Transport::new_hec(args.vector.clone(), args.token.clone())
+    } else {
+        Transport::Vector {
+            url: args.vector.clone(),
+            token: args.token.clone(),
+        }
+    };
 
     info!("Initializing World State ({} assets)...", args.assets);
     let world = Arc::new(parking_lot::RwLock::new(WorldState::new(args.assets)));
@@ -171,23 +224,22 @@ async fn main() -> Result<()> {
     // aggregate always has something to render.
     let chain_handle = if args.chain_interval_secs > 0 {
         let chain_world = world.clone();
-        let url = args.vector.clone();
-        let token = args.token.clone();
+        let chain_transport = transport.clone();
         let interval_secs = args.chain_interval_secs;
         let max_hops = args.chain_max_hops;
         Some(tokio::spawn(async move {
-            run_chain_emitter(chain_world, url, token, interval_secs, max_hops).await;
+            run_chain_emitter(chain_world, chain_transport, interval_secs, max_hops).await;
         }))
     } else {
         None
     };
 
     let result = if args.spike {
-        run_spike_mode(args, world).await
+        run_spike_mode(args, transport, world).await
     } else if args.blast {
-        run_blast_mode(args, world).await
+        run_blast_mode(args, transport, world).await
     } else {
-        run_normal_mode(args, world).await
+        run_normal_mode(args, transport, world).await
     };
 
     if let Some(h) = chain_handle {
@@ -210,8 +262,7 @@ fn tail4(s: &str) -> String {
 /// the graph doesn't always center on the same host.
 async fn run_chain_emitter(
     world: Arc<parking_lot::RwLock<WorldState>>,
-    vector_url: String,
-    token: Option<String>,
+    transport: Transport,
     interval_secs: u64,
     max_hops: usize,
 ) {
@@ -262,7 +313,7 @@ async fn run_chain_emitter(
             .first()
             .map(|e| e.display_label.clone())
             .unwrap_or_default();
-        match send_batch_with_retry(&client, &vector_url, &batch, token.as_deref(), 3).await {
+        match send_batch_with_retry(&client, &transport, &batch, 3).await {
             Ok(()) => {
                 info!(
                     "[CHAIN] {} events across {} hops (seed: {})",
@@ -316,7 +367,11 @@ fn generate_event(
     cloudtrail_gen.generate(timestamp, entity, rng)
 }
 
-async fn run_normal_mode(args: Args, world: Arc<parking_lot::RwLock<WorldState>>) -> Result<()> {
+async fn run_normal_mode(
+    args: Args,
+    transport: Transport,
+    world: Arc<parking_lot::RwLock<WorldState>>,
+) -> Result<()> {
     let client = Client::builder()
         .pool_max_idle_per_host(4)
         .connect_timeout(TokioDuration::from_secs(10))
@@ -337,8 +392,10 @@ async fn run_normal_mode(args: Args, world: Arc<parking_lot::RwLock<WorldState>>
 
     let sleep_ms = (60_000.0 / args.rate as f64) as u64;
     info!(
-        "Starting simulation. Rate: ~{} events/min. Vector: {}",
-        args.rate, args.vector
+        "Starting simulation. Rate: ~{} events/min. {}: {}",
+        args.rate,
+        transport.kind(),
+        args.vector
     );
 
     let mut sim_time = Utc::now();
@@ -380,9 +437,7 @@ async fn run_normal_mode(args: Args, world: Arc<parking_lot::RwLock<WorldState>>
             let since_flush = last_flush.elapsed().as_millis() as u64;
             if since_flush >= batch_interval_ms || pending_batch.len() >= 500 {
                 let batch = std::mem::take(&mut pending_batch);
-                match send_batch_with_retry(&client, &args.vector, &batch, args.token.as_deref(), 3)
-                    .await
-                {
+                match send_batch_with_retry(&client, &transport, &batch, 3).await {
                     Ok(()) => {
                         consecutive_errors = 0;
                     }
@@ -404,7 +459,7 @@ async fn run_normal_mode(args: Args, world: Arc<parking_lot::RwLock<WorldState>>
                 last_flush = Instant::now();
             }
         } else {
-            match send_event(&client, &args.vector, &event, args.token.as_deref()).await {
+            match send_event(&client, &transport, &event).await {
                 Ok(()) => {
                     consecutive_errors = 0;
                 }
@@ -442,15 +497,7 @@ async fn run_normal_mode(args: Args, world: Arc<parking_lot::RwLock<WorldState>>
     }
 
     if !pending_batch.is_empty() {
-        if let Err(e) = send_batch_with_retry(
-            &client,
-            &args.vector,
-            &pending_batch,
-            args.token.as_deref(),
-            3,
-        )
-        .await
-        {
+        if let Err(e) = send_batch_with_retry(&client, &transport, &pending_batch, 3).await {
             warn!("Error flushing final batch: {}", e);
         }
     }
@@ -458,7 +505,11 @@ async fn run_normal_mode(args: Args, world: Arc<parking_lot::RwLock<WorldState>>
     Ok(())
 }
 
-async fn run_blast_mode(args: Args, world: Arc<parking_lot::RwLock<WorldState>>) -> Result<()> {
+async fn run_blast_mode(
+    args: Args,
+    transport: Transport,
+    world: Arc<parking_lot::RwLock<WorldState>>,
+) -> Result<()> {
     let eps_per_thread_raw = args.eps / args.threads as u32;
     let max_sleep_ms: u64 = 1000;
     let effective_batch_size = if eps_per_thread_raw > 0 {
@@ -480,8 +531,7 @@ async fn run_blast_mode(args: Args, world: Arc<parking_lot::RwLock<WorldState>>)
     let inflight_per_thread: usize = 4;
     let mut handles = Vec::new();
     for thread_id in 0..args.threads {
-        let url = args.vector.clone();
-        let token = args.token.clone();
+        let transport = transport.clone();
         let events_sent = events_sent.clone();
         let running = running.clone();
         let worker_world = world.clone();
@@ -535,11 +585,10 @@ async fn run_blast_mode(args: Args, world: Arc<parking_lot::RwLock<WorldState>>)
 
                 let batch_len = batch.len() as u64;
                 let client = client.clone();
-                let url = url.clone();
-                let token = token.clone();
+                let transport = transport.clone();
                 let events_sent = events_sent.clone();
                 tokio::spawn(async move {
-                    match send_batch_with_retry(&client, &url, &batch, token.as_deref(), 3).await {
+                    match send_batch_with_retry(&client, &transport, &batch, 3).await {
                         Ok(()) => {
                             events_sent.fetch_add(batch_len, Ordering::Relaxed);
                         }
@@ -615,7 +664,11 @@ async fn run_blast_mode(args: Args, world: Arc<parking_lot::RwLock<WorldState>>)
 /// Each worker recomputes its per-thread EPS from the shared target on every
 /// batch, so a ramp-up from 500 → 15000 EPS over 30s is reflected in worker
 /// sleep intervals within ~250ms of each tick.
-async fn run_spike_mode(args: Args, world: Arc<parking_lot::RwLock<WorldState>>) -> Result<()> {
+async fn run_spike_mode(
+    args: Args,
+    transport: Transport,
+    world: Arc<parking_lot::RwLock<WorldState>>,
+) -> Result<()> {
     // Clap's `requires = "spike_profile"` on the --spike flag guarantees this
     // is set before we reach this function.
     let profile_path = args
@@ -678,8 +731,7 @@ async fn run_spike_mode(args: Args, world: Arc<parking_lot::RwLock<WorldState>>)
     let batch_size_cap = args.batch_size.max(1);
     let mut handles = Vec::new();
     for thread_id in 0..args.threads {
-        let url = args.vector.clone();
-        let token = args.token.clone();
+        let transport = transport.clone();
         let events_sent = events_sent.clone();
         let running = running.clone();
         let worker_world = world.clone();
@@ -753,13 +805,10 @@ async fn run_spike_mode(args: Args, world: Arc<parking_lot::RwLock<WorldState>>)
 
                     let batch_len = batch.len() as u64;
                     let client = client.clone();
-                    let url = url.clone();
-                    let token = token.clone();
+                    let transport = transport.clone();
                     let events_sent = events_sent.clone();
                     tokio::spawn(async move {
-                        match send_batch_with_retry(&client, &url, &batch, token.as_deref(), 3)
-                            .await
-                        {
+                        match send_batch_with_retry(&client, &transport, &batch, 3).await {
                             Ok(()) => {
                                 events_sent.fetch_add(batch_len, Ordering::Relaxed);
                             }

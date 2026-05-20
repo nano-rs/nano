@@ -7,7 +7,6 @@ import {
   BreadcrumbItem,
   BreadcrumbLink,
   BreadcrumbList,
-  BreadcrumbPage,
   BreadcrumbSeparator,
 } from '@/components/ui/breadcrumb';
 import { useBreadcrumbContext } from '@/contexts/BreadcrumbContext';
@@ -179,34 +178,34 @@ export function useCurrentPageTitle(): string {
 export function AppBreadcrumbs() {
   const segments = useResolvedSegments();
 
-  // Don't render if no match or single segment (just "Home")
-  if (!segments || segments.length <= 1) return null;
+  // The TopBar already renders the current page as a chip via
+  // `useCurrentPageTitle()` (the last segment). Dropping it here keeps the
+  // trail to ancestors-only and avoids "Add Feed · Home / ... / Add Feed"
+  // (NAN-911 F-16/F-32). If only "Home" remains after the drop we still
+  // render — that single breadcrumb gives the user a one-click back to the
+  // landing surface from any leaf route.
+  const trail = segments?.slice(0, -1) ?? [];
+  if (trail.length === 0) return null;
 
   return (
     <>
       <span className="text-muted-foreground/40 select-none" aria-hidden="true">&middot;</span>
       <Breadcrumb>
         <BreadcrumbList>
-          {segments.map((segment, index) => {
-            const isLast = index === segments.length - 1;
-
-            return (
-              <span key={index} className="contents">
-                {index > 0 && <BreadcrumbSeparator>/</BreadcrumbSeparator>}
-                <BreadcrumbItem>
-                  {isLast ? (
-                    <BreadcrumbPage>{segment.label}</BreadcrumbPage>
-                  ) : segment.href ? (
-                    <BreadcrumbLink asChild>
-                      <Link to={segment.href}>{segment.label}</Link>
-                    </BreadcrumbLink>
-                  ) : (
-                    <span className="text-muted-foreground">{segment.label}</span>
-                  )}
-                </BreadcrumbItem>
-              </span>
-            );
-          })}
+          {trail.map((segment, index) => (
+            <span key={index} className="contents">
+              {index > 0 && <BreadcrumbSeparator>/</BreadcrumbSeparator>}
+              <BreadcrumbItem>
+                {segment.href ? (
+                  <BreadcrumbLink asChild>
+                    <Link to={segment.href}>{segment.label}</Link>
+                  </BreadcrumbLink>
+                ) : (
+                  <span className="text-muted-foreground">{segment.label}</span>
+                )}
+              </BreadcrumbItem>
+            </span>
+          ))}
         </BreadcrumbList>
       </Breadcrumb>
     </>

@@ -22,7 +22,7 @@ use tokio::time::Duration as TokioDuration;
 use tracing::info;
 
 use event_core::entity::WorldState;
-use event_core::http::send_batch_with_retry;
+use event_core::http::{send_batch_with_retry, Transport};
 use event_core::profiles;
 
 use scenarios::{exfil, lateral, persistence, quick, staggered, AttackScenario};
@@ -137,11 +137,17 @@ async fn main() -> Result<()> {
 
     info!("{} attack steps generated", steps.len());
 
-    // Execute steps with timing
+    // Execute steps with timing. Injector currently only targets Vector
+    // HTTP; if HEC injection is needed, add a `--hec` flag and build the
+    // matching Transport variant (mirrors log-blaster's NAN-909 wiring).
     let client = Client::builder()
         .connect_timeout(TokioDuration::from_secs(10))
         .timeout(TokioDuration::from_secs(30))
         .build()?;
+    let transport = Transport::Vector {
+        url: args.vector.clone(),
+        token: args.token.clone(),
+    };
 
     let start = std::time::Instant::now();
 
@@ -163,15 +169,7 @@ async fn main() -> Result<()> {
             );
         }
 
-        if let Err(e) = send_batch_with_retry(
-            &client,
-            &args.vector,
-            &step.events,
-            args.token.as_deref(),
-            3,
-        )
-        .await
-        {
+        if let Err(e) = send_batch_with_retry(&client, &transport, &step.events, 3).await {
             tracing::warn!("Failed to send step '{}': {}", step.description, e);
         }
     }

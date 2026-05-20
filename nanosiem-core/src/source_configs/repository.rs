@@ -23,6 +23,13 @@ pub enum SourceConfigRepositoryError {
     NotFound(String),
     #[error("Source configuration already exists: {0}")]
     AlreadyExists(String),
+    /// NAN-883: a DB-level uniqueness constraint other than the name index
+    /// fired (e.g. the partial unique index on `config_type` for
+    /// `splunk_hec`). Distinct from `AlreadyExists` so the API layer can
+    /// surface it as 409 with the constraint-specific message instead of
+    /// the generic "name already exists" copy.
+    #[error("Conflict: {0}")]
+    Conflict(String),
     #[error("Routing rule not found: {0}")]
     RuleNotFound(String),
     #[error("Invalid configuration: {0}")]
@@ -148,6 +155,33 @@ impl SourceConfigRepository {
         })
     }
 
+    /// NAN-883: surface the partial-unique-index violation on `splunk_hec`
+    /// as `Conflict` (→ HTTP 409) instead of a generic 500. The race
+    /// window for the application-level list-then-insert in
+    /// `SourceConfigService::create` is closed by migration 184's partial
+    /// unique index; this is the translation when the race lands at the
+    /// INSERT. Name-collision races fall through to `AlreadyExists` and
+    /// keep their existing 400 mapping.
+    fn map_create_insert_error(
+        err: sqlx::Error,
+        request: &NewSourceConfiguration,
+    ) -> SourceConfigRepositoryError {
+        if let sqlx::Error::Database(db_err) = &err {
+            // PG SQLSTATE 23505 = unique_violation.
+            if db_err.code().as_deref() == Some("23505") {
+                let constraint = db_err.constraint().unwrap_or("");
+                if constraint == "source_configurations_single_splunk_hec" {
+                    return SourceConfigRepositoryError::Conflict(format!(
+                        "Only one {} source configuration is supported per deployment.",
+                        request.config_type
+                    ));
+                }
+                return SourceConfigRepositoryError::AlreadyExists(request.name.clone());
+            }
+        }
+        SourceConfigRepositoryError::from(err)
+    }
+
     /// Create a new source configuration
     pub async fn create(
         &self,
@@ -178,7 +212,8 @@ impl SourceConfigRepository {
         .bind(&request.connection_config)
         .bind(&request.credential_id)
         .fetch_one(&self.pool)
-        .await?;
+        .await
+        .map_err(|e| Self::map_create_insert_error(e, &request))?;
 
         let config: SourceConfiguration = config.into();
 

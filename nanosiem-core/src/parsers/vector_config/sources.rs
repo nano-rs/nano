@@ -40,9 +40,24 @@ impl VectorConfigManager {
                 (config, source_name)
             }
             "splunk_hec" | "splunk" | "hec" => {
-                let source_name = format!("{}_source", safe_name);
-                let config = self.generate_splunk_hec_source(parser, &source_name);
-                (config, source_name)
+                // NAN-921: HEC events arrive on the OOTB splunk_hec_ingest
+                // source (`:8088`) declared in `config/vector/02-hec-source.toml`.
+                // Per-parser HEC source declarations collided on the port and
+                // blocked Vector reload. Instead, fan out from the user's
+                // `splunk_hec_route` (the source-config routing transform)
+                // through a per-parser filter on `.source_type`, so each
+                // parser only sees the events its `match_values` declares.
+                let filter_name = format!("{}_filter", safe_name);
+                let match_values: &[String] = parser
+                    .match_values
+                    .as_deref()
+                    .unwrap_or(&[]);
+                let config = self.generate_splunk_hec_filter(
+                    &filter_name,
+                    match_values,
+                    &parser.name,
+                );
+                (config, filter_name)
             }
             "vector" => {
                 // Vector-to-Vector source is handled at infrastructure level in 01-vector-source.toml
@@ -317,91 +332,123 @@ impl VectorConfigManager {
     ///
     /// Splunk's HTTP Event Collector (HEC) is a common log shipping protocol.
     /// Vector can act as a HEC endpoint to receive logs from any HEC-speaking forwarder.
+    /// NAN-921: generate a Vector `filter` transform that consumes from
+    /// `splunk_hec_route` (the OOTB HEC source's per-source-config routing
+    /// transform output) and passes only events whose `.source_type` is in
+    /// the parser's `match_values` list. Each HEC parser gets its own
+    /// filter so each event lands in exactly one parser pipeline.
     ///
-    /// Required config:
-    /// - address: Listen address (e.g., "0.0.0.0:8088")
-    /// - valid_tokens: Array of valid HEC tokens for authentication
-    ///
-    /// Optional config:
-    /// - permit_origin: IP allowlist in CIDR notation
-    /// - tls: TLS configuration for HTTPS
-    fn generate_splunk_hec_source(&self, parser: &Parser, source_name: &str) -> String {
-        let config = &parser.source_config;
-        let address = config["address"].as_str().unwrap_or("0.0.0.0:8088");
+    /// Pre-NAN-921 this code generated a `[sources.<parser>_source]
+    /// type = "splunk_hec" address = "0.0.0.0:8088"` block per parser,
+    /// which collided with the OOTB `splunk_hec_ingest` source and any
+    /// other imported HEC parser. Vector rejected the config with
+    /// `Resource tcp 0.0.0.0:8088 is claimed by multiple components` and
+    /// kept running on the last successful reload — meaning whichever
+    /// parser bound :8088 first received ALL HEC traffic regardless of
+    /// sourcetype.
+    fn generate_splunk_hec_filter(
+        &self,
+        filter_name: &str,
+        match_values: &[String],
+        parser_name: &str,
+    ) -> String {
+        let condition = build_hec_filter_condition(match_values, parser_name);
+        format!(
+            "[transforms.{}]\n\
+             type = \"filter\"\n\
+             inputs = [\"splunk_hec_route\"]\n\
+             condition = '{}'\n",
+            filter_name, condition,
+        )
+    }
+}
 
-        let mut source_config = format!(
-            "[sources.{}]\n\
-             type = \"splunk_hec\"\n\
-             address = \"{}\"\n",
-            source_name, address
+/// Build the VRL condition for a HEC parser's filter transform. Falls
+/// back to the parser's name when no `match_values` are declared (rare —
+/// imports post-NAN-920 always have at least the parser name in the list).
+/// Each match value is escaped for safe interpolation into a VRL string
+/// literal.
+fn build_hec_filter_condition(match_values: &[String], parser_name: &str) -> String {
+    let fallback: [String; 1];
+    let values: &[String] = if match_values.is_empty() {
+        fallback = [parser_name.to_string()];
+        &fallback
+    } else {
+        match_values
+    };
+    let list = values
+        .iter()
+        .map(|v| format!("\"{}\"", escape_vrl_string(v)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // `to_string(.source_type) ?? ""` coerces a missing/non-string field to
+    // an empty string so `includes` doesn't error and drop the event for
+    // the wrong reason.
+    format!(
+        "includes([{}], to_string(.source_type) ?? \"\")",
+        list
+    )
+}
+
+/// Escape backslashes, double-quotes, and newlines for safe interpolation
+/// into a VRL double-quoted string literal.
+fn escape_vrl_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod hec_filter_tests {
+    use super::*;
+
+    /// NAN-921: filter condition for an apache parser whose match_values
+    /// include the canonical name + legacy aliases. `includes` checks the
+    /// event's `.source_type` against the list. Defensive `to_string ??`
+    /// drops non-string source_types safely.
+    #[test]
+    fn build_filter_condition_lists_all_match_values() {
+        let condition = build_hec_filter_condition(
+            &["apache_http_server".to_string(), "apache".to_string(), "apache_access".to_string()],
+            "apache_http_server",
         );
+        assert_eq!(
+            condition,
+            r#"includes(["apache_http_server", "apache", "apache_access"], to_string(.source_type) ?? "")"#
+        );
+    }
 
-        // Add valid tokens (required for authentication)
-        if let Some(tokens) = config["valid_tokens"].as_array() {
-            if !tokens.is_empty() {
-                let token_list: Vec<String> = tokens
-                    .iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| format!("\"{}\"", s))
-                    .collect();
-                if !token_list.is_empty() {
-                    source_config
-                        .push_str(&format!("valid_tokens = [{}]\n", token_list.join(", ")));
-                }
-            }
-        }
+    /// Empty match_values list falls back to parser name — guards against
+    /// edge case where a YAML has no match_values and the import flow
+    /// didn't union (shouldn't happen post-NAN-920, defensive nonetheless).
+    #[test]
+    fn build_filter_condition_falls_back_to_parser_name_when_match_values_empty() {
+        let condition = build_hec_filter_condition(&[], "some_parser");
+        assert_eq!(
+            condition,
+            r#"includes(["some_parser"], to_string(.source_type) ?? "")"#
+        );
+    }
 
-        // Add IP allowlist if configured
-        if let Some(permit_origin) = config["permit_origin"].as_array() {
-            if !permit_origin.is_empty() {
-                let origins: Vec<String> = permit_origin
-                    .iter()
-                    .filter_map(|v| v.as_str())
-                    .map(|s| format!("\"{}\"", s))
-                    .collect();
-                if !origins.is_empty() {
-                    source_config.push_str(&format!("permit_origin = [{}]\n", origins.join(", ")));
-                }
-            }
-        }
-
-        // Add TLS configuration if enabled
-        // Cert files are written by write_credential_files() and referenced by managed path
-        if let Some(tls) = config.get("tls") {
-            let tls_enabled = tls["enabled"].as_bool().unwrap_or(false);
-            if tls_enabled {
-                source_config.push_str(&format!("\n[sources.{}.tls]\n", source_name));
-                source_config.push_str("enabled = true\n");
-
-                // Credential files written to parsers_dir for S3/GCS sync
-                let safe = Self::safe_name(&parser.name);
-                // Server certificate (required for TLS)
-                if let Some(crt_content) = tls["crt_content"].as_str() {
-                    if !crt_content.is_empty() {
-                        let crt_path =
-                            self.parser_creds_runtime(&format!("splunk_hec_{}_crt.pem", safe));
-                        source_config.push_str(&format!("crt_file = \"{}\"\n", crt_path));
-                    }
-                }
-                // Private key (required for TLS)
-                if let Some(key_content) = tls["key_content"].as_str() {
-                    if !key_content.is_empty() {
-                        let key_path =
-                            self.parser_creds_runtime(&format!("splunk_hec_{}_key.pem", safe));
-                        source_config.push_str(&format!("key_file = \"{}\"\n", key_path));
-                    }
-                }
-                // CA certificate (optional, for client verification)
-                if let Some(ca_content) = tls["ca_content"].as_str() {
-                    if !ca_content.is_empty() {
-                        let ca_path =
-                            self.parser_creds_runtime(&format!("splunk_hec_{}_ca.pem", safe));
-                        source_config.push_str(&format!("ca_file = \"{}\"\n", ca_path));
-                    }
-                }
-            }
-        }
-
-        source_config
+    /// Escape backslashes, double quotes, and embedded newlines so a
+    /// malicious or malformed YAML can't break out of the VRL string
+    /// literal. Defense-in-depth alongside upstream validation.
+    #[test]
+    fn build_filter_condition_escapes_dangerous_chars() {
+        let condition = build_hec_filter_condition(
+            &[r#"weird"\value"#.to_string(), "with\nnewline".to_string()],
+            "p",
+        );
+        assert!(condition.contains(r#""weird\"\\value""#), "got: {condition}");
+        assert!(condition.contains(r#""with\nnewline""#), "got: {condition}");
+        assert!(!condition.contains('\n'), "literal newline leaked: {condition}");
     }
 }

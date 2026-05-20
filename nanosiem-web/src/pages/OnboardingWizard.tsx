@@ -13,7 +13,7 @@
  */
 
 import { useMemo, useCallback } from 'react';
-import { useNavigate, Navigate, Link } from 'react-router-dom';
+import { useNavigate, Navigate } from 'react-router-dom';
 import {
   Cloud,
   Building2,
@@ -31,6 +31,7 @@ import {
   Lock,
   Sparkles,
   ArrowUpRight,
+  RotateCcw,
 } from 'lucide-react';
 import {
   useOnboardingProgress,
@@ -38,6 +39,7 @@ import {
   useCompleteOnboardingStep,
   useSkipOnboardingStep,
   useDismissOnboarding,
+  useResetOnboarding,
   useSystemConfig,
 } from '@/hooks/use-api';
 import { useTierContext } from '@/hooks/use-tier';
@@ -52,6 +54,9 @@ interface SetupStep {
   icon: typeof Cloud;
   description: string;
   href: string;
+  /** Destination when the step is already done — falls back to `href`. Used so
+   *  "Review" navigates to a list/detail page rather than the create-wizard. */
+  doneHref?: string;
   statusKey: keyof OnboardingStatus;
   doneLabel: string;
   todoLabel: string;
@@ -67,18 +72,18 @@ const STEPS: SetupStep[] = [
     description: 'Configure an LLM provider to power AI-assisted parsing, detection, and investigations.',
     href: '/settings/ai?tab=providers',
     statusKey: 'has_ai_provider',
-    doneLabel: 'Provider configured',
+    doneLabel: 'Providers configured',
     todoLabel: 'Not configured',
     capability: 'melod',
   },
   {
     key: 'org_context',
-    label: 'Organization Context',
+    label: 'AI Guidance',
     icon: Building2,
     description: 'Tell the AI about your org so it can give more relevant guidance and detection tuning.',
     href: '/settings/ai?tab=guidance',
     statusKey: 'has_org_context',
-    doneLabel: 'Context set',
+    doneLabel: 'Guidance set',
     todoLabel: 'Not configured',
     capability: 'melod',
   },
@@ -109,6 +114,7 @@ const STEPS: SetupStep[] = [
     icon: Activity,
     description: 'Connect your first log source to start ingesting data into nano.',
     href: '/ingestion/log-sources/wizard',
+    doneHref: '/ingestion/log-sources',
     statusKey: 'has_log_sources',
     doneLabel: 'Feed connected',
     todoLabel: 'No feeds yet',
@@ -119,6 +125,7 @@ const STEPS: SetupStep[] = [
     icon: Code,
     description: 'Create a parser to normalize raw logs into the Unified Data Model for searching and detection.',
     href: '/ingestion/log-sources/wizard',
+    doneHref: '/ingestion/log-sources/repositories',
     statusKey: 'has_parsers',
     doneLabel: 'Parser created',
     todoLabel: 'No parsers yet',
@@ -170,6 +177,7 @@ export function OnboardingWizard() {
   const { mutate: completeStep } = useCompleteOnboardingStep();
   const { mutate: skipStep } = useSkipOnboardingStep();
   const { mutate: dismissOnboarding } = useDismissOnboarding();
+  const { mutate: resetOnboarding } = useResetOnboarding();
   const completedSteps = useMemo(() => progress?.completed_steps || [], [progress]);
   const skippedSteps = useMemo(() => progress?.skipped_steps || [], [progress]);
 
@@ -213,6 +221,15 @@ export function OnboardingWizard() {
     }
   }, [dismissOnboarding, navigate]);
 
+  const handleReenable = useCallback(async () => {
+    try {
+      await resetOnboarding();
+      await refetchProgress();
+    } catch (err) {
+      console.error('Failed to re-enable:', err);
+    }
+  }, [resetOnboarding, refetchProgress]);
+
   const handleFinish = useCallback(async () => {
     try {
       const pending = steps.filter((s) => {
@@ -235,16 +252,39 @@ export function OnboardingWizard() {
     );
   }
 
-  // Once onboarding is dismissed or fully completed, redirect away —
-  // the Getting Started page should no longer exist for this user.
-  if (progress?.dismissed || progress?.completed_at) {
+  // After full completion the page is no longer useful — redirect home.
+  // Dismissed-but-not-completed users still land here, but on a re-enable
+  // surface (NAN-912 F-22): the wizard was previously a one-way door.
+  if (progress?.completed_at) {
     return <Navigate to="/" replace />;
   }
 
+  const isDismissed = !!progress?.dismissed;
   const allDone = doneCount === steps.length;
 
   return (
     <div className="mx-auto w-full max-w-[820px] space-y-3">
+      {/* DISMISSED BANNER (NAN-912 F-22) — only the page itself is the way back. */}
+      {isDismissed && (
+        <div className="flex items-center gap-3 rounded-xl border border-amber-500/30 bg-amber-500/[0.06] px-4 py-3">
+          <RotateCcw className="h-[14px] w-[14px] shrink-0 text-amber-500" />
+          <div className="min-w-0 flex-1">
+            <div className="text-[12.5px] font-medium text-foreground">Setup is dismissed</div>
+            <p className="mt-0.5 text-[11.5px] text-muted-foreground/80">
+              You hid the wizard. Re-enable it to keep tracking your setup progress.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={handleReenable}
+            className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 text-[11.5px] font-medium text-amber-500 hover:bg-amber-500/15"
+          >
+            <RotateCcw className="h-[11px] w-[11px]" />
+            Re-enable
+          </button>
+        </div>
+      )}
+
       {/* HEADER CARD */}
       <div className="rounded-xl border border-border bg-card p-5">
         <div className="mb-3 flex items-center gap-2">
@@ -270,14 +310,16 @@ export function OnboardingWizard() {
               Set up your nano instance step by step. Click any item to configure it &mdash; come back any time.
             </p>
           </div>
-          <button
-            type="button"
-            onClick={handleDismiss}
-            className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md border border-border/70 px-2.5 text-[11.5px] text-muted-foreground hover:bg-muted/50 hover:text-foreground"
-          >
-            <X className="h-[11px] w-[11px]" />
-            Dismiss
-          </button>
+          {!isDismissed && (
+            <button
+              type="button"
+              onClick={handleDismiss}
+              className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md border border-border/70 px-2.5 text-[11.5px] text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+            >
+              <X className="h-[11px] w-[11px]" />
+              Dismiss
+            </button>
+          )}
         </div>
       </div>
 
@@ -286,7 +328,7 @@ export function OnboardingWizard() {
         <div className="mb-3 flex items-center gap-2">
           <Eyebrow>Setup progress</Eyebrow>
           <div className="flex-1" />
-          <span className="font-display text-[20px] leading-none tabular-nums text-foreground">
+          <span className="font-mono text-[20px] leading-none tabular-nums text-foreground">
             {doneCount}
             <span className="text-muted-foreground/70">/{steps.length}</span>
           </span>
@@ -373,13 +415,17 @@ export function OnboardingWizard() {
 
               <div className="flex shrink-0 items-center gap-1">
                 {isLocked ? (
-                  <Link
-                    to="/settings/billing"
+                  // No self-serve billing page exists yet (NAN-912 F-14); previously
+                  // routed to /settings/billing which 404'd. Send to marketing instead.
+                  <a
+                    href="https://nano.rs"
+                    target="_blank"
+                    rel="noopener noreferrer"
                     className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 text-[11.5px] font-medium text-amber-500 hover:bg-amber-500/15"
                   >
-                    Upgrade
+                    Learn more
                     <ArrowUpRight className="h-[11px] w-[11px]" />
-                  </Link>
+                  </a>
                 ) : (
                   <>
                     {!isDone && !isSkipped && (
@@ -397,7 +443,7 @@ export function OnboardingWizard() {
                     )}
                     <button
                       type="button"
-                      onClick={() => navigate(step.href)}
+                      onClick={() => navigate(isDone ? (step.doneHref ?? step.href) : step.href)}
                       className={cn(
                         'inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-[11.5px] font-medium',
                         isDone
@@ -449,10 +495,10 @@ export function OnboardingWizard() {
         </button>
       </div>
 
-      {/* SUB-FOOTER */}
-      <div className="mt-4 flex items-center border-t border-border pt-3 font-mono text-[10.5px] tabular-nums text-muted-foreground/70">
-        <span>nano &middot; home &middot; first run</span>
-        <span className="flex-1" />
+      {/* SUB-FOOTER — page-level "nano · home · first run" breadcrumb removed
+          (NAN-911 F-3); the global StatusBar already shows location. Keep the
+          support link as the only content, right-aligned. */}
+      <div className="mt-4 flex items-center justify-end border-t border-border pt-3 font-mono text-[10.5px] tabular-nums text-muted-foreground/70">
         <span>
           need a hand?{' '}
           <a

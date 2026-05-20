@@ -184,7 +184,7 @@ impl DemoService {
 
         // Create ephemeral user
         let session_id = Uuid::now_v7();
-        let email = format!("demo-{}@demo.nanosiem.local", session_id);
+        let email = format!("demo-{}@demo.nano.local", session_id);
         let name = display_name
             .clone()
             .unwrap_or_else(|| "Demo User".to_string());

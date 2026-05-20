@@ -314,6 +314,21 @@ function HeroIntake({ attentionCount }: { attentionCount: number | null }) {
     }
   };
 
+  // "Catch me up" wants a guaranteed destination — falling back through the
+  // generic submit() lands the user on /search when AI is off, which is the
+  // wrong surface for a "what's in my queue" question. NAN-916 F-33: take the
+  // user straight to their cases when AI is unavailable. The PIVT path is
+  // unchanged.
+  const handleCatchMeUp = () => {
+    if (canUseAi && aiAvailable) {
+      submit('Catch me up on my open cases');
+      return;
+    }
+    if (canViewCases) {
+      navigate('/cases?filter=my');
+    }
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -340,7 +355,7 @@ function HeroIntake({ attentionCount }: { attentionCount: number | null }) {
             <>
               {attentionCount} {attentionCount === 1 ? 'thing needs' : 'things need'} your attention today.{' '}
               <button
-                onClick={() => submit('Catch me up on my open cases')}
+                onClick={handleCatchMeUp}
                 className="text-primary hover:underline"
                 disabled={isProcessing}
               >

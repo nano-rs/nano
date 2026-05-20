@@ -180,7 +180,7 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
   // ------- Detection & Search -------
   {
     id: 'ai',
-    label: 'AI & PIVT',
+    label: 'AI & pivt',
     group: 'detection',
     icon: Bot,
     desc: 'Model selection, guardrails, allowed capabilities, cost caps.',

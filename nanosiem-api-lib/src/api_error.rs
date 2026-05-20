@@ -446,6 +446,9 @@ impl From<nanosiem_core::SourceConfigServiceError> for ApiError {
                         name
                     ))
                 }
+                nanosiem_core::source_configs::SourceConfigRepositoryError::Conflict(msg) => {
+                    ApiError::Conflict(msg.clone())
+                }
                 nanosiem_core::source_configs::SourceConfigRepositoryError::RuleNotFound(id) => {
                     ApiError::NotFound(format!("Routing rule not found: {}", id))
                 }
@@ -463,6 +466,7 @@ impl From<nanosiem_core::SourceConfigServiceError> for ApiError {
             nanosiem_core::SourceConfigServiceError::InvalidConfig(msg) => {
                 ApiError::ValidationError(format!("Invalid configuration: {}", msg))
             }
+            nanosiem_core::SourceConfigServiceError::Conflict(msg) => ApiError::Conflict(msg.clone()),
             nanosiem_core::SourceConfigServiceError::DeploymentFailed(msg) => {
                 ApiError::InternalError(format!("Deployment failed: {}", msg))
             }

@@ -65,6 +65,7 @@ import {
   useMelodStatus,
   useStoreQueryExplanation,
   useGetQueryExplanation,
+  useIngestionHistory,
   toApiTimeRange,
   type TimeRangeValue
 } from '@/hooks/use-api';
@@ -463,7 +464,7 @@ export function Search() {
       ? {
           icon: 'Search',
           title: 'Search',
-          tags: queryMode === 'sql' ? ['SQL'] : ['NPL'],
+          tags: queryMode === 'sql' ? ['SQL'] : ['nPL'],
           lines: [
             { label: 'query', value: query || '— (empty)' },
             {
@@ -493,6 +494,16 @@ export function Search() {
   
   // Histogram data from API
   const [histogramData, setHistogramData] = useState<Array<{ time: string; count: number }>>([]);
+
+  // NAN-916 F-21: pre-search baseline. The chart used to fall back to 24
+  // zero buckets when no search had run, even though the platform was
+  // ingesting normally — so /search showed a flat zero line while the
+  // StatusBar footer ticked. Pull the last 24h of per-source-type
+  // ingestion counts (same hook the footer uses) and feed them as a
+  // baseline when the page hasn't issued a search yet. Backend buckets
+  // hourly via `toStartOfHour`, which lines up with the existing
+  // 24-bucket fallback shape.
+  const { data: ingestionBaseline } = useIngestionHistory(24);
 
   // Asset prevalence filter (for filtering asset timeline by prevalence artifacts).
   // Setter is currently unused — the previous wiring lived inside dead asset
@@ -2521,9 +2532,31 @@ export function Search() {
     
     // Fallback: build from search results (only accurate for non-paginated results)
     if (searchResults.length === 0) {
+      // NAN-916 F-21: only slot the ingestion baseline in *before* a search
+      // has been issued. Once the user has actually queried and gotten zero
+      // rows back, the chart needs to honor that — showing ingest activity
+      // would contradict the empty result table.
+      const HOUR_MS = 60 * 60 * 1000;
+      const baselineByHour = new Map<number, number>();
+      if (!hasSearched && ingestionBaseline) {
+        for (const point of ingestionBaseline) {
+          // Snap to the start-of-hour epoch boundary (UTC by definition,
+          // since epoch ms tick from 1970-01-01T00:00:00Z). Matches the
+          // backend's `toStartOfHour` and avoids the local-TZ pitfall of
+          // `Date#setMinutes(0,0,0)` — which would put the key out of band
+          // with the UTC `parseUTCTimestamp(point.timestamp)` lookup.
+          const hourStart = Math.floor(parseUTCTimestamp(point.timestamp).getTime() / HOUR_MS) * HOUR_MS;
+          baselineByHour.set(hourStart, (baselineByHour.get(hourStart) ?? 0) + point.count);
+        }
+      }
       return Array.from({ length: 24 }, (_, i) => {
-        const time = new Date(Date.now() - (23 - i) * 60 * 60 * 1000);
-        return { time: formatTimelineLabel(time, spansDays, showSeconds), timestamp: time.getTime(), events: 0 };
+        const ts = Math.floor((Date.now() - (23 - i) * HOUR_MS) / HOUR_MS) * HOUR_MS;
+        const time = new Date(ts);
+        return {
+          time: formatTimelineLabel(time, spansDays, showSeconds),
+          timestamp: ts,
+          events: baselineByHour.get(ts) ?? 0,
+        };
       });
     }
     if (isAggregateQuery && searchResults[0]?.fields?.time_bucket) {
@@ -2542,7 +2575,7 @@ export function Search() {
       else timeBuckets.set(timeKey, { timestamp: result.timestamp.getTime(), events: 1 });
     });
     return Array.from(timeBuckets.entries()).sort((a, b) => a[1].timestamp - b[1].timestamp).map(([time, data]) => ({ time, timestamp: data.timestamp, events: data.events }));
-  }, [histogramData, searchResults, isAggregateQuery, apiTimeRange, displayType]);
+  }, [histogramData, searchResults, isAggregateQuery, apiTimeRange, displayType, ingestionBaseline, hasSearched]);
 
   // Sum of histogram events - this is the true raw event count before aggregation/filtering
   const histogramEventCount = useMemo(() => {
@@ -2987,7 +3020,9 @@ export function Search() {
           <div className="search-console-header flex flex-wrap items-center gap-2 whitespace-nowrap font-mono text-[11px] tracking-[0.16em] uppercase font-semibold leading-none mb-1">
             <span className="text-muted-foreground">Search Console</span>
             <span className="text-muted-foreground/40">›</span>
-            <span className="text-primary search-console-mode">{queryMode === 'sql' ? 'SQL Pipeline' : 'nPL Pipeline'}</span>
+            <span className="text-primary search-console-mode">
+              {queryMode === 'sql' ? 'SQL' : <span className="normal-case">nPL</span>} Pipeline
+            </span>
             <span className="text-muted-foreground/40 hidden md:inline">›</span>
             <span className="hidden md:inline text-muted-foreground search-console-time">UTC {new Date().toLocaleTimeString('en-US', { timeZone: 'UTC', hour: '2-digit', minute: '2-digit', hour12: false })}</span>
           </div>
@@ -3481,7 +3516,7 @@ export function Search() {
                   : 'border-border bg-foreground/[0.03] text-primary hover:border-primary/40 hover:bg-primary/8',
               )}
             >
-              <span>{queryMode === 'sql' ? 'SQL' : 'NPL'}</span>
+              <span>{queryMode === 'sql' ? 'SQL' : 'nPL'}</span>
               <Settings2
                 className={cn(
                   'w-[10px] h-[10px]',

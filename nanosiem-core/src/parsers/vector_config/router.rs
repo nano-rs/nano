@@ -86,6 +86,19 @@ pub(super) const BUILTIN_TYPES: [&str; 12] = [
     "nginx",
 ];
 
+/// NAN-923: return true iff the file's TOML content declares the named
+/// route transform. Uses a simple substring search rather than parsing
+/// TOML so a fully-commented `# [transforms.foo_route]` is correctly
+/// rejected — the `#` prefix means the substring `[transforms.foo_route]`
+/// doesn't appear on the active line. Cheap, deterministic, and matches
+/// the way generated files actually look.
+pub(super) fn file_declares_route_transform(content: &str, route_name: &str) -> bool {
+    let needle = format!("[transforms.{}]", route_name);
+    content
+        .lines()
+        .any(|line| !line.trim_start().starts_with('#') && line.contains(&needle))
+}
+
 impl VectorConfigManager {
     /// Get the directory for source configuration files
     fn source_configs_dir(&self) -> PathBuf {
@@ -95,7 +108,15 @@ impl VectorConfigManager {
     /// Find deployed source configuration route transform names
     ///
     /// Scans the sources/configs directory for deployed source configurations
-    /// and returns the names of their routing transforms (e.g., "aws_cloudtrail_queue_route")
+    /// and returns the names of their routing transforms (e.g., "aws_cloudtrail_queue_route").
+    ///
+    /// NAN-923: only include files that actually declare the
+    /// `[transforms.<stem>_route]` block. A bare or fully-commented-out
+    /// .toml file (e.g. a local-dev placeholder for a disabled source
+    /// config) would otherwise add an input to `source_router` that
+    /// references a non-existent transform, and Vector would refuse to
+    /// load the config with "Input <name>_route for transform source_router
+    /// doesn't match any components."
     pub(super) async fn get_source_config_routes(&self) -> Vec<String> {
         let configs_dir = self.source_configs_dir();
         let mut routes = Vec::new();
@@ -104,15 +125,19 @@ impl VectorConfigManager {
             return routes;
         }
 
-        // Read all .toml files in the configs directory
         if let Ok(mut entries) = fs::read_dir(&configs_dir).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let path = entry.path();
                 if path.extension().map(|e| e == "toml").unwrap_or(false) {
-                    // Extract config name from filename (e.g., "aws_cloudtrail_queue.toml" -> "aws_cloudtrail_queue")
                     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        // The route transform is named {safe_name}_route
-                        routes.push(format!("{}_route", stem));
+                        let route_name = format!("{}_route", stem);
+                        // Verify the file actually declares the transform
+                        // before adding it to source_router inputs.
+                        if let Ok(content) = fs::read_to_string(&path).await {
+                            if file_declares_route_transform(&content, &route_name) {
+                                routes.push(route_name);
+                            }
+                        }
                     }
                 }
             }
@@ -142,11 +167,19 @@ impl VectorConfigManager {
                 let path = entry.path();
                 if path.extension().map(|e| e == "toml").unwrap_or(false) {
                     if let Ok(content) = fs::read_to_string(&path).await {
-                        if content.contains("inputs = [\"source_type_extract\"]") {
-                            source_type_extract = true;
-                        }
-                        if content.contains("inputs = [\"hec_normalize\"]") {
-                            hec_normalize = true;
+                        // NAN-923: only consider non-commented lines so a
+                        // fully-commented placeholder file doesn't
+                        // incorrectly cover an intermediary channel.
+                        for line in content.lines() {
+                            if line.trim_start().starts_with('#') {
+                                continue;
+                            }
+                            if line.contains("inputs = [\"source_type_extract\"]") {
+                                source_type_extract = true;
+                            }
+                            if line.contains("inputs = [\"hec_normalize\"]") {
+                                hec_normalize = true;
+                            }
                         }
                         if source_type_extract && hec_normalize {
                             return (true, true);
@@ -402,6 +435,52 @@ impl VectorConfigManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NAN-923: a file with a real `[transforms.foo_route]` block is
+    /// recognized — gets added to source_router.inputs.
+    #[test]
+    fn file_declares_route_transform_matches_real_declaration() {
+        let content = r#"
+[transforms.foo_route]
+type = "remap"
+inputs = ["hec_normalize"]
+source = ".source_type = \"foo\""
+"#;
+        assert!(file_declares_route_transform(content, "foo_route"));
+    }
+
+    /// NAN-923: a fully-commented placeholder file (the gcp_pub_sub.toml
+    /// failure mode) must NOT be recognized.
+    #[test]
+    fn file_declares_route_transform_rejects_fully_commented_file() {
+        let content = r#"
+# [sources.gcp_pub_sub_source]
+# type = "gcp_pubsub"
+#
+# [transforms.gcp_pub_sub_route]
+# type = "remap"
+# inputs = ["gcp_pub_sub_source"]
+"#;
+        assert!(!file_declares_route_transform(content, "gcp_pub_sub_route"));
+    }
+
+    /// NAN-923: don't match a similarly-named transform that isn't the
+    /// expected route — e.g. `[transforms.foo_route_helper]` should NOT
+    /// register as `foo_route`.
+    #[test]
+    fn file_declares_route_transform_does_not_match_prefix() {
+        let content = "[transforms.foo_route_helper]\ntype = \"filter\"\n";
+        assert!(!file_declares_route_transform(content, "foo_route"));
+    }
+
+    /// NAN-923: whitespace at the start of the line should not throw off
+    /// the comment check (defensive — TOML doesn't usually indent but a
+    /// hand-edited file might).
+    #[test]
+    fn file_declares_route_transform_handles_indented_comments() {
+        let content = "    # [transforms.foo_route]\n";
+        assert!(!file_declares_route_transform(content, "foo_route"));
+    }
 
     /// `vector_merge` has no per-config intermediary — always direct.
     #[test]

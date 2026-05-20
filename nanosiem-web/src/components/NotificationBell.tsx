@@ -141,7 +141,11 @@ export function NotificationBell() {
         >
           <Bell className="w-[14px] h-[14px]" />
           {unreadCount > 0 && (
-            <span className="absolute top-1 right-1 w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
+            // NAN-917 F-23: show the count instead of a featureless dot.
+            // The popover header already uses this exact treatment.
+            <span className="absolute -top-1 -right-1 min-w-[16px] h-[14px] px-[3px] inline-flex items-center justify-center rounded-sm bg-primary text-primary-foreground text-[9px] font-mono tabular-nums leading-none">
+              {unreadCount > 99 ? '99+' : unreadCount}
+            </span>
           )}
         </button>
       </PopoverTrigger>

@@ -550,7 +550,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
       const demoUser = {
         id: response.auth.user.id,
-        email: `demo-${response.session_id}@demo.nanosiem.local`,
+        email: `demo-${response.session_id}@demo.nano.local`,
         name: response.auth.user.name,
         roles: response.auth.user.roles,
         permissions: response.auth.user.permissions,
@@ -585,7 +585,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
 
       const demoUser = {
         id: response.auth.user.id,
-        email: `demo-${response.session_id}@demo.nanosiem.local`,
+        email: `demo-${response.session_id}@demo.nano.local`,
         name: response.auth.user.name,
         roles: response.auth.user.roles,
         permissions: response.auth.user.permissions,

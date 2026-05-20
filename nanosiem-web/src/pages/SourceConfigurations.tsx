@@ -76,6 +76,12 @@ interface TransportSpec {
   popular?: boolean;
 }
 
+// NAN-883: HEC is served by the OOTB `splunk_hec_ingest` listener with one
+// shared `${VECTOR_AUTH_TOKEN}`. A user HEC source config is just a routing
+// profile — two of them would emit colliding `splunk_hec_route` transforms.
+// Gate the picker (and the backend rejects duplicates with 409).
+const SINGLE_INSTANCE_TYPES: SourceConfigType[] = ['splunk_hec'];
+
 const TRANSPORTS: TransportSpec[] = [
   { value: 'http', label: 'HTTP', icon: Globe, description: 'Generic HTTP POST endpoint with X-Source-Type header routing.', popular: true },
   { value: 'vector', label: 'Vector', icon: Radio, description: 'Upstream Vector forwarders over the native Vector protocol.', popular: true },
@@ -301,6 +307,7 @@ export default function SourceConfigurations() {
           onOpenChange={setCreateDialogOpen}
           submitting={createMutation.isPending}
           onSubmit={(request) => createMutation.mutate(request)}
+          existingTypes={new Set(sourceConfigs.map((c) => c.config_type as SourceConfigType))}
         />
 
         <AlertDialog open={!!deleteTarget} onOpenChange={() => setDeleteTarget(null)}>
@@ -839,11 +846,13 @@ function AddSourceSheet({
   onOpenChange,
   submitting,
   onSubmit,
+  existingTypes,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   submitting: boolean;
   onSubmit: (request: NewSourceConfiguration) => void;
+  existingTypes: Set<SourceConfigType>;
 }) {
   const [step, setStep] = useState<'pick' | 'name'>('pick');
   const [picked, setPicked] = useState<SourceConfigType | null>(null);
@@ -898,7 +907,11 @@ function AddSourceSheet({
 
         <div className="flex-1 min-h-0 overflow-y-auto px-5 py-4">
           {step === 'pick' ? (
-            <PickTransport selected={picked} onSelect={setPicked} />
+            <PickTransport
+              selected={picked}
+              onSelect={setPicked}
+              existingTypes={existingTypes}
+            />
           ) : transport ? (
             <NameTransport
               transport={transport}
@@ -948,33 +961,47 @@ function AddSourceSheet({
 function PickTransport({
   selected,
   onSelect,
+  existingTypes,
 }: {
   selected: SourceConfigType | null;
   onSelect: (value: SourceConfigType) => void;
+  existingTypes: Set<SourceConfigType>;
 }) {
   const popular = TRANSPORTS.filter((t) => t.popular);
   const rest = TRANSPORTS.filter((t) => !t.popular);
+
+  // NAN-883: HEC is single-instance — disable if one already exists.
+  const isDisabled = (t: TransportSpec): boolean =>
+    SINGLE_INSTANCE_TYPES.includes(t.value) && existingTypes.has(t.value);
+  const disabledReason = (t: TransportSpec): string | null =>
+    t.value === 'splunk_hec' && existingTypes.has('splunk_hec')
+      ? 'Only one Splunk HEC routing config is supported. Edit the existing one to add routing rules.'
+      : null;
+
+  const renderCard = (t: TransportSpec) => (
+    <TransportCard
+      key={t.value}
+      transport={t}
+      active={selected === t.value}
+      disabled={isDisabled(t)}
+      disabledReason={disabledReason(t)}
+      onSelect={() => onSelect(t.value)}
+    />
+  );
+
   return (
     <div className="space-y-4">
       <div>
         <div className="text-[10.5px] font-mono uppercase tracking-[0.12em] text-muted-foreground mb-2">
           Popular
         </div>
-        <div className="grid grid-cols-2 gap-2">
-          {popular.map((t) => (
-            <TransportCard key={t.value} transport={t} active={selected === t.value} onSelect={() => onSelect(t.value)} />
-          ))}
-        </div>
+        <div className="grid grid-cols-2 gap-2">{popular.map(renderCard)}</div>
       </div>
       <div>
         <div className="text-[10.5px] font-mono uppercase tracking-[0.12em] text-muted-foreground mb-2">
           All sources
         </div>
-        <div className="grid grid-cols-2 gap-2">
-          {rest.map((t) => (
-            <TransportCard key={t.value} transport={t} active={selected === t.value} onSelect={() => onSelect(t.value)} />
-          ))}
-        </div>
+        <div className="grid grid-cols-2 gap-2">{rest.map(renderCard)}</div>
       </div>
       <div className="rounded-md border border-border bg-foreground/[0.02] p-3 text-[11px] text-muted-foreground leading-relaxed">
         After creating the source, you&rsquo;ll configure connection settings (auth, endpoints,
@@ -987,10 +1014,14 @@ function PickTransport({
 function TransportCard({
   transport,
   active,
+  disabled,
+  disabledReason,
   onSelect,
 }: {
   transport: TransportSpec;
   active: boolean;
+  disabled?: boolean;
+  disabledReason?: string | null;
   onSelect: () => void;
 }) {
   const Icon = transport.icon;
@@ -998,24 +1029,31 @@ function TransportCard({
     <button
       type="button"
       onClick={onSelect}
+      disabled={disabled}
+      title={disabled ? disabledReason ?? undefined : undefined}
+      aria-disabled={disabled}
       className={cn(
         'flex flex-col items-start gap-1.5 p-3 rounded-md border text-left transition-all',
-        active
-          ? 'border-primary/60 bg-primary/8'
-          : 'border-border bg-foreground/[0.02] hover:border-border/80 hover:bg-foreground/[0.04]',
+        disabled
+          ? 'border-border bg-foreground/[0.01] opacity-55 cursor-not-allowed'
+          : active
+            ? 'border-primary/60 bg-primary/8'
+            : 'border-border bg-foreground/[0.02] hover:border-border/80 hover:bg-foreground/[0.04]',
       )}
     >
       <div
         className={cn(
           'w-7 h-7 rounded-md flex items-center justify-center',
-          active ? 'bg-primary/15 text-primary' : 'bg-card border border-border text-muted-foreground',
+          active && !disabled
+            ? 'bg-primary/15 text-primary'
+            : 'bg-card border border-border text-muted-foreground',
         )}
       >
         <Icon className="w-[14px] h-[14px]" />
       </div>
       <div className="text-[12.5px] font-medium text-foreground">{transport.label}</div>
       <div className="text-[10.5px] text-muted-foreground leading-[1.45]">
-        {transport.description}
+        {disabled && disabledReason ? disabledReason : transport.description}
       </div>
     </button>
   );

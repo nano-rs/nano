@@ -39,6 +39,12 @@ pub enum SourceConfigServiceError {
     NotFound(String),
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
+    /// NAN-883: rejected because the target driver is single-instance and
+    /// a configuration already exists (e.g. `splunk_hec` shares one OOTB
+    /// listener; two would collide on the `splunk_hec_route` transform).
+    /// Maps to HTTP 409 in the API layer.
+    #[error("Conflict: {0}")]
+    Conflict(String),
     #[error("Deployment failed: {0}")]
     DeploymentFailed(String),
     #[error("Credential error: {0}")]
@@ -162,6 +168,25 @@ impl SourceConfigService {
         // unescaped interpolation.
         Self::validate_connection_config(&request.config_type, &request.connection_config)?;
 
+        // NAN-883: single-instance drivers (currently `splunk_hec`) share an
+        // OOTB Vector listener; a second config would emit a colliding
+        // routing transform. Reject the duplicate with a Conflict (409).
+        //
+        // This list-then-check is racy on its own — two concurrent POSTs
+        // could both pass — but the partial unique index added in
+        // migration 184 backstops it at the DB layer (the repository maps
+        // the resulting `unique_violation` back to `Conflict`). The
+        // application-level check still runs first so the typical path
+        // gets a clean error without a wasted INSERT.
+        if Self::is_single_instance_driver(&request.config_type) {
+            let existing = self.repository.list(None).await?;
+            if let Some(err) =
+                Self::reject_if_duplicate_single_instance(&request.config_type, &existing)
+            {
+                return Err(err);
+            }
+        }
+
         // Validate credential exists if specified
         if let Some(cred_id) = request.credential_id {
             self.credential_repo
@@ -171,6 +196,33 @@ impl SourceConfigService {
         }
 
         Ok(self.repository.create(request).await?)
+    }
+
+    /// NAN-883: drivers where only one source configuration may exist per
+    /// deployment. Today: `splunk_hec` (the OOTB `splunk_hec_ingest` listener
+    /// is shared, and a user config is just a routing profile over it — two
+    /// would emit colliding `splunk_hec_route` transforms).
+    fn is_single_instance_driver(config_type: &str) -> bool {
+        matches!(config_type, "splunk_hec")
+    }
+
+    /// Pure decision helper for the single-instance check. Returns
+    /// `Some(Conflict)` when `existing` already contains a row with the
+    /// requested `config_type`, else `None`. Split out from `create` so it
+    /// can be unit-tested without a database — the I/O is in `list` and
+    /// the partial unique index (migration 184).
+    fn reject_if_duplicate_single_instance(
+        config_type: &str,
+        existing: &[SourceConfiguration],
+    ) -> Option<SourceConfigServiceError> {
+        if existing.iter().any(|c| c.config_type == config_type) {
+            Some(SourceConfigServiceError::Conflict(format!(
+                "Only one {config_type} source configuration is supported per deployment. \
+                 Edit the existing config to add routing rules."
+            )))
+        } else {
+            None
+        }
     }
 
     /// Update a source configuration
@@ -323,24 +375,45 @@ impl SourceConfigService {
         Ok(())
     }
 
+    /// NAN-855: post-NAN-853 a `splunk_hec` source config no longer emits its
+    /// own Vector source — it consumes from the OOTB `splunk_hec_ingest`
+    /// listener (`:8088`, shared `${VECTOR_AUTH_TOKEN}`). The fields below
+    /// are vestigial and silently ignored at deploy time. Reject any value
+    /// other than null / empty so the schema doesn't look configurable on
+    /// settings that have zero effect.
     fn validate_splunk_hec_conn(conn: &serde_json::Value) -> Result<(), SourceConfigServiceError> {
-        Self::expect_string_if_present(conn, "address")?;
-        if let Some(tokens) = conn.get("valid_tokens") {
-            let arr = tokens.as_array().ok_or_else(|| {
-                SourceConfigServiceError::InvalidConfig(
-                    "splunk_hec connection_config.valid_tokens must be an array of strings"
-                        .to_string(),
-                )
-            })?;
-            for (i, t) in arr.iter().enumerate() {
-                if !t.is_string() {
-                    return Err(SourceConfigServiceError::InvalidConfig(format!(
-                        "splunk_hec connection_config.valid_tokens[{i}] must be a string"
-                    )));
-                }
-            }
-        }
+        Self::reject_nonempty_vestigial_field(conn, "address")?;
+        Self::reject_nonempty_vestigial_field(conn, "valid_tokens")?;
+        Self::reject_nonempty_vestigial_field(conn, "permit_origin")?;
+        Self::reject_nonempty_vestigial_field(conn, "tls")?;
         Ok(())
+    }
+
+    /// Reject `key` if present and non-empty. Accepts absence, JSON null,
+    /// empty string, and empty array/object — those round-trip cleanly from
+    /// the frontend's `connection_config: {}` and from any legacy stored
+    /// payload that has been cleared.
+    fn reject_nonempty_vestigial_field(
+        conn: &serde_json::Value,
+        key: &str,
+    ) -> Result<(), SourceConfigServiceError> {
+        let Some(v) = conn.get(key) else { return Ok(()) };
+        let is_empty = match v {
+            serde_json::Value::Null => true,
+            serde_json::Value::String(s) => s.is_empty(),
+            serde_json::Value::Array(a) => a.is_empty(),
+            serde_json::Value::Object(o) => o.is_empty(),
+            _ => false,
+        };
+        if is_empty {
+            Ok(())
+        } else {
+            Err(SourceConfigServiceError::InvalidConfig(format!(
+                "splunk_hec connection_config.{key} is not configurable per source — \
+                 HEC is served by the platform-managed listener (:8088, shared token). \
+                 Remove this field."
+            )))
+        }
     }
 
     /// If `key` is present in `conn`, require it to be a string (not number /
@@ -726,10 +799,16 @@ impl SourceConfigService {
 
     /// Returns true when the (config_type, match_field) combination is the
     /// known buggy shape: a non-system-level source whose rule matches on
-    /// `.source_type`. Pub/Sub / Kafka / S3 / HEC events do not carry
-    /// an inbound `.source_type` field, so such rules cannot fire.
+    /// `.source_type`. Pub/Sub / Kafka / S3 events do not carry an inbound
+    /// `.source_type` field, so such rules cannot fire.
+    ///
+    /// NAN-918: `splunk_hec` is excluded because `hec_normalize`
+    /// (`config/vector/02-hec-source.toml`) populates `.source_type` from
+    /// the inbound `.sourcetype` envelope field before this routing
+    /// transform runs — so source_type rules on HEC are legitimate
+    /// (matches HTTP / Vector).
     fn is_pull_source_source_type_match(config_type: &str, match_field: &str) -> bool {
-        config_type != "http" && config_type != "vector" && match_field == "source_type"
+        !matches!(config_type, "http" | "vector" | "splunk_hec") && match_field == "source_type"
     }
 
     /// Coerce `match_type` to `"default"` when the rule shape would otherwise
@@ -793,22 +872,15 @@ impl SourceConfigService {
 
     /// Whether a system-level source config has rules worth emitting to disk.
     ///
-    /// HTTP/Vector default rules are passthrough no-ops (the routing transform
-    /// emits `# passthrough — keep existing .source_type`), so a config with
+    /// System-level default rules (HTTP, Vector, HEC post-NAN-918) are
+    /// passthrough no-ops (the routing transform emits
+    /// `# passthrough — keep existing .source_type`), so a config with
     /// only defaults adds nothing — we skip the file write entirely.
-    ///
-    /// HEC inverts this: hec_normalize already set `.source_type` from the
-    /// envelope's `sourcetype`, and the user's default rule's `target` is
-    /// meant to override that. Even a single default rule is meaningful.
     fn has_meaningful_routing_rules(config: &SourceConfigurationWithRules) -> bool {
-        if config.config.config_type == "splunk_hec" {
-            !config.routing_rules.is_empty()
-        } else {
-            config
-                .routing_rules
-                .iter()
-                .any(|r| r.match_type != "default")
-        }
+        config
+            .routing_rules
+            .iter()
+            .any(|r| r.match_type != "default")
     }
 
     /// Deploy a source configuration to Vector
@@ -824,12 +896,15 @@ impl SourceConfigService {
         if let Some(intermediary_source) = Self::system_intermediary_source(&config.config_type) {
             let has_meaningful_rules = Self::has_meaningful_routing_rules(&config_with_rules);
 
-            // HTTP/Vector use passthrough-default semantics: default rules
-            // preserve the inbound .source_type. HEC inverts this — the
-            // default rule's target is authoritative, so we pass
-            // system_level=false to make `generate_routing_transform` emit it
-            // as an unconditional assignment.
-            let routing_default_passthrough = config.config_type != "splunk_hec";
+            // HTTP / Vector / HEC all use passthrough-default semantics
+            // post-NAN-918: a default rule preserves the upstream
+            // `.source_type` (set by source_type_extract for HTTP/Vector,
+            // by hec_normalize for HEC). Lets imported parsers' sourcetypes
+            // flow through to parser matching without per-parser routing
+            // rules. Users who actually need to force `.source_type` to a
+            // fixed value can write a non-default rule (e.g. regex `.*`).
+            let routing_default_passthrough =
+                Self::system_intermediary_source(&config.config_type).is_some();
 
             let vector_config = if has_meaningful_rules {
                 let safe_name = Self::safe_name(&config.name);
@@ -2385,11 +2460,134 @@ mod tests {
         });
         SourceConfigService::validate_connection_config("gcp_pubsub", &gcp).unwrap();
 
-        let hec = serde_json::json!({
-            "address": "0.0.0.0:8088",
-            "valid_tokens": ["00000000-0000-0000-0000-000000000000"],
+        // NAN-855: post-NAN-853, HEC's connection_config is non-configurable
+        // per source. Empty payloads are the valid shape; the next test below
+        // (`validate_connection_config_rejects_vestigial_splunk_hec_fields`)
+        // pins the rejection of populated `address` / `valid_tokens`.
+        let hec_empty = serde_json::json!({});
+        SourceConfigService::validate_connection_config("splunk_hec", &hec_empty).unwrap();
+        let hec_nulls = serde_json::json!({
+            "address": null,
+            "valid_tokens": [],
+            "permit_origin": [],
+            "tls": {},
         });
-        SourceConfigService::validate_connection_config("splunk_hec", &hec).unwrap();
+        SourceConfigService::validate_connection_config("splunk_hec", &hec_nulls).unwrap();
+    }
+
+    /// NAN-883: lock the single-instance driver matrix. `splunk_hec` is the
+    /// only driver where the OOTB listener is shared and a second user
+    /// config would emit a colliding routing transform. Push drivers
+    /// (http/vector) and broker pulls (kafka/aws_s3/gcp_pubsub) all support
+    /// multiple instances.
+    #[test]
+    fn is_single_instance_driver_matrix() {
+        assert!(SourceConfigService::is_single_instance_driver("splunk_hec"));
+        for driver in ["http", "vector", "kafka", "aws_s3", "gcp_pubsub", "unknown"] {
+            assert!(
+                !SourceConfigService::is_single_instance_driver(driver),
+                "{driver} must not be single-instance",
+            );
+        }
+    }
+
+    /// NAN-883: `reject_if_duplicate_single_instance` is the pure decision
+    /// the create-path uses against the existing-configs list returned by
+    /// the repository. The DB-level partial unique index (migration 184)
+    /// is the race-safety backstop; this is the friendly-error path.
+    #[test]
+    fn reject_if_duplicate_single_instance_returns_conflict_on_match() {
+        let existing = vec![
+            fake_config("kafka-prod", "kafka"),
+            fake_config("hec-main", "splunk_hec"),
+        ];
+        // Existing splunk_hec → duplicate creation must be rejected.
+        let err =
+            SourceConfigService::reject_if_duplicate_single_instance("splunk_hec", &existing)
+                .expect("expected Conflict, got None");
+        match err {
+            SourceConfigServiceError::Conflict(msg) => {
+                assert!(msg.contains("splunk_hec"), "msg: {msg}");
+                assert!(msg.contains("Only one"), "msg: {msg}");
+            }
+            other => panic!("expected Conflict variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_if_duplicate_single_instance_passes_with_no_existing_hec() {
+        // No HEC in the list — even with other drivers present, creating a
+        // HEC config must be allowed.
+        let existing = vec![
+            fake_config("kafka-prod", "kafka"),
+            fake_config("s3-cloudtrail", "aws_s3"),
+        ];
+        assert!(
+            SourceConfigService::reject_if_duplicate_single_instance("splunk_hec", &existing)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reject_if_duplicate_single_instance_passes_with_empty_existing() {
+        assert!(
+            SourceConfigService::reject_if_duplicate_single_instance("splunk_hec", &[]).is_none()
+        );
+    }
+
+    /// Helper: build a minimal SourceConfiguration row for in-memory tests.
+    fn fake_config(name: &str, config_type: &str) -> SourceConfiguration {
+        SourceConfiguration {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            description: None,
+            config_type: config_type.to_string(),
+            connection_config: serde_json::json!({}),
+            credential_id: None,
+            enabled: false,
+            deployed: false,
+            deployed_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            events_24h: None,
+            bytes_per_day_24h: None,
+            last_event_at: None,
+        }
+    }
+
+    /// NAN-855: vestigial `splunk_hec` fields (`address`, `valid_tokens`,
+    /// `permit_origin`, `tls`) must be rejected when populated — they have
+    /// zero effect at deploy time post-NAN-853, so accepting them would
+    /// silently mislead operators into thinking they're configurable.
+    #[test]
+    fn validate_connection_config_rejects_vestigial_splunk_hec_fields() {
+        for (field, payload) in [
+            (
+                "address",
+                serde_json::json!({ "address": "0.0.0.0:8088" }),
+            ),
+            (
+                "valid_tokens",
+                serde_json::json!({
+                    "valid_tokens": ["00000000-0000-0000-0000-000000000000"]
+                }),
+            ),
+            (
+                "permit_origin",
+                serde_json::json!({ "permit_origin": ["10.0.0.0/8"] }),
+            ),
+            (
+                "tls",
+                serde_json::json!({ "tls": { "enabled": true } }),
+            ),
+        ] {
+            let err = SourceConfigService::validate_connection_config("splunk_hec", &payload)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains(field) && err.to_string().contains("not configurable"),
+                "expected rejection of vestigial `{field}`, got: {err}",
+            );
+        }
     }
 
     #[test]
@@ -2944,33 +3142,38 @@ mod tests {
         );
     }
 
-    /// Guards NAN-856: a splunk_hec config with only a default rule
-    /// (the most common UI flow) must produce an unconditional
-    /// `.source_type = "<target>"` VRL, not a passthrough that ignores
-    /// the user's target.
+    /// NAN-918: HEC now uses HTTP-parity passthrough-default semantics.
+    /// A default rule on a HEC config preserves `.source_type` (set by
+    /// hec_normalize from the envelope's sourcetype), so imported parsers
+    /// with various sourcetypes route correctly without per-parser rules.
+    /// Users who need "force all events to <X>" can express that with a
+    /// non-default rule (e.g. regex `.*`).
+    ///
+    /// Supersedes the pre-NAN-918 NAN-856 "default target is authoritative"
+    /// semantic — HEC was reclassified as push in NAN-883, matching HTTP/Vector.
     #[test]
-    fn splunk_hec_default_only_rule_emits_unconditional_source_type_set() {
+    fn splunk_hec_default_only_rule_emits_passthrough() {
         let cfg = make_config(
             "splunk_hec",
-            vec![make_rule(1000, "source_type", "default", None, "apache_access")],
+            vec![make_rule(1000, "source_type", "default", None, "unknown")],
         );
 
-        // Matches what deploy() passes for splunk_hec post-NAN-856:
-        // intermediary=hec_normalize, system_level=false (so default target is authoritative).
+        // Mirrors what deploy() passes for splunk_hec post-NAN-918:
+        // intermediary=hec_normalize, system_level=true (passthrough default).
         let routing = SourceConfigService::generate_routing_transform(
             &cfg,
             "hec_normalize",
             "splunk_hec_test_route",
-            false,
+            true,
         );
 
         assert!(
-            routing.contains(".source_type = \"apache_access\""),
-            "user's default target must be emitted as unconditional assignment, got:\n{routing}"
+            routing.contains("passthrough"),
+            "default rule must coalesce to passthrough for HEC post-NAN-918, got:\n{routing}"
         );
         assert!(
-            !routing.contains("passthrough"),
-            "default rule must not coalesce to passthrough for HEC, got:\n{routing}"
+            !routing.contains(".source_type = \"unknown\""),
+            "stored default target must NOT be emitted as unconditional assignment, got:\n{routing}"
         );
     }
 
@@ -2991,26 +3194,27 @@ mod tests {
     }
 
     /// HEC with no rules at all: nothing to deploy. has_meaningful_rules
-    /// must return false so deploy() skips the file write — without that, the
-    /// generator would emit `.source_type = "unknown"` (the fallback when
-    /// system_level=false and no default rule), wiping out hec_normalize's
-    /// envelope-derived value for every HEC event.
+    /// must return false so deploy() skips the file write — hec_normalize's
+    /// envelope-derived `.source_type` flows directly to parser matching.
     #[test]
     fn has_meaningful_routing_rules_false_for_splunk_hec_with_empty_rules() {
         let cfg = make_config("splunk_hec", vec![]);
         assert!(!SourceConfigService::has_meaningful_routing_rules(&cfg));
     }
 
-    /// HEC with a single default rule: deploy() must write the file. Without
-    /// this, _router.toml references splunk_hec_route while the transform
-    /// itself doesn't exist on disk — Vector aborts reload. (NAN-856 root cause)
+    /// NAN-918: HEC default-only rules are now passthrough (HTTP-parity),
+    /// so they're no-ops just like HTTP's. has_meaningful_routing_rules
+    /// returns false — same as HTTP — so deploy() skips the file write.
+    /// Previously (NAN-856) HEC defaults were authoritative and a
+    /// default-only config DID require the file; that semantic was reverted
+    /// once HEC was reclassified as push.
     #[test]
-    fn has_meaningful_routing_rules_true_for_splunk_hec_with_default_only() {
+    fn has_meaningful_routing_rules_false_for_splunk_hec_with_default_only() {
         let cfg = make_config(
             "splunk_hec",
-            vec![make_rule(1000, "source_type", "default", None, "apache_access")],
+            vec![make_rule(1000, "source_type", "default", None, "unknown")],
         );
-        assert!(SourceConfigService::has_meaningful_routing_rules(&cfg));
+        assert!(!SourceConfigService::has_meaningful_routing_rules(&cfg));
     }
 
     /// HTTP/Vector with a default-only rule: existing behavior must be

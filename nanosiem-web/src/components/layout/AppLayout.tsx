@@ -39,6 +39,8 @@ import {
   ShieldCheck,
   Rocket,
   Menu,
+  Moon,
+  Sun,
 } from 'lucide-react';
 import {
   NavHome,
@@ -73,6 +75,7 @@ import { PivtSummon } from '@/enterprise/components/pivt/PivtSummon';
 import { PivtShellOverlay } from '@/enterprise/components/pivt/PivtShellOverlay';
 import { useCapabilities, type Capabilities } from '@/hooks/use-capabilities';
 import { NotificationBell } from '@/components/NotificationBell';
+import { useTheme } from 'next-themes';
 import { SettingsLayout } from '@/components/layout/settings/SettingsLayout';
 const CommandPalette = lazy(() => import('@/components/shared/CommandPalette').then(m => ({ default: m.CommandPalette })));
 import { Button } from '@/components/ui/button';
@@ -316,17 +319,22 @@ function TopBar({
         size="icon"
         onClick={onMobileMenuOpen}
         className="h-[22px] w-[22px] shrink-0 md:hidden"
+        aria-label="Open menu"
         title="Open menu"
       >
         <Menu className="h-[15px] w-[15px]" />
       </Button>
 
-      {/* Desktop sidebar toggle — custom collapse icon (rotates 180° when collapsed) */}
+      {/* Desktop sidebar toggle — custom collapse icon (rotates 180° when collapsed).
+          Uses a generic "Toggle sidebar" aria-label to avoid colliding with the
+          rail's own collapse button (NAN-915 F-7); the rail button carries the
+          state-specific Expand/Collapse wording. */}
       <Button
         variant="ghost"
         size="icon"
         onClick={onToggleSidebar}
         className="h-[22px] w-[22px] shrink-0 hidden md:inline-flex"
+        aria-label="Toggle sidebar"
         title={sidebarCollapsed ? 'Expand sidebar (⌘B)' : 'Collapse sidebar (⌘B)'}
       >
         <NavCollapse className={cn('h-[15px] w-[15px]', sidebarCollapsed && 'rotate-180')} />
@@ -334,7 +342,7 @@ function TopBar({
 
       {/* Breadcrumb: current page title + trail */}
       <div className="text-[13px] flex items-center gap-2 whitespace-nowrap min-w-0 overflow-hidden">
-        <span className="font-medium text-foreground truncate shrink-0">{currentTitle}</span>
+        <span aria-current="page" className="font-medium text-foreground truncate shrink-0">{currentTitle}</span>
         <div className="hidden md:flex items-center gap-2.5 min-w-0 text-muted-foreground">
           <AppBreadcrumbs />
         </div>
@@ -353,6 +361,26 @@ function TopBar({
       </div>
     </div>
   );
+}
+
+/**
+ * Strip inline markdown so AI-generated narrative renders cleanly inside the
+ * single-line footer cell. The full markdown source still flows to
+ * `/platform/health` where `<Markdown>` formats it properly; here we just
+ * remove the `**bold**`/`*italic*`/`` `code` `` markers that would otherwise
+ * show as literal characters (NAN-914 F-2).
+ */
+function stripInlineMarkdown(text: string): string {
+  // Skip underscore-italic stripping — UDM field names (src_ip, windows_event_log,
+  // src_ip_filled_pct, etc.) routinely appear in the narrative and the `_..._`
+  // regex would mangle them. The AI prompt produces `**bold**`/`*italic*` style
+  // markdown, not underscore italics, so this is the safer trade-off.
+  return text
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .trim();
 }
 
 /**
@@ -387,6 +415,9 @@ function StatusBar() {
   // out the AI-unavailable placeholder so open builds drop down to score.
   const rawIngestDetail = siemHealth?.dimension_details?.ingestion?.trim();
   const ingestDetail = rawIngestDetail === 'AI analysis unavailable' ? undefined : rawIngestDetail;
+  // The narrative is markdown; strip inline formatting for the single-line
+  // footer cell so `**foo**` etc. don't render as literal asterisks (F-2).
+  const ingestDetailDisplay = ingestDetail ? stripInlineMarkdown(ingestDetail) : undefined;
   const ingestScore = siemHealth ? `${Math.round(siemHealth.ingestion_score)}% ingest` : null;
 
   // Events/min: sum the last hour of ingestion-history points across source
@@ -413,14 +444,25 @@ function StatusBar() {
         <span className="flex items-center gap-[18px] min-w-0">{pageStatus}</span>
       ) : (
         <>
-          {(ingestDetail || ingestScore) && (
+          {ingestDetailDisplay ? (
+            // AI narrative is the meaningful content — wire the cell as a link
+            // to the full /platform/health report so the truncated text has a
+            // clear expand-on-click affordance (NAN-914 F-6).
+            <Link
+              to="/platform/health"
+              className="hidden lg:inline truncate max-w-[280px] hover:text-foreground transition-colors"
+              title={ingestDetailDisplay}
+            >
+              {ingestDetailDisplay}
+            </Link>
+          ) : ingestScore ? (
             <span
               className="hidden lg:inline truncate max-w-[280px]"
-              title={ingestDetail || ingestScore || undefined}
+              title={ingestScore}
             >
-              {ingestDetail || ingestScore}
+              {ingestScore}
             </span>
-          )}
+          ) : null}
           {eventsLabel && <span className="hidden lg:inline">{eventsLabel}</span>}
         </>
       )}
@@ -460,6 +502,8 @@ function UserMenuContent({
   onLogout: () => void | Promise<void>;
   onUserSettings: () => void;
 }) {
+  const { resolvedTheme, setTheme } = useTheme();
+  const isDark = resolvedTheme === 'dark';
   const itemCls = 'text-[11.5px] py-1.5 gap-2';
   // Pops up from the avatar trigger with a small lift, then shifts right
   // via `alignOffset` so the menu straddles the sidebar / content edge —
@@ -477,6 +521,15 @@ function UserMenuContent({
       <DropdownMenuItem onClick={onUserSettings} className={itemCls}>
         <User className="w-3.5 h-3.5" />
         User Settings
+      </DropdownMenuItem>
+      {/* NAN-917 F-25: theme toggle is now reachable from every route via the
+          user menu (previously only on /settings/*). */}
+      <DropdownMenuItem
+        onClick={() => setTheme(isDark ? 'light' : 'dark')}
+        className={itemCls}
+      >
+        {isDark ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
+        {isDark ? 'Switch to light theme' : 'Switch to dark theme'}
       </DropdownMenuItem>
       <DropdownMenuSeparator />
       <DropdownMenuItem asChild className={itemCls}>
@@ -570,8 +623,10 @@ function MainAppShell({ children }: AppLayoutProps) {
   // Filtered navigation arrays based on user permissions
   const filteredNavigation = useMemo(() => {
     const items = filterNavItems(navigation);
-    // Hide "Getting Started" for demo users, or when onboarding is dismissed or completed
-    if (isDemoUser || onboardingProgress?.dismissed || onboardingProgress?.completed_at) {
+    // Hide "Getting Started" for demo users or once onboarding is fully completed.
+    // Dismissed-but-not-completed users keep the entry so they can re-enable —
+    // it was previously the only way back to /getting-started (NAN-912 F-22).
+    if (isDemoUser || onboardingProgress?.completed_at) {
       return items.filter(item => item.href !== '/getting-started');
     }
     return items;
@@ -775,6 +830,7 @@ function MainAppShell({ children }: AppLayoutProps) {
                     : 'text-muted-foreground hover:bg-foreground/5 hover:text-foreground',
                   sidebarCollapsed && 'w-8 !px-0 !gap-0 mx-auto justify-center'
                 )}
+                aria-label={item.name}
                 title={sidebarCollapsed ? item.name : undefined}
               >
                 <Icon className="w-[15px] h-[15px]" />
@@ -927,6 +983,7 @@ function MainAppShell({ children }: AppLayoutProps) {
                     : 'text-muted-foreground hover:bg-foreground/5 hover:text-foreground',
                   sidebarCollapsed && 'w-8 !px-0 !gap-0 mx-auto justify-center'
                 )}
+                aria-label={item.name}
                 title={sidebarCollapsed ? item.name : undefined}
               >
                 <Icon className="w-[15px] h-[15px]" />
@@ -947,6 +1004,7 @@ function MainAppShell({ children }: AppLayoutProps) {
                   : 'text-muted-foreground hover:bg-foreground/5 hover:text-foreground',
                 sidebarCollapsed && 'w-8 !px-0 !gap-0 mx-auto justify-center'
               )}
+              aria-label="Marketplace"
               title={sidebarCollapsed ? 'Marketplace' : undefined}
             >
               <NavSquares className="w-[15px] h-[15px]" />
@@ -1041,6 +1099,7 @@ function MainAppShell({ children }: AppLayoutProps) {
                     : 'text-muted-foreground hover:bg-foreground/5 hover:text-foreground',
                   sidebarCollapsed && 'w-8 !px-0 !gap-0 mx-auto justify-center',
                 )}
+                aria-label="Settings"
                 title={sidebarCollapsed ? 'Settings' : undefined}
               >
                 <NavGear className="w-[15px] h-[15px]" />
@@ -1090,6 +1149,7 @@ function MainAppShell({ children }: AppLayoutProps) {
               'rounded-md flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-foreground/5 transition-colors',
               sidebarCollapsed ? 'w-7 h-7 mt-0.5' : 'w-full h-7 mt-1 gap-1.5 px-2 text-[11px]',
             )}
+            aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
             title={sidebarCollapsed ? 'Expand sidebar (⌘B)' : 'Collapse sidebar (⌘B)'}
           >
             <NavCollapse className={cn('w-[14px] h-[14px]', sidebarCollapsed && 'rotate-180')} />

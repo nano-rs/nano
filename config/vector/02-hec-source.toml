@@ -26,9 +26,18 @@ source = '''
 # valid_tokens on the source already enforced auth — mark and move on.
 .auth_status = "authenticated"
 
-# Pull Splunk's sourcetype into our canonical source_type field.
+# Vector's `splunk_hec` source emits the envelope's sourcetype as
+# `.splunk_sourcetype` (prefixed to avoid collisions with the event's
+# own fields — Vector 0.50+). Earlier versions used `.sourcetype`.
+# Check both so we work across versions. (NAN-924)
 source_type = "unknown"
-if exists(.sourcetype) {
+if exists(.splunk_sourcetype) {
+    st = to_string(.splunk_sourcetype) ?? ""
+    if st != "" {
+        source_type = downcase(st)
+    }
+}
+if source_type == "unknown" && exists(.sourcetype) {
     st = to_string(.sourcetype) ?? ""
     if st != "" {
         source_type = downcase(st)

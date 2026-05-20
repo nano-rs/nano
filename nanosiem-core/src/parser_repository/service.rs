@@ -476,20 +476,20 @@ impl ParserRepositoryService {
             .clone()
             .unwrap_or_else(|| parser.name.clone().unwrap_or_else(|| path.to_string()));
 
-        // match_values: source_type values that route to this parser.
-        // Priority: explicit request override > YAML match_values > parser name fallback.
+        // match_values: union the UI's `source_type` override (parser name
+        // by default), the YAML's `match_values` list, and the parser's
+        // canonical name as a fallback. See `resolve_match_values` for the
+        // ordering rationale. NAN-920.
         let parsed_yaml = super::yaml_parser::parse_parser_yaml(&parser.raw_content).ok();
-        let match_values = if let Some(ref st) = req.source_type {
-            vec![st.clone()]
-        } else if let Some(mv) = parsed_yaml.as_ref().and_then(|y| y.match_values.clone()) {
-            if !mv.is_empty() {
-                mv
-            } else {
-                vec![parser.name.clone().unwrap_or_else(|| "unknown".to_string())]
-            }
-        } else {
-            vec![parser.name.clone().unwrap_or_else(|| "unknown".to_string())]
-        };
+        let yaml_match_values = parsed_yaml
+            .as_ref()
+            .and_then(|y| y.match_values.clone())
+            .unwrap_or_default();
+        let match_values = Self::resolve_match_values(
+            req.source_type.as_deref(),
+            &yaml_match_values,
+            parser.name.as_deref(),
+        );
 
         // ingestion_method: how logs arrive (routed, kafka, aws_s3, etc.)
         let ingestion_method = req
@@ -884,13 +884,23 @@ impl ParserRepositoryService {
                 Ok(p) => p,
                 Err(_) => continue,
             };
-            let yaml_mv = match parsed.match_values {
-                Some(ref mv) if !mv.is_empty() => mv,
-                _ => continue,
-            };
+            // Use the same union logic as import_parser so periodic sync
+            // doesn't clobber the parser's canonical name from match_values.
+            // We don't track the original UI-provided source_type override
+            // across syncs, so we pass None — the parser's name (from the
+            // YAML's `name:` field) is what we anchor on. NAN-920.
+            let yaml_match_values = parsed.match_values.clone().unwrap_or_default();
+            let resolved = Self::resolve_match_values(
+                None,
+                &yaml_match_values,
+                Some(parsed.name.as_str()),
+            );
+            if resolved.is_empty() {
+                continue;
+            }
 
             let update = crate::log_sources::UpdateLogSource {
-                match_values: Some(yaml_mv.clone()),
+                match_values: Some(resolved),
                 ..Default::default()
             };
             if let Err(e) = ls_repo.update(*log_source_id, &update).await {
@@ -913,6 +923,53 @@ impl ParserRepositoryService {
     // Helpers
     // =========================================================================
 
+    /// NAN-920: build the `match_values` list for an imported / re-synced
+    /// log source. We union three sources, dedup-preserving order:
+    ///
+    /// 1. UI override (`req.source_type`) — when present, lands first so
+    ///    the parser's canonical identifier is the primary entry.
+    /// 2. YAML's `match_values` — legacy aliases that drive OOTB routing
+    ///    rule targets (e.g. apache_http_server's YAML declares
+    ///    `[apache, apache_access, apache_error]`; without these, HEC's
+    ///    seeded rules with target `apache` would render as orphans).
+    /// 3. Parser name fallback — last-resort identifier when neither of
+    ///    the above produced any entries.
+    ///
+    /// Falls back to `["unknown"]` if all sources are empty (e.g. a
+    /// minimal parser YAML with no name and no UI input).
+    pub(super) fn resolve_match_values(
+        ui_source_type: Option<&str>,
+        yaml_match_values: &[String],
+        parser_name: Option<&str>,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let push = |out: &mut Vec<String>,
+                    seen: &mut std::collections::HashSet<String>,
+                    value: &str| {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+                out.push(trimmed.to_string());
+            }
+        };
+
+        if let Some(st) = ui_source_type {
+            push(&mut out, &mut seen, st);
+        }
+        for alias in yaml_match_values {
+            push(&mut out, &mut seen, alias);
+        }
+        if out.is_empty() {
+            if let Some(n) = parser_name {
+                push(&mut out, &mut seen, n);
+            }
+        }
+        if out.is_empty() {
+            out.push("unknown".to_string());
+        }
+        out
+    }
+
     fn validate_url(&self, url: &str) -> Result<(), ParserRepositoryError> {
         let normalized = url
             .trim_end_matches('/')
@@ -930,5 +987,85 @@ impl ParserRepositoryService {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// NAN-920: a UI source_type override (e.g. parser name) plus YAML
+    /// match_values aliases unions cleanly with the override first and
+    /// no duplicates.
+    #[test]
+    fn resolve_match_values_unions_ui_override_and_yaml_aliases() {
+        let result = ParserRepositoryService::resolve_match_values(
+            Some("apache_http_server"),
+            &["apache".into(), "apache_access".into(), "apache_error".into()],
+            Some("apache_http_server"),
+        );
+        assert_eq!(
+            result,
+            vec![
+                "apache_http_server".to_string(),
+                "apache".to_string(),
+                "apache_access".to_string(),
+                "apache_error".to_string(),
+            ]
+        );
+    }
+
+    /// Dedups when the UI override appears in YAML match_values too —
+    /// preserves first-occurrence ordering.
+    #[test]
+    fn resolve_match_values_dedups_when_override_is_in_yaml() {
+        let result = ParserRepositoryService::resolve_match_values(
+            Some("apache"),
+            &["apache".into(), "apache_access".into()],
+            Some("apache"),
+        );
+        assert_eq!(result, vec!["apache".to_string(), "apache_access".to_string()]);
+    }
+
+    /// Fixup path: no UI override (None), parser name + YAML aliases.
+    #[test]
+    fn resolve_match_values_fixup_path_includes_parser_name_if_no_yaml_match() {
+        let result =
+            ParserRepositoryService::resolve_match_values(None, &[], Some("custom_parser"));
+        assert_eq!(result, vec!["custom_parser".to_string()]);
+    }
+
+    /// Fixup path with YAML aliases that already include the parser name —
+    /// doesn't duplicate.
+    #[test]
+    fn resolve_match_values_fixup_path_with_yaml_aliases() {
+        let result = ParserRepositoryService::resolve_match_values(
+            None,
+            &["apache_http_server".into(), "apache".into()],
+            Some("apache_http_server"),
+        );
+        assert_eq!(
+            result,
+            vec!["apache_http_server".to_string(), "apache".to_string()]
+        );
+    }
+
+    /// Empty / whitespace-only entries are skipped, never end up in the
+    /// list. Guards against bad YAML.
+    #[test]
+    fn resolve_match_values_skips_empty_and_whitespace_entries() {
+        let result = ParserRepositoryService::resolve_match_values(
+            Some(""),
+            &["".into(), "   ".into(), "apache".into()],
+            Some(""),
+        );
+        assert_eq!(result, vec!["apache".to_string()]);
+    }
+
+    /// Last-resort fallback when literally everything is empty: ["unknown"].
+    #[test]
+    fn resolve_match_values_falls_back_to_unknown() {
+        let result = ParserRepositoryService::resolve_match_values(None, &[], None);
+        assert_eq!(result, vec!["unknown".to_string()]);
     }
 }
