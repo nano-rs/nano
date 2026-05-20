@@ -48,6 +48,8 @@ impl LogSourceVersionRepository {
         created_by: Option<Uuid>,
         change_reason: &str,
         reverted_from: Option<i32>,
+        extension_vrl: Option<&str>,
+        extension_enabled: bool,
     ) -> Result<LogSourceVersion, LogSourceVersionError> {
         let mut tx = self.pool.begin().await?;
 
@@ -74,10 +76,12 @@ impl LogSourceVersionRepository {
         let version: LogSourceVersion = sqlx::query_as(
             r#"INSERT INTO log_source_versions
                (log_source_id, version_number, parser_vrl, output_fields, is_active,
-                created_by, change_reason, reverted_from_version)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                created_by, change_reason, reverted_from_version,
+                extension_vrl, extension_enabled)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                RETURNING id, log_source_id, version_number, parser_vrl, output_fields,
-                         is_active, created_at, created_by, change_reason, reverted_from_version"#,
+                         is_active, created_at, created_by, change_reason, reverted_from_version,
+                         extension_vrl, extension_enabled"#,
         )
         .bind(log_source_id)
         .bind(next_version)
@@ -87,6 +91,8 @@ impl LogSourceVersionRepository {
         .bind(created_by)
         .bind(change_reason)
         .bind(reverted_from)
+        .bind(extension_vrl)
+        .bind(extension_enabled)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -101,7 +107,8 @@ impl LogSourceVersionRepository {
     ) -> Result<Option<LogSourceVersion>, LogSourceVersionError> {
         let version: Option<LogSourceVersion> = sqlx::query_as(
             r#"SELECT id, log_source_id, version_number, parser_vrl, output_fields,
-                      is_active, created_at, created_by, change_reason, reverted_from_version
+                      is_active, created_at, created_by, change_reason, reverted_from_version,
+                      extension_vrl, extension_enabled
                FROM log_source_versions
                WHERE log_source_id = $1 AND is_active = true"#,
         )
@@ -120,7 +127,8 @@ impl LogSourceVersionRepository {
     ) -> Result<Vec<LogSourceVersion>, LogSourceVersionError> {
         let versions: Vec<LogSourceVersion> = sqlx::query_as(
             r#"SELECT id, log_source_id, version_number, parser_vrl, output_fields,
-                      is_active, created_at, created_by, change_reason, reverted_from_version
+                      is_active, created_at, created_by, change_reason, reverted_from_version,
+                      extension_vrl, extension_enabled
                FROM log_source_versions
                WHERE log_source_id = $1
                ORDER BY version_number DESC
@@ -141,7 +149,8 @@ impl LogSourceVersionRepository {
     ) -> Result<LogSourceVersion, LogSourceVersionError> {
         let version: LogSourceVersion = sqlx::query_as(
             r#"SELECT id, log_source_id, version_number, parser_vrl, output_fields,
-                      is_active, created_at, created_by, change_reason, reverted_from_version
+                      is_active, created_at, created_by, change_reason, reverted_from_version,
+                      extension_vrl, extension_enabled
                FROM log_source_versions
                WHERE id = $1"#,
         )

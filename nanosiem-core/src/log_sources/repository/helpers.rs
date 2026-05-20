@@ -51,6 +51,8 @@ pub(crate) fn row_to_log_source(row: &sqlx::postgres::PgRow) -> LogSource {
         stale_threshold_minutes: row.get("stale_threshold_minutes"),
         sampling_ratio: row.try_get("sampling_ratio").unwrap_or(None),
         sampling_exclude_condition: row.try_get("sampling_exclude_condition").unwrap_or(None),
+        extension_vrl: row.try_get("extension_vrl").unwrap_or(None),
+        extension_enabled: row.try_get("extension_enabled").unwrap_or(false),
         parser_only: row.try_get("parser_only").unwrap_or(false),
         source_parser_repository_id: row.try_get("source_parser_repository_id").unwrap_or(None),
         source_parser_path: row.try_get("source_parser_path").unwrap_or(None),

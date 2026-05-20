@@ -908,12 +908,18 @@ class ApiClient {
     return this._tuning.getProposal(id);
   }
 
-  async approveTuningProposal(id: string, opts?: { comment?: string; modified_query?: string }): Promise<void> {
+  async approveTuningProposal(
+    id: string,
+    opts?: { comment?: string; modified_query?: string },
+  ): Promise<import('@/enterprise/api/tuning').ApprovalResponse> {
     return this._tuning.approveProposal(id, opts);
   }
 
-  async rejectTuningProposal(id: string, notes?: string): Promise<void> {
-    return this._tuning.rejectProposal(id, notes);
+  async rejectTuningProposal(
+    id: string,
+    reason: string,
+  ): Promise<import('@/enterprise/api/tuning').RejectionResponse> {
+    return this._tuning.rejectProposal(id, reason);
   }
 
   // Cases
@@ -1336,8 +1342,12 @@ class ApiClient {
     return this._logSources.validateLogSourceVrl(vrlCode);
   }
 
-  async testLogSourceVrl(vrlCode: string, sampleLog: string): Promise<import('./types').LogSourceTestResult> {
-    return this._logSources.testLogSourceVrl(vrlCode, sampleLog);
+  async testLogSourceVrl(
+    vrlCode: string,
+    sampleLog: string,
+    extensionVrl?: string,
+  ): Promise<import('./types').LogSourceTestResult> {
+    return this._logSources.testLogSourceVrl(vrlCode, sampleLog, extensionVrl);
   }
 
   async testLogSourceVrlLive(vrlCode: string, sourceType: string, currentVrl?: string, limit?: number): Promise<import('./types').LiveTestResult[]> {

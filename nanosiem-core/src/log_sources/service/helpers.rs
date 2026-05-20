@@ -91,6 +91,8 @@ pub(super) fn log_source_to_parser(ls: LogSource) -> Parser {
         category: ls.category,
         vendor: ls.vendor,
         product: ls.product,
+        extension_vrl: ls.extension_vrl,
+        extension_enabled: ls.extension_enabled,
         created_at: ls.created_at,
         updated_at: ls.updated_at,
     }

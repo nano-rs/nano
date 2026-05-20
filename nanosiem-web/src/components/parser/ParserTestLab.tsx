@@ -20,7 +20,6 @@ import {
   Database,
   Loader2,
   FlaskConical,
-  Pencil,
   Clipboard,
   CircleCheck,
   XCircle,
@@ -36,6 +35,12 @@ interface ParserTestLabProps {
   vrlCode: string;
   sourceType: string;
   currentDeployedVrl?: string;
+  /**
+   * NAN-874: when present, the paste test runs `vrlCode → extensionVrl` as a chain
+   * (matches the production extension pipeline). Live test is hidden in this mode
+   * pending chain-aware comparison support on the backend.
+   */
+  extensionVrl?: string;
 }
 
 /** Key fields to preview in collapsed row — shown as badges */
@@ -55,7 +60,7 @@ function FieldGrid({
   ])].sort();
 
   if (allKeys.length === 0) {
-    return <p className="text-xs text-muted-foreground p-3">No fields extracted</p>;
+    return <p className="text-[11px] text-muted-foreground p-3">No fields extracted</p>;
   }
 
   // Separate changed vs unchanged fields
@@ -201,19 +206,19 @@ function EventRowHeader({
   );
 }
 
-export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl }: ParserTestLabProps) {
+export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl, extensionVrl }: ParserTestLabProps) {
   const { toast } = useToast();
   const { mutate: testVrl, loading: testLoading } = useTestLogSourceVrl();
   const { mutate: testVrlLive, loading: liveLoading } = useTestLogSourceVrlLive();
 
-  // Paste test state
+  // Paste test state — each non-blank line is tested as a separate event.
   const [pasteInput, setPasteInput] = useState('');
-  const [isInputMode, setIsInputMode] = useState(true);
-  const [pasteResult, setPasteResult] = useState<{
+  const [pasteResults, setPasteResults] = useState<Array<{
+    input: string;
     success: boolean;
     output?: Record<string, unknown>;
     error?: string;
-  } | null>(null);
+  }> | null>(null);
 
   // Live events state
   const [liveResults, setLiveResults] = useState<LiveTestResult[] | null>(null);
@@ -224,14 +229,34 @@ export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl }: Parse
   const liveFailed = liveResults ? liveResults.length - livePassed : 0;
 
   const handlePasteTest = async () => {
-    if (!pasteInput.trim()) {
-      toast({ title: 'No input', description: 'Paste a raw log to test', variant: 'destructive' });
+    // Split on newlines — every non-blank line is its own event. Pasting 5
+    // log lines runs 5 separate tests, not 1 collapsed test. Cap to keep a
+    // runaway paste from fanning out 100+ concurrent backend calls.
+    const MAX_PASTE_EVENTS = 20;
+    const lines = pasteInput.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
+    if (lines.length === 0) {
+      toast({ title: 'No input', description: 'Paste one or more raw events to test', variant: 'destructive' });
       return;
     }
+    const capped = lines.slice(0, MAX_PASTE_EVENTS);
+    if (lines.length > MAX_PASTE_EVENTS) {
+      toast({
+        title: `Capped at ${MAX_PASTE_EVENTS} events`,
+        description: `Testing the first ${MAX_PASTE_EVENTS} of ${lines.length} lines.`,
+      });
+    }
     try {
-      const result = await testVrl({ vrlCode, sampleLog: pasteInput });
-      setPasteResult(result);
-      setIsInputMode(false);
+      const results = await Promise.all(
+        capped.map((line) =>
+          testVrl({ vrlCode, sampleLog: line, extensionVrl }).then((r) => ({
+            input: line,
+            success: r.success,
+            output: r.output as Record<string, unknown> | undefined,
+            error: r.error ?? undefined,
+          })),
+        ),
+      );
+      setPasteResults(results);
     } catch (err) {
       toast({ title: 'Test error', description: err instanceof Error ? err.message : 'Failed to test', variant: 'destructive' });
     }
@@ -266,23 +291,23 @@ export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl }: Parse
     }
   };
 
-  const pasteFields = extractFields(pasteResult?.output);
-  const pasteFieldCount = Object.keys(pasteFields).length;
+  const pastePassed = pasteResults?.filter((r) => r.success).length ?? 0;
+  const pasteFailed = pasteResults ? pasteResults.length - pastePassed : 0;
 
   return (
     <div className="bg-card border-0 flex flex-col h-full min-h-0 overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-border shrink-0">
+      <div className="flex items-center justify-between px-4 py-2.5 border-b border-border shrink-0">
         <div className="flex items-center gap-2">
-          <FlaskConical className="w-4 h-4 text-muted-foreground" />
-          <span className="font-semibold text-foreground text-sm">Test Lab</span>
+          <FlaskConical className="w-3.5 h-3.5 text-muted-foreground" />
+          <span className="text-[11.5px] font-medium text-foreground">Test Lab</span>
           {liveResults && (
-            <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+            <div className="flex items-center gap-1.5 font-mono text-[10.5px] text-muted-foreground">
               <span className="text-green-400">{livePassed}</span>
               <span>/</span>
               <span>{liveResults.length}</span>
               {liveFailed > 0 && (
-                <Badge variant="destructive" className="text-[10px] rounded-md px-1 py-0">
+                <Badge variant="destructive" className="text-[9.5px] rounded-md px-1 py-0 font-mono">
                   {liveFailed}
                 </Badge>
               )}
@@ -294,8 +319,13 @@ export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl }: Parse
             size="sm"
             variant="outline"
             onClick={handleLiveTest}
-            disabled={liveLoading}
-            className="h-7 text-xs rounded-lg border-border gap-1"
+            disabled={liveLoading || !!extensionVrl}
+            title={
+              extensionVrl
+                ? 'Live test against deployed events is not yet supported for parser extensions — use paste mode'
+                : undefined
+            }
+            className="h-7 text-[11.5px] rounded-md border-border gap-1"
           >
             {liveLoading ? (
               <Loader2 className="w-3 h-3 animate-spin" />
@@ -304,8 +334,8 @@ export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl }: Parse
             )}
             {liveLoading ? 'Fetching...' : 'Fetch Events'}
           </Button>
-          <Select value={liveLimit} onValueChange={setLiveLimit}>
-            <SelectTrigger className="w-16 h-7 text-xs rounded-lg border-border">
+          <Select value={liveLimit} onValueChange={setLiveLimit} disabled={!!extensionVrl}>
+            <SelectTrigger className="w-16 h-7 text-[11.5px] rounded-md border-border">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -319,7 +349,7 @@ export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl }: Parse
 
       {/* Live event results */}
       <ScrollArea className="flex-1 min-h-0">
-        <div className="p-3 space-y-2">
+        <div className="p-3 space-y-3">
           {liveResults ? (
             liveResults.map((result, idx) => {
               const isExpanded = expandedResult === idx;
@@ -330,7 +360,7 @@ export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl }: Parse
               return (
                 <div
                   key={idx}
-                  className={`rounded-xl border bg-background overflow-hidden ${
+                  className={`rounded-md border bg-background overflow-hidden ${
                     result.new_parse.success ? 'border-border' : 'border-red-500/30'
                   }`}
                   style={{
@@ -360,96 +390,101 @@ export function ParserTestLab({ vrlCode, sourceType, currentDeployedVrl }: Parse
                 </div>
               );
             })
-          ) : (
-            <div className="text-center py-12 text-xs text-muted-foreground">
-              Click <strong>Fetch Events</strong> to test against real ingested data
+          ) : !pasteResults ? (
+            <div className="text-center py-12 text-[11px] text-muted-foreground/80">
+              Click <strong className="text-foreground/80">Fetch Events</strong> to test against real ingested data
             </div>
-          )}
+          ) : null}
 
-          {/* Paste result card — shown when user has pasted and run */}
-          {pasteResult && !isInputMode && (
-            <div
-              className={`rounded-xl border bg-background overflow-hidden ${
-                pasteResult.success ? 'border-border' : 'border-red-500/30'
-              }`}
-              style={{
-                borderLeftWidth: '3px',
-                borderLeftColor: pasteResult.success ? 'rgb(74 222 128)' : 'rgb(248 113 113)',
-              }}
-            >
-              <div className="flex items-center gap-2 px-3 py-2">
-                {pasteResult.success ? (
-                  <CircleCheck className="w-3.5 h-3.5 text-green-400 shrink-0" />
-                ) : (
-                  <XCircle className="w-3.5 h-3.5 text-red-400 shrink-0" />
-                )}
-                <span className="text-xs text-muted-foreground">Custom log</span>
-                <Badge variant="secondary" className="text-[10px] px-1.5 py-0 rounded font-mono">
-                  {pasteFieldCount}
-                </Badge>
-              </div>
-              <div className="border-t border-border/40">
-                <div className="px-3 py-1.5 bg-muted/20 border-b border-border/20">
-                  <p className="text-[10px] text-muted-foreground font-mono leading-relaxed break-all line-clamp-2">
-                    {pasteInput}
-                  </p>
+          {/* Paste result cards — one per non-blank input line, rendered after the live results */}
+          {pasteResults && pasteResults.map((r, idx) => {
+            const fields = extractFields(r.output);
+            const fieldCount = Object.keys(fields).length;
+            return (
+              <div
+                key={idx}
+                className={`rounded-md border bg-background overflow-hidden ${
+                  r.success ? 'border-border' : 'border-red-500/30'
+                }`}
+                style={{
+                  borderLeftWidth: '3px',
+                  borderLeftColor: r.success ? 'rgb(74 222 128)' : 'rgb(248 113 113)',
+                }}
+              >
+                <div className="flex items-center gap-2 px-3 py-2">
+                  {r.success ? (
+                    <CircleCheck className="w-3.5 h-3.5 text-green-400 shrink-0" />
+                  ) : (
+                    <XCircle className="w-3.5 h-3.5 text-red-400 shrink-0" />
+                  )}
+                  <span className="font-mono text-[10.5px] text-muted-foreground">
+                    Event {idx + 1}
+                  </span>
+                  <Badge variant="secondary" className="text-[9.5px] px-1.5 py-0 rounded font-mono">
+                    {fieldCount}
+                  </Badge>
                 </div>
-                {pasteResult.error ? (
-                  <p className="text-red-400 text-xs px-3 py-2">{pasteResult.error}</p>
-                ) : (
-                  <FieldGrid newFields={pasteFields} />
-                )}
+                <div className="border-t border-border/40">
+                  <div className="px-3 py-1.5 bg-muted/20 border-b border-border/20">
+                    <p className="text-[10px] text-muted-foreground font-mono leading-relaxed break-all line-clamp-2">
+                      {r.input}
+                    </p>
+                  </div>
+                  {r.error ? (
+                    <p className="text-red-400 text-[11px] px-3 py-2">{r.error}</p>
+                  ) : (
+                    <FieldGrid newFields={fields} />
+                  )}
+                </div>
               </div>
-            </div>
-          )}
+            );
+          })}
         </div>
       </ScrollArea>
 
-      {/* Paste input — pinned at bottom */}
+      {/* Paste input — pinned at bottom, always editable */}
       <div className="shrink-0 border-t border-border p-3">
         <div className="flex items-center gap-2 mb-2">
           <Clipboard className="w-3 h-3 text-muted-foreground" />
-          <span className="text-[11px] text-muted-foreground font-medium">Paste Raw Log</span>
-          {!isInputMode && (
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-5 text-[10px] text-muted-foreground hover:text-foreground gap-1 px-1.5"
-              onClick={() => setIsInputMode(true)}
-            >
-              <Pencil className="w-2.5 h-2.5" />
-              Edit
-            </Button>
+          <span className="font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+            Paste raw logs (one per line)
+          </span>
+          {pasteResults && pasteResults.length > 0 && (
+            <span className="font-mono text-[10px] text-muted-foreground/80">
+              <span className="text-green-400">{pastePassed}</span>
+              <span className="text-muted-foreground/60"> / </span>
+              <span>{pasteResults.length}</span>
+              {pasteFailed > 0 && (
+                <span className="text-red-400"> · {pasteFailed} failed</span>
+              )}
+            </span>
           )}
         </div>
-        {isInputMode ? (
-          <div className="flex gap-2">
-            <textarea
-              className="flex-1 bg-background font-mono text-xs text-foreground p-2 rounded-lg border border-border resize-none outline-none placeholder:text-muted-foreground/50 h-[60px]"
-              placeholder="Paste log here... (Cmd+Enter to run)"
-              value={pasteInput}
-              onChange={(e) => setPasteInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              spellCheck={false}
-            />
-            <Button
-              size="sm"
-              className="h-[60px] rounded-lg px-3"
-              onClick={handlePasteTest}
-              disabled={testLoading || !pasteInput.trim()}
-            >
-              {testLoading ? (
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              ) : (
+        <div className="flex gap-2 items-start">
+          <textarea
+            className="flex-1 bg-background font-mono text-[11px] text-foreground p-2 rounded-md border border-border resize-y outline-none placeholder:text-muted-foreground/50 min-h-[100px] max-h-[320px] focus:min-h-[160px] transition-[min-height] duration-150 focus:border-primary focus:ring-1 focus:ring-primary/30"
+            placeholder="Paste 1+ raw events, one per line. Cmd/Ctrl+Enter to run."
+            value={pasteInput}
+            onChange={(e) => setPasteInput(e.target.value)}
+            onKeyDown={handleKeyDown}
+            spellCheck={false}
+          />
+          <Button
+            size="sm"
+            className="h-8 shrink-0 rounded-md px-3 text-[11.5px]"
+            onClick={handlePasteTest}
+            disabled={testLoading || !pasteInput.trim()}
+          >
+            {testLoading ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : (
+              <>
                 <Play className="w-3.5 h-3.5" />
-              )}
-            </Button>
-          </div>
-        ) : (
-          <p className="text-[10px] text-muted-foreground font-mono truncate">
-            {pasteInput.slice(0, 100)}{pasteInput.length > 100 ? '...' : ''}
-          </p>
-        )}
+                <span className="ml-1.5">{pasteResults ? 'Re-test' : 'Test'}</span>
+              </>
+            )}
+          </Button>
+        </div>
       </div>
     </div>
   );

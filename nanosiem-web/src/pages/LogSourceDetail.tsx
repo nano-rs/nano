@@ -68,6 +68,8 @@ import {
 } from '@/hooks/use-api';
 
 import { VrlEditor } from '@/components/editor';
+import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from '@/components/ui/resizable';
+import { useDefaultLayout } from 'react-resizable-panels';
 import { computeDiff, type DiffLine, type VrlUpdateInfo } from '@/lib/parser-diff';
 import { ParserTestLab } from '@/components/parser/ParserTestLab';
 import { Markdown } from '@/components/ui/markdown';
@@ -118,7 +120,7 @@ const CATEGORY_OPTIONS = [
   { value: 'system', label: 'System' },
 ];
 
-const TAB_IDS = ['overview', 'config', 'vrl', 'deployments', 'versions'] as const;
+const TAB_IDS = ['overview', 'config', 'vrl', 'extension', 'deployments', 'versions'] as const;
 type TabId = (typeof TAB_IDS)[number];
 function isTabId(value: string | null): value is TabId {
   return value !== null && (TAB_IDS as readonly string[]).includes(value);
@@ -656,6 +658,20 @@ export function LogSourceDetail() {
               onAiVrlUpdate={handleAiVrlUpdate}
             />
           )}
+          {activeTab === 'extension' && (
+            <ExtensionTab
+              source={logSource}
+              updating={updating}
+              onSave={async ({ extension_vrl, extension_enabled }) => {
+                await updateLogSource({
+                  id: logSource.id,
+                  data: { extension_vrl, extension_enabled },
+                });
+                refetch();
+                refetchDraftStatus();
+              }}
+            />
+          )}
           {activeTab === 'deployments' && <DeploymentsTab deployments={deployments ?? null} />}
           {activeTab === 'versions' && (
             <VersionsTab
@@ -1045,6 +1061,7 @@ function TabNav({ active, onChange }: { active: TabId; onChange: (id: TabId) => 
     { id: 'overview', label: 'Overview' },
     { id: 'config', label: 'Configuration' },
     { id: 'vrl', label: 'VRL editor' },
+    { id: 'extension', label: 'Extension' },
     { id: 'deployments', label: 'Deployments' },
     { id: 'versions', label: 'Versions' },
   ];
@@ -2412,12 +2429,21 @@ function LogSourceAiPanel({
   onVrlUpdate,
   onUndo,
   canUndo,
+  mode = 'parser',
+  baseParserVrl,
 }: {
   parserId: string;
   currentVrl: string;
   onVrlUpdate: (info: VrlUpdateInfo) => void;
   onUndo?: () => void;
   canUndo?: boolean;
+  /**
+   * NAN-874: when 'extension', the panel edits a parser EXTENSION overlay
+   * instead of the parser. The agent is given the OOTB parser as read-only
+   * context via `baseParserVrl` so it targets the right field names.
+   */
+  mode?: 'parser' | 'extension';
+  baseParserVrl?: string;
 }) {
   const { toast } = useToast();
   const { data: melodStatus, loading: melodStatusLoading } = useMelodStatus();
@@ -2426,7 +2452,13 @@ function LogSourceAiPanel({
 
   const [messages, setMessages] = useState<AiChatMessage[]>([]);
   const [input, setInput] = useState('');
-  const storageKey = `melod-session-parser-${parserId}`;
+  // Optional sample-log input (Play-icon toggles visibility). When non-empty,
+  // each non-blank line is passed to melodEditParser as `sample_logs` so the
+  // agent sees actual event shapes AND the runtime-retry loop validates the
+  // proposed VRL against them.
+  const [sampleLogs, setSampleLogs] = useState('');
+  const [showSampleInput, setShowSampleInput] = useState(false);
+  const storageKey = `melod-session-${mode}-${parserId}`;
   const [sessionId, setSessionId] = useState<string | undefined>(
     () => localStorage.getItem(storageKey) ?? undefined,
   );
@@ -2446,12 +2478,23 @@ function LogSourceAiPanel({
     setMessages((prev) => [...prev, { role: 'user', content: userMessage }]);
 
     try {
+      const sampleLogsArray = sampleLogs
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0);
       const response = await editParserJob.start(() =>
         api.melodEditParser({
           parser_id: parserId,
           current_vrl: currentVrl,
           message: userMessage,
           session_id: sessionId,
+          ...(sampleLogsArray.length > 0
+            ? { sample_logs: sampleLogsArray }
+            : {}),
+          // NAN-874: only send base_parser_vrl when editing an extension overlay.
+          ...(mode === 'extension' && baseParserVrl
+            ? { base_parser_vrl: baseParserVrl }
+            : {}),
         }),
       );
       if (response.session_id) {
@@ -2513,9 +2556,19 @@ function LogSourceAiPanel({
         <div className="rounded-md bg-primary/[0.06] border border-primary/20 p-2.5 flex items-start gap-2">
           <PivtIcon className="w-3.5 h-3.5 text-primary shrink-0 mt-0.5" />
           <div className="text-[11px] text-foreground/80 leading-relaxed">
-            <span className="font-medium text-foreground">pivt has full context of this parser</span> —{' '}
-            <span className="font-mono text-[10.5px]">{lineCount}</span> lines. Ask for edits, explanations, or test
-            cases.
+            {mode === 'extension' ? (
+              <>
+                <span className="font-medium text-foreground">pivt is editing your extension overlay</span> —{' '}
+                <span className="font-mono text-[10.5px]">{lineCount}</span> lines. The OOTB parser is in pivt's
+                context as read-only reference; edits here only touch the extension.
+              </>
+            ) : (
+              <>
+                <span className="font-medium text-foreground">pivt has full context of this parser</span> —{' '}
+                <span className="font-mono text-[10.5px]">{lineCount}</span> lines. Ask for edits, explanations, or
+                test cases.
+              </>
+            )}
           </div>
         </div>
 
@@ -2546,7 +2599,34 @@ function LogSourceAiPanel({
             </button>
           ))}
         </div>
+        {showSampleInput && (
+          <div className="mb-2">
+            <label className="mb-1 block font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+              Sample logs (one per line)
+            </label>
+            <Textarea
+              value={sampleLogs}
+              onChange={(e) => setSampleLogs(e.target.value)}
+              placeholder="Paste 1–5 raw events. pivt sees these and the retry loop validates against them."
+              rows={3}
+              className="resize-none min-h-[64px] max-h-[160px] px-2.5 py-1.5 rounded-md border border-border bg-card font-mono text-[11px] focus:border-primary focus:outline-none focus-visible:ring-0"
+            />
+          </div>
+        )}
         <div className="flex items-end gap-2">
+          <button
+            type="button"
+            onClick={() => setShowSampleInput((v) => !v)}
+            title={showSampleInput ? 'Hide sample logs' : 'Add sample logs for pivt'}
+            className={cn(
+              'h-[34px] w-[34px] shrink-0 flex items-center justify-center rounded-md border transition-colors',
+              showSampleInput
+                ? 'border-primary/40 bg-primary/15 text-primary'
+                : 'border-border bg-card text-muted-foreground hover:text-foreground hover:border-primary/40',
+            )}
+          >
+            <Play className="w-3.5 h-3.5" />
+          </button>
           <Textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
@@ -2680,6 +2760,214 @@ function ConfirmDialog({
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
+  );
+}
+
+// ============================================================================
+// Parser extension tab (NAN-874)
+// ============================================================================
+
+function ExtensionTab({
+  source,
+  updating,
+  onSave,
+}: {
+  source: LogSource;
+  updating: boolean;
+  onSave: (data: { extension_vrl: string; extension_enabled: boolean }) => Promise<void>;
+}) {
+  const { toast } = useToast();
+  const initialExt = source.extension_vrl ?? '';
+  const [editedExt, setEditedExt] = useState(initialExt);
+  const [enabled, setEnabled] = useState<boolean>(source.extension_enabled ?? false);
+  const [sidePanelTab, setSidePanelTab] = useState<'ai' | 'test' | 'diag'>('test');
+  const [validationResult, setValidationResult] = useState<ValidationResult>(null);
+  const [validating, setValidating] = useState(false);
+  const [validatedJustNow, setValidatedJustNow] = useState(false);
+
+  // Persist the editor/side-panel split across reloads.
+  const extLayout = useDefaultLayout({
+    id: 'logsource-extension-tab-v1',
+    panelIds: ['extension-editor', 'extension-side-panel'],
+    storage: typeof window !== 'undefined' ? window.localStorage : undefined,
+  });
+
+  // Reset when navigating to a different log_source.
+  useEffect(() => {
+    setEditedExt(source.extension_vrl ?? '');
+    setEnabled(source.extension_enabled ?? false);
+    setValidationResult(null);
+    setValidatedJustNow(false);
+  }, [source.id, source.extension_vrl, source.extension_enabled]);
+
+  const dirty =
+    editedExt !== (source.extension_vrl ?? '') || enabled !== (source.extension_enabled ?? false);
+  const isStub = !source.parser_vrl || source.parser_vrl.trim() === '';
+
+  const handleValidate = async () => {
+    setValidating(true);
+    setValidatedJustNow(false);
+    try {
+      const result = await api.validateLogSourceVrl(editedExt);
+      setValidationResult({ valid: result.valid, errors: result.errors });
+      setValidatedJustNow(true);
+      setTimeout(() => setValidatedJustNow(false), 3000);
+      if (!result.valid) {
+        // Auto-switch to Diagnostics so the user sees the errors.
+        setSidePanelTab('diag');
+      }
+    } catch (err) {
+      toast({
+        title: 'Validation failed',
+        description: err instanceof Error ? err.message : 'Unable to validate',
+        variant: 'destructive',
+      });
+    } finally {
+      setValidating(false);
+    }
+  };
+
+  const handleSave = async () => {
+    try {
+      await onSave({ extension_vrl: editedExt, extension_enabled: enabled });
+      toast({
+        title: 'Extension saved',
+        description:
+          'Draft updated. Publish a new version and redeploy to push the extension to Vector.',
+      });
+    } catch (err) {
+      toast({
+        title: 'Save failed',
+        description: err instanceof Error ? err.message : 'Unable to save',
+        variant: 'destructive',
+      });
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-full min-h-0">
+      {/* Toolbar — same shape as VrlEditorTab */}
+      <div className="shrink-0 flex items-center gap-2 px-4 py-2 border-b border-border bg-card/40">
+        <div className="flex items-center gap-2 min-w-0">
+          <PivtIcon className="w-3.5 h-3.5 text-muted-foreground" />
+          <span className="text-[11.5px] font-mono text-foreground truncate">
+            {effectiveSourceType(source)}.ext.vrl
+          </span>
+          <span className="text-[9.5px] font-mono uppercase tracking-[0.14em] text-muted-foreground/70">
+            VRL · extension
+          </span>
+          {isStub && (
+            <span className="font-mono text-[10px] text-muted-foreground/80">
+              (stub — extension IS the parser)
+            </span>
+          )}
+          {dirty && (
+            <span className="inline-flex items-center gap-1 text-[10px] font-mono text-amber-500 bg-amber-500/15 rounded px-1.5 py-0.5">
+              <span className="w-1 h-1 rounded-full bg-amber-500" />
+              UNSAVED
+            </span>
+          )}
+        </div>
+        <div className="flex-1" />
+        <label className="flex items-center gap-1.5 font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+          <Switch checked={enabled} onCheckedChange={setEnabled} disabled={updating} />
+          <span>Enabled</span>
+        </label>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-7 text-[11.5px] gap-1.5"
+          onClick={handleValidate}
+          disabled={validating}
+        >
+          {validating ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}
+          Validate
+        </Button>
+        <Button
+          size="sm"
+          className="h-7 text-[11.5px] gap-1.5"
+          onClick={handleSave}
+          disabled={!dirty || updating}
+        >
+          {updating ? <Loader2 className="w-3 h-3 animate-spin" /> : <Save className="w-3 h-3" />}
+          Save
+        </Button>
+        {validatedJustNow && !validating && validationResult?.valid && (
+          <span className="text-[10px] font-mono text-muted-foreground whitespace-nowrap ml-1">
+            <span className="text-emerald-500">✓</span> Validated
+          </span>
+        )}
+      </div>
+
+      {/* Resizable editor / side-panel split. extLayout persists drag position via localStorage. */}
+      <div className="flex-1 min-h-0">
+        <ResizablePanelGroup
+          orientation="horizontal"
+          defaultLayout={extLayout.defaultLayout}
+          onLayoutChanged={extLayout.onLayoutChanged}
+          className="divide-x divide-border"
+        >
+          <ResizablePanel id="extension-editor" defaultSize="58%" minSize="30%">
+            <div className="flex flex-col min-h-0 h-full bg-background">
+              <VrlEditor value={editedExt} onChange={setEditedExt} className="h-full" />
+            </div>
+          </ResizablePanel>
+
+          <ResizableHandle withHandle />
+
+          <ResizablePanel id="extension-side-panel" defaultSize="42%" minSize="22%">
+            <div className="flex flex-col min-h-0 h-full bg-card/40">
+              <div className="shrink-0 flex items-center gap-1 px-3 py-1.5 border-b border-border">
+                {([
+                  { id: 'ai', label: 'pivt', Icon: PivtIcon },
+                  { id: 'test', label: 'Test events', Icon: Play },
+                  { id: 'diag', label: 'Diagnostics', Icon: AlertTriangle },
+                ] as const).map((t) => {
+                  const Icon = t.Icon;
+                  const isActive = sidePanelTab === t.id;
+                  return (
+                    <button
+                      key={t.id}
+                      type="button"
+                      onClick={() => setSidePanelTab(t.id)}
+                      className={cn(
+                        'h-7 px-2.5 rounded text-[11px] flex items-center gap-1.5 transition-colors whitespace-nowrap',
+                        isActive ? 'text-foreground bg-foreground/[0.06]' : 'text-muted-foreground hover:text-foreground/80',
+                      )}
+                    >
+                      <Icon className="w-3 h-3" />
+                      {t.label}
+                    </button>
+                  );
+                })}
+              </div>
+              <div className="flex-1 min-h-0 overflow-hidden">
+                {/* Each panel mounts unconditionally so chat/test state survives tab switches. */}
+                <div className={cn('h-full', sidePanelTab === 'ai' ? 'block' : 'hidden')}>
+                  <LogSourceAiPanel
+                    parserId={source.id}
+                    currentVrl={editedExt}
+                    mode="extension"
+                    baseParserVrl={source.parser_vrl}
+                    onVrlUpdate={(info) => setEditedExt(info.newVrl)}
+                  />
+                </div>
+                <div className={cn('h-full overflow-auto', sidePanelTab === 'test' ? 'block' : 'hidden')}>
+                  <ParserTestLab
+                    vrlCode={source.parser_vrl}
+                    sourceType={effectiveSourceType(source)}
+                    extensionVrl={editedExt}
+                  />
+                </div>
+                <div className={cn('h-full overflow-auto', sidePanelTab === 'diag' ? 'block' : 'hidden')}>
+                  <DiagnosticsPanel result={validationResult} />
+                </div>
+              </div>
+            </div>
+          </ResizablePanel>
+        </ResizablePanelGroup>
+      </div>
+    </div>
   );
 }
 

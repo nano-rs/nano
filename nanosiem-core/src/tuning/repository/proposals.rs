@@ -118,6 +118,44 @@ impl TuningRepository {
         Ok(())
     }
 
+    /// Upgrade an open silent-rule proposal in place when the rule crosses to
+    /// a higher tier (NAN-880). Updates the descriptive fields without
+    /// resetting `created_at`, so the analyst sees how long the rule has been
+    /// queued and that it just escalated.
+    ///
+    /// Caller is responsible for ensuring the proposal is still in
+    /// `proposed` / `test_passed`; calling this on an actioned row is a no-op
+    /// but technically allowed.
+    pub async fn upgrade_silent_proposal(
+        &self,
+        proposal_id: Uuid,
+        rationale: &str,
+        confidence_score: f64,
+        changes_summary: &[String],
+    ) -> Result<()> {
+        let changes_summary_json = serde_json::to_value(changes_summary)
+            .context("Failed to serialize changes summary")?;
+
+        sqlx::query(
+            r#"
+            UPDATE tuning_proposals
+            SET rationale = $1,
+                confidence_score = $2,
+                changes_summary = $3
+            WHERE id = $4
+            "#,
+        )
+        .bind(rationale)
+        .bind(confidence_score)
+        .bind(changes_summary_json)
+        .bind(proposal_id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to upgrade silent proposal")?;
+
+        Ok(())
+    }
+
     /// List tuning proposals with optional filters
     ///
     /// # Arguments

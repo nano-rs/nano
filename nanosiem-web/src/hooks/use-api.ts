@@ -694,8 +694,16 @@ export function useValidateLogSourceVrl() {
 
 export function useTestLogSourceVrl() {
   return useMutation(
-    ({ vrlCode, sampleLog }: { vrlCode: string; sampleLog: string }) =>
-      api.testLogSourceVrl(vrlCode, sampleLog)
+    ({
+      vrlCode,
+      sampleLog,
+      extensionVrl,
+    }: {
+      vrlCode: string;
+      sampleLog: string;
+      /** NAN-874: when present, run vrlCode → extensionVrl as a chain. */
+      extensionVrl?: string;
+    }) => api.testLogSourceVrl(vrlCode, sampleLog, extensionVrl)
   );
 }
 
@@ -1148,6 +1156,23 @@ export function useArtifactDetail(artifact: string | undefined, window?: string)
   );
 }
 
+/**
+ * Reactive bulk-prevalence lookup. Used by the prevalence smart-search bar
+ * (NAN-871) to render header stats — host_count, first_seen, last_seen,
+ * prevalence_score, is_rare — for one or many artifacts in parallel with the
+ * facet-detail fetch. Pass `null` to skip the request.
+ */
+export function useArtifactLookup(artifacts: string[] | null, window?: string) {
+  const key = artifacts ? artifacts.join('|') : '';
+  return useQuery(
+    () =>
+      artifacts && artifacts.length > 0
+        ? api.getBulkPrevalence({ artifacts, window })
+        : Promise.resolve(null),
+    [key, window]
+  );
+}
+
 export function usePrevalenceScatterData() {
   return useMutation(api.getPrevalenceScatterData.bind(api));
 }
@@ -1409,7 +1434,9 @@ export function useApproveTuningProposal() {
 }
 
 export function useRejectTuningProposal() {
-  return useMutation(({ id, notes }: { id: string; notes?: string }) => api.rejectTuningProposal(id, notes));
+  return useMutation(({ id, reason }: { id: string; reason: string }) =>
+    api.rejectTuningProposal(id, reason)
+  );
 }
 
 // ============================================================================

@@ -201,6 +201,15 @@ pub struct LogSource {
     pub parser_vrl: String,
     pub output_fields: Option<serde_json::Value>,
 
+    // Parser extension (NAN-874): optional VRL overlay chained after _parse, before _output.
+    // When extension_vrl is set and extension_enabled is true, parser_config emits an extra
+    // {safe_name}_extension transform and rewires {safe_name}_output.inputs to consume it.
+    // Stub case: parser_vrl empty + extension set → extension IS the parser for this source_type.
+    #[serde(default)]
+    pub extension_vrl: Option<String>,
+    #[serde(default)]
+    pub extension_enabled: bool,
+
     // Metadata
     pub category: Option<String>,
     pub vendor: Option<String>,
@@ -325,6 +334,17 @@ pub struct UpdateLogSource {
     pub sampling_ratio: Option<f64>,
     /// VRL condition for events that are NEVER sampled. None = no change.
     pub sampling_exclude_condition: Option<String>,
+    /// Optional VRL overlay (NAN-874). Tri-state semantics enforced by
+    /// `repository::update`'s SQL CASE expression:
+    ///   - `None`           → column unchanged
+    ///   - `Some("")`       → column set to NULL (extension removed)
+    ///   - `Some(content)`  → column set to `content`
+    ///
+    /// JSON callers must omit the field entirely to mean "no change"; sending
+    /// an empty string is the explicit clear signal.
+    pub extension_vrl: Option<String>,
+    /// Toggle whether extension_vrl is included in deploys. None = no change.
+    pub extension_enabled: Option<bool>,
 }
 
 /// Log source with health metrics for list views
@@ -477,6 +497,12 @@ pub struct LogSourceVersion {
     pub created_by: Option<Uuid>,
     pub change_reason: String,
     pub reverted_from_version: Option<i32>,
+    /// Snapshot of extension_vrl at publish time (NAN-874).
+    #[serde(default)]
+    pub extension_vrl: Option<String>,
+    /// Snapshot of extension_enabled at publish time (NAN-874).
+    #[serde(default)]
+    pub extension_enabled: bool,
 }
 
 /// Log source with draft status information for the UI

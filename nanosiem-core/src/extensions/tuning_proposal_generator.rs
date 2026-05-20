@@ -30,4 +30,17 @@ pub trait TuningProposalGenerator: Send + Sync {
     /// tuning, when AI is disabled per-rule, or when safety checks reject the
     /// generated proposals).
     async fn process_breaches(&self) -> Result<usize, ExtensionError>;
+
+    /// Process silent rules and generate diagnostic proposals (NAN-880).
+    ///
+    /// Scans detection rules that haven't fired in N days, computes structured
+    /// signals (source volume, eventually: field presence, threshold headroom),
+    /// and emits `ProposalType::SilentRule` proposals into the existing tuning
+    /// queue. Returns the number of proposals generated this cycle.
+    ///
+    /// The default impl returns 0 so implementers that don't need silent-rule
+    /// detection (open-core stubs, tests) compile without changes.
+    async fn process_silent_rules(&self) -> Result<usize, ExtensionError> {
+        Ok(0)
+    }
 }

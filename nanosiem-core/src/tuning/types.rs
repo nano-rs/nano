@@ -32,6 +32,13 @@ pub enum ProposalType {
     QueryTuning,
     /// Hint update - updates AI triage hints for the rule
     HintUpdate,
+    /// Silent-rule diagnostic — rule hasn't fired in N days. The proposal
+    /// surfaces structured signals (source volume, missing fields, etc.) and
+    /// recommends an action (disable, rewrite query, lower threshold).
+    /// Approving a silent-rule proposal records the analyst decision without
+    /// modifying the rule itself; phase-3 wiring will route specific signal
+    /// recommendations through the existing apply paths.
+    SilentRule,
 }
 
 impl std::fmt::Display for ProposalType {
@@ -39,6 +46,7 @@ impl std::fmt::Display for ProposalType {
         match self {
             ProposalType::QueryTuning => write!(f, "query_tuning"),
             ProposalType::HintUpdate => write!(f, "hint_update"),
+            ProposalType::SilentRule => write!(f, "silent_rule"),
         }
     }
 }
@@ -50,6 +58,7 @@ impl std::str::FromStr for ProposalType {
         match s {
             "query_tuning" => Ok(ProposalType::QueryTuning),
             "hint_update" => Ok(ProposalType::HintUpdate),
+            "silent_rule" => Ok(ProposalType::SilentRule),
             _ => Err(format!("Unknown proposal type: {}", s)),
         }
     }
@@ -638,6 +647,7 @@ mod tests {
     fn test_proposal_type_display() {
         assert_eq!(ProposalType::QueryTuning.to_string(), "query_tuning");
         assert_eq!(ProposalType::HintUpdate.to_string(), "hint_update");
+        assert_eq!(ProposalType::SilentRule.to_string(), "silent_rule");
     }
 
     #[test]
@@ -649,6 +659,10 @@ mod tests {
         assert_eq!(
             "hint_update".parse::<ProposalType>().unwrap(),
             ProposalType::HintUpdate
+        );
+        assert_eq!(
+            "silent_rule".parse::<ProposalType>().unwrap(),
+            ProposalType::SilentRule
         );
         assert!("invalid".parse::<ProposalType>().is_err());
     }

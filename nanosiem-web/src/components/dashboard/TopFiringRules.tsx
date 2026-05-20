@@ -37,7 +37,7 @@ export function TopFiringRules() {
       .map(fromApiDetection)
       .map(r => ({
         ...r,
-        totalMatches: (r.matchCount || 0) + (r.liveMatchCount || 0),
+        totalMatches: r.matchCount || 0,
       }))
       .filter(r => r.status === 'active' && r.totalMatches > 0)
       .sort((a, b) => b.totalMatches - a.totalMatches)

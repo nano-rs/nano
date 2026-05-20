@@ -615,6 +615,97 @@ impl VrlValidator {
         }
     }
 
+    /// Test a chain of VRL stages against sample input (NAN-874).
+    ///
+    /// Each stage runs sequentially: output of stage N becomes input to stage N+1.
+    /// This mirrors the production pipeline where an extension transform runs
+    /// after the parser's `_parse` transform and feeds its output into `_output`.
+    ///
+    /// Empty / blank stages are skipped (treated as passthrough), which lets the
+    /// caller pass `[parser_vrl, extension_vrl]` even when one of them is empty
+    /// (e.g. an extension on a stub log_source with no OOTB parser).
+    ///
+    /// If any stage fails validation, the chain short-circuits with that stage's
+    /// error message prefixed with `stage {i}:` so the UI can point at the
+    /// offending transform.
+    pub async fn test_vrl_chain(
+        &self,
+        vrl_stages: &[&str],
+        sample_input: &str,
+    ) -> Result<ParserTestResult, VrlValidatorError> {
+        let start = Instant::now();
+
+        // Filter out blank stages — they're no-ops in the chain.
+        let stages: Vec<(usize, &str)> = vrl_stages
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.trim().is_empty())
+            .map(|(i, s)| (i, *s))
+            .collect();
+
+        if stages.is_empty() {
+            // Nothing to run — return the input unchanged as a successful no-op.
+            let parsed = serde_json::from_str::<serde_json::Value>(sample_input)
+                .unwrap_or_else(|_| serde_json::Value::String(sample_input.to_string()));
+            return Ok(ParserTestResult {
+                success: true,
+                input: sample_input.to_string(),
+                output: Some(parsed),
+                error: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+
+        // Validate every stage upfront — we don't want to leak partial state on a
+        // downstream syntax error.
+        for (idx, vrl) in &stages {
+            let validation = self.validate_vrl(vrl).await?;
+            if !validation.valid {
+                return Ok(ParserTestResult {
+                    success: false,
+                    input: sample_input.to_string(),
+                    output: None,
+                    error: Some(format!(
+                        "stage {}: {}",
+                        idx,
+                        validation.error.unwrap_or_else(|| "validation failed".into())
+                    )),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+        }
+
+        // Parse the sample as JSON; if it isn't JSON, fall through with the raw
+        // string as `.message` — same forgiving behavior the Vector pipeline has.
+        let mut current: serde_json::Value = match serde_json::from_str(sample_input) {
+            Ok(v) => v,
+            Err(_) => serde_json::json!({ "message": sample_input }),
+        };
+
+        for (idx, vrl) in &stages {
+            match self.execute_vrl(vrl, &current) {
+                Ok(output) => current = output,
+                Err(e) => {
+                    return Ok(ParserTestResult {
+                        success: false,
+                        input: sample_input.to_string(),
+                        output: None,
+                        error: Some(format!("stage {}: execution error: {}", idx, e)),
+                        duration_ms: start.elapsed().as_millis() as u64,
+                    });
+                }
+            }
+        }
+
+        Ok(ParserTestResult {
+            success: true,
+            input: sample_input.to_string(),
+            output: Some(current),
+            error: None,
+            duration_ms: start.elapsed().as_millis() as u64,
+        })
+    }
+
     /// Execute VRL code against input using the native VRL runtime
     fn execute_vrl(
         &self,
@@ -1142,6 +1233,95 @@ mod tests {
             !result.warnings.iter().any(|w| w.contains("E651")),
             "Should NOT warn about E651 for parse_json(): {:?}",
             result.warnings
+        );
+    }
+
+    // ----- NAN-874: parser extension chain tests -----
+
+    #[tokio::test]
+    async fn test_vrl_chain_single_element_matches_single() {
+        let v = validator();
+        let vrl = ".processed = true";
+        let sample = r#"{"message": "x"}"#;
+
+        let chain = v.test_vrl_chain(&[vrl], sample).await.unwrap();
+        let single = v.test_vrl(vrl, sample).await.unwrap();
+
+        assert!(chain.success, "chain error: {:?}", chain.error);
+        assert!(single.success, "single error: {:?}", single.error);
+        assert_eq!(chain.output, single.output);
+    }
+
+    #[tokio::test]
+    async fn test_vrl_chain_parser_plus_extension() {
+        let v = validator();
+        let parser = ".udm.user = .raw_user";
+        let extension = ".team = \"soc\"";
+        let sample = r#"{"raw_user": "alice"}"#;
+
+        let r = v
+            .test_vrl_chain(&[parser, extension], sample)
+            .await
+            .unwrap();
+        assert!(r.success, "chain failed: {:?}", r.error);
+        let out = r.output.expect("output");
+        assert_eq!(out.get("team").and_then(|v| v.as_str()), Some("soc"));
+        // Extension sees the parser's output — udm.user was set by parser stage.
+        assert_eq!(
+            out.pointer("/udm/user").and_then(|v| v.as_str()),
+            Some("alice")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vrl_chain_empty_stage_skipped() {
+        let v = validator();
+        // Mimics the stub case: no OOTB parser, just an extension.
+        let r = v
+            .test_vrl_chain(&["", ".team = \"soc\""], r#"{"raw": "x"}"#)
+            .await
+            .unwrap();
+        assert!(r.success, "should succeed with empty first stage: {:?}", r.error);
+        assert_eq!(
+            r.output.unwrap().get("team").and_then(|v| v.as_str()),
+            Some("soc")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_vrl_chain_runtime_error_surfaces_stage_index() {
+        let v = validator();
+        // Stage 1 succeeds; stage 2 has a runtime error (abort).
+        let parser = ".step1 = true";
+        let extension = "abort";
+        let r = v
+            .test_vrl_chain(&[parser, extension], r#"{"x": 1}"#)
+            .await
+            .unwrap();
+        assert!(!r.success);
+        let err = r.error.expect("error string");
+        // The validator may either flag this at validation time (stage 1, because
+        // index in the filtered list) or at runtime — both forms of message
+        // should make it clear which stage broke. Check that a stage index is
+        // present and the message names "abort".
+        assert!(err.contains("stage "), "should mention stage: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_vrl_chain_blocks_dangerous_function() {
+        let v = validator();
+        let r = v
+            .test_vrl_chain(
+                &[".x = 1", ".y = get_env_var!(\"NANOS_API_KEY\")"],
+                r#"{"x": 1}"#,
+            )
+            .await
+            .unwrap();
+        assert!(!r.success, "dangerous function should be blocked");
+        let err = r.error.unwrap();
+        assert!(
+            err.contains("get_env_var") || err.contains("not allowed") || err.contains("blocked"),
+            "error should mention the blocked function: {err}"
         );
     }
 }

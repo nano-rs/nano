@@ -446,6 +446,8 @@ fn row_to_parser(row: &sqlx::postgres::PgRow) -> Parser {
         match_values: row.try_get("match_values").ok(),
         sampling_ratio: row.try_get("sampling_ratio").unwrap_or(None),
         sampling_exclude_condition: row.try_get("sampling_exclude_condition").unwrap_or(None),
+        extension_vrl: row.try_get("extension_vrl").unwrap_or(None),
+        extension_enabled: row.try_get("extension_enabled").unwrap_or(false),
         category: row.get("category"),
         vendor: row.get("vendor"),
         product: row.get("product"),

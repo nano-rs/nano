@@ -9,7 +9,7 @@ use std::path::Path;
 
 use tokio::fs;
 
-use super::router::{base_router_inputs, BUILTIN_TYPES};
+use super::router::{base_router_inputs, hec_normalize_present, BUILTIN_TYPES};
 use super::VectorConfigError;
 use super::VectorConfigManager;
 use crate::parsers::types::Parser;
@@ -130,11 +130,14 @@ impl VectorConfigManager {
 
         let (source_type_extract_covered, hec_normalize_covered) =
             self.source_config_intermediary_coverage().await;
-        let mut router_inputs: Vec<String> =
-            base_router_inputs(source_type_extract_covered, hec_normalize_covered)
-                .into_iter()
-                .map(String::from)
-                .collect();
+        let mut router_inputs: Vec<String> = base_router_inputs(
+            source_type_extract_covered,
+            hec_normalize_covered,
+            hec_normalize_present(),
+        )
+        .into_iter()
+        .map(String::from)
+        .collect();
         let source_config_routes = self.get_source_config_routes().await;
         router_inputs.extend(source_config_routes);
         let inputs_formatted = router_inputs

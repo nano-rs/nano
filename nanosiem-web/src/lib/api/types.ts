@@ -1991,6 +1991,12 @@ export interface MelodEditParserRequest {
   message: string;
   sample_logs?: string[];
   session_id?: string;
+  /**
+   * Optional OOTB parser VRL shown read-only when editing a parser extension (NAN-874).
+   * When present, `current_vrl` is the extension overlay and the agent switches into
+   * "edit overlay only" mode.
+   */
+  base_parser_vrl?: string;
 }
 
 // Edit operation types for AI parser editing
@@ -4327,6 +4333,10 @@ export interface LogSource {
   sampling_ratio?: number | null;
   /** VRL condition for events that are NEVER sampled. null = no exclusions. */
   sampling_exclude_condition?: string | null;
+  /** Optional VRL overlay chained after _parse, before _output (NAN-874). */
+  extension_vrl?: string | null;
+  /** When false, extension_vrl is persisted but not deployed (NAN-874). */
+  extension_enabled?: boolean;
   parser_only: boolean;
   source_parser_repository_id?: string;
   source_parser_path?: string;
@@ -4387,6 +4397,10 @@ export interface UpdateLogSource {
   sampling_ratio?: number | null;
   /** VRL condition for events that are NEVER sampled. */
   sampling_exclude_condition?: string | null;
+  /** Parser extension VRL (NAN-874). Empty string clears the extension; undefined leaves unchanged. */
+  extension_vrl?: string;
+  /** Toggle whether extension_vrl is included in deploys (NAN-874). */
+  extension_enabled?: boolean;
 }
 
 export interface LogSourceHealth {
@@ -4492,6 +4506,10 @@ export interface LogSourceVersion {
   created_by?: string;
   change_reason: string;
   reverted_from_version?: number;
+  /** Snapshot of extension_vrl at publish time (NAN-874). */
+  extension_vrl?: string | null;
+  /** Snapshot of extension_enabled at publish time (NAN-874). */
+  extension_enabled?: boolean;
 }
 
 export interface LogSourceWithDraftStatus extends LogSource {

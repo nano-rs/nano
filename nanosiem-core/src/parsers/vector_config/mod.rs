@@ -27,7 +27,7 @@ mod staging;
 mod validation;
 
 pub use redaction::redact_config_snapshot;
-pub use router::base_router_inputs;
+pub use router::{base_router_inputs, hec_normalize_present};
 
 use std::path::{Path, PathBuf};
 use thiserror::Error;

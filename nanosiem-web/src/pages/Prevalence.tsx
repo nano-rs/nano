@@ -55,9 +55,17 @@ import {
   ShieldCheck,
   Store,
 } from 'lucide-react';
-import { useArtifactExplorer, useArtifactDetail } from '@/hooks/use-api';
+import { useArtifactExplorer, useArtifactDetail, useArtifactLookup } from '@/hooks/use-api';
 import { formatUTCCompact, formatRelativeCompact, buildHeatmapDays, expandPackedDaily } from '@/lib/date-utils';
 import { PrevalenceExplorerHeatmap } from '@/components/prevalence';
+import {
+  detectArtifact,
+  detectBulkArtifacts,
+  artifactKindLabel,
+  type DetectedArtifact,
+} from '@/lib/prevalence-detect';
+import type { PrevalenceData, PrevalenceArtifactType } from '@/lib/api/types';
+import { X } from 'lucide-react';
 import { RuleActivityHeatmap } from '@/components/detection/RuleActivityHeatmap';
 import type {
   ArtifactExplorerItem,
@@ -328,14 +336,51 @@ export function Prevalence() {
     setPage(0);
   }, [timeWindow, artifactTypeFilter, riskFilter, debouncedSearch]);
 
+  // NAN-871: derive page mode from the debounced input so the same bar serves
+  // browse / single-artifact lookup / bulk-paste lookup. `bulkDetected` only
+  // populates when ≥2 valid artifacts are detected (paste-style); a single
+  // valid artifact routes through `singleDetected`. Free-text falls through
+  // to browse mode and the existing substring-in-buffer behavior.
+  const trimmedSearch = debouncedSearch.trim();
+  const bulkDetected = useMemo(
+    () => detectBulkArtifacts(debouncedSearch),
+    [debouncedSearch],
+  );
+  const singleDetected = useMemo<DetectedArtifact | null>(
+    () => (bulkDetected.length >= 2 ? null : detectArtifact(trimmedSearch)),
+    [trimmedSearch, bulkDetected],
+  );
+  const mode: 'browse' | 'lookup' | 'bulk' =
+    bulkDetected.length >= 2 ? 'bulk' : singleDetected ? 'lookup' : 'browse';
+
+  const clearSearch = useCallback(() => {
+    setSearchQuery('');
+    setDebouncedSearch('');
+  }, []);
+
   const { data, loading, error, refetch } = useArtifactExplorer({
     window: timeWindow,
     type: artifactTypeFilter === 'all' ? undefined : artifactTypeFilter,
     risk_level: riskFilter === 'all' ? undefined : riskFilter,
-    search: debouncedSearch || undefined,
+    // Only forward the search term in browse mode — in lookup/bulk we drive
+    // results from the point-lookup endpoints below.
+    search: mode === 'browse' ? (debouncedSearch || undefined) : undefined,
     limit: PAGE_SIZE,
     offset: page * PAGE_SIZE,
   });
+
+  // Header stats for lookup/bulk modes. `useArtifactLookup` resolves to null
+  // when artifacts is null/empty so the request short-circuits in browse mode.
+  const lookupArtifacts =
+    mode === 'lookup' && singleDetected
+      ? [singleDetected.value]
+      : mode === 'bulk'
+        ? bulkDetected.map((d) => d.value)
+        : null;
+  const { data: lookupData, loading: lookupLoading } = useArtifactLookup(
+    lookupArtifacts,
+    undefined,
+  );
 
   const handleDrilldown = useCallback(
     (artifact: ArtifactExplorerItem) => {
@@ -429,54 +474,123 @@ export function Prevalence() {
         <div className="relative flex h-9 min-w-0 flex-1 items-center gap-2 rounded-md border border-border bg-card/40 px-3 transition-colors focus-within:bg-card/80 hover:bg-card/70">
           <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
           <input
-            value={searchQuery}
+            // NAN-871: in bulk mode the raw paste value contains newlines that
+            // a single-line `<input>` can't faithfully render — show the
+            // placeholder ("N artifacts pasted") instead so the user gets a
+            // truthful indicator. The actual paste lives in `searchQuery`
+            // state and drives the bulk results table below.
+            value={mode === 'bulk' ? '' : searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search artifacts…"
+            onPaste={(e) => {
+              // NAN-871: when ≥2 newline-separated artifacts are pasted, swap
+              // the search input wholesale instead of letting the browser drop
+              // a multi-line blob into a single-line `<input>`. Mode-derivation
+              // upstream picks up the bulk shape. Single-line pastes fall
+              // through to default behavior (LookupTableView precedent).
+              const text = e.clipboardData.getData('text/plain');
+              if (!text.includes('\n')) return;
+              const detected = detectBulkArtifacts(text);
+              if (detected.length >= 2) {
+                e.preventDefault();
+                setSearchQuery(text);
+              }
+            }}
+            placeholder={
+              mode === 'browse'
+                ? 'Search artifacts, or paste a hash / IP / domain…'
+                : mode === 'lookup'
+                  ? 'Looking up artifact…'
+                  : `${bulkDetected.length} artifacts pasted — looking up…`
+            }
             className="flex-1 bg-transparent text-[13px] text-foreground outline-none placeholder:text-muted-foreground"
           />
+          {mode !== 'browse' && (
+            <button
+              type="button"
+              onClick={clearSearch}
+              aria-label="Clear search"
+              className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground"
+            >
+              <X className="h-3 w-3" />
+            </button>
+          )}
         </div>
-        <FilterPill
-          icon={Clock}
-          value={timeWindow}
-          options={(Object.entries(TIME_LABELS) as [TimeWindow, string][]).map(([value, label]) => ({ value, label }))}
-          onChange={(v) => setTimeWindow(v as TimeWindow)}
-          ariaLabel="Time window"
-        />
-        <FilterPill
-          icon={Filter}
-          value={artifactTypeFilter}
-          options={(Object.entries(TYPE_LABELS) as [ArtifactTypeFilter, string][]).map(([value, label]) => ({ value, label }))}
-          onChange={(v) => setArtifactTypeFilter(v as ArtifactTypeFilter)}
-          ariaLabel="Artifact type"
-        />
-        <FilterPill
-          icon={ShieldAlert}
-          value={riskFilter}
-          options={(Object.entries(RISK_LABELS) as [RiskFilter, string][]).map(([value, label]) => ({ value, label }))}
-          onChange={(v) => setRiskFilter(v as RiskFilter)}
-          ariaLabel="Risk filter"
-        />
-        <button
-          type="button"
-          onClick={() => refetch()}
-          disabled={loading}
-          aria-label="Refresh"
-          className="flex h-9 w-9 items-center justify-center rounded-md border border-border bg-card text-muted-foreground transition-colors hover:bg-card/70 hover:text-foreground disabled:opacity-50"
-        >
-          {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
-        </button>
-        <button
-          type="button"
-          onClick={onExport}
-          className="flex h-9 items-center gap-1.5 rounded-md border border-border bg-card px-3 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-card/70 hover:text-foreground"
-        >
-          <Download className="h-3.5 w-3.5" />
-          Export
-        </button>
+        {mode === 'browse' ? (
+          <>
+            <FilterPill
+              icon={Clock}
+              value={timeWindow}
+              options={(Object.entries(TIME_LABELS) as [TimeWindow, string][]).map(([value, label]) => ({ value, label }))}
+              onChange={(v) => setTimeWindow(v as TimeWindow)}
+              ariaLabel="Time window"
+            />
+            <FilterPill
+              icon={Filter}
+              value={artifactTypeFilter}
+              options={(Object.entries(TYPE_LABELS) as [ArtifactTypeFilter, string][]).map(([value, label]) => ({ value, label }))}
+              onChange={(v) => setArtifactTypeFilter(v as ArtifactTypeFilter)}
+              ariaLabel="Artifact type"
+            />
+            <FilterPill
+              icon={ShieldAlert}
+              value={riskFilter}
+              options={(Object.entries(RISK_LABELS) as [RiskFilter, string][]).map(([value, label]) => ({ value, label }))}
+              onChange={(v) => setRiskFilter(v as RiskFilter)}
+              ariaLabel="Risk filter"
+            />
+            <button
+              type="button"
+              onClick={() => refetch()}
+              disabled={loading}
+              aria-label="Refresh"
+              className="flex h-9 w-9 items-center justify-center rounded-md border border-border bg-card text-muted-foreground transition-colors hover:bg-card/70 hover:text-foreground disabled:opacity-50"
+            >
+              {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+            </button>
+            <button
+              type="button"
+              onClick={onExport}
+              className="flex h-9 items-center gap-1.5 rounded-md border border-border bg-card px-3 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-card/70 hover:text-foreground"
+            >
+              <Download className="h-3.5 w-3.5" />
+              Export
+            </button>
+          </>
+        ) : (
+          <button
+            type="button"
+            onClick={clearSearch}
+            className="flex h-9 items-center gap-1.5 rounded-md border border-border bg-card px-3 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-card/70 hover:text-foreground"
+          >
+            <X className="h-3.5 w-3.5" />
+            Clear search
+          </button>
+        )}
       </div>
 
+      {/* NAN-871: lookup / bulk modes replace the browse experience entirely
+          (heatmap + KPI table). `Clear search` returns to browse. */}
+      {mode === 'lookup' && singleDetected && (
+        <ArtifactLookupCard
+          detected={singleDetected}
+          lookupData={lookupData?.data?.[0]}
+          lookupLoading={lookupLoading}
+          timeWindow={timeWindow}
+          onDrilldown={handleDrilldown}
+        />
+      )}
+
+      {mode === 'bulk' && (
+        <BulkLookupTable
+          detected={bulkDetected}
+          lookupData={lookupData?.data ?? []}
+          lookupLoading={lookupLoading}
+          onSelectRow={(artifact) => setSearchQuery(artifact)}
+        />
+      )}
+
       {/* Heatmap card */}
-      {heatmapArtifacts.length > 0 && (
+      {mode === 'browse' && heatmapArtifacts.length > 0 && (
         <div className="mt-4 overflow-hidden rounded-lg border border-border bg-card">
           <div className="flex items-center gap-3 border-b border-border px-4 py-3">
             <Eyebrow icon={GridIcon}>Artifact prevalence · per host</Eyebrow>
@@ -533,6 +647,7 @@ export function Prevalence() {
       )}
 
       {/* Artifacts table */}
+      {mode === 'browse' && (
       <div className="mt-4 overflow-hidden rounded-lg border border-border bg-card">
         <div className="flex items-center gap-3 border-b border-border px-4 py-3">
           <Eyebrow icon={Hash}>Artifacts · <span className="text-foreground tabular-nums">{total.toLocaleString()}</span></Eyebrow>
@@ -622,6 +737,7 @@ export function Prevalence() {
           </div>
         )}
       </div>
+      )}
     </div>
     </TooltipProvider>
   );
@@ -1042,6 +1158,236 @@ function ProcessRow({ row }: { row: ArtifactProcessEntry }) {
       <span className="shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground">
         {row.count.toLocaleString()}
       </span>
+    </div>
+  );
+}
+
+// ============================================================================
+// NAN-871 — Smart lookup mode (single artifact + bulk)
+// ============================================================================
+
+/** Adapt a `PrevalenceData` row from `/api/prevalence/bulk` into the
+ * `ArtifactExplorerItem` shape `ExpandedArtifactDetail` / `handleDrilldown`
+ * expect. Daily counts aren't fetched by the bulk endpoint — leave empty so
+ * the heatmap-driven sparkline gracefully renders as zero activity. */
+function explorerItemFromLookup(
+  detected: DetectedArtifact,
+  data: PrevalenceData | undefined,
+): ArtifactExplorerItem {
+  return {
+    artifact: detected.value,
+    artifact_type: data?.artifact_type ?? detected.kind,
+    host_count: data?.host_count ?? 0,
+    total_occurrences: data?.total_occurrences ?? 0,
+    first_seen: data?.first_seen ?? '',
+    last_seen: data?.last_seen ?? '',
+    is_rare: data?.is_rare ?? false,
+    prevalence_score: data?.prevalence_score ?? 0,
+    daily_counts: [],
+    daily_start: '',
+  };
+}
+
+function TypeChip({ kind }: { kind: PrevalenceArtifactType }) {
+  return (
+    <span className="inline-flex h-5 items-center rounded-sm border border-border bg-card/40 px-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground">
+      {artifactKindLabel(kind)}
+    </span>
+  );
+}
+
+function ArtifactLookupCard({
+  detected,
+  lookupData,
+  lookupLoading,
+  timeWindow,
+  onDrilldown,
+}: {
+  detected: DetectedArtifact;
+  lookupData: PrevalenceData | undefined;
+  lookupLoading: boolean;
+  timeWindow: string;
+  onDrilldown: (artifact: ArtifactExplorerItem) => void;
+}) {
+  const item = useMemo(
+    () => explorerItemFromLookup(detected, lookupData),
+    [detected, lookupData],
+  );
+  const seen = (lookupData?.host_count ?? 0) > 0;
+
+  return (
+    <div className="mt-4 overflow-hidden rounded-lg border border-border bg-card">
+      {/* Header strip */}
+      <div className="flex flex-wrap items-center gap-3 border-b border-border px-4 py-3">
+        <TypeChip kind={lookupData?.artifact_type ?? detected.kind} />
+        <div className="min-w-0 flex-1">
+          <div className="truncate font-mono text-[13px] text-foreground">{detected.value}</div>
+          <div className="mt-0.5 font-mono text-[10.5px] text-muted-foreground">
+            {lookupLoading ? (
+              'Looking up…'
+            ) : seen ? (
+              <>
+                <span className="tabular-nums text-foreground">{(lookupData?.host_count ?? 0).toLocaleString()}</span>{' '}
+                {lookupData?.host_count === 1 ? 'host' : 'hosts'} ·{' '}
+                <span className="tabular-nums text-foreground">{(lookupData?.total_occurrences ?? 0).toLocaleString()}</span>{' '}
+                {lookupData?.total_occurrences === 1 ? 'event' : 'events'}
+                {lookupData?.first_seen && (
+                  <>
+                    {' · first '}
+                    <span className="text-foreground">{formatUTCCompact(lookupData.first_seen)}</span>
+                  </>
+                )}
+                {lookupData?.last_seen && (
+                  <>
+                    {' · last '}
+                    <span className="text-foreground">{formatRelativeCompact(lookupData.last_seen)}</span>
+                  </>
+                )}
+              </>
+            ) : (
+              <span className="text-muted-foreground/70">Not seen in this environment</span>
+            )}
+          </div>
+        </div>
+        {lookupData?.is_rare && (
+          <span className="inline-flex h-5 items-center gap-1 rounded-sm border border-red-400/30 bg-red-400/10 px-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-red-300">
+            <AlertOctagon className="h-2.5 w-2.5" />
+            Rare
+          </span>
+        )}
+        <button
+          type="button"
+          onClick={() => onDrilldown(item)}
+          disabled={!seen}
+          className="inline-flex h-7 items-center gap-1.5 rounded-md border border-border bg-card px-2.5 text-[11.5px] text-muted-foreground transition-colors hover:bg-card/70 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-card disabled:hover:text-muted-foreground"
+        >
+          <Search className="h-3 w-3" />
+          Search events
+        </button>
+      </div>
+
+      {/* Body: facet grid when seen, empty state when not */}
+      <div className="px-3 pt-3 pb-4">
+        {lookupLoading ? (
+          <div className="flex items-center justify-center py-6">
+            <Loader2 className="h-4 w-4 animate-spin text-primary" />
+            <span className="ml-2 font-mono text-[11px] text-muted-foreground">Looking up artifact…</span>
+          </div>
+        ) : seen ? (
+          <ExpandedArtifactDetail
+            artifact={item}
+            timeWindow={timeWindow}
+            onDrilldown={onDrilldown}
+          />
+        ) : (
+          <div className="px-4 py-10 text-center text-[12px] text-muted-foreground">
+            <Search className="mx-auto mb-2 h-5 w-5 opacity-50" />
+            <p>Not seen in this environment</p>
+            <p className="mt-1 text-[11px] text-muted-foreground/70">
+              No prevalence record exists for this artifact in the configured retention window.
+            </p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function BulkLookupTable({
+  detected,
+  lookupData,
+  lookupLoading,
+  onSelectRow,
+}: {
+  detected: DetectedArtifact[];
+  lookupData: PrevalenceData[];
+  lookupLoading: boolean;
+  onSelectRow: (artifact: string) => void;
+}) {
+  // Index the API response by artifact value so we can pair each row in the
+  // pasted list with its prevalence stats. The bulk endpoint may return rows
+  // in a different order than the input — keying preserves the user's order.
+  const byArtifact = useMemo(() => {
+    const m = new Map<string, PrevalenceData>();
+    for (const row of lookupData) m.set(row.artifact.toLowerCase(), row);
+    return m;
+  }, [lookupData]);
+
+  return (
+    <div className="mt-4 overflow-hidden rounded-lg border border-border bg-card">
+      <div className="flex items-center gap-3 border-b border-border px-4 py-3">
+        <Eyebrow icon={Hash}>
+          Bulk lookup ·{' '}
+          <span className="tabular-nums text-foreground">{detected.length.toLocaleString()}</span>{' '}
+          artifacts
+        </Eyebrow>
+      </div>
+
+      {/* Column header strip — mirrors the rare-artifacts table grid */}
+      <div
+        className="grid items-center border-b border-border bg-card/40 font-mono text-[9.5px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/80"
+        style={{ gridTemplateColumns: 'minmax(0,1fr) 110px 80px 80px 140px 140px 80px' }}
+      >
+        <div className="px-3 py-2">Artifact</div>
+        <div className="px-2 py-2">Type</div>
+        <div className="px-2 py-2 text-right">Hosts</div>
+        <div className="px-2 py-2 text-right">Events</div>
+        <div className="px-2 py-2">First seen</div>
+        <div className="px-2 py-2">Last seen</div>
+        <div className="px-2 py-2 text-right">Rare</div>
+      </div>
+
+      {lookupLoading ? (
+        <div className="px-4 py-12 text-center text-[12px] text-muted-foreground">
+          <Loader2 className="mx-auto mb-2 h-5 w-5 animate-spin" />
+          <p>Looking up artifacts…</p>
+        </div>
+      ) : (
+        <div className="divide-y divide-border">
+          {detected.map((d, i) => {
+            const row = byArtifact.get(d.value.toLowerCase());
+            const seen = (row?.host_count ?? 0) > 0;
+            return (
+              <button
+                key={`${d.value}-${i}`}
+                type="button"
+                onClick={() => onSelectRow(d.value)}
+                className="grid w-full items-center text-left transition-colors hover:bg-card/40"
+                style={{ gridTemplateColumns: 'minmax(0,1fr) 110px 80px 80px 140px 140px 80px' }}
+              >
+                <div className="truncate px-3 py-2 font-mono text-[12px] text-foreground" title={d.value}>
+                  {d.value}
+                </div>
+                <div className="px-2 py-2">
+                  <TypeChip kind={row?.artifact_type ?? d.kind} />
+                </div>
+                <div className="px-2 py-2 text-right font-mono text-[11.5px] tabular-nums text-foreground">
+                  {seen ? (row?.host_count ?? 0).toLocaleString() : <span className="text-muted-foreground/60">—</span>}
+                </div>
+                <div className="px-2 py-2 text-right font-mono text-[11.5px] tabular-nums text-muted-foreground">
+                  {seen ? (row?.total_occurrences ?? 0).toLocaleString() : <span className="text-muted-foreground/60">—</span>}
+                </div>
+                <div className="px-2 py-2 font-mono text-[11px] text-muted-foreground">
+                  {row?.first_seen ? formatUTCCompact(row.first_seen) : <span className="text-muted-foreground/60">—</span>}
+                </div>
+                <div className="px-2 py-2 font-mono text-[11px] text-muted-foreground">
+                  {row?.last_seen ? formatRelativeCompact(row.last_seen) : <span className="text-muted-foreground/60">—</span>}
+                </div>
+                <div className="px-2 py-2 text-right">
+                  {row?.is_rare ? (
+                    <span className="inline-flex h-5 items-center gap-1 rounded-sm border border-red-400/30 bg-red-400/10 px-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-red-300">
+                      <AlertOctagon className="h-2.5 w-2.5" />
+                      Rare
+                    </span>
+                  ) : (
+                    <span className="font-mono text-[10px] text-muted-foreground/60">—</span>
+                  )}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

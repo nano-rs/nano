@@ -46,9 +46,9 @@ export function TestResultRow({ input, newParse, currentParse, expanded, onToggl
   const allKeys = [...new Set([...Object.keys(newFields), ...Object.keys(currentFields)])].sort();
 
   return (
-    <div className={`rounded-xl border ${newParse.success ? 'border-border' : 'border-red-500/30'} bg-card`}>
+    <div className={`rounded-md border ${newParse.success ? 'border-border' : 'border-red-500/30'} bg-card`}>
       <button
-        className="w-full flex items-center gap-2 px-3 py-2 text-left text-sm hover:bg-muted/30 rounded-xl transition-colors"
+        className="w-full flex items-center gap-2 px-3 py-2 text-left text-[11.5px] hover:bg-muted/30 rounded-md transition-colors"
         onClick={onToggle}
       >
         {newParse.success ? (
@@ -69,7 +69,7 @@ export function TestResultRow({ input, newParse, currentParse, expanded, onToggl
       {expanded && (
         <div className="border-t border-border/50">
           {newParse.error && (
-            <p className="text-red-400 text-xs px-3 py-2">{newParse.error}</p>
+            <p className="text-red-400 text-[11px] px-3 py-2">{newParse.error}</p>
           )}
           {allKeys.length > 0 && (
             <div className="overflow-auto max-h-80">

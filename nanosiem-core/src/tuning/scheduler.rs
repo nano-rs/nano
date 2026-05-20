@@ -312,9 +312,11 @@ impl TuningScheduler {
 
                 // If orchestrator is available, use it to process breaches and generate proposals
                 let result: Result<(), String> = if let Some(orch) = &orchestrator {
-                    match orch.process_breaches().await {
+                    // Breach-driven proposals (FP/noisy)
+                    let breach_result = orch.process_breaches().await;
+                    let breach_ok = match &breach_result {
                         Ok(count) => {
-                            if count > 0 {
+                            if *count > 0 {
                                 info!(
                                     "Generated {} tuning proposals from threshold breaches",
                                     count
@@ -325,7 +327,31 @@ impl TuningScheduler {
                             Ok(())
                         }
                         Err(e) => Err(e.to_string()),
+                    };
+
+                    // Silent-rule diagnostic proposals (NAN-880). Runs on the
+                    // same tick as breach detection but is treated as a lower
+                    // priority job: failures are warn-logged and do NOT roll
+                    // into `consecutive_errors` / backoff so a temporary
+                    // ClickHouse hiccup on the source_volume query doesn't
+                    // starve the breach-driven tuning path.
+                    match orch.process_silent_rules().await {
+                        Ok(count) => {
+                            if count > 0 {
+                                info!(
+                                    "Generated {} silent-rule diagnostic proposals",
+                                    count
+                                );
+                            } else {
+                                debug!("No silent rules requiring diagnostic proposals");
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Silent-rule detection failed: {}", e);
+                        }
                     }
+
+                    breach_ok
                 } else {
                     // No orchestrator (AI not configured) - just detect breaches for monitoring
                     match threshold_detector.check_all_thresholds().await {

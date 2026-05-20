@@ -22,5 +22,6 @@ pub use service::{ParserService, ParserServiceError};
 pub use types::*;
 pub use validator::{VrlValidator, VrlValidatorError};
 pub use vector_config::{
-    base_router_inputs, redact_config_snapshot, VectorConfigError, VectorConfigManager,
+    base_router_inputs, hec_normalize_present, redact_config_snapshot, VectorConfigError,
+    VectorConfigManager,
 };

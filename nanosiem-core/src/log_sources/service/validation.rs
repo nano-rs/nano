@@ -127,12 +127,36 @@ impl LogSourceService {
 
     /// Test VRL against a sample log
     pub async fn test_vrl(&self, vrl_code: &str, sample_log: &str) -> ParserTestResult {
+        self.test_vrl_chain(vrl_code, None, sample_log).await
+    }
+
+    /// Test a parser VRL plus an optional extension overlay (NAN-874) against a
+    /// sample log. When `extension_vrl` is `None` or blank, this is identical
+    /// to the single-stage `test_vrl`. When provided, the chain mirrors the
+    /// production pipeline: parse → extension → (downstream).
+    pub async fn test_vrl_chain(
+        &self,
+        parser_vrl: &str,
+        extension_vrl: Option<&str>,
+        sample_log: &str,
+    ) -> ParserTestResult {
         let input_json = serde_json::json!({
             "message": sample_log
         });
         let input_str = serde_json::to_string(&input_json).unwrap_or_default();
 
-        match self.vrl_validator.test_vrl(vrl_code, &input_str).await {
+        // Pick the right validator method to avoid the chain wrapper's empty-stage
+        // bookkeeping when no extension is in play.
+        let result = match extension_vrl {
+            Some(ext) if !ext.trim().is_empty() => {
+                self.vrl_validator
+                    .test_vrl_chain(&[parser_vrl, ext], &input_str)
+                    .await
+            }
+            _ => self.vrl_validator.test_vrl(parser_vrl, &input_str).await,
+        };
+
+        match result {
             Ok(result) => {
                 let extracted_field_count = count_extracted_fields(&result.output);
                 ParserTestResult {

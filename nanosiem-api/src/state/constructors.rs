@@ -117,6 +117,17 @@ impl AppState {
         );
         search_service.set_inputlookup_service(inputlookup_service);
 
+        // Wire the enterprise `CloudRiskProvider` impl onto the search service
+        // so cloud overview / dossier surfaces render risk badges. Open-core
+        // builds keep the default `NoopCloudRiskProvider` (empty risk data).
+        // NAN-873: the bridge impl shipped with NAN-744 Phase 2.5 but neither
+        // the `impl CloudRiskProvider for RiskAnalyticsService` nor this setter
+        // call ever landed, so production silently returned noop risk data.
+        #[cfg(feature = "enterprise")]
+        let risk_service = RiskAnalyticsService::with_dual_pool(&dual_pool);
+        #[cfg(feature = "enterprise")]
+        search_service.set_cloud_risk(Arc::new(risk_service.clone()));
+
         // Create melod_service Arc (initialized as None, reloaded later in reload_melod_service).
         // Open-core build skips the meloD handles entirely; shadow_investigation
         // wires NoopAiClient and the engine falls back to its non-AI path.
@@ -149,24 +160,45 @@ impl AppState {
             ))
         };
 
-        // Create signal processor; in enterprise also wire shadow investigation.
+        // Build the case-grouping hook for enterprise builds. NAN-744 Phase 2.3
+        // added the `CaseGroupingHook` trait surface on detection_service /
+        // signal_processor / realtime_evaluator, but the AppState wire-up was
+        // never written — so saturn fired alerts but never created cases
+        // (case_id stayed NULL). NAN-872 restores the wiring. Open-core
+        // builds keep `NoopCaseGroupingHook` on all three services.
+        #[cfg(feature = "enterprise")]
+        let case_grouping_hook = nanosiem_enterprise::cases::case_grouping_hook(
+            pg_pool.clone(),
+            dual_pool.clone(),
+        );
+
+        // Create signal processor; in enterprise also wire shadow investigation
+        // and case grouping.
         let signal_processor = {
             let sp = SignalProcessor::new(dual_pool.clone(), SignalProcessorConfig::default());
             #[cfg(feature = "enterprise")]
-            let sp = sp.with_shadow_investigation(shadow_investigation.clone());
+            let sp = sp
+                .with_shadow_investigation(shadow_investigation.clone())
+                .with_case_grouping(case_grouping_hook.clone());
             Arc::new(sp)
         };
 
-        // Wire shadow investigation into detection service (enterprise only).
+        // Wire shadow investigation and case grouping into detection service
+        // (enterprise only).
         #[cfg(feature = "enterprise")]
-        let detection_service =
-            detection_service.with_shadow_investigation(shadow_investigation.clone());
+        let detection_service = detection_service
+            .with_shadow_investigation(shadow_investigation.clone())
+            .with_case_grouping(case_grouping_hook.clone());
 
-        // Create realtime evaluator; enterprise wires shadow investigation too.
+        // Create realtime evaluator; enterprise wires shadow investigation
+        // and case grouping too.
         #[cfg_attr(not(feature = "enterprise"), allow(unused_mut))]
         let mut realtime_evaluator = RealtimeEvaluator::with_dual_pool(&dual_pool);
         #[cfg(feature = "enterprise")]
-        realtime_evaluator.set_shadow_investigation(shadow_investigation);
+        {
+            realtime_evaluator.set_shadow_investigation(shadow_investigation);
+            realtime_evaluator.set_case_grouping(case_grouping_hook);
+        }
 
         // Create disk pressure service for automatic partition eviction
         let ingestion_paused = Arc::new(AtomicBool::new(false));
@@ -220,8 +252,9 @@ impl AppState {
             #[cfg(feature = "enterprise")]
             melod_service,
             // Risk service needs DualPool for time-windowed queries (findings are in ClickHouse)
+            // Same instance is also wired into search_service as a CloudRiskProvider above (NAN-873).
             #[cfg(feature = "enterprise")]
-            risk_service: RiskAnalyticsService::with_dual_pool(&dual_pool),
+            risk_service,
             query_library: QueryLibraryRepository::new(pg_pool.clone()),
 
             // Store both pools

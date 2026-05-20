@@ -25,6 +25,9 @@ impl LogSourceService {
                 if let Some(fields) = active.output_fields {
                     ls.output_fields = Some(fields);
                 }
+                // Pull active extension snapshot — extension is part of the published version.
+                ls.extension_vrl = active.extension_vrl;
+                ls.extension_enabled = active.extension_enabled;
             }
             result.push(ls);
         }
@@ -52,6 +55,31 @@ impl LogSourceService {
             });
         }
 
+        // NAN-874: when the extension is enabled and non-empty, validate it at the
+        // same gate. Otherwise a broken overlay only surfaces at `vector validate`
+        // time, after rollback. The deploy-time guard still backs us up, but the
+        // user gets clearer feedback here.
+        if ls.extension_enabled {
+            if let Some(ref ext) = ls.extension_vrl {
+                if !ext.trim().is_empty() {
+                    let ext_validation = self.validate_vrl(ext).await;
+                    if !ext_validation.valid {
+                        return Ok(DeploymentResult {
+                            success: false,
+                            log_source_id: id,
+                            action: "publish".to_string(),
+                            message: format!(
+                                "Extension VRL validation failed: {}",
+                                ext_validation.errors.join("; ")
+                            ),
+                            validation_result: Some(ext_validation),
+                            deployment_id: None,
+                        });
+                    }
+                }
+            }
+        }
+
         // Create new active version from working copy
         self.version_repository()
             .create_version(
@@ -62,6 +90,8 @@ impl LogSourceService {
                 user_id,
                 "publish",
                 None,
+                ls.extension_vrl.as_deref(),
+                ls.extension_enabled,
             )
             .await?;
 
@@ -100,16 +130,26 @@ impl LogSourceService {
                 user_id,
                 "revert",
                 Some(target.version_number),
+                target.extension_vrl.as_deref(),
+                target.extension_enabled,
             )
             .await?;
 
         // Update working copy to match reverted version
+        // Pass empty string for extension_vrl when target had None — the COALESCE
+        // pattern in repository::update interprets empty string as "set NULL".
+        let extension_vrl_for_update = target
+            .extension_vrl
+            .clone()
+            .or_else(|| Some(String::new()));
         self.repository()
             .update(
                 log_source_id,
                 &UpdateLogSource {
                     parser_vrl: Some(target.parser_vrl),
                     output_fields: target.output_fields,
+                    extension_vrl: extension_vrl_for_update,
+                    extension_enabled: Some(target.extension_enabled),
                     ..Default::default()
                 },
             )
@@ -143,6 +183,14 @@ impl LogSourceService {
                 )
             })?;
 
+        // Restore extension state too. None in the snapshot means "no extension on
+        // the active version" — use empty string to drive the repository COALESCE
+        // pattern that clears the column.
+        let extension_vrl_for_update = active
+            .extension_vrl
+            .clone()
+            .or_else(|| Some(String::new()));
+
         let updated = self
             .repository()
             .update(
@@ -150,6 +198,8 @@ impl LogSourceService {
                 &UpdateLogSource {
                     parser_vrl: Some(active.parser_vrl),
                     output_fields: active.output_fields,
+                    extension_vrl: extension_vrl_for_update,
+                    extension_enabled: Some(active.extension_enabled),
                     ..Default::default()
                 },
             )
@@ -180,14 +230,23 @@ impl LogSourceService {
         let active = self.version_repository().get_active_version(id).await?;
 
         let (has_draft_changes, active_version_number, active_parser_vrl) = match &active {
-            Some(v) => (
-                ls.parser_vrl != v.parser_vrl,
-                Some(v.version_number),
-                Some(v.parser_vrl.clone()),
-            ),
+            Some(v) => {
+                let parser_changed = ls.parser_vrl != v.parser_vrl;
+                let extension_changed = ls.extension_vrl != v.extension_vrl
+                    || ls.extension_enabled != v.extension_enabled;
+                (
+                    parser_changed || extension_changed,
+                    Some(v.version_number),
+                    Some(v.parser_vrl.clone()),
+                )
+            }
             // No active version yet — source has never been published.
-            // If it has parser VRL, that's an unpublished draft.
-            None => (!ls.parser_vrl.is_empty(), None, None),
+            // If it has parser VRL or an extension, that's an unpublished draft.
+            None => (
+                !ls.parser_vrl.is_empty() || ls.extension_vrl.is_some(),
+                None,
+                None,
+            ),
         };
 
         Ok(LogSourceWithDraftStatus {

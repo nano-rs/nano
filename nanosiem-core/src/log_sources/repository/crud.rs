@@ -23,6 +23,7 @@ impl LogSourceRepository {
                 validated, validation_error, deployed, deployed_at, enabled,
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
+                extension_vrl, extension_enabled,
                 parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
                 created_at, updated_at
@@ -102,6 +103,7 @@ impl LogSourceRepository {
                 validated, validation_error, deployed, deployed_at, enabled,
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
+                extension_vrl, extension_enabled,
                 parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
                 created_at, updated_at
@@ -126,6 +128,7 @@ impl LogSourceRepository {
                 validated, validation_error, deployed, deployed_at, enabled,
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
+                extension_vrl, extension_enabled,
                 parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
                 created_at, updated_at
@@ -151,6 +154,7 @@ impl LogSourceRepository {
                 validated, validation_error, deployed, deployed_at, enabled,
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
+                extension_vrl, extension_enabled,
                 parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
                 created_at, updated_at
@@ -176,6 +180,7 @@ impl LogSourceRepository {
                 validated, validation_error, deployed, deployed_at, enabled,
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
+                extension_vrl, extension_enabled,
                 parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
                 created_at, updated_at
@@ -202,6 +207,7 @@ impl LogSourceRepository {
                 validated, validation_error, deployed, deployed_at, enabled,
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
+                extension_vrl, extension_enabled,
                 parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
                 created_at, updated_at
@@ -243,6 +249,7 @@ impl LogSourceRepository {
                 validated, validation_error, deployed, deployed_at, enabled,
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
+                extension_vrl, extension_enabled,
                 parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
                 created_at, updated_at
@@ -305,7 +312,9 @@ impl LogSourceRepository {
             || update.match_pattern.is_some()
             || update.match_values.is_some()
             || update.sampling_ratio.is_some()
-            || update.sampling_exclude_condition.is_some();
+            || update.sampling_exclude_condition.is_some()
+            || update.extension_vrl.is_some()
+            || update.extension_enabled.is_some();
 
         let row = sqlx::query(
             r#"
@@ -332,7 +341,13 @@ impl LogSourceRepository {
                 stale_alert_enabled = COALESCE($21, stale_alert_enabled),
                 stale_threshold_minutes = COALESCE($22, stale_threshold_minutes),
                 sampling_ratio = COALESCE($23, sampling_ratio),
-                sampling_exclude_condition = COALESCE($24, sampling_exclude_condition)
+                sampling_exclude_condition = COALESCE($24, sampling_exclude_condition),
+                extension_vrl = CASE
+                    WHEN $25::text IS NULL THEN extension_vrl
+                    WHEN $25 = '' THEN NULL
+                    ELSE $25
+                END,
+                extension_enabled = COALESCE($26, extension_enabled)
             WHERE id = $1
             RETURNING id, name, description, namespace, timezone, source_type, source_config, credential_id,
                 parser_vrl, output_fields, category, vendor, product, icon, color,
@@ -340,6 +355,7 @@ impl LogSourceRepository {
                 validated, validation_error, deployed, deployed_at, enabled,
                 stale_alert_enabled, stale_threshold_minutes,
                 sampling_ratio, sampling_exclude_condition,
+                extension_vrl, extension_enabled,
                 parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
                 created_at, updated_at
@@ -369,6 +385,8 @@ impl LogSourceRepository {
         .bind(&update.stale_threshold_minutes)
         .bind(&update.sampling_ratio)
         .bind(&update.sampling_exclude_condition)
+        .bind(&update.extension_vrl)
+        .bind(&update.extension_enabled)
         .fetch_one(&self.pool)
         .await?;
 

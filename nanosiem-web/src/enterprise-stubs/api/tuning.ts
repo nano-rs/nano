@@ -12,7 +12,7 @@ export interface TuningProposal {
   rule_id: string;
   rule_name?: string;
   created_at: string;
-  proposal_type: 'query_tuning' | 'hint_update';
+  proposal_type: 'query_tuning' | 'hint_update' | 'silent_rule';
   original_query: string;
   proposed_query: string;
   rationale: string;
@@ -51,6 +51,17 @@ export interface TuningLogEntry {
   status: string;
 }
 
+export interface ApprovalResponse {
+  success: boolean;
+  message: string;
+  version_id: number | null;
+}
+
+export interface RejectionResponse {
+  success: boolean;
+  message: string;
+}
+
 export class TuningAPI {
   listProposals(): Promise<TuningProposal[]> {
     return ENTERPRISE_ONLY();
@@ -61,10 +72,10 @@ export class TuningAPI {
   approveProposal(
     _id: string,
     _opts?: { comment?: string; modified_query?: string },
-  ): Promise<void> {
+  ): Promise<ApprovalResponse> {
     return ENTERPRISE_ONLY();
   }
-  rejectProposal(_id: string, _notes?: string): Promise<void> {
+  rejectProposal(_id: string, _reason: string): Promise<RejectionResponse> {
     return ENTERPRISE_ONLY();
   }
   listLogs(): Promise<TuningLogEntry[]> {

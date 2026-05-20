@@ -17,7 +17,9 @@ use super::types::{
     UpdateSourceConfiguration,
 };
 use crate::log_telemetry::repository::is_safe_source_type;
-use crate::parsers::{base_router_inputs, redact_config_snapshot, CredentialRepository};
+use crate::parsers::{
+    base_router_inputs, hec_normalize_present, redact_config_snapshot, CredentialRepository,
+};
 
 /// Reduce a Pub/Sub subscription value to its bare name. Vector's `gcp_pubsub`
 /// source builds `projects/<p>/subscriptions/<n>` itself, so a fully-qualified
@@ -1595,7 +1597,8 @@ impl SourceConfigService {
     /// Build the ordered `inputs = [...]` list for the source_router transform.
     ///
     /// Pure function over deployed source configs; takes a closure for the
-    /// filesystem check so it stays testable without touching disk.
+    /// filesystem check and an explicit `hec_normalize_present` bool so it
+    /// stays testable without touching disk or env vars.
     /// `is_system_route_deployed_on_disk` returns true when a system-level
     /// (http/vector/splunk_hec) config has its routing TOML present — only
     /// then does it contribute a route and suppress its corresponding
@@ -1603,6 +1606,7 @@ impl SourceConfigService {
     fn compute_router_inputs<F>(
         deployed_configs: &[SourceConfiguration],
         is_system_route_deployed_on_disk: F,
+        hec_normalize_present: bool,
     ) -> Vec<String>
     where
         F: Fn(&str) -> bool,
@@ -1634,11 +1638,14 @@ impl SourceConfigService {
             source_config_routes.push(format!("{}_route", safe_name));
         }
 
-        let mut router_inputs: Vec<String> =
-            base_router_inputs(source_type_extract_covered, hec_normalize_covered)
-                .into_iter()
-                .map(String::from)
-                .collect();
+        let mut router_inputs: Vec<String> = base_router_inputs(
+            source_type_extract_covered,
+            hec_normalize_covered,
+            hec_normalize_present,
+        )
+        .into_iter()
+        .map(String::from)
+        .collect();
         router_inputs.extend(source_config_routes);
         router_inputs
     }
@@ -1654,9 +1661,11 @@ impl SourceConfigService {
             }))
             .await?;
 
-        let router_inputs = Self::compute_router_inputs(&deployed_configs, |name| {
-            self.get_config_file_path(name).exists()
-        });
+        let router_inputs = Self::compute_router_inputs(
+            &deployed_configs,
+            |name| self.get_config_file_path(name).exists(),
+            hec_normalize_present(),
+        );
 
         let new_inputs_line = format!(
             "inputs = [{}]",
@@ -2789,10 +2798,11 @@ mod tests {
         }
     }
 
-    /// Guards against the NAN-852 regression: any source-config mutation
-    /// rebuilds the router inputs and `hec_normalize` must never be dropped.
+    /// Guards against the NAN-852 regression: when the base config defines
+    /// `hec_normalize` (OOTB open-core), any source-config mutation rebuilds
+    /// the router inputs and `hec_normalize` must never be dropped.
     #[test]
-    fn compute_router_inputs_always_contains_hec_normalize() {
+    fn compute_router_inputs_always_contains_hec_normalize_when_present() {
         let scenarios: Vec<Vec<SourceConfiguration>> = vec![
             vec![],
             vec![bare_config("kafka_audit", "kafka")],
@@ -2801,7 +2811,7 @@ mod tests {
         ];
 
         for configs in scenarios {
-            let inputs = SourceConfigService::compute_router_inputs(&configs, |_| true);
+            let inputs = SourceConfigService::compute_router_inputs(&configs, |_| true, true);
             assert!(
                 inputs.iter().any(|s| s == "hec_normalize"),
                 "hec_normalize missing from inputs for configs={:?}",
@@ -2815,10 +2825,32 @@ mod tests {
         }
     }
 
+    /// NAN-867: when the base config doesn't define `hec_normalize` (nano-main
+    /// customer deploys), it must never appear in router inputs — Vector 0.55
+    /// rejects dangling input references at startup.
+    #[test]
+    fn compute_router_inputs_never_contains_hec_normalize_when_absent() {
+        let scenarios: Vec<Vec<SourceConfiguration>> = vec![
+            vec![],
+            vec![bare_config("kafka_audit", "kafka")],
+            vec![bare_config("http_main", "http")],
+            vec![bare_config("vec_relay", "vector"), bare_config("s3_logs", "s3")],
+        ];
+
+        for configs in scenarios {
+            let inputs = SourceConfigService::compute_router_inputs(&configs, |_| true, false);
+            assert!(
+                !inputs.iter().any(|s| s == "hec_normalize"),
+                "hec_normalize emitted with hec_normalize_present=false for configs={:?}",
+                configs.iter().map(|c| &c.name).collect::<Vec<_>>()
+            );
+        }
+    }
+
     #[test]
     fn compute_router_inputs_appends_non_system_routes_after_base() {
         let configs = vec![bare_config("kafka_audit", "kafka")];
-        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| false);
+        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| false, true);
         assert_eq!(
             inputs,
             vec!["source_type_extract", "vector_merge", "hec_normalize", "kafka_audit_route"]
@@ -2828,14 +2860,14 @@ mod tests {
     #[test]
     fn compute_router_inputs_drops_source_type_extract_when_system_route_on_disk() {
         let configs = vec![bare_config("http_main", "http")];
-        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| true);
+        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| true, true);
         assert_eq!(inputs, vec!["vector_merge", "hec_normalize", "http_main_route"]);
     }
 
     #[test]
     fn compute_router_inputs_skips_system_route_when_no_file_on_disk() {
         let configs = vec![bare_config("http_main", "http")];
-        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| false);
+        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| false, true);
         assert_eq!(inputs, vec!["source_type_extract", "vector_merge", "hec_normalize"]);
     }
 
@@ -2949,7 +2981,7 @@ mod tests {
     #[test]
     fn compute_router_inputs_skips_splunk_hec_when_no_file_on_disk() {
         let configs = vec![bare_config("hec_main", "splunk_hec")];
-        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| false);
+        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| false, true);
         assert!(
             !inputs.iter().any(|s| s == "hec_main_route"),
             "splunk_hec route must not be in inputs when no file on disk, got: {inputs:?}"
@@ -3013,7 +3045,7 @@ mod tests {
     #[test]
     fn compute_router_inputs_suppresses_hec_normalize_when_splunk_hec_route_on_disk() {
         let configs = vec![bare_config("hec_main", "splunk_hec")];
-        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| true);
+        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| true, true);
         assert_eq!(
             inputs,
             vec!["source_type_extract", "vector_merge", "hec_main_route"],
@@ -3028,7 +3060,7 @@ mod tests {
             bare_config("http_main", "http"),
             bare_config("hec_main", "splunk_hec"),
         ];
-        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| true);
+        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| true, true);
         assert_eq!(
             inputs,
             vec!["vector_merge", "http_main_route", "hec_main_route"]

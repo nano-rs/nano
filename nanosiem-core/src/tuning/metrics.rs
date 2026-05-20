@@ -3,12 +3,17 @@
 //! Metrics Collector for AI Detection Auto-Tuning
 //!
 //! Continuously collects detection rule execution metrics including:
-//! - Alert counts over various time windows (1h, 24h, 7d)
-//! - Unique entity counts (users, hosts, IPs)
-//! - Alert patterns and common field values
-//! - Query execution times
+//! - Finding counts over various time windows (1h, 24h, 7d) read from
+//!   ClickHouse `logs` where `source_type='findings'` (the actual output of
+//!   scheduled-mode detections; the PG `alerts` table is only written by the
+//!   legacy realtime path).
+//! - Unique entity counts (users, hosts, IPs) extracted from the finding's
+//!   `matched_events_sample` payload in the `metadata` column.
+//! - Finding patterns and common field values.
+//! - Query execution times.
 
 use chrono::{DateTime, Duration, Utc};
+use clickhouse::Client as ClickHouseClient;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -16,6 +21,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::{AlertPattern, RuleMetrics};
+use crate::db::TableNames;
 
 /// Errors that can occur during metrics collection
 #[derive(Error, Debug)]
@@ -54,37 +60,63 @@ impl From<serde_json::Error> for MetricsCollectorError {
     }
 }
 
-/// Alert data retrieved from PostgreSQL
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct Alert {
-    pub id: Uuid,
+/// Finding data retrieved from ClickHouse `logs` (`source_type='findings'`).
+///
+/// Each row represents one logged detection event (live-mode match or alert).
+/// `severity` is read from the direct CH column; `matched_events` is parsed
+/// out of the JSON `metadata.matched_events_sample` written by
+/// `FindingLogger::log_to_clickhouse` so the existing entity-extraction and
+/// pattern-extraction code keeps working unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Finding {
     pub rule_id: Uuid,
     pub severity: String,
     pub matched_events: serde_json::Value,
-    pub created_at: DateTime<Utc>,
+    pub timestamp: DateTime<Utc>,
 }
 
-/// Metrics collector service
+/// Row shape returned by the ClickHouse `logs` SELECT for findings.
+///
+/// We pull `severity` from the direct column (populated by `FindingLogger`)
+/// and the matched-event sample out of the JSON `metadata` column. The CH
+/// `timestamp` is a `DateTime64(6)` — we decode it as microseconds since
+/// epoch (i64) and convert to `DateTime<Utc>` in code.
+#[derive(Debug, clickhouse::Row, serde::Deserialize)]
+struct FindingRow {
+    severity: String,
+    metadata: String,
+    timestamp_us: i64,
+}
+
+/// Metrics collector service.
+///
+/// Uses PostgreSQL for the rule registry / metrics-storage tables and
+/// ClickHouse for the finding count / sample queries.
 pub struct MetricsCollector {
     pg_pool: PgPool,
+    ch_client: ClickHouseClient,
+    table_names: TableNames,
 }
 
 impl MetricsCollector {
-    /// Create a new metrics collector
-    pub fn new(pg_pool: PgPool) -> Self {
-        Self { pg_pool }
+    /// Create a new metrics collector.
+    ///
+    /// The PG pool is used for the rule registry + `detection_rule_metrics`
+    /// storage. The CH client + `TableNames` resolver is used to count
+    /// findings from `logs` (or `logs_distributed` in cluster mode) where
+    /// `source_type='findings'`.
+    pub fn new(pg_pool: PgPool, ch_client: ClickHouseClient, table_names: TableNames) -> Self {
+        Self {
+            pg_pool,
+            ch_client,
+            table_names,
+        }
     }
 
-    /// Collect comprehensive metrics for a detection rule
+    /// Collect comprehensive metrics for a detection rule.
     ///
-    /// This method queries PostgreSQL to count alerts over various time windows
-    /// and extracts entity information from matched events.
-    ///
-    /// # Arguments
-    /// * `rule_id` - UUID of the detection rule
-    ///
-    /// # Returns
-    /// * `RuleMetrics` - Comprehensive metrics for the rule
+    /// Counts findings from ClickHouse for each window and extracts entity
+    /// information from the matched-event samples on those findings.
     pub async fn collect_rule_metrics(
         &self,
         rule_id: Uuid,
@@ -102,55 +134,38 @@ impl MetricsCollector {
             return Err(MetricsCollectorError::RuleNotFound(rule_id));
         }
 
-        // Count alerts in last 1 hour
-        let one_hour_ago = now - Duration::hours(1);
-        let alert_count_1h: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM alerts WHERE rule_id = $1 AND created_at >= $2",
-        )
-        .bind(rule_id)
-        .bind(one_hour_ago)
-        .fetch_one(&self.pg_pool)
-        .await?;
+        // Count findings in the three rolling windows. All three share the
+        // same `now` anchor as the stored `RuleMetrics.timestamp` so the
+        // row's windows line up exactly with its recorded timestamp.
+        let finding_count_1h = self
+            .count_findings(rule_id, now, Duration::hours(1))
+            .await?;
+        let finding_count_24h = self
+            .count_findings(rule_id, now, Duration::hours(24))
+            .await?;
+        let finding_count_7d = self
+            .count_findings(rule_id, now, Duration::days(7))
+            .await?;
 
-        // Count alerts in last 24 hours
-        let twenty_four_hours_ago = now - Duration::hours(24);
-        let alert_count_24h: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM alerts WHERE rule_id = $1 AND created_at >= $2",
-        )
-        .bind(rule_id)
-        .bind(twenty_four_hours_ago)
-        .fetch_one(&self.pg_pool)
-        .await?;
-
-        // Count alerts in last 7 days
-        let seven_days_ago = now - Duration::days(7);
-        let alert_count_7d: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM alerts WHERE rule_id = $1 AND created_at >= $2",
-        )
-        .bind(rule_id)
-        .bind(seven_days_ago)
-        .fetch_one(&self.pg_pool)
-        .await?;
-
-        // Get recent alerts to extract entity information
-        let recent_alerts = self.get_recent_alerts(rule_id, Duration::hours(24)).await?;
+        // Get recent findings to extract entity information
+        let recent_findings = self.get_recent_findings(rule_id, Duration::hours(24)).await?;
 
         // Extract unique entities from matched events
-        let (unique_users, unique_hosts, unique_ips) = self.extract_unique_entities(&recent_alerts);
+        let (unique_users, unique_hosts, unique_ips) =
+            self.extract_unique_entities(&recent_findings);
 
         // Calculate average severity (map severity to numeric values)
-        let avg_severity = self.calculate_average_severity(&recent_alerts);
+        let avg_severity = self.calculate_average_severity(&recent_findings);
 
         // For now, execution_time_ms is set to 0 as we don't track this yet
-        // This can be enhanced later by measuring actual query execution times
         let execution_time_ms = 0;
 
         Ok(RuleMetrics {
             rule_id,
             timestamp: now,
-            alert_count_1h,
-            alert_count_24h,
-            alert_count_7d,
+            alert_count_1h: finding_count_1h,
+            alert_count_24h: finding_count_24h,
+            alert_count_7d: finding_count_7d,
             unique_users,
             unique_hosts,
             unique_ips,
@@ -159,75 +174,146 @@ impl MetricsCollector {
         })
     }
 
-    /// Get recent alerts for a detection rule
+    /// Count findings for a rule over the given trailing window.
     ///
-    /// # Arguments
-    /// * `rule_id` - UUID of the detection rule
-    /// * `duration` - How far back to look for alerts
+    /// Hits `nanosiem.logs` (or `logs_distributed` in cluster mode) filtered
+    /// to `source_type='findings'` and the rule's stringified UUID. The
+    /// `rule_id` column is `String` on CH and is populated for every
+    /// finding row by `FindingLogger::log_to_clickhouse`.
+    async fn count_findings(
+        &self,
+        rule_id: Uuid,
+        now: DateTime<Utc>,
+        window: Duration,
+    ) -> Result<i64, MetricsCollectorError> {
+        // SAFETY: the only value interpolated into `sql` via `format!` is the
+        // table name returned by `TableNames::read`, which is a hard-coded
+        // constant (`nanosiem.logs` / `nanosiem.logs_distributed`). All
+        // caller-supplied values flow through `.bind(...)` placeholders.
+        let table = self.table_names.read("logs");
+        let cutoff = now - window;
+        let sql = format!(
+            "SELECT count() FROM {table} \
+             WHERE source_type = 'findings' \
+               AND rule_id = ? \
+               AND timestamp >= fromUnixTimestamp64Micro(?)"
+        );
+
+        let count: u64 = self
+            .ch_client
+            .query(&sql)
+            .bind(rule_id.to_string())
+            .bind(cutoff.timestamp_micros())
+            .fetch_one()
+            .await?;
+
+        Ok(count as i64)
+    }
+
+    /// Get recent findings for a detection rule from ClickHouse.
     ///
-    /// # Returns
-    /// * `Vec<Alert>` - List of recent alerts
-    pub async fn get_recent_alerts(
+    /// Returns up to 1000 findings within the window, ordered most recent
+    /// first. The finding's matched-event sample is parsed out of the JSON
+    /// stored in the `metadata` column so the existing pattern / entity
+    /// extraction code can consume it unchanged.
+    pub async fn get_recent_findings(
         &self,
         rule_id: Uuid,
         duration: Duration,
-    ) -> Result<Vec<Alert>, MetricsCollectorError> {
-        let cutoff_time = Utc::now() - duration;
+    ) -> Result<Vec<Finding>, MetricsCollectorError> {
+        let cutoff = Utc::now() - duration;
+        // SAFETY: the only value interpolated into `sql` via `format!` is the
+        // table name returned by `TableNames::read`, which is a hard-coded
+        // constant (`nanosiem.logs` / `nanosiem.logs_distributed`). All
+        // caller-supplied values flow through `.bind(...)` placeholders.
+        let table = self.table_names.read("logs");
+        let sql = format!(
+            "SELECT severity, metadata, toUnixTimestamp64Micro(timestamp) AS timestamp_us \
+             FROM {table} \
+             WHERE source_type = 'findings' \
+               AND rule_id = ? \
+               AND timestamp >= fromUnixTimestamp64Micro(?) \
+             ORDER BY timestamp DESC \
+             LIMIT 1000"
+        );
 
-        let alerts: Vec<Alert> = sqlx::query_as(
-            r#"
-            SELECT 
-                id,
-                rule_id,
-                severity,
-                matched_events,
-                created_at
-            FROM alerts
-            WHERE rule_id = $1 AND created_at >= $2
-            ORDER BY created_at DESC
-            LIMIT 1000
-            "#,
-        )
-        .bind(rule_id)
-        .bind(cutoff_time)
-        .fetch_all(&self.pg_pool)
-        .await?;
+        let rows: Vec<FindingRow> = self
+            .ch_client
+            .query(&sql)
+            .bind(rule_id.to_string())
+            .bind(cutoff.timestamp_micros())
+            .fetch_all()
+            .await?;
 
-        Ok(alerts)
+        let findings = rows
+            .into_iter()
+            .map(|row| {
+                // Parse the metadata JSON and lift `matched_events_sample` out
+                // as the row's matched_events (an array). Anything we can't
+                // parse degrades to an empty array — entity extraction just
+                // skips it — but we log so a finding-writer regression that
+                // starts emitting malformed metadata doesn't silently zero
+                // out baselines (the same failure mode as NAN-866).
+                let matched_events = match serde_json::from_str::<serde_json::Value>(&row.metadata)
+                {
+                    Ok(v) => v
+                        .get("matched_events_sample")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Array(Vec::new())),
+                    Err(e) => {
+                        tracing::warn!(
+                            rule_id = %rule_id,
+                            error = %e,
+                            "Failed to parse finding metadata JSON; treating as empty matched_events"
+                        );
+                        serde_json::Value::Array(Vec::new())
+                    }
+                };
+
+                // `from_timestamp_micros` only returns `None` for values
+                // outside i64 micros range, which can't happen for CH
+                // `DateTime64(6)`. Fall back to epoch instead of `now()` so
+                // any pathological row stands out in the data.
+                let timestamp =
+                    DateTime::<Utc>::from_timestamp_micros(row.timestamp_us).unwrap_or_default();
+
+                Finding {
+                    rule_id,
+                    severity: row.severity,
+                    matched_events,
+                    timestamp,
+                }
+            })
+            .collect();
+
+        Ok(findings)
     }
 
-    /// Identify common patterns in alert field values
+    /// Identify common patterns in finding field values.
     ///
-    /// This method analyzes matched events to find frequently occurring field values
-    /// that might indicate false positive patterns.
-    ///
-    /// # Arguments
-    /// * `rule_id` - UUID of the detection rule
-    ///
-    /// # Returns
-    /// * `Vec<AlertPattern>` - List of common patterns with occurrence counts
+    /// Analyzes matched events from recent findings to find frequently
+    /// occurring field values that might indicate false-positive patterns.
     pub async fn get_alert_patterns(
         &self,
         rule_id: Uuid,
     ) -> Result<Vec<AlertPattern>, MetricsCollectorError> {
-        // Get recent alerts (last 24 hours)
-        let recent_alerts = self.get_recent_alerts(rule_id, Duration::hours(24)).await?;
+        // Get recent findings (last 24 hours)
+        let recent_findings = self.get_recent_findings(rule_id, Duration::hours(24)).await?;
 
-        if recent_alerts.is_empty() {
+        if recent_findings.is_empty() {
             return Ok(Vec::new());
         }
 
-        let total_alerts = recent_alerts.len() as i64;
+        let total_findings = recent_findings.len() as i64;
 
         // Track field value occurrences
         let mut field_value_counts: HashMap<(String, String), i64> = HashMap::new();
 
         // Extract field values from matched events
-        for alert in &recent_alerts {
-            if let Some(events) = alert.matched_events.as_array() {
+        for finding in &recent_findings {
+            if let Some(events) = finding.matched_events.as_array() {
                 for event in events {
                     if let Some(obj) = event.as_object() {
-                        // Extract common UDM fields
                         self.extract_field_patterns(obj, &mut field_value_counts);
                     }
                 }
@@ -238,7 +324,7 @@ impl MetricsCollector {
         let mut patterns: Vec<AlertPattern> = field_value_counts
             .into_iter()
             .map(|((field_name, field_value), occurrence_count)| {
-                let percentage = (occurrence_count as f64 / total_alerts as f64) * 100.0;
+                let percentage = (occurrence_count as f64 / total_findings as f64) * 100.0;
                 AlertPattern {
                     field_name,
                     field_value,
@@ -257,17 +343,17 @@ impl MetricsCollector {
         Ok(patterns)
     }
 
-    /// Extract unique entity counts from alerts
+    /// Extract unique entity counts from findings.
     ///
-    /// Uses UDM field names from signal_processor matched_events:
-    /// src_user, dest_user, src_host, dest_host, src_ip, dest_ip
-    fn extract_unique_entities(&self, alerts: &[Alert]) -> (i64, i64, i64) {
+    /// Reads UDM fields from the finding's `matched_events_sample` payload:
+    /// `src_user`, `dest_user`, `src_host`, `dest_host`, `src_ip`, `dest_ip`.
+    fn extract_unique_entities(&self, findings: &[Finding]) -> (i64, i64, i64) {
         let mut unique_users = std::collections::HashSet::new();
         let mut unique_hosts = std::collections::HashSet::new();
         let mut unique_ips = std::collections::HashSet::new();
 
-        for alert in alerts {
-            if let Some(events) = alert.matched_events.as_array() {
+        for finding in findings {
+            if let Some(events) = finding.matched_events.as_array() {
                 for event in events {
                     if let Some(obj) = event.as_object() {
                         // Extract user information (UDM fields)
@@ -308,15 +394,15 @@ impl MetricsCollector {
         )
     }
 
-    /// Calculate average severity from alerts
-    fn calculate_average_severity(&self, alerts: &[Alert]) -> f64 {
-        if alerts.is_empty() {
+    /// Calculate average severity from findings.
+    fn calculate_average_severity(&self, findings: &[Finding]) -> f64 {
+        if findings.is_empty() {
             return 0.0;
         }
 
-        let severity_sum: i32 = alerts
+        let severity_sum: i32 = findings
             .iter()
-            .map(|alert| match alert.severity.as_str() {
+            .map(|finding| match finding.severity.as_str() {
                 "critical" => 5,
                 "high" => 4,
                 "medium" => 3,
@@ -326,20 +412,20 @@ impl MetricsCollector {
             })
             .sum();
 
-        severity_sum as f64 / alerts.len() as f64
+        severity_sum as f64 / findings.len() as f64
     }
 
-    /// Extract field patterns from an event object
+    /// Extract field patterns from an event object.
     ///
-    /// Uses UDM field names from signal_processor matched_events:
-    /// src_ip, dest_ip, src_host, dest_host, src_user, dest_user,
-    /// source_type, risk_entity, plus metadata object keys.
+    /// Uses UDM field names from the finding's `matched_events_sample`:
+    /// `src_ip`, `dest_ip`, `src_host`, `dest_host`, `src_user`, `dest_user`,
+    /// `source_type`, `risk_entity`, plus metadata object keys.
     fn extract_field_patterns(
         &self,
         obj: &serde_json::Map<String, serde_json::Value>,
         field_value_counts: &mut HashMap<(String, String), i64>,
     ) {
-        // UDM fields present in matched_events from signal_processor
+        // UDM fields present in matched_events_sample
         let tracked_fields = [
             "src_ip",
             "dest_ip",
@@ -393,15 +479,11 @@ impl MetricsCollector {
         }
     }
 
-    /// Collect metrics for all enabled detection rules
+    /// Collect metrics for all enabled detection rules.
     ///
-    /// This method is called by the scheduler to collect metrics for all rules.
-    /// It queries all enabled rules and collects metrics for each one.
-    ///
-    /// # Returns
-    /// * `usize` - Number of rules for which metrics were collected
+    /// Called by the scheduler to collect metrics for all active rules
+    /// (those not in `staging` or `paused` mode).
     pub async fn collect_all_metrics(&self) -> Result<usize, MetricsCollectorError> {
-        // Get all active detection rules (not staging or paused)
         let rule_ids: Vec<Uuid> = sqlx::query_scalar(
             "SELECT id FROM detection_rules WHERE mode NOT IN ('staging', 'paused')",
         )
@@ -413,7 +495,6 @@ impl MetricsCollector {
         for rule_id in rule_ids {
             match self.collect_rule_metrics(rule_id).await {
                 Ok(metrics) => {
-                    // Store metrics in database
                     if let Err(e) = self.store_metrics(&metrics).await {
                         tracing::warn!(
                             rule_id = %rule_id,
@@ -437,7 +518,7 @@ impl MetricsCollector {
         Ok(collected_count)
     }
 
-    /// Store metrics in the database
+    /// Store metrics in the PostgreSQL `detection_rule_metrics` table.
     async fn store_metrics(&self, metrics: &RuleMetrics) -> Result<(), MetricsCollectorError> {
         sqlx::query(
             r#"
@@ -471,37 +552,26 @@ impl MetricsCollector {
 mod tests {
     use super::*;
 
+    fn make_finding(severity: &str, matched_events: serde_json::Value) -> Finding {
+        Finding {
+            rule_id: Uuid::now_v7(),
+            severity: severity.to_string(),
+            matched_events,
+            timestamp: Utc::now(),
+        }
+    }
+
     #[test]
     fn test_calculate_average_severity() {
-        // Create a mock collector without database connections
-        let alerts = vec![
-            Alert {
-                id: Uuid::now_v7(),
-                rule_id: Uuid::now_v7(),
-                severity: "critical".to_string(),
-                matched_events: serde_json::json!([]),
-                created_at: Utc::now(),
-            },
-            Alert {
-                id: Uuid::now_v7(),
-                rule_id: Uuid::now_v7(),
-                severity: "high".to_string(),
-                matched_events: serde_json::json!([]),
-                created_at: Utc::now(),
-            },
-            Alert {
-                id: Uuid::now_v7(),
-                rule_id: Uuid::now_v7(),
-                severity: "medium".to_string(),
-                matched_events: serde_json::json!([]),
-                created_at: Utc::now(),
-            },
+        let findings = vec![
+            make_finding("critical", serde_json::json!([])),
+            make_finding("high", serde_json::json!([])),
+            make_finding("medium", serde_json::json!([])),
         ];
 
-        // Test the calculation directly without needing a collector instance
-        let severity_sum: i32 = alerts
+        let severity_sum: i32 = findings
             .iter()
-            .map(|alert| match alert.severity.as_str() {
+            .map(|finding| match finding.severity.as_str() {
                 "critical" => 5,
                 "high" => 4,
                 "medium" => 3,
@@ -511,52 +581,43 @@ mod tests {
             })
             .sum();
 
-        let avg = severity_sum as f64 / alerts.len() as f64;
+        let avg = severity_sum as f64 / findings.len() as f64;
         assert_eq!(avg, 4.0); // (5 + 4 + 3) / 3 = 4.0
     }
 
     #[test]
     fn test_extract_unique_entities() {
-        let alerts = vec![
-            Alert {
-                id: Uuid::now_v7(),
-                rule_id: Uuid::now_v7(),
-                severity: "high".to_string(),
-                matched_events: serde_json::json!([
+        let findings = vec![
+            make_finding(
+                "high",
+                serde_json::json!([
                     {
                         "src_user": "alice",
                         "src_host": "server1",
                         "src_ip": "192.168.1.1"
                     }
                 ]),
-                created_at: Utc::now(),
-            },
-            Alert {
-                id: Uuid::now_v7(),
-                rule_id: Uuid::now_v7(),
-                severity: "high".to_string(),
-                matched_events: serde_json::json!([
+            ),
+            make_finding(
+                "high",
+                serde_json::json!([
                     {
                         "src_user": "alice",
                         "dest_host": "server2",
                         "src_ip": "192.168.1.1"
                     }
                 ]),
-                created_at: Utc::now(),
-            },
-            Alert {
-                id: Uuid::now_v7(),
-                rule_id: Uuid::now_v7(),
-                severity: "high".to_string(),
-                matched_events: serde_json::json!([
+            ),
+            make_finding(
+                "high",
+                serde_json::json!([
                     {
                         "dest_user": "bob",
                         "src_host": "server1",
                         "dest_ip": "192.168.1.2"
                     }
                 ]),
-                created_at: Utc::now(),
-            },
+            ),
         ];
 
         // Test entity extraction directly using UDM field names
@@ -564,8 +625,8 @@ mod tests {
         let mut unique_hosts = std::collections::HashSet::new();
         let mut unique_ips = std::collections::HashSet::new();
 
-        for alert in &alerts {
-            if let Some(events) = alert.matched_events.as_array() {
+        for finding in &findings {
+            if let Some(events) = finding.matched_events.as_array() {
                 for event in events {
                     if let Some(obj) = event.as_object() {
                         for field in &["src_user", "dest_user"] {

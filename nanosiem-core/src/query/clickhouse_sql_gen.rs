@@ -816,8 +816,20 @@ impl ClickHouseSqlGenerator {
             let cte_sql = match stage {
                 QueryStage::Search(expr) => {
                     let where_clause = self.generate_search_expr(expr)?;
-                    let base_select =
-                        self.build_select_clause(&ctx.required_fields, &ctx.ext_fields);
+                    // NAN-876: stage_0 of a multi-stage CTE chain must
+                    // preserve the physical `action` column so downstream
+                    // stages (and LLM-generated commands like `| where
+                    // action="..."` or `| stats count by action`) can
+                    // resolve it by its UDM name. The `action AS
+                    // event_type` alias is still emitted so the canonical
+                    // name is also available; the redundant `action`
+                    // column is dropped once at the outer SELECT below
+                    // when the last stage left it in scope.
+                    let base_select = self.build_select_clause_with_options(
+                        &ctx.required_fields,
+                        &ctx.ext_fields,
+                        true,
+                    );
                     let select_clause = if materialized_cols.is_empty() {
                         base_select
                     } else {
@@ -893,6 +905,16 @@ impl ClickHouseSqlGenerator {
                             // These commands also produce aggregated/projected results
                             has_aggregate_or_projection = true;
                         }
+                        Command::Rename { .. } | Command::Fields { keep: false, .. } => {
+                            // NAN-876: these don't aggregate, but they CAN strip
+                            // `action` from the CTE schema — `rename action AS x`
+                            // or `fields - action`. The flag's secondary job is
+                            // gating the outer SELECT's `* EXCEPT (action)`
+                            // collapse; if action might be gone, we must not
+                            // attempt the EXCEPT or CH will reject the column
+                            // reference.
+                            has_aggregate_or_projection = true;
+                        }
                         _ => {}
                     }
                     self.generate_command_cte(&cte_name, &prev_cte, cmd, ctx)?
@@ -909,13 +931,28 @@ impl ClickHouseSqlGenerator {
         // so optimize_read_in_order is irrelevant here (pass false).
         let last_cte = format!("stage_{}", stages.len() - 1);
         let settings = generate_settings(ctx.use_cache, false, has_non_timechart_aggregation);
+
+        // NAN-876: stage_0 preserves the physical `action` column for
+        // downstream stages, so the last CTE may still carry it alongside
+        // its `event_type` alias. When no transforming command stripped
+        // those columns (i.e. the pipeline is search → optional
+        // sort/filter/head/eval), apply the NAN-671 EXCEPT collapse once
+        // at the outer SELECT so the user-facing result keeps only
+        // `event_type`. When an aggregation/projection ran, the last
+        // CTE's schema is whatever that command produced (`action` is
+        // gone), so plain `SELECT *` is correct.
+        let select_list = if has_aggregate_or_projection {
+            "*".to_string()
+        } else {
+            "* EXCEPT (action)".to_string()
+        };
         if last_stage_has_ordering || has_aggregate_or_projection {
-            write!(sql, "\nSELECT * FROM {} {}", last_cte, settings).unwrap();
+            write!(sql, "\nSELECT {} FROM {} {}", select_list, last_cte, settings).unwrap();
         } else {
             write!(
                 sql,
-                "\nSELECT * FROM {} ORDER BY timestamp DESC {}",
-                last_cte, settings
+                "\nSELECT {} FROM {} ORDER BY timestamp DESC {}",
+                select_list, last_cte, settings
             )
             .unwrap();
         }
@@ -1141,6 +1178,30 @@ impl ClickHouseSqlGenerator {
         required_fields: &Option<HashSet<String>>,
         ext_fields: &HashSet<String>,
     ) -> String {
+        self.build_select_clause_with_options(required_fields, ext_fields, false)
+    }
+
+    /// Variant of [`build_select_clause`] that controls whether the
+    /// physical `action` column is excluded from the wildcard expansion
+    /// (NAN-671's terminal-projection behavior) or kept alongside its
+    /// canonical `event_type` alias (NAN-876's intermediate-CTE
+    /// behavior).
+    ///
+    /// **When to set `preserve_legacy_columns = true`:** stage_0 of a
+    /// multi-stage CTE chain, where downstream stages (e.g. a LLM-
+    /// generated `... | where action="foo"` or `... | stats count by
+    /// action`) need to reference `action` by its physical name. The
+    /// terminal `EXCEPT (action)` collapse, if there is one, is applied
+    /// once at the outer SELECT in [`generate_cte_query`] — not at every
+    /// intermediate stage. NAN-876 was the bug where intermediate
+    /// stages stripped `action` and the LLM hunting queries hit
+    /// `Unknown expression identifier \`action\`` for every reference.
+    fn build_select_clause_with_options(
+        &self,
+        required_fields: &Option<HashSet<String>>,
+        ext_fields: &HashSet<String>,
+        preserve_legacy_columns: bool,
+    ) -> String {
         match required_fields {
             None => {
                 // ClickHouse's SELECT * excludes MATERIALIZED and ALIAS columns.
@@ -1149,13 +1210,22 @@ impl ClickHouseSqlGenerator {
                 // This ensures they're visible in CTE stages and downstream queries.
                 //
                 // `action` is the physical column for what the UDM canonically calls
-                // `event_type` (NAN-659). We project `event_type` (the alias) and
-                // exclude `action` from the wildcard so default search results show
-                // the canonical name in the column header. User queries that type
-                // `action=` keep working (alias is bidirectional and `action` is
-                // still in EXPLICIT_COLUMNS so the SQL gen routes it to the column
-                // not ext.action).
-                let base = "* EXCEPT (action), action AS event_type";
+                // `event_type` (NAN-659). For terminal projections we project
+                // `event_type` (the alias) and exclude `action` from the wildcard so
+                // default search results show the canonical name in the column header.
+                // User queries that type `action=` keep working (alias is bidirectional
+                // and `action` is still in EXPLICIT_COLUMNS so the SQL gen routes it
+                // to the column not ext.action).
+                //
+                // For intermediate CTE stages we keep `action` inside `*` so
+                // downstream stages (and LLM-generated commands) can still reference
+                // it directly. The redundant column is dropped at the outer SELECT
+                // when the last stage didn't transform it away. See NAN-876.
+                let base = if preserve_legacy_columns {
+                    "*, action AS event_type"
+                } else {
+                    "* EXCEPT (action), action AS event_type"
+                };
                 let materialized = "enriched_src_country, enriched_src_country_code, \
                     enriched_src_asn, enriched_src_as_name, enriched_src_as_domain, \
                     enriched_dest_country, enriched_dest_country_code, \
@@ -1189,6 +1259,15 @@ impl ClickHouseSqlGenerator {
                 }
             }
             Some(fields) => {
+                // Explicit-fields path: `preserve_legacy_columns` is not
+                // consulted here — when field_analysis enumerates required
+                // columns, it's expected to include `action` if any stage
+                // references it. If a future LLM-generated query slips a
+                // reference past field_analysis (e.g. via an unusual
+                // construct), NAN-876's symptom (`Unknown expression
+                // identifier`) can reappear in this branch. The fix in
+                // that case lives in field_analysis, not here.
+                //
                 // Sort fields for consistent output
                 let mut field_list: Vec<_> = fields.iter().collect();
                 field_list.sort();
@@ -1340,6 +1419,96 @@ mod tests {
             sql.contains("action AS event_type"),
             "expected `action AS event_type` so result header carries the canonical UDM name, got:\n{}",
             sql
+        );
+    }
+
+    /// NAN-876: multi-stage CTE chains must keep `action` accessible to
+    /// downstream stages. The shadow_hunting LLM agent generates queries
+    /// like `... | stats count by action` and `... | where action="foo"`,
+    /// and the previous SELECT clause stripped `action` in stage_0 of the
+    /// wildcard path, causing ClickHouse to fail with `Unknown expression
+    /// identifier \`action\` in scope stage_1`. Pin: when stage_0 falls
+    /// back to `SELECT *` (no field-pruning), it must NOT also apply the
+    /// NAN-671 EXCEPT — the alias still gets projected, but `action`
+    /// stays inside `*` so downstream stages can reference it.
+    ///
+    /// Uses `sort -timestamp` because it doesn't drive field_analysis to
+    /// enumerate explicit columns; it preserves the wildcard path that
+    /// the original NAN-876 reproducer (saturn shadow_hunting at
+    /// 16:40:51 UTC) hit.
+    #[test]
+    fn cte_stage_0_preserves_action_for_downstream_reference() {
+        let query = parse_query("error | sort -timestamp").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+
+        let stage_0_marker = "stage_0 AS (";
+        let stage_0_start = sql
+            .find(stage_0_marker)
+            .expect("expected a stage_0 CTE for a piped query");
+        let stage_0_end = sql[stage_0_start..]
+            .find("),")
+            .or_else(|| sql[stage_0_start..].find(')'))
+            .map(|i| stage_0_start + i)
+            .unwrap_or(sql.len());
+        let stage_0_body = &sql[stage_0_start..stage_0_end];
+
+        assert!(
+            !stage_0_body.contains("* EXCEPT (action)"),
+            "stage_0 must preserve `action` for downstream stages (NAN-876), got:\n{}",
+            stage_0_body
+        );
+        assert!(
+            stage_0_body.contains("action AS event_type"),
+            "stage_0 should still expose the `event_type` alias alongside `action`, got:\n{}",
+            stage_0_body
+        );
+    }
+
+    /// NAN-876: non-aggregating multi-stage pipelines should still hide
+    /// `action` from the final user-facing result, matching NAN-671's
+    /// intent. The outer SELECT applies `* EXCEPT (action)` when the
+    /// pipeline didn't transform columns away.
+    #[test]
+    fn cte_outer_select_strips_redundant_action_when_no_aggregation() {
+        let query = parse_query("error | sort -timestamp").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+
+        // Locate the outer SELECT (the one after the last CTE closes).
+        // It should EXCEPT(action) because `sort` preserves columns.
+        let last_select = sql
+            .rfind("SELECT")
+            .map(|i| &sql[i..])
+            .expect("outer SELECT present");
+        assert!(
+            last_select.contains("* EXCEPT (action)"),
+            "outer SELECT must drop the redundant `action` column when the last stage didn't aggregate, got:\n{}",
+            last_select
+        );
+    }
+
+    /// NAN-876: aggregating pipelines (stats / table / timechart) produce
+    /// their own column set in the last CTE — `action` is gone by then,
+    /// and the outer SELECT must NOT attempt EXCEPT(action) (CH would
+    /// reject the reference). Plain `SELECT *` from the last CTE.
+    #[test]
+    fn cte_outer_select_plain_when_aggregation_ran() {
+        let query = parse_query("error | stats count by user").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+
+        let last_select = sql
+            .rfind("SELECT")
+            .map(|i| &sql[i..])
+            .expect("outer SELECT present");
+        assert!(
+            !last_select.contains("EXCEPT (action)"),
+            "outer SELECT after an aggregation must not reference `action`, got:\n{}",
+            last_select
         );
     }
 }

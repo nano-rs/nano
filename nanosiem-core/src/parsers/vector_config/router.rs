@@ -24,6 +24,13 @@ use crate::parsers::types::Parser;
 ///
 /// - `source_type_extract_covered`: an http/vector routing config is deployed
 /// - `hec_normalize_covered`: a splunk_hec routing config is deployed
+/// - `hec_normalize_present`: the deployment's base Vector config actually
+///   defines `[transforms.hec_normalize]`. OOTB open-core (config/vector/
+///   02-hec-source.toml) does; nano-main customer deploys do not — their
+///   Splunk HEC events flow through `splunk_in` → `auth_check` →
+///   `source_type_extract` instead. Emitting `hec_normalize` when absent
+///   makes Vector 0.55 reject the config on startup (`Input "hec_normalize"
+///   for transform "source_router" doesn't match any components`). NAN-867.
 ///
 /// `vector_merge` has no per-config intermediary (the Vector-native protocol
 /// is always direct), so it stays unconditionally present.
@@ -34,16 +41,33 @@ use crate::parsers::types::Parser;
 pub fn base_router_inputs(
     source_type_extract_covered: bool,
     hec_normalize_covered: bool,
+    hec_normalize_present: bool,
 ) -> Vec<&'static str> {
     let mut inputs = Vec::with_capacity(3);
     if !source_type_extract_covered {
         inputs.push("source_type_extract");
     }
     inputs.push("vector_merge");
-    if !hec_normalize_covered {
+    if hec_normalize_present && !hec_normalize_covered {
         inputs.push("hec_normalize");
     }
     inputs
+}
+
+/// Whether the deployment's base Vector config defines `[transforms.hec_normalize]`.
+///
+/// Reads `NANOSIEM_VECTOR_HEC_NORMALIZE_PRESENT`. Defaults to `true` to
+/// preserve the OOTB open-core invariant from NAN-836 — that path ships
+/// `02-hec-source.toml` and the router must keep wiring HEC events into
+/// `source_router` directly.
+///
+/// nano-main customer deploys (Hetzner via compose-generator, K8s via
+/// k8s-manifests/vector.ts) set this to `"false"`; their base config uses
+/// `splunk_in` + `auth_check` and never defines `hec_normalize`.
+pub fn hec_normalize_present() -> bool {
+    std::env::var("NANOSIEM_VECTOR_HEC_NORMALIZE_PRESENT")
+        .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "false" | "0" | "no" | "off"))
+        .unwrap_or(true)
 }
 
 /// Built-in source types that get placeholder routes when no parser is deployed.
@@ -237,11 +261,14 @@ impl VectorConfigManager {
 
         let (source_type_extract_covered, hec_normalize_covered) =
             self.source_config_intermediary_coverage().await;
-        let mut router_inputs: Vec<String> =
-            base_router_inputs(source_type_extract_covered, hec_normalize_covered)
-                .into_iter()
-                .map(String::from)
-                .collect();
+        let mut router_inputs: Vec<String> = base_router_inputs(
+            source_type_extract_covered,
+            hec_normalize_covered,
+            hec_normalize_present(),
+        )
+        .into_iter()
+        .map(String::from)
+        .collect();
         let source_config_routes = self.get_source_config_routes().await;
         router_inputs.extend(source_config_routes);
         let inputs_formatted = router_inputs
@@ -381,21 +408,25 @@ mod tests {
     fn base_router_inputs_always_includes_vector_merge() {
         for src_covered in [true, false] {
             for hec_covered in [true, false] {
-                assert!(
-                    base_router_inputs(src_covered, hec_covered).contains(&"vector_merge"),
-                    "vector_merge missing for ({src_covered}, {hec_covered})"
-                );
+                for hec_present in [true, false] {
+                    assert!(
+                        base_router_inputs(src_covered, hec_covered, hec_present)
+                            .contains(&"vector_merge"),
+                        "vector_merge missing for ({src_covered}, {hec_covered}, {hec_present})"
+                    );
+                }
             }
         }
     }
 
-    /// HEC OOTB invariant (NAN-836): when no splunk_hec route is deployed,
-    /// `hec_normalize` must feed `source_router` directly so HEC events on
-    /// :8088 reach the router.
+    /// HEC OOTB invariant (NAN-836): when the base config defines
+    /// `hec_normalize` and no splunk_hec route is deployed, `hec_normalize`
+    /// must feed `source_router` directly so HEC events on :8088 reach
+    /// the router.
     #[test]
-    fn base_router_inputs_includes_hec_normalize_when_uncovered() {
-        assert!(base_router_inputs(false, false).contains(&"hec_normalize"));
-        assert!(base_router_inputs(true, false).contains(&"hec_normalize"));
+    fn base_router_inputs_includes_hec_normalize_when_uncovered_and_present() {
+        assert!(base_router_inputs(false, false, true).contains(&"hec_normalize"));
+        assert!(base_router_inputs(true, false, true).contains(&"hec_normalize"));
     }
 
     /// NAN-857: when a splunk_hec route is deployed, `hec_normalize` must NOT
@@ -404,21 +435,46 @@ mod tests {
     /// the route) and lands in CH duplicated.
     #[test]
     fn base_router_inputs_excludes_hec_normalize_when_covered() {
-        assert!(!base_router_inputs(false, true).contains(&"hec_normalize"));
-        assert!(!base_router_inputs(true, true).contains(&"hec_normalize"));
+        for hec_present in [true, false] {
+            assert!(!base_router_inputs(false, true, hec_present).contains(&"hec_normalize"));
+            assert!(!base_router_inputs(true, true, hec_present).contains(&"hec_normalize"));
+        }
+    }
+
+    /// NAN-867: when the base config doesn't define `hec_normalize` (nano-main
+    /// customer deploys), the router must never reference it. Vector 0.55
+    /// rejects dangling input references and aborts startup.
+    #[test]
+    fn base_router_inputs_excludes_hec_normalize_when_absent() {
+        for src_covered in [true, false] {
+            for hec_covered in [true, false] {
+                assert!(
+                    !base_router_inputs(src_covered, hec_covered, false).contains(&"hec_normalize"),
+                    "hec_normalize emitted with hec_normalize_present=false ({src_covered}, {hec_covered})"
+                );
+            }
+        }
     }
 
     /// Symmetric invariant for http/vector: when an http/vector route is
     /// deployed, `source_type_extract` must be suppressed from base inputs.
     #[test]
     fn base_router_inputs_excludes_source_type_extract_when_covered() {
-        assert!(!base_router_inputs(true, false).contains(&"source_type_extract"));
-        assert!(!base_router_inputs(true, true).contains(&"source_type_extract"));
+        for hec_present in [true, false] {
+            assert!(
+                !base_router_inputs(true, false, hec_present).contains(&"source_type_extract")
+            );
+            assert!(!base_router_inputs(true, true, hec_present).contains(&"source_type_extract"));
+        }
     }
 
     #[test]
     fn base_router_inputs_includes_source_type_extract_when_uncovered() {
-        assert!(base_router_inputs(false, false).contains(&"source_type_extract"));
-        assert!(base_router_inputs(false, true).contains(&"source_type_extract"));
+        for hec_present in [true, false] {
+            assert!(
+                base_router_inputs(false, false, hec_present).contains(&"source_type_extract")
+            );
+            assert!(base_router_inputs(false, true, hec_present).contains(&"source_type_extract"));
+        }
     }
 }

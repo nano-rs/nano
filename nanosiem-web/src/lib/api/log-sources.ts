@@ -69,10 +69,20 @@ export class LogSourcesApi {
     });
   }
 
-  async testLogSourceVrl(vrlCode: string, sampleLog: string): Promise<LogSourceTestResult> {
+  async testLogSourceVrl(
+    vrlCode: string,
+    sampleLog: string,
+    extensionVrl?: string,
+  ): Promise<LogSourceTestResult> {
     return this.request('/api/log-sources/test-vrl', {
       method: 'POST',
-      body: JSON.stringify({ vrl_code: vrlCode, sample_log: sampleLog }),
+      body: JSON.stringify({
+        vrl_code: vrlCode,
+        sample_log: sampleLog,
+        ...(extensionVrl && extensionVrl.trim() !== ''
+          ? { extension_vrl: extensionVrl }
+          : {}),
+      }),
     });
   }
 

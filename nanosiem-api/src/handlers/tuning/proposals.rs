@@ -165,6 +165,131 @@ pub async fn approve_proposal(
 
     let (rule_name, rule_description, rule_severity, rule_mode) = rule;
 
+    // SilentRule proposals (NAN-880 phase 3c) route by what the detector
+    // encoded in proposed_query:
+    //
+    // 1. Pause sentinel (`// __NANOSIEM_SILENT_ACTION:pause__`)
+    //    → set rule mode='paused', record decision, audit.
+    // 2. proposed_query == original_query (no rewrite)
+    //    → record decision only (MissingFields / Generic causes; the
+    //      analyst should use Customize to navigate to the rule editor).
+    // 3. proposed_query != original_query, no sentinel
+    //    → fall through to the QueryTuning apply path below, which
+    //      validates the rewritten query, updates the rule, and creates
+    //      a new rule version (Used by the ThresholdUnreachable cause).
+    if proposal.proposal_type == ProposalType::SilentRule
+        && nanosiem_core::tuning::silent_actions::is_pause_action(&proposal.proposed_query)
+    {
+        sqlx::query(
+            "UPDATE detection_rules SET mode = 'paused', updated_at = NOW() WHERE id = $1",
+        )
+        .bind(proposal.rule_id)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| ApiError::InternalError(format!("Failed to pause rule: {}", e)))?;
+
+        state
+            .tuning_repository
+            .update_proposal_status(proposal.id, TuningStatus::ManuallyApproved)
+            .await
+            .map_err(|e| {
+                ApiError::InternalError(format!("Failed to update proposal status: {}", e))
+            })?;
+
+        if let Some(ref comment) = request.comment {
+            if let Err(e) = state
+                .tuning_repository
+                .set_reviewer_notes(proposal.id, comment)
+                .await
+            {
+                tracing::warn!(
+                    "Failed to set reviewer notes on silent-rule pause: {}",
+                    e
+                );
+            }
+        }
+
+        state.emit_audit(
+            AuditEvent::builder(AuditSource::Tuning, PROPOSAL_APPROVED)
+                .actor(Some(auth.user_id()), None)
+                .api_key(auth.api_key_id, auth.api_key_name.clone())
+                .resource(
+                    "tuning_proposal",
+                    Some(proposal.id),
+                    Some(rule_name.clone()),
+                )
+                .client_context(&client)
+                .details(serde_json::json!({
+                    "rule_id": proposal.rule_id,
+                    "proposal_type": "silent_rule",
+                    "action": "pause",
+                    "comment": request.comment,
+                }))
+                .build(),
+        );
+
+        return Ok(Json(ApprovalResponse {
+            success: true,
+            message: format!("Silent rule paused: '{}'", rule_name),
+            version_id: None,
+        }));
+    }
+
+    if proposal.proposal_type == ProposalType::SilentRule
+        && proposal.proposed_query == proposal.original_query
+    {
+        state
+            .tuning_repository
+            .update_proposal_status(proposal.id, TuningStatus::ManuallyApproved)
+            .await
+            .map_err(|e| {
+                ApiError::InternalError(format!("Failed to update proposal status: {}", e))
+            })?;
+
+        if let Some(ref comment) = request.comment {
+            if let Err(e) = state
+                .tuning_repository
+                .set_reviewer_notes(proposal.id, comment)
+                .await
+            {
+                tracing::warn!(
+                    "Failed to set reviewer notes on silent-rule approval: {}",
+                    e
+                );
+            }
+        }
+
+        state.emit_audit(
+            AuditEvent::builder(AuditSource::Tuning, PROPOSAL_APPROVED)
+                .actor(Some(auth.user_id()), None)
+                .api_key(auth.api_key_id, auth.api_key_name.clone())
+                .resource(
+                    "tuning_proposal",
+                    Some(proposal.id),
+                    Some(rule_name.clone()),
+                )
+                .client_context(&client)
+                .details(serde_json::json!({
+                    "rule_id": proposal.rule_id,
+                    "proposal_type": "silent_rule",
+                    "action": "acknowledge",
+                    "comment": request.comment,
+                }))
+                .build(),
+        );
+
+        return Ok(Json(ApprovalResponse {
+            success: true,
+            message: format!(
+                "Silent-rule diagnostic acknowledged for rule '{}'",
+                rule_name
+            ),
+            version_id: None,
+        }));
+    }
+    // Else: SilentRule with proposed_query != original_query (no sentinel)
+    // → falls through to the QueryTuning apply logic below.
+
     // Handle based on proposal type
     let version_id = if proposal.proposal_type == ProposalType::HintUpdate {
         // Hint update: Update ai_triage_hints, no version needed

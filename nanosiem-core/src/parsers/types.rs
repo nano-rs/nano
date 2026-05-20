@@ -342,6 +342,14 @@ pub struct Parser {
     pub sampling_ratio: Option<f64>,
     /// VRL condition for events that are NEVER sampled (e.g., .action != "allow"). None = no exclusions.
     pub sampling_exclude_condition: Option<String>,
+    /// Optional VRL overlay chained after _parse, before _output (NAN-874).
+    /// Stub case: when parser_vrl is effectively empty and extension_vrl is set,
+    /// the extension IS the parser for this source_type.
+    #[serde(default)]
+    pub extension_vrl: Option<String>,
+    /// Toggle whether extension_vrl is deployed (NAN-874).
+    #[serde(default)]
+    pub extension_enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

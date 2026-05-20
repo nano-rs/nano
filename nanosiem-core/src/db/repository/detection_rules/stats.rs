@@ -50,7 +50,13 @@ impl DetectionRuleRepository {
     }
 
     /// Update live match count (for bake-in mode)
-    /// Also updates last_match_at if there were matches
+    /// Also updates last_match_at if there were matches.
+    ///
+    /// NAN-869: `match_count` is the true lifetime counter (always incremented
+    /// in both modes); `live_match_count` is the current bake-in phase counter
+    /// (reset on Alerting→Live demotion). The two columns are disjoint — no
+    /// code path folds one into the other — so incrementing both here is
+    /// exact, not a double-count.
     pub async fn update_live_match_count(
         &self,
         id: Uuid,
@@ -63,7 +69,8 @@ impl DetectionRuleRepository {
                 UPDATE detection_rules SET
                     last_run_at = NOW(),
                     last_match_at = NOW(),
-                    live_match_count = live_match_count + $2
+                    live_match_count = live_match_count + $2,
+                    match_count = match_count + $2
                 WHERE id = $1
                 "#,
             )
@@ -77,7 +84,8 @@ impl DetectionRuleRepository {
                 r#"
                 UPDATE detection_rules SET
                     last_run_at = NOW(),
-                    live_match_count = live_match_count + $2
+                    live_match_count = live_match_count + $2,
+                    match_count = match_count + $2
                 WHERE id = $1
                 "#,
             )

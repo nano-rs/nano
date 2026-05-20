@@ -606,6 +606,10 @@ pub async fn validate_vrl(
 pub struct TestVrlRequest {
     pub vrl_code: String,
     pub sample_log: String,
+    /// Optional parser extension VRL to chain after `vrl_code` (NAN-874).
+    /// When present, the request tests the combined pipeline: parse → extension.
+    #[serde(default)]
+    pub extension_vrl: Option<String>,
 }
 
 /// Test VRL against a sample log
@@ -630,7 +634,11 @@ pub async fn test_vrl(
 
     let result = state
         .log_source_service
-        .test_vrl(&request.vrl_code, &request.sample_log)
+        .test_vrl_chain(
+            &request.vrl_code,
+            request.extension_vrl.as_deref(),
+            &request.sample_log,
+        )
         .await;
     Ok(Json(result))
 }

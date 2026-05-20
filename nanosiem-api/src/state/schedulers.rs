@@ -283,8 +283,15 @@ impl AppState {
         #[cfg_attr(not(feature = "enterprise"), allow(unused_variables))]
         let dual_pool = self.dual_pool.clone();
 
-        // Create tuning services
-        let metrics_collector = MetricsCollector::new(self.pool.clone());
+        // Create tuning services. Metrics collector reads findings from
+        // ClickHouse (`logs WHERE source_type='findings'`) — not the legacy
+        // PG `alerts` table — so it sees scheduled-mode detection output
+        // (NAN-866).
+        let metrics_collector = MetricsCollector::new(
+            self.pool.clone(),
+            self.dual_pool.clickhouse().clone(),
+            self.dual_pool.table_names(),
+        );
         let baseline_monitor = BaselineMonitor::new(self.pool.clone());
         let threshold_detector =
             ThresholdDetector::new(self.pool.clone(), Arc::new(baseline_monitor.clone()));
