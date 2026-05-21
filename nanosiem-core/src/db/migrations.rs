@@ -82,6 +82,13 @@ pub enum MigrationError {
     /// `sqlx::migrate!("../migrations/postgres").run()` failed.
     #[error("postgres migrator failed: {0}")]
     MigratorFailed(#[from] sqlx::migrate::MigrateError),
+
+    /// Pre-migration repair for the NAN-922 collision failed. See
+    /// [`repair_nan922_185_collision`]. Rare; only fires if the DELETE
+    /// against `_sqlx_migrations` is blocked (privilege model) or the
+    /// table-exists probe fails.
+    #[error("nan-922 collision repair failed: {0}")]
+    RepairFailed(#[source] sqlx::Error),
 }
 
 /// Mode for [`run_postgres_migrations`], controlled by the
@@ -153,6 +160,105 @@ pub async fn is_fresh_database(pool: &PgPool) -> Result<bool, sqlx::Error> {
     .fetch_one(pool)
     .await?;
     Ok(!has_known_table)
+}
+
+/// Description that sqlx assigns to a migration whose filename is
+/// `*_brand_rename_system_ai.sql`. sqlx strips the leading version + `_`,
+/// drops the `.sql` extension, and replaces remaining `_` with spaces.
+///
+/// Used by [`repair_nan922_185_collision`] to identify a poisoned legacy row
+/// without depending on checksum comparison (which would also need to know
+/// the exact byte content of the pre-rename file).
+const NAN922_BRAND_RENAME_DESCRIPTION: &str = "brand rename system ai";
+
+/// NAN-926: heal tenants stuck on the NAN-922 migration-185 collision.
+///
+/// NAN-922 (PR #1350) renamed `185_brand_rename_system_ai.sql` →
+/// `187_brand_rename_system_ai.sql` to resolve a parallel-PR version
+/// collision (NAN-910 + NAN-918 both landed at 185). For tenants that had
+/// already applied the OLD 185 (NAN-910's brand-rename), the rename leaves
+/// `_sqlx_migrations.version=185` pinned to the old checksum. On the next
+/// `sqlx::migrate!` run, sqlx finds that the file at version 185 is now
+/// `185_seed_splunk_hec_routing_rules.sql` (different checksum) and aborts
+/// with "migration 185 was previously applied but has been modified",
+/// blocking every subsequent migration. NAN-922's commit body documented
+/// the manual recovery (`DELETE FROM _sqlx_migrations WHERE version = 185`)
+/// but humans missed it on the 0.1.532 rollout and broke both saturn and the
+/// local docker stack.
+///
+/// This function makes the recovery automatic. It deletes the poisoned row
+/// IFF all three signals line up:
+///   1. `_sqlx_migrations` exists (skip on fresh DBs that haven't bootstrapped
+///      it yet — `migrator.run()` will create it next).
+///   2. There IS a row at version 185, and its description is
+///      `brand rename system ai` (the exact slug derived from the pre-rename
+///      filename — unambiguous; that description only ever existed in the old
+///      185 file because no other migration shares that name).
+///   3. There is NO row at version 187. Once 187 lands the brand-rename has
+///      been re-applied under its new version and self-healing is done; we
+///      MUST NOT touch the table again.
+///
+/// All three together are tight enough to never fire on a legitimate row.
+/// Once 187 is applied this function is a permanent no-op for that DB. A
+/// fresh DB never satisfies signal 2. A DB that already applied the new 185
+/// (HEC seed rules) has a different description there and won't match.
+///
+/// Both re-applied migration bodies are idempotent on the re-run:
+///   - `185_seed_splunk_hec_routing_rules.sql` → `INSERT ... ON CONFLICT DO NOTHING`
+///   - `187_brand_rename_system_ai.sql` → `UPDATE ... WHERE email = '<old>'`
+///     (matches zero rows post-recovery because the column was already
+///     rewritten by the original NAN-910 run).
+///
+/// Errors are not silenced: callers receive [`MigrationError::RepairFailed`]
+/// so a broken privilege model surfaces as a boot failure rather than
+/// half-fixing the DB and proceeding.
+pub async fn repair_nan922_185_collision(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let has_sqlx_table: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_name = '_sqlx_migrations')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !has_sqlx_table {
+        return Ok(());
+    }
+
+    let row_185: Option<(String,)> = sqlx::query_as(
+        "SELECT description FROM public._sqlx_migrations WHERE version = 185",
+    )
+    .fetch_optional(pool)
+    .await?;
+    let Some((description_185,)) = row_185 else {
+        return Ok(());
+    };
+    if description_185 != NAN922_BRAND_RENAME_DESCRIPTION {
+        return Ok(());
+    }
+
+    let has_187: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM public._sqlx_migrations WHERE version = 187)",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_187 {
+        return Ok(());
+    }
+
+    warn!(
+        "NAN-922 collision detected: removing poisoned _sqlx_migrations row \
+         (version=185, description='{}') so the renamed brand-rename can \
+         re-land at version=187. See NAN-926.",
+        NAN922_BRAND_RENAME_DESCRIPTION
+    );
+    sqlx::query(
+        "DELETE FROM public._sqlx_migrations \
+         WHERE version = 185 AND description = $1",
+    )
+    .bind(NAN922_BRAND_RENAME_DESCRIPTION)
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }
 
 /// Insert one row per migration in `migrator` whose version is
@@ -309,6 +415,15 @@ pub async fn run_postgres_migrations(pool: &PgPool) -> Result<(), MigrationError
         info!("Open-init snapshot applied; legacy history backfilled");
     }
 
+    // NAN-926: self-heal the NAN-922 migration-185 rename collision before
+    // sqlx::migrate! gets a chance to abort on the mismatched checksum. No-op
+    // on fresh DBs (signal: _sqlx_migrations absent), DBs that already
+    // applied the new 185 (signal: description mismatch), and DBs that have
+    // already self-healed (signal: 187 row present).
+    repair_nan922_185_collision(pool)
+        .await
+        .map_err(MigrationError::RepairFailed)?;
+
     info!("Running PostgreSQL migrations (sqlx::migrate!('../migrations/postgres'))");
     open_migrator.run(pool).await?;
     info!("PostgreSQL migrations complete");
@@ -375,6 +490,28 @@ mod tests {
             past_baseline > 0,
             "no migrations past baseline {} — bump OPEN_INIT_BASELINE_VERSION to the new snapshot high-water mark, or this guard is the only thing keeping the filter honest",
             OPEN_INIT_BASELINE_VERSION
+        );
+    }
+
+    /// NAN-926: the repair function looks up the poisoned row by its
+    /// sqlx-derived description. That description is the slug taken from
+    /// the renamed file at version 187 — if anyone ever renames
+    /// `187_brand_rename_system_ai.sql`, the constant goes stale silently.
+    /// This guard pins the constant against the embedded migrator so the
+    /// build fails loudly instead.
+    #[test]
+    fn nan922_brand_rename_description_matches_embedded_187() {
+        let migrator = sqlx::migrate!("../migrations/postgres");
+        let m187 = migrator
+            .iter()
+            .find(|m| m.version == 187)
+            .expect("embedded migrator must include version 187 (post-NAN-922 brand rename)");
+        assert_eq!(
+            m187.description.as_ref(),
+            NAN922_BRAND_RENAME_DESCRIPTION,
+            "187's description drifted from NAN922_BRAND_RENAME_DESCRIPTION \
+             — the repair function will no-op against legitimately poisoned \
+             tenants. Update the constant if 187 was intentionally renamed."
         );
     }
 

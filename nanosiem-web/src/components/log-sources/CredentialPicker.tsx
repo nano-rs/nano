@@ -21,6 +21,17 @@ const PROVIDER_LABELS: Record<string, string> = {
   kafka: 'Kafka',
 };
 
+// What "no credential selected" actually means depends on the provider:
+// AWS/GCP fall back to ambient cloud identity (instance metadata / ADC), but
+// Kafka with no credential means an anonymous PLAINTEXT consumer — common for
+// local dev brokers like the NAN-884 test stand. Be explicit so the picker
+// doesn't read as "set credentials = magic env" for the Kafka case.
+const NONE_OPTION_LABEL: Record<string, string> = {
+  aws_s3: 'None (use environment / IAM role)',
+  gcp_pubsub: 'None (use Application Default Credentials)',
+  kafka: 'None (unauthenticated — local / dev brokers)',
+};
+
 export function CredentialPicker({ provider, value, onChange, disabled }: CredentialPickerProps) {
   const [credentials, setCredentials] = useState<CloudCredential[]>([]);
   const [loading, setLoading] = useState(true);
@@ -86,7 +97,7 @@ export function CredentialPicker({ provider, value, onChange, disabled }: Creden
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="_none" className="text-[12px] text-muted-foreground">
-              None (use environment/IAM)
+              {NONE_OPTION_LABEL[provider]}
             </SelectItem>
             {credentials.map((cred) => (
               <SelectItem key={cred.id} value={cred.id} className="text-[12px]">
@@ -117,8 +128,10 @@ export function CredentialPicker({ provider, value, onChange, disabled }: Creden
             className="underline hover:text-amber-500 dark:hover:text-amber-300"
           >
             Add credentials
-          </Link>{' '}
-          or use environment variables/IAM roles.
+          </Link>
+          {provider === 'kafka'
+            ? ' — or leave as None for an unauthenticated broker.'
+            : ' or use environment variables/IAM roles.'}
         </p>
       )}
     </div>

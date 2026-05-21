@@ -41,9 +41,111 @@ pub struct SourceConfigRepository {
     pool: PgPool,
 }
 
+/// NAN-930: Vector-route-name safe identifier rule. Single source of truth
+/// for the source_configs side of the codebase — `SourceConfigService` has
+/// its own private `safe_name` (in `service.rs`) which uses the same rule;
+/// keeping them character-for-character identical is what makes the
+/// claim-to-route join correct. Unicode-aware `is_alphanumeric` is the
+/// canonical filter — must NOT be computed in SQL where regex character
+/// classes are ASCII-only and would drift on non-ASCII names.
+fn route_safe_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// NAN-930: a deployed parser's claim over a Vector source-config routing
+/// transform. Used by `update_dynamic_router` to (a) substitute claimed
+/// routes with their `<route>_unclaimed` filter in `source_router.inputs`,
+/// and (b) emit the matching filter transform block when it's not already
+/// present in `_router.toml`.
+#[derive(Debug, Clone)]
+pub struct RouteClaim {
+    /// Vector route name being claimed (e.g. `splunk_hec_route`,
+    /// `kafka_source_route`).
+    pub route: String,
+    /// Parser name — used as filter-condition fallback when match_values is empty.
+    pub parser_name: String,
+    /// Source-type values the parser-filter accepts. Union across all
+    /// claimants of a route forms the `includes([...])` condition the
+    /// `_unclaimed` filter negates.
+    pub match_values: Vec<String>,
+}
+
 impl SourceConfigRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// NAN-930: load route-claim info for every enabled parser that consumes
+    /// from a Vector route shared with `source_router`. Used by the source-
+    /// config deploy path (`update_dynamic_router`) so its surgical update
+    /// of `source_router.inputs` keeps the parser-claim substitution intact.
+    ///
+    /// Returns one entry per claiming parser. Two parsers claiming the same
+    /// route appear as separate entries — callers union them.
+    ///
+    /// - HEC parsers (`source_type IN ('splunk_hec','splunk','hec')`) always
+    ///   claim `splunk_hec_route` (the OOTB singleton).
+    /// - Fetch-source parsers (`source_type IN ('kafka','aws_s3','aws_sqs','gcp_pubsub')`)
+    ///   claim `<safe(name)>_route` of their `dispatch_source_config_id`.
+    ///
+    /// **safe_name is computed in Rust, not in SQL**, so the route name
+    /// derivation always matches what `parsers/vector_config/router.rs::
+    /// get_source_config_routes` actually generates (Unicode-aware
+    /// `char::is_alphanumeric` vs PG's ASCII-only `[^A-Za-z0-9]` regex
+    /// would otherwise drift on non-ASCII source-config names — e.g.
+    /// `café-kafka` → Rust `café_kafka` vs PG `caf__kafka`).
+    pub async fn load_route_claims(
+        &self,
+    ) -> Result<Vec<RouteClaim>, SourceConfigRepositoryError> {
+        // Fetch raw fields — route name is derived in Rust to keep the
+        // safe_name rule canonical. HEC parsers have no source-config
+        // dispatch; the LEFT JOIN yields NULL for `sc_name` and the
+        // caller maps that to `splunk_hec_route`.
+        let rows = sqlx::query_as::<_, (String, String, Option<Vec<String>>, Option<String>)>(
+            r#"
+            SELECT
+                ls.source_type,
+                ls.name AS parser_name,
+                ls.match_values,
+                sc.name AS sc_name
+            FROM log_sources ls
+            LEFT JOIN source_configurations sc ON sc.id = ls.dispatch_source_config_id
+            WHERE ls.enabled = true
+              AND (
+                  ls.source_type IN ('splunk_hec', 'splunk', 'hec')
+                  OR (
+                      ls.source_type IN ('kafka', 'aws_s3', 'aws_sqs', 'gcp_pubsub')
+                      AND ls.dispatch_source_config_id IS NOT NULL
+                      AND sc.id IS NOT NULL
+                  )
+              )
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|(source_type, parser_name, match_values, sc_name)| {
+                let route = match source_type.as_str() {
+                    "splunk_hec" | "splunk" | "hec" => "splunk_hec_route".to_string(),
+                    _ => {
+                        // Fetch-source parsers must have a non-null sc.name —
+                        // the WHERE clause guarantees it, but be defensive.
+                        let sc_name = sc_name?;
+                        format!("{}_route", route_safe_name(&sc_name))
+                    }
+                };
+                Some(RouteClaim {
+                    route,
+                    parser_name,
+                    match_values: match_values.unwrap_or_default(),
+                })
+            })
+            .collect())
     }
 
     // ========================================================================

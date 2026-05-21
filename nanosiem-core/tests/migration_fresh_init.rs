@@ -21,6 +21,7 @@
 //! Run: `cargo test --test migration_fresh_init -- --nocapture --test-threads=1`
 //! (single-threaded because scenarios share one process env).
 
+use nanosiem_core::db::migrations::repair_nan922_185_collision;
 use nanosiem_core::db::run_postgres_migrations;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Executor, PgPool};
@@ -252,4 +253,172 @@ async fn nan749_fresh_init_path_creates_open_schema_and_backfills_history() {
             "auto-detect on fresh DB should pick fresh path → no enterprise tables"
         );
     }
+}
+
+// ============================================================================
+// NAN-926 — auto-repair the NAN-922 migration-185 rename collision.
+//
+// The fixture shape mirrors the broken tenant: `_sqlx_migrations` exists with
+// a single row at version=185 whose description is the old brand-rename slug
+// and whose checksum does NOT match the post-NAN-922 file at that version.
+// We don't seed 1..=184 because `repair_nan922_185_collision` is independent
+// of the rest of the migration history — its three signals all live in the
+// `_sqlx_migrations` table itself.
+// ============================================================================
+
+/// Create just the `_sqlx_migrations` table (matching sqlx's own schema) and
+/// return the pool. Used to set up the four NAN-926 scenarios without
+/// dragging in the open-init snapshot.
+async fn schema_with_empty_sqlx_migrations() -> PgPool {
+    let pool = fresh_schema_pool().await.expect("fresh schema");
+    pool.execute(
+        "CREATE TABLE public._sqlx_migrations ( \
+            version BIGINT PRIMARY KEY, \
+            description TEXT NOT NULL, \
+            installed_on TIMESTAMPTZ NOT NULL DEFAULT now(), \
+            success BOOLEAN NOT NULL, \
+            checksum BYTEA NOT NULL, \
+            execution_time BIGINT NOT NULL \
+        )",
+    )
+    .await
+    .expect("create _sqlx_migrations");
+    pool
+}
+
+async fn insert_migration_row(pool: &PgPool, version: i64, description: &str) {
+    sqlx::query(
+        "INSERT INTO public._sqlx_migrations \
+           (version, description, success, checksum, execution_time) \
+         VALUES ($1, $2, TRUE, $3, 1000)",
+    )
+    .bind(version)
+    .bind(description)
+    // Arbitrary 20-byte checksum — the repair function never compares it,
+    // it only looks at description + version=187 absence.
+    .bind(vec![0u8; 20])
+    .execute(pool)
+    .await
+    .expect("insert _sqlx_migrations row");
+}
+
+async fn version_present(pool: &PgPool, version: i64) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM public._sqlx_migrations WHERE version = $1)",
+    )
+    .bind(version)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false)
+}
+
+#[tokio::test]
+async fn nan926_repair_deletes_poisoned_185_when_187_absent() {
+    if std::env::var("SKIP_DB_TESTS").is_ok() {
+        return;
+    }
+    if let Err(e) = recreate_test_db().await {
+        eprintln!("Could not (re)create test DB at {}: {}", admin_url(), e);
+        return;
+    }
+
+    // Poisoned legacy tenant: 185 = old brand-rename, 187 not present.
+    let pool = schema_with_empty_sqlx_migrations().await;
+    insert_migration_row(&pool, 185, "brand rename system ai").await;
+
+    repair_nan922_185_collision(&pool)
+        .await
+        .expect("repair succeeds");
+
+    assert!(
+        !version_present(&pool, 185).await,
+        "repair should have deleted the poisoned version=185 row"
+    );
+
+    // Idempotent: a second call on the now-clean DB is a no-op.
+    repair_nan922_185_collision(&pool)
+        .await
+        .expect("second call is a no-op");
+    assert!(!version_present(&pool, 185).await);
+}
+
+#[tokio::test]
+async fn nan926_repair_leaves_healthy_185_alone() {
+    if std::env::var("SKIP_DB_TESTS").is_ok() {
+        return;
+    }
+    if let Err(e) = recreate_test_db().await {
+        eprintln!("Could not (re)create test DB at {}: {}", admin_url(), e);
+        return;
+    }
+
+    // Post-rename healthy state: 185 = new HEC seed migration, 187 present.
+    let pool = schema_with_empty_sqlx_migrations().await;
+    insert_migration_row(&pool, 185, "seed splunk hec routing rules").await;
+    insert_migration_row(&pool, 187, "brand rename system ai").await;
+
+    repair_nan922_185_collision(&pool)
+        .await
+        .expect("repair succeeds");
+
+    assert!(
+        version_present(&pool, 185).await,
+        "repair must not touch a healthy 185 row"
+    );
+    assert!(version_present(&pool, 187).await);
+}
+
+#[tokio::test]
+async fn nan926_repair_is_noop_when_187_already_landed() {
+    // Edge case: somehow both the poisoned 185 description AND a 187 row
+    // exist. This can't happen via the normal migrator path, but if a
+    // tenant manually re-applied the brand-rename at 187 and then forgot
+    // to clean up the old row, the repair must NOT delete the 185 row a
+    // second time (the new file's checksum is already there).
+    //
+    // Reality: the description check would have to also match — i.e. the
+    // tenant's 185 row still has the old brand-rename description. In that
+    // pathological case the safe move is "do nothing", because we'd be
+    // deleting the row that records the new 185 application. The 187-absent
+    // signal is what makes this safe; this test pins the behavior.
+    if std::env::var("SKIP_DB_TESTS").is_ok() {
+        return;
+    }
+    if let Err(e) = recreate_test_db().await {
+        eprintln!("Could not (re)create test DB at {}: {}", admin_url(), e);
+        return;
+    }
+
+    let pool = schema_with_empty_sqlx_migrations().await;
+    insert_migration_row(&pool, 185, "brand rename system ai").await;
+    insert_migration_row(&pool, 187, "brand rename system ai").await;
+
+    repair_nan922_185_collision(&pool)
+        .await
+        .expect("repair succeeds");
+
+    assert!(
+        version_present(&pool, 185).await,
+        "with 187 present the repair must leave 185 alone"
+    );
+    assert!(version_present(&pool, 187).await);
+}
+
+#[tokio::test]
+async fn nan926_repair_is_noop_without_sqlx_migrations_table() {
+    // Fresh DB: the migrator hasn't bootstrapped _sqlx_migrations yet. The
+    // repair must not fail with "relation does not exist" — it should
+    // detect the missing table and return Ok.
+    if std::env::var("SKIP_DB_TESTS").is_ok() {
+        return;
+    }
+    if let Err(e) = recreate_test_db().await {
+        eprintln!("Could not (re)create test DB at {}: {}", admin_url(), e);
+        return;
+    }
+    let pool = fresh_schema_pool().await.expect("fresh schema");
+
+    repair_nan922_185_collision(&pool)
+        .await
+        .expect("repair is a no-op when _sqlx_migrations is absent");
 }

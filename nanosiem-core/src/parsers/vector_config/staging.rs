@@ -130,7 +130,7 @@ impl VectorConfigManager {
 
         let (source_type_extract_covered, hec_normalize_covered) =
             self.source_config_intermediary_coverage().await;
-        let mut router_inputs: Vec<String> = base_router_inputs(
+        let base_inputs: Vec<String> = base_router_inputs(
             source_type_extract_covered,
             hec_normalize_covered,
             hec_normalize_present(),
@@ -139,7 +139,19 @@ impl VectorConfigManager {
         .map(String::from)
         .collect();
         let source_config_routes = self.get_source_config_routes().await;
-        router_inputs.extend(source_config_routes);
+
+        // NAN-930: apply the same claim-dedupe substitution as the active
+        // router writer (router.rs::write_router_config). `promote_staged`
+        // copies this file over the active `_router.toml` after validation,
+        // so without this call the staging output would re-introduce raw
+        // route names in `source_router.inputs` and the double-write bug
+        // would return. Shared helper keeps the two writers in lockstep.
+        let (router_inputs, unclaimed_filter_blocks) =
+            super::router::build_router_inputs_with_claim_dedupe(
+                base_inputs,
+                &source_config_routes,
+                parsers,
+            );
         let inputs_formatted = router_inputs
             .iter()
             .map(|s| format!("\"{}\"", s))
@@ -149,12 +161,14 @@ impl VectorConfigManager {
         let mut config = format!(
             "# Auto-generated dynamic router for staged validation\n\
              # Generated at: {}\n\n\
+             {}\
              # Accepts input from HTTP pipeline, Vector native protocol, and source configurations.\n\
              [transforms.source_router]\n\
              type = \"route\"\n\
              inputs = [{}]\n\n\
              [transforms.source_router.route]\n",
             chrono::Utc::now().to_rfc3339(),
+            unclaimed_filter_blocks,
             inputs_formatted
         );
 

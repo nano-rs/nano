@@ -16,7 +16,18 @@ impl ParserService {
     pub async fn deploy_to_vector(&self) -> Result<(), ParserServiceError> {
         let parsers = self.list().await?;
         // Inject credentials for cloud sources before deployment
-        let parsers_with_creds = self.inject_credentials_for_all(&parsers).await?;
+        let mut parsers_with_creds = self.inject_credentials_for_all(&parsers).await?;
+        // NAN-930 follow-up: this path runs at API startup and after parser-
+        // only mutations. Without resolving dispatch_route_name here the
+        // generator falls through to the legacy parser-owned-source branch
+        // even for parsers bound to a source-config — re-introducing the
+        // double-write topology NAN-930 fixed for the log-source-publish path.
+        crate::parsers::resolve_parser_dispatch_routes(
+            &self.pool,
+            &mut parsers_with_creds,
+        )
+        .await
+        .map_err(|e| ParserServiceError::DeploymentFailed(e.to_string()))?;
         self.vector_config
             .deploy_and_reload(&parsers_with_creds)
             .await?;
@@ -113,7 +124,17 @@ impl ParserService {
         }
 
         // Inject credentials for cloud sources before staging
-        let all_parsers_with_creds = self.inject_credentials_for_all(&all_parsers).await?;
+        let mut all_parsers_with_creds = self.inject_credentials_for_all(&all_parsers).await?;
+        // NAN-930 follow-up: stamp dispatch_route_name on every parser bound
+        // to a source-config so the generator's match arm picks the
+        // filter-on-dispatch-route branch instead of emitting a parser-owned
+        // Vector source. Mirrors the resolution call in `deploy_to_vector`.
+        crate::parsers::resolve_parser_dispatch_routes(
+            &self.pool,
+            &mut all_parsers_with_creds,
+        )
+        .await
+        .map_err(|e| ParserServiceError::DeploymentFailed(e.to_string()))?;
 
         // Stage all enabled parsers including this one
         if let Err(e) = self

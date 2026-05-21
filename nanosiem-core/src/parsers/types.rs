@@ -321,6 +321,22 @@ pub struct Parser {
     #[serde(default, with = "typeid::cloud_credential::opt")]
     #[schema(value_type = Option<String>)]
     pub credential_id: Option<Uuid>,
+    /// NAN-928: dispatch source-configuration whose route this parser should
+    /// consume from (set by the parser-import "DISPATCH FROM" picker).
+    /// Surfaced here so the Vector config generator can read it without
+    /// re-fetching the LogSource row.
+    #[serde(default, with = "typeid::source_config::opt")]
+    #[schema(value_type = Option<String>)]
+    pub dispatch_source_config_id: Option<Uuid>,
+    /// NAN-928: transient route name resolved from
+    /// `dispatch_source_config_id` (format: `<safe_name>_route`). The
+    /// LogSourceService stamps this just before passing parsers into the
+    /// Vector generator so the kafka/aws_s3/gcp_pubsub branches can emit a
+    /// `filter inputs = ["<dispatch_route_name>"]` instead of a parser-owned
+    /// source. Not persisted; not part of the public API or wire format
+    /// (`#[serde(skip)]` keeps it out of JSON in both directions).
+    #[serde(default, skip)]
+    pub dispatch_route_name: Option<String>,
     pub enabled: bool,
     pub validated: bool,
     pub validation_error: Option<String>,

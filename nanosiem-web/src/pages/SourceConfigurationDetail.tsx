@@ -165,7 +165,7 @@ const BINDING_CALLOUT: Partial<
   },
   kafka: {
     binding:
-      'This Kafka source binds to one consumer group on one cluster. To ingest from another cluster, create a separate Source Configuration.',
+      'This Kafka source binds to one consumer group on one cluster. To ingest from another cluster, create a separate Source Configuration. Each Source Configuration must use a unique consumer group ID — two configs sharing a group will split partitions and each will only receive a fraction of the records.',
     multipleHint:
       'To split a single set of topics into multiple source types, switch to Multiple-source-types mode below.',
   },

@@ -24,6 +24,30 @@ impl VectorConfigManager {
                 let router_input = format!("source_router.{}", safe_name);
                 (String::new(), router_input)
             }
+            "kafka" | "aws_s3" | "aws_sqs" | "gcp_pubsub"
+                if parser.dispatch_route_name.is_some() =>
+            {
+                // NAN-928: fetch-source parser bound to a deployed source
+                // configuration via the "DISPATCH FROM" picker. Mirror the
+                // HEC shape — `filter` on the source-config's routing
+                // transform, condition matching the parser's `match_values`.
+                // The user's source config owns the connection; this parser
+                // only consumes its already-routed output.
+                let filter_name = format!("{}_filter", safe_name);
+                let route_name = parser
+                    .dispatch_route_name
+                    .as_deref()
+                    .expect("checked by match guard");
+                let match_values: &[String] =
+                    parser.match_values.as_deref().unwrap_or(&[]);
+                let config = self.generate_dispatch_route_filter(
+                    &filter_name,
+                    route_name,
+                    match_values,
+                    &parser.name,
+                );
+                (config, filter_name)
+            }
             "kafka" => {
                 let source_name = format!("{}_source", safe_name);
                 let config = self.generate_kafka_source(parser, &source_name);
@@ -352,13 +376,34 @@ impl VectorConfigManager {
         match_values: &[String],
         parser_name: &str,
     ) -> String {
+        self.generate_dispatch_route_filter(
+            filter_name,
+            "splunk_hec_route",
+            match_values,
+            parser_name,
+        )
+    }
+
+    /// NAN-928: build a per-parser `filter` transform that consumes from an
+    /// arbitrary source-config routing transform (`<safe_name>_route`).
+    /// Generalises `generate_splunk_hec_filter` so fetch-source parsers
+    /// bound to a Kafka / S3 / GCP source config via the DISPATCH FROM
+    /// picker share the same shape — no per-parser owned Vector source,
+    /// the source config alone holds the connection.
+    fn generate_dispatch_route_filter(
+        &self,
+        filter_name: &str,
+        route_name: &str,
+        match_values: &[String],
+        parser_name: &str,
+    ) -> String {
         let condition = build_hec_filter_condition(match_values, parser_name);
         format!(
             "[transforms.{}]\n\
              type = \"filter\"\n\
-             inputs = [\"splunk_hec_route\"]\n\
+             inputs = [\"{}\"]\n\
              condition = '{}'\n",
-            filter_name, condition,
+            filter_name, route_name, condition,
         )
     }
 }
@@ -450,5 +495,150 @@ mod hec_filter_tests {
         assert!(condition.contains(r#""weird\"\\value""#), "got: {condition}");
         assert!(condition.contains(r#""with\nnewline""#), "got: {condition}");
         assert!(!condition.contains('\n'), "literal newline leaked: {condition}");
+    }
+}
+
+// =============================================================================
+// NAN-928: dispatch-source-based parser generation
+// =============================================================================
+//
+// Pre-NAN-928 the parser-generator's kafka/aws_s3/gcp_pubsub branches always
+// emitted a parser-owned Vector source, ignoring the "DISPATCH FROM" picker
+// that the UI showed for fetch-source imports. Result: a parser imported
+// against a Kafka source-config would try to connect to localhost:9092 with
+// default topics, while the user's correctly-configured source-config
+// streamed events into source_router that no parser was wired to.
+//
+// These tests pin the new behavior:
+//   - When `dispatch_route_name` is `Some`, the kafka/aws_s3/gcp_pubsub
+//     branches emit a `filter` on that route (same shape as HEC), not a
+//     parser-owned source.
+//   - When `None`, fall back to the legacy parser-owned source so parsers
+//     imported pre-fix keep generating identical config.
+
+#[cfg(test)]
+mod dispatch_source_tests {
+    use super::*;
+    use crate::parsers::types::Parser;
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    fn make_parser(source_type: &str, dispatch_route: Option<&str>) -> Parser {
+        Parser {
+            id: Uuid::new_v4(),
+            name: "Apache HTTP Server".to_string(),
+            description: None,
+            source_type: source_type.to_string(),
+            source_config: serde_json::json!({}),
+            parser_vrl: String::new(),
+            output_fields: None,
+            feed_id: None,
+            credential_id: None,
+            dispatch_source_config_id: dispatch_route.map(|_| Uuid::new_v4()),
+            dispatch_route_name: dispatch_route.map(|s| s.to_string()),
+            enabled: true,
+            validated: true,
+            validation_error: None,
+            category: None,
+            vendor: None,
+            product: None,
+            namespace: "default".to_string(),
+            timezone: "UTC".to_string(),
+            match_values: Some(vec!["apache_access".to_string(), "apache".to_string()]),
+            sampling_ratio: None,
+            sampling_exclude_condition: None,
+            extension_vrl: None,
+            extension_enabled: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn run_generator(parser: &Parser) -> (String, String) {
+        let mgr = VectorConfigManager::with_defaults();
+        mgr.generate_source_config(parser)
+    }
+
+    /// Kafka parser bound to a deployed source config emits a `filter` on
+    /// that source-config's route — no parser-owned Kafka source.
+    #[test]
+    fn kafka_with_dispatch_route_emits_filter_not_owned_source() {
+        let parser = make_parser("kafka", Some("nan884_smoke_sasl_plaintext_route"));
+        let (config, input_name) = run_generator(&parser);
+
+        assert!(
+            config.contains("type = \"filter\""),
+            "expected filter transform, got:\n{config}",
+        );
+        assert!(
+            config.contains("inputs = [\"nan884_smoke_sasl_plaintext_route\"]"),
+            "expected filter inputs pointing at the dispatch route, got:\n{config}",
+        );
+        assert!(
+            !config.contains("type = \"kafka\""),
+            "must NOT emit a parser-owned kafka source, got:\n{config}",
+        );
+        assert!(
+            !config.contains("bootstrap_servers"),
+            "must NOT carry connection config — source-config owns it, got:\n{config}",
+        );
+        assert!(
+            input_name.ends_with("_filter"),
+            "input chain name should reference the filter transform, got: {input_name}",
+        );
+    }
+
+    /// Same shape for AWS S3 dispatch-bound parsers.
+    #[test]
+    fn aws_s3_with_dispatch_route_emits_filter_not_owned_source() {
+        let parser = make_parser("aws_s3", Some("audit_bucket_route"));
+        let (config, _input) = run_generator(&parser);
+        assert!(config.contains("inputs = [\"audit_bucket_route\"]"));
+        assert!(!config.contains("type = \"aws_s3\""));
+        assert!(!config.contains("queue_url"));
+    }
+
+    /// Same shape for GCP Pub/Sub.
+    #[test]
+    fn gcp_pubsub_with_dispatch_route_emits_filter_not_owned_source() {
+        let parser = make_parser("gcp_pubsub", Some("gcp_audit_route"));
+        let (config, _input) = run_generator(&parser);
+        assert!(config.contains("inputs = [\"gcp_audit_route\"]"));
+        assert!(!config.contains("type = \"gcp_pubsub\""));
+        assert!(!config.contains("project ="));
+    }
+
+    /// Backward-compat: a Kafka parser with no dispatch route still gets a
+    /// parser-owned Kafka source. Pre-NAN-928 imports rely on this.
+    #[test]
+    fn kafka_without_dispatch_route_falls_back_to_owned_source() {
+        let parser = make_parser("kafka", None);
+        let (config, _input) = run_generator(&parser);
+        assert!(
+            config.contains("type = \"kafka\""),
+            "expected parser-owned kafka source as fallback, got:\n{config}",
+        );
+        assert!(
+            config.contains("bootstrap_servers"),
+            "owned source must carry its own connection config, got:\n{config}",
+        );
+        assert!(
+            !config.contains("type = \"filter\""),
+            "must NOT emit a filter when no dispatch route is bound, got:\n{config}",
+        );
+    }
+
+    /// The filter condition still matches against `.source_type` using the
+    /// parser's `match_values`, identical to the HEC behavior — so any
+    /// source_type the source-config routing rule sets will reach the
+    /// parser as long as it's in `match_values`.
+    #[test]
+    fn dispatch_filter_condition_matches_source_type_against_match_values() {
+        let parser = make_parser("kafka", Some("kafka_route_x"));
+        let (config, _input) = run_generator(&parser);
+        assert!(
+            config.contains(r#"includes(["apache_access", "apache"], to_string(.source_type) ?? "")"#),
+            "expected source_type filter condition, got:\n{config}",
+        );
     }
 }

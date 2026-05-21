@@ -329,6 +329,8 @@ mod tests {
             output_fields: None,
             feed_id: None,
             credential_id: None,
+            dispatch_source_config_id: None,
+            dispatch_route_name: None,
             namespace: "default".to_string(),
             enabled: true,
             validated: true,

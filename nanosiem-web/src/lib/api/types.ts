@@ -4478,6 +4478,15 @@ export interface RoutingRuleReachability {
   source_config_enabled: boolean;
   source_config_deployed: boolean;
   target_log_source_exists: boolean;
+  /**
+   * NAN-884 K-4: TCP-dial result for broker-bound configs (Kafka).
+   * `true` if at least one `bootstrap_servers` entry accepted a connection,
+   * `false` if every entry failed, `undefined` for non-broker source types
+   * or when no bootstrap_servers were parseable.
+   */
+  broker_reachable?: boolean;
+  /** One line per probed broker — `host:port → ok` or `host:port → <reason>`. */
+  broker_reachable_details?: string[];
   warnings: string[];
 }
 

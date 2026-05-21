@@ -98,6 +98,13 @@ export interface ParserImportRequest {
   source_type?: string;
   /** Ingestion method: routed, kafka, aws_s3, gcp_pubsub, splunk_hec, vector */
   ingestion_method?: string;
+  /**
+   * NAN-928: source-configuration id whose route should dispatch events into
+   * this parser. Set by the "DISPATCH FROM" picker. When set on a Kafka/S3/GCP
+   * import, the backend generator emits a filter on the source-config's
+   * `*_route` transform instead of a parser-owned Vector source.
+   */
+  dispatch_source_config_id?: string | null;
 }
 
 export interface ParserImportPreview {
@@ -122,6 +129,8 @@ export interface BatchImportParserItem {
   import_type?: 'linked' | 'forked';
   source_type?: string;
   ingestion_method?: string;
+  /** NAN-928: see ParserImportRequest.dispatch_source_config_id */
+  dispatch_source_config_id?: string | null;
 }
 
 export interface ParserBatchImportResponse {

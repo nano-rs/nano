@@ -40,7 +40,7 @@ impl ParserRepository {
             SELECT
                 id, name, description, source_type,
                 source_config, parser_vrl, output_fields,
-                credential_id, enabled, validated, validation_error,
+                credential_id, dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 created_at, updated_at
             FROM log_sources
@@ -59,7 +59,7 @@ impl ParserRepository {
             SELECT
                 id, name, description, source_type,
                 source_config, parser_vrl, output_fields,
-                credential_id, enabled, validated, validation_error,
+                credential_id, dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 created_at, updated_at
             FROM log_sources
@@ -79,7 +79,7 @@ impl ParserRepository {
             SELECT
                 id, name, description, source_type,
                 source_config, parser_vrl, output_fields,
-                credential_id, enabled, validated, validation_error,
+                credential_id, dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 created_at, updated_at
             FROM log_sources
@@ -100,7 +100,7 @@ impl ParserRepository {
             SELECT
                 id, name, description, source_type,
                 source_config, parser_vrl, output_fields,
-                credential_id, enabled, validated, validation_error,
+                credential_id, dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 created_at, updated_at
             FROM log_sources
@@ -133,7 +133,7 @@ impl ParserRepository {
             RETURNING
                 id, name, description, source_type,
                 source_config, parser_vrl, output_fields,
-                credential_id, enabled, validated, validation_error,
+                credential_id, dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 created_at, updated_at
             "#
@@ -190,7 +190,7 @@ impl ParserRepository {
             RETURNING
                 id, name, description, source_type,
                 source_config, parser_vrl, output_fields,
-                credential_id, enabled, validated, validation_error,
+                credential_id, dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 created_at, updated_at
             "#,
@@ -238,7 +238,7 @@ impl ParserRepository {
             RETURNING
                 id, name, description, source_type,
                 source_config, parser_vrl, output_fields,
-                credential_id, enabled, validated, validation_error,
+                credential_id, dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 created_at, updated_at
             "#,
@@ -260,7 +260,7 @@ impl ParserRepository {
             RETURNING
                 id, name, description, source_type,
                 source_config, parser_vrl, output_fields,
-                credential_id, enabled, validated, validation_error,
+                credential_id, dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 created_at, updated_at
             "#,
@@ -281,7 +281,7 @@ impl ParserRepository {
             RETURNING
                 id, name, description, source_type,
                 source_config, parser_vrl, output_fields,
-                credential_id, enabled, validated, validation_error,
+                credential_id, dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 created_at, updated_at
             "#,
@@ -377,7 +377,7 @@ impl ParserRepository {
             RETURNING
                 id, name, description, source_type,
                 source_config, parser_vrl, output_fields,
-                credential_id, enabled, validated, validation_error,
+                credential_id, dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 created_at, updated_at
             "#,
@@ -407,7 +407,7 @@ impl ParserRepository {
             RETURNING
                 id, name, description, source_type,
                 source_config, parser_vrl, output_fields,
-                credential_id, enabled, validated, validation_error,
+                credential_id, dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
                 created_at, updated_at
             "#,
@@ -422,6 +422,66 @@ impl ParserRepository {
     }
 }
 
+/// NAN-928 / NAN-930: stamp `dispatch_route_name` on every parser that
+/// carries a `dispatch_source_config_id`. The Vector config generator
+/// reads `dispatch_route_name` to decide between "emit a parser-owned
+/// source" (None) and "emit a filter on the source-config's route" (Some).
+///
+/// Free function (not a method) so both `ParserService::deploy_to_vector`
+/// (parser-only path that the API startup hook fires) and
+/// `LogSourceService::deploy*` (log-source publish path) can share the
+/// resolution — without this dedup, the two paths drifted: parser-deploy
+/// produced a parser-owned Kafka source while log-source-deploy produced
+/// the correct dispatched filter. NAN-930 follow-up.
+///
+/// `safe_name` is computed in Rust (matches `source_configs::service::
+/// safe_name`) so it stays Unicode-correct against `[^A-Za-z0-9]` regex
+/// semantics (see RouteClaim doc).
+pub async fn resolve_parser_dispatch_routes(
+    pool: &sqlx::PgPool,
+    parsers: &mut [Parser],
+) -> Result<(), sqlx::Error> {
+    use std::collections::HashMap;
+    let ids: Vec<Uuid> = parsers
+        .iter()
+        .filter_map(|p| p.dispatch_source_config_id)
+        .collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let mut unique = ids;
+    unique.sort();
+    unique.dedup();
+
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, name FROM source_configurations WHERE id = ANY($1)",
+    )
+    .bind(&unique)
+    .fetch_all(pool)
+    .await?;
+    let name_by_id: HashMap<Uuid, String> = rows.into_iter().collect();
+
+    for parser in parsers.iter_mut() {
+        if let Some(id) = parser.dispatch_source_config_id {
+            if let Some(sc_name) = name_by_id.get(&id) {
+                let safe: String = sc_name
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                    .collect::<String>()
+                    .to_lowercase();
+                parser.dispatch_route_name = Some(format!("{}_route", safe));
+            } else {
+                tracing::warn!(
+                    parser = %parser.name,
+                    dispatch_source_config_id = %id,
+                    "dispatch source config not found; parser will fall back to legacy parser-owned source",
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Convert a database row to a Parser struct
 fn row_to_parser(row: &sqlx::postgres::PgRow) -> Parser {
     Parser {
@@ -434,6 +494,11 @@ fn row_to_parser(row: &sqlx::postgres::PgRow) -> Parser {
         output_fields: row.get("output_fields"),
         feed_id: None, // log_sources doesn't have feed_id
         credential_id: row.get("credential_id"),
+        // NAN-928: try_get so existing parsers built from log_source rows
+        // that pre-date migration 189 still load cleanly with None.
+        dispatch_source_config_id: row.try_get("dispatch_source_config_id").unwrap_or(None),
+        // Resolved at deploy time by the service layer.
+        dispatch_route_name: None,
         namespace: row
             .try_get("namespace")
             .unwrap_or_else(|_| "default".to_string()),

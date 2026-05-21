@@ -16,7 +16,8 @@ pub use auto_detect::{
 };
 pub use credential_repository::{CredentialRepository, CredentialRepositoryError};
 pub use repository::{
-    DetectionPatternRepository, ParserLibraryRepository, ParserRepository, ParserRepositoryError,
+    resolve_parser_dispatch_routes, DetectionPatternRepository, ParserLibraryRepository,
+    ParserRepository, ParserRepositoryError,
 };
 pub use service::{ParserService, ParserServiceError};
 pub use types::*;

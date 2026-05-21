@@ -149,7 +149,9 @@ impl LogSourceService {
         if was_deployed {
             let enabled = self.list_enabled_for_deploy().await?;
             let with_creds = self.inject_credentials_for_all(&enabled).await?;
-            let parsers: Vec<Parser> = with_creds.into_iter().map(log_source_to_parser).collect();
+            let mut parsers: Vec<Parser> =
+                with_creds.into_iter().map(log_source_to_parser).collect();
+            self.resolve_dispatch_route_names(&mut parsers).await?;
 
             if let Err(e) = self.vector_config.deploy_and_reload(&parsers).await {
                 tracing::warn!(

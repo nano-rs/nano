@@ -8,6 +8,24 @@ use crate::log_sources::types::{LogSource, SourceType};
 use crate::parsers::Parser;
 
 impl LogSourceService {
+    /// NAN-928 / NAN-930: thin wrapper around the canonical
+    /// `parsers::repository::resolve_parser_dispatch_routes`. Kept on
+    /// `LogSourceService` so existing call sites in this module stay terse;
+    /// the real implementation is shared with `ParserService` so both
+    /// deploy paths produce identical Vector config for a given Parser slice
+    /// (NAN-930 follow-up — the parser-service path was missing the resolve
+    /// step and re-introduced the double-write topology at API startup).
+    pub(super) async fn resolve_dispatch_route_names(
+        &self,
+        parsers: &mut [Parser],
+    ) -> Result<(), LogSourceServiceError> {
+        crate::parsers::resolve_parser_dispatch_routes(&self.pool, parsers)
+            .await
+            .map_err(|e| LogSourceServiceError::DeploymentFailed(e.to_string()))
+    }
+}
+
+impl LogSourceService {
     /// Inject credentials for cloud sources
     pub(super) async fn inject_credentials(
         &self,
@@ -80,6 +98,14 @@ pub(super) fn log_source_to_parser(ls: LogSource) -> Parser {
         output_fields: ls.output_fields,
         feed_id: None, // No longer used
         credential_id: ls.credential_id,
+        // NAN-928: carry the dispatch source-config binding through to the
+        // generator so kafka/aws_s3/gcp_pubsub branches can emit a filter on
+        // the source-config's `*_route` instead of a parser-owned source.
+        dispatch_source_config_id: ls.dispatch_source_config_id,
+        // Resolved at deploy time by `resolve_dispatch_route_names` — leave
+        // None here; only the deploy entry-points have the pool needed to
+        // look up the source-config's safe_name.
+        dispatch_route_name: None,
         namespace: ls.namespace,
         enabled: ls.enabled,
         validated: ls.validated,

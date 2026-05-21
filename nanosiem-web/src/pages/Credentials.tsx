@@ -58,6 +58,62 @@ type EnvironmentFilter = 'all' | CredentialEnvironment;
 type InspectorTab = 'overview' | 'versions' | 'usage' | 'danger';
 type Health = 'healthy' | 'expires-soon' | 'expired' | 'unknown';
 
+// Pre-fill profiles for the three biggest cloud Kafka offerings.
+// Selecting a preset sets mechanism + TLS + username placeholder so users don't
+// have to hunt through the cloud vendor's docs for the right combination.
+// "self_hosted" leaves everything blank for full manual control.
+type KafkaPresetId = 'confluent' | 'event_hubs' | 'msk_scram' | 'self_hosted';
+interface KafkaPreset {
+  id: KafkaPresetId;
+  label: string;
+  mechanism: 'PLAIN' | 'SCRAM-SHA-256' | 'SCRAM-SHA-512' | '_none';
+  tls: boolean;
+  usernamePlaceholder: string;
+  passwordPlaceholder: string;
+  hint: string;
+}
+const KAFKA_PRESETS: KafkaPreset[] = [
+  {
+    id: 'confluent',
+    label: 'Confluent Cloud',
+    mechanism: 'PLAIN',
+    tls: true,
+    usernamePlaceholder: 'API key (e.g. ABCDEF1234567890)',
+    passwordPlaceholder: 'API secret',
+    hint: 'PLAIN over SASL_SSL with your Confluent API key as username.',
+  },
+  {
+    id: 'event_hubs',
+    label: 'Azure Event Hubs',
+    mechanism: 'PLAIN',
+    tls: true,
+    usernamePlaceholder: '$ConnectionString',
+    passwordPlaceholder: 'Endpoint=sb://…;SharedAccessKeyName=…;SharedAccessKey=…',
+    hint: 'Username is the literal $ConnectionString; password is the Event Hub SAS connection string.',
+  },
+  {
+    id: 'msk_scram',
+    label: 'AWS MSK (SCRAM)',
+    mechanism: 'SCRAM-SHA-512',
+    tls: true,
+    usernamePlaceholder: 'msk-scram-user',
+    passwordPlaceholder: 'SCRAM password from AWS Secrets Manager',
+    hint: 'SCRAM-SHA-512 over SASL_SSL. MSK IAM auth is not yet supported — use SCRAM at MSK cluster creation.',
+  },
+  {
+    id: 'self_hosted',
+    label: 'Self-hosted / other',
+    mechanism: '_none',
+    tls: false,
+    usernamePlaceholder: 'logs-consumer',
+    passwordPlaceholder: '',
+    hint: 'Configure mechanism + TLS manually. Leave SASL as None for unauthenticated brokers.',
+  },
+];
+const KAFKA_PRESET_BY_ID: Record<KafkaPresetId, KafkaPreset> = Object.fromEntries(
+  KAFKA_PRESETS.map((p) => [p.id, p]),
+) as Record<KafkaPresetId, KafkaPreset>;
+
 interface HealthBadge {
   label: string;
   dot: string;
@@ -1673,7 +1729,9 @@ function AddCredentialForm({
   const [saslUsername, setSaslUsername] = useState('');
   const [saslPassword, setSaslPassword] = useState('');
   const [tlsEnabled, setTlsEnabled] = useState(false);
+  const [tlsCaCert, setTlsCaCert] = useState('');
   const [showKafkaPassword, setShowKafkaPassword] = useState(false);
+  const [kafkaPreset, setKafkaPreset] = useState<KafkaPresetId | null>(null);
 
   const spec = providerSpec(provider);
 
@@ -1713,6 +1771,7 @@ function AddCredentialForm({
           sasl_username: saslUsername.trim() || undefined,
           sasl_password: saslPassword || undefined,
           tls_enabled: tlsEnabled || undefined,
+          tls_ca_cert: tlsEnabled && tlsCaCert.trim() ? tlsCaCert : undefined,
         };
         break;
     }
@@ -1725,6 +1784,15 @@ function AddCredentialForm({
       expires_at: dateInputToIso(expiresAt),
       credentials,
     };
+  };
+
+  const applyKafkaPreset = (id: KafkaPresetId) => {
+    const preset = KAFKA_PRESET_BY_ID[id];
+    setKafkaPreset(id);
+    setSaslMechanism(preset.mechanism);
+    setTlsEnabled(preset.tls);
+    // Don't overwrite user-typed values when switching presets — only seed the
+    // mechanism/TLS toggle. Placeholder hints already steer the rest.
   };
 
   return (
@@ -1867,10 +1935,37 @@ function AddCredentialForm({
 
           {provider === 'kafka' && (
             <div className="space-y-2.5">
+              <FieldRow label="Quick start">
+                <div className="flex flex-wrap gap-1.5">
+                  {KAFKA_PRESETS.map((p) => (
+                    <button
+                      key={p.id}
+                      type="button"
+                      onClick={() => applyKafkaPreset(p.id)}
+                      className={cn(
+                        'h-7 rounded-md border px-2.5 text-[11.5px] font-mono transition-colors',
+                        kafkaPreset === p.id
+                          ? 'border-primary/60 bg-primary/10 text-foreground'
+                          : 'border-border bg-card hover:bg-foreground/[0.04] text-foreground/80',
+                      )}
+                    >
+                      {p.label}
+                    </button>
+                  ))}
+                </div>
+              </FieldRow>
+              {kafkaPreset && (
+                <div className="rounded-md border border-border bg-foreground/[0.02] px-2.5 py-1.5 text-[11px] text-muted-foreground leading-relaxed">
+                  {KAFKA_PRESET_BY_ID[kafkaPreset].hint}
+                </div>
+              )}
               <FieldRow label="SASL mechanism">
                 <select
                   value={saslMechanism}
-                  onChange={(e) => setSaslMechanism(e.target.value)}
+                  onChange={(e) => {
+                    setSaslMechanism(e.target.value);
+                    setKafkaPreset(null);
+                  }}
                   className="h-8 w-full rounded-md border border-border bg-card px-2.5 text-[12px] text-foreground outline-none focus:border-primary/60 font-mono"
                 >
                   <option value="_none">None (unauthenticated)</option>
@@ -1885,8 +1980,12 @@ function AddCredentialForm({
                     <Input
                       value={saslUsername}
                       onChange={(e) => setSaslUsername(e.target.value)}
-                      placeholder="logs-consumer"
-                      className="h-8 text-[12px] bg-card"
+                      placeholder={
+                        kafkaPreset
+                          ? KAFKA_PRESET_BY_ID[kafkaPreset].usernamePlaceholder
+                          : 'logs-consumer'
+                      }
+                      className="h-8 text-[12px] bg-card font-mono"
                     />
                   </FieldRow>
                   <FieldRow label="Password" required secret>
@@ -1895,6 +1994,9 @@ function AddCredentialForm({
                       onChange={setSaslPassword}
                       reveal={showKafkaPassword}
                       onToggleReveal={() => setShowKafkaPassword((v) => !v)}
+                      placeholder={
+                        kafkaPreset ? KAFKA_PRESET_BY_ID[kafkaPreset].passwordPlaceholder : undefined
+                      }
                     />
                   </FieldRow>
                 </>
@@ -1903,11 +2005,25 @@ function AddCredentialForm({
                 <input
                   type="checkbox"
                   checked={tlsEnabled}
-                  onChange={(e) => setTlsEnabled(e.target.checked)}
+                  onChange={(e) => {
+                    setTlsEnabled(e.target.checked);
+                    setKafkaPreset(null);
+                  }}
                   className="rounded border-border"
                 />
                 Enable TLS/SSL
               </label>
+              {tlsEnabled && (
+                <FieldRow label="CA certificate (PEM, optional)">
+                  <Textarea
+                    value={tlsCaCert}
+                    onChange={(e) => setTlsCaCert(e.target.value)}
+                    rows={4}
+                    placeholder={'-----BEGIN CERTIFICATE-----\n…\n-----END CERTIFICATE-----'}
+                    className="text-[11.5px] font-mono bg-card resize-y min-h-[96px]"
+                  />
+                </FieldRow>
+              )}
             </div>
           )}
         </div>
@@ -1964,6 +2080,7 @@ function RotateCredentialForm({
   const [saslUsername, setSaslUsername] = useState('');
   const [saslPassword, setSaslPassword] = useState('');
   const [tlsEnabled, setTlsEnabled] = useState(false);
+  const [tlsCaCert, setTlsCaCert] = useState('');
   const [showKafkaPassword, setShowKafkaPassword] = useState(false);
   const [note, setNote] = useState('');
 
@@ -2002,6 +2119,7 @@ function RotateCredentialForm({
           sasl_username: saslUsername.trim() || undefined,
           sasl_password: saslPassword || undefined,
           tls_enabled: tlsEnabled || undefined,
+          tls_ca_cert: tlsEnabled && tlsCaCert.trim() ? tlsCaCert : undefined,
         };
         break;
     }
@@ -2120,6 +2238,17 @@ function RotateCredentialForm({
                 />
                 Enable TLS/SSL
               </label>
+              {tlsEnabled && (
+                <FieldRow label="CA certificate (PEM, optional)">
+                  <Textarea
+                    value={tlsCaCert}
+                    onChange={(e) => setTlsCaCert(e.target.value)}
+                    rows={4}
+                    placeholder={'-----BEGIN CERTIFICATE-----\n…\n-----END CERTIFICATE-----'}
+                    className="text-[11.5px] font-mono bg-card resize-y min-h-[96px]"
+                  />
+                </FieldRow>
+              )}
             </div>
           )}
         </div>
@@ -2233,11 +2362,13 @@ function SecretInput({
   onChange,
   reveal,
   onToggleReveal,
+  placeholder,
 }: {
   value: string;
   onChange: (v: string) => void;
   reveal: boolean;
   onToggleReveal: () => void;
+  placeholder?: string;
 }) {
   return (
     <div className="relative">
@@ -2245,9 +2376,10 @@ function SecretInput({
         type={reveal ? 'text' : 'password'}
         value={value}
         onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
         className={cn(
           'h-8 text-[12px] bg-card font-mono pr-9',
-          !reveal && 'tracking-widest',
+          !reveal && value && 'tracking-widest',
         )}
       />
       <button

@@ -32,6 +32,9 @@ pub(crate) fn row_to_log_source(row: &sqlx::postgres::PgRow) -> LogSource {
         source_type: row.get("source_type"),
         source_config: row.get("source_config"),
         credential_id: row.get("credential_id"),
+        // NAN-928: try_get keeps reads working against tenants that have not
+        // yet applied migration 189; the column simply reads as None.
+        dispatch_source_config_id: row.try_get("dispatch_source_config_id").unwrap_or(None),
         parser_vrl: row.get("parser_vrl"),
         output_fields: row.get("output_fields"),
         category: row.get("category"),

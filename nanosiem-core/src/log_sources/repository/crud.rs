@@ -26,6 +26,7 @@ impl LogSourceRepository {
                 extension_vrl, extension_enabled,
                 parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
+                dispatch_source_config_id,
                 created_at, updated_at
             FROM log_sources
             WHERE 1=1
@@ -106,6 +107,7 @@ impl LogSourceRepository {
                 extension_vrl, extension_enabled,
                 parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
+                dispatch_source_config_id,
                 created_at, updated_at
             FROM log_sources
             ORDER BY name ASC
@@ -131,6 +133,7 @@ impl LogSourceRepository {
                 extension_vrl, extension_enabled,
                 parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
+                dispatch_source_config_id,
                 created_at, updated_at
             FROM log_sources
             WHERE enabled = true
@@ -157,6 +160,7 @@ impl LogSourceRepository {
                 extension_vrl, extension_enabled,
                 parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
+                dispatch_source_config_id,
                 created_at, updated_at
             FROM log_sources
             WHERE deployed = true
@@ -183,6 +187,7 @@ impl LogSourceRepository {
                 extension_vrl, extension_enabled,
                 parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
+                dispatch_source_config_id,
                 created_at, updated_at
             FROM log_sources
             WHERE id = $1
@@ -210,6 +215,7 @@ impl LogSourceRepository {
                 extension_vrl, extension_enabled,
                 parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
+                dispatch_source_config_id,
                 created_at, updated_at
             FROM log_sources
             WHERE name = $1
@@ -240,9 +246,9 @@ impl LogSourceRepository {
             INSERT INTO log_sources (
                 name, description, namespace, timezone, source_type, source_config, credential_id,
                 parser_vrl, output_fields, category, vendor, product, icon, color,
-                match_field, match_pattern, match_values
+                match_field, match_pattern, match_values, dispatch_source_config_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
             RETURNING id, name, description, namespace, timezone, source_type, source_config, credential_id,
                 parser_vrl, output_fields, category, vendor, product, icon, color,
                 match_field, match_pattern, match_values,
@@ -252,6 +258,7 @@ impl LogSourceRepository {
                 extension_vrl, extension_enabled,
                 parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
+                dispatch_source_config_id,
                 created_at, updated_at
             "#,
         )
@@ -272,6 +279,7 @@ impl LogSourceRepository {
         .bind(&new.match_field)
         .bind(&new.match_pattern)
         .bind(&new.match_values)
+        .bind(&new.dispatch_source_config_id)
         .fetch_one(&self.pool)
         .await?;
 
@@ -306,6 +314,7 @@ impl LogSourceRepository {
         let config_changed = update.source_type.is_some()
             || update.source_config.is_some()
             || update.credential_id.is_some()
+            || update.dispatch_source_config_id.is_some()
             || update.parser_vrl.is_some()
             || update.output_fields.is_some()
             || update.match_field.is_some()
@@ -347,7 +356,8 @@ impl LogSourceRepository {
                     WHEN $25 = '' THEN NULL
                     ELSE $25
                 END,
-                extension_enabled = COALESCE($26, extension_enabled)
+                extension_enabled = COALESCE($26, extension_enabled),
+                dispatch_source_config_id = COALESCE($27, dispatch_source_config_id)
             WHERE id = $1
             RETURNING id, name, description, namespace, timezone, source_type, source_config, credential_id,
                 parser_vrl, output_fields, category, vendor, product, icon, color,
@@ -358,6 +368,7 @@ impl LogSourceRepository {
                 extension_vrl, extension_enabled,
                 parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
+                dispatch_source_config_id,
                 created_at, updated_at
             "#,
         )
@@ -387,6 +398,7 @@ impl LogSourceRepository {
         .bind(&update.sampling_exclude_condition)
         .bind(&update.extension_vrl)
         .bind(&update.extension_enabled)
+        .bind(&update.dispatch_source_config_id)
         .fetch_one(&self.pool)
         .await?;
 

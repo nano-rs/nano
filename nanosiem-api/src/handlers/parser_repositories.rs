@@ -99,6 +99,13 @@ pub struct ImportParserRequest {
     pub source_type: Option<String>,
     /// Ingestion method: routed, kafka, aws_s3, gcp_pubsub, splunk_hec, vector
     pub ingestion_method: Option<String>,
+    /// NAN-928: source-configuration whose route should dispatch events
+    /// into this parser. Captured by the parser-import UI's
+    /// "DISPATCH FROM" picker. When set, the generator emits a `filter`
+    /// on the source-config's `*_route` instead of a parser-owned source.
+    #[serde(default, with = "nanosiem_core::typeid::source_config::opt")]
+    #[schema(value_type = Option<String>)]
+    pub dispatch_source_config_id: Option<uuid::Uuid>,
 }
 
 fn default_import_type() -> String {
@@ -124,6 +131,11 @@ pub struct BatchImportParserItem {
     pub source_type: Option<String>,
     /// Ingestion method: routed, kafka, aws_s3, gcp_pubsub, splunk_hec, vector
     pub ingestion_method: Option<String>,
+    /// NAN-928: source-configuration whose route should dispatch events
+    /// into this parser. See `ImportParserRequest` for semantics.
+    #[serde(default, with = "nanosiem_core::typeid::source_config::opt")]
+    #[schema(value_type = Option<String>)]
+    pub dispatch_source_config_id: Option<uuid::Uuid>,
 }
 
 /// Request body for batch import
@@ -657,6 +669,7 @@ pub async fn import_parser(
         import_type: import_type.clone(),
         source_type: req.source_type,
         ingestion_method: req.ingestion_method,
+        dispatch_source_config_id: req.dispatch_source_config_id,
     };
 
     let log_source_id = service
@@ -717,6 +730,7 @@ pub async fn batch_import_parsers(
                 import_type: req.import_type.clone(),
                 source_type: None,
                 ingestion_method: None,
+                dispatch_source_config_id: None,
             })
             .collect()
     };
@@ -744,6 +758,7 @@ pub async fn batch_import_parsers(
             import_type,
             source_type: item.source_type.clone(),
             ingestion_method: item.ingestion_method.clone(),
+            dispatch_source_config_id: item.dispatch_source_config_id,
         };
 
         match service

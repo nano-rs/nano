@@ -89,10 +89,14 @@ impl LogSourceService {
         let log_sources_with_creds = self.inject_credentials_for_all(&all_log_sources).await?;
 
         // Convert LogSource to Parser for VectorConfigManager compatibility
-        let parsers: Vec<Parser> = log_sources_with_creds
+        let mut parsers: Vec<Parser> = log_sources_with_creds
             .into_iter()
             .map(log_source_to_parser)
             .collect();
+        // NAN-928: resolve dispatch source-config route names so the
+        // generator wires fetch-source parsers to the user's source-config
+        // route instead of creating a parser-owned Vector source.
+        self.resolve_dispatch_route_names(&mut parsers).await?;
 
         // Stage and validate
         if let Err(e) = self.vector_config.stage_parsers(&parsers).await {
@@ -322,7 +326,9 @@ impl LogSourceService {
         // Redeploy all remaining enabled log sources (using active versions)
         let enabled = self.list_enabled_for_deploy().await?;
         let with_creds = self.inject_credentials_for_all(&enabled).await?;
-        let parsers: Vec<Parser> = with_creds.into_iter().map(log_source_to_parser).collect();
+        let mut parsers: Vec<Parser> =
+            with_creds.into_iter().map(log_source_to_parser).collect();
+        self.resolve_dispatch_route_names(&mut parsers).await?;
 
         if let Err(e) = self.vector_config.deploy_and_reload(&parsers).await {
             let error_msg = format!("Failed to redeploy after undeploy: {}", e);
@@ -405,7 +411,9 @@ impl LogSourceService {
     pub async fn deploy_all(&self) -> Result<(), LogSourceServiceError> {
         let enabled = self.list_enabled_for_deploy().await?;
         let with_creds = self.inject_credentials_for_all(&enabled).await?;
-        let parsers: Vec<Parser> = with_creds.into_iter().map(log_source_to_parser).collect();
+        let mut parsers: Vec<Parser> =
+            with_creds.into_iter().map(log_source_to_parser).collect();
+        self.resolve_dispatch_route_names(&mut parsers).await?;
 
         self.vector_config.deploy_and_reload(&parsers).await?;
 

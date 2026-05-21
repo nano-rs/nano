@@ -507,6 +507,7 @@ impl ParserRepositoryService {
             parser_vrl,
             output_fields: None,
             credential_id: None,
+            dispatch_source_config_id: req.dispatch_source_config_id,
             category: parser.category.clone(),
             vendor: parser.vendor.clone(),
             product: parser.product.clone(),
@@ -594,6 +595,7 @@ impl ParserRepositoryService {
                 import_type: import_type.clone(),
                 source_type: None,
                 ingestion_method: None, // Defaults to "routed"
+                dispatch_source_config_id: None,
             };
             match self.import_parser(repo_id, path, &req, user_id).await {
                 Ok(id) => results.push(Ok(id)),

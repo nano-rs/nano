@@ -23,6 +23,7 @@ impl LogSourceRepository {
                 sampling_ratio, sampling_exclude_condition,
                 parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
+                dispatch_source_config_id,
                 created_at, updated_at
             "#,
         )
@@ -48,6 +49,7 @@ impl LogSourceRepository {
                 sampling_ratio, sampling_exclude_condition,
                 parser_only,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
+                dispatch_source_config_id,
                 created_at, updated_at
             "#,
         )

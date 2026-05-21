@@ -197,6 +197,18 @@ pub struct LogSource {
     #[schema(value_type = Option<String>)]
     pub credential_id: Option<Uuid>,
 
+    // Dispatch source (NAN-928): the deployed source-configuration whose
+    // routing transform feeds events into this parser. Set when the user
+    // picks a fetch-source config (Kafka / S3 / GCP Pub/Sub) in the
+    // parser-import "DISPATCH FROM" UI. When `Some`, the parser generator
+    // emits a `filter` on `<sc.safe_name>_route` instead of a brand-new
+    // parser-owned source (which was the silent-failure pre-NAN-928).
+    // `None` means "use the legacy parser-owned source from source_config",
+    // preserving behavior for parsers imported before this field existed.
+    #[serde(default, with = "typeid::source_config::opt")]
+    #[schema(value_type = Option<String>)]
+    pub dispatch_source_config_id: Option<Uuid>,
+
     // Transformation
     pub parser_vrl: String,
     pub output_fields: Option<serde_json::Value>,
@@ -281,6 +293,13 @@ pub struct NewLogSource {
     #[serde(default, with = "typeid::cloud_credential::opt")]
     #[schema(value_type = Option<String>)]
     pub credential_id: Option<Uuid>,
+    /// NAN-928: dispatch source-configuration this parser should consume from.
+    /// When set on a fetch-source parser (kafka/aws_s3/gcp_pubsub), the
+    /// generator emits a filter on the source-config's routing transform
+    /// instead of a parser-owned Vector source.
+    #[serde(default, with = "typeid::source_config::opt")]
+    #[schema(value_type = Option<String>)]
+    pub dispatch_source_config_id: Option<Uuid>,
     pub category: Option<String>,
     pub vendor: Option<String>,
     pub product: Option<String>,
@@ -319,6 +338,11 @@ pub struct UpdateLogSource {
     #[serde(default, with = "typeid::cloud_credential::opt")]
     #[schema(value_type = Option<String>)]
     pub credential_id: Option<Uuid>,
+    /// NAN-928: rebind dispatch source. `None` here means "no change"; use
+    /// the dedicated null-clear path on the API if you need to unbind.
+    #[serde(default, with = "typeid::source_config::opt")]
+    #[schema(value_type = Option<String>)]
+    pub dispatch_source_config_id: Option<Uuid>,
     pub category: Option<String>,
     pub vendor: Option<String>,
     pub product: Option<String>,

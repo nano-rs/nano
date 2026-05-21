@@ -160,6 +160,13 @@ pub struct ParserImportRequest {
     pub source_type: Option<String>,
     /// Ingestion method: routed, kafka, aws_s3, gcp_pubsub, splunk_hec, vector
     pub ingestion_method: Option<String>,
+    /// NAN-928: source-configuration whose routing transform should dispatch
+    /// events into this parser. The parser-import UI's "DISPATCH FROM" picker
+    /// fills this. When set, the generator emits a `filter` on the
+    /// source-config's `*_route` transform instead of a parser-owned source.
+    #[serde(default, with = "typeid::source_config::opt")]
+    #[schema(value_type = Option<String>)]
+    pub dispatch_source_config_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]

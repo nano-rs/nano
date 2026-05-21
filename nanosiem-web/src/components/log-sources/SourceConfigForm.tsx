@@ -182,6 +182,7 @@ function KafkaConfigForm({ config, onChange, credentialId, onCredentialChange, d
             ))}
           </div>
         )}
+        <p className={HELP_TEXT}>Regex match (not glob). <span className="font-mono">^audit\..*</span> matches any topic starting with <span className="font-mono">audit.</span></p>
       </div>
 
       <div className="grid grid-cols-2 gap-3">

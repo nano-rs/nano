@@ -482,7 +482,12 @@ pub struct UpdateSourceConfiguration {
 pub struct KafkaConnectionConfig {
     /// Bootstrap servers (comma-separated)
     pub bootstrap_servers: String,
-    /// Topics to consume (can include patterns like "audit-*")
+    /// Topics to consume. Each entry is a Vector `kafka` source topic value,
+    /// which is matched as a **regex** (not a glob). `audit-logs` matches
+    /// only that exact topic name; `^audit\..*` matches any topic whose
+    /// name starts with `audit.`. A literal `audit-*` would match the
+    /// topic named `audit-*` (asterisk char), almost certainly not what
+    /// the user wants — that's NAN-884 K-8.
     pub topics: Vec<String>,
     /// Consumer group ID
     pub group_id: String,

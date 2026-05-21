@@ -3,6 +3,7 @@
 //! Source Configuration service for business logic
 
 use sqlx::PgPool;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -10,7 +11,7 @@ use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 use super::creds_backend::{CredsBackend, CredsBackendError};
-use super::repository::{SourceConfigRepository, SourceConfigRepositoryError};
+use super::repository::{RouteClaim, SourceConfigRepository, SourceConfigRepositoryError};
 use super::types::{
     DeploymentResult, ListParams, NewRoutingRule, NewSourceConfiguration, RoutingRule,
     SourceConfigDeployment, SourceConfiguration, SourceConfigurationWithRules, UpdateRoutingRule,
@@ -1269,6 +1270,30 @@ impl SourceConfigService {
             None
         };
 
+        // Kafka TLS CA cert is persisted by the same backend that handles GCP
+        // creds — Vector's `tls.ca_file` wants an on-disk path, not inline PEM
+        // (NAN-884 K-1). Empty / absent CA cert falls back to system CAs, which
+        // is correct for Confluent Cloud + AWS MSK with public CAs.
+        let kafka_ca_path = if config.config.config_type == "kafka" {
+            if let Some(ref c) = creds {
+                if let Some(ca_cert) = c["tls_ca_cert"].as_str() {
+                    if !ca_cert.is_empty() {
+                        let key = format!("kafka_{}.ca.pem", safe_name);
+                        let backend = self.creds_backend().await?;
+                        Some(backend.write_creds(&key, ca_cert.as_bytes()).await?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // System-level sources have their ingest declared in `config/vector/*.toml`
         // and don't need a per-config source block. See `system_intermediary_source`.
         if Self::system_intermediary_source(&config.config.config_type).is_some() {
@@ -1276,7 +1301,13 @@ impl SourceConfigService {
         }
 
         let source_block = match config.config.config_type.as_str() {
-            "kafka" => Self::generate_kafka_source(&source_name, conn, creds.as_ref()),
+            "kafka" => Self::generate_kafka_source(
+                &source_name,
+                &config.config.id,
+                conn,
+                creds.as_ref(),
+                kafka_ca_path.as_deref(),
+            ),
             "aws_s3" => Self::generate_aws_s3_source(&source_name, conn, creds.as_ref()),
             "gcp_pubsub" => {
                 Self::generate_gcp_pubsub_source(&source_name, conn, gcp_creds_path.as_deref())
@@ -1299,10 +1330,26 @@ impl SourceConfigService {
     /// strings. Hand-rolled `format!("\"{}\"", v)` previously allowed a `"` +
     /// newline in `bootstrap_servers` etc. to terminate the string and inject
     /// new TOML tables (NAN-689).
+    ///
+    /// `tls_ca_path` is the absolute path the caller wrote the credential CA
+    /// PEM to via the credentials backend (or `None` when no custom CA was
+    /// provided — the system CA bundle is then used). The function still
+    /// decides whether to emit a `[tls]` block based on the `tls_enabled`
+    /// flag on the credential JSON.
+    ///
+    /// `config_id` is folded into the auto-generated consumer `group_id`
+    /// (`nanosiem-<base32 typeid suffix>`) when the user didn't set one
+    /// explicitly. Two configs without explicit `group_id` previously
+    /// collapsed onto the same broker-side consumer group and split
+    /// partitions across them (NAN-884 K-3). Existing rows are backfilled
+    /// to literal `"nanosiem"` by `190_kafka_default_group_id_backfill.sql`
+    /// so committed offsets survive the rollout.
     fn generate_kafka_source(
         source_name: &str,
+        config_id: &Uuid,
         conn: &serde_json::Value,
         creds: Option<&serde_json::Value>,
+        tls_ca_path: Option<&str>,
     ) -> String {
         let bootstrap_servers = conn["bootstrap_servers"]
             .as_str()
@@ -1311,8 +1358,16 @@ impl SourceConfigService {
             .as_array()
             .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_else(|| vec!["logs".to_string()]);
-        let group_id = conn["group_id"].as_str().unwrap_or("nanosiem");
         let auto_offset_reset = conn["auto_offset_reset"].as_str().unwrap_or("latest");
+        let group_id_owned: String;
+        let group_id: &str = match conn["group_id"].as_str() {
+            Some(explicit) => explicit,
+            None => {
+                group_id_owned =
+                    format!("nanosiem-{}", crate::typeid::encode_suffix(config_id));
+                &group_id_owned
+            }
+        };
 
         let mut source = toml::Table::new();
         source.insert("type".into(), "kafka".into());
@@ -1324,24 +1379,62 @@ impl SourceConfigService {
         source.insert("group_id".into(), group_id.into());
         source.insert("auto_offset_reset".into(), auto_offset_reset.into());
 
-        // Add SASL config from credentials
-        if let Some(c) = creds {
-            if let Some(mechanism) = c["sasl_mechanism"].as_str() {
-                if !mechanism.is_empty() {
-                    let mut sasl = toml::Table::new();
-                    sasl.insert("enabled".into(), true.into());
-                    sasl.insert("mechanism".into(), mechanism.into());
-                    sasl.insert(
-                        "username".into(),
-                        c["sasl_username"].as_str().unwrap_or("").into(),
-                    );
-                    sasl.insert(
-                        "password".into(),
-                        c["sasl_password"].as_str().unwrap_or("").into(),
-                    );
-                    source.insert("sasl".into(), toml::Value::Table(sasl));
-                }
+        // Detect SASL + TLS up front so security.protocol can be chosen
+        // accordingly (NAN-884 K-1 / K-2). librdkafka silently defaults to
+        // PLAINTEXT when the protocol isn't set, which broke every TLS-required
+        // broker (Confluent Cloud, AWS MSK, Aiven Kafka).
+        let sasl_mechanism = creds
+            .and_then(|c| c["sasl_mechanism"].as_str())
+            .filter(|m| !m.is_empty());
+        let tls_enabled = creds
+            .and_then(|c| c["tls_enabled"].as_bool())
+            .unwrap_or(false);
+
+        if let Some(mechanism) = sasl_mechanism {
+            let mut sasl = toml::Table::new();
+            sasl.insert("enabled".into(), true.into());
+            sasl.insert("mechanism".into(), mechanism.into());
+            sasl.insert(
+                "username".into(),
+                creds
+                    .and_then(|c| c["sasl_username"].as_str())
+                    .unwrap_or("")
+                    .into(),
+            );
+            sasl.insert(
+                "password".into(),
+                creds
+                    .and_then(|c| c["sasl_password"].as_str())
+                    .unwrap_or("")
+                    .into(),
+            );
+            source.insert("sasl".into(), toml::Value::Table(sasl));
+        }
+
+        if tls_enabled {
+            let mut tls = toml::Table::new();
+            tls.insert("enabled".into(), true.into());
+            if let Some(path) = tls_ca_path {
+                tls.insert("ca_file".into(), path.into());
             }
+            source.insert("tls".into(), toml::Value::Table(tls));
+        }
+
+        // Emit security.protocol whenever SASL or TLS is involved. librdkafka's
+        // default is PLAINTEXT, so we only need to override when something else
+        // is required — but mismatched combinations (SASL_PLAINTEXT against a
+        // TLS-required broker, etc.) are exactly the silent-failure mode
+        // NAN-884 is killing, so be explicit.
+        let security_protocol = match (sasl_mechanism.is_some(), tls_enabled) {
+            (true, true) => Some("SASL_SSL"),
+            (true, false) => Some("SASL_PLAINTEXT"),
+            (false, true) => Some("SSL"),
+            (false, false) => None,
+        };
+        if let Some(proto) = security_protocol {
+            let mut opts = toml::Table::new();
+            opts.insert("security.protocol".into(), proto.into());
+            source.insert("librdkafka_options".into(), toml::Value::Table(opts));
         }
 
         Self::wrap_source_table(source_name, source)
@@ -1527,7 +1620,31 @@ impl SourceConfigService {
         route_name: &str,
         system_level: bool,
     ) -> String {
-        let mut vrl = String::from("# Apply routing rules to set source_type\n");
+        let mut vrl = String::new();
+
+        // Stamp the ingestion path for pull sources. NAN-201 set
+        // `.metadata.forwarded_via` for http / vector_native / splunk_hec in
+        // their always-on transforms (config/vector/00-base.toml,
+        // 01-vector-source.toml, 02-hec-source.toml), but the per-config
+        // generator missed kafka / aws_s3 / gcp_pubsub (NAN-884 K-6).
+        // System-level configs route through those always-on transforms
+        // already and inherit the stamp, so we skip stamping again here to
+        // avoid clobbering values like `splunk_hec`.
+        if !system_level {
+            if let Some(forwarded_via) =
+                Self::forwarded_via_for_pull_source(&config.config.config_type)
+            {
+                vrl.push_str(&format!(
+                    "# Stamp ingestion path for downstream troubleshooting (NAN-884 K-6).\n\
+                     # Matches the assignment 00-base.toml / 01-vector-source.toml /\n\
+                     # 02-hec-source.toml do for the system-level sources.\n\
+                     if !is_object(.metadata) {{\n    .metadata = {{}}\n}}\n\
+                     .metadata.forwarded_via = \"{forwarded_via}\"\n\n",
+                ));
+            }
+        }
+
+        vrl.push_str("# Apply routing rules to set source_type\n");
 
         // Sort rules by priority
         let mut rules: Vec<_> = config.routing_rules.iter().collect();
@@ -1553,7 +1670,18 @@ impl SourceConfigService {
             // straight string interpolation here is safe. Nested paths
             // (e.g. `attributes.source_type`) emit as `.attributes.source_type`
             // — exactly the dotted access VRL expects.
-            let field = format!(".{}", rule.match_field);
+            //
+            // Kafka headers are the one exception: Vector decodes
+            // `.headers` as `Object(String, Bytes)`, and a `Bytes == String`
+            // comparison in VRL returns false unconditionally — the
+            // "Header (recommended)" routing path was always-false since it
+            // shipped (NAN-884 K-7). Coerce header values to string for
+            // every comparison; `?? ""` keeps the rule falsy when the
+            // header is missing instead of aborting the VRL program.
+            let field = Self::routing_field_expression(
+                &config.config.config_type,
+                &rule.match_field,
+            );
             let raw_value = rule.match_value.as_deref().unwrap_or("");
 
             let condition = match rule.match_type.as_str() {
@@ -1736,15 +1864,34 @@ impl SourceConfigService {
             }))
             .await?;
 
+        // NAN-930: load parser-route claims so the substitution stays correct
+        // across source-config redeploys. Without this, the surgical inputs
+        // rewrite would put back raw route names that double-feed events into
+        // both `source_router` and the per-parser filter.
+        let claims = self.repository.load_route_claims().await?;
+        let claim_substitutions = Self::build_claim_substitutions(&claims);
+
         let router_inputs = Self::compute_router_inputs(
             &deployed_configs,
             |name| self.get_config_file_path(name).exists(),
             hec_normalize_present(),
         );
+        // Apply claim substitution AFTER compute_router_inputs so the
+        // pure function (and its 8 unit tests) stay focused on the base-input
+        // logic; this layer adds dedupe-safety on top.
+        let substituted_inputs: Vec<String> = router_inputs
+            .iter()
+            .map(|name| {
+                claim_substitutions
+                    .get(name.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| name.clone())
+            })
+            .collect();
 
         let new_inputs_line = format!(
             "inputs = [{}]",
-            router_inputs
+            substituted_inputs
                 .iter()
                 .map(|s| format!("\"{}\"", s))
                 .collect::<Vec<_>>()
@@ -1765,7 +1912,20 @@ impl SourceConfigService {
             return Ok(());
         }
 
-        let current_content = tokio::fs::read_to_string(&router_path).await?;
+        let raw_content = tokio::fs::read_to_string(&router_path).await?;
+
+        // NAN-930: strip then rewrite all `<route>_unclaimed` filter blocks.
+        // Adding-only (the previous behavior) left stale conditions for
+        // edited `match_values` and orphan blocks for renamed/deleted
+        // source-configs. The clean rewrite handles both:
+        //   - match_values changes propagate via build_unclaimed_blocks
+        //     emitting the current condition
+        //   - removed claims simply don't get re-emitted; their blocks
+        //     stripped above don't return
+        // Filter blocks are injected just above `[transforms.source_router]`
+        // (placement is cosmetic — Vector resolves inputs file-wide).
+        let current_content = Self::strip_existing_unclaimed_blocks(&raw_content);
+        let claim_blocks = Self::build_unclaimed_blocks(&claims);
 
         // Replace the inputs line in the [transforms.source_router] section.
         // Match the first inputs = [...] line that appears after the source_router header.
@@ -1774,9 +1934,16 @@ impl SourceConfigService {
         let mut updated = String::new();
         let mut found = false;
         let mut in_source_router = false;
+        let mut filter_block_emitted = false;
         for line in current_content.lines() {
             let trimmed = line.trim();
             if trimmed == "[transforms.source_router]" {
+                // Emit unclaimed-filter blocks immediately before
+                // source_router so the file reads top-down.
+                if !filter_block_emitted && !claim_blocks.is_empty() {
+                    updated.push_str(&claim_blocks);
+                    filter_block_emitted = true;
+                }
                 in_source_router = true;
                 updated.push_str(line);
                 updated.push('\n');
@@ -1801,6 +1968,144 @@ impl SourceConfigService {
         }
 
         Ok(())
+    }
+
+    /// NAN-930: build the route→substituted-route map. Any route that one or
+    /// more enabled parsers claim is rewritten to `<route>_unclaimed` so the
+    /// surgical inputs update keeps `source_router` consuming only the
+    /// leftover stream (events no parser-filter matched).
+    fn build_claim_substitutions(claims: &[RouteClaim]) -> HashMap<&str, String> {
+        let mut subs: HashMap<&str, String> = HashMap::new();
+        for claim in claims {
+            subs.entry(claim.route.as_str())
+                .or_insert_with(|| format!("{}_unclaimed", claim.route));
+        }
+        subs
+    }
+
+    /// NAN-930: strip all `[transforms.*_unclaimed]` filter blocks from the
+    /// router file content. Pairs with `build_unclaimed_blocks` to give
+    /// `update_dynamic_router` a clean rewrite (no stale conditions for
+    /// changed `match_values`, no orphan blocks for renamed/deleted
+    /// source-configs).
+    ///
+    /// Line-by-line state machine: enter "skip" mode when we see a
+    /// `[transforms.<name>_unclaimed]` header, exit on the next `[` (next
+    /// TOML section starts) or EOF. Comment lines that happen to mention
+    /// `_unclaimed` don't trigger skip — we only match section headers
+    /// (line starts with `[`, ignoring whitespace).
+    pub(super) fn strip_existing_unclaimed_blocks(content: &str) -> String {
+        let mut out = String::new();
+        let mut in_unclaimed = false;
+        for line in content.lines() {
+            let trimmed = line.trim_start();
+            // Section-header start. Decide whether to enter or exit skip mode.
+            if trimmed.starts_with('[') {
+                in_unclaimed = trimmed.starts_with("[transforms.")
+                    && trimmed.contains("_unclaimed]");
+                if in_unclaimed {
+                    continue;
+                }
+            }
+            if in_unclaimed {
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// NAN-930: format `[transforms.<route>_unclaimed]` filter blocks for
+    /// every current claim. Pair with `strip_existing_unclaimed_blocks` so
+    /// `update_dynamic_router` does a clean rewrite — both renamed/deleted
+    /// claims (block disappears) and changed `match_values` (condition
+    /// regenerates) propagate without needing a parser redeploy. Earlier
+    /// "add missing only" version left stale blocks behind and was the
+    /// root cause of the NAN-930 gotchas #2 + #3.
+    fn build_unclaimed_blocks(claims: &[RouteClaim]) -> String {
+        // Group claimants by route so the union match_values list comes out stable.
+        let mut by_route: BTreeMap<&str, Vec<&RouteClaim>> = BTreeMap::new();
+        for claim in claims {
+            by_route.entry(claim.route.as_str()).or_default().push(claim);
+        }
+
+        let mut out = String::new();
+        for (route, claimants) in by_route {
+            let filter_name = format!("{}_unclaimed", route);
+            let mut values: Vec<String> = Vec::new();
+            for claim in claimants {
+                if claim.match_values.is_empty() {
+                    values.push(claim.parser_name.clone());
+                } else {
+                    values.extend(claim.match_values.iter().cloned());
+                }
+            }
+            values.sort();
+            values.dedup();
+            let list = values
+                .iter()
+                .map(|v| {
+                    // Same minimal escape rule as the parser-config generator —
+                    // backslashes, quotes, and embedded newlines.
+                    let mut esc = String::with_capacity(v.len());
+                    for ch in v.chars() {
+                        match ch {
+                            '\\' => esc.push_str("\\\\"),
+                            '"' => esc.push_str("\\\""),
+                            '\n' => esc.push_str("\\n"),
+                            '\r' => esc.push_str("\\r"),
+                            _ => esc.push(ch),
+                        }
+                    }
+                    format!("\"{}\"", esc)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(
+                "[transforms.{}]\n\
+                 type = \"filter\"\n\
+                 inputs = [\"{}\"]\n\
+                 condition = '!includes([{}], to_string(.source_type) ?? \"\")'\n\n",
+                filter_name, route, list,
+            ));
+        }
+        out
+    }
+
+    /// Build the VRL access expression for a routing-rule `match_field`.
+    ///
+    /// Default is a plain dotted access — `headers.source_type` becomes
+    /// `.headers.source_type`. Kafka headers need a `to_string` coercion
+    /// because Vector's `kafka` source decodes `.headers` as
+    /// `Object(String, Bytes)` and a `Bytes == String` comparison in VRL
+    /// is unconditionally false (NAN-884 K-7). `?? ""` ensures missing
+    /// headers fall through cleanly rather than aborting the VRL program.
+    ///
+    /// GCP `attributes.*` doesn't need coercion — `gcp_pubsub` decodes
+    /// `.attributes` as `Object(String, String)` already.
+    fn routing_field_expression(config_type: &str, match_field: &str) -> String {
+        if config_type == "kafka" && match_field.starts_with("headers.") {
+            format!("(to_string(.{match_field}) ?? \"\")")
+        } else {
+            format!(".{match_field}")
+        }
+    }
+
+    /// Map a pull-source `config_type` to the canonical
+    /// `.metadata.forwarded_via` value emitted in the per-config routing
+    /// transform (NAN-884 K-6). Values match NAN-201's HTTP/HEC/Vector
+    /// conventions: short, lowercase, `aws_s3`/`gcp_pubsub` keep the
+    /// Vector source-type spelling so detection rules can filter by it.
+    /// System-level configs (http / vector / splunk_hec) are stamped in
+    /// their always-on transforms and are not handled here.
+    fn forwarded_via_for_pull_source(config_type: &str) -> Option<&'static str> {
+        match config_type {
+            "kafka" => Some("kafka"),
+            "aws_s3" => Some("aws_s3"),
+            "gcp_pubsub" => Some("gcp_pubsub"),
+            _ => None,
+        }
     }
 
     /// Get the path for a source config file
@@ -1927,9 +2232,12 @@ mod tests {
             "expected unconditional default assignment, got:\n{}",
             vrl
         );
+        // Narrow assertion: ensure no source_type conditional. The
+        // forwarded_via stamp (NAN-884 K-6) introduces an unrelated
+        // `if !is_object(.metadata)` guard which is fine here.
         assert!(
-            !vrl.contains("if "),
-            "expected no conditional, got:\n{}",
+            !vrl.contains("if .source_type"),
+            "expected no source_type conditional, got:\n{}",
             vrl
         );
     }
@@ -2082,7 +2390,12 @@ mod tests {
     }
 
     #[test]
-    fn kafka_with_headers_path_match_field_emits_dotted_access() {
+    fn kafka_with_headers_path_match_field_emits_coerced_access() {
+        // NAN-884 K-7: Vector's kafka source emits `.headers` as
+        // `Object(String, Bytes)`; a raw `.headers.source_type == "X"`
+        // comparison is `Bytes == String` and is always-false. The
+        // generator must wrap header accesses in `to_string(...) ?? ""`
+        // so the comparison actually fires.
         let config = make_config(
             "kafka",
             vec![
@@ -2100,8 +2413,15 @@ mod tests {
         let vrl = SourceConfigService::generate_routing_transform(&config, "src", "route", false);
 
         assert!(
-            vrl.contains("if .headers.source_type == \"audit_logs\""),
-            "expected headers.source_type conditional, got:\n{vrl}",
+            vrl.contains(
+                "if (to_string(.headers.source_type) ?? \"\") == \"audit_logs\""
+            ),
+            "expected coerced headers.source_type conditional, got:\n{vrl}",
+        );
+        // Regression guard: the broken raw form must not slip back in.
+        assert!(
+            !vrl.contains("if .headers.source_type =="),
+            "raw .headers access regressed (Bytes vs String always-false), got:\n{vrl}",
         );
     }
 
@@ -2254,7 +2574,7 @@ mod tests {
     fn kafka_generator_neutralises_bootstrap_servers_toml_injection() {
         let payload = "bs:9092\"\n[transforms.evil]\nsource = \"\"";
         let conn = serde_json::json!({ "bootstrap_servers": payload, "topics": ["logs"] });
-        let out = SourceConfigService::generate_kafka_source("test", &conn, None);
+        let out = SourceConfigService::generate_kafka_source("test", &Uuid::nil(), &conn, None, None);
         let parsed: toml::Value = toml::from_str(&out).expect("generated TOML must parse");
         assert!(
             !parsed_has_unexpected_top_level_tables(&parsed),
@@ -2309,13 +2629,503 @@ mod tests {
             "sasl_username": "u",
             "sasl_password": payload,
         });
-        let out = SourceConfigService::generate_kafka_source("test", &conn, Some(&creds));
+        let out = SourceConfigService::generate_kafka_source("test", &Uuid::nil(), &conn, Some(&creds), None);
         let parsed: toml::Value = toml::from_str(&out).expect("must parse");
         assert!(!parsed_has_unexpected_top_level_tables(&parsed), "{out}");
         assert_eq!(
             parsed["sources"]["test"]["sasl"]["password"].as_str().unwrap(),
             payload,
         );
+    }
+
+    // ------------------------------------------------------------------
+    // NAN-884 K-1 / K-2: TLS block + librdkafka security.protocol must
+    // both make it into the generated Vector source so cloud-hosted
+    // brokers (Confluent Cloud, MSK, Aiven) actually connect instead of
+    // failing silently with a PLAINTEXT handshake against a TLS broker.
+    // ------------------------------------------------------------------
+
+    /// Credential with `tls_enabled = true` and a CA cert path persisted by
+    /// the caller must emit `[sources.<name>.tls]` with `enabled = true` and
+    /// the supplied `ca_file`.
+    #[test]
+    fn kafka_generator_emits_tls_block_when_credential_has_tls() {
+        let conn = serde_json::json!({
+            "bootstrap_servers": "broker.confluent.cloud:9092",
+            "topics": ["audit"],
+        });
+        let creds = serde_json::json!({
+            "sasl_mechanism": "SCRAM-SHA-512",
+            "sasl_username": "u",
+            "sasl_password": "p",
+            "tls_enabled": true,
+            "tls_ca_cert": "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n",
+        });
+        let ca_path = "/etc/vector/source-creds/kafka_test.ca.pem";
+        let out = SourceConfigService::generate_kafka_source(
+            "test",
+            &Uuid::nil(),
+            &conn,
+            Some(&creds),
+            Some(ca_path),
+        );
+        let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+        let tls = parsed["sources"]["test"]["tls"]
+            .as_table()
+            .expect("tls block must be emitted when tls_enabled");
+        assert_eq!(tls["enabled"].as_bool(), Some(true));
+        assert_eq!(tls["ca_file"].as_str(), Some(ca_path));
+    }
+
+    /// `tls_enabled = true` without a custom CA still emits the TLS block —
+    /// Vector then trusts the system CA bundle (Confluent Cloud's public CA
+    /// is in there). No `ca_file` key should appear.
+    #[test]
+    fn kafka_generator_tls_block_omits_ca_file_when_no_cert_supplied() {
+        let conn = serde_json::json!({
+            "bootstrap_servers": "broker:9092",
+            "topics": ["x"],
+        });
+        let creds = serde_json::json!({ "tls_enabled": true });
+        let out = SourceConfigService::generate_kafka_source("test", &Uuid::nil(), &conn, Some(&creds), None);
+        let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+        let tls = parsed["sources"]["test"]["tls"]
+            .as_table()
+            .expect("tls block must be emitted");
+        assert_eq!(tls["enabled"].as_bool(), Some(true));
+        assert!(
+            !tls.contains_key("ca_file"),
+            "ca_file must be absent when no cert is provided, fall back to system CAs",
+        );
+    }
+
+    /// SASL + TLS together must produce `security.protocol = "SASL_SSL"`.
+    #[test]
+    fn kafka_generator_emits_security_protocol_sasl_ssl() {
+        let conn = serde_json::json!({ "bootstrap_servers": "h:9092", "topics": ["x"] });
+        let creds = serde_json::json!({
+            "sasl_mechanism": "SCRAM-SHA-256",
+            "sasl_username": "u",
+            "sasl_password": "p",
+            "tls_enabled": true,
+        });
+        let out = SourceConfigService::generate_kafka_source("test", &Uuid::nil(), &conn, Some(&creds), None);
+        let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+        assert_eq!(
+            parsed["sources"]["test"]["librdkafka_options"]["security.protocol"].as_str(),
+            Some("SASL_SSL"),
+        );
+    }
+
+    /// SASL only (no TLS) → SASL_PLAINTEXT. Covers the local SASL_PLAINTEXT
+    /// listener case in the test stand.
+    #[test]
+    fn kafka_generator_emits_security_protocol_sasl_plaintext() {
+        let conn = serde_json::json!({ "bootstrap_servers": "h:9092", "topics": ["x"] });
+        let creds = serde_json::json!({
+            "sasl_mechanism": "PLAIN",
+            "sasl_username": "u",
+            "sasl_password": "p",
+        });
+        let out = SourceConfigService::generate_kafka_source("test", &Uuid::nil(), &conn, Some(&creds), None);
+        let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+        assert_eq!(
+            parsed["sources"]["test"]["librdkafka_options"]["security.protocol"].as_str(),
+            Some("SASL_PLAINTEXT"),
+        );
+    }
+
+    /// TLS only (no SASL) → SSL. Used by anonymous-but-TLS-required brokers.
+    #[test]
+    fn kafka_generator_emits_security_protocol_ssl_when_tls_only() {
+        let conn = serde_json::json!({ "bootstrap_servers": "h:9093", "topics": ["x"] });
+        let creds = serde_json::json!({ "tls_enabled": true });
+        let out = SourceConfigService::generate_kafka_source("test", &Uuid::nil(), &conn, Some(&creds), None);
+        let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+        assert_eq!(
+            parsed["sources"]["test"]["librdkafka_options"]["security.protocol"].as_str(),
+            Some("SSL"),
+        );
+    }
+
+    /// Plain anonymous broker (T-1 local stand): no librdkafka_options table
+    /// should appear — keeping the generated TOML minimal and letting Vector
+    /// use its PLAINTEXT default.
+    #[test]
+    fn kafka_generator_omits_security_protocol_when_plaintext() {
+        let conn = serde_json::json!({ "bootstrap_servers": "kafka:9092", "topics": ["x"] });
+        let out = SourceConfigService::generate_kafka_source("test", &Uuid::nil(), &conn, None, None);
+        let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+        assert!(
+            parsed["sources"]["test"].get("librdkafka_options").is_none(),
+            "anonymous PLAINTEXT must not emit librdkafka_options:\n{out}",
+        );
+        assert!(
+            parsed["sources"]["test"].get("tls").is_none(),
+            "anonymous PLAINTEXT must not emit tls block:\n{out}",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // NAN-884 K-3: consumer-group_id must be unique per source-config when
+    // not explicitly set. Two implicit-group_id Kafka configs against the
+    // same broker previously shared the literal "nanosiem" group and split
+    // partitions across them, silently halving throughput per consumer.
+    // ------------------------------------------------------------------
+
+    /// Two different source-config ids without explicit `group_id` must
+    /// produce two different generated group_ids. Format is documented as
+    /// `nanosiem-<base32 typeid suffix>` so operators recognize it on the
+    /// broker side.
+    #[test]
+    fn kafka_generator_auto_generates_unique_group_id_per_config() {
+        let conn = serde_json::json!({ "bootstrap_servers": "h:9092", "topics": ["x"] });
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+
+        let out_a =
+            SourceConfigService::generate_kafka_source("a", &id_a, &conn, None, None);
+        let out_b =
+            SourceConfigService::generate_kafka_source("b", &id_b, &conn, None, None);
+
+        let parsed_a: toml::Value = toml::from_str(&out_a).expect("a must parse");
+        let parsed_b: toml::Value = toml::from_str(&out_b).expect("b must parse");
+
+        let gid_a = parsed_a["sources"]["a"]["group_id"]
+            .as_str()
+            .expect("group_id must be emitted");
+        let gid_b = parsed_b["sources"]["b"]["group_id"]
+            .as_str()
+            .expect("group_id must be emitted");
+
+        assert_ne!(gid_a, gid_b, "two configs must get different group_ids");
+        assert!(
+            gid_a.starts_with("nanosiem-"),
+            "auto-generated group_id must use the nanosiem- prefix, got {gid_a}",
+        );
+        assert_eq!(
+            gid_a.len(),
+            "nanosiem-".len() + 26,
+            "auto-generated suffix must be a 26-char base32 typeid suffix, got {gid_a}",
+        );
+    }
+
+    /// Explicit user-set `group_id` in `connection_config` always wins —
+    /// even when the user picks the legacy literal "nanosiem", we must
+    /// keep that value (this is the post-migration shape for already-
+    /// deployed configs and preserves their committed broker offsets).
+    #[test]
+    fn kafka_generator_preserves_explicit_group_id() {
+        let conn = serde_json::json!({
+            "bootstrap_servers": "h:9092",
+            "topics": ["x"],
+            "group_id": "my-team-pipeline",
+        });
+        let out = SourceConfigService::generate_kafka_source(
+            "test",
+            &Uuid::new_v4(),
+            &conn,
+            None,
+            None,
+        );
+        let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+        assert_eq!(
+            parsed["sources"]["test"]["group_id"].as_str(),
+            Some("my-team-pipeline"),
+        );
+    }
+
+    /// Post-migration shape: existing rows backfilled to `"nanosiem"` by
+    /// `190_kafka_default_group_id_backfill.sql` must keep that value so
+    /// already-deployed consumers don't restart from `auto_offset_reset`.
+    #[test]
+    fn kafka_generator_preserves_backfilled_nanosiem_group_id() {
+        let conn = serde_json::json!({
+            "bootstrap_servers": "h:9092",
+            "topics": ["x"],
+            "group_id": "nanosiem",
+        });
+        let out = SourceConfigService::generate_kafka_source(
+            "test",
+            &Uuid::new_v4(),
+            &conn,
+            None,
+            None,
+        );
+        let parsed: toml::Value = toml::from_str(&out).expect("must parse");
+        assert_eq!(parsed["sources"]["test"]["group_id"].as_str(), Some("nanosiem"));
+    }
+
+    // ------------------------------------------------------------------
+    // NAN-884 K-6: per-config routing transform must stamp
+    // `.metadata.forwarded_via` for pull sources so downstream rows can
+    // be filtered by ingestion path (NAN-201 covered HTTP / HEC / vector
+    // already via the always-on transforms in config/vector/*.toml).
+    // ------------------------------------------------------------------
+
+    /// Kafka routing transform must set `.metadata.forwarded_via = "kafka"`
+    /// before the source_type rules so detection rules / ad-hoc searches can
+    /// filter by ingestion path the same way they do for HEC.
+    #[test]
+    fn routing_transform_stamps_forwarded_via_for_kafka() {
+        let config = make_config(
+            "kafka",
+            vec![make_rule(1000, "topic", "default", None, "apache_http_server")],
+        );
+
+        let toml_out =
+            SourceConfigService::generate_routing_transform(&config, "src", "route", false);
+        let parsed: toml::Value = toml::from_str(&toml_out).expect("must parse");
+        let vrl = parsed["transforms"]["route"]["source"]
+            .as_str()
+            .expect("source string");
+
+        assert!(
+            vrl.contains(".metadata.forwarded_via = \"kafka\""),
+            "expected kafka forwarded_via stamp, got:\n{vrl}",
+        );
+        assert!(
+            vrl.contains("if !is_object(.metadata)"),
+            "expected metadata object guard, got:\n{vrl}",
+        );
+    }
+
+    /// AWS S3 routing transform stamps `aws_s3` (same gap as Kafka — pull
+    /// source with no upstream `forwarded_via`).
+    #[test]
+    fn routing_transform_stamps_forwarded_via_for_aws_s3() {
+        let config = make_config(
+            "aws_s3",
+            vec![make_rule(1000, "source_type", "default", None, "aws_cloudtrail")],
+        );
+
+        let toml_out =
+            SourceConfigService::generate_routing_transform(&config, "src", "route", false);
+        let parsed: toml::Value = toml::from_str(&toml_out).expect("must parse");
+        let vrl = parsed["transforms"]["route"]["source"]
+            .as_str()
+            .expect("source string");
+
+        assert!(
+            vrl.contains(".metadata.forwarded_via = \"aws_s3\""),
+            "expected aws_s3 forwarded_via stamp, got:\n{vrl}",
+        );
+    }
+
+    /// GCP Pub/Sub routing transform stamps `gcp_pubsub`.
+    #[test]
+    fn routing_transform_stamps_forwarded_via_for_gcp_pubsub() {
+        let config = make_config(
+            "gcp_pubsub",
+            vec![make_rule(1000, "source_type", "default", None, "gcp_audit_log")],
+        );
+
+        let toml_out =
+            SourceConfigService::generate_routing_transform(&config, "src", "route", false);
+        let parsed: toml::Value = toml::from_str(&toml_out).expect("must parse");
+        let vrl = parsed["transforms"]["route"]["source"]
+            .as_str()
+            .expect("source string");
+
+        assert!(
+            vrl.contains(".metadata.forwarded_via = \"gcp_pubsub\""),
+            "expected gcp_pubsub forwarded_via stamp, got:\n{vrl}",
+        );
+    }
+
+    /// System-level sources (http / vector / splunk_hec) MUST NOT get the
+    /// per-config stamp — their always-on transforms in `config/vector/*.toml`
+    /// already set `forwarded_via`, and a second assignment here would
+    /// clobber the upstream value (e.g. overwrite `splunk_hec` with `http`).
+    #[test]
+    fn routing_transform_skips_forwarded_via_for_system_level_sources() {
+        let config = make_config(
+            "http",
+            vec![make_rule(
+                10,
+                "source_type",
+                "exact",
+                Some("aws_cloudtrail_raw"),
+                "aws_cloudtrail",
+            )],
+        );
+
+        let toml_out = SourceConfigService::generate_routing_transform(
+            &config,
+            "source_type_extract",
+            "route",
+            true,
+        );
+        let parsed: toml::Value = toml::from_str(&toml_out).expect("must parse");
+        let vrl = parsed["transforms"]["route"]["source"]
+            .as_str()
+            .expect("source string");
+
+        assert!(
+            !vrl.contains("forwarded_via"),
+            "system-level routing transform must not stamp forwarded_via, got:\n{vrl}",
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // NAN-884 K-7: Kafka header match must wrap value access in
+    // `to_string(...) ?? ""`. Without the coercion the comparison is
+    // `Bytes == String` and is always-false; the entire "Header
+    // (recommended)" routing preset was broken since it shipped.
+    // ------------------------------------------------------------------
+
+    /// `prefix` / `suffix` / `contains` match types all take string-coerced
+    /// inputs too — coercion must apply to every match type, not just
+    /// `exact`.
+    #[test]
+    fn kafka_headers_path_match_field_is_coerced_for_all_match_types() {
+        for (mt, expected_fn_call) in [
+            ("prefix", "starts_with((to_string(.headers.team) ?? \"\")"),
+            ("suffix", "ends_with((to_string(.headers.team) ?? \"\")"),
+            ("contains", "contains((to_string(.headers.team) ?? \"\")"),
+            ("regex", "match((to_string(.headers.team) ?? \"\")"),
+        ] {
+            let config = make_config(
+                "kafka",
+                vec![
+                    make_rule(10, "headers.team", mt, Some("audit"), "audit_logs"),
+                    make_rule(1000, "topic", "default", None, "unknown"),
+                ],
+            );
+            let vrl =
+                SourceConfigService::generate_routing_transform(&config, "src", "route", false);
+            assert!(
+                vrl.contains(expected_fn_call),
+                "match_type={mt} must coerce header to string, got:\n{vrl}",
+            );
+        }
+    }
+
+    /// Non-Kafka configs do not need (and must not get) the header
+    /// coercion — `gcp_pubsub` already exposes `.attributes` as
+    /// `Object(String, String)`, and adding a `to_string(...) ?? ""`
+    /// wrapper there would be dead weight.
+    #[test]
+    fn non_kafka_header_paths_are_not_coerced() {
+        // gcp_pubsub commonly uses `attributes.*`; even if a rule used the
+        // word "headers" the source type isn't kafka so no coercion.
+        let config = make_config(
+            "gcp_pubsub",
+            vec![
+                make_rule(
+                    10,
+                    "attributes.source_type",
+                    "exact",
+                    Some("limacharlie_edr"),
+                    "limacharlie_edr",
+                ),
+                make_rule(1000, "subscription", "default", None, "unknown"),
+            ],
+        );
+        let vrl =
+            SourceConfigService::generate_routing_transform(&config, "src", "route", false);
+        assert!(
+            vrl.contains("if .attributes.source_type == \"limacharlie_edr\""),
+            "gcp_pubsub attributes must keep plain access, got:\n{vrl}",
+        );
+        assert!(
+            !vrl.contains("to_string(.attributes"),
+            "gcp_pubsub attributes must NOT be wrapped, got:\n{vrl}",
+        );
+    }
+
+    /// Coerced VRL must still compile against the standard VRL function
+    /// set — otherwise Vector rejects the generated config on deploy and
+    /// the failure surfaces only in saturn logs (per
+    /// `feedback_compile_test_generated_vrl`).
+    #[test]
+    fn routing_transform_vrl_compiles_with_kafka_header_coercion() {
+        let fns = vrl::stdlib::all();
+        for mt in ["exact", "prefix", "suffix", "contains", "regex"] {
+            let config = make_config(
+                "kafka",
+                vec![
+                    make_rule(10, "headers.source_type", mt, Some("sysmon"), "sysmon"),
+                    make_rule(1000, "topic", "default", None, "unknown"),
+                ],
+            );
+            let toml_out = SourceConfigService::generate_routing_transform(
+                &config, "src", "route", false,
+            );
+            let parsed: toml::Value = toml::from_str(&toml_out).expect("must parse");
+            let vrl_src = parsed["transforms"]["route"]["source"]
+                .as_str()
+                .expect("source string");
+            if let Err(diagnostics) = vrl::compiler::compile(vrl_src, &fns) {
+                let formatted =
+                    vrl::diagnostic::Formatter::new(vrl_src, diagnostics).to_string();
+                panic!(
+                    "match_type={mt} kafka header VRL failed to compile:\n\
+                     {vrl_src}\n\
+                     ---\n{formatted}",
+                );
+            }
+        }
+    }
+
+    /// Unit-level coverage for the helper itself — Kafka headers get
+    /// coerced, everything else stays plain.
+    #[test]
+    fn routing_field_expression_picks_coerced_form_for_kafka_headers_only() {
+        assert_eq!(
+            SourceConfigService::routing_field_expression("kafka", "headers.source_type"),
+            "(to_string(.headers.source_type) ?? \"\")",
+        );
+        assert_eq!(
+            SourceConfigService::routing_field_expression("kafka", "headers.team_id"),
+            "(to_string(.headers.team_id) ?? \"\")",
+        );
+        // Kafka non-headers fields stay plain.
+        assert_eq!(
+            SourceConfigService::routing_field_expression("kafka", "topic"),
+            ".topic",
+        );
+        // Other config types stay plain even for `headers.*` (defensive).
+        assert_eq!(
+            SourceConfigService::routing_field_expression("gcp_pubsub", "attributes.source_type"),
+            ".attributes.source_type",
+        );
+        assert_eq!(
+            SourceConfigService::routing_field_expression("aws_s3", "bucket"),
+            ".bucket",
+        );
+    }
+
+    /// VRL compile gate (per `feedback_compile_test_generated_vrl`): the
+    /// emitted metadata-object guard + forwarded_via assignment must
+    /// type-check against the standard VRL function set — otherwise Vector
+    /// startup fails on deploy and the failure surfaces only in saturn
+    /// logs (NAN-667 E651 precedent).
+    #[test]
+    fn routing_transform_vrl_compiles_with_forwarded_via_stamp() {
+        let fns = vrl::stdlib::all();
+        for config_type in ["kafka", "aws_s3", "gcp_pubsub"] {
+            let config = make_config(
+                config_type,
+                vec![make_rule(1000, "topic", "default", None, "apache_http_server")],
+            );
+            let toml_out = SourceConfigService::generate_routing_transform(
+                &config, "src", "route", false,
+            );
+            let parsed: toml::Value = toml::from_str(&toml_out).expect("must parse");
+            let vrl_src = parsed["transforms"]["route"]["source"]
+                .as_str()
+                .expect("source string");
+            if let Err(diagnostics) = vrl::compiler::compile(vrl_src, &fns) {
+                let formatted =
+                    vrl::diagnostic::Formatter::new(vrl_src, diagnostics).to_string();
+                panic!(
+                    "routing transform VRL for {config_type} failed to compile:\n\
+                     {vrl_src}\n\
+                     ---\n{formatted}",
+                );
+            }
+        }
     }
 
     /// Routing transform: a `target_source_type` containing `'''` would have
@@ -2836,7 +3646,7 @@ mod tests {
             "group_id": "nanosiem",
             "auto_offset_reset": "latest",
         });
-        let mut full = SourceConfigService::generate_kafka_source("test", &conn, None);
+        let mut full = SourceConfigService::generate_kafka_source("test", &Uuid::nil(), &conn, None, None);
         full.push('\n');
         let routing = SourceConfigService::generate_routing_transform(
             &make_config(
@@ -3269,5 +4079,130 @@ mod tests {
             inputs,
             vec!["vector_merge", "http_main_route", "hec_main_route"]
         );
+    }
+
+    // ------------------------------------------------------------------
+    // NAN-930: claim-based substitution for the surgical inputs rewrite.
+    // ------------------------------------------------------------------
+
+    fn claim(route: &str, parser: &str, match_values: &[&str]) -> RouteClaim {
+        RouteClaim {
+            route: route.to_string(),
+            parser_name: parser.to_string(),
+            match_values: match_values.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Sanity: no claims → identity mapping (no substitution).
+    #[test]
+    fn build_claim_substitutions_is_empty_when_no_claims() {
+        let subs = SourceConfigService::build_claim_substitutions(&[]);
+        assert!(subs.is_empty());
+    }
+
+    /// Single claimant produces a `<route>_unclaimed` substitution.
+    #[test]
+    fn build_claim_substitutions_maps_route_to_unclaimed_name() {
+        let claims = vec![claim("kafka_x_route", "Apache HTTP Server", &["apache_access"])];
+        let subs = SourceConfigService::build_claim_substitutions(&claims);
+        assert_eq!(subs.get("kafka_x_route").map(String::as_str), Some("kafka_x_route_unclaimed"));
+        // Routes not in the claim list aren't substituted.
+        assert!(subs.get("vector_merge").is_none());
+    }
+
+    /// Two claimants of the same route collapse to one substitution.
+    #[test]
+    fn build_claim_substitutions_dedupes_multiple_claimants() {
+        let claims = vec![
+            claim("splunk_hec_route", "apache", &["apache_access"]),
+            claim("splunk_hec_route", "nginx", &["nginx"]),
+        ];
+        let subs = SourceConfigService::build_claim_substitutions(&claims);
+        assert_eq!(subs.len(), 1);
+        assert_eq!(
+            subs.get("splunk_hec_route").map(String::as_str),
+            Some("splunk_hec_route_unclaimed"),
+        );
+    }
+
+    /// Emit a filter block with the union of match_values, negated so
+    /// source_router only gets the leftover stream. Post-NAN-930 this is
+    /// a clean rewrite — there is no "skip when present" branch; the
+    /// strip step handles dedup at the file level.
+    #[test]
+    fn build_unclaimed_blocks_emits_block_with_sorted_dedup_values() {
+        let claims = vec![claim("kafka_x_route", "Apache HTTP Server", &["apache_access", "apache"])];
+        let blocks = SourceConfigService::build_unclaimed_blocks(&claims);
+        assert!(blocks.contains("[transforms.kafka_x_route_unclaimed]"), "blocks=\n{blocks}");
+        assert!(blocks.contains("type = \"filter\""));
+        assert!(blocks.contains("inputs = [\"kafka_x_route\"]"));
+        // Match values are sorted+deduped before negation.
+        assert!(blocks.contains(r#"'!includes(["apache", "apache_access"], to_string(.source_type) ?? "")'"#),
+            "blocks=\n{blocks}");
+    }
+
+    /// Empty match_values falls back to the parser name (matches what
+    /// `build_hec_filter_condition` in parsers/vector_config/sources.rs does).
+    #[test]
+    fn build_unclaimed_blocks_falls_back_to_parser_name_when_match_values_empty() {
+        let claims = vec![claim("kafka_x_route", "lone_parser", &[])];
+        let blocks = SourceConfigService::build_unclaimed_blocks(&claims);
+        assert!(blocks.contains(r#"["lone_parser"]"#), "blocks=\n{blocks}");
+    }
+
+    /// Strip removes a `[transforms.X_unclaimed]` block while preserving
+    /// surrounding sections — handles the NAN-930 #2 case (changed
+    /// match_values must regenerate the condition).
+    #[test]
+    fn strip_existing_unclaimed_blocks_removes_unclaimed_section() {
+        let content = "[transforms.foo]\ntype = \"remap\"\n\
+                       [transforms.kafka_x_route_unclaimed]\ntype = \"filter\"\ncondition = 'stale'\n\
+                       [transforms.source_router]\ntype = \"route\"\n";
+        let stripped = SourceConfigService::strip_existing_unclaimed_blocks(content);
+        assert!(!stripped.contains("[transforms.kafka_x_route_unclaimed]"),
+            "expected unclaimed section removed, got:\n{stripped}");
+        assert!(!stripped.contains("'stale'"), "expected stale condition removed");
+        // Other sections survive.
+        assert!(stripped.contains("[transforms.foo]"));
+        assert!(stripped.contains("[transforms.source_router]"));
+    }
+
+    /// Strip removes multiple unclaimed blocks — handles a deploy where
+    /// several source-configs were renamed/deleted simultaneously.
+    #[test]
+    fn strip_existing_unclaimed_blocks_removes_multiple_blocks() {
+        let content = "[transforms.a_unclaimed]\ntype = \"filter\"\n\
+                       [transforms.keep_me]\ntype = \"remap\"\n\
+                       [transforms.b_unclaimed]\ntype = \"filter\"\n\
+                       [transforms.also_keep]\ntype = \"route\"\n";
+        let stripped = SourceConfigService::strip_existing_unclaimed_blocks(content);
+        assert!(!stripped.contains("a_unclaimed"));
+        assert!(!stripped.contains("b_unclaimed"));
+        assert!(stripped.contains("[transforms.keep_me]"));
+        assert!(stripped.contains("[transforms.also_keep]"));
+    }
+
+    /// Strip with no unclaimed blocks returns the content unchanged
+    /// (modulo trailing newline normalization).
+    #[test]
+    fn strip_existing_unclaimed_blocks_is_noop_when_no_blocks() {
+        let content = "[transforms.foo]\ntype = \"remap\"\n[transforms.source_router]\ntype = \"route\"\n";
+        let stripped = SourceConfigService::strip_existing_unclaimed_blocks(content);
+        assert!(stripped.contains("[transforms.foo]"));
+        assert!(stripped.contains("[transforms.source_router]"));
+        // No unclaimed mentions
+        assert!(!stripped.contains("_unclaimed"));
+    }
+
+    /// Strip does NOT match comment lines that happen to mention
+    /// `_unclaimed`. Only `[transforms.X_unclaimed]` headers count.
+    #[test]
+    fn strip_existing_unclaimed_blocks_ignores_comment_mentions() {
+        let content = "# NAN-930: _unclaimed comment\n\
+                       [transforms.foo]\ntype = \"remap\"\n";
+        let stripped = SourceConfigService::strip_existing_unclaimed_blocks(content);
+        // Comment line survives (we only strip section bodies, not comments).
+        assert!(stripped.contains("# NAN-930: _unclaimed comment"));
+        assert!(stripped.contains("[transforms.foo]"));
     }
 }

@@ -978,13 +978,106 @@ pub struct CheckReachabilityRequest {
 #[derive(Debug, serde::Serialize, ToSchema)]
 pub struct ReachabilityResult {
     /// True only when the source config is enabled, deployed, and a log source
-    /// exists for the target_source_type.
+    /// exists for the target_source_type. For broker-bound config types
+    /// (Kafka), also requires `broker_reachable` to be true.
     pub reachable: bool,
     pub source_config_enabled: bool,
     pub source_config_deployed: bool,
     pub target_log_source_exists: bool,
+    /// TCP-dial result for broker-bound configs (NAN-884 K-4).
+    /// `Some(true)` if at least one `bootstrap_servers` entry accepted a
+    /// connection within the timeout; `Some(false)` if every entry failed;
+    /// `None` for config types where the check does not apply (HTTP, Vector,
+    /// HEC) or where `bootstrap_servers` is missing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broker_reachable: Option<bool>,
+    /// One line per probed broker — `host:port → ok` or `host:port → <reason>`.
+    /// Empty when `broker_reachable` is `None`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub broker_reachable_details: Vec<String>,
     /// Human-readable warnings explaining any false flags above.
     pub warnings: Vec<String>,
+}
+
+/// TCP-dial timeout for the Kafka broker reachability probe (NAN-884 K-4).
+/// Short enough that an unreachable broker can't stall the deploy modal,
+/// long enough that a slow but live broker still gets reported reachable.
+const KAFKA_BROKER_PROBE_TIMEOUT_MS: u64 = 2000;
+
+/// Parse a Kafka `bootstrap_servers` value into `(host, port)` pairs.
+///
+/// Vector accepts the librdkafka format: a comma-separated list of
+/// `host[:port]` entries with whitespace trimmed. We default to the
+/// librdkafka default port (9092) when none is specified. Empty / unparsable
+/// entries are silently skipped so a single bad entry doesn't poison the
+/// list.
+fn parse_bootstrap_servers(raw: &str) -> Vec<(String, u16)> {
+    raw.split(',')
+        .filter_map(|entry| {
+            let s = entry.trim();
+            if s.is_empty() {
+                return None;
+            }
+            match s.rsplit_once(':') {
+                Some((host, port_str)) => {
+                    let host = host.trim();
+                    if host.is_empty() {
+                        return None;
+                    }
+                    let port: u16 = port_str.trim().parse().ok()?;
+                    Some((host.to_string(), port))
+                }
+                None => Some((s.to_string(), 9092)),
+            }
+        })
+        .collect()
+}
+
+/// Probe each broker in `bootstrap_servers` with a TCP connect.
+///
+/// Returns `(Some(true), details)` when at least one broker accepts the
+/// connection within the timeout, `(Some(false), details)` when every
+/// broker fails, `(None, vec![])` when `bootstrap_servers` is missing /
+/// empty so the caller can leave the field unset. Each detail line is
+/// `host:port → ok` or `host:port → <reason>` so the deploy modal can show
+/// the raw probe outcome.
+async fn probe_kafka_broker_reachability(
+    connection_config: &serde_json::Value,
+) -> (Option<bool>, Vec<String>) {
+    let raw = match connection_config["bootstrap_servers"].as_str() {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return (None, Vec::new()),
+    };
+
+    let brokers = parse_bootstrap_servers(raw);
+    if brokers.is_empty() {
+        return (None, Vec::new());
+    }
+
+    let timeout = std::time::Duration::from_millis(KAFKA_BROKER_PROBE_TIMEOUT_MS);
+    let mut details = Vec::with_capacity(brokers.len());
+    let mut any_ok = false;
+
+    for (host, port) in &brokers {
+        let addr = format!("{host}:{port}");
+        match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
+            Ok(Ok(_stream)) => {
+                details.push(format!("{addr} → ok"));
+                any_ok = true;
+            }
+            Ok(Err(err)) => {
+                details.push(format!("{addr} → {err}"));
+            }
+            Err(_) => {
+                details.push(format!(
+                    "{addr} → timed out after {}ms",
+                    KAFKA_BROKER_PROBE_TIMEOUT_MS
+                ));
+            }
+        }
+    }
+
+    (Some(any_ok), details)
 }
 
 /// Check whether a candidate routing rule on a source configuration can
@@ -1055,13 +1148,38 @@ pub async fn check_routing_rule_reachability(
         ));
     }
 
-    let reachable = config.enabled && config.deployed && target_log_source_exists;
+    // Broker-bound configs (Kafka) get a real TCP-dial probe so the deploy
+    // modal can tell "broker not reachable" from "config is fine"
+    // (NAN-884 K-4). Non-broker types skip the probe; an MVP TCP connect
+    // catches the most common failure modes — wrong hostname, firewall,
+    // broker down — without pulling in `rdkafka` for a full ApiVersions
+    // request. Auth / topic-existence probes are deferred follow-up.
+    let (broker_reachable, broker_reachable_details) =
+        if config.config_type == "kafka" {
+            probe_kafka_broker_reachability(&config.connection_config).await
+        } else {
+            (None, Vec::new())
+        };
+
+    if broker_reachable == Some(false) {
+        warnings.push(format!(
+            "No Kafka broker in `bootstrap_servers` responded within {} ms — events will not flow until at least one broker is reachable.",
+            KAFKA_BROKER_PROBE_TIMEOUT_MS,
+        ));
+    }
+
+    let reachable = config.enabled
+        && config.deployed
+        && target_log_source_exists
+        && broker_reachable != Some(false);
 
     Ok(Json(ReachabilityResult {
         reachable,
         source_config_enabled: config.enabled,
         source_config_deployed: config.deployed,
         target_log_source_exists,
+        broker_reachable,
+        broker_reachable_details,
         warnings,
     }))
 }
@@ -1248,5 +1366,130 @@ mod tests {
     fn collect_target_source_types_for_configs_empty_for_no_configs() {
         let by_config: HashMap<Uuid, Vec<RoutingRule>> = HashMap::new();
         assert!(collect_target_source_types_for_configs(&by_config).is_empty());
+    }
+
+    // ============================================================================
+    // NAN-884 K-4: Kafka broker reachability probe — `parse_bootstrap_servers`
+    // is pure / sync so it's exercised here without a tokio runtime; the
+    // async `probe_kafka_broker_reachability` uses a TCP dial + 2s timeout
+    // and is covered against a closed-port loopback + the running test stand.
+    // ============================================================================
+
+    #[test]
+    fn parse_bootstrap_servers_single_host_with_port() {
+        assert_eq!(
+            parse_bootstrap_servers("broker.example.com:9093"),
+            vec![("broker.example.com".to_string(), 9093)],
+        );
+    }
+
+    #[test]
+    fn parse_bootstrap_servers_defaults_port_when_missing() {
+        // Default port is 9092 to match librdkafka's default — anything else
+        // would silently send users to the wrong listener.
+        assert_eq!(
+            parse_bootstrap_servers("broker"),
+            vec![("broker".to_string(), 9092)],
+        );
+    }
+
+    #[test]
+    fn parse_bootstrap_servers_comma_separated_and_whitespace_tolerant() {
+        assert_eq!(
+            parse_bootstrap_servers(" b1:9092 , b2:9093 ,b3 "),
+            vec![
+                ("b1".to_string(), 9092),
+                ("b2".to_string(), 9093),
+                ("b3".to_string(), 9092),
+            ],
+        );
+    }
+
+    #[test]
+    fn parse_bootstrap_servers_skips_unparsable_entries() {
+        // Empty entry, missing host, non-numeric port — none should panic
+        // and none should poison the rest of the list.
+        assert_eq!(
+            parse_bootstrap_servers("good:9092,,:9092,bad:not-a-port,b2:9093"),
+            vec![
+                ("good".to_string(), 9092),
+                ("b2".to_string(), 9093),
+            ],
+        );
+    }
+
+    /// Closed-port loopback dial — must fail fast (definitely under the 2s
+    /// timeout) and produce one detail line. Picks a high port that's almost
+    /// certainly unbound on the test host.
+    #[tokio::test]
+    async fn probe_kafka_broker_reachability_reports_unreachable_for_closed_port() {
+        let cfg = serde_json::json!({
+            "bootstrap_servers": "127.0.0.1:1"
+        });
+        let start = std::time::Instant::now();
+        let (reachable, details) = probe_kafka_broker_reachability(&cfg).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(reachable, Some(false), "details: {details:?}");
+        assert_eq!(details.len(), 1, "details: {details:?}");
+        assert!(details[0].starts_with("127.0.0.1:1 → "));
+        assert!(
+            elapsed.as_millis() < KAFKA_BROKER_PROBE_TIMEOUT_MS as u128 + 500,
+            "closed-port dial should fail much faster than the timeout, took {elapsed:?}",
+        );
+    }
+
+    /// Missing `bootstrap_servers` returns `(None, vec![])` so the caller
+    /// can leave the field unset on the response — the deploy modal then
+    /// hides the broker-reachable badge rather than rendering "false".
+    #[tokio::test]
+    async fn probe_kafka_broker_reachability_returns_none_when_servers_missing() {
+        let cfg = serde_json::json!({});
+        let (reachable, details) = probe_kafka_broker_reachability(&cfg).await;
+        assert_eq!(reachable, None);
+        assert!(details.is_empty(), "details: {details:?}");
+
+        // Empty / whitespace-only string also yields None.
+        let cfg = serde_json::json!({ "bootstrap_servers": "   " });
+        let (reachable, details) = probe_kafka_broker_reachability(&cfg).await;
+        assert_eq!(reachable, None);
+        assert!(details.is_empty());
+    }
+
+    /// All-unparsable list yields `(None, vec![])` because no broker was
+    /// actually probed — same shape as "missing bootstrap_servers" so the
+    /// UI doesn't render a misleading "unreachable" badge for input the
+    /// validator should have caught earlier.
+    #[tokio::test]
+    async fn probe_kafka_broker_reachability_returns_none_when_no_parsable_brokers() {
+        let cfg = serde_json::json!({ "bootstrap_servers": ":,," });
+        let (reachable, details) = probe_kafka_broker_reachability(&cfg).await;
+        assert_eq!(reachable, None);
+        assert!(details.is_empty());
+    }
+
+    /// Multi-broker fallback: at least one reachable broker should report
+    /// `Some(true)` even when others fail. Uses a loopback TCP listener
+    /// bound to an ephemeral port (definitely reachable) alongside a
+    /// known-bad host:port.
+    #[tokio::test]
+    async fn probe_kafka_broker_reachability_succeeds_when_any_broker_responds() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral bind");
+        let good = listener.local_addr().expect("local addr");
+        let cfg = serde_json::json!({
+            "bootstrap_servers": format!("127.0.0.1:1,{good}"),
+        });
+
+        let (reachable, details) = probe_kafka_broker_reachability(&cfg).await;
+
+        assert_eq!(reachable, Some(true), "details: {details:?}");
+        assert_eq!(details.len(), 2);
+        assert!(details[0].contains("→"));
+        assert!(
+            details.iter().any(|d| d.ends_with(" → ok")),
+            "expected at least one ok line, got: {details:?}",
+        );
     }
 }

@@ -356,6 +356,9 @@ export function ParserRepositories() {
         import_type: mode,
         source_type: sourceType || undefined,
         ingestion_method: ingestionMethod,
+        // NAN-928: ship the picker's selection so the backend can wire the
+        // generator to the user's source-config route (Kafka/S3/GCP).
+        dispatch_source_config_id: configId ?? null,
       });
 
       // Routing-rule create-on-import — non-fatal if it fails.

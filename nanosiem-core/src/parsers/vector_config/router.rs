@@ -99,6 +99,154 @@ pub(super) fn file_declares_route_transform(content: &str, route_name: &str) -> 
         .any(|line| !line.trim_start().starts_with('#') && line.contains(&needle))
 }
 
+/// NAN-930: which route does this parser pull events from? The router needs
+/// this so that source-config routes claimed by a fetch-source parser (Kafka
+/// / S3 / GCP) or by an HEC parser don't ALSO flow into `source_router` —
+/// otherwise every event lands in ClickHouse twice (once parsed via the
+/// parser pipeline, once raw via `source_router.generic`).
+///
+/// Returns `None` for parsers that don't claim a source-config route
+/// (routed, vector, or non-dispatch fetch parsers that emit their own
+/// owned Vector source — those don't share an input with source_router).
+pub(super) fn parser_claimed_route(parser: &Parser) -> Option<&str> {
+    match parser.source_type.as_str() {
+        // HEC parsers always read from the OOTB/source-config splunk_hec_route.
+        "splunk_hec" | "splunk" | "hec" => Some("splunk_hec_route"),
+        // Kafka/S3/GCP parsers only claim a route when bound to a source-config
+        // via the DISPATCH FROM picker (NAN-928); otherwise they spin their own
+        // owned source and don't intersect with source_router.
+        "kafka" | "aws_s3" | "aws_sqs" | "gcp_pubsub" => {
+            parser.dispatch_route_name.as_deref()
+        }
+        _ => None,
+    }
+}
+
+/// NAN-930: build the `<route>_unclaimed` filter condition — an event passes
+/// only when its `.source_type` is NOT in any claiming parser's match_values.
+/// Mirrors `build_hec_filter_condition` (sources.rs) but with the leading `!`
+/// so we capture the leftover stream that no parser wants.
+fn build_unclaimed_filter_condition(claimants: &[&Parser]) -> String {
+    let mut values: Vec<String> = Vec::new();
+    for parser in claimants {
+        if let Some(match_values) = &parser.match_values {
+            if !match_values.is_empty() {
+                values.extend(match_values.iter().cloned());
+                continue;
+            }
+        }
+        // No match_values configured → claim falls back to the parser name
+        // (same fallback `build_hec_filter_condition` uses).
+        values.push(parser.name.clone());
+    }
+    values.sort();
+    values.dedup();
+    let list = values
+        .iter()
+        .map(|v| format!("\"{}\"", escape_vrl_string_for_router(v)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "!includes([{}], to_string(.source_type) ?? \"\")",
+        list
+    )
+}
+
+/// Minimal VRL string escape — backslashes + quotes + embedded newlines.
+/// Duplicated from `sources::escape_vrl_string` (private) to keep the router
+/// module standalone; sub-50-char helper, not worth lifting yet.
+fn escape_vrl_string_for_router(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// NAN-930: shared between `router.rs::write_router_config` (active path)
+/// and `staging.rs::stage_parsers` (validation path). Both writers emit
+/// `_router.toml` and both need the same dedupe-substitution to prevent
+/// double-writes — without this shared helper the staging writer's output
+/// (which gets promoted on top of the active file via `promote_staged`)
+/// would clobber the active writer's substitution and the
+/// double-write-to-ClickHouse bug would return.
+///
+/// Inputs:
+///   - `base_inputs`: `base_router_inputs(...)` result (unchanged on disk).
+///   - `source_config_routes`: routes from `get_source_config_routes`.
+///   - `parsers`: full parser slice (used to detect HEC + dispatched
+///     fetch-source claims).
+///
+/// Returns:
+///   - The substituted Vec<String> of `source_router.inputs`.
+///   - The TOML block for the `<route>_unclaimed` filter transforms
+///     (empty when no claims, otherwise the full set of blocks ready to
+///     `push_str` into the file before `[transforms.source_router]`).
+pub(super) fn build_router_inputs_with_claim_dedupe(
+    base_inputs: Vec<String>,
+    source_config_routes: &[String],
+    parsers: &[Parser],
+) -> (Vec<String>, String) {
+    use std::collections::HashMap;
+    let mut claims: HashMap<&str, Vec<&Parser>> = HashMap::new();
+    for parser in parsers.iter().filter(|p| p.enabled) {
+        if let Some(route) = parser_claimed_route(parser) {
+            claims.entry(route).or_default().push(parser);
+        }
+    }
+
+    let substitutions: HashMap<String, String> = claims
+        .keys()
+        .map(|route| (route.to_string(), format!("{}_unclaimed", route)))
+        .collect();
+
+    let final_inputs: Vec<String> = base_inputs
+        .iter()
+        .chain(source_config_routes.iter())
+        .map(|name| {
+            substitutions
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| name.clone())
+        })
+        .collect();
+
+    let mut claimed_sorted: Vec<(&str, &Vec<&Parser>)> =
+        claims.iter().map(|(k, v)| (*k, v)).collect();
+    claimed_sorted.sort_by_key(|(k, _)| *k);
+
+    let mut filter_blocks = String::new();
+    if !claimed_sorted.is_empty() {
+        filter_blocks.push_str(
+            "# =============================================================================\n\
+             # NAN-930: Unclaimed-event filters for parser-bound source-config routes\n\
+             # =============================================================================\n\
+             # Each `<route>_unclaimed` filter passes only events that NO parser-filter\n\
+             # claimed (i.e., `.source_type` not in any claiming parser's match_values).\n\
+             # Prevents events from being double-written: once via the parser pipeline\n\
+             # and once via `source_router.generic`.\n\n",
+        );
+        for (route, claimants) in &claimed_sorted {
+            let condition = build_unclaimed_filter_condition(claimants);
+            filter_blocks.push_str(&format!(
+                "[transforms.{}_unclaimed]\n\
+                 type = \"filter\"\n\
+                 inputs = [\"{}\"]\n\
+                 condition = '{}'\n\n",
+                route, route, condition,
+            ));
+        }
+    }
+
+    (final_inputs, filter_blocks)
+}
+
 impl VectorConfigManager {
     /// Get the directory for source configuration files
     fn source_configs_dir(&self) -> PathBuf {
@@ -303,12 +451,30 @@ impl VectorConfigManager {
         .map(String::from)
         .collect();
         let source_config_routes = self.get_source_config_routes().await;
-        router_inputs.extend(source_config_routes);
+
+        // NAN-930: any source-config route that's also claimed by a parser
+        // (HEC → splunk_hec_route, or kafka/s3/gcp bound via DISPATCH FROM →
+        // <safe_name>_route) must NOT flow into `source_router` directly —
+        // the parser-filter is already consuming it. Without this hop every
+        // event landed in ClickHouse twice: once parsed via the parser
+        // pipeline and once raw via `source_router.generic`. The shared
+        // helper produces both the substituted inputs list and the
+        // `<route>_unclaimed` filter blocks; staging.rs uses the same helper
+        // so the staging-then-promote path can't clobber the substitution.
+        let (router_inputs_substituted, unclaimed_filter_blocks) =
+            build_router_inputs_with_claim_dedupe(router_inputs, &source_config_routes, parsers);
+        router_inputs = router_inputs_substituted;
         let inputs_formatted = router_inputs
             .iter()
             .map(|s| format!("\"{}\"", s))
             .collect::<Vec<_>>()
             .join(", ");
+
+        // NAN-930: emit the `<route>_unclaimed` filter transforms BEFORE
+        // source_router (cosmetic — Vector resolves inputs across the
+        // whole file regardless of order). Shared helper builds the blocks
+        // so this writer and `staging.rs::stage_parsers` stay in lockstep.
+        config.push_str(&unclaimed_filter_blocks);
 
         config.push_str(&format!(
             "# Auto-generated dynamic router for deployed parsers\n\
@@ -555,5 +721,105 @@ source = ".source_type = \"foo\""
             );
             assert!(base_router_inputs(false, true, hec_present).contains(&"source_type_extract"));
         }
+    }
+
+    // ------------------------------------------------------------------
+    // NAN-930: parser_claimed_route + build_unclaimed_filter_condition
+    // ------------------------------------------------------------------
+
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    fn parser_for_claim_tests(source_type: &str, dispatch: Option<&str>) -> Parser {
+        Parser {
+            id: Uuid::new_v4(),
+            name: "Apache HTTP Server".to_string(),
+            description: None,
+            source_type: source_type.to_string(),
+            source_config: serde_json::json!({}),
+            parser_vrl: String::new(),
+            output_fields: None,
+            feed_id: None,
+            credential_id: None,
+            dispatch_source_config_id: dispatch.map(|_| Uuid::new_v4()),
+            dispatch_route_name: dispatch.map(|s| s.to_string()),
+            enabled: true,
+            validated: true,
+            validation_error: None,
+            category: None,
+            vendor: None,
+            product: None,
+            namespace: "default".to_string(),
+            timezone: "UTC".to_string(),
+            match_values: Some(vec!["apache_access".to_string(), "apache".to_string()]),
+            sampling_ratio: None,
+            sampling_exclude_condition: None,
+            extension_vrl: None,
+            extension_enabled: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// HEC parsers always claim `splunk_hec_route` — singleton-owned by the OOTB HEC source.
+    #[test]
+    fn parser_claimed_route_returns_splunk_hec_for_hec_parsers() {
+        for source_type in ["splunk_hec", "splunk", "hec"] {
+            let p = parser_for_claim_tests(source_type, None);
+            assert_eq!(parser_claimed_route(&p), Some("splunk_hec_route"));
+        }
+    }
+
+    /// Fetch-source parser bound via DISPATCH FROM claims that route.
+    #[test]
+    fn parser_claimed_route_returns_dispatch_route_for_bound_fetch_parser() {
+        for source_type in ["kafka", "aws_s3", "aws_sqs", "gcp_pubsub"] {
+            let p = parser_for_claim_tests(source_type, Some("nan884_smoke_route"));
+            assert_eq!(parser_claimed_route(&p), Some("nan884_smoke_route"));
+        }
+    }
+
+    /// Fetch-source parser with no dispatch (legacy parser-owned source)
+    /// doesn't claim a shared route — its source is private to the parser.
+    #[test]
+    fn parser_claimed_route_returns_none_for_unbound_fetch_parser() {
+        let p = parser_for_claim_tests("kafka", None);
+        assert!(parser_claimed_route(&p).is_none());
+    }
+
+    /// Routed and vector parsers don't share a route with source_router —
+    /// they consume `source_router.<name>` outputs.
+    #[test]
+    fn parser_claimed_route_returns_none_for_routed_and_vector() {
+        for source_type in ["routed", "vector"] {
+            let p = parser_for_claim_tests(source_type, None);
+            assert!(parser_claimed_route(&p).is_none());
+        }
+    }
+
+    /// Condition is `!includes([...])` with sorted+deduped match_values.
+    #[test]
+    fn build_unclaimed_filter_condition_negates_union_of_match_values() {
+        let p1 = parser_for_claim_tests("kafka", Some("r"));
+        let p2 = Parser {
+            match_values: Some(vec!["nginx".to_string(), "apache".to_string()]),
+            ..parser_for_claim_tests("kafka", Some("r"))
+        };
+        let cond = build_unclaimed_filter_condition(&[&p1, &p2]);
+        assert_eq!(
+            cond,
+            r#"!includes(["apache", "apache_access", "nginx"], to_string(.source_type) ?? "")"#,
+        );
+    }
+
+    /// Empty match_values falls back to the parser name (same fallback
+    /// `sources.rs::build_hec_filter_condition` uses).
+    #[test]
+    fn build_unclaimed_filter_condition_falls_back_to_parser_name() {
+        let mut p = parser_for_claim_tests("kafka", Some("r"));
+        p.match_values = None;
+        p.name = "lone_parser".to_string();
+        let cond = build_unclaimed_filter_condition(&[&p]);
+        assert!(cond.contains(r#"["lone_parser"]"#), "got: {cond}");
     }
 }
