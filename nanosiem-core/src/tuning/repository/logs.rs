@@ -141,6 +141,7 @@ impl TuningRepository {
             let proposal = TuningProposal {
                 id: row.try_get("proposal_id")?,
                 rule_id: row.try_get("rule_id")?,
+                rule_name: None,
                 created_at: row.try_get("proposal_created_at")?,
                 proposal_type: ProposalType::QueryTuning,
                 original_query: row.try_get("original_query")?,
@@ -265,6 +266,7 @@ impl TuningRepository {
             let proposal = TuningProposal {
                 id: row.try_get("proposal_id")?,
                 rule_id: row.try_get("rule_id")?,
+                rule_name: None,
                 created_at: row.try_get("proposal_created_at")?,
                 proposal_type: ProposalType::QueryTuning,
                 original_query: row.try_get("original_query")?,
@@ -389,6 +391,7 @@ impl TuningRepository {
             let proposal = TuningProposal {
                 id: row.try_get("proposal_id")?,
                 rule_id: row.try_get("rule_id")?,
+                rule_name: None,
                 created_at: row.try_get("proposal_created_at")?,
                 proposal_type: ProposalType::QueryTuning,
                 original_query: row.try_get("original_query")?,

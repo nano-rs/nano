@@ -32,6 +32,7 @@ import { cn } from '@/lib/utils';
 import { QueryHighlight } from '@/lib/syntax-highlight';
 
 import { AlertHero } from '@/components/alerts/AlertHero';
+import { AlertTriageBar } from '@/components/alerts/AlertTriageBar';
 import { EventViewer } from '@/components/matches/EventViewer';
 
 type TabId = 'events' | 'rule' | 'timeline';
@@ -45,7 +46,7 @@ export function AlertDetail() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
 
-  const { data: apiAlert, loading, error } = useAlert(id);
+  const { data: apiAlert, loading, error, refetch: refetchAlert } = useAlert(id);
   // Memoize the camelized view: `fromApiAlert` allocates a new object on
   // every call, which would make `alert` a fresh reference each render and
   // cascade through every effect that depends on it (recordView, notebook
@@ -142,6 +143,15 @@ export function AlertDetail() {
           }}
           rule={apiRule}
           linkedNotebookCount={0}
+        />
+        {/* NAN-967: triage CTAs (Acknowledge / Assign / Close) — were
+            previously only reachable from the /alerts list row icons. */}
+        <AlertTriageBar
+          alertId={alert.id}
+          ruleName={alert.ruleName}
+          status={alert.status as 'open' | 'acknowledged' | 'closed'}
+          currentAssignee={apiAlert?.assigned_to ?? null}
+          onActionComplete={refetchAlert}
         />
       </div>
 

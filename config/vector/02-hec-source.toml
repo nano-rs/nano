@@ -48,11 +48,20 @@ if source_type == "unknown" && exists(.sourcetype) {
 # Splunk's .event holds the actual log payload. Lift it into .message
 # (raw forms) or merge its keys (structured forms) so downstream parsers
 # see the same shape as HTTP-ingested events.
+#
+# Reserved root keys must not be lifted from .event — otherwise a Splunk
+# forwarder can clobber routing-critical fields (.source_type, .namespace,
+# .auth_status, etc.) and bypass per-parser HEC filters that fire on
+# source_type. NAN-938.
 if exists(.event) {
     if is_object(.event) {
+        reserved = ["source_type", "namespace", "auth_status", "timestamp",
+                    "metadata", "ingest_time", "_inserted_at", "id", "ext",
+                    "message", "sourcetype", "splunk_sourcetype",
+                    "content_format", "routing_timestamp"]
         event_keys = keys(object!(.event))
         for_each(event_keys) -> |_idx, key| {
-            if key != "message" {
+            if !includes(reserved, key) {
                 val, get_err = get(.event, [key])
                 if get_err == null && val != null {
                     . = set!(., [key], val)

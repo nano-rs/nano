@@ -16,6 +16,7 @@ import {
   useDetectionStats,
   useTodayCounts,
   useAlertCounts,
+  useAlertVelocity,
   useFleetHealth,
 } from '@/hooks/use-api';
 import { useAuth } from '@/contexts/AuthContext';
@@ -71,6 +72,7 @@ export function Rules() {
   const { data: stats } = useDetectionStats(28);
   const { data: todayCounts, refetch: refetchTodayCounts } = useTodayCounts();
   const { data: alertCounts } = useAlertCounts();
+  const { data: alertVelocity } = useAlertVelocity(24);
   const { data: fleetHealth } = useFleetHealth();
 
   const [sev, setSev] = useState<SevFilter>('all');
@@ -263,7 +265,8 @@ export function Rules() {
             className="h-8 px-2.5 rounded-md border border-border text-[11.5px] text-foreground hover:bg-foreground/5 flex items-center gap-1.5 @max-[900px]:hidden"
           >
             <Database className="w-3.5 h-3.5" strokeWidth={2} />
-            Marketplace
+            {/* NAN-957: label matches destination page title "Rule repositories". */}
+            Repositories
           </Link>
           {canCreate && (
             <Link
@@ -282,6 +285,7 @@ export function Rules() {
         rules={rules}
         silentCount={silentCount}
         alerts24h={alertCounts?.total ?? 0}
+        velocity={alertVelocity}
         fleetHealth={fleetHealth}
         onReviewSilent={() => navigate('/rules/tuning?tab=silent')}
       />

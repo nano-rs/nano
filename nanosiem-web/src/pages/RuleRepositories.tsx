@@ -551,6 +551,7 @@ export function RuleRepositories() {
               onToggleSelectAll={toggleSelectAll}
               onSelectRule={setSelectedRuleId}
               onAction={handleRowAction}
+              activeCat={activeCat}
             />
           )}
         </div>

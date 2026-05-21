@@ -67,6 +67,13 @@ pub struct RateLimitConfig {
     pub dry_resolve_max_requests: u32,
     /// Time window for dry-resolve rate limiting
     pub dry_resolve_window_seconds: u64,
+    /// Max Kafka broker-probe requests per authenticated user in the time
+    /// window. The probe holds a worker for up to `(DNS + TCP) × N brokers`
+    /// ms and dials caller-supplied addresses, so without a per-user cap it
+    /// doubles as a port-scan amplifier (NAN-939 H3).
+    pub kafka_probe_max_requests: u32,
+    /// Time window for Kafka broker-probe rate limiting
+    pub kafka_probe_window_seconds: u64,
 }
 
 impl Default for RateLimitConfig {
@@ -92,6 +99,8 @@ impl Default for RateLimitConfig {
             upload_window_seconds: 60,       // per minute (prevents DoS)
             dry_resolve_max_requests: 30,    // 30 dry-resolves per user
             dry_resolve_window_seconds: 60,  // per minute
+            kafka_probe_max_requests: 6,     // 6 broker probes per user
+            kafka_probe_window_seconds: 60,  // per minute (heavy: DNS + TCP × N)
         }
     }
 }
@@ -161,6 +170,14 @@ impl RateLimitState {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30),
             dry_resolve_window_seconds: std::env::var("RATE_LIMIT_DRY_RESOLVE_WINDOW_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+            kafka_probe_max_requests: std::env::var("RATE_LIMIT_KAFKA_PROBE_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(6),
+            kafka_probe_window_seconds: std::env::var("RATE_LIMIT_KAFKA_PROBE_WINDOW_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
@@ -439,6 +456,59 @@ pub async fn dry_resolve_rate_limit_middleware(
 
             let error = RateLimitError {
                 error: "Too many dry-resolve requests. Please try again later.".to_string(),
+                retry_after_seconds: retry_after,
+            };
+
+            let body = serde_json::to_string(&error)
+                .unwrap_or_else(|_| r#"{"error":"Too many requests"}"#.to_string());
+
+            Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("Content-Type", "application/json")
+                .header("Retry-After", retry_after.to_string())
+                .body(Body::from(body))
+                .unwrap()
+        }
+    }
+}
+
+/// Middleware for rate limiting Kafka broker reachability probes (NAN-939 H3).
+///
+/// Per-user because the endpoint is authenticated, and per-user is what
+/// prevents a single compromised tenant from pinning the runtime. Cost
+/// model: each call does up to `(DNS_TIMEOUT + TCP_TIMEOUT) × MAX_BROKERS`
+/// ms of work, so the default `6/min` keeps the worst-case worker hold
+/// well below 30 s/min/user.
+pub async fn kafka_probe_rate_limit_middleware(
+    State(state): State<RateLimitState>,
+    req: Request,
+    next: Next,
+) -> Response<Body> {
+    let (category, key) = match req.extensions().get::<crate::middleware::AuthContext>() {
+        Some(auth) => ("kafka_probe_user", auth.user_id().to_string()),
+        None => {
+            tracing::warn!(
+                "kafka_probe_rate_limit_middleware: AuthContext missing, falling back to IP"
+            );
+            ("kafka_probe_ip", extract_client_ip(&req))
+        }
+    };
+
+    match state
+        .check(
+            category,
+            &key,
+            state.config.kafka_probe_window_seconds,
+            state.config.kafka_probe_max_requests,
+        )
+        .await
+    {
+        Ok(_) => next.run(req).await,
+        Err(retry_after) => {
+            tracing::warn!(key = %key, "Kafka broker-probe rate limit exceeded");
+
+            let error = RateLimitError {
+                error: "Too many broker-probe requests. Please try again later.".to_string(),
                 retry_after_seconds: retry_after,
             };
 

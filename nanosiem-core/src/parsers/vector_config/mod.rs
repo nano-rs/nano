@@ -30,6 +30,7 @@ pub use redaction::redact_config_snapshot;
 pub use router::{base_router_inputs, hec_normalize_present};
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
 
 use super::types::Parser;
@@ -73,7 +74,13 @@ pub struct VectorConfigManager {
     sources_runtime_path: String,
     /// Serializes all deploy operations to prevent concurrent deploys from
     /// corrupting config or overwriting each other's backups.
-    deploy_lock: tokio::sync::Mutex<()>,
+    ///
+    /// NAN-948: wrapped in `Arc` so the same lock can be shared with
+    /// `SourceConfigService::update_dynamic_router`, which read-mutate-writes
+    /// the same `_router.toml` outside this manager. Without the shared
+    /// lock, a parser deploy and a source-config router update can
+    /// interleave and lose one of the two updates.
+    deploy_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl VectorConfigManager {
@@ -97,13 +104,21 @@ impl VectorConfigManager {
             backup_dir,
             credentials_dir,
             sources_runtime_path,
-            deploy_lock: tokio::sync::Mutex::new(()),
+            deploy_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
     /// Create with default config directory
     pub fn with_defaults() -> Self {
         Self::new("config/vector")
+    }
+
+    /// Hand out a clone of the deploy lock so other services can serialize
+    /// their `_router.toml` mutations against this manager's deploys.
+    /// NAN-948 — without this shared lock, `SourceConfigService` and the
+    /// parser deploy path can race on the read-mutate-write of `_router.toml`.
+    pub fn deploy_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.deploy_lock)
     }
 
     /// Get the base config directory

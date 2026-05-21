@@ -1384,7 +1384,10 @@ function Step1Identify({
               value={feedId}
               onChange={(e) => setFeedId(sanitizeFeedId(e.target.value))}
               placeholder="aws_cloudtrail"
-              className="h-10 w-full rounded-md border border-input bg-background pl-[105px] pr-3 font-mono text-[13px] text-foreground placeholder:text-muted-foreground/60 focus:border-primary focus:outline-none"
+              // NAN-936 F-17: left padding sits flush against the `source_type=`
+              // prefix so the placeholder reads `source_type=aws_cloudtrail`,
+              // matching the description text and the in-queries form below.
+              className="h-10 w-full rounded-md border border-input bg-background pl-[92px] pr-3 font-mono text-[13px] text-foreground placeholder:text-muted-foreground/60 focus:border-primary focus:outline-none"
             />
           </div>
           <FieldHint>
@@ -1762,11 +1765,15 @@ function Step2Parse(props: Step2Props) {
   const passingTests = tests.filter((t) => t.status === 'pass').length;
   const totalTests = tests.length;
   const ok = errors === 0 && totalTests > 0 && passingTests === totalTests && sampleCount > 0;
+  const vrlLineCount = vrl.split('\n').length;
 
   const summary = (
     <div className="hidden md:flex items-center gap-3 text-[11px] shrink-0">
       <span className="font-mono text-foreground">
-        {vrl.split('\n').length} <span className="text-muted-foreground/60">lines</span>
+        {vrlLineCount}{' '}
+        <span className="text-muted-foreground/60">
+          {vrlLineCount === 1 ? 'line' : 'lines'}
+        </span>
       </span>
       <span className="w-px h-4 bg-border" />
       <span className={passingTests === totalTests && totalTests > 0 ? 'text-emerald-500' : 'text-amber-500'}>
@@ -2802,6 +2809,7 @@ function Step3Deploy(props: Step3Props) {
 
   const ok = canDeploy;
   const totalTests = passingTests + failingTests;
+  const vrlLineCount = vrl.split('\n').length;
 
   const summary = (
     <div className="hidden md:flex items-center gap-3 text-[11px] shrink-0">
@@ -2871,7 +2879,7 @@ function Step3Deploy(props: Step3Props) {
             kind="VRL parser"
             icon={Code}
             primary={`${feedId || 'parser'}.vrl`}
-            secondary={`${vrl.split('\n').length} lines`}
+            secondary={`${vrlLineCount} ${vrlLineCount === 1 ? 'line' : 'lines'}`}
             code={vrl}
           />
         </div>

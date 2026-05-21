@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useId, useState } from 'react';
+import { useDocumentTitle } from '@/hooks/useDocumentTitle';
+import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
@@ -64,6 +66,8 @@ function StatusPill({ status }: { status: GdprAnonymizationStatus }) {
 }
 
 export function GdprAnonymizationPage() {
+  useDocumentTitle('GDPR & Compliance');
+  useBreadcrumbTitle('GDPR & Compliance');
   const { toast } = useToast();
   const baseId = useId();
 

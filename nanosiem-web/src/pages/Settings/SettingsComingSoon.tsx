@@ -9,6 +9,7 @@
 import { useLocation } from 'react-router-dom';
 import { Sparkles } from 'lucide-react';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
+import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
 import { resolveActiveSection, SECTION_BY_ID } from '@/components/layout/settings/sections';
 
 export function SettingsComingSoon() {
@@ -18,6 +19,7 @@ export function SettingsComingSoon() {
   const title = section?.label || 'Settings';
 
   useDocumentTitle(`${title} · Settings`);
+  useBreadcrumbTitle(title);
 
   return (
     <div className="h-full">
@@ -27,19 +29,7 @@ export function SettingsComingSoon() {
         </div>
         <div className="text-[18px] font-semibold tracking-tight text-foreground leading-none">{title}</div>
         <div className="text-[12.5px] text-muted-foreground max-w-[420px] leading-relaxed">
-          {section?.desc || 'This section is part of the redesign roadmap and isn\'t shipped yet.'}
-        </div>
-        <div className="text-[11px] text-muted-foreground/70 mt-2">
-          Track progress on{' '}
-          <a
-            href="https://linear.app/nanos-sh/issue/NAN-368"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-primary hover:underline"
-          >
-            NAN-368 — UI redesign epic
-          </a>
-          .
+          {section?.desc || 'Coming soon.'}
         </div>
       </div>
     </div>

@@ -13,6 +13,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::log_sources::{LogSourceRepository, NewLogSource, UpdateLogSource};
+use crate::log_telemetry::repository::is_safe_source_type;
 use crate::rule_repository::GitHubClient;
 
 use super::error::ParserRepositoryError;
@@ -72,6 +73,48 @@ impl ParserRepositoryService {
     pub fn with_config(mut self, config: ParserRepositoryServiceConfig) -> Self {
         self.config = config;
         self
+    }
+
+    /// Compatibility check between a `source_configurations.config_type`
+    /// and a parser's `ingestion_method`. NAN-943.
+    ///
+    /// The dispatch picker (`SourceConfigForm.tsx` → `SOURCE_TYPE_MAP`)
+    /// only surfaces 1:1 pairs for the pull-style sources, so the matrix
+    /// here mirrors that map:
+    ///
+    /// | config_type   | ingestion_method | dispatch-bound?      |
+    /// |---------------|------------------|----------------------|
+    /// | kafka         | kafka            | yes                  |
+    /// | aws_s3 / s3   | aws_s3           | yes                  |
+    /// | gcp_pubsub    | gcp_pubsub       | yes                  |
+    /// | splunk_hec    | splunk_hec       | yes                  |
+    /// | http          | routed           | no (always-on)       |
+    /// | vector        | vector           | no (always-on)       |
+    ///
+    /// Always-on sources don't need a per-config dispatch, but callers
+    /// who DO pass `dispatch_source_config_id` for a routed/vector parser
+    /// must point at the matching config_type. The check is symmetric:
+    /// it rejects both "kafka parser + s3 dispatch" AND "s3 parser + kafka
+    /// dispatch".
+    fn is_dispatch_compatible(config_type: &str, ingestion_method: &str) -> bool {
+        let normalized_ct = match config_type {
+            // `SourceConfigType::from_str` accepts the legacy short forms;
+            // database rows have always stored the canonical name, but
+            // defense-in-depth.
+            "s3" => "aws_s3",
+            "pubsub" => "gcp_pubsub",
+            "splunk" | "hec" => "splunk_hec",
+            other => other,
+        };
+        matches!(
+            (normalized_ct, ingestion_method),
+            ("kafka", "kafka")
+                | ("aws_s3", "aws_s3")
+                | ("gcp_pubsub", "gcp_pubsub")
+                | ("splunk_hec", "splunk_hec")
+                | ("http", "routed")
+                | ("vector", "vector")
+        )
     }
 
     // =========================================================================
@@ -497,6 +540,38 @@ impl ParserRepositoryService {
             .clone()
             .unwrap_or_else(|| "routed".to_string());
 
+        // NAN-943: when the caller pairs a parser with a specific
+        // source-configuration via `dispatch_source_config_id`, that
+        // source-config's `config_type` must be compatible with the
+        // parser's `ingestion_method`. Without this guard the FK
+        // constraint passes, the parser is created, and at deploy time
+        // it filters on `<wrong_config>_route` and receives zero events
+        // — the exact silent-failure mode NAN-928 set out to eliminate.
+        // The web UI guards via SOURCE_TYPE_MAP, but the API has no
+        // enforcement; a hand-rolled POST with mismatched
+        // (ingestion_method=kafka, dispatch_source_config_id=<aws_s3 id>)
+        // would be accepted.
+        if let Some(dispatch_id) = req.dispatch_source_config_id {
+            let row: Option<(String,)> = sqlx::query_as(
+                "SELECT config_type FROM source_configurations WHERE id = $1",
+            )
+            .bind(dispatch_id)
+            .fetch_optional(&self.pg_pool)
+            .await
+            .map_err(ParserRepositoryError::Database)?;
+            let config_type = row.map(|(ct,)| ct).ok_or_else(|| {
+                ParserRepositoryError::InvalidRequest(format!(
+                    "dispatch_source_config_id {dispatch_id} does not match any source-configuration",
+                ))
+            })?;
+            if !Self::is_dispatch_compatible(&config_type, &ingestion_method) {
+                return Err(ParserRepositoryError::InvalidRequest(format!(
+                    "dispatch_source_config_id config_type '{config_type}' is incompatible with parser ingestion_method '{ingestion_method}'; \
+                     pick a {ingestion_method} source-configuration or change the parser's ingestion_method",
+                )));
+            }
+        }
+
         let new_log_source = NewLogSource {
             name: display_name,
             description: parser.description.clone(),
@@ -520,51 +595,113 @@ impl ParserRepositoryService {
             sampling_exclude_condition: None,
         };
 
-        // Create log source via repository
-        let ls_repo = self.log_source_repository.as_ref().ok_or_else(|| {
-            ParserRepositoryError::Internal("Log source repository not available".to_string())
-        })?;
-
-        let log_source = ls_repo
-            .create(&new_log_source)
-            .await
-            .map_err(|e| ParserRepositoryError::LogSourceService(e.to_string()))?;
-
-        let log_source_id = log_source.id;
+        // NAN-950: do the three writes (log_sources INSERT, log_sources
+        // UPDATE for parser-only flags, parser_imports INSERT) inside one
+        // sqlx transaction so an API crash between statements can't leave
+        // a half-imported log_source — pre-NAN-950 the orphan had
+        // `parser_only = false` and the deploy enumerator picked it up
+        // as a "normal" parser, which with NAN-928's dispatch_source_config_id
+        // dispatched from a real source-config and produced broken state.
+        //
+        // We bypass LogSourceRepository::create + ParserImportsRepository::create
+        // for this path because they each take `&PgPool`; the transaction
+        // requires `&mut Transaction`. The SQL below mirrors those two
+        // methods (kept in sync with `log_sources/repository/crud.rs::create`
+        // and `parser_repository/repository.rs::ParserImportsRepository::create`);
+        // future column additions to log_sources or parser_imports must
+        // also be made here.
         let is_linked = matches!(req.import_type, ParserImportType::Linked);
+        let import_type_str = req.import_type.to_string();
 
-        // Set parser_only=true, validated, and source repository tracking
-        sqlx::query(
+        let mut tx = self
+            .pg_pool
+            .begin()
+            .await
+            .map_err(ParserRepositoryError::Database)?;
+
+        // Duplicate-name check — must be inside the transaction so two
+        // concurrent imports of the same parser can't both pass.
+        let existing: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM log_sources WHERE name = $1",
+        )
+        .bind(&new_log_source.name)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(ParserRepositoryError::Database)?;
+        if existing > 0 {
+            return Err(ParserRepositoryError::LogSourceService(format!(
+                "Log source with name '{}' already exists",
+                new_log_source.name
+            )));
+        }
+
+        // Single INSERT that already sets parser_only=true / validated=true
+        // / source_parser_* — collapses the original INSERT + UPDATE into
+        // one round-trip while inside the transaction.
+        let log_source_id: Uuid = sqlx::query_scalar(
             r#"
-            UPDATE log_sources SET
-                parser_only = true,
-                validated = true,
-                validation_error = NULL,
-                source_parser_repository_id = $2,
-                source_parser_path = $3,
-                source_parser_linked = $4
-            WHERE id = $1
+            INSERT INTO log_sources (
+                name, description, namespace, timezone, source_type, source_config, credential_id,
+                parser_vrl, output_fields, category, vendor, product, icon, color,
+                match_field, match_pattern, match_values, dispatch_source_config_id,
+                parser_only, validated, validation_error,
+                source_parser_repository_id, source_parser_path, source_parser_linked
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                    $15, $16, $17, $18,
+                    true, true, NULL,
+                    $19, $20, $21)
+            RETURNING id
             "#,
         )
-        .bind(log_source_id)
+        .bind(&new_log_source.name)
+        .bind(&new_log_source.description)
+        .bind(&new_log_source.namespace)
+        .bind(&new_log_source.timezone)
+        .bind(&new_log_source.source_type)
+        .bind(&new_log_source.source_config)
+        .bind(&new_log_source.credential_id)
+        .bind(&new_log_source.parser_vrl)
+        .bind(&new_log_source.output_fields)
+        .bind(&new_log_source.category)
+        .bind(&new_log_source.vendor)
+        .bind(&new_log_source.product)
+        .bind(&new_log_source.icon)
+        .bind(&new_log_source.color)
+        .bind(&new_log_source.match_field)
+        .bind(&new_log_source.match_pattern)
+        .bind(&new_log_source.match_values)
+        .bind(&new_log_source.dispatch_source_config_id)
         .bind(repo_id)
         .bind(path)
         .bind(is_linked)
-        .execute(&self.pg_pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(ParserRepositoryError::Database)?;
 
-        // Create import record
-        self.imports_repository
-            .create(
-                parser.id,
-                log_source_id,
-                &req.import_type.to_string(),
-                user_id,
-                repo.last_sync_commit.as_deref(),
+        // Create the parser_imports row inside the same transaction so a
+        // crash between INSERTs rolls back the log_source.
+        sqlx::query(
+            r#"
+            INSERT INTO parser_imports (
+                repository_parser_id, log_source_id, import_type,
+                imported_by, imported_commit, last_sync_commit
             )
+            VALUES ($1, $2, $3, $4, $5, $5)
+            "#,
+        )
+        .bind(parser.id)
+        .bind(log_source_id)
+        .bind(&import_type_str)
+        .bind(user_id)
+        .bind(repo.last_sync_commit.as_deref())
+        .execute(&mut *tx)
+        .await
+        .map_err(ParserRepositoryError::Database)?;
+
+        tx.commit()
             .await
-            .map_err(|e| ParserRepositoryError::Internal(e.to_string()))?;
+            .map_err(ParserRepositoryError::Database)?;
 
         info!(
             repo_id = %repo_id,
@@ -946,24 +1083,44 @@ impl ParserRepositoryService {
     ) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // NAN-945: silently drop values that don't pass the source_type
+        // allow-list. Match values flow into the `_unclaimed` router
+        // substitution (router.rs:129+), the routing-rule orphan check,
+        // and per-parser HEC filters via `escape_vrl_string` (sources.rs:440).
+        // VRL escape blocks immediate injection at emit, but allow-listing
+        // at resolve-time stops unsafe values from reaching any of those
+        // downstream surfaces in the first place. Mirrors
+        // `validate_routing_rule_values` in source_configs/service.rs.
         let push = |out: &mut Vec<String>,
                     seen: &mut std::collections::HashSet<String>,
-                    value: &str| {
+                    value: &str,
+                    source_label: &str| {
             let trimmed = value.trim();
-            if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+            if trimmed.is_empty() {
+                return;
+            }
+            if !is_safe_source_type(trimmed) {
+                tracing::warn!(
+                    source = source_label,
+                    value = trimmed,
+                    "resolve_match_values: dropping unsafe match_value (must be alphanumeric + `_` or `-`)",
+                );
+                return;
+            }
+            if seen.insert(trimmed.to_string()) {
                 out.push(trimmed.to_string());
             }
         };
 
         if let Some(st) = ui_source_type {
-            push(&mut out, &mut seen, st);
+            push(&mut out, &mut seen, st, "ui_source_type");
         }
         for alias in yaml_match_values {
-            push(&mut out, &mut seen, alias);
+            push(&mut out, &mut seen, alias, "yaml_match_value");
         }
         if out.is_empty() {
             if let Some(n) = parser_name {
-                push(&mut out, &mut seen, n);
+                push(&mut out, &mut seen, n, "parser_name");
             }
         }
         if out.is_empty() {
@@ -1069,5 +1226,167 @@ mod tests {
     fn resolve_match_values_falls_back_to_unknown() {
         let result = ParserRepositoryService::resolve_match_values(None, &[], None);
         assert_eq!(result, vec!["unknown".to_string()]);
+    }
+
+    // ----------------------------------------------------------------------
+    // NAN-943: dispatch compatibility matrix.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn is_dispatch_compatible_accepts_canonical_pair_for_each_pull_source() {
+        assert!(ParserRepositoryService::is_dispatch_compatible("kafka", "kafka"));
+        assert!(ParserRepositoryService::is_dispatch_compatible("aws_s3", "aws_s3"));
+        assert!(ParserRepositoryService::is_dispatch_compatible("gcp_pubsub", "gcp_pubsub"));
+        assert!(ParserRepositoryService::is_dispatch_compatible("splunk_hec", "splunk_hec"));
+    }
+
+    #[test]
+    fn is_dispatch_compatible_accepts_always_on_sources() {
+        // http maps to ingestion_method "routed" (matches SOURCE_TYPE_MAP).
+        assert!(ParserRepositoryService::is_dispatch_compatible("http", "routed"));
+        // vector is identity.
+        assert!(ParserRepositoryService::is_dispatch_compatible("vector", "vector"));
+    }
+
+    #[test]
+    fn is_dispatch_compatible_normalizes_legacy_short_forms() {
+        // Stored canonical form is "aws_s3"/"gcp_pubsub"/"splunk_hec"; legacy
+        // ingest paths used "s3"/"pubsub"/"splunk"/"hec". from_str on
+        // SourceConfigType accepts both; the dispatch check must too.
+        assert!(ParserRepositoryService::is_dispatch_compatible("s3", "aws_s3"));
+        assert!(ParserRepositoryService::is_dispatch_compatible("pubsub", "gcp_pubsub"));
+        assert!(ParserRepositoryService::is_dispatch_compatible("splunk", "splunk_hec"));
+        assert!(ParserRepositoryService::is_dispatch_compatible("hec", "splunk_hec"));
+    }
+
+    #[test]
+    fn is_dispatch_compatible_rejects_kafka_parser_against_s3_dispatch() {
+        // The exact silent-failure mode NAN-928 set out to eliminate —
+        // FK passes, parser filters on `<s3_config>_route`, receives zero
+        // events. The reverse must also reject.
+        assert!(!ParserRepositoryService::is_dispatch_compatible("aws_s3", "kafka"));
+        assert!(!ParserRepositoryService::is_dispatch_compatible("kafka", "aws_s3"));
+    }
+
+    #[test]
+    fn is_dispatch_compatible_rejects_all_cross_pairs() {
+        let drivers = ["kafka", "aws_s3", "gcp_pubsub", "splunk_hec", "http", "vector"];
+        let methods = ["kafka", "aws_s3", "gcp_pubsub", "splunk_hec", "routed", "vector"];
+        for ct in &drivers {
+            for im in &methods {
+                let expected_ok = matches!(
+                    (*ct, *im),
+                    ("kafka", "kafka")
+                        | ("aws_s3", "aws_s3")
+                        | ("gcp_pubsub", "gcp_pubsub")
+                        | ("splunk_hec", "splunk_hec")
+                        | ("http", "routed")
+                        | ("vector", "vector")
+                );
+                assert_eq!(
+                    ParserRepositoryService::is_dispatch_compatible(ct, im),
+                    expected_ok,
+                    "compat({ct}, {im}) returned the wrong answer",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn is_dispatch_compatible_rejects_unknown_config_type() {
+        // A future / typo'd config_type should fail closed.
+        assert!(!ParserRepositoryService::is_dispatch_compatible("rabbitmq", "kafka"));
+        assert!(!ParserRepositoryService::is_dispatch_compatible("", ""));
+    }
+
+    // ----------------------------------------------------------------------
+    // NAN-945: allow-list match_values. The function silently drops any
+    // value that fails `is_safe_source_type` (must be non-empty + alphanumeric
+    // / `_` / `-`). Existing imports are alphanumeric+_- already, so this
+    // is defense-in-depth — but the dropped values must not leak into the
+    // downstream `_unclaimed` substitution or VRL filter conditions.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_match_values_drops_unsafe_quote_in_yaml_alias() {
+        let result = ParserRepositoryService::resolve_match_values(
+            Some("apache"),
+            &[
+                "apache_access".into(),
+                // VRL injection attempt — quotes + semicolons.
+                "evil\"; .source_type = \"x".into(),
+                "apache_error".into(),
+            ],
+            None,
+        );
+        // Safe values preserved in order, unsafe one dropped silently.
+        assert_eq!(
+            result,
+            vec!["apache".to_string(), "apache_access".to_string(), "apache_error".to_string()],
+        );
+    }
+
+    #[test]
+    fn resolve_match_values_drops_unsafe_dot_and_space_and_newline() {
+        let result = ParserRepositoryService::resolve_match_values(
+            Some("good_one"),
+            &[
+                "dot.in.name".into(),
+                "space in name".into(),
+                "newline\nin\nname".into(),
+                "valid-with-dash".into(),
+            ],
+            None,
+        );
+        assert_eq!(
+            result,
+            vec!["good_one".to_string(), "valid-with-dash".to_string()],
+        );
+    }
+
+    #[test]
+    fn resolve_match_values_drops_unsafe_ui_source_type_then_falls_back() {
+        // If the only candidates are unsafe, fall through to parser_name.
+        let result = ParserRepositoryService::resolve_match_values(
+            Some("ui_evil\""),
+            &["yaml.dot".into()],
+            Some("parser_name_ok"),
+        );
+        assert_eq!(result, vec!["parser_name_ok".to_string()]);
+    }
+
+    #[test]
+    fn resolve_match_values_drops_unsafe_parser_name_too_and_uses_unknown() {
+        // If even the parser_name fallback fails the allow-list, we land
+        // on the "unknown" sentinel rather than persisting unsafe input.
+        let result = ParserRepositoryService::resolve_match_values(
+            None,
+            &[],
+            Some("bad parser name"),
+        );
+        assert_eq!(result, vec!["unknown".to_string()]);
+    }
+
+    #[test]
+    fn resolve_match_values_preserves_dash_and_underscore() {
+        // Sanity: the allow-list must not over-fire on legitimate names.
+        let result = ParserRepositoryService::resolve_match_values(
+            Some("apache_http_server"),
+            &[
+                "ms-windows-sysmon".into(),
+                "cisco_asa".into(),
+                "fortinet-fortigate".into(),
+            ],
+            None,
+        );
+        assert_eq!(
+            result,
+            vec![
+                "apache_http_server".to_string(),
+                "ms-windows-sysmon".to_string(),
+                "cisco_asa".to_string(),
+                "fortinet-fortigate".to_string(),
+            ],
+        );
     }
 }

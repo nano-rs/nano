@@ -24,6 +24,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use nanosiem_core::log_telemetry::repository::is_safe_source_type;
+use nanosiem_core::inputlookup::SsrfValidator;
 use nanosiem_core::audit::{
     AuditEvent, AuditSource, ClientContext, ROUTING_RULE_CREATED, ROUTING_RULE_DELETED,
     ROUTING_RULE_REORDERED, ROUTING_RULE_UPDATED, SOURCE_CONFIG_CREATED, SOURCE_CONFIG_DELETED,
@@ -1004,33 +1005,214 @@ pub struct ReachabilityResult {
 /// long enough that a slow but live broker still gets reported reachable.
 const KAFKA_BROKER_PROBE_TIMEOUT_MS: u64 = 2000;
 
+/// DNS-resolution timeout per broker. Bounds the worst-case for the SSRF
+/// validation step so a slow resolver can't pin a runtime worker.
+const KAFKA_BROKER_PROBE_DNS_TIMEOUT_MS: u64 = 1500;
+
+/// Cap on brokers parsed from `bootstrap_servers` (NAN-939 H3). Each broker
+/// holds a worker for up to `DNS_TIMEOUT + PROBE_TIMEOUT` ms, so an
+/// uncapped list lets an authenticated user pin the runtime indefinitely.
+/// Real-world Kafka clusters quote 3-5 brokers in bootstrap_servers; 10 is
+/// generous and matches librdkafka guidance.
+const KAFKA_BROKER_PROBE_MAX_BROKERS: usize = 10;
+
+/// Ports accepted by the broker probe (NAN-939 H1). librdkafka defaults to
+/// 9092 (plaintext) / 9093 (SSL) / 9094 (SASL_PLAINTEXT) / 9095 (SASL_SSL),
+/// with 9096 as a common mTLS variant. Anything else (22, 80, 443, 6379,
+/// 169.254.169.254:80 …) is a port-scan probe in disguise.
+const KAFKA_BROKER_ALLOWED_PORTS: &[u16] = &[9092, 9093, 9094, 9095, 9096];
+
 /// Parse a Kafka `bootstrap_servers` value into `(host, port)` pairs.
 ///
 /// Vector accepts the librdkafka format: a comma-separated list of
 /// `host[:port]` entries with whitespace trimmed. We default to the
 /// librdkafka default port (9092) when none is specified. Empty / unparsable
 /// entries are silently skipped so a single bad entry doesn't poison the
-/// list.
-fn parse_bootstrap_servers(raw: &str) -> Vec<(String, u16)> {
-    raw.split(',')
-        .filter_map(|entry| {
-            let s = entry.trim();
-            if s.is_empty() {
+/// list. The list is capped at `KAFKA_BROKER_PROBE_MAX_BROKERS` (NAN-939)
+/// so an authenticated user can't pin the runtime by persisting a 1000-entry
+/// `bootstrap_servers` and triggering a probe.
+/// Parse a single `host[:port]` entry from a Kafka bootstrap_servers list.
+///
+/// IPv4 / hostname: `broker:9092` or `broker` (port defaults to 9092).
+///
+/// IPv6 (NAN-951): MUST be bracketed per librdkafka's expectation, e.g.
+/// `[2001:db8::1]:9092` or `[::1]:9092`. A bare unbracketed IPv6 like
+/// `2001:db8::1` is ambiguous (the last `:` could be host/port or the
+/// segment separator) and is rejected — librdkafka itself rejects them
+/// too, so we don't try to be clever.
+///
+/// Returns None for empty / unparsable / disallowed entries so a single
+/// bad entry doesn't poison the list. Hosts inside brackets are returned
+/// WITHOUT brackets (e.g. `2001:db8::1`) — callers re-add them when
+/// formatting for display.
+fn parse_one_bootstrap_entry(s: &str) -> Option<(String, u16)> {
+    if s.is_empty() {
+        return None;
+    }
+
+    // Bracketed IPv6 form: `[host]:port` (or `[host]` — port defaults).
+    // We `find` rather than `starts_with` because of leading whitespace
+    // edge cases (caller trims, but be defensive).
+    if let Some(stripped) = s.strip_prefix('[') {
+        let close = stripped.find(']')?;
+        let host = stripped[..close].trim();
+        if host.is_empty() {
+            return None;
+        }
+        // Validate the host parses as IPv6 — rejects `[broker.example.com]`
+        // and other nonsense bracketed values.
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return None;
+        }
+        let after_bracket = &stripped[close + 1..];
+        if after_bracket.is_empty() {
+            return Some((host.to_string(), 9092));
+        }
+        // Expected form `]:port`.
+        let port_str = after_bracket.strip_prefix(':')?.trim();
+        let port: u16 = port_str.parse().ok()?;
+        return Some((host.to_string(), port));
+    }
+
+    // Bare IPv6 (no brackets): ambiguous and rejected. We detect by
+    // counting colons — IPv4 / hostnames have at most one `:` (host:port),
+    // anything with `>=2` colons is either a bare IPv6 (reject) or a
+    // hostname containing illegal characters (also reject).
+    if s.matches(':').count() >= 2 {
+        tracing::warn!(
+            entry = %s,
+            "rejecting unbracketed IPv6-shaped bootstrap_servers entry — use [host]:port form",
+        );
+        return None;
+    }
+
+    // IPv4 / hostname path: `host:port` or bare `host`.
+    match s.rsplit_once(':') {
+        Some((host, port_str)) => {
+            let host = host.trim();
+            if host.is_empty() {
                 return None;
             }
-            match s.rsplit_once(':') {
-                Some((host, port_str)) => {
-                    let host = host.trim();
-                    if host.is_empty() {
-                        return None;
-                    }
-                    let port: u16 = port_str.trim().parse().ok()?;
-                    Some((host.to_string(), port))
-                }
-                None => Some((s.to_string(), 9092)),
-            }
-        })
-        .collect()
+            let port: u16 = port_str.trim().parse().ok()?;
+            Some((host.to_string(), port))
+        }
+        None => Some((s.to_string(), 9092)),
+    }
+}
+
+fn parse_bootstrap_servers(raw: &str) -> Vec<(String, u16)> {
+    let parsed: Vec<(String, u16)> = raw
+        .split(',')
+        .filter_map(|entry| parse_one_bootstrap_entry(entry.trim()))
+        .collect();
+
+    if parsed.len() > KAFKA_BROKER_PROBE_MAX_BROKERS {
+        tracing::warn!(
+            count = parsed.len(),
+            cap = KAFKA_BROKER_PROBE_MAX_BROKERS,
+            "bootstrap_servers list exceeds probe cap — truncating",
+        );
+        parsed
+            .into_iter()
+            .take(KAFKA_BROKER_PROBE_MAX_BROKERS)
+            .collect()
+    } else {
+        parsed
+    }
+}
+
+/// Validate + probe a single Kafka broker.
+///
+/// NAN-939 H1/H2: the probe runs unauthenticated DNS + TCP connect against
+/// caller-supplied addresses, so without filtering it's an SSRF / port-scan
+/// primitive (loopback, RFC1918, link-local, cloud metadata, kube apiserver).
+/// Every failure path collapses to `"unreachable"` in the user-facing detail
+/// line; the specific reason (port disallowed, SSRF-blocked IP, DNS failure,
+/// TCP refused, timeout) is logged via `tracing::warn!` for ops.
+async fn validate_and_probe_broker(host: &str, port: u16) -> Result<(), &'static str> {
+    use std::net::ToSocketAddrs;
+    use tokio::net::TcpStream;
+    use tokio::time::{timeout, Duration};
+
+    if !KAFKA_BROKER_ALLOWED_PORTS.contains(&port) {
+        tracing::warn!(host = %host, port, "kafka probe rejected: port not in allow-list");
+        return Err("port_not_allowed");
+    }
+
+    let validator = SsrfValidator::default_secure();
+    // NAN-951: bracket IPv6 hosts when formatting for `to_socket_addrs`.
+    // `parse_one_bootstrap_entry` returns IPv6 hosts without brackets
+    // (e.g. `2001:db8::1`), and `ToSocketAddrs` on `&str` requires the
+    // `[host]:port` form for IPv6.
+    let host_with_port = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let resolve_host = host_with_port.clone();
+
+    let resolve_fut = tokio::task::spawn_blocking(move || {
+        resolve_host
+            .to_socket_addrs()
+            .map(|iter| iter.collect::<Vec<_>>())
+    });
+
+    let dns_timeout = Duration::from_millis(KAFKA_BROKER_PROBE_DNS_TIMEOUT_MS);
+    let addrs = match timeout(dns_timeout, resolve_fut).await {
+        Ok(Ok(Ok(a))) if !a.is_empty() => a,
+        Ok(Ok(Ok(_))) => {
+            tracing::warn!(host = %host, port, "kafka probe rejected: DNS returned no addresses");
+            return Err("dns_empty");
+        }
+        Ok(Ok(Err(err))) => {
+            tracing::warn!(host = %host, port, error = %err, "kafka probe rejected: DNS failure");
+            return Err("dns_failed");
+        }
+        Ok(Err(join_err)) => {
+            tracing::warn!(host = %host, port, error = %join_err, "kafka probe rejected: DNS task panicked");
+            return Err("dns_failed");
+        }
+        Err(_elapsed) => {
+            tracing::warn!(host = %host, port, "kafka probe rejected: DNS timeout");
+            return Err("dns_timeout");
+        }
+    };
+
+    // Reject if ANY resolved IP is blocked — defends against multi-A
+    // DNS-rebinding where the attacker mixes a public IP with a private one.
+    let mut validated: Option<std::net::SocketAddr> = None;
+    for sock in &addrs {
+        if let Err(err) = validator.validate_ip_address(sock.ip()) {
+            tracing::warn!(
+                host = %host,
+                port,
+                resolved_ip = %sock.ip(),
+                error = %err,
+                "kafka probe rejected: SSRF guard blocked resolved IP",
+            );
+            return Err("blocked_address");
+        }
+        if validated.is_none() {
+            validated = Some(*sock);
+        }
+    }
+    let target = match validated {
+        Some(t) => t,
+        None => return Err("dns_empty"),
+    };
+
+    let connect_timeout = Duration::from_millis(KAFKA_BROKER_PROBE_TIMEOUT_MS);
+    match timeout(connect_timeout, TcpStream::connect(target)).await {
+        Ok(Ok(_stream)) => Ok(()),
+        Ok(Err(err)) => {
+            tracing::warn!(host = %host, port, target = %target, error = %err, "kafka probe TCP connect failed");
+            Err("tcp_failed")
+        }
+        Err(_) => {
+            tracing::warn!(host = %host, port, target = %target, "kafka probe TCP connect timed out");
+            Err("tcp_timeout")
+        }
+    }
 }
 
 /// Probe each broker in `bootstrap_servers` with a TCP connect.
@@ -1039,8 +1221,9 @@ fn parse_bootstrap_servers(raw: &str) -> Vec<(String, u16)> {
 /// connection within the timeout, `(Some(false), details)` when every
 /// broker fails, `(None, vec![])` when `bootstrap_servers` is missing /
 /// empty so the caller can leave the field unset. Each detail line is
-/// `host:port → ok` or `host:port → <reason>` so the deploy modal can show
-/// the raw probe outcome.
+/// `host:port → ok` or `host:port → unreachable` — collapsed (NAN-939 H2)
+/// so the response can't be used as a port-scan oracle. Detailed failure
+/// reasons live in `tracing::warn!` for ops.
 async fn probe_kafka_broker_reachability(
     connection_config: &serde_json::Value,
 ) -> (Option<bool>, Vec<String>) {
@@ -1054,25 +1237,22 @@ async fn probe_kafka_broker_reachability(
         return (None, Vec::new());
     }
 
-    let timeout = std::time::Duration::from_millis(KAFKA_BROKER_PROBE_TIMEOUT_MS);
     let mut details = Vec::with_capacity(brokers.len());
     let mut any_ok = false;
 
     for (host, port) in &brokers {
         let addr = format!("{host}:{port}");
-        match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
-            Ok(Ok(_stream)) => {
+        match validate_and_probe_broker(host, *port).await {
+            Ok(()) => {
                 details.push(format!("{addr} → ok"));
                 any_ok = true;
             }
-            Ok(Err(err)) => {
-                details.push(format!("{addr} → {err}"));
-            }
-            Err(_) => {
-                details.push(format!(
-                    "{addr} → timed out after {}ms",
-                    KAFKA_BROKER_PROBE_TIMEOUT_MS
-                ));
+            Err(_reason) => {
+                // Generic message — see tracing::warn! for the specific
+                // reason. Returning `Connection refused` vs `No route to host`
+                // vs `blocked_address` vs `port_not_allowed` would tell an
+                // attacker which internal hosts the API pod can reach.
+                details.push(format!("{addr} → unreachable"));
             }
         }
     }
@@ -1419,8 +1599,9 @@ mod tests {
     }
 
     /// Closed-port loopback dial — must fail fast (definitely under the 2s
-    /// timeout) and produce one detail line. Picks a high port that's almost
-    /// certainly unbound on the test host.
+    /// timeout) and produce one detail line. Post NAN-939 the failure path
+    /// is "port not in allow-list" rather than TCP refused, but the
+    /// user-visible message collapses to "unreachable" either way.
     #[tokio::test]
     async fn probe_kafka_broker_reachability_reports_unreachable_for_closed_port() {
         let cfg = serde_json::json!({
@@ -1432,10 +1613,10 @@ mod tests {
 
         assert_eq!(reachable, Some(false), "details: {details:?}");
         assert_eq!(details.len(), 1, "details: {details:?}");
-        assert!(details[0].starts_with("127.0.0.1:1 → "));
+        assert_eq!(details[0], "127.0.0.1:1 → unreachable");
         assert!(
             elapsed.as_millis() < KAFKA_BROKER_PROBE_TIMEOUT_MS as u128 + 500,
-            "closed-port dial should fail much faster than the timeout, took {elapsed:?}",
+            "rejected broker should fail much faster than the timeout, took {elapsed:?}",
         );
     }
 
@@ -1468,28 +1649,180 @@ mod tests {
         assert!(details.is_empty());
     }
 
-    /// Multi-broker fallback: at least one reachable broker should report
-    /// `Some(true)` even when others fail. Uses a loopback TCP listener
-    /// bound to an ephemeral port (definitely reachable) alongside a
-    /// known-bad host:port.
+    /// NAN-939 H1: loopback brokers must be rejected by the SSRF guard.
+    /// Even a live loopback listener on an allowed port returns "unreachable"
+    /// so an authenticated user can't use the probe to fingerprint services
+    /// running alongside the API pod.
     #[tokio::test]
-    async fn probe_kafka_broker_reachability_succeeds_when_any_broker_responds() {
+    async fn probe_kafka_broker_reachability_rejects_loopback_brokers() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("ephemeral bind");
-        let good = listener.local_addr().expect("local addr");
+        // Bind succeeded but we use one of the Kafka allow-listed ports
+        // for the probe input — the SSRF guard is what should reject the
+        // dial, not the port allow-list (we test that separately).
+        let _ = listener;
         let cfg = serde_json::json!({
-            "bootstrap_servers": format!("127.0.0.1:1,{good}"),
+            "bootstrap_servers": "127.0.0.1:9092,127.0.0.1:9093",
         });
 
         let (reachable, details) = probe_kafka_broker_reachability(&cfg).await;
 
-        assert_eq!(reachable, Some(true), "details: {details:?}");
+        assert_eq!(reachable, Some(false), "details: {details:?}");
         assert_eq!(details.len(), 2);
-        assert!(details[0].contains("→"));
         assert!(
-            details.iter().any(|d| d.ends_with(" → ok")),
-            "expected at least one ok line, got: {details:?}",
+            details.iter().all(|d| d.ends_with(" → unreachable")),
+            "every loopback broker should be marked unreachable, got: {details:?}",
         );
+    }
+
+    /// NAN-939 H1: cloud-metadata endpoints must be rejected by the SSRF
+    /// guard. The probe response must not let an authenticated user
+    /// fingerprint whether the API pod can reach 169.254.169.254 (AWS IMDS).
+    #[tokio::test]
+    async fn probe_kafka_broker_reachability_rejects_aws_imds() {
+        let cfg = serde_json::json!({
+            "bootstrap_servers": "169.254.169.254:9092",
+        });
+        let (reachable, details) = probe_kafka_broker_reachability(&cfg).await;
+        assert_eq!(reachable, Some(false));
+        assert_eq!(details, vec!["169.254.169.254:9092 → unreachable"]);
+    }
+
+    /// NAN-939 H1: RFC1918 private ranges must be rejected.
+    #[tokio::test]
+    async fn probe_kafka_broker_reachability_rejects_private_ranges() {
+        let cfg = serde_json::json!({
+            "bootstrap_servers": "10.0.0.5:9092,192.168.1.10:9092,172.16.0.5:9092",
+        });
+        let (reachable, details) = probe_kafka_broker_reachability(&cfg).await;
+        assert_eq!(reachable, Some(false), "details: {details:?}");
+        assert_eq!(details.len(), 3);
+        assert!(
+            details.iter().all(|d| d.ends_with(" → unreachable")),
+            "every private-range broker should be marked unreachable, got: {details:?}",
+        );
+    }
+
+    /// NAN-939 H1: ports outside the librdkafka-standard allow-list must
+    /// be rejected. Probing port 22 / 80 / 443 / 6379 is a port-scan
+    /// disguised as a "Kafka" config.
+    #[tokio::test]
+    async fn probe_kafka_broker_reachability_rejects_disallowed_ports() {
+        let cfg = serde_json::json!({
+            "bootstrap_servers": "broker.example.com:22,broker.example.com:80,broker.example.com:6379",
+        });
+        let (reachable, details) = probe_kafka_broker_reachability(&cfg).await;
+        assert_eq!(reachable, Some(false), "details: {details:?}");
+        assert_eq!(details.len(), 3);
+        assert!(
+            details.iter().all(|d| d.ends_with(" → unreachable")),
+            "every disallowed-port broker should be marked unreachable, got: {details:?}",
+        );
+    }
+
+    /// NAN-939 H3: bootstrap_servers list must be capped so a single
+    /// authenticated request can't pin a worker probing 1000 brokers.
+    #[test]
+    fn parse_bootstrap_servers_caps_at_max_brokers() {
+        let raw = (1..=20)
+            .map(|i| format!("b{i}:9092"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let parsed = parse_bootstrap_servers(&raw);
+        assert_eq!(parsed.len(), KAFKA_BROKER_PROBE_MAX_BROKERS);
+        // Should keep the first N — librdkafka uses brokers in list order
+        // as the seed set, so truncating from the head would surprise users.
+        assert_eq!(parsed[0].0, "b1");
+        assert_eq!(parsed[KAFKA_BROKER_PROBE_MAX_BROKERS - 1].0, format!("b{}", KAFKA_BROKER_PROBE_MAX_BROKERS));
+    }
+
+    // ----------------------------------------------------------------------
+    // NAN-951: IPv6 broker parsing. Pre-NAN-951 `rsplit_once(':')` worked
+    // for `[::1]:9092` by luck (host = `[::1]`, port = 9092 — librdkafka
+    // accepts both with and without brackets, but ToSocketAddrs requires
+    // brackets) and silently mishandled bare `2001:db8::1` (host =
+    // `2001:db8:`, port = 1). Post-NAN-951:
+    //   - bracketed `[::1]:9092` parses cleanly (host stored without
+    //     brackets so SocketAddr construction works downstream)
+    //   - bare `2001:db8::1` is rejected (ambiguous)
+    //   - non-IPv6 entries pass through unchanged
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn parse_bootstrap_servers_accepts_bracketed_ipv6_loopback() {
+        // [::1]:9092 — bracketed loopback, port specified.
+        let parsed = parse_bootstrap_servers("[::1]:9092");
+        assert_eq!(parsed, vec![("::1".to_string(), 9092)]);
+    }
+
+    #[test]
+    fn parse_bootstrap_servers_accepts_bracketed_ipv6_full() {
+        let parsed = parse_bootstrap_servers("[2001:db8::1]:9093");
+        assert_eq!(parsed, vec![("2001:db8::1".to_string(), 9093)]);
+    }
+
+    #[test]
+    fn parse_bootstrap_servers_defaults_port_for_bracketed_ipv6_without_port() {
+        // [::1] with no `:port` suffix → default 9092 (librdkafka default).
+        let parsed = parse_bootstrap_servers("[::1]");
+        assert_eq!(parsed, vec![("::1".to_string(), 9092)]);
+    }
+
+    #[test]
+    fn parse_bootstrap_servers_rejects_bare_unbracketed_ipv6() {
+        // Pre-NAN-951 this silently became (host="2001:db8:", port=1).
+        // Now: rejected as ambiguous (two or more `:` without brackets).
+        let parsed = parse_bootstrap_servers("2001:db8::1");
+        assert!(
+            parsed.is_empty(),
+            "bare IPv6 must be rejected — librdkafka also rejects this form: {parsed:?}"
+        );
+    }
+
+    #[test]
+    fn parse_bootstrap_servers_rejects_bare_ipv6_with_port_form() {
+        // `2001:db8::1:9092` — last `:` is ambiguous (segment vs port).
+        // Reject; user must bracket: `[2001:db8::1]:9092`.
+        let parsed = parse_bootstrap_servers("2001:db8::1:9092");
+        assert!(parsed.is_empty(), "ambiguous bare IPv6 must be rejected: {parsed:?}");
+    }
+
+    #[test]
+    fn parse_bootstrap_servers_rejects_bracketed_non_ipv6_garbage() {
+        // `[broker.example.com]:9092` is not valid librdkafka syntax;
+        // brackets are reserved for IPv6.
+        let parsed = parse_bootstrap_servers("[broker.example.com]:9092");
+        assert!(parsed.is_empty(), "bracketed hostname must be rejected: {parsed:?}");
+    }
+
+    #[test]
+    fn parse_bootstrap_servers_rejects_bracketed_ipv6_with_bad_port() {
+        let parsed = parse_bootstrap_servers("[::1]:not-a-port");
+        assert!(parsed.is_empty(), "bracketed IPv6 with non-numeric port must be rejected: {parsed:?}");
+    }
+
+    #[test]
+    fn parse_bootstrap_servers_mixed_ipv4_and_bracketed_ipv6() {
+        let parsed = parse_bootstrap_servers("b1:9092,[::1]:9093,b2:9094");
+        assert_eq!(
+            parsed,
+            vec![
+                ("b1".to_string(), 9092),
+                ("::1".to_string(), 9093),
+                ("b2".to_string(), 9094),
+            ],
+        );
+    }
+
+    #[test]
+    fn parse_bootstrap_servers_ipv4_hostname_path_unchanged() {
+        // Sanity: the IPv6 plumbing must not regress IPv4/hostname parsing.
+        let parsed = parse_bootstrap_servers("broker.example.com:9092");
+        assert_eq!(parsed, vec![("broker.example.com".to_string(), 9092)]);
+        let parsed = parse_bootstrap_servers("10.0.0.5:9094");
+        assert_eq!(parsed, vec![("10.0.0.5".to_string(), 9094)]);
+        let parsed = parse_bootstrap_servers("bare-host");
+        assert_eq!(parsed, vec![("bare-host".to_string(), 9092)]);
     }
 }

@@ -91,6 +91,14 @@ impl ParserService {
         }
     }
 
+    /// Hand out a clone of the inner `VectorConfigManager`'s deploy lock.
+    /// Lets other services (e.g. `SourceConfigService`) serialize their
+    /// `_router.toml` mutations against this service's parser deploys.
+    /// NAN-948.
+    pub fn deploy_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.vector_config.deploy_lock()
+    }
+
     fn repository(&self) -> ParserRepository {
         ParserRepository::new(self.pool.clone())
     }

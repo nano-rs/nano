@@ -22,6 +22,7 @@ import type {
   RulePredicatesResponse,
   Alert,
   AlertCounts,
+  AlertVelocityBucket,
   CloseAlertRequest,
   BulkAlertRequest,
   BulkUpdateRulesRequest,
@@ -286,6 +287,14 @@ export class DetectionsApi {
 
   async getAlertCounts(): Promise<AlertCounts> {
     return this.request('/api/alerts/counts');
+  }
+
+  /** NAN-1019: hourly velocity histogram over the last N hours
+   *  (default 24). Returns one bucket per hour including zero-count
+   *  ones, ordered chronologically. */
+  async getAlertVelocity(hours?: number): Promise<AlertVelocityBucket[]> {
+    const q = hours ? `?hours=${hours}` : '';
+    return this.request(`/api/alerts/velocity${q}`);
   }
 
   async acknowledgeAlert(id: string): Promise<Alert> {

@@ -801,4 +801,58 @@ mod tests {
             failures.join("\n----\n")
         );
     }
+
+    /// The OOTB HEC source's `hec_normalize` VRL lifts `.event` keys onto the
+    /// root. Without a reserved-key deny-list a forwarder can clobber routing
+    /// fields like `.source_type` or `.auth_status` via the event body and
+    /// bypass per-parser HEC filters. NAN-938.
+    ///
+    /// This test pins the deny-list in the shipped file: the VRL must compile,
+    /// and every reserved key must be named in the `reserved` array.
+    #[test]
+    fn hec_source_vrl_has_reserved_event_key_denylist() {
+        use vrl::compiler::compile;
+        use vrl::diagnostic::Formatter;
+
+        let content = include_str!("../../../../config/vector/02-hec-source.toml");
+        let blocks = extract_vrl_blocks(content);
+        assert_eq!(blocks.len(), 1, "expected exactly one VRL block in 02-hec-source.toml");
+        let block = blocks[0];
+
+        let fns = vrl::stdlib::all();
+        if let Err(diagnostics) = compile(block, &fns) {
+            panic!(
+                "02-hec-source.toml VRL failed to compile:\n{}",
+                Formatter::new(block, diagnostics)
+            );
+        }
+
+        for key in [
+            "source_type",
+            "namespace",
+            "auth_status",
+            "timestamp",
+            "metadata",
+            "ingest_time",
+            "_inserted_at",
+            "id",
+            "ext",
+            "message",
+            "sourcetype",
+            "splunk_sourcetype",
+            "content_format",
+            "routing_timestamp",
+        ] {
+            assert!(
+                block.contains(&format!("\"{key}\"")),
+                "reserved key \"{key}\" missing from hec_normalize deny-list — \
+                 a Splunk forwarder could clobber .{key} via the .event body"
+            );
+        }
+
+        assert!(
+            block.contains("includes(reserved,"),
+            "hec_normalize must gate the .event-keys lift on the reserved-key deny-list"
+        );
+    }
 }

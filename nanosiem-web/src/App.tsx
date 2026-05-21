@@ -25,6 +25,10 @@ function lazyWithRetry<T extends ComponentType<any>>(
 }
 
 // Variant for named exports
+// NAN-998: throw loudly if the named export is missing (e.g. caller mismatched
+// `lazyWithRetryNamed(...'Foo')` against a file with only `export default`).
+// Previously this silently resolved to `{ default: undefined }`, which paints
+// a blank page with React error #306 at render time — hard to trace.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function lazyWithRetryNamed<T extends ComponentType<any>>(
   importFn: () => Promise<{ [key: string]: T }>,
@@ -32,8 +36,22 @@ function lazyWithRetryNamed<T extends ComponentType<any>>(
 ): React.LazyExoticComponent<T> {
   return lazy(() =>
     importFn()
-      .then((module) => ({ default: module[namedExport] as T }))
-      .catch(() => {
+      .then((module) => {
+        const exported = module[namedExport];
+        if (exported === undefined) {
+          throw new Error(
+            `lazyWithRetryNamed: module is missing named export '${namedExport}'. ` +
+              `Did the file only export default? Use lazyWithRetry instead.`,
+          );
+        }
+        return { default: exported as T };
+      })
+      .catch((err) => {
+        // If it's our own "missing named export" diagnostic, rethrow so the
+        // error surfaces in dev + Sentry instead of triggering a refresh loop.
+        if (err instanceof Error && err.message.startsWith('lazyWithRetryNamed:')) {
+          throw err;
+        }
         window.location.reload();
         return new Promise(() => {});
       })
@@ -145,12 +163,15 @@ const Marketplace = lazyWithRetryNamed(() => import('@/pages/Marketplace'), 'Mar
 const EnrichmentDetail = lazyWithRetryNamed(() => import('@/pages/Settings/EnrichmentDetail'), 'EnrichmentDetail');
 const AgentEnrichmentDetail = lazyWithRetryNamed(() => import('@/enterprise/pages/AgentEnrichmentDetail'), 'AgentEnrichmentDetail');
 const Credentials = lazyWithRetryNamed(() => import('@/pages/Credentials'), 'Credentials');
-const Upload = lazyWithRetryNamed(() => import('@/pages/Upload'), 'Upload');
+// NAN-998: Upload.tsx is a default export — must use lazyWithRetry, not the
+// Named variant. Previously crashed with React error #306 on /upload because
+// module['Upload'] was undefined.
+const Upload = lazyWithRetry(() => import('@/pages/Upload'));
 const LookupTables = lazyWithRetryNamed(() => import('@/pages/LookupTables'), 'LookupTables');
 const LookupTableCreate = lazyWithRetryNamed(() => import('@/pages/LookupTableCreate'), 'LookupTableCreate');
 const LookupTableView = lazyWithRetryNamed(() => import('@/pages/LookupTableView'), 'LookupTableView');
 const Notebooks = lazyWithRetryNamed(() => import('@/enterprise/pages/Notebooks'), 'Notebooks');
-const Placeholder = lazyWithRetryNamed(() => import('@/pages/Placeholder'), 'Placeholder');
+// Placeholder lazy-loader removed with NAN-1008 (/help now redirects to /docs).
 const SiemHealth = lazyWithRetryNamed(() => import('@/pages/SiemHealth'), 'SiemHealth');
 const SourceConfigurations = lazyWithRetry(() => import('@/pages/SourceConfigurations'));
 const SourceConfigurationDetail = lazyWithRetry(() => import('@/pages/SourceConfigurationDetail'));
@@ -444,6 +465,11 @@ function ProtectedAppRoutes() {
                 <RuleRepositories />
               </Suspense>
             } />
+          } />
+          {/* NAN-958: shareable-link alias — `/rules/marketplace` used to
+              fall through to the rule-editor "Rule not found" empty state. */}
+          <Route path="/rules/marketplace" element={
+            <Navigate to="/rules/repositories" replace />
           } />
 
           {/* Parser Repositories */}
@@ -801,6 +827,26 @@ function ProtectedAppRoutes() {
             } />
           } />
 
+          {/* NAN-1005: bare list-view aliases — shareable links shaped like
+              `/settings/access-control/groups` redirect to the canonical
+              `?tab=groups` form. The `/new` and `/:id` sub-paths below are
+              real routes (form pages), unchanged. */}
+          <Route path="/settings/access-control/groups" element={
+            <Navigate to="/settings/access-control?tab=groups" replace />
+          } />
+          <Route path="/settings/access-control/roles" element={
+            <Navigate to="/settings/access-control?tab=roles" replace />
+          } />
+          <Route path="/settings/access-control/api-keys" element={
+            <Navigate to="/settings/access-control?tab=api-keys" replace />
+          } />
+          <Route path="/settings/access-control/sso" element={
+            <Navigate to="/settings/access-control?tab=sso" replace />
+          } />
+          <Route path="/settings/access-control/sessions" element={
+            <Navigate to="/settings/access-control?tab=sessions" replace />
+          } />
+
           {/* Access Control Form Pages */}
           <Route path="/settings/access-control/groups/new" element={
             <PermissionRoute permission="groups:create" element={
@@ -880,6 +926,11 @@ function ProtectedAppRoutes() {
               </Suspense>
             } />
           } />
+          {/* NAN-1005: `/settings/sso` is the spec'd path; the canonical
+              implementation lives at /settings/oidc. */}
+          <Route path="/settings/sso" element={
+            <Navigate to="/settings/oidc" replace />
+          } />
           <Route path="/settings/api-keys" element={
             <PermissionRoute permission="apikeys:view" element={
               <Suspense fallback={<ListPageLoadingFallback />}>
@@ -900,6 +951,11 @@ function ProtectedAppRoutes() {
                 <AuditLogPage key={resetKey} />
               </Suspense>
             } />
+          } />
+          {/* NAN-1005: `/settings/audit-log` was the spec'd path; canonical
+              implementation lives at /settings/audit. */}
+          <Route path="/settings/audit-log" element={
+            <Navigate to="/settings/audit" replace />
           } />
 
           {/* Source Configurations - infrastructure + routing */}
@@ -929,11 +985,9 @@ function ProtectedAppRoutes() {
           <Route path="/docs" element={
             <ExternalRedirect url="https://nano.rs/docs/" />
           } />
-          <Route path="/help" element={
-            <Suspense fallback={<PageLoadingFallback />}>
-              <Placeholder key={resetKey} title="Help" description="Documentation and support" />
-            </Suspense>
-          } />
+          {/* NAN-1008: `/help` had no inbound links anywhere in the app —
+              just a leftover placeholder stub. Route removed entirely so
+              the global 404 catch-all handles stale bookmarks. */}
 
           {/* 404 catch-all */}
           <Route path="*" element={<NotFoundPage />} />

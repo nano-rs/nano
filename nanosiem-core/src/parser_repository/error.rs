@@ -50,6 +50,12 @@ pub enum ParserRepositoryError {
     #[error("Log source service error: {0}")]
     LogSourceService(String),
 
+    /// Caller passed a syntactically valid but semantically unacceptable
+    /// request (e.g. a dispatch_source_config_id whose config_type doesn't
+    /// match the parser's ingestion_method). Maps to 400.
+    #[error("Invalid request: {0}")]
+    InvalidRequest(String),
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -78,6 +84,7 @@ impl ParserRepositoryError {
             ParserRepositoryError::InvalidUrl(_) => 400,
             ParserRepositoryError::RepositoryNotAllowed(_) => 403,
             ParserRepositoryError::YamlParse(_) => 400,
+            ParserRepositoryError::InvalidRequest(_) => 400,
             ParserRepositoryError::RateLimited(_) => 429,
             ParserRepositoryError::SyncInProgress(_) => 409,
             ParserRepositoryError::RepositoryDisabled => 403,

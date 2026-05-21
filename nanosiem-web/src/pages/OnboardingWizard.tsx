@@ -31,7 +31,6 @@ import {
   Lock,
   Sparkles,
   ArrowUpRight,
-  RotateCcw,
 } from 'lucide-react';
 import {
   useOnboardingProgress,
@@ -39,7 +38,6 @@ import {
   useCompleteOnboardingStep,
   useSkipOnboardingStep,
   useDismissOnboarding,
-  useResetOnboarding,
   useSystemConfig,
 } from '@/hooks/use-api';
 import { useTierContext } from '@/hooks/use-tier';
@@ -177,7 +175,6 @@ export function OnboardingWizard() {
   const { mutate: completeStep } = useCompleteOnboardingStep();
   const { mutate: skipStep } = useSkipOnboardingStep();
   const { mutate: dismissOnboarding } = useDismissOnboarding();
-  const { mutate: resetOnboarding } = useResetOnboarding();
   const completedSteps = useMemo(() => progress?.completed_steps || [], [progress]);
   const skippedSteps = useMemo(() => progress?.skipped_steps || [], [progress]);
 
@@ -221,15 +218,6 @@ export function OnboardingWizard() {
     }
   }, [dismissOnboarding, navigate]);
 
-  const handleReenable = useCallback(async () => {
-    try {
-      await resetOnboarding();
-      await refetchProgress();
-    } catch (err) {
-      console.error('Failed to re-enable:', err);
-    }
-  }, [resetOnboarding, refetchProgress]);
-
   const handleFinish = useCallback(async () => {
     try {
       const pending = steps.filter((s) => {
@@ -244,6 +232,19 @@ export function OnboardingWizard() {
     }
   }, [steps, status, completedSteps, completeStep, dismissOnboarding, navigate]);
 
+  // "Skip for now" used to just navigate, leaving the wizard active and
+  // the rail entry persistently visible. Skip is an explicit opt-out, so
+  // dismiss the wizard before navigating — the rail entry hides and the
+  // re-entry path is User Settings → Reopen Getting Started.
+  const handleSkipForNow = useCallback(async () => {
+    try {
+      await dismissOnboarding();
+      navigate('/');
+    } catch (err) {
+      console.error('Failed to skip:', err);
+    }
+  }, [dismissOnboarding, navigate]);
+
   if (progressLoading) {
     return (
       <div className="flex h-[60vh] items-center justify-center">
@@ -252,39 +253,18 @@ export function OnboardingWizard() {
     );
   }
 
-  // After full completion the page is no longer useful — redirect home.
-  // Dismissed-but-not-completed users still land here, but on a re-enable
-  // surface (NAN-912 F-22): the wizard was previously a one-way door.
-  if (progress?.completed_at) {
+  // Page is for users actively working through setup. Dismissed (Skip /
+  // Finish Early / Dismiss) and completed users redirect home; the
+  // recovery path for both is User Settings → Reopen Getting Started,
+  // which calls /api/onboarding/reset before navigating back.
+  if (progress?.dismissed || progress?.completed_at) {
     return <Navigate to="/" replace />;
   }
 
-  const isDismissed = !!progress?.dismissed;
   const allDone = doneCount === steps.length;
 
   return (
     <div className="mx-auto w-full max-w-[820px] space-y-3">
-      {/* DISMISSED BANNER (NAN-912 F-22) — only the page itself is the way back. */}
-      {isDismissed && (
-        <div className="flex items-center gap-3 rounded-xl border border-amber-500/30 bg-amber-500/[0.06] px-4 py-3">
-          <RotateCcw className="h-[14px] w-[14px] shrink-0 text-amber-500" />
-          <div className="min-w-0 flex-1">
-            <div className="text-[12.5px] font-medium text-foreground">Setup is dismissed</div>
-            <p className="mt-0.5 text-[11.5px] text-muted-foreground/80">
-              You hid the wizard. Re-enable it to keep tracking your setup progress.
-            </p>
-          </div>
-          <button
-            type="button"
-            onClick={handleReenable}
-            className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 text-[11.5px] font-medium text-amber-500 hover:bg-amber-500/15"
-          >
-            <RotateCcw className="h-[11px] w-[11px]" />
-            Re-enable
-          </button>
-        </div>
-      )}
-
       {/* HEADER CARD */}
       <div className="rounded-xl border border-border bg-card p-5">
         <div className="mb-3 flex items-center gap-2">
@@ -310,16 +290,14 @@ export function OnboardingWizard() {
               Set up your nano instance step by step. Click any item to configure it &mdash; come back any time.
             </p>
           </div>
-          {!isDismissed && (
-            <button
-              type="button"
-              onClick={handleDismiss}
-              className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md border border-border/70 px-2.5 text-[11.5px] text-muted-foreground hover:bg-muted/50 hover:text-foreground"
-            >
-              <X className="h-[11px] w-[11px]" />
-              Dismiss
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={handleDismiss}
+            className="inline-flex h-7 shrink-0 items-center gap-1 rounded-md border border-border/70 px-2.5 text-[11.5px] text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+          >
+            <X className="h-[11px] w-[11px]" />
+            Dismiss
+          </button>
         </div>
       </div>
 
@@ -480,7 +458,7 @@ export function OnboardingWizard() {
         <div className="flex-1" />
         <button
           type="button"
-          onClick={() => navigate('/')}
+          onClick={handleSkipForNow}
           className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border/70 px-3 text-[12px] text-muted-foreground hover:bg-muted/50 hover:text-foreground"
         >
           Skip for now
@@ -495,22 +473,11 @@ export function OnboardingWizard() {
         </button>
       </div>
 
-      {/* SUB-FOOTER — page-level "nano · home · first run" breadcrumb removed
-          (NAN-911 F-3); the global StatusBar already shows location. Keep the
-          support link as the only content, right-aligned. */}
-      <div className="mt-4 flex items-center justify-end border-t border-border pt-3 font-mono text-[10.5px] tabular-nums text-muted-foreground/70">
-        <span>
-          need a hand?{' '}
-          <a
-            href="https://nano.rs"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-primary hover:underline"
-          >
-            talk to support
-          </a>
-        </span>
-      </div>
+      {/* NAN-936 F-3: full sub-footer row removed. NAN-911 removed the
+          "nano · home · first run" breadcrumb half but left the orphan
+          "talk to support" link; NAN-911's spec was no body-rendered
+          chrome, so the whole row goes. Support is reachable from the
+          user menu (Docs entry) and from the global TopBar. */}
     </div>
   );
 }

@@ -7,7 +7,7 @@
 
 import { useMemo } from 'react';
 import { AlertTriangle, ArrowRight } from 'lucide-react';
-import type { DetectionRule, FleetHealthSummary } from '@/lib/api/types';
+import type { DetectionRule, FleetHealthSummary, AlertVelocityBucket } from '@/lib/api/types';
 import { SEV_META, bandOf, type SeverityKey } from './helpers';
 
 interface RulesOverviewProps {
@@ -20,6 +20,12 @@ interface RulesOverviewProps {
    * falls back to em-dashes, matching the original placeholder layout.
    */
   fleetHealth?: FleetHealthSummary | null;
+  /**
+   * NAN-1019: hourly alert-velocity buckets (24h, chronological) powering
+   * the FIRING NOW sparkline. `undefined` while loading; the spark renders
+   * a flat baseline. Empty array also renders the baseline.
+   */
+  velocity?: AlertVelocityBucket[] | null;
   onReviewSilent?: () => void;
 }
 
@@ -53,9 +59,18 @@ function FleetMatrix({ rules }: { rules: DetectionRule[] }) {
   );
 }
 
-// Placeholder — 24-hour velocity bars.
-function VelocitySpark() {
-  const bars = [0, 0, 0, 0, 1, 0, 0, 0, 0, 2, 3, 1, 0, 0, 0, 1, 0, 0, 5, 8, 12, 18, 12, 8];
+// 24-hour velocity bars. NAN-1019: wired to `/api/alerts/velocity` instead
+// of the hard-coded fake series. When no buckets are loaded yet (or when a
+// quiet tenant has zero alerts in the window), all bars render at the
+// minimum height (faint outline) — same shape, honest data.
+function VelocitySpark({ buckets }: { buckets?: AlertVelocityBucket[] | null }) {
+  // Server returns one bucket per hour over the requested window, but be
+  // defensive about empty / missing data — fall back to 24 zeros so the
+  // sparkline still occupies its layout slot.
+  const bars: number[] = useMemo(() => {
+    if (!buckets || buckets.length === 0) return Array(24).fill(0);
+    return buckets.map((b) => b.count);
+  }, [buckets]);
   const max = Math.max(...bars, 1);
   return (
     <div className="flex items-end gap-[2px] h-[28px]">
@@ -78,7 +93,7 @@ function VelocitySpark() {
   );
 }
 
-export function RulesOverview({ rules, silentCount, alerts24h, fleetHealth, onReviewSilent }: RulesOverviewProps) {
+export function RulesOverview({ rules, silentCount, alerts24h, fleetHealth, velocity, onReviewSilent }: RulesOverviewProps) {
   const byBand = useMemo(() => {
     const acc: Record<string, number> = { firing: 0, active: 0, silent: 0, staging: 0, disabled: 0 };
     rules.forEach((r) => { acc[bandOf(r)]++; });
@@ -167,11 +182,10 @@ export function RulesOverview({ rules, silentCount, alerts24h, fleetHealth, onRe
                 {alerts24h.toLocaleString()}
               </div>
             </div>
-            <VelocitySpark />
+            <VelocitySpark buckets={velocity} />
           </div>
           <div className="mt-2 text-[10.5px] text-muted-foreground">
-            24h velocity trend{' '}
-            <span className="text-muted-foreground/60">· placeholder until hourly aggregate lands</span>
+            24h velocity trend
           </div>
         </div>
 

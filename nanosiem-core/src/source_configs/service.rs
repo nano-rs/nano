@@ -70,6 +70,12 @@ pub struct SourceConfigService {
     /// the sync constructors. `OnceCell` doesn't cache failures, so transient
     /// init errors retry on the next call.
     creds_backend: Arc<OnceCell<CredsBackend>>,
+    /// Shared with `VectorConfigManager::deploy_lock` when wired in
+    /// production so `update_dynamic_router`'s read-mutate-write of
+    /// `_router.toml` is serialized against parser-deploy writes from the
+    /// other service. `None` is a valid fallback for tests and unit-only
+    /// callers — they don't write to `_router.toml`. NAN-948.
+    deploy_lock: Option<Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl SourceConfigService {
@@ -80,6 +86,7 @@ impl SourceConfigService {
             vector_config_dir: PathBuf::from("config/vector"),
             vector_sources_runtime_path: Self::resolve_runtime_path(),
             creds_backend: Arc::new(OnceCell::new()),
+            deploy_lock: None,
         }
     }
 
@@ -90,7 +97,17 @@ impl SourceConfigService {
             vector_config_dir: config_dir.as_ref().to_path_buf(),
             vector_sources_runtime_path: Self::resolve_runtime_path(),
             creds_backend: Arc::new(OnceCell::new()),
+            deploy_lock: None,
         }
+    }
+
+    /// Wire this service's `update_dynamic_router` into the same lock that
+    /// the parser-deploy path uses, so the two paths can't interleave on
+    /// `_router.toml`. Production callers pass `VectorConfigManager::deploy_lock()`;
+    /// tests can omit. NAN-948.
+    pub fn with_deploy_lock(mut self, lock: Arc<tokio::sync::Mutex<()>>) -> Self {
+        self.deploy_lock = Some(lock);
+        self
     }
 
     /// Resolve the runtime path where Vector reads dynamic source configs.
@@ -266,7 +283,71 @@ impl SourceConfigService {
                 .map_err(|e| SourceConfigServiceError::CredentialError(e.to_string()))?;
         }
 
-        Ok(self.repository.update(id, request).await?)
+        // NAN-947: when a rename changes the on-disk file path, the old
+        // file would otherwise linger in configs/ until the user manually
+        // cleans up — and the next router scan would pick up both. We
+        // snapshot the pre-update name BEFORE the DB write, then after
+        // the update succeeds, compare paths and remove the stale file.
+        //
+        // For system-level singletons (NAN-940 — splunk_hec) the file
+        // stem is pinned, so old_path == new_path and this is a no-op.
+        // For Kafka / S3 / GCP / HTTP / Vector configs the stem follows
+        // safe_name(name) and the path changes on rename.
+        let pre_update_snapshot: Option<(String, String, PathBuf, bool)> =
+            if request.name.is_some() {
+                let existing = self.repository.get(id).await?;
+                let old_path = self.get_config_file_path(&existing.config_type, &existing.name);
+                Some((existing.config_type, existing.name, old_path, existing.deployed))
+            } else {
+                None
+            };
+
+        let updated = self.repository.update(id, request).await?;
+
+        if let Some((old_type, old_name, old_path, was_deployed)) = pre_update_snapshot {
+            let stem_changed = Self::rename_changes_on_disk_stem(
+                &old_type,
+                &old_name,
+                &updated.config_type,
+                &updated.name,
+            );
+            if stem_changed && old_path.exists() {
+                let new_path = self.get_config_file_path(&updated.config_type, &updated.name);
+                if let Err(err) = tokio::fs::remove_file(&old_path).await {
+                    // Don't fail the update on cleanup error; just warn —
+                    // the DB rename has committed and the old file is at
+                    // worst a benign orphan (NAN-947 trade-off: best-effort
+                    // cleanup over rollback). Operators see the warn line
+                    // and can rm by hand.
+                    tracing::warn!(
+                        old_path = %old_path.display(),
+                        new_path = %new_path.display(),
+                        error = %err,
+                        "failed to remove orphan TOML after source-config rename",
+                    );
+                } else {
+                    tracing::info!(
+                        old_path = %old_path.display(),
+                        new_path = %new_path.display(),
+                        "removed orphan TOML after source-config rename",
+                    );
+                }
+                // Only refresh the router when the rename touched a config
+                // that was actually deployed — otherwise nothing in the
+                // router references either path, and refreshing would be
+                // wasted I/O.
+                if was_deployed {
+                    if let Err(err) = self.update_dynamic_router().await {
+                        tracing::warn!(
+                            error = %err,
+                            "failed to refresh dynamic router after source-config rename",
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(updated)
     }
 
     /// Reject control chars / newlines in a source-config name. The name lands
@@ -433,13 +514,44 @@ impl SourceConfigService {
         Ok(())
     }
 
+    /// Maximum JSON nesting depth that `validate_safe_strings` will walk.
+    ///
+    /// NAN-946: admin-controlled `connection_config` payloads are arbitrary
+    /// JSON, so without a cap the recursive walker can overflow the stack
+    /// on a deeply-nested input. 32 is generous for legitimate shapes —
+    /// every driver's connection_config today is flat or one-level deep
+    /// (Kafka: `bootstrap_servers` / `topics`, HEC: empty, S3: AWS creds /
+    /// regions, GCP: project / subscription / credentials). Pick a value
+    /// safely past those without being close to the default Rust thread
+    /// stack limit (~8 MiB / ~2-4 KiB per frame ≈ 2000 frames).
+    const VALIDATE_SAFE_STRINGS_MAX_DEPTH: usize = 32;
+
     /// Recursively walk a JSON value and reject any string scalar that
     /// contains a newline / carriage return / NUL / other ASCII control
     /// char (tab is allowed). Path is used to produce a helpful error.
+    ///
+    /// NAN-946: depth is capped at `VALIDATE_SAFE_STRINGS_MAX_DEPTH` so a
+    /// malicious admin payload can't overflow the runtime stack. Depth 0
+    /// is the entry call; each Array/Object recursion bumps it by 1.
     fn validate_safe_strings(
         v: &serde_json::Value,
         path: &str,
     ) -> Result<(), SourceConfigServiceError> {
+        Self::validate_safe_strings_inner(v, path, 0)
+    }
+
+    fn validate_safe_strings_inner(
+        v: &serde_json::Value,
+        path: &str,
+        depth: usize,
+    ) -> Result<(), SourceConfigServiceError> {
+        if depth > Self::VALIDATE_SAFE_STRINGS_MAX_DEPTH {
+            return Err(SourceConfigServiceError::InvalidConfig(format!(
+                "{path} exceeds maximum nesting depth of {} — refusing to validate \
+                 deeply-nested connection_config",
+                Self::VALIDATE_SAFE_STRINGS_MAX_DEPTH
+            )));
+        }
         match v {
             serde_json::Value::String(s) => {
                 if let Some(c) = s.chars().find(|c| Self::is_unsafe_scalar_char(*c)) {
@@ -451,7 +563,7 @@ impl SourceConfigService {
             }
             serde_json::Value::Array(arr) => {
                 for (i, item) in arr.iter().enumerate() {
-                    Self::validate_safe_strings(item, &format!("{path}[{i}]"))?;
+                    Self::validate_safe_strings_inner(item, &format!("{path}[{i}]"), depth + 1)?;
                 }
             }
             serde_json::Value::Object(map) => {
@@ -463,7 +575,7 @@ impl SourceConfigService {
                             "{path} contains disallowed control character in key '{k}'"
                         )));
                     }
-                    Self::validate_safe_strings(val, &format!("{path}.{k}"))?;
+                    Self::validate_safe_strings_inner(val, &format!("{path}.{k}"), depth + 1)?;
                 }
             }
             _ => {}
@@ -485,7 +597,7 @@ impl SourceConfigService {
         }
 
         // Remove config file
-        let config_file = self.get_config_file_path(&config.name);
+        let config_file = self.get_config_file_path(&config.config_type, &config.name);
         if config_file.exists() {
             tokio::fs::remove_file(&config_file).await?;
         }
@@ -908,8 +1020,11 @@ impl SourceConfigService {
                 Self::system_intermediary_source(&config.config_type).is_some();
 
             let vector_config = if has_meaningful_rules {
-                let safe_name = Self::safe_name(&config.name);
-                let route_name = format!("{}_route", safe_name);
+                // NAN-940: pin route_name for system-level singletons so a
+                // rename of the OOTB row doesn't break parsers that hardcode
+                // the transform name (e.g. HEC parsers reading from
+                // `splunk_hec_route` via `parser_claimed_route`).
+                let route_name = Self::config_route_name(&config.config_type, &config.name);
                 let routing_block = Self::generate_routing_transform(
                     &config_with_rules,
                     intermediary_source,
@@ -957,7 +1072,7 @@ impl SourceConfigService {
                 }
 
                 // Write config file so Vector picks up the routing transform
-                let config_file = self.get_config_file_path(&config.name);
+                let config_file = self.get_config_file_path(&config.config_type, &config.name);
                 let configs_dir = config_file.parent().unwrap();
                 tokio::fs::create_dir_all(configs_dir).await?;
                 tokio::fs::write(&config_file, &config_content).await?;
@@ -1041,7 +1156,7 @@ impl SourceConfigService {
         }
 
         // Write config file
-        let config_file = self.get_config_file_path(&config.name);
+        let config_file = self.get_config_file_path(&config.config_type, &config.name);
         let configs_dir = config_file.parent().unwrap();
         tokio::fs::create_dir_all(configs_dir).await?;
         tokio::fs::write(&config_file, &vector_config).await?;
@@ -1084,7 +1199,7 @@ impl SourceConfigService {
         // routing config file if it was deployed; the OOTB source itself
         // keeps running. See `system_intermediary_source` for rationale.
         if Self::system_intermediary_source(&config.config_type).is_some() {
-            let config_file = self.get_config_file_path(&config.name);
+            let config_file = self.get_config_file_path(&config.config_type, &config.name);
             if config_file.exists() {
                 tokio::fs::remove_file(&config_file).await?;
             }
@@ -1115,7 +1230,7 @@ impl SourceConfigService {
         }
 
         // Remove config file
-        let config_file = self.get_config_file_path(&config.name);
+        let config_file = self.get_config_file_path(&config.config_type, &config.name);
         if config_file.exists() {
             tokio::fs::remove_file(&config_file).await?;
         }
@@ -1245,6 +1360,13 @@ impl SourceConfigService {
             None
         };
 
+        // NAN-952: credential filenames are keyed by source-config UUID,
+        // not safe_name(config.name). safe_name lowercases + replaces
+        // non-alphanumerics with `_`, so e.g. "Prod-Kafka" and "prod kafka"
+        // both produced `prod_kafka` — second deploy clobbered the first
+        // tenant's CA. UUID is unique by construction.
+        let creds_filename_stem = Self::creds_filename_stem(&config.config.id);
+
         // For GCP Pub/Sub, dispatch credential storage to the active backend.
         // K8s mode PATCHes the `vector-source-credentials` Secret (mounted at
         // /etc/vector/source-creds/); Docker mode writes flat under sources/
@@ -1254,7 +1376,7 @@ impl SourceConfigService {
             if let Some(ref c) = creds {
                 if let Some(creds_json) = c["credentials_json"].as_str() {
                     if !creds_json.is_empty() {
-                        let key = format!("gcp_{}.creds", safe_name);
+                        let key = format!("gcp_{}.creds", creds_filename_stem);
                         let backend = self.creds_backend().await?;
                         Some(backend.write_creds(&key, creds_json.as_bytes()).await?)
                     } else {
@@ -1278,7 +1400,7 @@ impl SourceConfigService {
             if let Some(ref c) = creds {
                 if let Some(ca_cert) = c["tls_ca_cert"].as_str() {
                     if !ca_cert.is_empty() {
-                        let key = format!("kafka_{}.ca.pem", safe_name);
+                        let key = format!("kafka_{}.ca.pem", creds_filename_stem);
                         let backend = self.creds_backend().await?;
                         Some(backend.write_creds(&key, ca_cert.as_bytes()).await?)
                     } else {
@@ -1812,7 +1934,7 @@ impl SourceConfigService {
         hec_normalize_present: bool,
     ) -> Vec<String>
     where
-        F: Fn(&str) -> bool,
+        F: Fn(&SourceConfiguration) -> bool,
     {
         let mut source_type_extract_covered = false;
         let mut hec_normalize_covered = false;
@@ -1824,7 +1946,7 @@ impl SourceConfigService {
             // this guard, a `mark_deployed` row whose file got skipped would
             // reference a transform that doesn't exist and abort Vector reload.
             if let Some(intermediary) = Self::system_intermediary_source(&config.config_type) {
-                if !is_system_route_deployed_on_disk(&config.name) {
+                if !is_system_route_deployed_on_disk(config) {
                     continue;
                 }
                 // The per-config route intermediates this always-on channel
@@ -1837,8 +1959,7 @@ impl SourceConfigService {
                     _ => {}
                 }
             }
-            let safe_name = Self::safe_name(&config.name);
-            source_config_routes.push(format!("{}_route", safe_name));
+            source_config_routes.push(Self::config_route_name(&config.config_type, &config.name));
         }
 
         let mut router_inputs: Vec<String> = base_router_inputs(
@@ -1855,6 +1976,16 @@ impl SourceConfigService {
 
     /// Update the dynamic router to include all source configuration routes
     async fn update_dynamic_router(&self) -> Result<(), SourceConfigServiceError> {
+        // NAN-948: serialize against parser deploys that mutate the same
+        // `_router.toml`. The lock is shared with `VectorConfigManager`
+        // (handed in via `with_deploy_lock`). When not wired (unit tests,
+        // legacy callers), proceed without locking — those paths don't
+        // collide with parser deploys.
+        let _deploy_guard = match &self.deploy_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+
         // Get all deployed source configs
         let deployed_configs = self
             .repository
@@ -1873,7 +2004,7 @@ impl SourceConfigService {
 
         let router_inputs = Self::compute_router_inputs(
             &deployed_configs,
-            |name| self.get_config_file_path(name).exists(),
+            |cfg| self.get_config_file_path(&cfg.config_type, &cfg.name).exists(),
             hec_normalize_present(),
         );
         // Apply claim substitution AFTER compute_router_inputs so the
@@ -2108,13 +2239,87 @@ impl SourceConfigService {
         }
     }
 
-    /// Get the path for a source config file
-    fn get_config_file_path(&self, name: &str) -> PathBuf {
-        let safe_name = Self::safe_name(name);
+    /// Pure helper for `update()`'s rename-cleanup branch.
+    ///
+    /// Returns true iff a rename actually changed the on-disk file stem,
+    /// signalling that the old file is now an orphan and should be
+    /// removed. For system-level singletons whose file stem is pinned
+    /// (NAN-940 — splunk_hec) this returns false even when the user-facing
+    /// name changes, because both stems resolve to the same singleton id.
+    ///
+    /// Split out so the precondition can be unit-tested without spinning
+    /// up a Postgres pool. NAN-947.
+    fn rename_changes_on_disk_stem(
+        old_config_type: &str,
+        old_name: &str,
+        new_config_type: &str,
+        new_name: &str,
+    ) -> bool {
+        Self::config_safe_stem(old_config_type, old_name)
+            != Self::config_safe_stem(new_config_type, new_name)
+    }
+
+    /// Get the path for a source config file.
+    ///
+    /// System-level singleton drivers (today: `splunk_hec`) use a pinned
+    /// stem (`splunk_hec.toml`) regardless of the user-facing `name`, so
+    /// renaming the OOTB row can't strand the deployed file on disk and
+    /// can't break parsers that consume from a fixed transform name. NAN-940.
+    fn get_config_file_path(&self, config_type: &str, name: &str) -> PathBuf {
+        let stem = Self::config_safe_stem(config_type, name);
         self.vector_config_dir
             .join("sources")
             .join("configs")
-            .join(format!("{}.toml", safe_name))
+            .join(format!("{}.toml", stem))
+    }
+
+    /// Stable identifier stem for a source configuration. System-level
+    /// singletons return a pinned, type-derived stem so a rename can't
+    /// cascade into broken parser routing or duplicate on-disk files;
+    /// everything else hashes through `safe_name` of the user-facing name.
+    /// NAN-940.
+    fn config_safe_stem(config_type: &str, name: &str) -> String {
+        if let Some(pinned) = Self::system_singleton_stem(config_type) {
+            return pinned.to_string();
+        }
+        Self::safe_name(name)
+    }
+
+    /// Pinned safe-name stem for system-level singleton drivers whose
+    /// route-transform name downstream parsers hardcode. Returning
+    /// `Some(stem)` overrides the rename-derived `safe_name` so an admin
+    /// renaming the OOTB row can't break HEC routing. NAN-940.
+    ///
+    /// Today only `splunk_hec` is a singleton (paired with
+    /// `is_single_instance_driver` and the partial unique index from
+    /// migration 184). Adding a new singleton driver here also requires
+    /// adding it to `is_single_instance_driver`.
+    fn system_singleton_stem(config_type: &str) -> Option<&'static str> {
+        match config_type {
+            "splunk_hec" => Some("splunk_hec"),
+            _ => None,
+        }
+    }
+
+    /// Route-transform name for a source configuration's generated TOML.
+    /// `<stem>_route` where `stem` is pinned for singletons (NAN-940).
+    fn config_route_name(config_type: &str, name: &str) -> String {
+        format!("{}_route", Self::config_safe_stem(config_type, name))
+    }
+
+    /// Stable, collision-free stem for on-disk credential filenames
+    /// (Kafka CA PEM, GCP service-account JSON). NAN-952.
+    ///
+    /// Pre-NAN-952 these used `safe_name(config.name)`, which lowercases +
+    /// replaces non-alphanumerics with `_`. Two configs named
+    /// `"Prod-Kafka"` and `"prod kafka"` both resolved to `prod_kafka`,
+    /// so the second deploy clobbered the first's credentials on disk.
+    /// The UUID is unique by construction.
+    fn creds_filename_stem(config_id: &Uuid) -> String {
+        // Hyphenated UUID is 36 chars of [0-9a-f-] — filesystem-safe on
+        // every target (Docker bind-mount, K8s ConfigMap-as-files,
+        // K8s Secret-as-files). No further sanitization needed.
+        config_id.to_string()
     }
 
     /// Convert name to safe identifier
@@ -4056,18 +4261,24 @@ mod tests {
     /// once via the route → user-configured source_type). And — separately —
     /// splunk_hec must NOT suppress source_type_extract; HEC and HTTP are
     /// independent channels.
+    ///
+    /// NAN-940: the splunk_hec route is pinned to `splunk_hec_route`
+    /// regardless of the user-facing config name — `bare_config("hec_main",
+    /// "splunk_hec")` resolves to the pinned route, not `hec_main_route`.
     #[test]
     fn compute_router_inputs_suppresses_hec_normalize_when_splunk_hec_route_on_disk() {
         let configs = vec![bare_config("hec_main", "splunk_hec")];
         let inputs = SourceConfigService::compute_router_inputs(&configs, |_| true, true);
         assert_eq!(
             inputs,
-            vec!["source_type_extract", "vector_merge", "hec_main_route"],
+            vec!["source_type_extract", "vector_merge", "splunk_hec_route"],
             "hec_normalize must be intermediated by the splunk_hec route, not also direct"
         );
     }
 
     /// Both intermediaries covered: only vector_merge + the two routes.
+    /// NAN-940: the splunk_hec route stays pinned even when paired with a
+    /// renamed http config (which is NOT pinned — http_main → http_main_route).
     #[test]
     fn compute_router_inputs_suppresses_both_intermediaries_when_both_routes_on_disk() {
         let configs = vec![
@@ -4077,7 +4288,56 @@ mod tests {
         let inputs = SourceConfigService::compute_router_inputs(&configs, |_| true, true);
         assert_eq!(
             inputs,
-            vec!["vector_merge", "http_main_route", "hec_main_route"]
+            vec!["vector_merge", "http_main_route", "splunk_hec_route"]
+        );
+    }
+
+    /// NAN-940 regression: a user renaming the OOTB splunk_hec config to an
+    /// arbitrary string must NOT change the route-transform name. HEC
+    /// parsers hardcode `splunk_hec_route` via `parser_claimed_route` —
+    /// a rename-derived `<safe_name>_route` would orphan every HEC parser.
+    #[test]
+    fn config_route_name_pinned_for_splunk_hec_across_rename() {
+        for renamed in [
+            "Splunk HEC",
+            "Foo",
+            "My HEC",
+            "internal-audit",
+            "  weird   spaces  ",
+        ] {
+            assert_eq!(
+                SourceConfigService::config_route_name("splunk_hec", renamed),
+                "splunk_hec_route",
+                "splunk_hec route name must be pinned regardless of user-facing name (was: {renamed})",
+            );
+        }
+
+        // Non-singleton drivers still derive from the user-facing name.
+        assert_eq!(
+            SourceConfigService::config_route_name("kafka", "Prod-Kafka"),
+            "prod_kafka_route",
+        );
+        assert_eq!(
+            SourceConfigService::config_route_name("http", "Main"),
+            "main_route",
+        );
+    }
+
+    /// NAN-940: the on-disk file stem is also pinned for splunk_hec so a
+    /// rename can't strand the old file on disk AND collide on the pinned
+    /// transform name when the new file is written.
+    #[test]
+    fn config_safe_stem_pinned_for_splunk_hec_across_rename() {
+        for renamed in ["Splunk HEC", "Foo", "Renamed HEC"] {
+            assert_eq!(
+                SourceConfigService::config_safe_stem("splunk_hec", renamed),
+                "splunk_hec",
+            );
+        }
+        // Non-singleton drivers still vary by name.
+        assert_eq!(
+            SourceConfigService::config_safe_stem("kafka", "Prod-Kafka"),
+            "prod_kafka",
         );
     }
 
@@ -4204,5 +4464,233 @@ mod tests {
         // Comment line survives (we only strip section bodies, not comments).
         assert!(stripped.contains("# NAN-930: _unclaimed comment"));
         assert!(stripped.contains("[transforms.foo]"));
+    }
+
+    // ----------------------------------------------------------------------
+    // NAN-946: validate_safe_strings depth cap. Admin-controlled JSON
+    // payloads on connection_config must not be able to overflow the
+    // runtime stack via deeply-nested objects/arrays.
+    // ----------------------------------------------------------------------
+
+    /// Build a JSON object nested `depth` levels deep:
+    /// `{"k": {"k": {"k": ... "leaf"}}}`
+    fn nested_object(depth: usize) -> serde_json::Value {
+        let mut v = serde_json::Value::String("leaf".to_string());
+        for _ in 0..depth {
+            let mut obj = serde_json::Map::new();
+            obj.insert("k".to_string(), v);
+            v = serde_json::Value::Object(obj);
+        }
+        v
+    }
+
+    /// Build a JSON array nested `depth` levels deep: `[[[..."leaf"...]]]`.
+    fn nested_array(depth: usize) -> serde_json::Value {
+        let mut v = serde_json::Value::String("leaf".to_string());
+        for _ in 0..depth {
+            v = serde_json::Value::Array(vec![v]);
+        }
+        v
+    }
+
+    #[test]
+    fn validate_safe_strings_accepts_realistic_connection_configs() {
+        // Real Kafka shape: one-level object with arrays of strings.
+        let kafka = serde_json::json!({
+            "bootstrap_servers": "broker1:9092,broker2:9092",
+            "topics": ["audit", "app", "infra"],
+            "group_id": "nanosiem-prod",
+            "sasl": {
+                "mechanism": "SCRAM-SHA-512",
+                "username": "nano",
+            }
+        });
+        assert!(SourceConfigService::validate_safe_strings(&kafka, "connection_config").is_ok());
+
+        // HEC: typically empty.
+        assert!(
+            SourceConfigService::validate_safe_strings(
+                &serde_json::json!({}),
+                "connection_config"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_safe_strings_accepts_depth_at_the_cap() {
+        // Depth == cap is fine; depth > cap is the rejection.
+        let v = nested_object(SourceConfigService::VALIDATE_SAFE_STRINGS_MAX_DEPTH);
+        assert!(
+            SourceConfigService::validate_safe_strings(&v, "connection_config").is_ok(),
+            "object at the exact cap must still validate"
+        );
+    }
+
+    #[test]
+    fn validate_safe_strings_rejects_object_past_depth_cap() {
+        let v = nested_object(SourceConfigService::VALIDATE_SAFE_STRINGS_MAX_DEPTH + 5);
+        let err = SourceConfigService::validate_safe_strings(&v, "connection_config")
+            .expect_err("expected depth-cap rejection");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nesting depth"),
+            "error must mention nesting depth: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_safe_strings_rejects_array_past_depth_cap() {
+        let v = nested_array(SourceConfigService::VALIDATE_SAFE_STRINGS_MAX_DEPTH + 5);
+        let err = SourceConfigService::validate_safe_strings(&v, "connection_config")
+            .expect_err("expected depth-cap rejection");
+        let msg = err.to_string();
+        assert!(msg.contains("nesting depth"), "error must mention nesting depth: {msg}");
+    }
+
+    // ----------------------------------------------------------------------
+    // NAN-947: rename cleanup — when a non-singleton source-config is
+    // renamed, the old .toml file on disk would otherwise linger as an
+    // orphan. `update()` snapshots the pre-rename path, compares against
+    // the post-rename path, and removes the old file if they differ.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn rename_changes_on_disk_stem_true_for_kafka_rename() {
+        assert!(
+            SourceConfigService::rename_changes_on_disk_stem(
+                "kafka", "Prod-Kafka", "kafka", "Renamed-Kafka",
+            ),
+            "kafka rename must change the on-disk stem so the orphan can be cleaned up",
+        );
+    }
+
+    #[test]
+    fn rename_changes_on_disk_stem_false_for_splunk_hec_rename() {
+        // NAN-940 pins splunk_hec's file stem regardless of name; a rename
+        // does NOT change the stem, so the cleanup branch must be a no-op.
+        assert!(
+            !SourceConfigService::rename_changes_on_disk_stem(
+                "splunk_hec", "Splunk HEC", "splunk_hec", "Renamed HEC",
+            ),
+            "splunk_hec rename must NOT change the on-disk stem (pinned by NAN-940)",
+        );
+    }
+
+    #[test]
+    fn rename_changes_on_disk_stem_false_when_name_identical() {
+        assert!(!SourceConfigService::rename_changes_on_disk_stem(
+            "kafka", "Audit-Kafka", "kafka", "Audit-Kafka",
+        ));
+    }
+
+    #[test]
+    fn rename_changes_on_disk_stem_false_when_safe_name_collides() {
+        // safe_name() lowercases + replaces non-alphanumerics → both
+        // "Prod-Kafka" and "prod kafka" resolve to "prod_kafka". A
+        // user-visible rename between two such names is a no-op on disk,
+        // so we should NOT try to delete the file that's still active.
+        // (Distinct configs colliding is the M9 / NAN-952 concern, not
+        // ours — but this test pins the cleanup-is-stem-based invariant.)
+        assert!(!SourceConfigService::rename_changes_on_disk_stem(
+            "kafka", "Prod-Kafka", "kafka", "prod kafka",
+        ));
+    }
+
+    #[test]
+    fn validate_safe_strings_still_rejects_control_chars_inside_nested() {
+        // Depth check must not short-circuit before the control-char check
+        // on the way down.
+        let v = serde_json::json!({
+            "outer": {
+                "inner": {
+                    "bad": "line\nbreak",
+                }
+            }
+        });
+        let err = SourceConfigService::validate_safe_strings(&v, "connection_config")
+            .expect_err("expected control-char rejection");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("control character"),
+            "error must mention control character: {msg}"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // NAN-948: deploy_lock sharing. The `with_deploy_lock` builder accepts
+    // an `Arc<Mutex<()>>` shared with VectorConfigManager so that
+    // `update_dynamic_router`'s read-mutate-write of `_router.toml` is
+    // serialized against parser deploys. The wire-up at API startup
+    // (state/constructors.rs) is integration-tested via cargo build; here
+    // we cover the core invariant: `VectorConfigManager::deploy_lock()`
+    // hands out the same Arc on every call (clone, not new), so a downstream
+    // service receives a lock that actually blocks the manager's own writes.
+    // ----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn vector_config_manager_deploy_lock_is_shared_not_cloned_anew() {
+        use crate::parsers::VectorConfigManager;
+        let vcm = VectorConfigManager::new(std::path::PathBuf::from("/tmp/nanosiem-test"));
+        let lock_a = vcm.deploy_lock();
+        let lock_b = vcm.deploy_lock();
+        assert!(
+            std::sync::Arc::ptr_eq(&lock_a, &lock_b),
+            "deploy_lock() must hand out clones of the SAME Arc, not new Arcs — otherwise the lock would not serialize across services"
+        );
+
+        // Acquiring lock_a blocks lock_b — same mutex, mutually exclusive.
+        let _outer = lock_a.lock().await;
+        assert!(
+            lock_b.try_lock().is_err(),
+            "lock acquired via one handle must block subsequent try_lock on a clone of the same Arc",
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // NAN-952: creds_filename_stem must be unique-per-config_id and not
+    // derived from the user-facing name (where safe_name() collisions
+    // would let one config's deploy overwrite another's CA / GCP JSON).
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn creds_filename_stem_returns_uuid_string() {
+        let id = Uuid::parse_str("30000000-0000-0000-0000-000000000003").unwrap();
+        assert_eq!(
+            SourceConfigService::creds_filename_stem(&id),
+            "30000000-0000-0000-0000-000000000003",
+        );
+    }
+
+    #[test]
+    fn creds_filename_stem_differs_for_distinct_configs_even_with_same_safe_name() {
+        // Two configs that would have collided under the old safe_name(name)
+        // approach. Their stem must differ — that's the whole point of
+        // NAN-952.
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        assert_ne!(
+            SourceConfigService::creds_filename_stem(&id_a),
+            SourceConfigService::creds_filename_stem(&id_b),
+            "distinct UUIDs must produce distinct filename stems",
+        );
+    }
+
+    #[test]
+    fn creds_filename_stem_is_filesystem_safe() {
+        // Hyphenated UUID is [0-9a-f-]+ — no spaces, slashes, dots, or
+        // shell metachars. ConfigMap-mount-safe (K8s flattens dirs but
+        // keys can't contain `/`).
+        let id = Uuid::new_v4();
+        let stem = SourceConfigService::creds_filename_stem(&id);
+        for c in stem.chars() {
+            assert!(
+                c.is_ascii_hexdigit() || c == '-',
+                "stem must contain only [0-9a-f-]: got '{c}' in {stem}",
+            );
+        }
+        // 36-char canonical UUID form. Allows our `kafka_{stem}.ca.pem`
+        // filename to stay under typical filesystem name limits (255).
+        assert_eq!(stem.len(), 36);
     }
 }

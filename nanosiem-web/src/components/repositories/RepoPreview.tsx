@@ -1343,7 +1343,7 @@ function PrimaryActionBtn({ rule, onAction }: { rule: RepoRuleView; onAction: ()
         className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium flex items-center gap-1.5"
       >
         <ArrowUpRight className="w-[12px] h-[12px]" strokeWidth={2} />
-        Update to latest
+        Update
       </button>
     );
   }

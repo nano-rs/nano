@@ -656,6 +656,7 @@ export function ParserRepositories() {
                 onToggleSelectAll={toggleSelectAll}
                 onSelectParser={setSelectedParserId}
                 onAction={handleRowAction}
+                activeCat={activeCat}
               />
             )}
           </div>

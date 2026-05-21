@@ -675,6 +675,12 @@ export interface AlertCounts {
   by_severity: Record<string, number>;
 }
 
+/** NAN-1019: one hourly bucket from /api/alerts/velocity. */
+export interface AlertVelocityBucket {
+  bucket_start: string;
+  count: number;
+}
+
 export interface CloseAlertRequest {
   disposition: 'true_positive' | 'false_positive' | 'benign';
   notes?: string;

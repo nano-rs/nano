@@ -461,6 +461,28 @@ pub async fn resolve_parser_dispatch_routes(
     .await?;
     let name_by_id: HashMap<Uuid, String> = rows.into_iter().collect();
 
+    apply_resolved_dispatch_routes(parsers, &name_by_id)
+        .map_err(|e| sqlx::Error::Configuration(e.into()))
+}
+
+/// Pure helper for `resolve_parser_dispatch_routes`'s in-memory phase.
+///
+/// Stamps `dispatch_route_name` on parsers whose `dispatch_source_config_id`
+/// resolves; returns `Err` when any parser is orphaned (NAN-949).
+///
+/// Pre-NAN-949 the orphan case logged a warn and fell through to the
+/// legacy parser-owned-source branch — for Kafka that emits a source
+/// pointing at `localhost:9092` with default topics, silently re-
+/// introducing the NAN-928 footgun. We now refuse the resolve so the
+/// caller can fail deploy with a clear error.
+///
+/// Split out so the orphan detection is unit-testable without a live
+/// PG pool.
+pub(crate) fn apply_resolved_dispatch_routes(
+    parsers: &mut [Parser],
+    name_by_id: &std::collections::HashMap<Uuid, String>,
+) -> Result<(), String> {
+    let mut orphans: Vec<(String, Uuid)> = Vec::new();
     for parser in parsers.iter_mut() {
         if let Some(id) = parser.dispatch_source_config_id {
             if let Some(sc_name) = name_by_id.get(&id) {
@@ -471,15 +493,28 @@ pub async fn resolve_parser_dispatch_routes(
                     .to_lowercase();
                 parser.dispatch_route_name = Some(format!("{}_route", safe));
             } else {
-                tracing::warn!(
+                tracing::error!(
                     parser = %parser.name,
                     dispatch_source_config_id = %id,
-                    "dispatch source config not found; parser will fall back to legacy parser-owned source",
+                    "dispatch source config not found; refusing to deploy parser to avoid silent fall-through to default source",
                 );
+                orphans.push((parser.name.clone(), id));
             }
         }
     }
-    Ok(())
+    if orphans.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<String> = orphans
+        .into_iter()
+        .map(|(name, id)| format!("{name} ({id})"))
+        .collect();
+    Err(format!(
+        "{} parser(s) reference a dispatch_source_config_id that no longer exists: {}; \
+         restore the source-configuration or clear dispatch_source_config_id on the parser(s)",
+        names.len(),
+        names.join(", "),
+    ))
 }
 
 /// Convert a database row to a Parser struct
@@ -842,5 +877,137 @@ fn row_to_detection_pattern(row: &sqlx::postgres::PgRow) -> DetectionPattern {
         priority: row.get("priority"),
         enabled: row.get("enabled"),
         created_at: row.get("created_at"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use std::collections::HashMap;
+
+    fn parser_with_dispatch(name: &str, dispatch_id: Option<Uuid>) -> Parser {
+        Parser {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            description: None,
+            source_type: "kafka".to_string(),
+            source_config: serde_json::json!({}),
+            parser_vrl: String::new(),
+            output_fields: None,
+            feed_id: None,
+            credential_id: None,
+            dispatch_source_config_id: dispatch_id,
+            dispatch_route_name: None,
+            namespace: "default".to_string(),
+            enabled: true,
+            validated: true,
+            validation_error: None,
+            timezone: "UTC".to_string(),
+            match_values: None,
+            sampling_ratio: None,
+            sampling_exclude_condition: None,
+            extension_vrl: None,
+            extension_enabled: false,
+            category: None,
+            vendor: None,
+            product: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // NAN-949: orphan-dispatch detection in apply_resolved_dispatch_routes.
+    // Pure helper takes the resolved name_by_id map + parser slice and
+    // stamps dispatch_route_name, returning Err for any orphan parser.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn apply_resolved_dispatch_routes_stamps_route_for_resolved_parser() {
+        let sc_id = Uuid::new_v4();
+        let mut parsers = vec![parser_with_dispatch("ds_auth", Some(sc_id))];
+        let mut map = HashMap::new();
+        map.insert(sc_id, "Prod Kafka".to_string());
+
+        apply_resolved_dispatch_routes(&mut parsers, &map).expect("happy path must succeed");
+        assert_eq!(
+            parsers[0].dispatch_route_name.as_deref(),
+            Some("prod_kafka_route"),
+            "resolved parser must get safe_name(config.name) + _route",
+        );
+    }
+
+    #[test]
+    fn apply_resolved_dispatch_routes_returns_err_for_orphan_parser() {
+        // Parser references a dispatch_source_config_id that's not in the
+        // name_by_id map — this is the silent-failure mode NAN-928 set out
+        // to eliminate (Kafka source falls back to localhost:9092). NAN-949
+        // refuses to deploy rather than emitting the broken source.
+        let orphan_id = Uuid::new_v4();
+        let mut parsers = vec![parser_with_dispatch("ds_auth", Some(orphan_id))];
+        let map: HashMap<Uuid, String> = HashMap::new();
+
+        let err = apply_resolved_dispatch_routes(&mut parsers, &map)
+            .expect_err("orphan must surface as Err");
+        assert!(err.contains("ds_auth"), "error must name the orphan parser: {err}");
+        assert!(err.contains(&orphan_id.to_string()), "error must include the id: {err}");
+        assert!(
+            err.contains("no longer exists"),
+            "error must describe the failure mode: {err}"
+        );
+        // dispatch_route_name must NOT have been stamped — otherwise the
+        // generator would happily emit a filter against a nonexistent route.
+        assert!(
+            parsers[0].dispatch_route_name.is_none(),
+            "orphan parser's dispatch_route_name must remain None, got: {:?}",
+            parsers[0].dispatch_route_name
+        );
+    }
+
+    #[test]
+    fn apply_resolved_dispatch_routes_ignores_parsers_without_dispatch_id() {
+        // Parsers that don't dispatch from a source-config (e.g. routed/vector
+        // sources, or pull parsers that own their own source) are passed
+        // through unchanged.
+        let mut parsers = vec![parser_with_dispatch("plain_routed", None)];
+        let map: HashMap<Uuid, String> = HashMap::new();
+
+        apply_resolved_dispatch_routes(&mut parsers, &map)
+            .expect("no-dispatch parsers must pass through");
+        assert!(parsers[0].dispatch_route_name.is_none());
+    }
+
+    #[test]
+    fn apply_resolved_dispatch_routes_reports_all_orphans_not_just_first() {
+        // Operators get one error listing every broken parser, not a
+        // whack-a-mole sequence of one-at-a-time failures.
+        let mut parsers = vec![
+            parser_with_dispatch("good_one", Some(Uuid::new_v4())),
+            parser_with_dispatch("orphan_a", Some(Uuid::new_v4())),
+            parser_with_dispatch("orphan_b", Some(Uuid::new_v4())),
+        ];
+        let mut map = HashMap::new();
+        map.insert(parsers[0].dispatch_source_config_id.unwrap(), "Good".to_string());
+
+        let err = apply_resolved_dispatch_routes(&mut parsers, &map)
+            .expect_err("two orphans must surface as Err");
+        assert!(err.contains("orphan_a"), "error must list orphan_a: {err}");
+        assert!(err.contains("orphan_b"), "error must list orphan_b: {err}");
+        assert!(err.contains("2 parser(s)"), "error must count: {err}");
+        // The good parser STILL got its route stamped before we hit the
+        // first orphan — that's fine; the caller fails the deploy on Err
+        // and the route stamp on `good_one` is in-memory only.
+        assert_eq!(
+            parsers[0].dispatch_route_name.as_deref(),
+            Some("good_route"),
+        );
+    }
+
+    #[test]
+    fn apply_resolved_dispatch_routes_handles_empty_parsers_slice() {
+        let mut parsers: Vec<Parser> = vec![];
+        let map: HashMap<Uuid, String> = HashMap::new();
+        apply_resolved_dispatch_routes(&mut parsers, &map).expect("empty input is OK");
     }
 }

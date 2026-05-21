@@ -653,6 +653,10 @@ class ApiClient {
     return this._detections.getAlertCounts();
   }
 
+  async getAlertVelocity(hours?: number): Promise<import('./types').AlertVelocityBucket[]> {
+    return this._detections.getAlertVelocity(hours);
+  }
+
   async acknowledgeAlert(id: string): Promise<import('./types').Alert> {
     return this._detections.acknowledgeAlert(id);
   }

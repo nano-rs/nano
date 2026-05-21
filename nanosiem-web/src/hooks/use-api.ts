@@ -307,6 +307,12 @@ export function useAlertCounts(options?: UseQueryOptions) {
   return useQuery(() => api.getAlertCounts(), [], options);
 }
 
+/** NAN-1019: hourly alert-velocity histogram over the last N hours
+ *  (default 24). Powers the FIRING NOW sparkline on /rules. */
+export function useAlertVelocity(hours: number = 24, options?: UseQueryOptions) {
+  return useQuery(() => api.getAlertVelocity(hours), [hours], options);
+}
+
 export function useAcknowledgeAlert() {
   return useMutation((id: string) => api.acknowledgeAlert(id));
 }

@@ -24,8 +24,8 @@ use crate::{
         auth::{auth_middleware, AuthState},
         ip_allowlist::{ip_allowlist_middleware, IpAllowlistState},
         rate_limit::{
-            dry_resolve_rate_limit_middleware, login_rate_limit_middleware,
-            mfa_setup_rate_limit_middleware,
+            dry_resolve_rate_limit_middleware, kafka_probe_rate_limit_middleware,
+            login_rate_limit_middleware, mfa_setup_rate_limit_middleware,
             password_reset_rate_limit_middleware, upload_rate_limit_middleware, RateLimitState,
         },
         request_id_middleware, request_logging_layer,
@@ -137,6 +137,20 @@ pub fn create_router(state: AppState) -> Router {
         .layer(axum_middleware::from_fn_with_state(
             (*rate_limit_state).clone(),
             dry_resolve_rate_limit_middleware,
+        ));
+
+    // NAN-939 H3: Kafka broker reachability probe is rate-limited per
+    // authenticated user. Each call can hold a worker for up to
+    // `(DNS + TCP) × MAX_BROKERS` ms, and the endpoint dials caller-supplied
+    // addresses — without a per-user cap it's a DoS + port-scan amplifier.
+    let kafka_probe_routes = Router::new()
+        .route(
+            "/api/source-configurations/{id}/rules/check-reachability",
+            post(handlers::source_configs::check_routing_rule_reachability),
+        )
+        .layer(axum_middleware::from_fn_with_state(
+            (*rate_limit_state).clone(),
+            kafka_probe_rate_limit_middleware,
         ));
 
     // Cacheable route groups with Cache-Control headers
@@ -453,6 +467,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/alerts/stream", get(handlers::stream_alerts))
         .route("/api/alerts/bulk", post(handlers::bulk_alerts))
         .route("/api/alerts/counts", get(handlers::alert_counts))
+        .route("/api/alerts/velocity", get(handlers::alert_velocity))
         .route("/api/alerts/{id}", get(handlers::get_alert))
         .route(
             "/api/alerts/{id}/acknowledge",
@@ -879,11 +894,9 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/source-configurations/{source_config_id}/rules/{rule_id}",
             delete(handlers::source_configs::delete_routing_rule),
-        )
-        .route(
-            "/api/source-configurations/{id}/rules/check-reachability",
-            post(handlers::source_configs::check_routing_rule_reachability),
         );
+    // NAN-939: probe route is registered separately via `kafka_probe_routes`
+    // below so it picks up the per-user rate-limit middleware.
 
     // meloD AI assistant endpoints — enterprise only.
     #[cfg(feature = "enterprise")]
@@ -2087,6 +2100,8 @@ pub fn create_router(state: AppState) -> Router {
         .merge(upload_routes)
         // NAN-474: rate-limited dry-resolve sub-router
         .merge(dry_resolve_routes)
+        // NAN-939: rate-limited Kafka broker-probe sub-router
+        .merge(kafka_probe_routes)
         .route("/api/upload/history", get(handlers::get_upload_history))
         // Lookup table endpoints
         .route("/api/lookup-tables", post(handlers::create_lookup_table))

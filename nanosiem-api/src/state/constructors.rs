@@ -218,6 +218,21 @@ impl AppState {
         #[cfg(feature = "enterprise")]
         let (case_events_tx, _) = tokio::sync::broadcast::channel(256);
 
+        // NAN-948: wire `SourceConfigService::update_dynamic_router` to
+        // the same deploy lock that `ParserService`'s inner
+        // `VectorConfigManager` uses. Without this, the two services'
+        // read-mutate-write of `_router.toml` can interleave and the
+        // later writer clobbers the earlier one's changes.
+        let parser_service = ParserService::with_vector_config_dir(
+            pg_pool.clone(),
+            get_vector_config_dir(),
+        );
+        let source_config_service = SourceConfigService::with_vector_config_dir(
+            pg_pool.clone(),
+            get_vector_config_dir(),
+        )
+        .with_deploy_lock(parser_service.deploy_lock());
+
         Self {
             // Services using DualPool for ClickHouse log queries
             search_service,
@@ -229,10 +244,7 @@ impl AppState {
             distributed_scheduler: Arc::new(RwLock::new(None)),
             node_id,
             enrichment: Arc::new(RwLock::new(enrichment_service)),
-            parser_service: ParserService::with_vector_config_dir(
-                pg_pool.clone(),
-                get_vector_config_dir(),
-            ),
+            parser_service,
             log_source_service: LogSourceService::with_dual_pool_and_config_dir(
                 &dual_pool,
                 get_vector_config_dir(),
@@ -245,10 +257,7 @@ impl AppState {
                 dual_pool.clickhouse().clone(),
                 dual_pool.table_names(),
             ),
-            source_config_service: SourceConfigService::with_vector_config_dir(
-                pg_pool.clone(),
-                get_vector_config_dir(),
-            ),
+            source_config_service,
             #[cfg(feature = "enterprise")]
             melod_service,
             // Risk service needs DualPool for time-windowed queries (findings are in ClickHouse)

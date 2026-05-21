@@ -194,6 +194,26 @@ interface TableProps {
   onToggleSelectAll: (sel: boolean) => void;
   onSelectParser: (id: string) => void;
   onAction: (parser: RepoParserView) => void;
+  /** NAN-974 — current category tab, used for tab-specific empty-state copy. */
+  activeCat?: 'all' | 'updated' | 'available' | 'imported' | 'drift' | 'deleted';
+}
+
+/** NAN-974 — tab-specific empty-state copy. */
+function parserEmptyStateCopy(activeCat: TableProps['activeCat']): { title: string; hint: string } {
+  switch (activeCat) {
+    case 'updated':
+      return { title: 'No upstream updates', hint: 'Your imported parsers match the upstream HEAD.' };
+    case 'available':
+      return { title: 'Nothing new to import', hint: 'All upstream parsers are already imported.' };
+    case 'imported':
+      return { title: 'No parsers imported yet', hint: 'Click Import on any parser above to add it to your tenant.' };
+    case 'drift':
+      return { title: 'No local drift', hint: 'All imported parsers match their upstream version.' };
+    case 'deleted':
+      return { title: 'No removals tracked', hint: 'No upstream parsers have been removed since the last sync.' };
+    default:
+      return { title: 'No parsers match these filters', hint: 'Try a different category, or clear your search.' };
+  }
 }
 
 export function ReposTable({
@@ -204,10 +224,12 @@ export function ReposTable({
   onToggleSelectAll,
   onSelectParser,
   onAction,
+  activeCat,
 }: TableProps) {
   const eligible = parsers.filter((p) => p.status !== 'DELETED' && p.status !== 'IMPORTED');
   const allSel = eligible.length > 0 && eligible.every((p) => selected.has(p.id));
   const someSel = selected.size > 0 && !allSel;
+  const empty = parserEmptyStateCopy(activeCat);
 
   return (
     <div className="flex-1 min-h-0 overflow-auto" style={{ containerType: 'inline-size' }}>
@@ -248,10 +270,8 @@ export function ReposTable({
               <td colSpan={8} className="py-8 text-center">
                 <div className="flex flex-col items-center gap-1.5 text-muted-foreground">
                   <SearchIcon className="w-5 h-5" strokeWidth={1.5} />
-                  <div className="text-[12.5px] font-medium text-foreground">
-                    No parsers match these filters
-                  </div>
-                  <div className="text-[11px]">Try a different category, or clear your search.</div>
+                  <div className="text-[12.5px] font-medium text-foreground">{empty.title}</div>
+                  <div className="text-[11px]">{empty.hint}</div>
                 </div>
               </td>
             </tr>

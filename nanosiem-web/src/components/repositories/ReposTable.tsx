@@ -190,6 +190,26 @@ interface TableProps {
   onToggleSelectAll: (sel: boolean) => void;
   onSelectRule: (id: string) => void;
   onAction: (rule: RepoRuleView) => void;
+  /** NAN-974 — current category tab, used for tab-specific empty-state copy. */
+  activeCat?: 'all' | 'new' | 'updated' | 'imported' | 'drift' | 'deleted';
+}
+
+/** NAN-974 — tab-specific empty-state copy. */
+function emptyStateCopy(activeCat: TableProps['activeCat']): { title: string; hint: string } {
+  switch (activeCat) {
+    case 'new':
+      return { title: 'No new upstream rules', hint: 'All upstream rules are already imported.' };
+    case 'updated':
+      return { title: 'No upstream updates', hint: 'Your imported rules match the upstream HEAD.' };
+    case 'imported':
+      return { title: 'No rules imported yet', hint: 'Click Import on any rule above to add it to your tenant.' };
+    case 'drift':
+      return { title: 'No local drift', hint: 'All imported rules match their upstream version.' };
+    case 'deleted':
+      return { title: 'No deletions tracked', hint: 'No upstream rules have been removed since the last sync.' };
+    default:
+      return { title: 'No rules match these filters', hint: 'Try a different category, source, or clear your search.' };
+  }
 }
 
 export function ReposTable({
@@ -200,10 +220,12 @@ export function ReposTable({
   onToggleSelectAll,
   onSelectRule,
   onAction,
+  activeCat,
 }: TableProps) {
   const eligible = rules.filter((r) => r.status !== 'DELETED');
   const allSel = eligible.length > 0 && eligible.every((r) => selected.has(r.id));
   const someSel = selected.size > 0 && !allSel;
+  const empty = emptyStateCopy(activeCat);
 
   return (
     <div
@@ -247,8 +269,8 @@ export function ReposTable({
               <td colSpan={8} className="py-8 text-center">
                 <div className="flex flex-col items-center gap-1.5 text-muted-foreground">
                   <SearchIcon className="w-5 h-5" strokeWidth={1.5} />
-                  <div className="text-[12.5px] font-medium text-foreground">No rules match these filters</div>
-                  <div className="text-[11px]">Try a different category, source, or clear your search.</div>
+                  <div className="text-[12.5px] font-medium text-foreground">{empty.title}</div>
+                  <div className="text-[11px]">{empty.hint}</div>
                 </div>
               </td>
             </tr>

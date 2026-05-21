@@ -20,6 +20,22 @@ use tracing::warn;
 
 use crate::event::Event;
 
+/// Compute the per-attempt retry backoff for HTTP/HEC send loops.
+///
+/// Exponential (`base × 2^(attempt-1)`) with both `attempt` and the
+/// multiplier saturating so any caller passing a large `max_retries`
+/// can't overflow into a multi-day sleep. NAN-953. Capped at ~128s
+/// (2^8 × 500ms) — sufficient to ride out a transient outage without
+/// pinning the runtime if a caller picks a pathological value.
+fn retry_backoff(attempt: u32) -> TokioDuration {
+    // `attempt` is the 1-indexed retry number (attempt=1 → first retry).
+    // We clamp the exponent at 8 so 500ms × 2^8 = 128_000ms is the
+    // absolute ceiling regardless of the caller's `max_retries`.
+    let exp = (attempt.saturating_sub(1)).min(8);
+    let millis = 500u64.saturating_mul(2u64.saturating_pow(exp));
+    TokioDuration::from_millis(millis)
+}
+
 /// Where to send events. Built once at startup; passed by reference through
 /// the send call chain so the wire format never gets re-derived per call.
 #[derive(Debug, Clone)]
@@ -163,7 +179,7 @@ async fn send_ndjson_group_with_retry(
     let mut last_err = None;
     for attempt in 0..=max_retries {
         if attempt > 0 {
-            let backoff = TokioDuration::from_millis(500 * 2u64.pow(attempt - 1));
+            let backoff = retry_backoff(attempt);
             warn!(
                 "[{}] Retry {}/{} after {:?}",
                 source_type, attempt, max_retries, backoff
@@ -301,7 +317,7 @@ async fn send_batch_hec_with_retry(
     let mut last_err = None;
     for attempt in 0..=max_retries {
         if attempt > 0 {
-            let backoff = TokioDuration::from_millis(500 * 2u64.pow(attempt - 1));
+            let backoff = retry_backoff(attempt);
             warn!("[hec] Retry {}/{} after {:?}", attempt, max_retries, backoff);
             tokio::time::sleep(backoff).await;
         }
@@ -405,6 +421,54 @@ mod tests {
             channel: "deadbeef-0000-0000-0000-000000000000".into(),
         };
         assert_eq!(hec_channel(&h), "deadbeef-0000-0000-0000-000000000000");
+    }
+
+    // ----------------------------------------------------------------------
+    // NAN-953: retry_backoff must cap at ~128s so a caller passing a large
+    // `max_retries` can't overflow into a multi-day sleep. The function is
+    // pub(crate) so any future caller in this file inherits the cap.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn retry_backoff_first_attempt_is_500ms() {
+        // attempt=1 → 500 × 2^0 = 500ms (unchanged from pre-NAN-953).
+        assert_eq!(retry_backoff(1), TokioDuration::from_millis(500));
+    }
+
+    #[test]
+    fn retry_backoff_second_attempt_is_1000ms() {
+        // attempt=2 → 500 × 2^1 = 1000ms.
+        assert_eq!(retry_backoff(2), TokioDuration::from_millis(1000));
+    }
+
+    #[test]
+    fn retry_backoff_third_attempt_is_2000ms() {
+        // attempt=3 → 500 × 2^2 = 2000ms (this is what current callers
+        // see — they pass max_retries=3).
+        assert_eq!(retry_backoff(3), TokioDuration::from_millis(2000));
+    }
+
+    #[test]
+    fn retry_backoff_caps_at_128s_at_attempt_9() {
+        // attempt=9 → exp clamped at 8 → 500 × 256 = 128_000ms.
+        assert_eq!(retry_backoff(9), TokioDuration::from_millis(128_000));
+    }
+
+    #[test]
+    fn retry_backoff_stays_capped_for_pathological_attempt() {
+        // Pre-NAN-953 attempt=53 would have produced 2^52 × 500 ≈ 71 years
+        // and attempt=64 would panic on `pow` overflow. Both must clamp.
+        assert_eq!(retry_backoff(53), TokioDuration::from_millis(128_000));
+        assert_eq!(retry_backoff(64), TokioDuration::from_millis(128_000));
+        assert_eq!(retry_backoff(u32::MAX), TokioDuration::from_millis(128_000));
+    }
+
+    #[test]
+    fn retry_backoff_handles_zero_attempt_gracefully() {
+        // 0-attempt isn't expected (callers gate on `attempt > 0`) but
+        // saturating_sub(1) yields 0, so 500 × 2^0 = 500ms — same as
+        // attempt=1. No panic.
+        assert_eq!(retry_backoff(0), TokioDuration::from_millis(500));
     }
 
     #[test]

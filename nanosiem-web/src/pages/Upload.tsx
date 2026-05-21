@@ -13,7 +13,8 @@ export default function Upload() {
   const navigate = useNavigate();
 
   useEffect(() => {
-    navigate('/lookup-tables', { replace: true });
+    // NAN-998: canonical path is `/rules/lookup-tables`, not `/lookup-tables`.
+    navigate('/rules/lookup-tables', { replace: true });
   }, [navigate]);
 
   return null;

@@ -6,7 +6,7 @@
 // detection context. No 28d heat / hourly strips — those are rule-scoped.
 
 import { useMemo } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import {
   ArrowLeft,
   Bell,
@@ -90,6 +90,18 @@ export function AlertHero({
   rule,
   linkedNotebookCount,
 }: AlertHeroProps) {
+  const navigate = useNavigate();
+  // NAN-968: Back button uses browser-back when there's history (so analysts
+  // return to whatever surface they came from — /alerts, /inbox, or a search
+  // result), falling back to /alerts as the canonical alert queue.
+  const handleBack = () => {
+    // Note: local `window` var on line 136 shadows the global — use globalThis.
+    if (globalThis.window?.history?.length > 1) {
+      navigate(-1);
+    } else {
+      navigate('/alerts');
+    }
+  };
   const sev = SEV_META[normalizeSeverity(alert.severity)];
   const tactic = primaryTactic(rule);
   const technique = primaryTechnique(rule);
@@ -156,13 +168,14 @@ export function AlertHero({
       <div className="flex items-start gap-4">
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2.5 flex-wrap">
-            <Link
-              to="/inbox"
+            <button
+              type="button"
+              onClick={handleBack}
               className="text-[11px] text-muted-foreground hover:text-foreground flex items-center gap-1 h-6 px-1.5 rounded hover:bg-foreground/5"
             >
               <ArrowLeft className="w-3 h-3" strokeWidth={2} />
-              Back to inbox
-            </Link>
+              Back
+            </button>
             <span className="text-muted-foreground/60">/</span>
 
             <div className="flex items-center gap-1.5">

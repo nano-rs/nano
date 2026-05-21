@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import React, { useRef, useCallback, useEffect, useState, lazy, Suspense } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useScrollContainer } from '@/contexts/ScrollContainerContext';
 import { useIsMobile } from '@/hooks/use-mobile';
@@ -23,6 +24,7 @@ import {
   ChartColumn,
   PanelRight,
   Rows3,
+  ExternalLink,
 } from 'lucide-react';
 import { PivtIcon } from '@/enterprise/icons/PivtIcon';
 import { cn } from '@/lib/utils';
@@ -554,7 +556,18 @@ interface FieldValueMenuProps {
   onAddToNotebook?: (entityType: string, value: string) => void;
 }
 
-function FieldValueMenu({
+// NAN-955: types EntityPage (`/entities/:type/:value`) can actually resolve.
+// FIELD_TO_ENTITY_TYPE is broader (covers `domain`/`hash`/`url`/etc. used by
+// the notebook surface) but EntityPage's ENTITY_TYPE_TO_FIELD map only knows
+// the three below; offering "Open entity page" for the others would land on
+// a broken search query.
+const ENTITY_PAGE_TYPES = new Set(['ip', 'host', 'user']);
+
+// NAN-955: exported so StatsView (sibling component) can reuse the same
+// popover on aggregated GROUP BY cells. Same affordances (Add to filter /
+// Exclude / Copy value / Open entity page) regardless of whether the
+// value comes from a raw event or a stats row.
+export function FieldValueMenu({
   fieldName,
   value,
   displayValue,
@@ -566,9 +579,15 @@ function FieldValueMenu({
   notebookActive,
   onAddToNotebook,
 }: FieldValueMenuProps) {
+  const navigate = useNavigate();
   const stringValue = typeof value === 'object' ? JSON.stringify(value) : String(value);
   const fieldType = getFieldType(fieldName);
   const entityType = FIELD_TO_ENTITY_TYPE[fieldName.toLowerCase()];
+  const canOpenEntityPage =
+    !!entityType &&
+    ENTITY_PAGE_TYPES.has(entityType) &&
+    typeof value === 'string' &&
+    value.trim().length > 0;
 
   // Escape value for query (handle quotes and special chars)
   const escapeValue = (v: string) => v.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
@@ -814,6 +833,20 @@ function FieldValueMenu({
           <span>Copy value</span>
           <DropdownMenuShortcut className="text-[10.5px]">⌘C</DropdownMenuShortcut>
         </DropdownMenuItem>
+
+        {/* NAN-955: drill to the entity dossier page when the field maps to
+            a type EntityPage can resolve (ip / host / user). Other entityTypes
+            in FIELD_TO_ENTITY_TYPE (domain / hash / url) are notebook-only
+            today — exposing them here would land on a broken search query. */}
+        {canOpenEntityPage && (
+          <DropdownMenuItem
+            onClick={() => navigate(`/entities/${entityType}/${encodeURIComponent(stringValue)}`)}
+            className="gap-1.5 px-2 py-1 text-[12px]"
+          >
+            <ExternalLink className="w-[13px] h-[13px]" />
+            <span>Open entity page</span>
+          </DropdownMenuItem>
+        )}
 
         {/* Add to notebook if available */}
         {notebookActive && onAddToNotebook && entityType && typeof value === 'string' && value.trim() && (
@@ -1499,6 +1532,10 @@ export function SearchResults({
               fieldsCount={fieldsCount}
               onExpandFields={onExpandFields}
               onDownload={results.length > 0 ? () => exportToCSV(results, isAggregateQuery) : undefined}
+              onAddToQuery={onAddToQuery}
+              onSetQuery={onSetQuery}
+              notebookActive={notebookActive}
+              onAddToNotebook={onAddToNotebook}
             />
           ) : effectiveDisplayType === 'table' ? (
             // Paginated table for non-stats aggregations (| table, | top, etc.)

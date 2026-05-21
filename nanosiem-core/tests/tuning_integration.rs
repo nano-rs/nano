@@ -509,6 +509,7 @@ async fn test_end_to_end_tuning_pipeline() {
     let unsafe_proposal = TuningProposal {
         id: Uuid::now_v7(),
         rule_id,
+        rule_name: None,
         created_at: Utc::now(),
         original_query: "source_type = 'windows' AND process.name = 'powershell.exe'".to_string(),
         proposed_query: r#"source_type = 'windows' AND user.name NOT IN ("admin")"#.to_string(), // Removes PowerShell check
@@ -537,6 +538,7 @@ async fn test_end_to_end_tuning_pipeline() {
     let safe_proposal = TuningProposal {
         id: Uuid::now_v7(),
         rule_id,
+        rule_name: None,
         created_at: Utc::now(),
         original_query: "source_type = \"windows\" AND process.name = \"powershell.exe\"".to_string(),
         proposed_query: r#"source_type = "windows" AND process.name = "powershell.exe" AND user.name != "admin""#.to_string(),
@@ -711,6 +713,7 @@ async fn test_safety_validation_comprehensive() {
     let proposal1 = TuningProposal {
         id: Uuid::now_v7(),
         rule_id,
+        rule_name: None,
         created_at: Utc::now(),
         original_query: "source_type = 'windows' AND process.name = 'powershell.exe'".to_string(),
         proposed_query: "source_type = 'windows'".to_string(), // Removes PowerShell check
@@ -729,6 +732,7 @@ async fn test_safety_validation_comprehensive() {
     let proposal2 = TuningProposal {
         id: Uuid::now_v7(),
         rule_id,
+        rule_name: None,
         created_at: Utc::now(),
         original_query: "source_type = \"windows\" AND process.name = \"powershell.exe\"".to_string(),
         proposed_query: r#"source_type = "windows" AND process.name = "powershell.exe" AND user.name != "admin""#.to_string(),
@@ -747,6 +751,7 @@ async fn test_safety_validation_comprehensive() {
     let proposal3 = TuningProposal {
         id: Uuid::now_v7(),
         rule_id,
+        rule_name: None,
         created_at: Utc::now(),
         original_query: "process.name = 'lsass.exe' AND event.action = 'access'".to_string(),
         proposed_query: "event.action = 'access'".to_string(), // Removes lsass check
@@ -767,6 +772,7 @@ async fn test_safety_validation_comprehensive() {
     let proposal4 = TuningProposal {
         id: Uuid::now_v7(),
         rule_id,
+        rule_name: None,
         created_at: Utc::now(),
         original_query: "process.name = 'powershell.exe' OR process.name = 'cmd.exe'".to_string(),
         proposed_query: "process.name = 'cmd.exe'".to_string(), // Removes PowerShell
@@ -787,6 +793,7 @@ async fn test_safety_validation_comprehensive() {
     let proposal5 = TuningProposal {
         id: Uuid::now_v7(),
         rule_id,
+        rule_name: None,
         created_at: Utc::now(),
         original_query: "source_type = \"windows\"".to_string(),
         proposed_query: "source_type = \"windows\" AND process.name = \"powershell.exe\""

@@ -37,7 +37,6 @@ import {
   Webhook,
   Gauge,
   ShieldCheck,
-  Rocket,
   Menu,
   Moon,
   Sun,
@@ -364,22 +363,44 @@ function TopBar({
 }
 
 /**
- * Strip inline markdown so AI-generated narrative renders cleanly inside the
+ * Strip markdown so AI-generated narrative renders cleanly inside the
  * single-line footer cell. The full markdown source still flows to
- * `/platform/health` where `<Markdown>` formats it properly; here we just
- * remove the `**bold**`/`*italic*`/`` `code` `` markers that would otherwise
- * show as literal characters (NAN-914 F-2).
+ * `/platform/health` where `<Markdown>` formats it properly; here we
+ * collapse both block-level structures (tables, code fences, lists,
+ * blockquotes — which `truncate` would otherwise render as literal `|`,
+ * `>`, `-`) and inline markers (`**bold**`, `*italic*`, `` `code` ``)
+ * to plain prose, then squash whitespace so the footer reads as one
+ * legible sentence (NAN-914 F-2, NAN-936 F-2).
  */
 function stripInlineMarkdown(text: string): string {
-  // Skip underscore-italic stripping — UDM field names (src_ip, windows_event_log,
-  // src_ip_filled_pct, etc.) routinely appear in the narrative and the `_..._`
-  // regex would mangle them. The AI prompt produces `**bold**`/`*italic*` style
-  // markdown, not underscore italics, so this is the safer trade-off.
-  return text
+  // Skip underscore-italic stripping — UDM field names (src_ip,
+  // windows_event_log, src_ip_filled_pct, etc.) routinely appear in the
+  // narrative and the `_..._` regex would mangle them. The AI prompt
+  // produces `**bold**`/`*italic*` style markdown, not underscore italics.
+  const blockStripped = text
+    // Fenced code blocks: ```...``` (multi-line)
+    .replace(/```[\s\S]*?```/g, '')
+    // Markdown table rows: any line that starts and ends with a pipe,
+    // including the `|---|---|` separator. The footer's `truncate`
+    // flattens these to literal `|` glyphs across the visible line.
+    .replace(/^\s*\|.*\|\s*$/gm, '')
+    // List bullets and numbered list markers at line start
+    .replace(/^\s*[-*+]\s+/gm, '')
+    .replace(/^\s*\d+\.\s+/gm, '')
+    // Blockquote bars
+    .replace(/^\s*>\s*/gm, '')
+    // Heading hashes
+    .replace(/^\s*#{1,6}\s+/gm, '');
+
+  return blockStripped
     .replace(/\*\*([^*]+)\*\*/g, '$1')
     .replace(/\*([^*]+)\*/g, '$1')
     .replace(/`([^`]+)`/g, '$1')
     .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    // Collapse any whitespace run (including newlines left by stripped
+    // blocks) to a single space; `truncate` would do the same visually
+    // but normalizing here avoids stray gaps where rows used to be.
+    .replace(/\s+/g, ' ')
     .trim();
 }
 
@@ -623,10 +644,12 @@ function MainAppShell({ children }: AppLayoutProps) {
   // Filtered navigation arrays based on user permissions
   const filteredNavigation = useMemo(() => {
     const items = filterNavItems(navigation);
-    // Hide "Getting Started" for demo users or once onboarding is fully completed.
-    // Dismissed-but-not-completed users keep the entry so they can re-enable —
-    // it was previously the only way back to /getting-started (NAN-912 F-22).
-    if (isDemoUser || onboardingProgress?.completed_at) {
+    // Hide "Getting Started" for demo users, or once the user has opted out
+    // (Dismiss / Finish Early / Skip for now → dismissed=true) or completed
+    // the wizard. The rail entry is for users still working through setup;
+    // the recovery path for everyone else is User Settings → Reopen
+    // Getting Started.
+    if (isDemoUser || onboardingProgress?.dismissed || onboardingProgress?.completed_at) {
       return items.filter(item => item.href !== '/getting-started');
     }
     return items;
@@ -1481,21 +1504,11 @@ function MainAppShell({ children }: AppLayoutProps) {
         <CommandPalette />
       </Suspense>
 
-      {/* Floating "Back to Setup" button when onboarding is active and user is elsewhere */}
-      {onboardingProgress &&
-        !onboardingProgress.dismissed &&
-        !onboardingProgress.completed_at &&
-        !location.pathname.startsWith('/getting-started') && (
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={() => navigate('/getting-started')}
-          className="fixed bottom-20 right-6 z-50 rounded-xl shadow-lg border-primary/30 bg-background/95 backdrop-blur-sm gap-2 hover:bg-primary/5"
-        >
-          <Rocket className="w-[15px] h-[15px]" />
-          Back to Setup
-        </Button>
-      )}
+      {/* The floating "Back to Setup" button was removed: with the sidebar
+          entry persisting until completion (NAN-912 F-22), the floating
+          chrome was redundant intrusion on every non-getting-started page
+          while onboarding was still in progress. Users have the rail link
+          for discovery and `/getting-started` as a direct URL. */}
 
     </div>
   );

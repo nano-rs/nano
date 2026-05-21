@@ -311,6 +311,13 @@ pub struct TuningProposal {
     pub id: Uuid,
     /// Rule ID being tuned
     pub rule_id: Uuid,
+    /// Human-readable name of the rule this proposal targets. NAN-963:
+    /// populated server-side by joining `rules` on `rule_id` so the
+    /// queue UI doesn't fall back to a truncated UUID when the rules
+    /// index hasn't loaded yet (or when a rule is archived but its
+    /// proposal still in scope).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_name: Option<String>,
     /// When the proposal was created
     pub created_at: DateTime<Utc>,
     /// Type of proposal (query tuning or hint update)

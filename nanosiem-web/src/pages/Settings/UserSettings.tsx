@@ -19,7 +19,8 @@
  */
 
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Link as RouterLink } from 'react-router-dom';
+import { Link as RouterLink, useNavigate } from 'react-router-dom';
+import { useResetOnboarding } from '@/hooks/use-api';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -56,6 +57,7 @@ import {
   List,
   Zap,
   X,
+  RotateCcw,
 } from 'lucide-react';
 import { useTheme } from 'next-themes';
 import { useToast } from '@/hooks/use-toast';
@@ -325,6 +327,21 @@ export function UserSettings() {
   const { toast } = useToast();
   const { setTheme, theme } = useTheme();
   const { user, hasPermission } = useAuth();
+  const navigate = useNavigate();
+  const { mutate: resetOnboarding } = useResetOnboarding();
+  const handleReopenSetup = useCallback(async () => {
+    try {
+      await resetOnboarding();
+      navigate('/getting-started');
+    } catch (err) {
+      console.error('Failed to reopen onboarding:', err);
+      toast({
+        title: "Couldn't reopen Getting Started",
+        description: 'Setup wizard reset failed. Try refreshing the page.',
+        variant: 'destructive',
+      });
+    }
+  }, [resetOnboarding, navigate, toast]);
   const canSql = hasPermission('search:sql');
   const {
     queryMode,
@@ -709,7 +726,7 @@ export function UserSettings() {
             />
           </Row>
 
-          <Row label="Theme" desc="Choose light, dark, or follow your system setting." last>
+          <Row label="Theme" desc="Choose light, dark, or follow your system setting.">
             <Select
               value={theme || 'system'}
               onValueChange={(v) => {
@@ -751,6 +768,22 @@ export function UserSettings() {
                 </SelectItem>
               </SelectContent>
             </Select>
+          </Row>
+
+          <Row
+            label="Getting Started"
+            desc="Reopen the setup wizard from the top — useful after dismissing or finishing it."
+            last
+          >
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleReopenSetup}
+              className="h-8 text-[12.5px] gap-1.5"
+            >
+              <RotateCcw className="w-3 h-3" />
+              Reopen Getting Started
+            </Button>
           </Row>
         </SectionCard>
 

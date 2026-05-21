@@ -5,8 +5,33 @@
 //! Generates complete TOML configuration for individual parsers,
 //! including source routing, VRL transform, and output transform blocks.
 
+use super::sources::escape_vrl_string;
 use super::VectorConfigManager;
 use crate::parsers::types::Parser;
+
+/// Sanitise a parser name for inclusion inside a one-line TOML comment.
+///
+/// TOML comments run from `#` to the next newline, so a name containing a
+/// literal `\n` or `\r` would close the comment and let downstream text be
+/// parsed as TOML structure (a fresh `[sinks.X]`, an `inputs = ...` line, …).
+/// `vector validate` catches *malformed* injected blocks but not *valid* ones.
+/// We strip CR/LF (replace with `\\n` / `\\r` literals so the original intent
+/// is still legible) and ASCII C0/DEL controls. NAN-942.
+fn safe_for_toml_comment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            // ASCII C0 (except already-handled \n and \r) and DEL
+            c if (c as u32) < 0x20 || (c as u32) == 0x7f => {
+                out.push_str(&format!("\\u{:04x}", c as u32))
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
 
 impl VectorConfigManager {
     /// Generate Vector TOML config for a single parser (returns string)
@@ -16,11 +41,15 @@ impl VectorConfigManager {
 
     /// Generate Vector TOML config for a single parser
     pub(super) fn generate_parser_config(&self, parser: &Parser) -> String {
+        // NAN-942: the parser name lands in a single-line TOML comment.
+        // Without escape, an admin-set name containing a literal newline
+        // could close the comment and inject TOML structure on the next
+        // line (e.g. a fresh [sinks.X] section).
         let mut config = format!(
             "# Auto-generated Vector configuration for parser: {}\n\
              # DO NOT EDIT - changes will be overwritten\n\
              # Generated at: {}\n\n",
-            parser.name,
+            safe_for_toml_comment(&parser.name),
             chrono::Utc::now().to_rfc3339()
         );
 
@@ -302,11 +331,17 @@ impl VectorConfigManager {
                 .map(|vrl| format!("{}\n             \n             ", vrl))
                 .unwrap_or_default(),
             output_source_type,
-            vendor,
-            product,
-            vendor_product,
-            category,
-            namespace
+            // NAN-942: metadata fields are admin-controlled string scalars
+            // that flow into VRL double-quoted literals (`.vendor = "{}"`).
+            // Without escape, a value containing `"`, `\`, or `\n` would
+            // close the string and let following text be parsed as VRL.
+            // `vector validate` would catch malformed VRL, but valid
+            // injected VRL would pass.
+            escape_vrl_string(&vendor),
+            escape_vrl_string(&product),
+            escape_vrl_string(&vendor_product),
+            escape_vrl_string(&category),
+            escape_vrl_string(namespace),
         )
     }
 }
@@ -462,5 +497,146 @@ mod tests {
             !config.contains("\n'''\n[transforms.evil]"),
             "raw triple-quoted injection survived sanitization: {config}"
         );
+    }
+
+    /// NAN-942: a parser name containing a literal newline followed by a
+    /// fake TOML section must not escape the comment block. The generated
+    /// config must NOT contain `[sinks.evil]` (or similar) as an actual
+    /// TOML section header — i.e. at the start of a line. Appearing inside
+    /// a `#` comment is fine; the TOML parser ignores comments.
+    #[test]
+    fn parser_name_newline_does_not_escape_toml_comment() {
+        let m = manager();
+        let mut p = make_parser(".x = 1", None, false);
+        p.name = "apache\n[sinks.evil]\ntype = \"console\"\nencoding.codec = \"json\"".to_string();
+        let config = m.generate_parser_config_string(&p);
+
+        // Look line-by-line for an actual section header — a non-comment
+        // line starting with `[sinks.`.
+        for line in config.lines() {
+            let trimmed = line.trim_start();
+            assert!(
+                !(trimmed.starts_with("[sinks.") || trimmed.starts_with("[sources.evil")),
+                "parser.name newline produced an actual TOML section header: {line:?}\nfull config:\n{config}"
+            );
+        }
+        // Sanitized form should keep `\n` visible as the escaped sequence
+        // `\\n` (backslash-n) inside the comment line.
+        assert!(
+            config.contains("apache\\n[sinks.evil]\\n"),
+            "expected the newline rendered as `\\n` in the comment, got: {config}"
+        );
+        // Parser the resulting TOML and confirm there's no `[sinks.evil]`
+        // section recognised by a real TOML parser.
+        // (Use the toml crate, which is already a transitive dep.)
+        if let Ok(parsed) = toml::from_str::<toml::Value>(&config) {
+            if let Some(t) = parsed.as_table() {
+                assert!(
+                    !t.contains_key("sinks"),
+                    "TOML parser sees a `sinks` section — newline injection escaped"
+                );
+            }
+        }
+        // If toml fails to parse the whole generated config (it contains
+        // VRL with TOML triple-quoted strings which `toml` should handle),
+        // the line-check above is the primary defense.
+    }
+
+    /// NAN-942: parser name with embedded CR / DEL / NUL must not break
+    /// the TOML comment. Verify they're rendered as escape sequences.
+    #[test]
+    fn parser_name_control_chars_escaped_in_toml_comment() {
+        let m = manager();
+        let mut p = make_parser(".x = 1", None, false);
+        // \r alone (old-Mac line ending) could also close a comment on
+        // some parsers; \x00 / \x7f are non-printables that have no
+        // legitimate place in a name.
+        p.name = "weird\rname\x00with\x7fcontrols".to_string();
+        let config = m.generate_parser_config_string(&p);
+
+        assert!(
+            !config.contains('\r'),
+            "raw CR in parser.name leaked to config: {config:?}"
+        );
+        assert!(
+            !config.contains('\x00'),
+            "raw NUL in parser.name leaked to config"
+        );
+        assert!(
+            config.contains("\\r") && config.contains("\\u0000") && config.contains("\\u007f"),
+            "expected escaped controls in the comment, got: {config}"
+        );
+    }
+
+    /// NAN-942: metadata fields (vendor / product / category / namespace)
+    /// flow into VRL double-quoted string literals. A value containing
+    /// `"` must be backslash-escaped, not passed through raw — otherwise
+    /// the VRL emitter would close the string and let following text be
+    /// parsed as VRL.
+    ///
+    /// We assert the *escaped* form is present (rather than the absence of
+    /// raw substrings — the raw substrings still appear, but inside an
+    /// escaped string, which is benign).
+    #[test]
+    fn parser_metadata_vrl_injection_blocked() {
+        let m = manager();
+        let mut p = make_parser(".x = 1", None, false);
+        p.vendor = Some("evil\"; .pwned = true; //".to_string());
+        p.product = Some("\"product\"".to_string());
+        p.category = Some("a\nb".to_string());
+        p.namespace = "ns\\with\\backslash".to_string();
+        let config = m.generate_parser_config_string(&p);
+
+        // Each `"` inside the value must appear as `\"` in the emitted VRL.
+        // vendor: `evil"; .pwned = true; //` → `evil\"; .pwned = true; //`
+        assert!(
+            config.contains(".vendor = \"evil\\\"; .pwned = true; //\""),
+            "vendor `\"` must be backslash-escaped in VRL: {config}"
+        );
+        // product is `"product"` (literal quotes) → `\"product\"`
+        assert!(
+            config.contains(".product = \"\\\"product\\\"\""),
+            "product `\"` must be backslash-escaped in VRL: {config}"
+        );
+        // category newline must be `\n`, not a real newline that would
+        // close the VRL string literal.
+        assert!(
+            config.contains(".category = \"a\\nb\""),
+            "category newline must be escaped in VRL: {config}"
+        );
+        // namespace backslash must be doubled.
+        assert!(
+            config.contains(".namespace = \"ns\\\\with\\\\backslash\""),
+            "namespace backslash must be doubled in VRL: {config}"
+        );
+
+        // Belt-and-suspenders: compile the generated output transform's
+        // VRL block. If injection slipped through, the block would either
+        // fail to compile (good catch) or — worse — compile to `.pwned
+        // = true` as an actual VRL statement.
+        use vrl::compiler::compile;
+        let blocks: Vec<&str> = {
+            let opener = "source = '''";
+            let mut out = Vec::new();
+            let mut rest = config.as_str();
+            while let Some(start) = rest.find(opener) {
+                let body = &rest[start + opener.len()..];
+                if let Some(end) = body.find("'''") {
+                    out.push(&body[..end]);
+                    rest = &body[end + 3..];
+                } else {
+                    break;
+                }
+            }
+            out
+        };
+        assert!(!blocks.is_empty(), "expected ≥1 VRL block in generated parser config");
+        let fns = vrl::stdlib::all();
+        for (idx, block) in blocks.iter().enumerate() {
+            assert!(
+                compile(block, &fns).is_ok(),
+                "VRL block #{idx} failed to compile (metadata-escape regression?): {block}"
+            );
+        }
     }
 }

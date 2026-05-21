@@ -1660,7 +1660,12 @@ export function SiemHealth() {
   }
 
   /* ---- Populated ---- */
-  const checkedAt = new Date(report.created_at).toLocaleString();
+  // NAN-1007: UTC formatting to match the rest of the platform
+  // (case detail, log sources, etc.) — analysts work across timezones.
+  const checkedAt = new Date(report.created_at)
+    .toISOString()
+    .replace('T', ' ')
+    .slice(0, 19) + ' UTC';
   const overallLabel =
     overallStatus === 'ok'
       ? 'healthy'

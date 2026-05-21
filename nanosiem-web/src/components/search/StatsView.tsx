@@ -3,6 +3,7 @@
 import React from 'react';
 import { ArrowUp, ArrowDown, ArrowUpDown, Check, ChevronRight, Copy, Download, Table as TableIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { FieldValueMenu } from './SearchResults';
 
 interface SearchResultLike {
   fields?: Record<string, unknown>;
@@ -16,6 +17,13 @@ interface StatsViewProps {
   fieldsCount?: number;
   onExpandFields?: () => void;
   onDownload?: () => void;
+  // NAN-955 F-1: wire GROUP BY cells (`process_name`, `src_ip`, etc.) into
+  // the shared FieldValueMenu so they expose the same Add to filter /
+  // Exclude / Copy / Open entity page actions as raw-event chips.
+  onAddToQuery?: (field: string, value: string, exclude: boolean) => void;
+  onSetQuery?: (query: string) => void;
+  notebookActive?: boolean;
+  onAddToNotebook?: (entityType: string, value: string) => void;
 }
 
 interface ParsedStats {
@@ -95,6 +103,10 @@ export function StatsView({
   fieldsCount,
   onExpandFields,
   onDownload,
+  onAddToQuery,
+  onSetQuery,
+  notebookActive,
+  onAddToNotebook,
 }: StatsViewProps) {
   const parsed = React.useMemo(() => parseStatsCommand(query), [query]);
 
@@ -274,17 +286,34 @@ export function StatsView({
               const isCopied = copiedKey === rowKey;
               return (
                 <tr key={rowKey} className="group border-b border-border/50 transition-colors hover:bg-foreground/[0.03]">
-                  {byCols.map((col, ci) => (
-                    <td
-                      key={col}
-                      className={cn(
-                        'py-1.5 pr-3 align-top text-foreground break-all',
-                        ci === 0 ? 'pl-3' : '',
-                      )}
-                    >
-                      {formatCell(row[col])}
-                    </td>
-                  ))}
+                  {byCols.map((col, ci) => {
+                    const cellValue = row[col];
+                    const cellDisplay = formatCell(cellValue);
+                    return (
+                      <td
+                        key={col}
+                        className={cn(
+                          'py-1.5 pr-3 align-top text-foreground break-all',
+                          ci === 0 ? 'pl-3' : '',
+                        )}
+                      >
+                        {onAddToQuery && cellValue != null && cellDisplay !== '' ? (
+                          <FieldValueMenu
+                            fieldName={col}
+                            value={cellValue}
+                            displayValue={cellDisplay}
+                            onAddToQuery={onAddToQuery}
+                            onSetQuery={onSetQuery}
+                            query={query}
+                            notebookActive={notebookActive}
+                            onAddToNotebook={onAddToNotebook}
+                          />
+                        ) : (
+                          cellDisplay
+                        )}
+                      </td>
+                    );
+                  })}
                   {aggCols.map((col) => {
                     const n = asNumber(row[col]);
                     const max = maxByAgg[col] ?? 0;

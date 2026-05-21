@@ -31,9 +31,9 @@ pub use ip_allowlist::{ip_allowlist_middleware, IpAllowlistState};
 pub use license_guard::license_guard;
 pub use logging::request_logging_layer;
 pub use rate_limit::{
-    dry_resolve_rate_limit_middleware, login_rate_limit_middleware,
-    password_reset_rate_limit_middleware, upload_rate_limit_middleware, RateLimitConfig,
-    RateLimitState,
+    dry_resolve_rate_limit_middleware, kafka_probe_rate_limit_middleware,
+    login_rate_limit_middleware, password_reset_rate_limit_middleware,
+    upload_rate_limit_middleware, RateLimitConfig, RateLimitState,
 };
 pub use request_id::{request_id_middleware, RequestId, REQUEST_ID_HEADER};
 pub use sanitize_errors::sanitize_error_responses;

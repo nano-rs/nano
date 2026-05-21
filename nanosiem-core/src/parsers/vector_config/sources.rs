@@ -437,7 +437,7 @@ fn build_hec_filter_condition(match_values: &[String], parser_name: &str) -> Str
 
 /// Escape backslashes, double-quotes, and newlines for safe interpolation
 /// into a VRL double-quoted string literal.
-fn escape_vrl_string(s: &str) -> String {
+pub(super) fn escape_vrl_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {

@@ -731,6 +731,110 @@ pub async fn alert_counts(
     }))
 }
 
+/// Velocity histogram point — one hourly bucket from /api/alerts/velocity.
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct VelocityBucket {
+    /// Bucket start timestamp (UTC, ISO-8601).
+    pub bucket_start: String,
+    /// Alerts created in this hour.
+    pub count: i64,
+}
+
+/// Query for /api/alerts/velocity. NAN-1019: powers the FIRING NOW
+/// 24h sparkline on the Rules index. Hours is clamped to [1, 168]
+/// (7 days) — long enough for weekly trend overlays without letting
+/// callers DoS the DB with arbitrary windows.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct VelocityQuery {
+    #[serde(default = "default_velocity_hours")]
+    pub hours: u32,
+}
+
+fn default_velocity_hours() -> u32 {
+    24
+}
+
+/// Get alert velocity (hourly histogram over the last N hours)
+///
+/// Returns one bucket per hour in the window, including hours with
+/// zero alerts so the frontend can render a fixed-length sparkline
+/// without filling gaps client-side. Buckets are ordered chronologically.
+#[utoipa::path(
+    get,
+    path = "/api/alerts/velocity",
+    tag = "alerts",
+    params(VelocityQuery),
+    responses(
+        (status = 200, description = "Hourly velocity buckets", body = Vec<VelocityBucket>),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
+pub async fn alert_velocity(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    Query(query): Query<VelocityQuery>,
+) -> Result<Json<Vec<VelocityBucket>>, ApiError> {
+    check_permission(&auth, permissions::ALERTS_VIEW)
+        .map_err(|_| ApiError::Forbidden("Missing permission: alerts:view".to_string()))?;
+
+    let hours = query.hours.clamp(1, 168) as i64;
+    let now = chrono::Utc::now();
+    let start = now - chrono::Duration::hours(hours);
+
+    // Bucket via date_trunc('hour', ...). LEFT JOIN against a generate_series
+    // so every hour in the window is represented even when no alerts hit it
+    // (otherwise the sparkline would have gaps + the frontend would have to
+    // backfill).
+    //
+    // generate_series is inclusive on both ends, so the upper bound is `now -
+    // 1h` rather than `now` — that gives exactly `hours` complete buckets
+    // (the in-progress current hour is excluded; analysts see settled data).
+    //
+    // No demo-isolation filter (cf. `alert_counts`): a 24-bucket hourly
+    // histogram doesn't expose per-rule attribution, so the aggregate is
+    // safe to surface across demo_analyst boundaries.
+    let sql = r#"
+        SELECT
+            bucket as bucket_start,
+            COALESCE(c.count, 0) AS count
+        FROM generate_series(
+            date_trunc('hour', $1::timestamptz),
+            date_trunc('hour', $2::timestamptz) - interval '1 hour',
+            interval '1 hour'
+        ) AS bucket
+        LEFT JOIN (
+            SELECT date_trunc('hour', created_at) AS bucket_start, COUNT(*) AS count
+            FROM alerts
+            WHERE created_at >= $1 AND created_at < $2
+            GROUP BY bucket_start
+        ) c ON c.bucket_start = bucket
+        ORDER BY bucket ASC
+    "#;
+
+    let rows = sqlx::query(sql)
+        .bind(start)
+        .bind(now)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+
+    use sqlx::Row;
+    let buckets: Vec<VelocityBucket> = rows
+        .into_iter()
+        .map(|row| {
+            let bucket: chrono::DateTime<chrono::Utc> = row.get("bucket_start");
+            let count: i64 = row.get("count");
+            VelocityBucket {
+                bucket_start: bucket.to_rfc3339(),
+                count,
+            }
+        })
+        .collect();
+
+    Ok(Json(buckets))
+}
+
 /// OpenAPI documentation for alerts endpoints
 pub struct AlertsApiDoc;
 
@@ -745,6 +849,7 @@ impl utoipa::OpenApi for AlertsApiDoc {
                 stream_alerts,
                 bulk_alerts,
                 alert_counts,
+                alert_velocity,
                 get_alert,
                 acknowledge_alert,
                 close_alert,
@@ -758,6 +863,7 @@ impl utoipa::OpenApi for AlertsApiDoc {
                 BulkRequest,
                 BulkAction,
                 AlertCounts,
+                VelocityBucket,
             ))
         )]
         struct ApiDoc;

@@ -15,6 +15,7 @@ fn create_test_proposal(rule_id: Uuid) -> TuningProposal {
     TuningProposal {
         id: Uuid::now_v7(),
         rule_id,
+        rule_name: None,
         created_at: Utc::now(),
         proposal_type: ProposalType::QueryTuning,
         original_query: "source_type = 'sysmon' AND event_id = 1".to_string(),

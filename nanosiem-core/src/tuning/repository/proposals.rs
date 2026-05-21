@@ -175,25 +175,30 @@ impl TuningRepository {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<TuningProposal>> {
+        // NAN-963: LEFT JOIN rules so the queue UI can render the rule
+        // name without falling back to a truncated UUID. LEFT (not INNER)
+        // so proposals against archived / deleted rules still surface.
         let mut query = String::from(
             r#"
             SELECT
-                id,
-                rule_id,
-                created_at,
-                COALESCE(proposal_type, 'query_tuning') as proposal_type,
-                original_query,
-                proposed_query,
-                rationale,
-                confidence_score,
-                changes_summary,
-                affected_patterns,
-                safety_validation,
-                status,
-                current_hints,
-                proposed_hints,
-                hints_diff
-            FROM tuning_proposals
+                tp.id,
+                tp.rule_id,
+                r.name as rule_name,
+                tp.created_at,
+                COALESCE(tp.proposal_type, 'query_tuning') as proposal_type,
+                tp.original_query,
+                tp.proposed_query,
+                tp.rationale,
+                tp.confidence_score,
+                tp.changes_summary,
+                tp.affected_patterns,
+                tp.safety_validation,
+                tp.status,
+                tp.current_hints,
+                tp.proposed_hints,
+                tp.hints_diff
+            FROM tuning_proposals tp
+            LEFT JOIN detection_rules r ON r.id = tp.rule_id
             WHERE 1=1
             "#,
         );
@@ -201,26 +206,28 @@ impl TuningRepository {
         let mut bindings: Vec<String> = vec![];
         let mut param_count = 1;
 
+        // Column prefixes (`tp.`) required now that `rules` is joined —
+        // bare names would be ambiguous.
         if let Some(rid) = rule_id {
-            query.push_str(&format!(" AND rule_id = ${}", param_count));
+            query.push_str(&format!(" AND tp.rule_id = ${}", param_count));
             bindings.push(rid.to_string());
             param_count += 1;
         }
 
         if let Some(s) = status {
-            query.push_str(&format!(" AND status = ${}", param_count));
+            query.push_str(&format!(" AND tp.status = ${}", param_count));
             bindings.push(s.to_string());
             param_count += 1;
         }
 
         if let Some(pt) = proposal_type {
-            query.push_str(&format!(" AND proposal_type = ${}", param_count));
+            query.push_str(&format!(" AND tp.proposal_type = ${}", param_count));
             bindings.push(pt.to_string());
             param_count += 1;
         }
 
         query.push_str(&format!(
-            " ORDER BY created_at DESC LIMIT ${} OFFSET ${}",
+            " ORDER BY tp.created_at DESC LIMIT ${} OFFSET ${}",
             param_count,
             param_count + 1
         ));
@@ -274,6 +281,8 @@ impl TuningRepository {
             proposals.push(TuningProposal {
                 id: row.try_get("id")?,
                 rule_id: row.try_get("rule_id")?,
+                // NAN-963: from the `rules` LEFT JOIN — None if archived.
+                rule_name: row.try_get("rule_name")?,
                 created_at: row.try_get("created_at")?,
                 proposal_type,
                 original_query: row.try_get("original_query")?,
@@ -304,26 +313,29 @@ impl TuningRepository {
     /// # Returns
     /// The tuning proposal if found, None otherwise
     pub async fn get_proposal(&self, proposal_id: Uuid) -> Result<Option<TuningProposal>> {
+        // NAN-963: LEFT JOIN rules (see list_proposals for rationale).
         let row = sqlx::query(
             r#"
             SELECT
-                id,
-                rule_id,
-                created_at,
-                COALESCE(proposal_type, 'query_tuning') as proposal_type,
-                original_query,
-                proposed_query,
-                rationale,
-                confidence_score,
-                changes_summary,
-                affected_patterns,
-                safety_validation,
-                status,
-                current_hints,
-                proposed_hints,
-                hints_diff
-            FROM tuning_proposals
-            WHERE id = $1
+                tp.id,
+                tp.rule_id,
+                r.name as rule_name,
+                tp.created_at,
+                COALESCE(tp.proposal_type, 'query_tuning') as proposal_type,
+                tp.original_query,
+                tp.proposed_query,
+                tp.rationale,
+                tp.confidence_score,
+                tp.changes_summary,
+                tp.affected_patterns,
+                tp.safety_validation,
+                tp.status,
+                tp.current_hints,
+                tp.proposed_hints,
+                tp.hints_diff
+            FROM tuning_proposals tp
+            LEFT JOIN detection_rules r ON r.id = tp.rule_id
+            WHERE tp.id = $1
             "#,
         )
         .bind(proposal_id)
@@ -366,6 +378,7 @@ impl TuningRepository {
             Ok(Some(TuningProposal {
                 id: row.try_get("id")?,
                 rule_id: row.try_get("rule_id")?,
+                rule_name: row.try_get("rule_name")?,
                 created_at: row.try_get("created_at")?,
                 proposal_type,
                 original_query: row.try_get("original_query")?,
