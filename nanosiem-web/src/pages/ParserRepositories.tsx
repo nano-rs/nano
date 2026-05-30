@@ -505,11 +505,16 @@ export function ParserRepositories() {
 
   const handleImport = () => {
     if (!activeRepoId || !selectedParser) return;
+    // NAN-1149: enrichment parsers route by enrich_source into target_table —
+    // they have no source-type routing rule and no dispatch config. Force both
+    // to empty so the mutation skips routing-rule creation and dispatch wiring,
+    // regardless of any stale auto-selected config.
+    const isEnrichment = selectedParser.raw.kind === 'enrichment';
     importMutation.mutate({
       repoId: activeRepoId,
       path: selectedParser.raw.file_path,
-      configId: selectedConfigId,
-      sourceType: sourceTypeInput,
+      configId: isEnrichment ? null : selectedConfigId,
+      sourceType: isEnrichment ? '' : sourceTypeInput,
       mode: importMode,
     });
   };

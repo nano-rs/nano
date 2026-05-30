@@ -94,23 +94,31 @@ impl LogSourceRepository {
         }
 
         // For now, use simple query without dynamic binds for simplicity
-        // In production, you'd want proper parameterized queries
+        // In production, you'd want proper parameterized queries.
+        //
+        // NAN-1084: LEFT JOIN source_configurations so the list view can render
+        // the real transport (kafka / gcp_pubsub / aws_s3 / ...) for parsers
+        // imported through the NAN-928 "DISPATCH FROM" flow. Legacy parser-owned
+        // sources have no dispatch_source_config_id and the joined column is
+        // NULL; the UI then falls back to `source_type`.
         let rows = sqlx::query(
             r#"
             SELECT
-                id, name, description, namespace, timezone, source_type, source_config, credential_id,
-                parser_vrl, output_fields, category, vendor, product, icon, color,
-                match_field, match_pattern, match_values,
-                validated, validation_error, deployed, deployed_at, enabled,
-                stale_alert_enabled, stale_threshold_minutes,
-                sampling_ratio, sampling_exclude_condition,
-                extension_vrl, extension_enabled,
-                parser_only,
-                source_parser_repository_id, source_parser_path, source_parser_linked,
-                dispatch_source_config_id,
-                created_at, updated_at
-            FROM log_sources
-            ORDER BY name ASC
+                ls.id, ls.name, ls.description, ls.namespace, ls.timezone, ls.source_type, ls.source_config, ls.credential_id,
+                ls.parser_vrl, ls.output_fields, ls.category, ls.vendor, ls.product, ls.icon, ls.color,
+                ls.match_field, ls.match_pattern, ls.match_values,
+                ls.validated, ls.validation_error, ls.deployed, ls.deployed_at, ls.enabled,
+                ls.stale_alert_enabled, ls.stale_threshold_minutes,
+                ls.sampling_ratio, ls.sampling_exclude_condition,
+                ls.extension_vrl, ls.extension_enabled,
+                ls.parser_only,
+                ls.source_parser_repository_id, ls.source_parser_path, ls.source_parser_linked,
+                ls.dispatch_source_config_id,
+                sc.config_type AS dispatch_source_config_type,
+                ls.created_at, ls.updated_at
+            FROM log_sources ls
+            LEFT JOIN source_configurations sc ON sc.id = ls.dispatch_source_config_id
+            ORDER BY ls.name ASC
             "#,
         )
         .fetch_all(&self.pool)
@@ -132,6 +140,7 @@ impl LogSourceRepository {
                 sampling_ratio, sampling_exclude_condition,
                 extension_vrl, extension_enabled,
                 parser_only,
+                kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
                 dispatch_source_config_id,
                 created_at, updated_at
@@ -175,22 +184,27 @@ impl LogSourceRepository {
 
     /// Get a log source by ID
     pub async fn find_by_id(&self, id: Uuid) -> Result<LogSource, LogSourceRepositoryError> {
+        // NAN-1084: JOIN source_configurations so the detail page can render the
+        // real transport label for parsers wired through NAN-928 dispatch.
         let row = sqlx::query(
             r#"
             SELECT
-                id, name, description, namespace, timezone, source_type, source_config, credential_id,
-                parser_vrl, output_fields, category, vendor, product, icon, color,
-                match_field, match_pattern, match_values,
-                validated, validation_error, deployed, deployed_at, enabled,
-                stale_alert_enabled, stale_threshold_minutes,
-                sampling_ratio, sampling_exclude_condition,
-                extension_vrl, extension_enabled,
-                parser_only,
-                source_parser_repository_id, source_parser_path, source_parser_linked,
-                dispatch_source_config_id,
-                created_at, updated_at
-            FROM log_sources
-            WHERE id = $1
+                ls.id, ls.name, ls.description, ls.namespace, ls.timezone, ls.source_type, ls.source_config, ls.credential_id,
+                ls.parser_vrl, ls.output_fields, ls.category, ls.vendor, ls.product, ls.icon, ls.color,
+                ls.match_field, ls.match_pattern, ls.match_values,
+                ls.validated, ls.validation_error, ls.deployed, ls.deployed_at, ls.enabled,
+                ls.stale_alert_enabled, ls.stale_threshold_minutes,
+                ls.sampling_ratio, ls.sampling_exclude_condition,
+                ls.extension_vrl, ls.extension_enabled,
+                ls.parser_only,
+                ls.kind, ls.enrich_kind, ls.enrich_source, ls.target_table, ls.normalize_vrl,
+                ls.source_parser_repository_id, ls.source_parser_path, ls.source_parser_linked,
+                ls.dispatch_source_config_id,
+                sc.config_type AS dispatch_source_config_type,
+                ls.created_at, ls.updated_at
+            FROM log_sources ls
+            LEFT JOIN source_configurations sc ON sc.id = ls.dispatch_source_config_id
+            WHERE ls.id = $1
             "#,
         )
         .bind(id)
@@ -323,7 +337,8 @@ impl LogSourceRepository {
             || update.sampling_ratio.is_some()
             || update.sampling_exclude_condition.is_some()
             || update.extension_vrl.is_some()
-            || update.extension_enabled.is_some();
+            || update.extension_enabled.is_some()
+            || update.normalize_vrl.is_some();
 
         let row = sqlx::query(
             r#"
@@ -357,7 +372,11 @@ impl LogSourceRepository {
                     ELSE $25
                 END,
                 extension_enabled = COALESCE($26, extension_enabled),
-                dispatch_source_config_id = COALESCE($27, dispatch_source_config_id)
+                dispatch_source_config_id = COALESCE($27, dispatch_source_config_id),
+                -- NAN-1151: let upstream-update/apply refresh an enrichment
+                -- parser's mapping VRL (enrichment parsers carry normalize_vrl,
+                -- not parser_vrl).
+                normalize_vrl = COALESCE($28, normalize_vrl)
             WHERE id = $1
             RETURNING id, name, description, namespace, timezone, source_type, source_config, credential_id,
                 parser_vrl, output_fields, category, vendor, product, icon, color,
@@ -367,6 +386,7 @@ impl LogSourceRepository {
                 sampling_ratio, sampling_exclude_condition,
                 extension_vrl, extension_enabled,
                 parser_only,
+                kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 source_parser_repository_id, source_parser_path, source_parser_linked,
                 dispatch_source_config_id,
                 created_at, updated_at
@@ -399,6 +419,7 @@ impl LogSourceRepository {
         .bind(&update.extension_vrl)
         .bind(&update.extension_enabled)
         .bind(&update.dispatch_source_config_id)
+        .bind(&update.normalize_vrl)
         .fetch_one(&self.pool)
         .await?;
 

@@ -54,6 +54,7 @@ import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/AuthContext';
 import { api } from '@/lib/api';
 import type { LogSource } from '@/lib/api';
+import { logSourceTransportLabel } from '@/lib/log-source-transports';
 import { cn } from '@/lib/utils';
 
 type DerivedStatus = 'deployed' | 'ready' | 'paused';
@@ -82,10 +83,6 @@ function derivePendingDeploy(ls: LogSource): boolean {
   return new Date(ls.updated_at) > new Date(ls.deployed_at);
 }
 
-// `LogSource.source_type` is the parser type (e.g. `aws_cloudtrail`), not the transport.
-// We don't have the source-config join here, and >95% of feeds in practice flow through
-// the routed (HTTP) transport. Show that honestly until we wire the join in a follow-up.
-const TRANSPORT_LABEL = 'HTTP';
 const TRANSPORT_COLOR = 'oklch(72% 0.15 200)';
 
 function fmtRate(n: number): string {
@@ -804,6 +801,7 @@ function LogSourceRow({
   const status = deriveStatus(source);
   const pending = derivePendingDeploy(source);
   const warn = pending; // single warn signal until backend ships richer health data
+  const transportLabel = logSourceTransportLabel(source);
 
   return (
     <tr
@@ -840,7 +838,7 @@ function LogSourceRow({
               {/* Inline transport surfaces when Type col hidden */}
               <span className="hidden @max-[900px]/table:inline-flex items-center gap-1 h-[15px] px-1 rounded-[3px] border border-border bg-foreground/[0.03]">
                 <Globe className="w-[8px] h-[8px]" style={{ color: TRANSPORT_COLOR }} />
-                <span className="text-[9.5px] font-mono uppercase tracking-wider text-foreground/80">{TRANSPORT_LABEL}</span>
+                <span className="text-[9.5px] font-mono uppercase tracking-wider text-foreground/80">{transportLabel}</span>
               </span>
             </div>
             {source.description && (
@@ -875,7 +873,7 @@ function LogSourceRow({
       <td className="py-3 align-top @max-[900px]/table:hidden">
         <div className="inline-flex items-center gap-1.5 h-[22px] px-1.5 rounded-[4px] border border-border bg-foreground/[0.03]">
           <Globe className="w-3 h-3" style={{ color: TRANSPORT_COLOR }} />
-          <span className="text-[10.5px] font-mono text-foreground/80">{TRANSPORT_LABEL}</span>
+          <span className="text-[10.5px] font-mono text-foreground/80">{transportLabel}</span>
         </div>
       </td>
 

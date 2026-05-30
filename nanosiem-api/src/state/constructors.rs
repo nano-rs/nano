@@ -48,11 +48,28 @@ impl AppState {
         let pg_pool = dual_pool.postgres().clone();
 
         let enrichment_repo = EnrichmentRepository::new(pg_pool.clone());
-        let enrichment_service = EnrichmentService::with_defaults(enrichment_repo);
+        // NAN-1117: the IP enrichment payload + lookups + record-count stat are
+        // ClickHouse-backed. The CH client MUST be attached here, before the
+        // service is wrapped in the shared Arc<RwLock<>> below, because the
+        // auto-sync scheduler (state/schedulers.rs) runs sync_ipinfo_lite
+        // against that same Arc — without it the writer would error.
+        let enrichment_service = EnrichmentService::with_defaults(enrichment_repo)
+            .with_clickhouse(dual_pool.clickhouse().clone());
 
-        // Create identity sync service
-        let identity_repo = IdentityRepository::new(pg_pool.clone());
-        let identity_service = Arc::new(IdentitySyncService::new(identity_repo));
+        // Create identity sync service. NAN-1117: the user_registry directory
+        // feed (the dict payload + browse/lookup/stats reads + soft-delete
+        // writes) is ClickHouse-backed, so the repo needs the CH client. PG is
+        // retained for identity_providers config/creds.
+        let identity_repo =
+            IdentityRepository::new_with_clickhouse(pg_pool.clone(), dual_pool.clickhouse().clone());
+        // NAN-1151: the identity-sync scheduler runs in this service, so the
+        // enrichment-lane client is built from this process's env
+        // (VECTOR_INGEST_URL / VECTOR_AUTH_TOKEN — provisioned in api.yaml +
+        // docker-compose + the dev script).
+        let identity_service = Arc::new(IdentitySyncService::new(
+            identity_repo,
+            nanosiem_core::enrichment::EnrichmentLaneClient::from_env(),
+        ));
 
         // Create lookup service for search enrichment (uses PostgreSQL)
         let lookup_repo = LookupRepository::new(pg_pool.clone());
@@ -170,6 +187,7 @@ impl AppState {
         let case_grouping_hook = nanosiem_enterprise::cases::case_grouping_hook(
             pg_pool.clone(),
             dual_pool.clone(),
+            shadow_investigation.clone(),
         );
 
         // Create signal processor; in enterprise also wire shadow investigation
@@ -196,9 +214,24 @@ impl AppState {
         let mut realtime_evaluator = RealtimeEvaluator::with_dual_pool(&dual_pool);
         #[cfg(feature = "enterprise")]
         {
-            realtime_evaluator.set_shadow_investigation(shadow_investigation);
+            realtime_evaluator.set_shadow_investigation(shadow_investigation.clone());
             realtime_evaluator.set_case_grouping(case_grouping_hook);
         }
+
+        // Trait-object form of the shadow hook stored on AppState so handler-
+        // built CaseService instances can wire it up (NAN-1059 re-triage on
+        // alert add). Enterprise hands over the live service; open-core uses
+        // the no-op so the cases handlers can call into it unconditionally.
+        let shadow_investigation_hook: Arc<dyn nanosiem_core::extensions::ShadowInvestigationHook> = {
+            #[cfg(feature = "enterprise")]
+            {
+                shadow_investigation
+            }
+            #[cfg(not(feature = "enterprise"))]
+            {
+                Arc::new(nanosiem_core::extensions::NoopShadowInvestigationHook)
+            }
+        };
 
         // Create disk pressure service for automatic partition eviction
         let ingestion_paused = Arc::new(AtomicBool::new(false));
@@ -320,6 +353,7 @@ impl AppState {
             ),
             search_result_cache: None,
             rule_test_in_flight: Arc::new(dashmap::DashMap::new()),
+            shadow_investigation_hook,
         }
     }
 

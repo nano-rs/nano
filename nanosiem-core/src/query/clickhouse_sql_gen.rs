@@ -246,11 +246,136 @@ const EXPLICIT_COLUMNS: &[&str] = &[
     "custom_ioc_domain_threat_type",
     "custom_ioc_hash_confidence",
     "custom_ioc_hash_threat_type",
+    // Resolved-identity enrichment (user_registry_dict fills — forward + src/dest).
+    // MATERIALIZED, like enriched_*/ioc_*; must be here too so `user_identity_*=…`
+    // filters route to the column instead of ext JSON (NAN-1154).
+    "user_identity_display_name",
+    "user_identity_title",
+    "user_identity_department",
+    "user_identity_country",
+    "user_identity_employee_type",
+    "user_identity_account_status",
+    "user_identity_mfa_enabled",
+    "user_identity_groups",
+    "src_user_identity_display_name",
+    "src_user_identity_title",
+    "src_user_identity_department",
+    "src_user_identity_country",
+    "src_user_identity_employee_type",
+    "src_user_identity_account_status",
+    "src_user_identity_mfa_enabled",
+    "src_user_identity_groups",
+    "dest_user_identity_display_name",
+    "dest_user_identity_title",
+    "dest_user_identity_department",
+    "dest_user_identity_country",
+    "dest_user_identity_employee_type",
+    "dest_user_identity_account_status",
+    "dest_user_identity_mfa_enabled",
+    "dest_user_identity_groups",
 ];
 
 /// HashSet for O(1) explicit column lookups (initialized lazily)
 static EXPLICIT_COLUMNS_SET: Lazy<HashSet<&'static str>> =
     Lazy::new(|| EXPLICIT_COLUMNS.iter().copied().collect());
+
+/// Columns declared `MATERIALIZED` on the `logs` table (computed at insert — enrichment,
+/// IOC, custom threat-intel, prevalence, process-GUID hashing, and resolved-identity
+/// dictionary fills). ClickHouse excludes MATERIALIZED columns from `SELECT *`, so a
+/// multi-stage CTE chain must re-add them explicitly in stage_0 or any downstream stage
+/// that references one fails with Code 47 (NAN-1147). This is the single source of truth
+/// for that re-add list; ground-truthed against
+/// `system.columns WHERE default_kind='MATERIALIZED'`.
+///
+/// NOT included: `event_type` (an ALIAS — handled via `action AS event_type`) and
+/// regular stored columns like `src_ip`/`prevalence_min` (already in `SELECT *`).
+pub(crate) const MATERIALIZED_COLUMNS: &[&str] = &[
+    // GeoIP / ASN enrichment (dictGet at insert)
+    "enriched_src_country",
+    "enriched_src_country_code",
+    "enriched_src_continent",
+    "enriched_src_continent_code",
+    "enriched_src_asn",
+    "enriched_src_as_name",
+    "enriched_src_as_domain",
+    "enriched_dest_country",
+    "enriched_dest_country_code",
+    "enriched_dest_continent",
+    "enriched_dest_continent_code",
+    "enriched_dest_asn",
+    "enriched_dest_as_name",
+    "enriched_dest_as_domain",
+    // IOC enrichment (threat-intel dict)
+    "ioc_confidence",
+    "ioc_tags",
+    "ioc_source",
+    "ioc_src_ip_threat_type",
+    "ioc_src_ip_malware",
+    "ioc_src_ip_confidence",
+    "ioc_dest_ip_threat_type",
+    "ioc_dest_ip_malware",
+    "ioc_dest_ip_confidence",
+    "ioc_domain_threat_type",
+    "ioc_domain_malware",
+    "ioc_domain_confidence",
+    "ioc_hash_threat_type",
+    "ioc_hash_malware",
+    "ioc_hash_confidence",
+    // Custom (user-defined) threat-intel enrichment
+    "custom_src_ip_risk",
+    "custom_src_ip_tags",
+    "custom_dest_ip_risk",
+    "custom_dest_ip_tags",
+    "custom_domain_risk",
+    "custom_domain_tags",
+    "custom_hash_risk",
+    "custom_hash_tags",
+    "custom_url_risk",
+    "custom_url_tags",
+    "custom_ioc_src_ip_confidence",
+    "custom_ioc_src_ip_malware",
+    "custom_ioc_src_ip_threat_type",
+    "custom_ioc_dest_ip_confidence",
+    "custom_ioc_dest_ip_malware",
+    "custom_ioc_dest_ip_threat_type",
+    "custom_ioc_domain_confidence",
+    "custom_ioc_domain_threat_type",
+    "custom_ioc_hash_confidence",
+    "custom_ioc_hash_threat_type",
+    // Prevalence (dict lookups)
+    "prevalence_file_hash",
+    "prevalence_process_hash",
+    "prevalence_dest_domain",
+    "prevalence_dest_ip",
+    // Process GUID hashing
+    "process_guid",
+    "parent_process_guid",
+    // Resolved-identity dictionary fills (forward + reverse)
+    "user_identity_display_name",
+    "user_identity_title",
+    "user_identity_department",
+    "user_identity_country",
+    "user_identity_employee_type",
+    "user_identity_account_status",
+    "user_identity_mfa_enabled",
+    "user_identity_groups",
+    "src_user_identity_display_name",
+    "src_user_identity_title",
+    "src_user_identity_department",
+    "src_user_identity_country",
+    "src_user_identity_employee_type",
+    "src_user_identity_account_status",
+    "src_user_identity_mfa_enabled",
+    "src_user_identity_groups",
+    "dest_user_identity_display_name",
+    "dest_user_identity_title",
+    "dest_user_identity_department",
+    "dest_user_identity_country",
+    "dest_user_identity_employee_type",
+    "dest_user_identity_account_status",
+    "dest_user_identity_mfa_enabled",
+    "dest_user_identity_groups",
+];
 
 /// Check if a field is an explicit column (direct column access) vs JSON field
 pub(crate) fn is_explicit_column(field: &str) -> bool {
@@ -804,8 +929,14 @@ impl ClickHouseSqlGenerator {
                 ..
             }) = stage
             {
-                materialized_cols.push(escape_identifier(parent_field));
-                materialized_cols.push(escape_identifier(child_field));
+                // Skip fields already re-added by build_select_clause's MATERIALIZED_COLUMNS
+                // list (e.g. process_guid/parent_process_guid) — adding them again would
+                // produce a duplicate column in `SELECT *, ...` (NAN-1147).
+                for f in [parent_field, child_field] {
+                    if !MATERIALIZED_COLUMNS.contains(&f.as_str()) {
+                        materialized_cols.push(escape_identifier(f));
+                    }
+                }
             }
         }
         materialized_cols.sort();
@@ -1226,17 +1357,12 @@ impl ClickHouseSqlGenerator {
                 } else {
                     "* EXCEPT (action), action AS event_type"
                 };
-                let materialized = "enriched_src_country, enriched_src_country_code, \
-                    enriched_src_asn, enriched_src_as_name, enriched_src_as_domain, \
-                    enriched_dest_country, enriched_dest_country_code, \
-                    enriched_dest_asn, enriched_dest_as_name, enriched_dest_as_domain, \
-                    ioc_src_ip_threat_type, ioc_src_ip_malware, ioc_src_ip_confidence, \
-                    ioc_dest_ip_threat_type, ioc_dest_ip_malware, ioc_dest_ip_confidence, \
-                    ioc_domain_threat_type, ioc_domain_malware, ioc_domain_confidence, \
-                    ioc_hash_threat_type, ioc_hash_malware, ioc_hash_confidence, \
-                    ioc_confidence, ioc_tags, ioc_source, \
-                    prevalence_file_hash, prevalence_process_hash, \
-                    prevalence_dest_domain, prevalence_dest_ip";
+                // Re-add every MATERIALIZED column (excluded from `SELECT *`) so any
+                // downstream CTE stage can reference it. Derived from the single
+                // MATERIALIZED_COLUMNS source of truth — the previous hand-maintained
+                // subset dropped enriched_*_continent / custom_* / *_identity_* and any
+                // downstream reference to those hit Code 47 (NAN-1147).
+                let materialized = MATERIALIZED_COLUMNS.join(", ");
 
                 if ext_fields.is_empty() {
                     format!("{}, {}", base, materialized)
@@ -1309,7 +1435,7 @@ impl ClickHouseSqlGenerator {
     /// Generate SQL for a command (public API without context tracking)
     pub fn generate_command_sql(&self, source: &str, cmd: &Command) -> Result<String, SqlGenError> {
         let mut no_ctx: Option<HashSet<String>> = None;
-        self.generate_command_sql_inner(source, cmd, &mut no_ctx, None, false)
+        self.generate_command_sql_inner(source, cmd, &mut no_ctx, None, false, false)
     }
 
     fn generate_command_sql_with_ctx(
@@ -1326,9 +1452,27 @@ impl ClickHouseSqlGenerator {
             &mut ctx.available_columns,
             Some(sparkline_span),
             has_prior_risk,
+            ctx.aggregated,
         );
         if matches!(cmd, Command::Risk { .. }) {
             ctx.has_prior_risk = true;
+        }
+        // Aggregating commands GROUP BY and drop the raw `timestamp` column; mark the
+        // pipeline so downstream order-sensitive commands (tail/reverse) don't ORDER BY
+        // a column that no longer exists (NAN-1146).
+        if matches!(
+            cmd,
+            Command::Stats { .. }
+                | Command::Chart { .. }
+                | Command::Timechart { .. }
+                | Command::Top { .. }
+                | Command::Rare { .. }
+                | Command::Transaction { .. }
+                | Command::Sequence { .. }
+                | Command::Funnel { .. }
+                | Command::Anomaly { .. }
+        ) {
+            ctx.aggregated = true;
         }
         result
     }
@@ -1367,6 +1511,10 @@ struct GeneratorContext<'a> {
     available_columns: Option<HashSet<String>>,
     /// Whether a prior Risk command exists in the pipeline (for score accumulation)
     has_prior_risk: bool,
+    /// Whether a prior aggregating command (stats/chart/timechart/top/rare/transaction/
+    /// sequence/funnel/anomaly) has run — these GROUP BY and drop the raw `timestamp`
+    /// column, so order-sensitive commands (tail/reverse) must not ORDER BY timestamp.
+    aggregated: bool,
 }
 
 impl<'a> GeneratorContext<'a> {
@@ -1381,6 +1529,7 @@ impl<'a> GeneratorContext<'a> {
             ext_fields: HashSet::new(),
             available_columns: None,
             has_prior_risk: false,
+            aggregated: false,
         }
     }
 }
@@ -1509,6 +1658,141 @@ mod tests {
             !last_select.contains("EXCEPT (action)"),
             "outer SELECT after an aggregation must not reference `action`, got:\n{}",
             last_select
+        );
+    }
+
+    // ---- NAN-1026 Phase 2 regression coverage ---------------------------
+    // hasToken*-based codegen silently dropped fragment matches when the needle
+    // wasn't a whole CH token in the data. Phase 2 lowers all alphanumeric
+    // needles to substring iLike instead. These tests pin the bug shapes that
+    // motivated the fix so we don't regress to whole-token semantics.
+
+    /// `src_host = /dc/` must lower to substring iLike, not hasTokenCaseInsensitive.
+    /// Pre-fix: hosts like `srv-dc01.corp.local` tokenize to `[srv, dc01, corp, local]`
+    /// and silently fail the `dc` whole-token check, so all DCs slip through
+    /// "find DCs" / "exclude DCs" filters.
+    #[test]
+    fn regex_fragment_on_udm_field_uses_ilike_not_hastoken() {
+        let query = parse_query("src_host = /dc/").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+
+        assert!(
+            sql.contains("iLike '%dc%'"),
+            "expected substring iLike, got:\n{}",
+            sql
+        );
+        assert!(
+            !sql.contains("hasToken"),
+            "must NOT lower to any hasToken variant (silently drops `dc` inside `dc01`), got:\n{}",
+            sql
+        );
+    }
+
+    /// `src_host != /ws/` should NOT iLike — same fragment concern, just negated.
+    /// Pre-fix: workstations `ws-mkt-088` were correctly excluded but WSUS hosts
+    /// `srv-wsus01` (tokens `[srv, wsus01, corp, local]`) leaked through because
+    /// `ws` isn't a whole token there.
+    #[test]
+    fn negated_regex_fragment_on_udm_field_uses_not_ilike() {
+        let query = parse_query("src_host != /ws/").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+
+        assert!(
+            sql.contains("NOT iLike '%ws%'"),
+            "expected NOT iLike on substring, got:\n{}",
+            sql
+        );
+        assert!(
+            !sql.contains("hasToken"),
+            "must NOT lower to NOT hasTokenCaseInsensitive (leaked WSUS), got:\n{}",
+            sql
+        );
+    }
+
+    /// `message contains "anom"` must match "anomalous" rows.
+    /// The `rules/credential_access/golden_ticket.yml` rule literally has this
+    /// pattern and was silently returning 0 hits under hasToken.
+    #[test]
+    fn contains_fragment_on_message_uses_ilike_not_hastoken() {
+        let query = parse_query("message contains \"anom\"").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+
+        assert!(
+            sql.contains("lower(message) iLike '%anom%'"),
+            "expected substring iLike on message, got:\n{}",
+            sql
+        );
+        assert!(
+            !sql.contains("hasToken"),
+            "must NOT lower to hasToken (would never match `anomalous` rows), got:\n{}",
+            sql
+        );
+    }
+
+    /// Bare keyword `anom` (no field qualifier) must also use iLike.
+    /// Same surface as CONTAINS — the bare-keyword codegen path was the third
+    /// site emitting hasToken on alphanumeric needles.
+    #[test]
+    fn bare_keyword_fragment_uses_ilike_not_hastoken() {
+        let query = parse_query("anom").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+
+        assert!(
+            sql.contains("lower(message) iLike '%anom%'"),
+            "expected substring iLike on message, got:\n{}",
+            sql
+        );
+        assert!(
+            !sql.contains("hasToken"),
+            "must NOT lower to hasToken, got:\n{}",
+            sql
+        );
+    }
+
+    /// Whole-token analyst patterns (`mimikatz`, `kerberos`) still work — same
+    /// iLike codegen now, splitByNonAlpha + LIKE-via-dictionary-scan keeps perf
+    /// in the same ballpark as the prior hasToken path.
+    #[test]
+    fn bare_whole_token_keyword_uses_ilike() {
+        let query = parse_query("mimikatz").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+
+        assert!(
+            sql.contains("lower(message) iLike '%mimikatz%'"),
+            "whole-token keyword should still lower to iLike (same codegen), got:\n{}",
+            sql
+        );
+    }
+
+    /// Special-char keywords (paths, IPs) collapse to a single iLike — the
+    /// pre-fix bloom-guard + iLike pair becomes redundant once iLike is itself
+    /// index-accelerated.
+    #[test]
+    fn bare_special_char_keyword_uses_single_ilike() {
+        let query = parse_query("cmd.exe").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+
+        assert!(
+            sql.contains("lower(message) iLike '%cmd.exe%'"),
+            "special-char keyword should iLike the full pattern, got:\n{}",
+            sql
+        );
+        assert!(
+            !sql.contains(" AND lower(message) iLike "),
+            "should NOT emit a redundant bloom-guard iLike alongside the main one, got:\n{}",
+            sql
         );
     }
 }

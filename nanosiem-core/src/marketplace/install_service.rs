@@ -268,12 +268,36 @@ impl MarketplaceInstallService {
         Ok(updated)
     }
 
-    /// Update credentials for an installed enrichment
+    /// Update credentials for an installed enrichment.
+    ///
+    /// Returns early without writing if the request body contains no real
+    /// credential material — i.e. every string value is empty or a masked
+    /// sentinel placeholder like `***` or `••••••••`. NAN-1107: this guards
+    /// against the configure flow re-POSTing the form (after an unrelated
+    /// click such as Apply/Activate) with the masked-display value populated,
+    /// which would otherwise re-encrypt the placeholder and silently destroy
+    /// the previously saved real key. The frontend should never send those
+    /// values, but pinning the contract here makes the data-loss class
+    /// impossible to reintroduce via any future frontend regression.
     pub async fn update_credentials(
         &self,
         slug: &str,
         credentials: &serde_json::Value,
     ) -> Result<(), MarketplaceError> {
+        if credentials_payload_is_masked_or_empty(credentials) {
+            // Promoted from info! — under correct frontend operation the
+            // handler skips calling us when no credentials field is in the
+            // request. Reaching this branch means a frontend round-tripped
+            // its stale masked-display state, which is the same upstream
+            // bug class NAN-1107 was filed for. Worth a warn-level
+            // breadcrumb so the next regression is loud, not silent.
+            tracing::warn!(
+                slug = %slug,
+                "Skipping credential update — payload contains only empty values or masked placeholders (NAN-1107)"
+            );
+            return Ok(());
+        }
+
         let entry = self.repository.get_catalog_entry(slug).await?;
 
         // Encrypt and store on marketplace_catalog
@@ -479,5 +503,162 @@ impl MarketplaceInstallService {
                 .await?;
         }
         Ok(())
+    }
+}
+
+/// Characters that frontend secret fields use to render "a secret is already
+/// configured" without revealing the real value. A string is considered a
+/// masked placeholder when it is non-empty and consists *only* of these
+/// characters. The character-class check is intentionally length-agnostic so
+/// any future UI that masks by typed-length (e.g., one `•` per character)
+/// still routes through the skip. Common examples actually shipped today:
+/// `••••••••` (8 bullets, used by MarketplaceDrawer + ThreatFoxProvider),
+/// `***`, `****`. Real credentials almost never consist solely of these
+/// characters, so false-positive risk is negligible.
+const MASK_CHARS: &[char] = &['*', '•', '●'];
+
+fn is_masked_sentinel(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty() && trimmed.chars().all(|c| MASK_CHARS.contains(&c))
+}
+
+/// Returns true when the credentials payload contains no real material — i.e.
+/// every string value is empty, whitespace-only, null, or consists only of
+/// masking characters (see [`MASK_CHARS`]). Non-string, non-null values
+/// (numbers, bools, nested objects) are treated as real data so legitimate
+/// non-string config isn't silently dropped.
+fn credentials_payload_is_masked_or_empty(credentials: &serde_json::Value) -> bool {
+    let Some(obj) = credentials.as_object() else {
+        // A non-object payload is unusual; let the caller's existing
+        // encrypt path handle it rather than silently swallowing.
+        return false;
+    };
+
+    if obj.is_empty() {
+        return true;
+    }
+
+    obj.values().all(|v| match v {
+        serde_json::Value::String(s) => s.trim().is_empty() || is_masked_sentinel(s),
+        serde_json::Value::Null => true,
+        // Non-string, non-null values count as real material.
+        _ => false,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn empty_object_is_masked_or_empty() {
+        assert!(credentials_payload_is_masked_or_empty(&json!({})));
+    }
+
+    #[test]
+    fn all_empty_strings_is_masked_or_empty() {
+        assert!(credentials_payload_is_masked_or_empty(
+            &json!({"API_KEY": "", "OTHER": ""})
+        ));
+    }
+
+    #[test]
+    fn masked_sentinel_strings_count_as_empty() {
+        assert!(credentials_payload_is_masked_or_empty(
+            &json!({"API_KEY": "••••••••"})
+        ));
+        assert!(credentials_payload_is_masked_or_empty(
+            &json!({"API_KEY": "***", "TOKEN": "••••••••"})
+        ));
+    }
+
+    #[test]
+    fn masked_sentinel_is_length_agnostic() {
+        // P2 follow-up: the original enumerated-list approach would have
+        // missed length variants. A 9-bullet, 13-bullet, or 32-star sentinel
+        // (the kind a "mask each typed char" UI might produce) must also
+        // route through the skip.
+        for n in 1..=64 {
+            let bullets: String = "•".repeat(n);
+            let stars: String = "*".repeat(n);
+            assert!(
+                credentials_payload_is_masked_or_empty(&json!({"API_KEY": bullets})),
+                "{} bullets should count as masked",
+                n
+            );
+            assert!(
+                credentials_payload_is_masked_or_empty(&json!({"API_KEY": stars})),
+                "{} stars should count as masked",
+                n
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_mask_characters_count_as_masked() {
+        // Don't care which mask char a future UI picks; we'd rather skip
+        // than overwrite.
+        assert!(credentials_payload_is_masked_or_empty(
+            &json!({"API_KEY": "•*●•*"})
+        ));
+    }
+
+    #[test]
+    fn real_credential_starting_with_mask_char_is_not_skipped() {
+        // Avoid the false-positive where someone's real key happens to lead
+        // with `*` — the trailing alphanumeric breaks the all-mask check.
+        assert!(!credentials_payload_is_masked_or_empty(&json!({
+            "API_KEY": "***real-value***"
+        })));
+    }
+
+    #[test]
+    fn null_values_count_as_empty() {
+        assert!(credentials_payload_is_masked_or_empty(
+            &json!({"API_KEY": null})
+        ));
+    }
+
+    #[test]
+    fn whitespace_only_strings_count_as_empty() {
+        assert!(credentials_payload_is_masked_or_empty(
+            &json!({"API_KEY": "   "})
+        ));
+    }
+
+    #[test]
+    fn real_credential_is_not_masked_or_empty() {
+        // A 48-char abuse.ch-style key.
+        assert!(!credentials_payload_is_masked_or_empty(&json!({
+            "API_KEY": "e6c7e5ed3c360c53e8fc66228751af99a21c45788fea66ad"
+        })));
+    }
+
+    #[test]
+    fn mixed_real_and_masked_is_treated_as_real() {
+        // A POST that re-sends some masked fields but also includes a real
+        // new value should still write — the user provided real material.
+        assert!(!credentials_payload_is_masked_or_empty(&json!({
+            "API_KEY": "real-value",
+            "REGION": "••••••••"
+        })));
+    }
+
+    #[test]
+    fn non_string_value_counts_as_real() {
+        // Numeric/bool credential configs (rare, but allowed) must not be
+        // silently dropped by the guard.
+        assert!(!credentials_payload_is_masked_or_empty(
+            &json!({"TIMEOUT_SECS": 30})
+        ));
+    }
+
+    #[test]
+    fn non_object_payload_does_not_skip() {
+        // Defensive: a non-object body falls through to the existing
+        // encrypt path rather than being silently swallowed.
+        assert!(!credentials_payload_is_masked_or_empty(&json!("string-body")));
+        assert!(!credentials_payload_is_masked_or_empty(&json!([1, 2, 3])));
     }
 }

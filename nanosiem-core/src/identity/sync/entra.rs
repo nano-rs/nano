@@ -6,13 +6,10 @@
 //! Supports both full sync and delta (incremental) sync via delta queries.
 
 use async_trait::async_trait;
-use sha2::{Digest, Sha256};
 use tracing::{info, instrument, warn};
 
 use super::{SyncError, SyncProvider};
-use crate::identity::types::{
-    ConnectionTestResult, DeltaSyncResult, EntraIdCredentials, UserRecordUpsert,
-};
+use crate::identity::types::{ConnectionTestResult, DeltaSyncResult, EntraIdCredentials};
 
 pub struct EntraIdSync {
     client: reqwest::Client,
@@ -74,71 +71,12 @@ impl EntraIdSync {
          accountEnabled,createdDateTime,signInActivity"
     }
 
-    /// Convert a MS Graph user JSON object to a UserRecordUpsert
-    fn map_graph_user(user: &serde_json::Value) -> Option<UserRecordUpsert> {
-        let external_id = user["id"].as_str()?.to_string();
-        let upn = user["userPrincipalName"].as_str().map(|s| s.to_string());
-        let username = upn
-            .as_ref()
-            .map(|u| u.split('@').next().unwrap_or(u).to_string());
-
-        let account_enabled = user["accountEnabled"].as_bool().unwrap_or(true);
-        let account_status = if account_enabled {
-            "active"
-        } else {
-            "disabled"
-        }
-        .to_string();
-
-        let last_sign_in = user["signInActivity"]["lastSignInDateTime"]
-            .as_str()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
-
-        let created_at = user["createdDateTime"]
-            .as_str()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
-
-        // Compute sync hash from the raw user object
-        let raw = serde_json::to_string(user).unwrap_or_default();
-        let hash = hex::encode(Sha256::digest(raw.as_bytes()));
-
-        Some(UserRecordUpsert {
-            external_id,
-            username,
-            upn,
-            email: user["mail"].as_str().map(|s| s.to_string()),
-            display_name: user["displayName"].as_str().map(|s| s.to_string()),
-            first_name: user["givenName"].as_str().map(|s| s.to_string()),
-            last_name: user["surname"].as_str().map(|s| s.to_string()),
-            department: user["department"].as_str().map(|s| s.to_string()),
-            title: user["jobTitle"].as_str().map(|s| s.to_string()),
-            manager_upn: None, // Populated via separate manager expansion
-            manager_display_name: None,
-            company: user["companyName"].as_str().map(|s| s.to_string()),
-            office_location: user["officeLocation"].as_str().map(|s| s.to_string()),
-            city: user["city"].as_str().map(|s| s.to_string()),
-            country: user["country"].as_str().map(|s| s.to_string()),
-            groups: Vec::new(), // Populated via separate group membership call
-            account_enabled,
-            account_status,
-            mfa_enabled: None, // Requires separate authentication methods API
-            last_sign_in_at: last_sign_in,
-            created_in_directory_at: created_at,
-            phone: user["mobilePhone"].as_str().map(|s| s.to_string()),
-            employee_id: user["employeeId"].as_str().map(|s| s.to_string()),
-            employee_type: user["employeeType"].as_str().map(|s| s.to_string()),
-            sync_hash: hash,
-        })
-    }
-
-    /// Fetch a single page from the Graph API and return parsed users + next URL
+    /// Fetch a single page from the Graph API and return raw user objects + next URL
     async fn fetch_page(
         &self,
         token: &str,
         url: &str,
-    ) -> Result<(Vec<UserRecordUpsert>, Option<String>), SyncError> {
+    ) -> Result<(Vec<serde_json::Value>, Option<String>), SyncError> {
         let resp = self
             .client
             .get(url)
@@ -176,9 +114,7 @@ impl EntraIdSync {
         let mut users = Vec::new();
         if let Some(values) = body["value"].as_array() {
             for user in values {
-                if let Some(record) = Self::map_graph_user(user) {
-                    users.push(record);
-                }
+                users.push(user.clone());
             }
         }
 
@@ -212,7 +148,7 @@ impl SyncProvider for EntraIdSync {
         &self,
         credentials: &serde_json::Value,
         config: &serde_json::Value,
-    ) -> Result<Vec<UserRecordUpsert>, SyncError> {
+    ) -> Result<Vec<serde_json::Value>, SyncError> {
         let creds: EntraIdCredentials = serde_json::from_value(credentials.clone())
             .map_err(|e| SyncError::InvalidCredentials(e.to_string()))?;
 
@@ -322,9 +258,7 @@ impl SyncProvider for EntraIdSync {
 
             if let Some(values) = body["value"].as_array() {
                 for user in values {
-                    if let Some(record) = Self::map_graph_user(user) {
-                        users.push(record);
-                    }
+                    users.push(user.clone());
                 }
             }
 

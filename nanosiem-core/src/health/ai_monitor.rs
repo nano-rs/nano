@@ -55,11 +55,22 @@ impl AiMonitor {
 
     /// Get list of enabled providers from database
     async fn get_enabled_providers(&self) -> Result<Vec<ProviderInfo>, sqlx::Error> {
+        // `credentials_encrypted` is a nullable BYTEA, and some enabled
+        // providers legitimately store NULL: Workers AI authenticates via the
+        // same-account Cloudflare AI Gateway and needs no api_key (migration
+        // 142; mirrored by credential_resolver's `workers-ai` branch). A
+        // provider can also be enabled before a key is set. Either way it has
+        // no api_key to connectivity-test, so skip it in SQL. This also avoids
+        // `Row::get` decoding a NULL into `Vec<u8>` and panicking — that panic
+        // aborted the whole nanosiem-jobs worker and crashlooped every
+        // background scheduler (enrichment auto-sync, identity/parser/rule/
+        // marketplace sync) (NAN-1102).
         let rows = sqlx::query(
             r#"
             SELECT provider, display_name, config, credentials_encrypted
             FROM provider_credentials
             WHERE enabled = true
+              AND credentials_encrypted IS NOT NULL
             "#,
         )
         .fetch_all(&self.pool)
@@ -67,11 +78,17 @@ impl AiMonitor {
 
         Ok(rows
             .iter()
-            .map(|r| ProviderInfo {
-                provider: r.get("provider"),
-                display_name: r.get("display_name"),
-                config: r.get("config"),
-                credentials_encrypted: r.get("credentials_encrypted"),
+            // Defense-in-depth: `try_get` so an unexpectedly-NULL credentials
+            // column skips the row instead of panicking the health monitor.
+            .filter_map(|r| {
+                let credentials_encrypted: Vec<u8> =
+                    r.try_get("credentials_encrypted").ok()?;
+                Some(ProviderInfo {
+                    provider: r.get("provider"),
+                    display_name: r.get("display_name"),
+                    config: r.get("config"),
+                    credentials_encrypted,
+                })
             })
             .collect())
     }

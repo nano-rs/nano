@@ -193,9 +193,13 @@ impl AnonymizationService {
             }
         };
 
-        // Also update PostgreSQL user_registry if applicable
+        // Also anonymize the user_registry directory feed if applicable
+        // (NAN-1117: moved PG -> ClickHouse).
         if result.is_ok() {
-            if let Err(e) = self.anonymize_user_registry(&request).await {
+            if let Err(e) = self
+                .anonymize_user_registry(ch, &salt, &request, &mut mutation_ids)
+                .await
+            {
                 warn!(error = %e, "Failed to anonymize user_registry (non-fatal)");
             }
         }
@@ -423,26 +427,24 @@ impl AnonymizationService {
         id_type: IdentifierType,
         value: &str,
     ) -> Result<i64, AnonymizationError> {
-        let lower_val = value.to_lowercase();
-        let count: (i64,) = match id_type {
-            IdentifierType::Username => sqlx::query_as(
-                "SELECT COUNT(*) FROM user_registry WHERE lower(username) = $1 OR lower(upn) = $1",
-            )
-            .bind(&lower_val)
-            .fetch_one(&self.pool)
-            .await?,
-            IdentifierType::Email => {
-                sqlx::query_as("SELECT COUNT(*) FROM user_registry WHERE lower(email) = $1")
-                    .bind(&lower_val)
-                    .fetch_one(&self.pool)
-                    .await?
-            }
+        // NAN-1117: user_registry payload moved PG -> ClickHouse. Count over the
+        // deduped (FINAL) set using the materialized lowercase lookup columns.
+        let ch = self.clickhouse();
+        let escaped = Self::escape_ch_string(&value.to_lowercase());
+        let sql = match id_type {
+            IdentifierType::Username => format!(
+                "SELECT count() FROM nanosiem.user_registry FINAL \
+                 WHERE username_lc = '{escaped}' OR upn_lc = '{escaped}'"
+            ),
+            IdentifierType::Email => format!(
+                "SELECT count() FROM nanosiem.user_registry FINAL WHERE email_lc = '{escaped}'"
+            ),
             IdentifierType::Ip => {
                 // user_registry doesn't contain IP addresses
                 return Ok(0);
             }
         };
-        Ok(count.0)
+        self.ch_count(ch, &sql).await
     }
 
     async fn ch_count(
@@ -718,46 +720,65 @@ impl AnonymizationService {
         Ok(())
     }
 
-    /// Anonymize user_registry entries in PostgreSQL.
+    /// Anonymize user_registry entries in ClickHouse (NAN-1117: payload moved
+    /// PG -> CH ReplacingMergeTree).
     ///
-    /// At execute time we only have the salted hash (plaintext discarded).
-    /// Uses pgcrypto: encode(digest(salt || lower(field), 'sha256'), 'hex')
-    /// to match rows — same function as ClickHouse and Rust.
+    /// At execute time we only have the salted hash (plaintext discarded). We
+    /// reproduce the same salt-hash CH-side — lower(hex(SHA256(concat(salt,
+    /// lower(field))))) — exactly as the logs/observations anonymizers do, so
+    /// the WHERE matches the right rows. ReplacingMergeTree has no in-place
+    /// UPDATE, so this is an `ALTER TABLE ... UPDATE` mutation: rare/low-volume
+    /// for GDPR, acceptable per the same approach used for the logs table. The
+    /// mutation rewrites every matching part (including any superseded
+    /// versions), guaranteeing erasure regardless of merge state.
     async fn anonymize_user_registry(
         &self,
+        ch: &clickhouse::Client,
+        salt: &str,
         request: &AnonymizationRequest,
+        mutation_ids: &mut Vec<String>,
     ) -> Result<(), AnonymizationError> {
-        let salt = self.load_salt().await?;
         let anon = &request.identifier_hash;
+        let salt_escaped = salt.replace('\'', "\\'");
 
-        let sql = match request.identifier_type {
-            IdentifierType::Username => {
-                r#"
-                UPDATE user_registry
-                SET username = $1, upn = $1, display_name = $1,
-                    first_name = '', last_name = '',
-                    account_status = 'anonymized', updated_at = NOW()
-                WHERE encode(digest($2 || lower(username), 'sha256'), 'hex') = $1
-                   OR encode(digest($2 || lower(upn), 'sha256'), 'hex') = $1
-                "#
-            }
-            IdentifierType::Email => {
-                r#"
-                UPDATE user_registry
-                SET email = $1, display_name = $1,
-                    first_name = '', last_name = '',
-                    account_status = 'anonymized', updated_at = NOW()
-                WHERE encode(digest($2 || lower(email), 'sha256'), 'hex') = $1
-                "#
-            }
+        // Anonymized identifiers are hex SHA256 — safe to splice, but escape
+        // defensively to be uniform with the rest of this module.
+        let anon_escaped = Self::escape_ch_string(anon);
+
+        let (set_clause, where_clause) = match request.identifier_type {
+            IdentifierType::Username => (
+                format!(
+                    "username = '{anon_escaped}', upn = '{anon_escaped}', \
+                     display_name = '{anon_escaped}', first_name = '', last_name = '', \
+                     account_status = 'anonymized'"
+                ),
+                format!(
+                    "lower(hex(SHA256(concat('{salt_escaped}', lower(username))))) = '{anon_escaped}' \
+                     OR lower(hex(SHA256(concat('{salt_escaped}', lower(upn))))) = '{anon_escaped}'"
+                ),
+            ),
+            IdentifierType::Email => (
+                format!(
+                    "email = '{anon_escaped}', display_name = '{anon_escaped}', \
+                     first_name = '', last_name = '', account_status = 'anonymized'"
+                ),
+                format!(
+                    "lower(hex(SHA256(concat('{salt_escaped}', lower(email))))) = '{anon_escaped}'"
+                ),
+            ),
             IdentifierType::Ip => return Ok(()),
         };
 
-        sqlx::query(sql)
-            .bind(anon)
-            .bind(&salt)
-            .execute(&self.pool)
-            .await?;
+        let mutation_id = format!("gdpr_user_registry_{}", Uuid::now_v7().simple());
+        let sql = format!(
+            "ALTER TABLE nanosiem.user_registry UPDATE {set_clause} \
+             WHERE {where_clause} SETTINGS mutations_sync = 0"
+        );
+        ch.query(&sql)
+            .execute()
+            .await
+            .map_err(|e| AnonymizationError::ClickHouse(e.to_string()))?;
+        mutation_ids.push(mutation_id);
 
         Ok(())
     }

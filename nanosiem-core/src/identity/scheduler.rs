@@ -23,6 +23,11 @@ pub struct IdentitySyncSchedulerConfig {
     pub stale_sync_timeout_minutes: i64,
     /// Minimum time between sync attempts after a failure (minutes)
     pub failure_cooldown_minutes: i64,
+    /// NAN-1151: how many sync intervals an account may go unseen before the
+    /// staleness reconciler tombstones it. Must be ≥2 so a still-active account
+    /// (whose latest landed sync is ≤1 interval old) is never false-deleted
+    /// while an in-flight async-lane emit is still settling.
+    pub staleness_multiplier: u64,
 }
 
 impl Default for IdentitySyncSchedulerConfig {
@@ -32,8 +37,22 @@ impl Default for IdentitySyncSchedulerConfig {
             default_sync_interval_hours: 6,
             stale_sync_timeout_minutes: 30,
             failure_cooldown_minutes: 30,
+            staleness_multiplier: 3,
         }
     }
+}
+
+/// Staleness cutoff: accounts whose latest `last_synced_at` is older than this
+/// are considered deprovisioned. Pure (testable) — `multiplier` is clamped to
+/// ≥2 so a misconfigured `1` can't collapse the safety margin and false-delete
+/// active accounts whose async-lane emit hasn't landed yet.
+fn staleness_cutoff(
+    now: chrono::DateTime<Utc>,
+    sync_interval_hours: u64,
+    multiplier: u64,
+) -> chrono::DateTime<Utc> {
+    let mult = multiplier.max(2);
+    now - chrono::Duration::hours((sync_interval_hours.max(1) * mult) as i64)
 }
 
 pub struct IdentitySyncScheduler {
@@ -98,8 +117,43 @@ impl IdentitySyncScheduler {
                     }
                 }
             }
+            // NAN-1151: staleness reconciliation runs independently of the sync
+            // trigger above — deprovisioning is now "not seen in N intervals",
+            // not "not in this sync", so it must not be gated on needs_sync.
+            self.reconcile_provider(&provider).await;
         }
         Ok(())
+    }
+
+    /// Age out directory accounts a pull provider hasn't re-synced within its
+    /// staleness window. No-op for AD (push-based, external cadence), disabled/
+    /// credential-less providers, and providers that have never synced.
+    async fn reconcile_provider(&self, provider: &IdentityProvider) {
+        if !provider.enabled
+            || !provider.has_credentials()
+            || provider.provider_type == "active_directory"
+            || provider.last_sync_at.is_none()
+        {
+            return;
+        }
+        let cutoff = staleness_cutoff(
+            Utc::now(),
+            self.sync_interval_hours(provider),
+            self.config.staleness_multiplier,
+        );
+        if let Err(e) = self.service.reconcile_stale_users(&provider.id, cutoff).await {
+            warn!(provider_id = %provider.id, error = %e, "Staleness reconciliation failed");
+        }
+    }
+
+    /// Per-provider sync interval (hours), falling back to the scheduler default.
+    fn sync_interval_hours(&self, provider: &IdentityProvider) -> u64 {
+        provider
+            .config
+            .as_ref()
+            .and_then(|c| c.get("sync_interval_hours"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(self.config.default_sync_interval_hours)
     }
 
     fn needs_sync(&self, provider: &IdentityProvider) -> bool {
@@ -145,12 +199,7 @@ impl IdentitySyncScheduler {
         }
 
         // Get sync interval from config
-        let sync_interval_hours = provider
-            .config
-            .as_ref()
-            .and_then(|c| c.get("sync_interval_hours"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(self.config.default_sync_interval_hours);
+        let sync_interval_hours = self.sync_interval_hours(provider);
 
         // Check last sync time
         match provider.last_sync_at {
@@ -160,5 +209,34 @@ impl IdentitySyncScheduler {
                 hours_since >= sync_interval_hours as i64
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::staleness_cutoff;
+    use chrono::{Duration, TimeZone, Utc};
+
+    #[test]
+    fn staleness_cutoff_is_interval_times_multiplier() {
+        let now = Utc.timestamp_opt(1_717_000_000, 0).unwrap();
+        // 6h interval × 3 = 18h window.
+        assert_eq!(staleness_cutoff(now, 6, 3), now - Duration::hours(18));
+    }
+
+    #[test]
+    fn staleness_cutoff_clamps_multiplier_to_two() {
+        // A misconfigured multiplier of 1 (or 0) would collapse the safety
+        // margin and risk false-deleting active accounts mid-emit; clamp to 2.
+        let now = Utc.timestamp_opt(1_717_000_000, 0).unwrap();
+        assert_eq!(staleness_cutoff(now, 6, 1), now - Duration::hours(12));
+        assert_eq!(staleness_cutoff(now, 6, 0), now - Duration::hours(12));
+    }
+
+    #[test]
+    fn staleness_cutoff_clamps_zero_interval() {
+        let now = Utc.timestamp_opt(1_717_000_000, 0).unwrap();
+        // interval 0 → treated as 1h; ×2 (clamped mult) = 2h.
+        assert_eq!(staleness_cutoff(now, 0, 2), now - Duration::hours(2));
     }
 }

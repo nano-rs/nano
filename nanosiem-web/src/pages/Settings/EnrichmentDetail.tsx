@@ -17,32 +17,27 @@ import { Loader2, ArrowLeft } from 'lucide-react';
 import { api, EnrichmentSource } from '@/lib/api';
 import { useToast } from '@/hooks/use-toast';
 
-// Import provider components
-import { IPinfoLiteProvider, ThreatFoxProvider, TorExitNodesProvider } from '@/components/enrichment/providers';
+// NAN-1111: ThreatFox + Tor moved to the marketplace; their provider
+// components were deleted from this directory. IPinfo Lite stays
+// native — see project_ipinfo_lite_stays_native memory for the
+// volume + schema rationale. The /enrichments/{threatfox,tor_exit_nodes}
+// deep-links are redirected to /marketplace?slug=... in App.tsx
+// (LegacyEnrichmentRoute) before this page ever renders, so the
+// dispatch table only needs to cover the still-native sources.
+import { IPinfoLiteProvider } from '@/components/enrichment/providers';
 
 type ProviderComponentType = React.ComponentType<{
   source: EnrichmentSource;
   onRefresh: () => void;
 }>;
 
-// Provider component mapping by source type
+// Provider component mapping by source type (still-native sources only).
 const PROVIDER_BY_TYPE: Record<string, ProviderComponentType> = {
   'ipinfo_lite': IPinfoLiteProvider,
 };
 
-// Provider component mapping by source ID (for sources with shared types like ioc_feed)
-const PROVIDER_BY_ID: Record<string, ProviderComponentType> = {
-  'threatfox': ThreatFoxProvider,
-  'tor_exit_nodes': TorExitNodesProvider,
-};
-
 // Helper to get the right provider component
 function getProviderComponent(source: EnrichmentSource): ProviderComponentType | undefined {
-  // First check by ID (more specific)
-  if (PROVIDER_BY_ID[source.id]) {
-    return PROVIDER_BY_ID[source.id];
-  }
-  // Then fall back to type
   return PROVIDER_BY_TYPE[source.source_type];
 }
 

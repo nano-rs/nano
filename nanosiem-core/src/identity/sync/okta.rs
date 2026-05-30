@@ -6,13 +6,10 @@
 //! Supports full sync and delta sync via `lastUpdated` filter.
 
 use async_trait::async_trait;
-use sha2::{Digest, Sha256};
 use tracing::{info, instrument};
 
 use super::{SyncError, SyncProvider};
-use crate::identity::types::{
-    ConnectionTestResult, DeltaSyncResult, OktaCredentials, UserRecordUpsert,
-};
+use crate::identity::types::{ConnectionTestResult, DeltaSyncResult, OktaCredentials};
 
 pub struct OktaSync {
     client: reqwest::Client,
@@ -33,80 +30,6 @@ impl OktaSync {
         format!("https://{}/api/v1/users", domain)
     }
 
-    /// Convert an Okta user JSON object to a UserRecordUpsert
-    fn map_okta_user(user: &serde_json::Value) -> Option<UserRecordUpsert> {
-        let external_id = user["id"].as_str()?.to_string();
-        let profile = &user["profile"];
-
-        let login = profile["login"].as_str().map(|s| s.to_string());
-        let username = login
-            .as_ref()
-            .map(|l| l.split('@').next().unwrap_or(l).to_string());
-
-        let display_name = profile["displayName"]
-            .as_str()
-            .map(|s| s.to_string())
-            .or_else(|| {
-                let first = profile["firstName"].as_str().unwrap_or("");
-                let last = profile["lastName"].as_str().unwrap_or("");
-                if first.is_empty() && last.is_empty() {
-                    None
-                } else {
-                    Some(format!("{} {}", first, last).trim().to_string())
-                }
-            });
-
-        let account_enabled = user["status"].as_str().map_or(true, |s| s == "ACTIVE");
-        let account_status = if account_enabled {
-            "active"
-        } else {
-            "disabled"
-        }
-        .to_string();
-
-        let last_login = user["lastLogin"]
-            .as_str()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
-
-        let created_at = user["created"]
-            .as_str()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
-
-        // Compute sync hash from the raw user object
-        let raw = serde_json::to_string(user).unwrap_or_default();
-        let hash = hex::encode(Sha256::digest(raw.as_bytes()));
-
-        Some(UserRecordUpsert {
-            external_id,
-            username,
-            upn: login,
-            email: profile["email"].as_str().map(|s| s.to_string()),
-            display_name,
-            first_name: profile["firstName"].as_str().map(|s| s.to_string()),
-            last_name: profile["lastName"].as_str().map(|s| s.to_string()),
-            department: profile["department"].as_str().map(|s| s.to_string()),
-            title: profile["title"].as_str().map(|s| s.to_string()),
-            manager_upn: profile["manager"].as_str().map(|s| s.to_string()),
-            manager_display_name: None,
-            company: profile["organization"].as_str().map(|s| s.to_string()),
-            office_location: None,
-            city: profile["city"].as_str().map(|s| s.to_string()),
-            country: profile["countryCode"].as_str().map(|s| s.to_string()),
-            groups: Vec::new(), // Requires per-user API call — skipped for now
-            account_enabled,
-            account_status,
-            mfa_enabled: None, // Requires per-user factors API — skipped for now
-            last_sign_in_at: last_login,
-            created_in_directory_at: created_at,
-            phone: profile["mobilePhone"].as_str().map(|s| s.to_string()),
-            employee_id: profile["employeeNumber"].as_str().map(|s| s.to_string()),
-            employee_type: profile["userType"].as_str().map(|s| s.to_string()),
-            sync_hash: hash,
-        })
-    }
-
     /// Parse the `after` cursor from the Link header for pagination.
     /// Okta returns: `<https://domain/api/v1/users?after=xyz>; rel="next"`
     fn parse_next_link(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -123,12 +46,12 @@ impl OktaSync {
         None
     }
 
-    /// Fetch a single page from the Okta API and return parsed users + next URL
+    /// Fetch a single page from the Okta API and return raw user Values + next URL
     async fn fetch_page(
         &self,
         creds: &OktaCredentials,
         url: &str,
-    ) -> Result<(Vec<UserRecordUpsert>, Option<String>), SyncError> {
+    ) -> Result<(Vec<serde_json::Value>, Option<String>), SyncError> {
         let resp = self
             .client
             .get(url)
@@ -183,9 +106,7 @@ impl OktaSync {
         let mut users = Vec::new();
         if let Some(arr) = body.as_array() {
             for user in arr {
-                if let Some(record) = Self::map_okta_user(user) {
-                    users.push(record);
-                }
+                users.push(user.clone());
             }
         }
 
@@ -200,7 +121,7 @@ impl SyncProvider for OktaSync {
         &self,
         credentials: &serde_json::Value,
         _config: &serde_json::Value,
-    ) -> Result<Vec<UserRecordUpsert>, SyncError> {
+    ) -> Result<Vec<serde_json::Value>, SyncError> {
         let creds: OktaCredentials = serde_json::from_value(credentials.clone())
             .map_err(|e| SyncError::InvalidCredentials(e.to_string()))?;
 

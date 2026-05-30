@@ -485,7 +485,7 @@ async fn query_log_sources(
 
 // Lane classification is shared with `service::asset`'s event-type classifier
 // — see `search::classification` for the single source of truth.
-use crate::search::classification::LANE_SQL;
+use crate::search::classification::{AUTH_PREDICATE, FILE_PREDICATE, LANE_SQL};
 
 async fn query_timeline(
     ch: &clickhouse::Client,
@@ -785,8 +785,11 @@ async fn query_auth(
     start: &str,
     end: &str,
 ) -> AssetAuthSummary {
-    // Treat auth as events where auth_result != '' or action/source_type hints at logon.
-    let auth_predicate = "(auth_result != '' OR lower(source_type) LIKE '%auth%' OR position(lower(action), 'logon') > 0 OR position(lower(action), 'login') > 0)";
+    // Auth membership uses the shared classifier predicate so dossier counts
+    // and drilldown queries operate on the same row set (NAN-1049). Refining
+    // sub-predicates (interactive / network logon type) stay local because
+    // they're auth-internal and not part of the cross-module classifier.
+    let auth_predicate = AUTH_PREDICATE;
     let interactive_predicate = "(lower(auth_type) = 'interactive' OR position(lower(action), 'interactive') > 0)";
     let network_predicate = "(lower(auth_type) = 'network' OR position(lower(action), 'network') > 0)";
 
@@ -878,13 +881,18 @@ async fn query_files(
     start: &str,
     end: &str,
 ) -> AssetFilesSummary {
+    // File-event membership uses the shared classifier predicate so dossier
+    // counts and the "All file events" drilldown operate on the same row set
+    // (NAN-1049). Recent-list still narrows on `file_path != ''` so empty
+    // paths don't render blank rows.
+    let file_predicate = FILE_PREDICATE;
     let scalar_sql = format!(
         r#"SELECT
             countIf(lower(file_action) IN ('create','write','modify','delete')) AS writes,
             countIf(file_path LIKE '%\\Documents\\%' OR file_path LIKE '%\\Desktop\\%' OR file_path LIKE '%payroll%' OR file_path LIKE '%secret%') AS sensitive,
             countIf(file_name LIKE '%.exe' OR file_name LIKE '%.dll' OR file_name LIKE '%.ps1' OR file_name LIKE '%.bat') AS exec_count
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND file_action != ''"#
+        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {file_predicate}"#
     );
     let recent_sql = format!(
         r#"SELECT
@@ -894,7 +902,7 @@ async fn query_files(
             file_action AS action,
             process_name AS proc
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND file_action != '' AND file_path != ''
+        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {file_predicate} AND file_path != ''
         ORDER BY timestamp DESC
         LIMIT {RECENT_LIMIT}"#
     );

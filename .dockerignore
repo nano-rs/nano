@@ -68,3 +68,16 @@ cursor_alignment_test.html
 test_syntax_highlighting.html
 scripts/
 config/
+# NAN-1156: nanosiem-core embeds these base Vector templates at COMPILE time via
+# include_str! (vector_config/deploy.rs — backpressure guard + default lane), so
+# they MUST be in the Docker build context even though the rest of config/ stays
+# excluded (credentials/, staging/, backup/, and untracked per-source parser
+# noise all remain ignored). Runtime still reads the mounted config_dir — this is
+# build-context only. Keep in sync with the include_str! list in deploy.rs.
+!config/vector/00-base.toml
+!config/vector/01-vector-source.toml
+!config/vector/02-hec-source.toml
+!config/vector/92-metrics.toml
+!config/vector/sources/parsers/_router.toml
+!config/vector/sources/parsers/_combiner.toml
+!config/vector/sources/parsers/_enrichment.toml

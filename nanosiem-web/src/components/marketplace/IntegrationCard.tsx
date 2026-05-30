@@ -115,18 +115,34 @@ export function IntegrationCard({ entry, onOpen, onInstall }: IntegrationCardPro
   );
 }
 
+/** Compact relative-time formatter (~"12m ago", "3h ago", "5d ago"). */
+function formatAgo(iso?: string): string {
+  if (!iso) return '';
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return '';
+  const seconds = Math.max(1, Math.round((Date.now() - then) / 1000));
+  if (seconds < 60) return 'just now';
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  return `${days}d ago`;
+}
+
+/** Truncate a long error string for inline display. The full text stays in
+ *  the title attribute for hover, so the user can see it without opening
+ *  the drawer. */
+function truncateError(err: string, max = 32): string {
+  const collapsed = err.replace(/\s+/g, ' ').trim();
+  if (collapsed.length <= max) return collapsed;
+  return `${collapsed.slice(0, max - 1)}…`;
+}
+
 function FooterStatus({ state, entry }: { state: IntegrationState; entry: MarketplaceCatalogEntry }) {
-  if (state === 'not') return <span className="text-[11px] text-muted-foreground font-mono">Not installed</span>;
-  if (state === 'configured') {
-    return (
-      <span className="text-[11px] text-emerald-500 font-mono inline-flex items-center gap-1">
-        <span
-          className="w-1 h-1 rounded-full bg-emerald-500"
-          style={{ boxShadow: '0 0 4px currentColor' }}
-        />
-        running
-      </span>
-    );
+  // Lifecycle states that have nothing to do with sync activity.
+  if (state === 'not') {
+    return <span className="text-[11px] text-muted-foreground font-mono">Not installed</span>;
   }
   if (state === 'notconfig') {
     return (
@@ -140,7 +156,65 @@ function FooterStatus({ state, entry }: { state: IntegrationState; entry: Market
     const toV = entry.manifest_version;
     return <span className="text-[11px] text-primary font-mono">{`v${fromV} → v${toV}`}</span>;
   }
-  return <span className="text-[11px] text-muted-foreground font-mono">Disabled</span>;
+  if (state === 'installed') {
+    // Installed but not enabled.
+    return <span className="text-[11px] text-muted-foreground font-mono">paused</span>;
+  }
+
+  // state === 'configured' (installed + enabled + has creds) — break out
+  // operational sub-states. NAN-1108: separate the lifecycle "ACTIVE"
+  // badge from the operational footer, which now reflects whether the
+  // sync is in flight, when it last ran, and whether it failed.
+
+  // Highest-priority signal: a run is in flight right now.
+  if (entry.is_syncing) {
+    return (
+      <span className="text-[11px] text-primary font-mono inline-flex items-center gap-1">
+        <span
+          className="w-1 h-1 rounded-full bg-primary animate-pulse"
+          style={{ boxShadow: '0 0 4px currentColor' }}
+        />
+        syncing…
+      </span>
+    );
+  }
+
+  // Most recent sync failed — surface the error inline.
+  if (entry.last_sync_status === 'failed') {
+    const full = entry.last_error || 'sync failed';
+    return (
+      <span
+        className="text-[11px] text-red-500 font-mono inline-flex items-center gap-1"
+        title={full}
+      >
+        <AlertTriangle className="w-[10px] h-[10px]" />
+        failed: {truncateError(full)}
+      </span>
+    );
+  }
+
+  // Most recent sync succeeded — show when + count.
+  if (entry.last_sync_status === 'success' && entry.last_sync_at) {
+    const ago = formatAgo(entry.last_sync_at);
+    const count = entry.record_count > 0
+      ? ` · ${entry.record_count.toLocaleString()}`
+      : '';
+    return (
+      <span
+        className="text-[11px] text-emerald-500 font-mono inline-flex items-center gap-1"
+        title={`Last sync: ${new Date(entry.last_sync_at).toLocaleString()}`}
+      >
+        <span
+          className="w-1 h-1 rounded-full bg-emerald-500"
+          style={{ boxShadow: '0 0 4px currentColor' }}
+        />
+        synced {ago}{count}
+      </span>
+    );
+  }
+
+  // Configured + enabled but no run yet — idle, waiting for first sync.
+  return <span className="text-[11px] text-muted-foreground font-mono">idle</span>;
 }
 
 function FooterAction({

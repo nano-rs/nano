@@ -66,10 +66,11 @@ import {
 } from '@/components/ui/dialog';
 import { Label } from '@/components/ui/label';
 import { useAuth } from '@/contexts/AuthContext';
+import { useCapabilities } from '@/hooks/use-capabilities';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useToast } from '@/hooks/use-toast';
 import { api } from '@/lib/api';
-import type { Alert as ApiAlert, AlertCounts } from '@/lib/api/types';
+import type { Alert as ApiAlert, AlertCounts, UserDetail } from '@/lib/api/types';
 import { cn } from '@/lib/utils';
 
 type StatusFilter = 'all' | 'new' | 'acknowledged' | 'closed';
@@ -174,6 +175,7 @@ function timeRangeCutoff(range: TimeRangeFilter): number | null {
 export function Alerts() {
   const navigate = useNavigate();
   const { hasPermission } = useAuth();
+  const { capabilities } = useCapabilities();
   const { toast } = useToast();
 
   useDocumentTitle('Alerts');
@@ -199,15 +201,37 @@ export function Alerts() {
   >(null);
   const [closeDisposition, setCloseDisposition] = useState<Disposition>('true_positive');
 
-  // Assign dialog — a tiny username input. Open-core has no assignee picker
-  // (no enterprise user directory hook in this surface yet), so we accept a
-  // free-form login name; the backend records whatever string we send.
+  // Assign dialog — opens with a user picker populated from /api/users.
   const [assignDialog, setAssignDialog] = useState<{ id: string; ruleName?: string } | null>(null);
   const [assignTo, setAssignTo] = useState('');
+  const [users, setUsers] = useState<UserDetail[]>([]);
 
-  const canAck = hasPermission('alerts:acknowledge');
-  const canClose = hasPermission('alerts:close');
-  const canAssign = hasPermission('alerts:assign');
+  // NAN-1066: ack/close/assign are open-core triage. Enterprise tenants
+  // run the Cases workflow instead — keep the page navigable, hide the
+  // single-alert lifecycle buttons.
+  const isOpenCoreTriage = !capabilities.cases;
+  const canAck = isOpenCoreTriage && hasPermission('alerts:acknowledge');
+  const canClose = isOpenCoreTriage && hasPermission('alerts:close');
+  const canAssign = isOpenCoreTriage && hasPermission('alerts:assign');
+
+  // NAN-1066: lazy-load active users when the assign dialog opens.
+  useEffect(() => {
+    if (!assignDialog || users.length > 0) return;
+    let cancelled = false;
+    api
+      .listUsers()
+      .then((res) => {
+        if (cancelled) return;
+        setUsers(res.users.filter((u) => u.status === 'active'));
+      })
+      .catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error('Failed to load users for assign picker', err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [assignDialog, users.length]);
 
   const fetchAlerts = useCallback(async () => {
     try {
@@ -382,18 +406,19 @@ export function Alerts() {
 
   const submitAssign = useCallback(async () => {
     const target = assignDialog;
-    const assignee = assignTo.trim();
-    if (!target || !assignee) {
+    if (!target || !assignTo) {
       setAssignDialog(null);
       setAssignTo('');
       return;
     }
+    const assignee = users.find((u) => u.id === assignTo);
+    const displayName = assignee?.name ?? assignTo;
     setAssignDialog(null);
     setAssignTo('');
     setActionBusy(true);
     try {
-      await api.assignAlert(target.id, assignee);
-      toast({ title: `Assigned to ${assignee}` });
+      await api.assignAlert(target.id, assignTo);
+      toast({ title: `Assigned to ${displayName}` });
       refetch();
     } catch (err) {
       // eslint-disable-next-line no-console
@@ -402,10 +427,14 @@ export function Alerts() {
     } finally {
       setActionBusy(false);
     }
-  }, [assignDialog, assignTo, refetch, toast]);
+  }, [assignDialog, assignTo, refetch, toast, users]);
 
   const selectionCount = selected.size;
-  const showBulkBar = selectionCount > 0;
+  // NAN-1066: only render selection UI when at least one bulk action is
+  // available. In enterprise (cases-mode) all three are hidden, so the
+  // checkboxes + bulk bar collapse and the table stays read-only.
+  const showSelection = canAck || canClose;
+  const showBulkBar = showSelection && selectionCount > 0;
 
   return (
     <div className="space-y-3 p-3">
@@ -552,26 +581,30 @@ export function Alerts() {
             {selectionCount} selected
           </span>
           <span className="text-muted-foreground/40 select-none">·</span>
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={!canAck || actionBusy}
-            onClick={acknowledgeBulk}
-            className="h-7 border-border text-[11px]"
-          >
-            <Check className="mr-1.5 h-3 w-3" />
-            Acknowledge
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={!canClose || actionBusy}
-            onClick={() => setCloseDialog({ id: null })}
-            className="h-7 border-border text-[11px]"
-          >
-            <CircleCheck className="mr-1.5 h-3 w-3" />
-            Close…
-          </Button>
+          {canAck && (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={actionBusy}
+              onClick={acknowledgeBulk}
+              className="h-7 border-border text-[11px]"
+            >
+              <Check className="mr-1.5 h-3 w-3" />
+              Acknowledge
+            </Button>
+          )}
+          {canClose && (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={actionBusy}
+              onClick={() => setCloseDialog({ id: null })}
+              className="h-7 border-border text-[11px]"
+            >
+              <CircleCheck className="mr-1.5 h-3 w-3" />
+              Close…
+            </Button>
+          )}
           <div className="flex-1" />
           <Button
             variant="ghost"
@@ -606,6 +639,7 @@ export function Alerts() {
           <Table>
             <TableHeader>
               <TableRow className="border-border hover:bg-transparent">
+                {showSelection && (
                 <TableHead className="w-[34px] pl-3">
                   <Checkbox
                     checked={allVisibleSelected}
@@ -614,6 +648,7 @@ export function Alerts() {
                     aria-label="Select all"
                   />
                 </TableHead>
+                )}
                 <SortHeader field="severity" current={sortField} dir={sortDirection} onSort={handleSort} className="w-[80px]">
                   Sev
                 </SortHeader>
@@ -642,7 +677,7 @@ export function Alerts() {
               {filteredAlerts.length === 0 ? (
                 <TableRow>
                   <TableCell
-                    colSpan={9}
+                    colSpan={showSelection ? 9 : 8}
                     className="py-10 text-center text-[11.5px] text-muted-foreground"
                   >
                     No alerts match the current filters.
@@ -663,14 +698,16 @@ export function Alerts() {
                       )}
                       onClick={() => navigate(`/alerts/${alert.id}`)}
                     >
-                      <TableCell className="pl-3" onClick={(e) => e.stopPropagation()}>
-                        <Checkbox
-                          checked={isSelected}
-                          onCheckedChange={() => toggleOne(alert.id)}
-                          className="h-3.5 w-3.5"
-                          aria-label={`Select ${shortAlertId(alert.id)}`}
-                        />
-                      </TableCell>
+                      {showSelection && (
+                        <TableCell className="pl-3" onClick={(e) => e.stopPropagation()}>
+                          <Checkbox
+                            checked={isSelected}
+                            onCheckedChange={() => toggleOne(alert.id)}
+                            className="h-3.5 w-3.5"
+                            aria-label={`Select ${shortAlertId(alert.id)}`}
+                          />
+                        </TableCell>
+                      )}
                       <TableCell>
                         <span
                           className={cn(
@@ -817,9 +854,9 @@ export function Alerts() {
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="true_positive">True positive</SelectItem>
-                <SelectItem value="false_positive">False positive</SelectItem>
-                <SelectItem value="benign">Benign</SelectItem>
+                <SelectItem value="true_positive" className="text-[11.5px]">True positive</SelectItem>
+                <SelectItem value="false_positive" className="text-[11.5px]">False positive</SelectItem>
+                <SelectItem value="benign" className="text-[11.5px]">Benign</SelectItem>
               </SelectContent>
             </Select>
           </div>
@@ -848,24 +885,28 @@ export function Alerts() {
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-2 py-2">
-            <Label htmlFor="assign-to" className="text-[11.5px]">Assignee (username)</Label>
-            <Input
-              id="assign-to"
-              value={assignTo}
-              autoFocus
-              placeholder="analyst.name"
-              onChange={(e) => setAssignTo(e.target.value)}
-              className="h-8 text-[11.5px] font-mono"
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && assignTo.trim()) submitAssign();
-              }}
-            />
+            <Label htmlFor="assign-to" className="text-[11.5px]">Assignee</Label>
+            <Select value={assignTo} onValueChange={setAssignTo}>
+              <SelectTrigger id="assign-to" className="h-8 text-[11.5px]">
+                <SelectValue placeholder={users.length === 0 ? 'Loading users…' : 'Select an analyst'} />
+              </SelectTrigger>
+              <SelectContent>
+                {users.map((u) => (
+                  <SelectItem key={u.id} value={u.id} className="text-[11.5px]">
+                    {u.name}
+                    <span className="ml-2 text-muted-foreground font-mono text-[10.5px]">
+                      {u.email}
+                    </span>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
           <DialogFooter>
             <Button variant="ghost" size="sm" onClick={() => setAssignDialog(null)} className="h-8 text-[11.5px]">
               Cancel
             </Button>
-            <Button size="sm" onClick={submitAssign} className="h-8 text-[11.5px]" disabled={actionBusy || !assignTo.trim()}>
+            <Button size="sm" onClick={submitAssign} className="h-8 text-[11.5px]" disabled={actionBusy || !assignTo}>
               Assign
             </Button>
           </DialogFooter>

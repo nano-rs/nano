@@ -7,9 +7,10 @@ import { formatBytes, formatCompact } from '../helpers';
 
 interface FilesCardProps {
   files: AssetDossierFiles;
+  onOpenAll?: () => void;
 }
 
-export function FilesCard({ files }: FilesCardProps) {
+export function FilesCard({ files, onOpenAll }: FilesCardProps) {
   const { writes, sensitive, exec, recent } = files;
 
   if (writes === 0 && recent.length === 0) {
@@ -17,6 +18,7 @@ export function FilesCard({ files }: FilesCardProps) {
       <SectionCard
         title="File activity"
         action={<span>All file events ↗</span>}
+        onActionClick={onOpenAll}
         icon={<FileText className="w-[13px] h-[13px] text-muted-foreground/70" />}
       >
         <EmptyCell>No file events for this entity in range</EmptyCell>
@@ -28,6 +30,7 @@ export function FilesCard({ files }: FilesCardProps) {
     <SectionCard
       title="File activity"
       action={<span>All file events ↗</span>}
+      onActionClick={onOpenAll}
       icon={<FileText className="w-[13px] h-[13px] text-muted-foreground/70" />}
     >
       <div className="space-y-3">

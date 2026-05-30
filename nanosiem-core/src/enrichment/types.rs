@@ -17,6 +17,9 @@ pub struct EnrichmentSource {
     pub last_sync_status: Option<String>,
     pub last_sync_error: Option<String>,
     pub record_count: i64,
+    /// NAN-1124: rows soft-deleted by the reconcile job (push deprovisioning).
+    #[sqlx(default)]
+    pub deprovisioned_count: i64,
     pub file_hash: Option<String>,
     pub config: serde_json::Value,
     pub enabled: bool,
@@ -36,22 +39,10 @@ pub struct EnrichmentSourceConfig {
     pub enabled: bool,
 }
 
-/// IP enrichment record
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
-pub struct IpEnrichment {
-    pub id: i64,
-    pub source_id: String,
-    pub network: String, // CIDR notation
-    pub country: Option<String>,
-    pub country_code: Option<String>,
-    pub continent: Option<String>,
-    pub continent_code: Option<String>,
-    pub asn: Option<String>,
-    pub as_name: Option<String>,
-    pub as_domain: Option<String>,
-    pub extra: serde_json::Value,
-    pub created_at: DateTime<Utc>,
-}
+// NAN-1117: the PG-shaped `IpEnrichment` row struct (id/extra/created_at) was
+// removed when the IP enrichment payload moved to ClickHouse. The CSV-shaped
+// `IpInfoLiteRecord` (sync input) and `IpEnrichmentResult` (lookup output)
+// remain.
 
 /// IP enrichment lookup result (for query-time enrichment)
 #[derive(Debug, Clone, Serialize, Deserialize, Default, utoipa::ToSchema)]

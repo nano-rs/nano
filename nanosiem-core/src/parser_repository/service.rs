@@ -262,34 +262,58 @@ impl ParserRepositoryService {
             .await
             .map_err(|e| ParserRepositoryError::GitHubApi(e.to_string()))?;
 
-        // Get tree to find parser.yaml files
-        let tree = self
+        // NAN-1149: enrichment parsers live under `enrichments/` in the same
+        // repo. Walk both trees and tag each file with its base path so the loop
+        // resolves the raw-file path correctly. The `enrichments/` dir is
+        // optional (a repo may ship only log parsers), so a missing/erroring
+        // subtree is tolerated.
+        let enrichments_path = "enrichments/";
+
+        let parsers_tree = self
             .github_client
             .get_tree(&owner, &repo_name, branch, Some(parsers_path))
             .await
             .map_err(|e| ParserRepositoryError::GitHubApi(e.to_string()))?;
+        let enrichments_tree = self
+            .github_client
+            .get_tree(&owner, &repo_name, branch, Some(enrichments_path))
+            .await
+            .unwrap_or_else(|e| {
+                warn!(repo_id = %id, error = %e, "No enrichments/ tree (optional); skipping");
+                Vec::new()
+            });
 
-        let yaml_files: Vec<_> = tree
+        let yaml_files: Vec<(_, &str)> = parsers_tree
             .iter()
             .filter(|entry| {
                 entry.path.ends_with("/parser.yaml") || entry.path.ends_with("/parser.yml")
             })
+            .map(|e| (e, parsers_path))
+            .chain(
+                enrichments_tree
+                    .iter()
+                    .filter(|entry| {
+                        entry.path.ends_with("/parser.yaml")
+                            || entry.path.ends_with("/parser.yml")
+                    })
+                    .map(|e| (e, enrichments_path)),
+            )
             .collect();
 
         let mut added = 0i32;
         let mut updated = 0i32;
         let mut synced_paths = Vec::new();
 
-        for entry in &yaml_files {
+        for &(entry, base_path) in &yaml_files {
             if synced_paths.len() >= self.config.max_parsers_per_repo {
                 warn!(repo_id = %id, "Max parsers per repo reached, stopping sync");
                 break;
             }
 
-            let full_path = if entry.path.starts_with(parsers_path) {
+            let full_path = if entry.path.starts_with(base_path) {
                 entry.path.clone()
             } else {
-                format!("{}{}", parsers_path, entry.path)
+                format!("{}{}", base_path, entry.path)
             };
 
             // Check if file changed (by SHA)
@@ -321,6 +345,13 @@ impl ParserRepositoryService {
             match parse_parser_yaml(&content) {
                 Ok(parsed) => {
                     let is_new = existing.is_none();
+                    // NAN-1149: files under enrichments/ are enrichment parsers
+                    // even if the yaml omits `kind`; otherwise honor the yaml.
+                    let kind = if base_path == enrichments_path {
+                        "enrichment"
+                    } else {
+                        parsed.kind.as_deref().unwrap_or("parser")
+                    };
                     self.parsers_repository
                         .upsert(
                             id,
@@ -335,6 +366,11 @@ impl ParserRepositoryService {
                             parsed.vendor.as_deref(),
                             parsed.product.as_deref(),
                             parsed.parser_vrl.as_deref(),
+                            kind,
+                            parsed.enrich_kind.as_deref(),
+                            parsed.enrich_source.as_deref(),
+                            parsed.target_table.as_deref(),
+                            parsed.normalize_vrl.as_deref(),
                         )
                         .await
                         .map_err(|e| ParserRepositoryError::Internal(e.to_string()))?;
@@ -511,6 +547,18 @@ impl ParserRepositoryService {
             });
         }
 
+        // NAN-1149: an enrichment parser (kind = "enrichment") deploys as a
+        // `kind='enrichment'` log_sources row carrying the per-source normalize
+        // VRL + routing columns instead of a log `source_type`. The deploy
+        // engine (`generate_enrichment_lane`) keys off these columns; without
+        // them a synced enrichment parser would land as an inert `kind='log'`
+        // row and never reach the enrichment lane. The match_values/ingestion/
+        // dispatch machinery below is log-only and is skipped for this flavor.
+        let is_enrichment = parser.kind == "enrichment";
+        if is_enrichment {
+            Self::validate_enrichment_import(&parser, path)?;
+        }
+
         let parser_vrl = parser.parser_vrl.clone().unwrap_or_default();
 
         // Build log source name from parser name
@@ -613,6 +661,16 @@ impl ParserRepositoryService {
         let is_linked = matches!(req.import_type, ParserImportType::Linked);
         let import_type_str = req.import_type.to_string();
 
+        // NAN-1149: enrichment-flavor columns. For a log import these stay at
+        // the schema default (kind='log', the rest NULL) so the deploy split
+        // treats the row exactly as before; for an enrichment import they carry
+        // the synced parser's routing + normalize VRL into the lane generator.
+        let ls_kind = if is_enrichment { "enrichment" } else { "log" };
+        let enrich_kind = is_enrichment.then(|| parser.enrich_kind.clone()).flatten();
+        let enrich_source = is_enrichment.then(|| parser.enrich_source.clone()).flatten();
+        let target_table = is_enrichment.then(|| parser.target_table.clone()).flatten();
+        let normalize_vrl = is_enrichment.then(|| parser.normalize_vrl.clone()).flatten();
+
         let mut tx = self
             .pg_pool
             .begin()
@@ -645,12 +703,14 @@ impl ParserRepositoryService {
                 parser_vrl, output_fields, category, vendor, product, icon, color,
                 match_field, match_pattern, match_values, dispatch_source_config_id,
                 parser_only, validated, validation_error,
-                source_parser_repository_id, source_parser_path, source_parser_linked
+                source_parser_repository_id, source_parser_path, source_parser_linked,
+                kind, enrich_kind, enrich_source, target_table, normalize_vrl
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
                     $15, $16, $17, $18,
                     true, true, NULL,
-                    $19, $20, $21)
+                    $19, $20, $21,
+                    $22, $23, $24, $25, $26)
             RETURNING id
             "#,
         )
@@ -675,6 +735,11 @@ impl ParserRepositoryService {
         .bind(repo_id)
         .bind(path)
         .bind(is_linked)
+        .bind(ls_kind)
+        .bind(&enrich_kind)
+        .bind(&enrich_source)
+        .bind(&target_table)
+        .bind(&normalize_vrl)
         .fetch_one(&mut *tx)
         .await
         .map_err(ParserRepositoryError::Database)?;
@@ -849,8 +914,20 @@ impl ParserRepositoryService {
             .await
             .map_err(|e| ParserRepositoryError::LogSourceService(e.to_string()))?;
 
-        let upstream_vrl = repo_parser.parser_vrl.clone().unwrap_or_default();
-        let current_vrl = log_source.parser_vrl.clone();
+        // NAN-1151: diff the VRL the flavor actually uses — enrichment parsers
+        // carry `normalize_vrl`, log parsers `parser_vrl`.
+        let is_enrichment = repo_parser.kind == "enrichment";
+        let (upstream_vrl, current_vrl) = if is_enrichment {
+            (
+                repo_parser.normalize_vrl.clone().unwrap_or_default(),
+                log_source.normalize_vrl.clone().unwrap_or_default(),
+            )
+        } else {
+            (
+                repo_parser.parser_vrl.clone().unwrap_or_default(),
+                log_source.parser_vrl.clone(),
+            )
+        };
         let has_changes = upstream_vrl != current_vrl;
 
         Ok(UpstreamParserDiff {
@@ -904,7 +981,16 @@ impl ParserRepositoryService {
                 ParserRepositoryError::Internal("Repository parser not found".to_string())
             })?;
 
-        let upstream_vrl = repo_parser.parser_vrl.clone().ok_or_else(|| {
+        // NAN-1151: enrichment parsers carry their mapping in `normalize_vrl`,
+        // not the log `parser_vrl` — without this branch a linked enrichment
+        // parser can never take an upstream update ("Upstream parser has no VRL").
+        let is_enrichment = repo_parser.kind == "enrichment";
+        let upstream_vrl = if is_enrichment {
+            repo_parser.normalize_vrl.clone()
+        } else {
+            repo_parser.parser_vrl.clone()
+        }
+        .ok_or_else(|| {
             ParserRepositoryError::Internal("Upstream parser has no VRL".to_string())
         })?;
 
@@ -914,9 +1000,13 @@ impl ParserRepositoryService {
             .await
             .map_err(|e| ParserRepositoryError::LogSourceService(e.to_string()))?;
 
-        // Update the log source VRL
+        // Update the log source VRL (the field depends on the parser flavor).
         let mut update = UpdateLogSource::default();
-        update.parser_vrl = Some(upstream_vrl);
+        if is_enrichment {
+            update.normalize_vrl = Some(upstream_vrl);
+        } else {
+            update.parser_vrl = Some(upstream_vrl);
+        }
         // Also update description if upstream has one
         if let Some(ref desc) = repo_parser.description {
             update.description = Some(desc.clone());
@@ -1061,6 +1151,29 @@ impl ParserRepositoryService {
     // =========================================================================
     // Helpers
     // =========================================================================
+
+    /// NAN-1149: gate an enrichment-flavor import. The Vector lane is
+    /// generated from `normalize_vrl` (the mapping) into the sink for
+    /// `target_table`; an enrichment parser missing either would deploy as an
+    /// empty transform that writes nothing — a silent no-op. Reject it here so
+    /// the failure surfaces at import time, not as missing enrichment data
+    /// later. (NAN-1150 adds the deeper VRL-compile check at deploy time.)
+    pub(super) fn validate_enrichment_import(
+        parser: &RepositoryParser,
+        path: &str,
+    ) -> Result<(), ParserRepositoryError> {
+        if parser.normalize_vrl.as_deref().unwrap_or("").trim().is_empty() {
+            return Err(ParserRepositoryError::InvalidRequest(format!(
+                "enrichment parser '{path}' has no normalize_vrl; nothing to deploy",
+            )));
+        }
+        if parser.target_table.as_deref().unwrap_or("").trim().is_empty() {
+            return Err(ParserRepositoryError::InvalidRequest(format!(
+                "enrichment parser '{path}' has no target_table; cannot route its writes",
+            )));
+        }
+        Ok(())
+    }
 
     /// NAN-920: build the `match_values` list for an imported / re-synced
     /// log source. We union three sources, dedup-preserving order:
@@ -1387,6 +1500,70 @@ mod tests {
                 "cisco_asa".to_string(),
                 "fortinet-fortigate".to_string(),
             ],
+        );
+    }
+
+    // ---- NAN-1149: enrichment import gate -----------------------------------
+
+    fn enrichment_repo_parser(
+        normalize_vrl: Option<&str>,
+        target_table: Option<&str>,
+    ) -> RepositoryParser {
+        let now = chrono::Utc::now();
+        RepositoryParser {
+            id: Uuid::nil(),
+            repository_id: Uuid::nil(),
+            file_path: "enrichments/identity/ad/parser.yaml".to_string(),
+            file_sha: None,
+            raw_content: String::new(),
+            name: Some("ad_identity".to_string()),
+            display_name: None,
+            description: None,
+            version: None,
+            category: None,
+            vendor: None,
+            product: None,
+            parser_vrl: None,
+            kind: "enrichment".to_string(),
+            enrich_kind: Some("identity".to_string()),
+            enrich_source: Some("ad".to_string()),
+            target_table: target_table.map(str::to_string),
+            normalize_vrl: normalize_vrl.map(str::to_string),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn validate_enrichment_import_accepts_complete_parser() {
+        let parser = enrichment_repo_parser(Some(".user = .external_id"), Some("user_registry"));
+        assert!(
+            ParserRepositoryService::validate_enrichment_import(&parser, &parser.file_path).is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_enrichment_import_rejects_missing_normalize_vrl() {
+        // None and whitespace-only both count as "no mapping".
+        for vrl in [None, Some("   \n  ")] {
+            let parser = enrichment_repo_parser(vrl, Some("user_registry"));
+            let err = ParserRepositoryService::validate_enrichment_import(&parser, &parser.file_path)
+                .unwrap_err();
+            assert!(
+                matches!(err, ParserRepositoryError::InvalidRequest(ref m) if m.contains("normalize_vrl")),
+                "expected normalize_vrl rejection, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_enrichment_import_rejects_missing_target_table() {
+        let parser = enrichment_repo_parser(Some(".user = .external_id"), None);
+        let err = ParserRepositoryService::validate_enrichment_import(&parser, &parser.file_path)
+            .unwrap_err();
+        assert!(
+            matches!(err, ParserRepositoryError::InvalidRequest(ref m) if m.contains("target_table")),
+            "expected target_table rejection, got {err:?}"
         );
     }
 }

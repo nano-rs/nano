@@ -56,12 +56,6 @@ pub const PARSERS_EDIT: &str = "parsers:edit";
 pub const PARSERS_DELETE: &str = "parsers:delete";
 pub const PARSERS_DEPLOY: &str = "parsers:deploy";
 
-// Feed permissions
-pub const FEEDS_VIEW: &str = "feeds:view";
-pub const FEEDS_CREATE: &str = "feeds:create";
-pub const FEEDS_EDIT: &str = "feeds:edit";
-pub const FEEDS_DELETE: &str = "feeds:delete";
-
 // Log Source permissions
 pub const LOG_SOURCES_VIEW: &str = "log_sources:view";
 pub const LOG_SOURCES_CREATE: &str = "log_sources:create";
@@ -257,11 +251,6 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     CREDENTIALS_CREATE,
     CREDENTIALS_EDIT,
     CREDENTIALS_DELETE,
-    // Feeds
-    FEEDS_VIEW,
-    FEEDS_CREATE,
-    FEEDS_EDIT,
-    FEEDS_DELETE,
     // Enrichments
     ENRICHMENTS_VIEW,
     ENRICHMENTS_CONFIGURE,
@@ -409,8 +398,6 @@ pub const DEMO_PERMISSIONS: &[&str] = &[
     ENRICHMENTS_VIEW,
     // Parsers — view only
     PARSERS_VIEW,
-    // Feeds — view only
-    FEEDS_VIEW,
     // Rule repos — view only
     RULE_REPOSITORIES_VIEW,
     // Parser repos — view only
@@ -444,7 +431,6 @@ pub const CATEGORIES: &[&str] = &[
     "log_sources",
     "source_configs",
     "credentials",
-    "feeds",
     "enrichments",
     "lookup",
     "upload",

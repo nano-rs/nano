@@ -903,15 +903,94 @@ pub struct CaseFilter {
     #[serde(default, with = "typeid::group::opt")]
     #[schema(value_type = Option<String>)]
     pub assigned_group: Option<Uuid>,
+    /// NAN-1093: multi-group filter. Used by the Signal Inbox Escalations
+    /// tab to scope to "cases assigned to any of the analyst's groups". Set
+    /// either this or `assigned_group`, not both. Empty vec means no match.
+    /// Typeid encoding is handled at the handler boundary; on the wire here
+    /// these are bare UUIDs.
+    #[serde(default)]
+    #[schema(value_type = Option<Vec<String>>)]
+    pub assigned_groups: Option<Vec<Uuid>>,
     /// Include cases where this user was mentioned in a comment
     #[serde(default, with = "typeid::user::opt")]
     #[schema(value_type = Option<String>)]
     pub mentioned_by: Option<Uuid>,
     pub search: Option<String>,
+    /// NAN-1074: free-text mode. When set, the list query joins against
+    /// `case_alerts` + `alerts` and ILIKE-matches alert content
+    /// (`rule_name`, serialised `matched_events`) in addition to case
+    /// title/description. Slower than `search`; intended for hunting.
+    /// `search` and `free_text` are mutually exclusive in the UI but
+    /// both honoured by the repo if set.
+    pub free_text: Option<String>,
     pub created_after: Option<DateTime<Utc>>,
     pub created_before: Option<DateTime<Utc>>,
     /// Filter by visibility levels
     pub visibility: Option<Vec<String>>,
+    /// NAN-1093: when set, filter to cases with a NULL or NOT-NULL
+    /// `incident_id`. Used by the Signal Inbox so the paginated loose
+    /// list (incident_id_is_null=true) and the incident summary (false)
+    /// stay in sync without overlap.
+    #[serde(default)]
+    pub incident_id_is_null: Option<bool>,
+    /// NAN-1093: result ordering. Default `Newest` preserves the
+    /// pre-1093 behaviour for callers that don't pass a sort.
+    #[serde(default)]
+    pub sort: CaseSort,
+    /// NAN-1095: per-severity SLA target minutes. Required when
+    /// `sort = CaseSort::Sla`; ignored otherwise. Caller fetches from
+    /// `CaseSettings::get_config()` and converts via
+    /// `SlaTargets::from_sla_config`.
+    #[serde(skip)]
+    pub sla_targets: Option<SlaTargets>,
+}
+
+/// NAN-1093: order options for `CaseRepository::list`. The Signal Inbox
+/// drives all of these; the legacy default is `Newest` which preserves
+/// the pre-1093 behaviour for any caller that doesn't pass a sort.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CaseSort {
+    /// Most recent activity first (current default).
+    #[default]
+    Newest,
+    /// Oldest activity first.
+    Oldest,
+    /// Severity first (critical → informational), recency tiebreaker.
+    Severity,
+    /// Cases assigned to the current user first, then by recency. The
+    /// user id comes from `user_id` passed to `list`.
+    MineFirst,
+    /// NAN-1095: SLA urgency — least remaining time across TTA / TTR /
+    /// TTClose, ascending. Breached rows (negative remaining) come
+    /// first. Requires `CaseFilter::sla_targets` to be set or the
+    /// repository falls back to `Newest`.
+    Sla,
+}
+
+/// NAN-1095: per-severity SLA target minutes. Lifted out of the
+/// enterprise `SlaConfig` so the core repository can take it without a
+/// reverse dependency. Mirrors the 5×3 grid (5 severities × triage /
+/// response / resolution). The repo inlines these as numeric literals
+/// into ORDER BY — safe because every field is an `i32` from a closed
+/// settings table, not user input.
+#[derive(Debug, Clone, Copy)]
+pub struct SlaTargets {
+    pub critical_triage_minutes: i32,
+    pub critical_response_minutes: i32,
+    pub critical_resolution_minutes: i32,
+    pub high_triage_minutes: i32,
+    pub high_response_minutes: i32,
+    pub high_resolution_minutes: i32,
+    pub medium_triage_minutes: i32,
+    pub medium_response_minutes: i32,
+    pub medium_resolution_minutes: i32,
+    pub low_triage_minutes: i32,
+    pub low_response_minutes: i32,
+    pub low_resolution_minutes: i32,
+    pub informational_triage_minutes: i32,
+    pub informational_response_minutes: i32,
+    pub informational_resolution_minutes: i32,
 }
 
 // =============================================================================

@@ -304,6 +304,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/api-keys", get(handlers::api_keys::list_keys))
         .route("/api/api-keys", post(handlers::api_keys::create_key))
         .route("/api/api-keys/{id}", get(handlers::api_keys::get_key))
+        .route(
+            "/api/api-keys/{id}/usage",
+            get(handlers::api_keys::get_key_usage),
+        )
         .route("/api/api-keys/{id}", put(handlers::api_keys::update_key))
         .route("/api/api-keys/{id}", delete(handlers::api_keys::delete_key))
         .route(
@@ -487,6 +491,15 @@ pub fn create_router(state: AppState) -> Router {
             .route("/api/cases", post(handlers::cases::create_case::<AppState>))
             .route("/api/cases/my", get(handlers::cases::get_my_cases::<AppState>))
             .route("/api/cases/stats", get(handlers::cases::get_case_stats::<AppState>))
+            // NAN-1093: Signal Inbox aggregation — per-tab counts + incident pills.
+            .route(
+                "/api/cases/inbox-counts",
+                get(handlers::cases::get_inbox_counts::<AppState>),
+            )
+            .route(
+                "/api/cases/inbox-incidents",
+                get(handlers::cases::get_inbox_incidents::<AppState>),
+            )
             .route(
                 "/api/cases/bulk/status",
                 post(handlers::cases::bulk_change_case_status::<AppState>),
@@ -578,6 +591,23 @@ pub fn create_router(state: AppState) -> Router {
                 "/api/cases/{id}/related-notebooks",
                 get(handlers::cases::get_related_notebooks::<AppState>),
             )
+            // Case saved searches (NAN-1072)
+            .route(
+                "/api/cases/saved-searches",
+                get(handlers::cases::list_case_saved_searches::<AppState>),
+            )
+            .route(
+                "/api/cases/saved-searches",
+                post(handlers::cases::create_case_saved_search::<AppState>),
+            )
+            .route(
+                "/api/cases/saved-searches/{id}",
+                axum::routing::patch(handlers::cases::update_case_saved_search::<AppState>),
+            )
+            .route(
+                "/api/cases/saved-searches/{id}",
+                delete(handlers::cases::delete_case_saved_search::<AppState>),
+            )
             // Queues (NAN-426)
             .route("/api/queues", get(handlers::cases::list_queues::<AppState>))
             .route("/api/queues", post(handlers::cases::create_queue::<AppState>))
@@ -658,34 +688,14 @@ pub fn create_router(state: AppState) -> Router {
             post(handlers::configure_auto_sync),
         )
         .route("/api/enrichment/stats", get(handlers::get_enrichment_stats))
-        .route("/api/enrichment/lookup/{ip}", get(handlers::lookup_ip))
-        // ThreatFox IOC enrichment
-        .route(
-            "/api/enrichment/threatfox/configure",
-            post(handlers::configure_threatfox),
-        )
-        .route(
-            "/api/enrichment/threatfox/sync",
-            post(handlers::sync_threatfox),
-        )
-        // TOR Exit Nodes enrichment
-        .route(
-            "/api/enrichment/tor/configure",
-            post(handlers::configure_tor_exit_nodes),
-        )
-        .route(
-            "/api/enrichment/tor/sync",
-            post(handlers::sync_tor_exit_nodes),
-        )
-        // IOC lookup (shared across all IOC sources)
-        .route(
-            "/api/enrichment/ioc/lookup/{value}",
-            get(handlers::lookup_ioc),
-        )
-        .route(
-            "/api/enrichment/ioc/stats/{source_id}",
-            get(handlers::get_ioc_stats),
-        );
+        .route("/api/enrichment/lookup/{ip}", get(handlers::lookup_ip));
+        // NAN-1111 sunset: ThreatFox + TOR Exit Nodes per-provider configure
+        // and sync routes lived here; both moved to the marketplace + Deno
+        // (nano-rs/nano-enrichments). The `/api/enrichment/ioc/{lookup,stats}`
+        // endpoints lived in `threatfox.rs` and had no remaining UI callers
+        // — deleted with the rest. IPinfo Lite routes above stay (single
+        // pre-built provider that doesn't fit the marketplace contract;
+        // see project_ipinfo_lite_stays_native).
 
     // Agent enrichment lookup (Deno providers — VirusTotal, AbuseIPDB, etc.)
     // — enterprise only, depends on the lifted agent_enrichment +
@@ -1203,11 +1213,8 @@ pub fn create_router(state: AppState) -> Router {
             "/api/settings/identity-providers/{id}/sync",
             post(handlers::identity::trigger_identity_sync),
         )
-        // Identity AD push endpoint (uses collector_token auth, not JWT)
-        .route(
-            "/api/identity-providers/{id}/push",
-            post(handlers::identity::push_identity_users),
-        )
+        // NAN-1151 (3d): the AD /push endpoint is retired — AD identity flows
+        // through the nano_enrich lane (collector POSTs to Vector ingest).
         // Identity user directory
         .route(
             "/api/identity/users/lookup",

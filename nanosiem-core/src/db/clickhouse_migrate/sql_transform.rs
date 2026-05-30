@@ -237,10 +237,18 @@ impl ClickHouseMigrator {
     /// - Fixes ClickHouse dictionary source ports (9000 -> 9001 for operator)
     ///
     /// Statements that already contain ON CLUSTER are returned unchanged.
+    ///
+    /// `is_cloud=true` forces "Replicated database" mode regardless of cluster vs
+    /// db name: ClickHouse Cloud reports `cluster_name="default"` against an
+    /// arbitrarily-named database (e.g. `nanosiem`), but the database engine is
+    /// always Replicated and rejects explicit `zookeeper_path` / `replica_name`
+    /// args in `ReplicatedMergeTree(...)` with `BAD_ARGUMENTS (36)`. Treating
+    /// `is_cloud` as "replicated DB" yields empty engine args (NAN-1092).
     pub(super) fn transform_for_cluster(
         statement: &str,
         cluster_name: &str,
         default_db: &str,
+        is_cloud: bool,
     ) -> String {
         let trimmed = statement.trim();
         if trimmed.is_empty() {
@@ -268,10 +276,13 @@ impl ClickHouseMigrator {
 
         let mut s = statement.to_string();
 
-        // When cluster name == database name, we're in a Replicated database.
-        // The Replicated engine auto-propagates DDL — no ON CLUSTER needed.
-        // Only add ON CLUSTER for explicit clusters (e.g., nanosiem_cluster from operator).
-        let replicated_db = cluster_name == default_db;
+        // Replicated-database mode: either (a) cluster name matches the database
+        // (self-hosted Replicated DB setup) or (b) we're on ClickHouse Cloud
+        // (cluster is always `default` regardless of db name; the engine forbids
+        // explicit zoo args). Either way: no ON CLUSTER, empty engine args.
+        // Explicit clusters (operator-managed `nanosiem_cluster`) still get the
+        // ON CLUSTER clause and explicit zoo path + replica macro. NAN-1092.
+        let replicated_db = is_cloud || cluster_name == default_db;
         let on_cluster_clause = if replicated_db {
             String::new()
         } else {
@@ -324,10 +335,11 @@ impl ClickHouseMigrator {
 
             // Convert engine: MergeTree -> ReplicatedMergeTree
             //
-            // When the database uses ENGINE = Replicated (auto-cluster name == db name),
-            // ClickHouse manages ZooKeeper paths automatically — use empty args.
-            // For explicit clusters (e.g., nanosiem_cluster from CH operator), supply paths.
-            let replicated_db = cluster_name == default_db;
+            // Replicated-DB mode (either cluster==db OR CH Cloud) → empty args,
+            // CH manages ZooKeeper paths automatically. Explicit clusters
+            // (operator-managed nanosiem_cluster) → supply zoo path + replica
+            // macro. NAN-1092.
+            let replicated_db = is_cloud || cluster_name == default_db;
             let zoo_path = format!("/clickhouse/tables/{{shard}}/{}/{}", db_name, table_name);
             let (mt_args, amt_args, smt_args) = if replicated_db {
                 // Replicated database: empty args, CH manages zoo paths
@@ -392,11 +404,18 @@ impl ClickHouseMigrator {
                     .to_string();
             }
 
-            // Add storage_policy = 'tiered' for main data tables (skip if already present)
-            if matches!(
-                table_name.as_str(),
-                "logs" | "signals" | "ingestion_errors" | "custom_enrichment_results"
-            ) {
+            // Add storage_policy = 'tiered' for main data tables (skip if already present).
+            // ClickHouse Cloud manages hot/warm tiering internally — there's no
+            // user-defined `tiered` policy on Cloud and the operator rejects the
+            // setting with UNKNOWN_POLICY (Code 478). sanitize_for_cloud strips
+            // `storage_policy` clauses from the source SQL, so skipping the
+            // re-injection here is the matching half of that pass. NAN-1096.
+            if !is_cloud
+                && matches!(
+                    table_name.as_str(),
+                    "logs" | "signals" | "ingestion_errors" | "custom_enrichment_results"
+                )
+            {
                 let upper_check = s.to_uppercase();
                 if !upper_check.contains("STORAGE_POLICY") {
                     if let Some(settings_pos) = upper_check.rfind("SETTINGS ") {

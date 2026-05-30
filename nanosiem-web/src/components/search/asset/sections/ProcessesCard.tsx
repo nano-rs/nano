@@ -6,9 +6,10 @@ import { SectionCard, EmptyCell } from './_shared';
 
 interface ProcessesCardProps {
   processes: AssetDossierProcesses;
+  onOpenTree?: () => void;
 }
 
-export function ProcessesCard({ processes }: ProcessesCardProps) {
+export function ProcessesCard({ processes, onOpenTree }: ProcessesCardProps) {
   const { unique, rare, from_office, top, rare_list } = processes;
   const maxCount = Math.max(1, ...top.map((t) => t.count));
 
@@ -24,6 +25,7 @@ export function ProcessesCard({ processes }: ProcessesCardProps) {
       title="Processes"
       badge={rareBadge}
       action={<span>Open tree ↗</span>}
+      onActionClick={onOpenTree}
       icon={<Layers className="w-[13px] h-[13px] text-muted-foreground/70" />}
     >
       {unique === 0 ? (

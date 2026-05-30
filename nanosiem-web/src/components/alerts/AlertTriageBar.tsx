@@ -7,18 +7,22 @@
 // AlertDetail.tsx can drop in beneath AlertHero. Mirrors the per-row
 // pattern from /alerts (Alerts.tsx).
 //
+// NAN-1066: open-core surface only — enterprise tenants triage via Cases,
+// so the whole bar is hidden when `capabilities.cases` is true.
+//
 // Escalate-to-case is intentionally NOT included — the backend endpoint
 // `/api/alerts/{id}/escalate-to-case` doesn't exist yet. Tracked
 // separately as a follow-up.
 
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Check, CircleCheck, UserPlus, Loader2 } from 'lucide-react';
 
 import { api } from '@/lib/api';
+import type { UserDetail } from '@/lib/api/types';
 import { useAuth } from '@/contexts/AuthContext';
+import { useCapabilities } from '@/hooks/use-capabilities';
 import { useToast } from '@/hooks/use-toast';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import {
   Select,
@@ -56,6 +60,7 @@ export function AlertTriageBar({
   onActionComplete,
 }: AlertTriageBarProps) {
   const { hasPermission } = useAuth();
+  const { capabilities } = useCapabilities();
   const { toast } = useToast();
 
   const canAck = hasPermission('alerts:acknowledge');
@@ -66,10 +71,31 @@ export function AlertTriageBar({
   const [closeOpen, setCloseOpen] = useState(false);
   const [closeDisposition, setCloseDisposition] = useState<Disposition>('true_positive');
   const [assignOpen, setAssignOpen] = useState(false);
-  const [assignTo, setAssignTo] = useState<string>(currentAssignee ?? '');
+  const [assignTo, setAssignTo] = useState<string>('');
+  const [users, setUsers] = useState<UserDetail[]>([]);
 
   const isOpen = status === 'open' || status === 'new';
   const isClosed = status === 'closed';
+
+  // NAN-1066: lazy-load the active user list when the assign dialog opens.
+  // Avoids hitting /api/users on every alert detail render.
+  useEffect(() => {
+    if (!assignOpen || users.length > 0) return;
+    let cancelled = false;
+    api
+      .listUsers()
+      .then((res) => {
+        if (cancelled) return;
+        setUsers(res.users.filter((u) => u.status === 'active'));
+      })
+      .catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error('Failed to load users for assign picker', err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [assignOpen, users.length]);
 
   const acknowledge = useCallback(async () => {
     setBusy(true);
@@ -111,16 +137,17 @@ export function AlertTriageBar({
   }, [alertId, closeDisposition, onActionComplete, toast]);
 
   const submitAssign = useCallback(async () => {
-    const assignee = assignTo.trim();
-    if (!assignee) {
+    if (!assignTo) {
       setAssignOpen(false);
       return;
     }
+    const assignee = users.find((u) => u.id === assignTo);
+    const displayName = assignee?.name ?? assignTo;
     setBusy(true);
     setAssignOpen(false);
     try {
-      await api.assignAlert(alertId, assignee);
-      toast({ title: `Assigned to ${assignee}` });
+      await api.assignAlert(alertId, assignTo);
+      toast({ title: `Assigned to ${displayName}` });
       onActionComplete?.();
     } catch (err) {
       // eslint-disable-next-line no-console
@@ -133,7 +160,13 @@ export function AlertTriageBar({
     } finally {
       setBusy(false);
     }
-  }, [alertId, assignTo, onActionComplete, toast]);
+  }, [alertId, assignTo, onActionComplete, toast, users]);
+
+  // NAN-1066: enterprise tenants have Cases; the single-alert lifecycle
+  // (ack/close/assign) is the open-core triage workflow only.
+  if (capabilities.cases) {
+    return null;
+  }
 
   // If everything is gated off / alert closed, render nothing — keeps
   // the page tidy when an analyst is just reviewing a closed alert.
@@ -160,7 +193,7 @@ export function AlertTriageBar({
           <button
             type="button"
             onClick={() => {
-              setAssignTo(currentAssignee ?? '');
+              setAssignTo('');
               setAssignOpen(true);
             }}
             disabled={busy}
@@ -210,9 +243,9 @@ export function AlertTriageBar({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="true_positive">True positive</SelectItem>
-                <SelectItem value="false_positive">False positive</SelectItem>
-                <SelectItem value="benign">Benign</SelectItem>
+                <SelectItem value="true_positive" className="text-[11.5px]">True positive</SelectItem>
+                <SelectItem value="false_positive" className="text-[11.5px]">False positive</SelectItem>
+                <SelectItem value="benign" className="text-[11.5px]">Benign</SelectItem>
               </SelectContent>
             </Select>
           </div>
@@ -237,7 +270,7 @@ export function AlertTriageBar({
         </DialogContent>
       </Dialog>
 
-      {/* Assign dialog — mirrors /alerts. */}
+      {/* Assign dialog — picks from active users. */}
       <Dialog open={assignOpen} onOpenChange={setAssignOpen}>
         <DialogContent className="sm:max-w-[400px]">
           <DialogHeader>
@@ -252,19 +285,23 @@ export function AlertTriageBar({
           </DialogHeader>
           <div className="space-y-2 py-2">
             <Label htmlFor="alert-assign-to" className="text-[11.5px]">
-              Assignee (username)
+              Assignee
             </Label>
-            <Input
-              id="alert-assign-to"
-              value={assignTo}
-              autoFocus
-              placeholder="analyst.name"
-              onChange={(e) => setAssignTo(e.target.value)}
-              className="h-8 text-[11.5px] font-mono"
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && assignTo.trim()) submitAssign();
-              }}
-            />
+            <Select value={assignTo} onValueChange={setAssignTo}>
+              <SelectTrigger id="alert-assign-to" className="h-8 text-[11.5px]">
+                <SelectValue placeholder={users.length === 0 ? 'Loading users…' : 'Select an analyst'} />
+              </SelectTrigger>
+              <SelectContent>
+                {users.map((u) => (
+                  <SelectItem key={u.id} value={u.id} className="text-[11.5px]">
+                    {u.name}
+                    <span className="ml-2 text-muted-foreground font-mono text-[10.5px]">
+                      {u.email}
+                    </span>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
           <DialogFooter>
             <Button
@@ -279,7 +316,7 @@ export function AlertTriageBar({
               size="sm"
               onClick={submitAssign}
               className="h-8 text-[11.5px]"
-              disabled={busy || !assignTo.trim()}
+              disabled={busy || !assignTo}
             >
               Assign
             </Button>

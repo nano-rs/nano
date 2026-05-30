@@ -17,6 +17,80 @@ use std::path::Path;
 static MIGRATION_FILENAME_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^\d+[a-z]*_.+\.sql$").expect("valid regex"));
 
+/// NAN-1028 default for ON CLUSTER DDL. Real-world data volumes routinely
+/// push a single index drop / materialize past ClickHouse's 180s default.
+/// 900s (15min) is generous enough that index churn on multi-shard prod
+/// clusters fits inside one statement and still bounds the worst case so a
+/// truly stuck DDL doesn't hang the deploy indefinitely.
+const DEFAULT_DISTRIBUTED_DDL_TIMEOUT_SECS: u64 = 900;
+
+/// Inject `distributed_ddl_task_timeout = 900` for `ON CLUSTER` DDL when
+/// the operator hasn't already specified one. Per-query client setting only —
+/// does not change the source file checksum, so checksum verification
+/// across tenants is unaffected.
+///
+/// NAN-1051: applies ONLY to `ALTER TABLE` and `CREATE TABLE` (the long-
+/// running cases NAN-1028 was designed for). Other DDL forms — `CREATE
+/// DICTIONARY`, `CREATE [MATERIALIZED] VIEW`, `CREATE FUNCTION`, `CREATE
+/// NAMED COLLECTION`, etc. — either reject a trailing `SETTINGS` clause
+/// outright or have ambiguous grammar, and are all metadata-only operations
+/// that complete well inside the 180s default. Whitelisting the two
+/// known-safe forms is safer than maintaining a deny-list as ClickHouse
+/// grows new DDL grammar.
+fn ensure_distributed_ddl_timeout(sql: &str) -> String {
+    let sql_upper = sql.to_uppercase();
+    if !sql_upper.contains(" ON CLUSTER ") {
+        return sql.to_string();
+    }
+    if sql_upper.contains("DISTRIBUTED_DDL_TASK_TIMEOUT") {
+        return sql.to_string();
+    }
+    let trimmed_upper = sql_upper.trim_start();
+    let is_target_ddl = trimmed_upper.starts_with("ALTER TABLE")
+        || trimmed_upper.starts_with("CREATE TABLE");
+    if !is_target_ddl {
+        return sql.to_string();
+    }
+
+    // Find a top-level SETTINGS clause (not inside parens — e.g. CREATE TABLE
+    // column defs / TTL / ENGINE() args may contain `SETTINGS` as a keyword
+    // for the engine config; we only want to amend the trailing query-level
+    // SETTINGS clause).
+    let mut depth: i32 = 0;
+    let bytes = sql.as_bytes();
+    let upper_bytes = sql_upper.as_bytes();
+    let mut top_level_settings: Option<usize> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0
+            && i + 10 <= upper_bytes.len()
+            && &upper_bytes[i..i + 10] == b" SETTINGS "
+        {
+            top_level_settings = Some(i);
+        }
+        i += 1;
+    }
+
+    let injection = format!(
+        "distributed_ddl_task_timeout = {}",
+        DEFAULT_DISTRIBUTED_DDL_TIMEOUT_SECS
+    );
+    match top_level_settings {
+        Some(pos) => {
+            // Insert "<injection>, " right after " SETTINGS "
+            let insert_at = pos + " SETTINGS ".len();
+            let (head, tail) = sql.split_at(insert_at);
+            format!("{}{}, {}", head, injection, tail)
+        }
+        None => format!("{} SETTINGS {}", sql.trim_end_matches(';'), injection),
+    }
+}
+
 impl ClickHouseMigrator {
     /// Apply a single migration
     async fn apply_migration(
@@ -62,7 +136,7 @@ impl ClickHouseMigrator {
 
             // Apply cluster transformation if in cluster mode
             let sql = if let Some(cluster) = cluster_name {
-                let transformed = Self::transform_for_cluster(sql, cluster, &self.database);
+                let transformed = Self::transform_for_cluster(sql, cluster, &self.database, is_cloud);
                 if transformed.trim().is_empty() {
                     continue; // Statement was intentionally skipped (e.g., non_replicated_dedup)
                 }
@@ -127,6 +201,8 @@ impl ClickHouseMigrator {
                 sql.clone()
             };
 
+            let full_sql = ensure_distributed_ddl_timeout(&full_sql);
+
             // Some statements may fail on ClickHouse Cloud:
             // - CREATE DICTIONARY: CH Cloud can't reach Docker-internal PostgreSQL
             // - GRANT statements: CH Cloud uses its own permission model
@@ -166,6 +242,90 @@ impl ClickHouseMigrator {
     /// Stores a SHA-256 hash of init.sql in the `_migrations` table and skips
     /// execution on subsequent startups if the hash hasn't changed. This avoids
     /// ~40s of ON CLUSTER DDL overhead on every restart.
+    /// Parse the target table identifier from a `CREATE TABLE [IF NOT EXISTS]
+    /// <name>` statement (handles an optional `db.table` qualifier, backticks,
+    /// and a trailing `(` or `ON CLUSTER`). Returns `None` if the statement
+    /// isn't a CREATE TABLE. (NAN-1115)
+    pub(crate) fn parse_create_table_name(stmt: &str) -> Option<String> {
+        let upper = stmt.to_uppercase();
+        let after = if let Some(i) = upper.find("CREATE TABLE IF NOT EXISTS ") {
+            &stmt[i + "CREATE TABLE IF NOT EXISTS ".len()..]
+        } else if let Some(i) = upper.find("CREATE TABLE ") {
+            &stmt[i + "CREATE TABLE ".len()..]
+        } else {
+            return None;
+        };
+        let token: String = after
+            .trim_start()
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '(')
+            .collect();
+        let name = token.replace('`', "");
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
+    }
+
+    /// Best-effort `EXISTS TABLE` check for a CREATE TABLE statement's target.
+    /// Used by `run_init_sql` to tell a real schema failure apart from CH merely
+    /// re-validating an already-existing table's dict-backed MATERIALIZED
+    /// defaults against a transiently-FAILED dictionary (NAN-1115).
+    async fn create_table_target_exists(&self, create_stmt: &str) -> bool {
+        let Some(name) = Self::parse_create_table_name(create_stmt) else {
+            return false;
+        };
+        let qualified = if name.contains('.') {
+            name
+        } else {
+            format!("{}.{}", self.database, name)
+        };
+        matches!(
+            self.client
+                .query(&format!("EXISTS TABLE {}", qualified))
+                .fetch_all::<u8>()
+                .await,
+            Ok(rows) if rows.first().copied() == Some(1)
+        )
+    }
+
+    /// NAN-1116: report any FAILED ClickHouse dictionaries, loudly. A FAILED
+    /// dictionary referenced by a `dictGet()`-backed MATERIALIZED column (the
+    /// `nanosiem.logs` `ioc_*`/`enriched_*`/`user_identity_*` columns) makes the
+    /// lookup THROW on every INSERT, so 100% of ingestion is dropped (Vector's
+    /// buffer discards on the resulting 500s) with nothing surfaced in the app
+    /// logs — only in `system.query_log`. Logging FAILED dicts at the end of
+    /// every migrate turns that silent outage into a visible deploy-log error.
+    /// Returns the count of FAILED dictionaries (0 = healthy). Never fails the
+    /// migrate — failing here would re-create the very deadlock NAN-1115 fixes.
+    pub async fn report_failed_dictionaries(&self) -> usize {
+        let rows: Vec<String> = self
+            .client
+            .query(&format!(
+                "SELECT concat(database, '.', name, ' :: ', substring(last_exception, 1, 200)) \
+                 FROM system.dictionaries WHERE database = '{}' AND status = 'FAILED'",
+                self.database
+            ))
+            .fetch_all::<String>()
+            .await
+            .unwrap_or_default();
+        if rows.is_empty() {
+            tracing::info!("ClickHouse dictionaries: all healthy");
+        } else {
+            tracing::error!(
+                count = rows.len(),
+                "FAILED ClickHouse dictionaries detected — every INSERT into a table with a \
+                 dictGet()-backed MATERIALIZED column on these will be dropped until they load \
+                 (NAN-1116)"
+            );
+            for r in &rows {
+                tracing::error!("  FAILED dict: {}", r);
+            }
+        }
+        rows.len()
+    }
+
     pub async fn run_init_sql(&mut self, init_sql: &str) -> Result<(), ClickHouseMigrateError> {
         let is_cloud = self.detect_cloud().await?;
         let cluster_name = self.detect_cluster().await?;
@@ -229,7 +389,7 @@ impl ClickHouseMigrator {
 
             // Apply cluster transformation
             let sql_stmt = if let Some(ref cluster) = cluster_name {
-                let transformed = Self::transform_for_cluster(sql_stmt, cluster, &self.database);
+                let transformed = Self::transform_for_cluster(sql_stmt, cluster, &self.database, is_cloud);
                 if transformed.trim().is_empty() {
                     continue;
                 }
@@ -290,6 +450,8 @@ impl ClickHouseMigrator {
                 sql_stmt.clone()
             };
 
+            let full_sql = ensure_distributed_ddl_timeout(&full_sql);
+
             // Dictionaries, GRANTs, and settings profiles are non-fatal
             // (may fail in cross-cluster setups or CH Cloud)
             let is_soft_fail = sql_upper.starts_with("CREATE DICTIONARY")
@@ -306,11 +468,34 @@ impl ClickHouseMigrator {
                     );
                 }
                 Err(e) => {
-                    return Err(ClickHouseMigrateError::ClickHouse(format!(
-                        "Failed to execute init SQL: {} - Error: {}",
-                        &sql_stmt[..sql_stmt.len().min(120)],
-                        e
-                    )));
+                    // NAN-1115: a `CREATE TABLE [IF NOT EXISTS]` can fail during
+                    // init.sql not because of a real schema problem but because
+                    // ClickHouse re-validates the table's dict-backed
+                    // MATERIALIZED column DEFAULTs at CREATE time, and a
+                    // referenced dictionary is currently FAILED (e.g. a
+                    // PG-sourced dict whose creds broke). The table already
+                    // exists, so the statement is a logical no-op — letting it
+                    // abort would block the WHOLE migrate and the deploy gated
+                    // on it, and the numbered migration that repairs the dict
+                    // never gets to run (init.sql runs first). If the target
+                    // table already exists, downgrade to a warning and continue.
+                    if sql_upper.starts_with("CREATE TABLE")
+                        && self.create_table_target_exists(&sql_stmt).await
+                    {
+                        tracing::warn!(
+                            "Init SQL CREATE TABLE failed but the table already exists — \
+                             continuing (likely a FAILED dependent dictionary re-validated \
+                             at CREATE time; see NAN-1115): {} - {}",
+                            &sql_stmt[..sql_stmt.len().min(120)],
+                            e
+                        );
+                    } else {
+                        return Err(ClickHouseMigrateError::ClickHouse(format!(
+                            "Failed to execute init SQL: {} - Error: {}",
+                            &sql_stmt[..sql_stmt.len().min(120)],
+                            e
+                        )));
+                    }
                 }
             }
         }
@@ -513,5 +698,108 @@ impl ClickHouseMigrator {
         }
 
         Ok(applied_count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_cluster_ddl_is_unchanged() {
+        let sql = "ALTER TABLE nanosiem.logs DROP INDEX IF EXISTS idx_foo";
+        assert_eq!(ensure_distributed_ddl_timeout(sql), sql);
+    }
+
+    #[test]
+    fn cluster_ddl_without_settings_gets_timeout_appended() {
+        // NAN-1028 repro: this exact statement timed out at 180s on Saturn
+        // and Hetzner org while dropping a real idx_ext_text.
+        let sql = "ALTER TABLE nanosiem.logs ON CLUSTER 'default' DROP INDEX IF EXISTS idx_ext_text";
+        let out = ensure_distributed_ddl_timeout(sql);
+        assert_eq!(
+            out,
+            "ALTER TABLE nanosiem.logs ON CLUSTER 'default' DROP INDEX IF EXISTS idx_ext_text \
+             SETTINGS distributed_ddl_task_timeout = 900"
+        );
+    }
+
+    #[test]
+    fn cluster_ddl_with_existing_settings_gets_timeout_prepended() {
+        let sql = "ALTER TABLE x ON CLUSTER 'default' MODIFY COLUMN y Int32 SETTINGS mutations_sync = 2";
+        let out = ensure_distributed_ddl_timeout(sql);
+        assert_eq!(
+            out,
+            "ALTER TABLE x ON CLUSTER 'default' MODIFY COLUMN y Int32 \
+             SETTINGS distributed_ddl_task_timeout = 900, mutations_sync = 2"
+        );
+    }
+
+    #[test]
+    fn cluster_ddl_with_caller_supplied_timeout_is_untouched() {
+        // If the migration author already wrote SET distributed_ddl_task_timeout=…
+        // (or pasted it inline), trust that decision.
+        let sql = "ALTER TABLE x ON CLUSTER 'default' DROP INDEX idx_foo SETTINGS distributed_ddl_task_timeout = 60";
+        assert_eq!(ensure_distributed_ddl_timeout(sql), sql);
+    }
+
+    #[test]
+    fn settings_keyword_inside_parens_is_ignored() {
+        // `SETTINGS` is also valid syntax inside CREATE TABLE engine config —
+        // we must amend the trailing query-level SETTINGS clause, not append
+        // inside the engine() parens.
+        let sql = "CREATE TABLE x ON CLUSTER 'default' (a Int32) \
+                   ENGINE = MergeTree() ORDER BY a SETTINGS index_granularity = 8192";
+        let out = ensure_distributed_ddl_timeout(sql);
+        assert!(
+            out.contains("distributed_ddl_task_timeout = 900, index_granularity = 8192"),
+            "expected timeout to be folded into trailing SETTINGS, got: {out}"
+        );
+    }
+
+    #[test]
+    fn non_table_ddl_on_cluster_is_not_amended() {
+        // NAN-1051 regression: only ALTER TABLE / CREATE TABLE accept a trailing
+        // `SETTINGS distributed_ddl_task_timeout = ...` clause. Other DDL forms
+        // either reject it outright (DICTIONARY, FUNCTION, NAMED COLLECTION) or
+        // have ambiguous grammar (MATERIALIZED VIEW with TO target). All of
+        // these are metadata-only and don't need the 900s timeout — leave them
+        // untouched.
+        let cases = [
+            // CREATE DICTIONARY — grammar ends with SOURCE / LAYOUT / LIFETIME / RANGE.
+            "CREATE DICTIONARY IF NOT EXISTS nanosiem.ip_enrichment_dict \
+             ON CLUSTER 'default' (network String) PRIMARY KEY network \
+             SOURCE(POSTGRESQL()) LIFETIME(MIN 300 MAX 600) LAYOUT(IP_TRIE())",
+            "CREATE OR REPLACE DICTIONARY nanosiem.hash_prevalence_dict \
+             ON CLUSTER 'default' (file_hash String, host_count UInt32) \
+             PRIMARY KEY file_hash SOURCE(CLICKHOUSE()) \
+             LIFETIME(MIN 300 MAX 600) LAYOUT(HASHED())",
+            // CREATE MATERIALIZED VIEW with TO target — trailing SETTINGS would
+            // be ambiguous (query-level vs engine-level).
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.foo_mv \
+             ON CLUSTER 'default' TO nanosiem.foo_agg AS SELECT 1",
+            // CREATE FUNCTION — no SETTINGS clause in grammar.
+            "CREATE FUNCTION ON CLUSTER 'default' my_fn AS (x) -> x + 1",
+            // CREATE NAMED COLLECTION — no SETTINGS clause in grammar.
+            "CREATE NAMED COLLECTION foo ON CLUSTER 'default' AS host = 'localhost'",
+        ];
+        for sql in cases {
+            assert_eq!(
+                ensure_distributed_ddl_timeout(sql),
+                sql,
+                "non-table DDL should be left untouched: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_settings_clause_keeps_existing_terminator_handled() {
+        // Some statements may arrive with a trailing semicolon from a careless
+        // split — we strip it before appending SETTINGS so the result is a
+        // valid single statement.
+        let sql = "ALTER TABLE x ON CLUSTER 'default' DROP INDEX idx_foo;";
+        let out = ensure_distributed_ddl_timeout(sql);
+        assert!(out.ends_with("distributed_ddl_task_timeout = 900"));
+        assert!(!out.contains("; SETTINGS"));
     }
 }

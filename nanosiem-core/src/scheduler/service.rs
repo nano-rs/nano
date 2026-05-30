@@ -604,7 +604,7 @@ impl SchedulerService {
 /// Normalize a cron expression to 6-field format (seconds included).
 /// The cron crate requires 6 fields (sec min hour day month weekday)
 /// but users typically write standard 5-field cron (min hour day month weekday).
-fn normalize_cron(expression: &str) -> String {
+pub fn normalize_cron(expression: &str) -> String {
     let parts: Vec<&str> = expression.split_whitespace().collect();
     if parts.len() == 5 {
         format!("0 {}", expression)
@@ -787,6 +787,26 @@ mod tests {
         for i in 1..runs.len() {
             assert!(runs[i] > runs[i - 1]);
         }
+    }
+
+    #[test]
+    fn test_normalize_cron_pads_five_field() {
+        // 5-field standard cron gets "0 " prepended for seconds.
+        // Custom enrichment manifests (nano-enrichments) use this format
+        // and were silently failing to schedule pre-NAN-1104.
+        assert_eq!(normalize_cron("0 */6 * * *"), "0 0 */6 * * *");
+        assert_eq!(normalize_cron("*/5 * * * *"), "0 */5 * * * *");
+        // 6-field expressions pass through unchanged.
+        assert_eq!(normalize_cron("0 */5 * * * *"), "0 */5 * * * *");
+    }
+
+    #[test]
+    fn test_validate_cron_accepts_five_field() {
+        // Regression for NAN-1104: 5-field manifests must validate without
+        // the caller having to know about the seconds-padding contract.
+        assert!(validate_cron("0 */6 * * *").is_ok());
+        assert!(validate_cron("*/5 * * * *").is_ok());
+        assert!(validate_cron("0 0 * * *").is_ok());
     }
 
     #[test]

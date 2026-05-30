@@ -34,8 +34,15 @@ max_body_size = 52428800  # 50MB to match batch size (was 10MB)
 # Keep-alive for better connection reuse from log shippers
 keepalive.max_connection_age_secs = 300  # 5 minutes
 
-# Note: End-to-end acknowledgements are enabled in the sink (91-clickhouse-sink.toml)
-# This ensures HTTP clients receive 200 only after ClickHouse confirms receipt
+# Buffering / acks (NAN-1114): the `clickhouse_logs` sink (in
+# sources/parsers/_pipeline.toml) runs a non-blocking memory buffer
+# (when_full = "drop_newest") with sink-level acknowledgements OFF. So this HTTP
+# source returns 200 once an event is accepted into the pipeline buffer, NOT
+# after ClickHouse confirms the write. That is deliberate: http_ingest is shared
+# by the logs lane and the push enrichment lane, so a sink that blocked or waited
+# on end-to-end acks here would backpressure this source and stall LOG ingestion.
+# The `shared_ingest_source_sinks_must_not_backpressure` test in
+# parsers/vector_config/deploy.rs enforces it. (There is no `91-clickhouse-sink.toml`.)
 
 # Split incoming body by newlines - each line becomes a separate event
 # This enables NDJSON batch ingestion from log shippers (Cribl, Fluentd, etc.)

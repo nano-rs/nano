@@ -15,12 +15,34 @@ pub struct MarketplaceRepository {
     pool: PgPool,
 }
 
+/// Live sync state for a native enrichment, read from `enrichment_sources`
+/// (the source of truth for native syncs — IPinfo Lite et al. have no
+/// `custom_enrichment_runs` row). Used to hydrate catalog cards (NAN-1122).
+#[derive(sqlx::FromRow)]
+struct NativeSyncState {
+    id: String,
+    last_sync_status: Option<String>,
+    last_sync_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_sync_error: Option<String>,
+    record_count: i64,
+}
+
 impl MarketplaceRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
 
-    /// Populate computed fields that aren't stored in the DB
+    /// Populate cheap row-local computed fields (only `has_credentials`
+    /// today) that don't depend on other tables.
+    ///
+    /// All public methods that return a [`MarketplaceCatalogEntry`] (reads
+    /// AND mutator returns) additionally call
+    /// [`Self::hydrate_with_run_state`] (single) or
+    /// [`Self::hydrate_vec_with_run_state`] (batched) so the in-flight
+    /// `is_syncing` signal is populated against `custom_enrichment_runs`.
+    /// Keep that invariant when adding new entry-returning methods —
+    /// otherwise the catalog card's syncing-vs-active distinction breaks
+    /// for whichever path skips it (NAN-1108).
     fn hydrate(mut entry: MarketplaceCatalogEntry) -> MarketplaceCatalogEntry {
         entry.has_credentials = entry.credentials_encrypted.is_some();
         entry
@@ -28,6 +50,119 @@ impl MarketplaceRepository {
 
     fn hydrate_vec(entries: Vec<MarketplaceCatalogEntry>) -> Vec<MarketplaceCatalogEntry> {
         entries.into_iter().map(Self::hydrate).collect()
+    }
+
+    /// Mark `is_syncing=true` for every entry whose `custom_enrichment_id`
+    /// currently has an in-flight run (status='running', completed_at IS
+    /// NULL). One batched query covers the whole catalog list.
+    ///
+    /// Native entries (a `native_source_id` and no `custom_enrichment_id`,
+    /// e.g. IPinfo Lite) have no `custom_enrichment_runs` row — their live
+    /// sync state lives in `enrichment_sources` keyed by `id`. For those we
+    /// read `last_sync_status` ('in_progress' ⇒ syncing) and also refresh
+    /// `last_sync_at` / `last_error` / `record_count` from the source of
+    /// truth so the card can show "synced <time>" (NAN-1122). The Deno path
+    /// above is untouched.
+    async fn hydrate_vec_with_run_state(
+        &self,
+        mut entries: Vec<MarketplaceCatalogEntry>,
+    ) -> Result<Vec<MarketplaceCatalogEntry>, MarketplaceError> {
+        // --- Deno path: in-flight custom_enrichment_runs ---
+        let ce_ids: Vec<Uuid> = entries
+            .iter()
+            .filter_map(|e| e.custom_enrichment_id)
+            .collect();
+
+        if !ce_ids.is_empty() {
+            let running: Vec<(Uuid,)> = sqlx::query_as(
+                "SELECT DISTINCT enrichment_id FROM custom_enrichment_runs \
+                 WHERE enrichment_id = ANY($1) AND status = 'running' AND completed_at IS NULL",
+            )
+            .bind(&ce_ids)
+            .fetch_all(&self.pool)
+            .await?;
+
+            let running: std::collections::HashSet<Uuid> =
+                running.into_iter().map(|(id,)| id).collect();
+
+            for e in &mut entries {
+                if let Some(ce_id) = e.custom_enrichment_id {
+                    e.is_syncing = running.contains(&ce_id);
+                }
+            }
+        }
+
+        // --- Native path: enrichment_sources.last_sync_status ---
+        let native_ids: Vec<String> = entries
+            .iter()
+            .filter(|e| e.custom_enrichment_id.is_none())
+            .filter_map(|e| e.native_source_id.clone())
+            .collect();
+
+        if !native_ids.is_empty() {
+            let sources: Vec<NativeSyncState> = sqlx::query_as(
+                "SELECT id, last_sync_status, last_sync_at, last_sync_error, record_count \
+                 FROM enrichment_sources WHERE id = ANY($1)",
+            )
+            .bind(&native_ids)
+            .fetch_all(&self.pool)
+            .await?;
+
+            let by_id: std::collections::HashMap<String, NativeSyncState> =
+                sources.into_iter().map(|s| (s.id.clone(), s)).collect();
+
+            for e in &mut entries {
+                if e.custom_enrichment_id.is_some() {
+                    continue;
+                }
+                if let Some(src_id) = &e.native_source_id {
+                    if let Some(s) = by_id.get(src_id) {
+                        e.is_syncing = s.last_sync_status.as_deref() == Some("in_progress");
+                        e.last_sync_status = s.last_sync_status.clone();
+                        e.last_sync_at = s.last_sync_at;
+                        e.last_error = s.last_sync_error.clone();
+                        e.record_count = s.record_count;
+                    }
+                }
+            }
+        }
+
+        Ok(entries)
+    }
+
+    /// Single-entry variant of [`Self::hydrate_vec_with_run_state`].
+    async fn hydrate_with_run_state(
+        &self,
+        mut entry: MarketplaceCatalogEntry,
+    ) -> Result<MarketplaceCatalogEntry, MarketplaceError> {
+        if let Some(ce_id) = entry.custom_enrichment_id {
+            // Deno path: in-flight custom_enrichment_runs.
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM custom_enrichment_runs \
+                 WHERE enrichment_id = $1 AND status = 'running' AND completed_at IS NULL)",
+            )
+            .bind(ce_id)
+            .fetch_one(&self.pool)
+            .await?;
+            entry.is_syncing = exists;
+        } else if let Some(src_id) = entry.native_source_id.clone() {
+            // Native path: enrichment_sources.last_sync_status (NAN-1122).
+            let source: Option<NativeSyncState> = sqlx::query_as(
+                "SELECT id, last_sync_status, last_sync_at, last_sync_error, record_count \
+                 FROM enrichment_sources WHERE id = $1",
+            )
+            .bind(&src_id)
+            .fetch_optional(&self.pool)
+            .await?;
+            if let Some(s) = source {
+                entry.is_syncing = s.last_sync_status.as_deref() == Some("in_progress");
+                entry.last_sync_status = s.last_sync_status;
+                entry.last_sync_at = s.last_sync_at;
+                entry.last_error = s.last_sync_error;
+                entry.record_count = s.record_count;
+            }
+        }
+        Ok(entry)
     }
 
     // =========================================================================
@@ -94,7 +229,8 @@ impl MarketplaceRepository {
         }
 
         let entries = q.fetch_all(&self.pool).await?;
-        Ok(Self::hydrate_vec(entries))
+        let entries = Self::hydrate_vec(entries);
+        self.hydrate_vec_with_run_state(entries).await
     }
 
     /// Get catalog stats
@@ -131,14 +267,16 @@ impl MarketplaceRepository {
         &self,
         slug: &str,
     ) -> Result<MarketplaceCatalogEntry, MarketplaceError> {
-        sqlx::query_as::<_, MarketplaceCatalogEntry>(
+        let entry = sqlx::query_as::<_, MarketplaceCatalogEntry>(
             "SELECT * FROM marketplace_catalog WHERE slug = $1",
         )
         .bind(slug)
         .fetch_optional(&self.pool)
         .await?
         .map(Self::hydrate)
-        .ok_or_else(|| MarketplaceError::CatalogEntryNotFound(slug.to_string()))
+        .ok_or_else(|| MarketplaceError::CatalogEntryNotFound(slug.to_string()))?;
+
+        self.hydrate_with_run_state(entry).await
     }
 
     /// Get a single catalog entry by ID
@@ -147,14 +285,16 @@ impl MarketplaceRepository {
         &self,
         id: Uuid,
     ) -> Result<MarketplaceCatalogEntry, MarketplaceError> {
-        sqlx::query_as::<_, MarketplaceCatalogEntry>(
+        let entry = sqlx::query_as::<_, MarketplaceCatalogEntry>(
             "SELECT * FROM marketplace_catalog WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
         .await?
         .map(Self::hydrate)
-        .ok_or_else(|| MarketplaceError::CatalogEntryNotFound(id.to_string()))
+        .ok_or_else(|| MarketplaceError::CatalogEntryNotFound(id.to_string()))?;
+
+        self.hydrate_with_run_state(entry).await
     }
 
     /// Upsert a catalog entry (used during repo sync)
@@ -226,7 +366,7 @@ impl MarketplaceRepository {
             MarketplaceError::Database(e)
         })?;
 
-        Ok(Self::hydrate(result))
+        self.hydrate_with_run_state(Self::hydrate(result)).await
     }
 
     /// Create a marketplace catalog entry for a user-created custom enrichment
@@ -295,7 +435,7 @@ impl MarketplaceRepository {
         .await
         .map_err(MarketplaceError::Database)?;
 
-        Ok(Self::hydrate(result))
+        self.hydrate_with_run_state(Self::hydrate(result)).await
     }
 
     /// Delete a marketplace catalog entry by custom_enrichment_id
@@ -342,7 +482,7 @@ impl MarketplaceRepository {
         .await?
         .ok_or_else(|| MarketplaceError::CatalogEntryNotFound(slug.to_string()))?;
 
-        Ok(Self::hydrate(result))
+        self.hydrate_with_run_state(Self::hydrate(result)).await
     }
 
     /// Update installed_version to match manifest_version (after an update)
@@ -365,7 +505,7 @@ impl MarketplaceRepository {
         .await?
         .ok_or_else(|| MarketplaceError::NotInstalled(slug.to_string()))?;
 
-        Ok(Self::hydrate(result))
+        self.hydrate_with_run_state(Self::hydrate(result)).await
     }
 
     /// Update catalog entry configuration
@@ -398,7 +538,7 @@ impl MarketplaceRepository {
         .await?
         .ok_or_else(|| MarketplaceError::CatalogEntryNotFound(slug.to_string()))?;
 
-        Ok(Self::hydrate(result))
+        self.hydrate_with_run_state(Self::hydrate(result)).await
     }
 
     /// Update sync status for a catalog entry

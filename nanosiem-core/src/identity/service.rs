@@ -8,6 +8,7 @@
 use thiserror::Error;
 use tracing::{error, info, instrument};
 
+use crate::enrichment::EnrichmentLaneClient;
 use super::repository::{IdentityRepository, IdentityRepositoryError};
 use super::sync::{
     entra::EntraIdSync, google::GoogleWorkspaceSync, okta::OktaSync, workday::WorkdaySync,
@@ -40,15 +41,36 @@ pub enum IdentityServiceError {
 #[derive(Clone)]
 pub struct IdentitySyncService {
     repo: IdentityRepository,
+    /// NAN-1151: client for emitting raw provider records onto the `nano_enrich`
+    /// enrichment lane. Wired now so the provider reroute (P3) can push instead
+    /// of writing ClickHouse directly; the per-source normalize VRL in the
+    /// parsers repo does the mapping. See [`crate::enrichment::EnrichmentLaneClient`].
+    lane_client: EnrichmentLaneClient,
 }
 
 impl IdentitySyncService {
-    pub fn new(repo: IdentityRepository) -> Self {
-        Self { repo }
+    pub fn new(repo: IdentityRepository, lane_client: EnrichmentLaneClient) -> Self {
+        if !lane_client.is_configured() {
+            // A token-protected Vector rejects unauthenticated pushes — surface
+            // the provisioning gap (NAN-1151) rather than discover it as silent
+            // 401s once the providers are rerouted.
+            tracing::warn!(
+                "identity enrichment lane client has no VECTOR_AUTH_TOKEN; \
+                 provider pushes to a token-protected Vector will be rejected"
+            );
+        } else {
+            tracing::info!("identity enrichment lane client configured");
+        }
+        Self { repo, lane_client }
     }
 
     pub fn repository(&self) -> &IdentityRepository {
         &self.repo
+    }
+
+    /// The `nano_enrich` lane client used to emit raw provider records (P3).
+    pub fn lane_client(&self) -> &EnrichmentLaneClient {
+        &self.lane_client
     }
 
     // ========================================================================
@@ -214,11 +236,15 @@ impl IdentitySyncService {
         sync_impl: &dyn SyncProvider,
     ) -> Result<IdentitySyncResult, IdentityServiceError> {
         let start = std::time::Instant::now();
-        // Capture DB server time for absent-user detection — must come from the same
-        // clock that sets last_synced_at to avoid clock skew false deletions.
-        let sync_started_at = self.repo.db_now().await?;
+        // NAN-1151: providers now fetch RAW user objects and we emit them onto
+        // the nano_enrich lane (tagged kind=identity, source=<provider>); the
+        // repo-sourced per-source VRL maps them into user_registry. The lane is
+        // fire-and-forget, so deprovisioning is the staleness reconciler's job
+        // (scheduler) — NOT a synchronous mark-absent here, which would race the
+        // async writes and false-delete the just-emitted users.
+        let source = Self::provider_source(&provider.provider_type);
 
-        // Try delta sync first — delta results are bounded (only changed users), safe to collect
+        // Try delta sync first — delta results are bounded (only changed users).
         if let Some(delta_link) = &provider.delta_link {
             if let Some(delta_result) = sync_impl
                 .delta_sync(credentials, config, Some(delta_link))
@@ -238,24 +264,28 @@ impl IdentitySyncService {
                 }
 
                 let users_synced = delta_result.users.len() as u64;
-                let (affected, _) = self
-                    .repo
-                    .upsert_users(provider_id, &delta_result.users)
-                    .await?;
+                let records: Vec<serde_json::Value> = delta_result
+                    .users
+                    .into_iter()
+                    .map(|u| Self::tag_enrich_value(u, source, provider_id))
+                    .collect();
+                self.lane_client.push_records(&records).await.map_err(|e| {
+                    IdentityServiceError::Sync(SyncError::StorageError(e.to_string()))
+                })?;
 
                 info!(
                     provider_id,
                     users_synced,
                     is_delta = true,
-                    "Delta sync completed"
+                    "Delta sync emitted to enrichment lane"
                 );
 
                 return Ok(IdentitySyncResult {
                     provider_id: provider_id.to_string(),
                     users_synced,
-                    users_created: affected,
+                    users_created: 0,
                     users_updated: 0,
-                    users_disabled: 0, // Delta syncs don't disable absent users
+                    users_disabled: 0,
                     duration_ms: start.elapsed().as_millis() as u64,
                     error: None,
                     is_delta: true,
@@ -267,51 +297,115 @@ impl IdentitySyncService {
             );
         }
 
-        // Full sync — use paged variant to keep memory bounded.
-        // Each page is upserted immediately and then dropped.
-        let repo = self.repo.clone();
+        // Full sync — paged to keep memory bounded; each page is tagged and
+        // emitted to the lane, then dropped.
+        let lane = self.lane_client.clone();
         let pid = provider_id.to_string();
+        let src = source.to_string();
 
         let users_synced = sync_impl
-            .full_sync_paged(credentials, config, &|page: Vec<UserRecordUpsert>| {
+            .full_sync_paged(credentials, config, &|page: Vec<serde_json::Value>| {
                 let count = page.len() as u64;
-                let repo = repo.clone();
+                let lane = lane.clone();
                 let pid = pid.clone();
+                let src = src.clone();
                 Box::pin(async move {
-                    repo.upsert_users(&pid, &page).await.map_err(|e| {
-                        SyncError::StorageError(format!("Paged upsert failed: {}", e))
+                    let records: Vec<serde_json::Value> = page
+                        .into_iter()
+                        .map(|u| IdentitySyncService::tag_enrich_value(u, &src, &pid))
+                        .collect();
+                    lane.push_records(&records).await.map_err(|e| {
+                        SyncError::StorageError(format!("Lane push failed: {}", e))
                     })?;
                     Ok(count)
                 })
             })
             .await?;
 
-        // Detect absent users via timestamp: any user whose last_synced_at is before
-        // sync_started_at (from DB clock) wasn't in the provider's response.
-        let users_disabled = if users_synced > 0 {
-            self.repo
-                .mark_absent_users_by_sync_time(provider_id, sync_started_at)
-                .await
-                .unwrap_or(0)
-        } else {
-            0
-        };
-
         info!(
             provider_id,
-            users_synced, users_disabled, "Full sync completed"
+            users_synced, "Full sync emitted to enrichment lane"
         );
 
         Ok(IdentitySyncResult {
             provider_id: provider_id.to_string(),
             users_synced,
-            users_created: 0, // Paged mode doesn't track create vs update
+            users_created: 0,
             users_updated: 0,
-            users_disabled,
+            users_disabled: 0, // deprovisioning handled by the staleness reconciler
             duration_ms: start.elapsed().as_millis() as u64,
             error: None,
             is_delta: false,
         })
+    }
+
+    /// Map an identity provider_type to its enrichment-lane `source`
+    /// discriminator (must match the parsers-repo `enrich_source`). NAN-1151.
+    fn provider_source(provider_type: &str) -> &'static str {
+        match provider_type {
+            "entra_id" => "entra",
+            "google_workspace" => "google",
+            "okta" => "okta",
+            "workday" => "workday",
+            // active_directory flows via /push (source=ad), not this pull path.
+            _ => "unknown",
+        }
+    }
+
+    /// Tag a raw provider user object for the `nano_enrich` lane: add the
+    /// `kind`/`source` the router keys on + the `provider_id` the VRL stamps.
+    fn tag_enrich_value(
+        mut value: serde_json::Value,
+        source: &str,
+        provider_id: &str,
+    ) -> serde_json::Value {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("kind".to_string(), serde_json::Value::from("identity"));
+            obj.insert("source".to_string(), serde_json::Value::from(source));
+            obj.insert(
+                "provider_id".to_string(),
+                serde_json::Value::from(provider_id),
+            );
+        }
+        value
+    }
+
+    // ========================================================================
+    // Staleness reconciliation (NAN-1151)
+    // ========================================================================
+
+    /// Tombstone directory accounts not seen since `cutoff` — the staleness
+    /// deprovisioning model that replaces synchronous per-sync mark-absent once
+    /// providers emit through the (fire-and-forget) enrichment lane.
+    ///
+    /// With synchronous writes, "absent" meant "not in THIS sync" (cutoff =
+    /// sync start). Through the lane, emitted records land asynchronously, so a
+    /// just-after-sync check would false-delete every active account. Instead we
+    /// age out by staleness: an account still being synced keeps a recent
+    /// `last_synced_at` (from prior landed syncs), so with a window of N≥2 sync
+    /// intervals only genuinely-removed accounts cross `cutoff`. This mirrors how
+    /// Google SecOps ages entity context out of its live window rather than
+    /// tombstoning per collection. Reuses the existing argMax-safe tombstone
+    /// path (`mark_absent_users_by_sync_time`).
+    #[instrument(skip(self))]
+    pub async fn reconcile_stale_users(
+        &self,
+        provider_id: &str,
+        cutoff: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, IdentityServiceError> {
+        let disabled = self
+            .repo
+            .mark_absent_users_by_sync_time(provider_id, cutoff)
+            .await?;
+        if disabled > 0 {
+            info!(
+                provider_id,
+                disabled,
+                cutoff = %cutoff,
+                "Staleness reconciliation tombstoned absent accounts"
+            );
+        }
+        Ok(disabled)
     }
 
     // ========================================================================
@@ -366,76 +460,9 @@ impl IdentitySyncService {
         Ok(result)
     }
 
-    // ========================================================================
-    // AD Push
-    // ========================================================================
-
-    /// Push users from an AD collector. Validates the collector token.
-    #[instrument(skip(self, users))]
-    pub async fn push_users(
-        &self,
-        provider_id: &str,
-        bearer_token: &str,
-        users: Vec<PushUserRecord>,
-    ) -> Result<IdentitySyncResult, IdentityServiceError> {
-        let start = std::time::Instant::now();
-        let provider = self.repo.get_provider(provider_id).await?;
-
-        // Validate provider type
-        if provider.provider_type != "active_directory" {
-            return Err(IdentityServiceError::InvalidProviderType(format!(
-                "Push endpoint only supports active_directory, got {}",
-                provider.provider_type
-            )));
-        }
-
-        // Validate collector token
-        let credentials = self.repo.get_decrypted_credentials(provider_id).await?;
-        let ad_creds: ActiveDirectoryCredentials =
-            serde_json::from_value(credentials).map_err(|e| {
-                IdentityServiceError::Repository(IdentityRepositoryError::EncryptionError(
-                    e.to_string(),
-                ))
-            })?;
-
-        if bearer_token != ad_creds.collector_token {
-            return Err(IdentityServiceError::Repository(
-                IdentityRepositoryError::ProviderNotFound("Invalid collector token".to_string()),
-            ));
-        }
-
-        // Convert push records to upsert records
-        let upsert_records: Vec<UserRecordUpsert> =
-            users.into_iter().map(|u| u.into_upsert()).collect();
-
-        let users_synced = upsert_records.len() as u64;
-        let (affected, _) = self.repo.upsert_users(provider_id, &upsert_records).await?;
-
-        let user_count = self.repo.get_user_count(provider_id).await.unwrap_or(0) as i32;
-        let duration_ms = start.elapsed().as_millis() as u64;
-
-        self.repo
-            .update_sync_status(
-                provider_id,
-                "completed",
-                None,
-                Some(user_count),
-                Some(duration_ms as i64),
-                None,
-            )
-            .await?;
-
-        Ok(IdentitySyncResult {
-            provider_id: provider_id.to_string(),
-            users_synced,
-            users_created: affected,
-            users_updated: 0,
-            users_disabled: 0,
-            duration_ms,
-            error: None,
-            is_delta: false,
-        })
-    }
+    // NAN-1151 (3d): `push_users` (the AD /push handler) is retired. AD identity
+    // now flows through the nano_enrich lane via the external collector, the
+    // same as the pull providers — no in-app AD ingestion path remains.
 
     // ========================================================================
     // User Queries
@@ -455,7 +482,7 @@ impl IdentitySyncService {
         Ok(self.repo.list_users(params).await?)
     }
 
-    pub async fn get_user(&self, id: i64) -> Result<UserRecord, IdentityServiceError> {
+    pub async fn get_user(&self, id: &str) -> Result<UserRecord, IdentityServiceError> {
         Ok(self.repo.get_user(id).await?)
     }
 
@@ -463,3 +490,4 @@ impl IdentitySyncService {
         Ok(self.repo.get_stats().await?)
     }
 }
+

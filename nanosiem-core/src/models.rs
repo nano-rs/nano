@@ -41,6 +41,7 @@ pub use case::{
     CaseRelationType,
     CaseResponseStats,
     CaseShareResult,
+    CaseSort,
     CaseStats,
     CaseStatus,
     CaseSummary,
@@ -71,6 +72,8 @@ pub use case::{
     ShareCaseRequest,
     // Sharing types
     SharedGroup as CaseSharedGroup,
+    // NAN-1095 — SLA sort target inputs
+    SlaTargets,
     UpdateCase,
     UpdateCaseGroupingRule,
     UpdateEntityEnrichment,

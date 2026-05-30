@@ -1,96 +1,51 @@
-# Auto-generated dynamic router for deployed parsers
-# DO NOT EDIT - changes will be overwritten by parser deployment
-# Generated at: 2026-04-18T01:38:14.987841+00:00
+# =============================================================================
+# Bootstrap dynamic router
+# =============================================================================
+# NAN-1083: ship a SIEM with no opinionated pre-seeded routes. This file is the
+# first-boot artifact used by Vector before any parser-deploy regenerates it
+# via `nanosiem-core::parsers::vector_config::router::write_router_config`.
+#
+# On a fresh install there are no deployed parsers and no source configs, so
+# `source_router` accepts the two always-present base inputs (`vector_merge`
+# from native Vector traffic, `http_ingestion_route` from the HTTP pipeline)
+# and offers only the `generic` catch-all route. Unmatched events fall through
+# to `generic_parser` in `_pipeline.toml` and are normalized as-is.
+#
+# `placeholder_combiner` is required because `_pipeline.toml`'s `normalize`
+# transform names it as an input. It's a no-op filter consuming from
+# `source_router.generic` and dropping every event via `condition = "false"`
+# — present-but-inert so the topology stays valid until a parser-deploy
+# rewrites this file with real placeholders for any installed parsers.
 
-# =============================================================================
-# Dynamic Source Type Router
-# =============================================================================
-# Accepts input from HTTP pipeline, Vector native protocol, and source configurations.
 [transforms.source_router]
 type = "route"
 inputs = ["vector_merge", "http_ingestion_route"]
 
 [transforms.source_router.route]
-aws_cloudtrail = '.source_type == "aws_cloudtrail"'
-squid_proxy = '.source_type == "squid_proxy"'
-windows_event = '.source_type == "windows_event"'
-sysmon = '.source_type == "sysmon"'
-palo_alto = '.source_type == "palo_alto"'
-fortinet = '.source_type == "fortinet"'
-cisco_asa = '.source_type == "cisco_asa"'
-syslog = '.source_type == "syslog"'
-aws_guardduty = '.source_type == "aws_guardduty"'
-azure_activity = '.source_type == "azure_activity"'
-azure_signin = '.source_type == "azure_signin"'
-okta = '.source_type == "okta"'
-nginx = '.source_type == "nginx"'
-generic = '!includes(["aws_cloudtrail", "squid_proxy", "windows_event", "sysmon", "palo_alto", "fortinet", "cisco_asa", "syslog", "aws_guardduty", "azure_activity", "azure_signin", "okta", "nginx"], .source_type)'
+# NAN-1124: exclude nano_enrich (push enrichment) so it never reaches the
+# generic log parser — enrichment_router below claims it instead.
+generic = '!starts_with(downcase(to_string(.source_type) ?? ""), "nano_enrich")'
 
 # =============================================================================
-# Placeholder Transforms
+# NAN-1124: Enrichment lane router (nano_enrich -> per-kind outputs)
 # =============================================================================
+# Sibling to source_router with identical inputs; routes push-enrichment records
+# by `.kind` to the outputs consumed by config/vector/03-enrichment-lane.toml.
+# Non-enrichment events fall to enrichment_router._unmatched (dropped). Present
+# in this bootstrap so the lane file's `enrichment_router.<kind>` inputs never
+# dangle before the first parser-deploy regenerates this file. Kept in sync with
+# router::write_router_config (which emits the same block dynamically).
+[transforms.enrichment_router]
+type = "route"
+inputs = ["vector_merge", "http_ingestion_route"]
 
-[transforms.windows_event_placeholder]
-type = "remap"
-inputs = ["source_router.windows_event"]
-source = '.metadata.awaiting_parser = "windows_event"'
+[transforms.enrichment_router.route]
+identity = 'downcase(to_string(.source_type) ?? "") == "nano_enrich" && downcase(to_string(.kind) ?? "") == "identity"'
+ip_context = 'downcase(to_string(.source_type) ?? "") == "nano_enrich" && downcase(to_string(.kind) ?? "") == "ip_context"'
+ioc = 'downcase(to_string(.source_type) ?? "") == "nano_enrich" && downcase(to_string(.kind) ?? "") == "ioc"'
+asset = 'downcase(to_string(.source_type) ?? "") == "nano_enrich" && downcase(to_string(.kind) ?? "") == "asset"'
 
-[transforms.sysmon_placeholder]
-type = "remap"
-inputs = ["source_router.sysmon"]
-source = '.metadata.awaiting_parser = "sysmon"'
-
-[transforms.palo_alto_placeholder]
-type = "remap"
-inputs = ["source_router.palo_alto"]
-source = '.metadata.awaiting_parser = "palo_alto"'
-
-[transforms.fortinet_placeholder]
-type = "remap"
-inputs = ["source_router.fortinet"]
-source = '.metadata.awaiting_parser = "fortinet"'
-
-[transforms.cisco_asa_placeholder]
-type = "remap"
-inputs = ["source_router.cisco_asa"]
-source = '.metadata.awaiting_parser = "cisco_asa"'
-
-[transforms.syslog_placeholder]
-type = "remap"
-inputs = ["source_router.syslog"]
-source = '.metadata.awaiting_parser = "syslog"'
-
-[transforms.aws_guardduty_placeholder]
-type = "remap"
-inputs = ["source_router.aws_guardduty"]
-source = '.metadata.awaiting_parser = "aws_guardduty"'
-
-[transforms.azure_activity_placeholder]
-type = "remap"
-inputs = ["source_router.azure_activity"]
-source = '.metadata.awaiting_parser = "azure_activity"'
-
-[transforms.azure_signin_placeholder]
-type = "remap"
-inputs = ["source_router.azure_signin"]
-source = '.metadata.awaiting_parser = "azure_signin"'
-
-[transforms.okta_placeholder]
-type = "remap"
-inputs = ["source_router.okta"]
-source = '.metadata.awaiting_parser = "okta"'
-
-[transforms.nginx_placeholder]
-type = "remap"
-inputs = ["source_router.nginx"]
-source = '.metadata.awaiting_parser = "nginx"'
-
-# =============================================================================
-# Placeholder Combiner
-# =============================================================================
 [transforms.placeholder_combiner]
-type = "remap"
-inputs = ["windows_event_placeholder", "sysmon_placeholder", "palo_alto_placeholder", "fortinet_placeholder", "cisco_asa_placeholder", "syslog_placeholder", "aws_guardduty_placeholder", "azure_activity_placeholder", "azure_signin_placeholder", "okta_placeholder", "nginx_placeholder"]
-source = '''
-.routed = true
-'''
+type = "filter"
+inputs = ["source_router.generic"]
+condition = "false"

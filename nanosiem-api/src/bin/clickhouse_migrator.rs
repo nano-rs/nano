@@ -185,5 +185,19 @@ async fn run() -> Result<()> {
         );
     }
 
+    // NAN-1116: surface any FAILED dictionaries in the deploy log. A FAILED
+    // dict referenced by a dictGet()-backed MATERIALIZED column silently drops
+    // 100% of ingestion at runtime; this makes it loud at every migrate instead
+    // of an invisible outage. Reported, never fatal (failing here would block
+    // the deploy — the deadlock NAN-1115 just removed).
+    let failed_dicts = migrator.report_failed_dictionaries().await;
+    if failed_dicts > 0 {
+        tracing::error!(
+            "{} ClickHouse dictionary(ies) are FAILED after migration (see errors above) — \
+             ingestion through their enrichment columns will be dropped until resolved",
+            failed_dicts
+        );
+    }
+
     Ok(())
 }

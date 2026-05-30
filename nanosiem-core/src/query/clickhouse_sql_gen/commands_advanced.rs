@@ -162,80 +162,70 @@ impl ClickHouseSqlGenerator {
 
         let window_exprs: Vec<String> = aggregations
             .iter()
-            .map(|agg| {
+            .map(|agg| -> Result<String, SqlGenError> {
                 let field_expr = agg
                     .field
                     .as_ref()
                     .map(|f| escape_identifier(normalize_field_name(f)))
                     .unwrap_or_else(|| "*".to_string());
 
-                // ClickHouse window functions: countOver, sumOver, avgOver, etc.
+                // Whole-partition window (no ORDER BY): eventstats annotates every row with the
+                // group aggregate. Computed once and reused by every arm below.
+                let over = if partition_clause.is_empty() {
+                    "OVER ()".to_string()
+                } else {
+                    format!("OVER (PARTITION BY {})", partition_clause)
+                };
+
+                // Exhaustive on purpose. Previously the `_` arm silently emitted `count() OVER`
+                // for stdev/var/values/list/range/median/perc/mode/first/last/earliest/latest,
+                // returning a row count under the user's alias (NAN-1145). Every variant now maps
+                // to its real window aggregate (mirroring streamstats/stats) or is rejected —
+                // never silently count(). A new AggFunc variant forces a decision here.
                 let window_func = match agg.func {
-                    AggFunc::Count => {
-                        if partition_clause.is_empty() {
-                            "count() OVER ()".to_string()
-                        } else {
-                            format!("count() OVER (PARTITION BY {})", partition_clause)
-                        }
-                    }
+                    AggFunc::Count => format!("count() {}", over),
                     AggFunc::Dc => {
-                        // ClickHouse doesn't have distinct window functions, use subquery approach
+                        // ClickHouse has no distinct window function; over the whole set use a
+                        // scalar subquery, otherwise approximate with uniqExact over the partition.
                         if partition_clause.is_empty() {
                             format!("(SELECT count(DISTINCT {}) FROM {})", field_expr, source)
                         } else {
-                            // Approximation: use uniqExact with window
-                            format!(
-                                "uniqExact({}) OVER (PARTITION BY {})",
-                                field_expr, partition_clause
-                            )
+                            format!("uniqExact({}) {}", field_expr, over)
                         }
                     }
-                    AggFunc::Sum => {
-                        if partition_clause.is_empty() {
-                            format!("sum({}) OVER ()", field_expr)
-                        } else {
-                            format!(
-                                "sum({}) OVER (PARTITION BY {})",
-                                field_expr, partition_clause
-                            )
-                        }
+                    AggFunc::Sum => format!("sum({}) {}", field_expr, over),
+                    AggFunc::Avg => format!("avg({}) {}", field_expr, over),
+                    AggFunc::Min => format!("min({}) {}", field_expr, over),
+                    AggFunc::Max => format!("max({}) {}", field_expr, over),
+                    AggFunc::Stdev => format!("stddevPop({}) {}", field_expr, over),
+                    AggFunc::Var => format!("varPop({}) {}", field_expr, over),
+                    AggFunc::Range => format!("(max({0}) {1} - min({0}) {1})", field_expr, over),
+                    AggFunc::Median => format!("median({}) {}", field_expr, over),
+                    AggFunc::Perc95 => format!("quantile(0.95)({}) {}", field_expr, over),
+                    AggFunc::Percentile(p) => {
+                        format!("quantile({})({}) {}", f64::from(p) / 100.0, field_expr, over)
                     }
-                    AggFunc::Avg => {
-                        if partition_clause.is_empty() {
-                            format!("avg({}) OVER ()", field_expr)
-                        } else {
-                            format!(
-                                "avg({}) OVER (PARTITION BY {})",
-                                field_expr, partition_clause
-                            )
-                        }
-                    }
-                    AggFunc::Min => {
-                        if partition_clause.is_empty() {
-                            format!("min({}) OVER ()", field_expr)
-                        } else {
-                            format!(
-                                "min({}) OVER (PARTITION BY {})",
-                                field_expr, partition_clause
-                            )
-                        }
-                    }
-                    AggFunc::Max => {
-                        if partition_clause.is_empty() {
-                            format!("max({}) OVER ()", field_expr)
-                        } else {
-                            format!(
-                                "max({}) OVER (PARTITION BY {})",
-                                field_expr, partition_clause
-                            )
-                        }
-                    }
-                    _ => {
-                        if partition_clause.is_empty() {
-                            "count() OVER ()".to_string()
-                        } else {
-                            format!("count() OVER (PARTITION BY {})", partition_clause)
-                        }
+                    AggFunc::Values => format!(
+                        "arrayStringConcat(arrayFilter(x -> x != '', \
+                         groupUniqArray({})(toString({})) {}), ', ')",
+                        self.max_group_array_size, field_expr, over
+                    ),
+                    AggFunc::List => format!(
+                        "arrayStringConcat(arrayFilter(x -> x != '', \
+                         groupArray({})(toString({})) {}), ', ')",
+                        self.max_group_array_size, field_expr, over
+                    ),
+                    AggFunc::First => format!("any({}) {}", field_expr, over),
+                    AggFunc::Last => format!("anyLast({}) {}", field_expr, over),
+                    AggFunc::Earliest => format!("argMin({}, timestamp) {}", field_expr, over),
+                    AggFunc::Latest => format!("argMax({}, timestamp) {}", field_expr, over),
+                    AggFunc::Mode => format!("(topK(1)({}) {})[1]", field_expr, over),
+                    AggFunc::Sparkline => {
+                        return Err(SqlGenError::InvalidQuery(
+                            "eventstats does not support sparkline() — there is no whole-partition \
+                             window form; use timechart or stats sparkline() instead"
+                                .into(),
+                        ))
                     }
                 };
 
@@ -247,7 +237,20 @@ impl ClickHouseSqlGenerator {
                         AggFunc::Avg => "avg",
                         AggFunc::Min => "min",
                         AggFunc::Max => "max",
-                        _ => "agg",
+                        AggFunc::Stdev => "stdev",
+                        AggFunc::Var => "var",
+                        AggFunc::Range => "range",
+                        AggFunc::Median => "median",
+                        AggFunc::Perc95 => "perc95",
+                        AggFunc::Percentile(_) => "percentile",
+                        AggFunc::Values => "values",
+                        AggFunc::List => "list",
+                        AggFunc::First => "first",
+                        AggFunc::Last => "last",
+                        AggFunc::Earliest => "earliest",
+                        AggFunc::Latest => "latest",
+                        AggFunc::Mode => "mode",
+                        AggFunc::Sparkline => "sparkline",
                     };
                     match &agg.field {
                         Some(f) => format!("{}_{}", func_name, normalize_field_name(f)),
@@ -255,9 +258,9 @@ impl ClickHouseSqlGenerator {
                     }
                 });
 
-                format!("{} AS {}", window_func, escape_identifier(&alias))
+                Ok(format!("{} AS {}", window_func, escape_identifier(&alias)))
             })
-            .collect();
+            .collect::<Result<Vec<String>, SqlGenError>>()?;
 
         Ok(format!(
             "  SELECT *, {} FROM {}",

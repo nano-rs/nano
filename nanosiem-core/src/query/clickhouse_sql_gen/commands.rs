@@ -20,7 +20,18 @@ impl ClickHouseSqlGenerator {
         available_columns: &mut Option<HashSet<String>>,
         sparkline_span_secs: Option<u64>,
         has_prior_risk: bool,
+        // True if an earlier aggregating command dropped the raw `timestamp` column.
+        // tail/reverse use this to avoid `ORDER BY timestamp` (which would be Code 47).
+        aggregated: bool,
     ) -> Result<String, SqlGenError> {
+        // Whether the raw `timestamp` column still exists at this pipeline stage:
+        // false after an aggregating command (stats/timechart/top/...) or after a
+        // table/fields projection that dropped it. tail/reverse branch on this.
+        let timestamp_available = !aggregated
+            && match available_columns {
+                None => true,
+                Some(cols) => cols.contains("timestamp"),
+            };
         match cmd {
             Command::Stats {
                 aggregations,
@@ -86,11 +97,22 @@ impl ClickHouseSqlGenerator {
             }
             Command::Head { count } => Ok(format!("  SELECT * FROM {}\n  LIMIT {}", source, count)),
             Command::Tail { count } => {
-                // For tail, reverse sort, limit, then reverse again
-                Ok(format!(
-                    "  SELECT * FROM (\n    SELECT * FROM {}\n    ORDER BY timestamp DESC\n    LIMIT {}\n  )\n  ORDER BY timestamp ASC",
-                    source, count
-                ))
+                if timestamp_available {
+                    // Raw events: last N by time = oldest N (search default order is newest-first),
+                    // presented oldest-first. Unchanged behavior.
+                    Ok(format!(
+                        "  SELECT * FROM (\n    SELECT * FROM {}\n    ORDER BY timestamp DESC\n    LIMIT {}\n  )\n  ORDER BY timestamp ASC",
+                        source, count
+                    ))
+                } else {
+                    // Post-aggregation / timestamp pruned: there is no `timestamp` to order by
+                    // (was Code 47, NAN-1146). Tail = last N of the CURRENT result order; capture
+                    // that order with rowNumberInAllBlocks() and take the last N in reverse.
+                    Ok(format!(
+                        "  SELECT * EXCEPT (__nano_rn) FROM (\n    SELECT *, rowNumberInAllBlocks() AS __nano_rn FROM {}\n  )\n  ORDER BY __nano_rn DESC\n  LIMIT {}",
+                        source, count
+                    ))
+                }
             }
             Command::Timechart {
                 span,
@@ -858,10 +880,22 @@ impl ClickHouseSqlGenerator {
                 "  SELECT * FROM {}\n  ORDER BY cityHash64(id, now())\n  LIMIT {}",
                 source, limit
             )),
-            Command::Reverse => Ok(format!(
-                "  SELECT * FROM {}\n  ORDER BY timestamp ASC",
-                source
-            )),
+            Command::Reverse => {
+                if timestamp_available {
+                    // Raw events: reverse the default newest-first order → oldest-first. Unchanged.
+                    Ok(format!(
+                        "  SELECT * FROM {}\n  ORDER BY timestamp ASC",
+                        source
+                    ))
+                } else {
+                    // Post-aggregation / timestamp pruned: reverse the CURRENT result order via
+                    // rowNumberInAllBlocks() rather than ORDER BY timestamp (was Code 47, NAN-1146).
+                    Ok(format!(
+                        "  SELECT * EXCEPT (__nano_rn) FROM (\n    SELECT *, rowNumberInAllBlocks() AS __nano_rn FROM {}\n  )\n  ORDER BY __nano_rn DESC",
+                        source
+                    ))
+                }
+            }
             Command::EventStats {
                 aggregations,
                 group_by,

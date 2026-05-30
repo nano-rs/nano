@@ -91,6 +91,20 @@ impl MitreSync {
         Ok((tactics.len() as i32, techniques.len() as i32))
     }
 
+    /// Sync the catalog from upstream only when it is currently empty.
+    ///
+    /// Returns `Ok(true)` if a sync ran (the catalog had no tactics), or
+    /// `Ok(false)` if data already existed and no sync was needed. Read
+    /// handlers use this to lazily seed the ATT&CK catalog on first use so any
+    /// MITRE surface — not just the rule-editor data endpoint — self-seeds.
+    pub async fn sync_if_empty(&self) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        if self.repository.has_data().await? {
+            return Ok(false);
+        }
+        self.sync().await?;
+        Ok(true)
+    }
+
     /// Parse a STIX tactic object
     fn parse_tactic(&self, obj: &StixObject) -> Option<MitreTactic> {
         let name = obj.name.as_ref()?;

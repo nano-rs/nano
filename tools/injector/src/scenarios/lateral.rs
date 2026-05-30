@@ -1,4 +1,10 @@
 //! Lateral movement scenario — pivot across hosts via RDP/SMB
+//!
+//! Scripted sysmon steps go through `process_create_step` (NAN-1058) so the
+//! wire payload carries the actual command lines. The `WindowsEventGenerator`
+//! call for the RDP/SMB logon stays as a random event — it's noise that
+//! contributes to the logon graph but doesn't try to assert a specific
+//! command-line pattern.
 
 use chrono::Utc;
 use std::time::Duration;
@@ -6,7 +12,7 @@ use std::time::Duration;
 use event_core::entity::Entity;
 use event_core::generators::{SysmonGenerator, WindowsEventGenerator};
 
-use super::{AttackScenario, AttackStep};
+use super::{process_create_step, AttackScenario, AttackStep};
 
 pub struct LateralScenario;
 
@@ -22,32 +28,35 @@ impl AttackScenario for LateralScenario {
         let now = Utc::now();
         let mut steps = Vec::new();
 
-        // Phase 1: Initial compromise on target
-        steps.push(AttackStep {
-            delay: Duration::from_secs(0),
-            events: vec![sysmon.generate(now, target, &mut rng)],
-            stage: "Initial Access".into(),
-            description: format!("Initial compromise on {}", target.hostname),
-        });
+        // Phase 1: Initial compromise — dropper lands on target.
+        steps.push(process_create_step(
+            &sysmon,
+            target,
+            now,
+            0,
+            "update.exe",
+            r"C:\Users\Public\Downloads\update.exe",
+            r"update.exe --silent --install",
+            None,
+            "Initial Access",
+            format!("Initial compromise on {}", target.hostname),
+        ));
 
-        // Phase 2: Recon for other hosts
-        steps.push(AttackStep {
-            delay: Duration::from_secs(30),
-            events: {
-                let ts = now + chrono::Duration::seconds(30);
-                target.spawn_process(
-                    "net.exe",
-                    r"C:\Windows\System32\net.exe",
-                    "net view /domain",
-                    None,
-                );
-                vec![sysmon.generate(ts, target, &mut rng)]
-            },
-            stage: "Discovery".into(),
-            description: "net view /domain — enumerate hosts".into(),
-        });
+        // Phase 2: Recon — enumerate hosts in the domain.
+        steps.push(process_create_step(
+            &sysmon,
+            target,
+            now,
+            30,
+            "net.exe",
+            r"C:\Windows\System32\net.exe",
+            "net view /domain",
+            None,
+            "Discovery",
+            "net view /domain — enumerate hosts",
+        ));
 
-        // Phase 3: Pivot to neighbor hosts
+        // Phase 3: Pivot to neighbor hosts via RDP/SMB.
         let pivot_targets: Vec<&Entity> = target
             .neighbor_indices
             .iter()
@@ -56,9 +65,12 @@ impl AttackScenario for LateralScenario {
             .collect();
 
         for (i, pivot) in pivot_targets.iter().enumerate() {
-            let base_delay = 120 + (i as u64 * 300); // 2min, 7min
+            let base_delay = 120 + (i as u64 * 300); // 2 min, 7 min
 
-            // RDP/SMB logon event on pivot target
+            // RDP/SMB logon event on pivot host — uses the Windows Event
+            // generator, not the sysmon process-create path. Detection rules
+            // for lateral movement key off Event ID 4624 logon type, which the
+            // winevt generator produces correctly.
             steps.push(AttackStep {
                 delay: Duration::from_secs(base_delay),
                 events: {
@@ -69,41 +81,71 @@ impl AttackScenario for LateralScenario {
                 description: format!("Lateral move to {} via RDP/SMB", pivot.hostname),
             });
 
-            // Recon on pivot host
-            steps.push(AttackStep {
-                delay: Duration::from_secs(base_delay + 15),
-                events: {
-                    let ts = now + chrono::Duration::seconds(base_delay as i64 + 15);
-                    pivot.spawn_process(
-                        "whoami.exe",
-                        r"C:\Windows\System32\whoami.exe",
-                        "whoami",
-                        None,
-                    );
-                    vec![sysmon.generate(ts, pivot, &mut rng)]
-                },
-                stage: "Discovery".into(),
-                description: format!("Recon on {}", pivot.hostname),
-            });
+            steps.push(process_create_step(
+                &sysmon,
+                pivot,
+                now,
+                base_delay + 15,
+                "whoami.exe",
+                r"C:\Windows\System32\whoami.exe",
+                "whoami",
+                None,
+                "Discovery",
+                format!("Recon on {}", pivot.hostname),
+            ));
 
-            // Process execution on pivot
-            steps.push(AttackStep {
-                delay: Duration::from_secs(base_delay + 45),
-                events: {
-                    let ts = now + chrono::Duration::seconds(base_delay as i64 + 45);
-                    pivot.spawn_process(
-                        "powershell.exe",
-                        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-                        r"powershell.exe -enc SQBFAFgA...",
-                        None,
-                    );
-                    vec![sysmon.generate(ts, pivot, &mut rng)]
-                },
-                stage: "Execution".into(),
-                description: format!("PowerShell execution on {}", pivot.hostname),
-            });
+            steps.push(process_create_step(
+                &sysmon,
+                pivot,
+                now,
+                base_delay + 45,
+                "powershell.exe",
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                r"powershell.exe -enc SQBFAFgA...",
+                None,
+                "Execution",
+                format!("PowerShell execution on {}", pivot.hostname),
+            ));
         }
 
         steps
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use event_core::entity::WorldState;
+
+    /// NAN-1058 regression — scripted sysmon steps must carry their command
+    /// lines to the wire. The winevt logon steps are not asserted here
+    /// (they're random Event ID 4624s for the logon graph).
+    #[test]
+    fn lateral_scenario_emits_scripted_command_lines() {
+        // 100 entities so target picks up a couple of neighbors for the pivot phase.
+        let world = WorldState::new(100);
+        let target = &world.entities()[0];
+        let steps = LateralScenario.generate(target, world.entities());
+
+        let wire: String = steps
+            .iter()
+            .flat_map(|s| s.events.iter().map(|e| e.message.clone()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for required in [
+            "update.exe",            // initial access
+            "net view /domain",      // recon
+            // Pivot phase lands at least one of these depending on neighbor count;
+            // assert the discovery + execution patterns are present.
+            "whoami",
+            "powershell.exe -enc",
+        ] {
+            assert!(
+                wire.contains(required),
+                "lateral scenario wire payload missing `{required}`. \
+                 NAN-1058 regression. Full payload:\n{wire}"
+            );
+        }
     }
 }

@@ -84,8 +84,25 @@ pub struct RepositoryParser {
     pub vendor: Option<String>,
     pub product: Option<String>,
     pub parser_vrl: Option<String>,
+    /// NAN-1149: "parser" (log) or "enrichment". Enrichment rows carry
+    /// `enrich_kind`/`enrich_source`/`target_table`/`normalize_vrl` instead of a
+    /// log `parser_vrl`.
+    #[serde(default = "default_repo_parser_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub enrich_kind: Option<String>,
+    #[serde(default)]
+    pub enrich_source: Option<String>,
+    #[serde(default)]
+    pub target_table: Option<String>,
+    #[serde(default)]
+    pub normalize_vrl: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+fn default_repo_parser_kind() -> String {
+    "parser".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::IntoParams)]

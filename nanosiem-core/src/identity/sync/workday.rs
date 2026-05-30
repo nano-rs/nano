@@ -11,13 +11,10 @@
 //! so delta sync is not supported — only full sync.
 
 use async_trait::async_trait;
-use sha2::{Digest, Sha256};
 use tracing::{info, instrument};
 
 use super::{SyncError, SyncProvider};
-use crate::identity::types::{
-    ConnectionTestResult, DeltaSyncResult, UserRecordUpsert, WorkdayCredentials,
-};
+use crate::identity::types::{ConnectionTestResult, DeltaSyncResult, WorkdayCredentials};
 
 pub struct WorkdaySync {
     client: reqwest::Client,
@@ -31,255 +28,6 @@ impl WorkdaySync {
                 .build()
                 .unwrap_or_default(),
         }
-    }
-
-    /// Try to extract a string from a JSON value, checking multiple possible field names.
-    /// Workday RaaS field names are admin-defined, so we check common variations.
-    fn extract_field(row: &serde_json::Value, candidates: &[&str]) -> Option<String> {
-        for key in candidates {
-            if let Some(val) = row.get(*key).and_then(|v| v.as_str()) {
-                if !val.is_empty() {
-                    return Some(val.to_string());
-                }
-            }
-        }
-        None
-    }
-
-    /// Convert a Workday RaaS report row to a UserRecordUpsert
-    fn map_workday_worker(row: &serde_json::Value) -> Option<UserRecordUpsert> {
-        // External ID — required
-        let external_id = Self::extract_field(
-            row,
-            &[
-                "Worker_ID",
-                "worker_id",
-                "Employee_ID",
-                "employee_id",
-                "WID",
-                "wid",
-            ],
-        )?;
-
-        let username = Self::extract_field(
-            row,
-            &[
-                "User_Name",
-                "user_name",
-                "Username",
-                "username",
-                "UserID",
-                "userId",
-            ],
-        );
-        let email = Self::extract_field(
-            row,
-            &[
-                "Email",
-                "email",
-                "Email_Address",
-                "email_address",
-                "primaryWorkEmail",
-                "Work_Email",
-                "work_email",
-            ],
-        );
-        let display_name = Self::extract_field(
-            row,
-            &[
-                "Legal_Name_Full",
-                "Preferred_Name_Full",
-                "Display_Name",
-                "display_name",
-                "Full_Name",
-                "full_name",
-                "Worker",
-            ],
-        )
-        .or_else(|| {
-            let first = Self::extract_field(row, &["First_Name", "first_name", "Legal_First_Name"]);
-            let last = Self::extract_field(row, &["Last_Name", "last_name", "Legal_Last_Name"]);
-            match (first.as_deref(), last.as_deref()) {
-                (Some(f), Some(l)) => Some(format!("{} {}", f, l)),
-                (Some(f), None) => Some(f.to_string()),
-                (None, Some(l)) => Some(l.to_string()),
-                _ => None,
-            }
-        });
-
-        let first_name = Self::extract_field(
-            row,
-            &[
-                "First_Name",
-                "first_name",
-                "Legal_First_Name",
-                "Preferred_First_Name",
-            ],
-        );
-        let last_name = Self::extract_field(
-            row,
-            &[
-                "Last_Name",
-                "last_name",
-                "Legal_Last_Name",
-                "Preferred_Last_Name",
-            ],
-        );
-        let department = Self::extract_field(
-            row,
-            &[
-                "Department",
-                "department",
-                "Cost_Center",
-                "Supervisory_Organization",
-                "supervisoryOrganization",
-            ],
-        );
-        let title = Self::extract_field(
-            row,
-            &[
-                "Job_Title",
-                "job_title",
-                "Business_Title",
-                "business_title",
-                "Title",
-                "title",
-            ],
-        );
-        let manager_upn = Self::extract_field(
-            row,
-            &["Manager_Email", "manager_email", "Manager_ID", "manager_id"],
-        );
-        let manager_display_name =
-            Self::extract_field(row, &["Manager", "manager", "Manager_Name", "manager_name"]);
-        let company =
-            Self::extract_field(row, &["Company", "company", "Organization", "organization"]);
-        let city = Self::extract_field(
-            row,
-            &["City", "city", "Work_City", "work_city", "Location_City"],
-        );
-        let country = Self::extract_field(
-            row,
-            &[
-                "Country",
-                "country",
-                "Work_Country",
-                "work_country",
-                "Country_Code",
-            ],
-        );
-        let phone = Self::extract_field(
-            row,
-            &[
-                "Phone",
-                "phone",
-                "Work_Phone",
-                "work_phone",
-                "primaryWorkPhone",
-                "Mobile",
-            ],
-        );
-        let employee_id =
-            Self::extract_field(row, &["Employee_ID", "employee_id", "Badge_ID", "badge_id"])
-                .or_else(|| Some(external_id.clone()));
-        let employee_type = Self::extract_field(
-            row,
-            &[
-                "Employee_Type",
-                "employee_type",
-                "Worker_Type",
-                "worker_type",
-                "Worker_Sub_Type",
-                "Position_Type",
-            ],
-        );
-
-        // Active status — check various field names and value formats
-        let account_enabled = Self::extract_field(
-            row,
-            &[
-                "Active_Status",
-                "active_status",
-                "Is_Active",
-                "is_active",
-                "Status",
-                "status",
-                "Active",
-                "active",
-            ],
-        )
-        .map_or(true, |v| {
-            let lower = v.to_lowercase();
-            lower == "1" || lower == "true" || lower == "yes" || lower == "active"
-        });
-        let account_status = if account_enabled {
-            "active"
-        } else {
-            "disabled"
-        }
-        .to_string();
-
-        let hire_date = Self::extract_field(
-            row,
-            &["Hire_Date", "hire_date", "Original_Hire_Date", "Start_Date"],
-        )
-        .and_then(|s| {
-            chrono::DateTime::parse_from_rfc3339(&s)
-                .ok()
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .or_else(|| {
-                    chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d")
-                        .ok()
-                        .and_then(|d| d.and_hms_opt(0, 0, 0))
-                        .map(|dt| {
-                            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-                                dt,
-                                chrono::Utc,
-                            )
-                        })
-                })
-        });
-
-        let raw = serde_json::to_string(row).unwrap_or_default();
-        let hash = hex::encode(Sha256::digest(raw.as_bytes()));
-
-        Some(UserRecordUpsert {
-            external_id,
-            username,
-            upn: email.clone(), // Workday doesn't have UPN; use email as best proxy
-            email,
-            display_name,
-            first_name,
-            last_name,
-            department,
-            title,
-            manager_upn,
-            manager_display_name,
-            company,
-            office_location: Self::extract_field(
-                row,
-                &[
-                    "Location",
-                    "location",
-                    "Office",
-                    "office",
-                    "Work_Location",
-                    "Building",
-                ],
-            ),
-            city,
-            country,
-            groups: Vec::new(),
-            account_enabled,
-            account_status,
-            mfa_enabled: None,
-            last_sign_in_at: None, // Workday doesn't track sign-in
-            created_in_directory_at: hire_date,
-            phone,
-            employee_id,
-            employee_type,
-            sync_hash: hash,
-        })
     }
 
     /// Extract the report entries array from the RaaS JSON response.
@@ -357,17 +105,15 @@ impl SyncProvider for WorkdaySync {
         &self,
         credentials: &serde_json::Value,
         _config: &serde_json::Value,
-    ) -> Result<Vec<UserRecordUpsert>, SyncError> {
+    ) -> Result<Vec<serde_json::Value>, SyncError> {
         let body = self.fetch_report(credentials).await?;
 
         let entries = Self::extract_entries(&body).ok_or_else(|| {
             SyncError::ParseError("No report entries found in RaaS response".into())
         })?;
 
-        let users: Vec<UserRecordUpsert> = entries
-            .iter()
-            .filter_map(|row| Self::map_workday_worker(row))
-            .collect();
+        // NAN-1151: yield RAW RaaS report rows; mapping to user_registry happens in VRL.
+        let users: Vec<serde_json::Value> = entries.iter().cloned().collect();
 
         info!(user_count = users.len(), "Workday full sync complete");
         Ok(users)
@@ -386,16 +132,13 @@ impl SyncProvider for WorkdaySync {
             SyncError::ParseError("No report entries found in RaaS response".into())
         })?;
 
-        // Process in chunks of 1000 to avoid holding all UserRecordUpserts at once.
-        // The JSON body is still in memory, but we avoid doubling memory with the mapped records.
+        // Process in chunks of 1000 to avoid holding all rows in a single page at once.
+        // NAN-1151: pages carry RAW RaaS report rows; mapping happens in VRL.
         const CHUNK_SIZE: usize = 1000;
         let mut total = 0u64;
 
         for chunk in entries.chunks(CHUNK_SIZE) {
-            let page: Vec<UserRecordUpsert> = chunk
-                .iter()
-                .filter_map(|row| Self::map_workday_worker(row))
-                .collect();
+            let page: Vec<serde_json::Value> = chunk.iter().cloned().collect();
 
             let page_size = page.len();
             total += on_page(page).await?;

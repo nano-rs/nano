@@ -1009,42 +1009,11 @@ export interface AutoSyncConfig {
   next_sync_at?: string;
 }
 
-// IOC (Indicators of Compromise) types for ThreatFox and other threat intel feeds
-
-export interface IocLookupResult {
-  ioc_value: string;
-  found: boolean;
-  ioc_type?: string;
-  confidence_level?: number;
-  threat_type?: string;
-  malware?: string;
-  tags?: string[];
-  first_seen_at?: string;
-  last_seen_at?: string;
-  reference_url?: string;
-}
-
-export interface IocStats {
-  source_id: string;
-  total_count: number;
-  ip_count?: number;
-  domain_count?: number;
-  md5_count?: number;
-  sha256_count?: number;
-  url_count?: number;
-}
-
-export interface ThreatFoxConfig {
-  api_key?: string;
-  ttl_days: number;
-  sync_interval_hours: number;
-}
-
-export interface TorExitNodesConfig {
-  ttl_days: number;
-  sync_interval_hours: number;
-  confidence_level: number;
-}
+// NAN-1111: IocLookupResult, IocStats, ThreatFoxConfig, and
+// TorExitNodesConfig used to live here. Both providers and the shared
+// IOC lookup/stats endpoints moved to the marketplace + Deno
+// (nano-rs/nano-enrichments). See project_ipinfo_lite_stays_native for
+// why IPinfo Lite stays native.
 
 export interface Feed {
   id: string;
@@ -2927,12 +2896,15 @@ export interface CreateApiKeyRequest {
   rate_limit?: number;
 }
 
+// Tri-state partial update: omit a field to leave it unchanged, send `null`
+// to clear it, or send a value to set it. (`name`/`permissions` are
+// non-nullable, so only omit-vs-value applies there.)
 export interface UpdateApiKeyRequest {
   name?: string;
-  description?: string;
+  description?: string | null;
   permissions?: string[];
-  expires_at?: string;
-  rate_limit?: number;
+  expires_at?: string | null;
+  rate_limit?: number | null;
 }
 
 export interface ApiKeyCreatedResponse {
@@ -2940,6 +2912,23 @@ export interface ApiKeyCreatedResponse {
   key: string;
   name: string;
   created_at: string;
+}
+
+/** One UTC day's count of audited actions for a key. */
+export interface ApiKeyUsagePoint {
+  date: string; // YYYY-MM-DD
+  count: number;
+}
+
+/**
+ * Per-key call volume. Counts audited actions (mutations + authorization
+ * denials) attributed to the key — not raw request volume. Read-only traffic
+ * is not audited and is not reflected here.
+ */
+export interface ApiKeyUsageResponse {
+  days: number;
+  total: number;
+  series: ApiKeyUsagePoint[];
 }
 
 // Session Types
@@ -3521,6 +3510,52 @@ export interface CaseListResponse {
   offset: number;
 }
 
+// NAN-1072: case saved searches
+export interface CaseSavedSearch {
+  id: string;
+  owner_id: string;
+  name: string;
+  query: string;
+  is_shared: boolean;
+  /** NAN-1075: 'structured' | 'free' — restored on load. */
+  mode: string;
+  /** NAN-1075: time-window id (e.g. '24h'). Matched against the page's
+   *  TIME_WINDOWS table; unknown values fall back to '24h'. */
+  time_window: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CaseSavedSearchWithContext {
+  id: string;
+  owner_id: string;
+  owner_name: string | null;
+  name: string;
+  query: string;
+  is_shared: boolean;
+  mode: string;
+  time_window: string;
+  is_owner: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NewCaseSavedSearch {
+  name: string;
+  query: string;
+  is_shared?: boolean;
+  mode?: string;
+  time_window?: string;
+}
+
+export interface UpdateCaseSavedSearch {
+  name?: string;
+  query?: string;
+  is_shared?: boolean;
+  mode?: string;
+  time_window?: string;
+}
+
 export interface ShareCaseRequest {
   visibility: CaseVisibility;
   group_ids?: string[];
@@ -3836,11 +3871,61 @@ export interface CaseFilter {
   severity?: string[];
   assigned_to?: string;
   assigned_group?: string;
+  /** NAN-1093: multi-group filter for the Signal Inbox Escalations tab —
+   *  cases whose `assigned_group` matches any of these. Empty array is
+   *  treated as no filter by the backend. */
+  assigned_groups?: string[];
   search?: string;
+  /** NAN-1074: free-text mode — server ILIKE against case
+   *  title/description AND joined alert content. Slower than `search`
+   *  (which scans only case columns); pair with a tight `created_after`. */
+  free_text?: string;
   created_after?: string;
   created_before?: string;
   limit?: number;
   offset?: number;
+  /** NAN-1093: filter to cases with NULL (true) or NOT-NULL (false)
+   *  `incident_id`. The Signal Inbox sets `true` for the loose list so
+   *  paginated tabs don't double-count cases inside an incident pill. */
+  incident_id_is_null?: boolean;
+  /** NAN-1093: result ordering. `mine_first` keys off the authenticated
+   *  user; other variants are caller-controlled. Defaults to `newest`. */
+  sort?: CaseSort;
+}
+
+/** NAN-1093: Signal Inbox sort options. Matches the Rust `CaseSortParam`.
+ *  NAN-1095 added `'sla'` — server resolves the per-severity SLA targets
+ *  from `case_settings` and orders by least remaining time. */
+export type CaseSort = 'newest' | 'oldest' | 'severity' | 'mine_first' | 'sla';
+
+/** NAN-1093: Per-tab counts for the Signal Inbox. `loose` are cases not
+ *  attached to an incident (rendered in the tab list); `grouped` are
+ *  cases inside an incident pill — the inbox surfaces this as `+N` next
+ *  to the tab label. */
+export interface InboxTabCount {
+  loose: number;
+  grouped: number;
+}
+
+export interface InboxCountsResponse {
+  active: InboxTabCount;
+  triage: InboxTabCount;
+  escalations: InboxTabCount;
+  all: InboxTabCount;
+  mine: InboxTabCount;
+}
+
+/** NAN-1093: Incident pill + its case children, returned by
+ *  `/api/cases/inbox-incidents`. Children are eagerly fetched (no
+ *  pagination) — typical SOC queues have far fewer grouped cases than
+ *  loose cases. */
+export interface InboxIncidentGroup {
+  incident: IncidentSummary;
+  cases: CaseWithDetails[];
+}
+
+export interface InboxIncidentsResponse {
+  incidents: InboxIncidentGroup[];
 }
 
 export interface AddAlertToCaseRequest {
@@ -4318,6 +4403,19 @@ export interface LogSource {
   source_type: string;
   source_config: Record<string, unknown>;
   credential_id?: string;
+  /**
+   * NAN-928: deployed source-configuration whose routing transform feeds
+   * events into this parser. Set when the user picked a fetch-source config
+   * (Kafka / S3 / GCP Pub/Sub) in the parser-import "DISPATCH FROM" UI.
+   */
+  dispatch_source_config_id?: string | null;
+  /**
+   * NAN-1084: derived transport label (e.g. "kafka", "gcp_pubsub") sourced
+   * from the joined source_configurations row. Populated by list/detail
+   * endpoints that join source_configurations; absent for legacy parser-
+   * owned sources, in which case the UI falls back to `source_type`.
+   */
+  dispatch_source_config_type?: string | null;
   parser_vrl: string;
   output_fields?: Record<string, unknown>;
   category?: string;
@@ -5377,7 +5475,9 @@ export interface IdentitySyncTriggerResponse {
 }
 
 export interface IdentityUser {
-  id: number;
+  // NAN-1117: the user_registry payload moved PG -> ClickHouse; the synthetic
+  // BIGSERIAL id is replaced by a stable composite key "provider_id|external_id".
+  id: string;
   provider_id: string;
   external_id: string;
   username?: string;
@@ -5404,8 +5504,9 @@ export interface IdentityUser {
   employee_id?: string;
   employee_type?: string;
   last_synced_at?: string;
-  created_at: string;
-  updated_at: string;
+  // NAN-1117: created_at dropped (CH has no row trigger); updated_at derived
+  // from last_synced_at and now optional.
+  updated_at?: string;
 }
 
 export interface IdentityUserListResponse {

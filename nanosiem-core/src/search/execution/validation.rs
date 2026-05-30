@@ -17,21 +17,37 @@ use sqlparser::ast::{Expr, GroupByExpr, Query, SelectItem, SetExpr, TableFactor,
 /// Tables that search queries are allowed to reference.
 /// SECURITY: This is an allowlist — any table NOT in this list is rejected.
 /// When adding new ClickHouse tables, add them here to make them queryable.
+///
+/// Naming convention in clustered deployments (see `deploy/scripts/init-clickhouse-cluster.sh`):
+/// - Bare name (e.g. `logs`) is the Distributed wrapper that fans out across shards.
+/// - `*_local` is the per-replica ReplicatedMergeTree that Vector writes to.
+/// - `*_distributed` is the legacy name still emitted by the nPL generator; allow it so
+///   user-submitted SQL can reference the same tables the nPL path generates.
 const ALLOWED_TABLES: &[&str] = &[
     // Core event tables
     "logs",
+    "logs_distributed",
     "signals",
+    "signals_distributed",
     "ingestion_errors",
+    "ingestion_errors_distributed",
     // Prevalence aggregation
     "domain_prevalence_agg",
+    "domain_prevalence_agg_distributed",
     "hash_prevalence_agg",
+    "hash_prevalence_agg_distributed",
     "ip_prevalence_agg",
+    "ip_prevalence_agg_distributed",
     // Identity & enrichment
     "identity_observations",
+    "identity_observations_distributed",
     "entity_time_range_agg",
+    "entity_time_range_agg_distributed",
     "custom_enrichment_results",
+    "custom_enrichment_results_distributed",
     // Cloud analytics
     "cloud_user_activity_agg",
+    "cloud_user_activity_agg_distributed",
     // Internal metadata
     "_migrations",
     "nat_candidates",
@@ -84,12 +100,12 @@ const DANGEROUS_KEYWORDS: &[&str] = &[
 
 /// Validate that SQL is a safe, single SELECT statement referencing only allowed tables.
 pub fn validate_sql_query(sql: &str) -> Result<(), SearchError> {
-    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::dialect::ClickHouseDialect;
     use sqlparser::parser::Parser;
 
     reject_sql_comments(sql)?;
 
-    let dialect = PostgreSqlDialect {};
+    let dialect = ClickHouseDialect {};
     let statements = Parser::parse_sql(&dialect, sql)
         .map_err(|e| SearchError::SqlValidationError(format!("SQL parse error: {}", e)))?;
 
@@ -178,10 +194,10 @@ fn check_dangerous_keywords(sql: &str) -> Result<(), SearchError> {
 /// than wrapping in a subquery, which would fail for aggregation queries where
 /// `source_type` is not in the output columns.
 pub fn inject_audit_filter(sql: &str) -> Result<String, SearchError> {
-    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::dialect::ClickHouseDialect;
     use sqlparser::parser::Parser;
 
-    let mut stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql)
+    let mut stmts = Parser::parse_sql(&ClickHouseDialect {}, sql)
         .map_err(|e| SearchError::SqlValidationError(format!("SQL parse error: {}", e)))?;
 
     if let Some(sqlparser::ast::Statement::Query(ref mut query)) = stmts.first_mut() {
@@ -780,5 +796,79 @@ mod tests {
         assert!(validate_sql_query(
             "WITH base AS (SELECT src_ip, count() AS cnt FROM logs GROUP BY src_ip) SELECT * FROM base WHERE cnt > 5"
         ).is_ok());
+    }
+
+    // =========================================================================
+    // ClickHouse dialect features (NAN-1086)
+    // =========================================================================
+
+    #[test]
+    fn test_allow_prewhere() {
+        // PREWHERE is ClickHouse-specific and was rejected by PostgreSqlDialect.
+        assert!(validate_sql_query(
+            "SELECT count() AS c FROM logs PREWHERE timestamp >= '2026-01-01 00:00:00' AND timestamp <= '2026-01-02 00:00:00'"
+        ).is_ok());
+    }
+
+    #[test]
+    fn test_allow_prewhere_with_where() {
+        assert!(validate_sql_query(
+            "SELECT timestamp, src_ip FROM logs PREWHERE timestamp BETWEEN '2026-01-01 00:00:00' AND '2026-01-02 00:00:00' AND lower(source_type) = lower('windows') WHERE lower(message) ILIKE '%logon failure%' ORDER BY timestamp DESC LIMIT 100"
+        ).is_ok());
+    }
+
+    #[test]
+    fn test_allow_logs_distributed() {
+        // nPL generator emits logs_distributed; user-submitted SQL must be able to query it too.
+        assert!(validate_sql_query(
+            "SELECT count() AS c FROM logs_distributed WHERE timestamp >= '2026-01-01 00:00:00'"
+        ).is_ok());
+    }
+
+    #[test]
+    fn test_allow_other_distributed_tables() {
+        assert!(validate_sql_query("SELECT * FROM signals_distributed LIMIT 10").is_ok());
+        assert!(validate_sql_query("SELECT * FROM hash_prevalence_agg_distributed LIMIT 10").is_ok());
+        assert!(validate_sql_query("SELECT * FROM identity_observations_distributed LIMIT 10").is_ok());
+    }
+
+    #[test]
+    fn test_reject_unknown_distributed_table() {
+        // Allowlist still applies — random *_distributed names are blocked.
+        assert!(validate_sql_query(
+            "SELECT * FROM secrets_distributed LIMIT 1"
+        ).is_err());
+    }
+
+    #[test]
+    fn test_probe_clickhouse_features() {
+        // Probes for which ClickHouse-specific syntax the current sqlparser version actually
+        // parses. Documents the known feature surface; tighten as sqlparser gains support.
+        for (label, sql, expect_ok) in &[
+            ("PREWHERE", "SELECT * FROM logs PREWHERE timestamp > '2026-01-01' LIMIT 1", true),
+            ("ext.field dot", "SELECT ext.event_id FROM logs WHERE ext.event_id = 4624", true),
+            ("ext['k'] bracket", "SELECT ext['event_id'] FROM logs WHERE ext['event_id'] = 4624", true),
+            ("hasToken()", "SELECT * FROM logs WHERE hasToken(lower(message), 'error') LIMIT 1", true),
+            ("toStartOfHour", "SELECT toStartOfHour(timestamp) AS h, count() FROM logs GROUP BY h LIMIT 1", true),
+        ] {
+            let result = validate_sql_query(sql);
+            if *expect_ok {
+                assert!(result.is_ok(), "expected OK for {}: got {:?}", label, result.err());
+            } else {
+                assert!(result.is_err(), "expected ERR for {}: got OK", label);
+            }
+        }
+    }
+
+    #[test]
+    fn test_asof_join_known_unsupported() {
+        // ASOF JOIN is a ClickHouse-specific feature that sqlparser 0.61's ClickHouseDialect
+        // does NOT yet parse. Documenting the limitation here so the sql-guide MCP resource
+        // can be kept in sync. Remove this test (and add a positive one) once upstream support
+        // lands.
+        let result = validate_sql_query(
+            "SELECT m.timestamp FROM logs AS m ASOF LEFT JOIN identity_observations AS i ON m.src_ip = i.ip AND m.timestamp >= i.observed_at"
+        );
+        assert!(result.is_err(), "ASOF JOIN unexpectedly parsed — update sql-guide if so");
     }
 }

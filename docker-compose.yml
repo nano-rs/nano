@@ -79,6 +79,11 @@ services:
     environment:
       # Vector config directory (must match volume mount)
       VECTOR_CONFIG_DIR: /etc/vector
+      # NAN-1151: enrichment-lane ingest — identity providers POST raw records
+      # to the nano_enrich lane instead of writing ClickHouse directly. Token
+      # must match the Vector service's VECTOR_AUTH_TOKEN (auth_check transform).
+      VECTOR_INGEST_URL: http://vector:8080/
+      VECTOR_AUTH_TOKEN: ${VECTOR_AUTH_TOKEN:-nanosiem-default-token}
       # PostgreSQL connection
       DATABASE_URL: postgres://nanosiem:nanosiem@postgres:5432/nanosiem
       # ClickHouse connection (runtime user - no DDL permissions for security)
@@ -304,7 +309,7 @@ services:
     restart: unless-stopped
 
   clickhouse:
-    image: clickhouse/clickhouse-server:26.3
+    image: clickhouse/clickhouse-server:26.4
     container_name: nanosiem-clickhouse
     security_opt:
       - no-new-privileges:true

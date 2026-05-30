@@ -257,11 +257,12 @@ mod tests {
         //   agent_enrichment + custom_enrichment + agent lookup (~24) +
         //   cases (~32) + queues + queue-routing-rules (~11) +
         //   incidents (~5) + case-grouping settings (~6) ≈ ~150.
-        // Open clears ~365; enterprise ~467 (floors, current values higher).
+        // Open clears ~366; enterprise ~470 (floors, current values higher).
+        // NAN-1093 added 2 enterprise paths: /inbox-counts + /inbox-incidents.
         #[cfg(feature = "enterprise")]
-        let min_paths = 467;
+        let min_paths = 470;
         #[cfg(not(feature = "enterprise"))]
-        let min_paths = 365;
+        let min_paths = 366;
 
         assert!(
             path_count >= min_paths,

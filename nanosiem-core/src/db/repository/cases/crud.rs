@@ -7,9 +7,172 @@ use uuid::Uuid;
 
 use super::{
     AssignCase, Case, CaseDisposition, CaseFilter, CaseFullResponse, CaseRepository,
-    CaseRepositoryError, CaseResponseStats, CaseStats, CaseSummary, CaseWithDetails,
-    CaseWithDetailsRow, ChangeCaseStatus, NewCase, UpdateCase,
+    CaseRepositoryError, CaseResponseStats, CaseSort, CaseStats, CaseSummary, CaseWithDetails,
+    CaseWithDetailsRow, ChangeCaseStatus, NewCase, SlaTargets, UpdateCase,
 };
+
+/// NAN-1093: assemble the ORDER BY clause for `CaseRepository::list`. Kept
+/// out of the format!() macro to keep the SQL string readable. `$9` is the
+/// bound `user_id` parameter — referenced inline by the `MineFirst` variant
+/// so we don't add a redundant bind.
+///
+/// NAN-1095: `Sla` is the only variant that needs runtime input — the
+/// per-severity target minutes. Those are inlined as numeric literals
+/// (safe — every value is an `i32` from a closed settings table, never
+/// user input) so the rest of the bind list stays the same.
+fn build_order_by(sort: CaseSort, sla_targets: Option<&SlaTargets>) -> String {
+    match sort {
+        // NAN-1057: recency first so new cases surface immediately; severity
+        // is the tiebreaker. last_activity_at is nullable for legacy rows,
+        // COALESCE so they still rank by created_at.
+        CaseSort::Newest => "ORDER BY \
+                COALESCE(c.last_activity_at, c.created_at) DESC, \
+                CASE c.severity \
+                    WHEN 'critical' THEN 1 \
+                    WHEN 'high' THEN 2 \
+                    WHEN 'medium' THEN 3 \
+                    WHEN 'low' THEN 4 \
+                    ELSE 5 \
+                END, \
+                c.priority DESC"
+            .to_string(),
+        CaseSort::Oldest => "ORDER BY \
+                COALESCE(c.last_activity_at, c.created_at) ASC, \
+                c.priority DESC"
+            .to_string(),
+        CaseSort::Severity => "ORDER BY \
+                CASE c.severity \
+                    WHEN 'critical' THEN 1 \
+                    WHEN 'high' THEN 2 \
+                    WHEN 'medium' THEN 3 \
+                    WHEN 'low' THEN 4 \
+                    ELSE 5 \
+                END, \
+                COALESCE(c.last_activity_at, c.created_at) DESC"
+            .to_string(),
+        CaseSort::MineFirst => {
+            // $9 is user_id (already bound for the visibility predicate). Cases
+            // assigned to the caller come first, then by recency.
+            "ORDER BY \
+                CASE WHEN c.assigned_to = $9 THEN 0 ELSE 1 END, \
+                COALESCE(c.last_activity_at, c.created_at) DESC"
+                .to_string()
+        }
+        CaseSort::Sla => {
+            // NAN-1095: server-side SLA-urgency sort. For each of the three
+            // tracked clocks (TTA / TTR / TTClose) compute `target - elapsed`
+            // when the clock is still running; NULL otherwise. `LEAST()` in
+            // Postgres ignores NULLs, so a case with all clocks stopped
+            // becomes NULL and sorts last via `NULLS LAST`. Breached cases
+            // (negative remaining) sort first.
+            //
+            // Clock stop conditions mirror `buildSlaSnapshot` in
+            // `nanosiem-web/src/enterprise/components/case-investigate/sla/helpers.ts`:
+            //   - TTA stops when `triage_completed_at` OR `first_response_at`
+            //   - TTR stops when `first_response_at`
+            //   - TTClose stops when `resolved_at` OR `closed_at`
+            //
+            // If `sla_targets` is None we shouldn't be here — defensive
+            // fallback uses the same defaults as `CaseConfig::default()` so
+            // a misconfigured caller still gets sensible ordering instead
+            // of an SQL error.
+            let t = sla_targets.copied().unwrap_or(SlaTargets::FALLBACK_DEFAULTS);
+            let elapsed = "EXTRACT(EPOCH FROM (now() - COALESCE(c.first_activity_at, c.created_at)))";
+
+            // Per-clock CASE expressions. Each yields the per-severity target
+            // in seconds when the relevant stop fields are NULL (clock
+            // running), else NULL (clock stopped → drop out of the LEAST).
+            //
+            // NAN-1097: `ELSE NULL` on the inner severity CASE is explicit
+            // so the "unknown severity → drop out of LEAST → sort last via
+            // NULLS LAST" path is visible to the next reader. Postgres would
+            // return NULL implicitly without it, but the contract is now
+            // documented in the SQL itself.
+            let tta = format!(
+                "CASE WHEN c.triage_completed_at IS NULL AND c.first_response_at IS NULL THEN \
+                    CASE c.severity \
+                        WHEN 'critical' THEN {ct} * 60 - {elapsed} \
+                        WHEN 'high' THEN {ht} * 60 - {elapsed} \
+                        WHEN 'medium' THEN {mt} * 60 - {elapsed} \
+                        WHEN 'low' THEN {lt} * 60 - {elapsed} \
+                        WHEN 'informational' THEN {it} * 60 - {elapsed} \
+                        ELSE NULL \
+                    END \
+                 END",
+                ct = t.critical_triage_minutes,
+                ht = t.high_triage_minutes,
+                mt = t.medium_triage_minutes,
+                lt = t.low_triage_minutes,
+                it = t.informational_triage_minutes,
+                elapsed = elapsed,
+            );
+            let ttr = format!(
+                "CASE WHEN c.first_response_at IS NULL THEN \
+                    CASE c.severity \
+                        WHEN 'critical' THEN {ct} * 60 - {elapsed} \
+                        WHEN 'high' THEN {ht} * 60 - {elapsed} \
+                        WHEN 'medium' THEN {mt} * 60 - {elapsed} \
+                        WHEN 'low' THEN {lt} * 60 - {elapsed} \
+                        WHEN 'informational' THEN {it} * 60 - {elapsed} \
+                        ELSE NULL \
+                    END \
+                 END",
+                ct = t.critical_response_minutes,
+                ht = t.high_response_minutes,
+                mt = t.medium_response_minutes,
+                lt = t.low_response_minutes,
+                it = t.informational_response_minutes,
+                elapsed = elapsed,
+            );
+            let tt_close = format!(
+                "CASE WHEN c.resolved_at IS NULL AND c.closed_at IS NULL THEN \
+                    CASE c.severity \
+                        WHEN 'critical' THEN {ct} * 60 - {elapsed} \
+                        WHEN 'high' THEN {ht} * 60 - {elapsed} \
+                        WHEN 'medium' THEN {mt} * 60 - {elapsed} \
+                        WHEN 'low' THEN {lt} * 60 - {elapsed} \
+                        WHEN 'informational' THEN {it} * 60 - {elapsed} \
+                        ELSE NULL \
+                    END \
+                 END",
+                ct = t.critical_resolution_minutes,
+                ht = t.high_resolution_minutes,
+                mt = t.medium_resolution_minutes,
+                lt = t.low_resolution_minutes,
+                it = t.informational_resolution_minutes,
+                elapsed = elapsed,
+            );
+            format!(
+                "ORDER BY LEAST({tta}, {ttr}, {tt_close}) ASC NULLS LAST, \
+                 COALESCE(c.last_activity_at, c.created_at) DESC"
+            )
+        }
+    }
+}
+
+impl SlaTargets {
+    /// NAN-1095: defensive defaults that match
+    /// `nanosiem_enterprise::cases::settings::CaseConfig::default()`. Used
+    /// when `build_order_by` is asked for `Sla` ordering without an explicit
+    /// target set — keeps the SQL valid instead of producing a runtime error.
+    pub const FALLBACK_DEFAULTS: SlaTargets = SlaTargets {
+        critical_triage_minutes: 60,
+        critical_response_minutes: 15,
+        critical_resolution_minutes: 240,
+        high_triage_minutes: 120,
+        high_response_minutes: 30,
+        high_resolution_minutes: 480,
+        medium_triage_minutes: 480,
+        medium_response_minutes: 120,
+        medium_resolution_minutes: 1440,
+        low_triage_minutes: 1440,
+        low_response_minutes: 480,
+        low_resolution_minutes: 4320,
+        informational_triage_minutes: 2880,
+        informational_response_minutes: 1440,
+        informational_resolution_minutes: 10080,
+    };
+}
 
 impl CaseRepository {
     // ==================== CASE CRUD ====================
@@ -211,6 +374,13 @@ impl CaseRepository {
         });
 
         let visibility_filter = filter.visibility.clone();
+        let assigned_groups_filter = filter.assigned_groups.clone();
+
+        // NAN-1093: ORDER BY varies by sort variant — assembled in Rust so
+        // each variant gets a static, planner-friendly clause (no big CASE
+        // tree that the planner can't index). `user_id` is bound as $9 and
+        // referenced inline in the `mine_first` ordering.
+        let order_by = build_order_by(filter.sort, filter.sla_targets.as_ref());
 
         // Query with visibility filtering using EXISTS for group membership check
         // This avoids DISTINCT which has issues with ORDER BY expressions.
@@ -220,7 +390,7 @@ impl CaseRepository {
         // across the list). The nested LEFT JOIN on `users` resolves the
         // recipient's display name so the list row can render "handoff to
         // Riley Chen" without a second lookup.
-        let rows = sqlx::query_as::<_, CaseWithDetailsRow>(
+        let sql = format!(
             r#"
             SELECT
                 c.id, c.case_number, c.title, c.description, c.severity, c.status,
@@ -280,6 +450,43 @@ impl CaseRepository {
               AND ($6::timestamptz IS NULL OR c.created_at <= $6)
               AND ($10::text[] IS NULL OR c.visibility = ANY($10))
               AND ($11::uuid IS NULL OR c.assigned_group = $11)
+              -- NAN-1093: multi-group filter for the Escalations tab.
+              -- `NULL` means "filter disabled". An empty array means
+              -- "match nothing" — keeps semantics in lock-step with the
+              -- `inbox-counts` aggregation, which treats `= ANY('{{}}')`
+              -- as FALSE. An analyst with zero groups gets an empty
+              -- Escalations tab from both endpoints.
+              AND ($13::uuid[] IS NULL OR c.assigned_group = ANY($13))
+              -- NAN-1093: incident_id NULL / NOT NULL gate. Used to keep
+              -- the inbox's loose list and incident summary in sync.
+              AND ($14::bool IS NULL
+                   OR ($14 = TRUE AND c.incident_id IS NULL)
+                   OR ($14 = FALSE AND c.incident_id IS NOT NULL))
+              -- NAN-1074: Free-text mode. EXISTS subquery keeps the row set
+              -- de-duplicated without DISTINCT (and avoids the join-induced
+              -- row blowup for cases with many alerts). Cast matched_events
+              -- to text for an ILIKE against the serialised JSON — good
+              -- enough for hunting; full FTS lands in a follow-up.
+              AND ($12::text IS NULL OR (
+                  c.title ILIKE '%' || $12 || '%'
+                  OR c.description ILIKE '%' || $12 || '%'
+                  OR EXISTS (
+                      -- NAN-1075: time-bound the alerts side too — `$5` is
+                      -- the same created_after filtering the case rows.
+                      -- NAN-1076: rule name lives on detection_rules.name,
+                      -- not on alerts. LEFT JOIN so an alert with a missing
+                      -- rule (rare orphan) still matches via matched_events.
+                      SELECT 1 FROM case_alerts ca
+                      JOIN alerts a ON a.id = ca.alert_id
+                      LEFT JOIN detection_rules r ON r.id = a.rule_id
+                      WHERE ca.case_id = c.id
+                        AND ($5::timestamptz IS NULL OR a.created_at >= $5)
+                        AND (
+                            (r.name IS NOT NULL AND r.name ILIKE '%' || $12 || '%')
+                            OR a.matched_events::text ILIKE '%' || $12 || '%'
+                        )
+                  )
+              ))
               AND (
                   c.visibility = 'public'
                   OR c.created_by = $9
@@ -290,32 +497,31 @@ impl CaseRepository {
                       WHERE cg.case_id = c.id AND ug.user_id = $9
                   ))
               )
-            ORDER BY
-                CASE c.severity
-                    WHEN 'critical' THEN 1
-                    WHEN 'high' THEN 2
-                    WHEN 'medium' THEN 3
-                    WHEN 'low' THEN 4
-                    ELSE 5
-                END,
-                c.priority DESC,
-                c.created_at DESC
+            -- NAN-1093: ORDER BY is built in Rust per `CaseFilter::sort`.
+            -- Default (`Newest`) preserves the NAN-1057 recency-first ordering.
+            {order_by}
             LIMIT $7 OFFSET $8
             "#,
-        )
-        .bind(&status_filter)
-        .bind(&severity_filter)
-        .bind(filter.assigned_to)
-        .bind(&filter.search)
-        .bind(filter.created_after)
-        .bind(filter.created_before)
-        .bind(limit)
-        .bind(offset)
-        .bind(user_id)
-        .bind(&visibility_filter)
-        .bind(filter.assigned_group)
-        .fetch_all(&self.pool)
-        .await?;
+            order_by = order_by,
+        );
+
+        let rows = sqlx::query_as::<_, CaseWithDetailsRow>(&sql)
+            .bind(&status_filter)
+            .bind(&severity_filter)
+            .bind(filter.assigned_to)
+            .bind(&filter.search)
+            .bind(filter.created_after)
+            .bind(filter.created_before)
+            .bind(limit)
+            .bind(offset)
+            .bind(user_id)
+            .bind(&visibility_filter)
+            .bind(filter.assigned_group)
+            .bind(&filter.free_text)
+            .bind(&assigned_groups_filter)
+            .bind(filter.incident_id_is_null)
+            .fetch_all(&self.pool)
+            .await?;
 
         // Convert rows to CaseWithDetails with shared_groups
         let mut results = Vec::with_capacity(rows.len());
@@ -393,6 +599,7 @@ impl CaseRepository {
         });
 
         let visibility_filter = filter.visibility.clone();
+        let assigned_groups_filter = filter.assigned_groups.clone();
 
         let count: (i64,) = sqlx::query_as(
             r#"
@@ -406,6 +613,30 @@ impl CaseRepository {
               AND ($6::timestamptz IS NULL OR c.created_at <= $6)
               AND ($8::text[] IS NULL OR c.visibility = ANY($8))
               AND ($9::uuid IS NULL OR c.assigned_group = $9)
+              -- NAN-1093: multi-group filter (Escalations tab). See
+              -- `list()` for the empty-array semantics.
+              AND ($11::uuid[] IS NULL OR c.assigned_group = ANY($11))
+              -- NAN-1093: incident_id NULL / NOT NULL gate.
+              AND ($12::bool IS NULL
+                   OR ($12 = TRUE AND c.incident_id IS NULL)
+                   OR ($12 = FALSE AND c.incident_id IS NOT NULL))
+              -- NAN-1074: free-text mode — same predicate as list().
+              AND ($10::text IS NULL OR (
+                  c.title ILIKE '%' || $10 || '%'
+                  OR c.description ILIKE '%' || $10 || '%'
+                  OR EXISTS (
+                      -- NAN-1075 / NAN-1076 — see list() for context.
+                      SELECT 1 FROM case_alerts ca
+                      JOIN alerts a ON a.id = ca.alert_id
+                      LEFT JOIN detection_rules r ON r.id = a.rule_id
+                      WHERE ca.case_id = c.id
+                        AND ($5::timestamptz IS NULL OR a.created_at >= $5)
+                        AND (
+                            (r.name IS NOT NULL AND r.name ILIKE '%' || $10 || '%')
+                            OR a.matched_events::text ILIKE '%' || $10 || '%'
+                        )
+                  )
+              ))
               AND (
                   c.visibility = 'public'
                   OR c.created_by = $7
@@ -427,6 +658,9 @@ impl CaseRepository {
         .bind(user_id)
         .bind(&visibility_filter)
         .bind(filter.assigned_group)
+        .bind(&filter.free_text)
+        .bind(&assigned_groups_filter)
+        .bind(filter.incident_id_is_null)
         .fetch_one(&self.pool)
         .await?;
 
@@ -531,7 +765,13 @@ impl CaseRepository {
         Ok(result)
     }
 
-    /// Assign a case to a user and/or group
+    /// Assign a case to a user and/or group.
+    ///
+    /// NAN-1069: wall-entry emission lives at the caller (`assign_case` in the
+    /// lifecycle service) so it can be enriched with resolved names and
+    /// suppressed entirely from contexts like `escalate_case`, which write
+    /// their own richer `action_taken` row. Mirrors the convention already
+    /// documented on `bulk_assign`.
     pub async fn assign(&self, id: Uuid, assign: &AssignCase) -> Result<Case, CaseRepositoryError> {
         let result = sqlx::query_as::<_, Case>(
             r#"
@@ -552,21 +792,6 @@ impl CaseRepository {
         .fetch_optional(&self.pool)
         .await?
         .ok_or(CaseRepositoryError::NotFound(id))?;
-
-        // Add wall entry for assignment change
-        let metadata = serde_json::json!({
-            "assigned_to": assign.assigned_to,
-            "assigned_group": assign.assigned_group,
-            "assigned_by": assign.assigned_by,
-        });
-        self.add_wall_entry_internal(
-            id,
-            "assignment_change",
-            None,
-            metadata,
-            Some(assign.assigned_by),
-        )
-        .await?;
 
         Ok(result)
     }

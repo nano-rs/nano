@@ -1,0 +1,148 @@
+# =============================================================================
+# NAN-1124: Push enrichment lane  (CANONICAL SOURCE)
+# =============================================================================
+# This file is the single source of truth for the enrichment lane. The API
+# compiles it in via `enrichment_lane_content()` (include_str!) and writes a
+# copy into the dynamic config dir on every deploy — so it ships identically to
+# dev/compose (mounted), Rackspace (GCS-synced), and nano-main SaaS (dynamic
+# ConfigMap), exactly like _pipeline.toml. EDIT HERE.
+#
+# Records tagged `source_type = nano_enrich` (+ a `kind`) arrive on the EXISTING
+# ingest sources with the deployment VECTOR_AUTH_TOKEN — no new source/port/
+# token. `enrichment_router` (in _router.toml) routes them by `.kind` to the
+# per-kind outputs consumed below; `source_router.generic` excludes nano_enrich
+# so enrichment records never reach the logs pipeline.
+#
+# NAN-1125 wires the `identity` kind only; `ip_context` (NAN-1137) and `asset`
+# (NAN-1140) add their own normalize+sink against the enrichment_router routes
+# that already exist.
+#
+# ENCODING INVARIANTS (NAN-1123): every DateTime64(3) column is emitted as a
+# FORMATTED STRING (`%Y-%m-%d %H:%M:%S%.3f`) under the sink's
+# date_time_best_effort; `version` (UInt64) is a bare integer-ms and is ALWAYS
+# set (the ReplacingMergeTree key — omitting it yields version=0, which loses
+# every argMax against a real row). Verified end-to-end against a live
+# ClickHouse: a row in this shape reloads + resolves through user_registry_dict
+# unchanged.
+#
+# NAN-1114 isolation: the enrichment sinks use when_full="drop_newest" + acks
+# off — IDENTICAL discipline to clickhouse_logs. They share the
+# http_ingest -> source_type_extract upstream with the logs lane (one-key model),
+# so a sink that *blocks* here would backpressure that shared source and stall
+# LOG ingestion. drop_newest can't backpressure: a sustained user_registry CH
+# stall drops enrichment (idempotent reference data, re-supplied on the next
+# sync) rather than taking logs down. A dedicated enrichment source (separate
+# backpressure domain, no drops) is the upgrade path if NAN-1128 shows drops
+# matter under large pushes.
+
+# -----------------------------------------------------------------------------
+# identity → nanosiem.user_registry
+# -----------------------------------------------------------------------------
+[transforms.enrichment_normalize_identity]
+type = "remap"
+inputs = ["enrichment_router.identity"]
+# Bad rows abort/err -> dead-letter (enrichment_dead_letter), never the CH sink.
+drop_on_abort = true
+drop_on_error = true
+reroute_dropped = true
+source = '''
+# Map a pushed nano_enrich/kind=identity record to the user_registry columns.
+now_ms = to_unix_timestamp(now(), unit: "milliseconds")
+
+external_id = to_string(.external_id) ?? ""
+if external_id == "" {
+    log("nano_enrich identity record missing external_id; dead-lettering", level: "warn")
+    abort
+}
+
+# version + last_synced_at on ONE clock (ms epoch). Sender may supply version;
+# otherwise stamp now. last_synced_at is the formatted-string form of version.
+version = to_int(.version) ?? 0
+if version <= 0 { version = now_ms }
+last_synced_at = format_timestamp!(from_unix_timestamp!(version, unit: "milliseconds"), "%Y-%m-%d %H:%M:%S%.3f")
+
+# account_status enum guard (defense-in-depth; full validation in NAN-1133).
+account_status = downcase(to_string(.account_status) ?? "active")
+if !includes(["active", "disabled", "deleted", "anonymized"], account_status) {
+    account_status = "active"
+}
+
+groups = .groups
+if !is_array(groups) { groups = [] }
+
+. = {
+    "provider_id": to_string(.provider_id) ?? "",
+    "external_id": external_id,
+    "username": to_string(.username) ?? "",
+    "upn": to_string(.upn) ?? "",
+    "email": to_string(.email) ?? "",
+    "display_name": to_string(.display_name) ?? "",
+    "first_name": to_string(.first_name) ?? "",
+    "last_name": to_string(.last_name) ?? "",
+    "department": to_string(.department) ?? "",
+    "title": to_string(.title) ?? "",
+    "manager_upn": to_string(.manager_upn) ?? "",
+    "manager_display_name": to_string(.manager_display_name) ?? "",
+    "company": to_string(.company) ?? "",
+    "office_location": to_string(.office_location) ?? "",
+    "city": to_string(.city) ?? "",
+    "country": to_string(.country) ?? "",
+    "groups": groups,
+    "account_enabled": to_int(.account_enabled) ?? 1,
+    "account_status": account_status,
+    "mfa_enabled": to_int(.mfa_enabled) ?? 0,
+    "phone": to_string(.phone) ?? "",
+    "employee_id": to_string(.employee_id) ?? "",
+    "employee_type": to_string(.employee_type) ?? "employee",
+    "sync_hash": to_string(.sync_hash) ?? "",
+    "last_synced_at": last_synced_at,
+    "version": version
+}
+'''
+
+[sinks.clickhouse_user_registry]
+type = "clickhouse"
+inputs = ["enrichment_normalize_identity"]
+endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
+database = "${CLICKHOUSE_DATABASE:-nanosiem}"
+table = "user_registry"
+auth.strategy = "basic"
+auth.user = "${CLICKHOUSE_USER:-nanosiem}"
+auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
+compression = "gzip"
+date_time_best_effort = true
+skip_unknown_fields = true
+
+[sinks.clickhouse_user_registry.buffer]
+# Memory + drop_newest + acks off, matching clickhouse_logs. MUST NOT block:
+# this lane shares the http_ingest upstream with logs, so block here stalls log
+# ingestion (NAN-1114). Generous size so only a SUSTAINED user_registry CH stall
+# drops (enrichment self-heals on the next sync). Malformed rows still
+# dead-letter via reroute_dropped above — this drop is buffer-overflow only,
+# counted by Vector's component_discarded_events_total.
+type = "memory"
+max_events = 50000
+when_full = "drop_newest"
+
+[sinks.clickhouse_user_registry.acknowledgements]
+enabled = false
+
+[sinks.clickhouse_user_registry.batch]
+max_events = 1000
+timeout_secs = 5
+
+[sinks.clickhouse_user_registry.request]
+concurrency = "adaptive"
+timeout_secs = 60
+retry_initial_backoff_secs = 1
+retry_max_duration_secs = 60
+
+# -----------------------------------------------------------------------------
+# Dead-letter: normalize aborts/errors land here, NEVER the ClickHouse sink.
+# blackhole discards but is metered (component_received_events_total) so dropped
+# enrichment is observable. NAN-1133 may upgrade this to a durable sink.
+# -----------------------------------------------------------------------------
+[sinks.enrichment_dead_letter]
+type = "blackhole"
+inputs = ["enrichment_normalize_identity.dropped"]
+print_interval_secs = 0

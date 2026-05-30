@@ -77,10 +77,13 @@ export class SearchApi {
   }
 
   // Fetch a single log by ID (for table_view mode row expansion)
-  async fetchLog(id: string, timeRange?: TimeRange): Promise<{ event: Record<string, unknown> | null }> {
+  // NAN-1032: pass sourceType when known so ClickHouse can use the
+  // (source_type, timestamp, ...) PK index for a tight range read — without it,
+  // S3-backed historical lookups scan every source_type's marks in the time window.
+  async fetchLog(id: string, timeRange?: TimeRange, sourceType?: string): Promise<{ event: Record<string, unknown> | null }> {
     return this.request('/api/search/log', {
       method: 'POST',
-      body: JSON.stringify({ id, time_range: timeRange }),
+      body: JSON.stringify({ id, time_range: timeRange, source_type: sourceType }),
     });
   }
 

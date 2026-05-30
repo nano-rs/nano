@@ -39,6 +39,8 @@ const BREADCRUMB_CONFIG: Array<{ path: string; segments: BreadcrumbSegment[]; ca
   // use /inbox as the canonical "Cases" parent; /cases is the table view.
   { path: '/inbox', segments: [{ label: 'Home', href: '/' }, { label: 'Cases' }], capability: 'cases' },
   { path: '/cases', segments: [{ label: 'Home', href: '/' }, { label: 'Cases', href: '/inbox' }, { label: 'Browse all' }], capability: 'cases' },
+  // NAN-1071/1076: cross-cutting case-search page.
+  { path: '/cases/search', segments: [{ label: 'Home', href: '/' }, { label: 'Cases', href: '/inbox' }, { label: 'Case search' }], capability: 'cases' },
   { path: '/settings/cases', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Case Management' }], capability: 'cases' },
   { path: '/cases/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Cases', href: '/inbox' }, { label: ':dynamic' }], capability: 'cases' },
 
@@ -50,6 +52,10 @@ const BREADCRUMB_CONFIG: Array<{ path: string; segments: BreadcrumbSegment[]; ca
   { path: '/rules/:id/matches', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: ':dynamic' }] },
   { path: '/rules/coverage', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: 'MITRE Coverage' }] },
   { path: '/rules/repositories', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: 'Repositories' }] },
+  // Playbooks
+  { path: '/playbooks', segments: [{ label: 'Home', href: '/' }, { label: 'Playbooks' }], capability: 'playbooks' },
+  { path: '/playbooks/new', segments: [{ label: 'Home', href: '/' }, { label: 'Playbooks', href: '/playbooks' }, { label: 'New playbook' }], capability: 'playbooks' },
+  { path: '/playbooks/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Playbooks', href: '/playbooks' }, { label: ':dynamic' }], capability: 'playbooks' },
   { path: '/playbooks/repositories', segments: [{ label: 'Home', href: '/' }, { label: 'Playbooks', href: '/playbooks' }, { label: 'Repositories' }], capability: 'playbooks' },
   { path: '/rules/tuning', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: 'AI Tuning' }], capability: 'aiTuning' },
   { path: '/rules/tuning/:id', segments: [{ label: 'Home', href: '/' }, { label: 'Rules', href: '/rules' }, { label: 'AI Tuning', href: '/rules/tuning' }, { label: ':dynamic' }], capability: 'aiTuning' },

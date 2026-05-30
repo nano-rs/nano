@@ -209,6 +209,14 @@ pub struct LogSource {
     #[schema(value_type = Option<String>)]
     pub dispatch_source_config_id: Option<Uuid>,
 
+    // NAN-1084: derived transport label resolved from the joined
+    // source_configurations row (e.g. "gcp_pubsub", "kafka"). Populated by
+    // list queries that LEFT JOIN source_configurations; left as None on
+    // read paths that don't join, in which case the UI falls back to
+    // `source_type`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_source_config_type: Option<String>,
+
     // Transformation
     pub parser_vrl: String,
     pub output_fields: Option<serde_json::Value>,
@@ -258,6 +266,27 @@ pub struct LogSource {
     /// The source_config, credential_id, and match_* fields are deprecated for parser_only sources.
     #[serde(default)]
     pub parser_only: bool,
+
+    // Enrichment-parser flavor (NAN-1149)
+    /// "log" (default) = a normal log-source parser; "enrichment" = a
+    /// push-enrichment normalizer that carries `normalize_vrl` +
+    /// `enrich_kind`/`enrich_source`/`target_table` instead of routing a
+    /// log `source_type`. The deploy path splits on this so an enrichment
+    /// source is staged into the push enrichment lane, not the log pipeline.
+    #[serde(default = "default_log_source_kind")]
+    pub kind: String,
+    /// Enrichment domain (identity | ip_context | asset | ioc); set when kind = "enrichment".
+    #[serde(default)]
+    pub enrich_kind: Option<String>,
+    /// Per-source discriminator the enrichment lane routes on (e.g. "ad", "entra").
+    #[serde(default)]
+    pub enrich_source: Option<String>,
+    /// Target ClickHouse table the enrichment writes (e.g. "user_registry").
+    #[serde(default)]
+    pub target_table: Option<String>,
+    /// Per-source normalize VRL — the remap body emitted into the enrichment lane.
+    #[serde(default)]
+    pub normalize_vrl: Option<String>,
 
     // Parser repository tracking
     /// Parser repository this log source was imported from (if any)
@@ -322,6 +351,10 @@ fn default_utc() -> String {
     "UTC".to_string()
 }
 
+fn default_log_source_kind() -> String {
+    "log".to_string()
+}
+
 /// Request to update a log source (all fields optional)
 #[derive(Debug, Clone, Serialize, Deserialize, Default, utoipa::ToSchema)]
 pub struct UpdateLogSource {
@@ -334,6 +367,11 @@ pub struct UpdateLogSource {
     pub source_type: Option<String>,
     pub source_config: Option<serde_json::Value>,
     pub parser_vrl: Option<String>,
+    /// NAN-1151: enrichment-parser mapping VRL. Lets the upstream-update/apply
+    /// path refresh a linked enrichment parser (which carries `normalize_vrl`,
+    /// not `parser_vrl`).
+    #[serde(default)]
+    pub normalize_vrl: Option<String>,
     pub output_fields: Option<serde_json::Value>,
     #[serde(default, with = "typeid::cloud_credential::opt")]
     #[schema(value_type = Option<String>)]

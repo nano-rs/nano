@@ -65,7 +65,7 @@ services:
           memory: 512M
 
   clickhouse:
-    image: clickhouse/clickhouse-server:26.3
+    image: clickhouse/clickhouse-server:26.4
     container_name: nano-clickhouse
     restart: unless-stopped
     logging: *verbose-logging

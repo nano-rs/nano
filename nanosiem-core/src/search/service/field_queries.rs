@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use super::*;
+use crate::query::MATERIALIZED_COLUMNS;
 
 impl SearchService {
     /// Get field statistics for a query (async, separate from main search)
@@ -147,22 +148,41 @@ impl SearchService {
     ///
     /// When `exclude_audit` is true, audit-source rows are filtered at the SQL layer so
     /// callers without `audit:view` cannot retrieve them by direct id lookup (NAN-694).
+    ///
+    /// NAN-1032: callers should pass `source_type` whenever known so the query can
+    /// use the `(source_type, timestamp, ...)` PK index for a tight range read.
+    /// Without it, S3-backed historical lookups scan every source_type's marks within
+    /// the time window — measured 12–60s on cold cache vs <1s with the filter.
+    /// Skips the parallel `count(*)` companion that `execute_clickhouse_sql` adds:
+    /// the response carries no count, the count is bounded to {0,1} by `id` + LIMIT 1,
+    /// and on S3 it doubles the I/O.
     #[instrument(skip(self))]
     pub async fn fetch_log_by_id(
         &self,
         id: &str,
         time_range: Option<&TimeRangeInput>,
+        source_type: Option<&str>,
         exclude_audit: bool,
     ) -> Result<Option<serde_json::Value>, SearchError> {
         let table = self.table_names.read("logs");
-        let sql = build_fetch_log_sql(&table, id, time_range, exclude_audit);
+        let sql = build_fetch_log_sql(&table, id, time_range, source_type, exclude_audit);
 
         debug!("Fetching log by ID: {}", sql);
 
         // Execute query
-        let (results, _) = match self.backend {
-            SearchBackend::ClickHouse => self.execute_clickhouse_sql(&sql, 1, 0).await?,
-            SearchBackend::PostgreSQL => self.execute_postgres_sql(&sql, 1, 0).await?,
+        let results = match self.backend {
+            SearchBackend::ClickHouse => {
+                let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
+                    SearchError::DatabaseError(sqlx::Error::Configuration(
+                        "ClickHouse client not configured".into(),
+                    ))
+                })?;
+                ch_executor.execute_sql_to_json(&sql).await?
+            }
+            SearchBackend::PostgreSQL => {
+                let (results, _) = self.execute_postgres_sql(&sql, 1, 0).await?;
+                results
+            }
         };
 
         Ok(results.into_iter().next())
@@ -442,10 +462,15 @@ impl SearchService {
 ///
 /// Extracted into a free function so the audit-exclusion behavior is unit-testable
 /// without a live ClickHouse/Postgres backend (NAN-694).
+///
+/// When `source_type` is provided it is added to the WHERE clause so the
+/// `(source_type, timestamp, ...)` PK index can do a tight range read instead
+/// of scanning every source_type's marks within the timestamp window (NAN-1032).
 fn build_fetch_log_sql(
     table: &str,
     id: &str,
     time_range: Option<&TimeRangeInput>,
+    source_type: Option<&str>,
     exclude_audit: bool,
 ) -> String {
     let escaped_id = id.replace('\'', "''");
@@ -454,19 +479,31 @@ fn build_fetch_log_sql(
     } else {
         ""
     };
+    let source_type_filter = source_type
+        .map(|st| format!(" AND source_type = '{}'", st.replace('\'', "''")))
+        .unwrap_or_default();
+    // ClickHouse's `SELECT *` excludes MATERIALIZED columns (enrichment, IOC,
+    // prevalence, process-GUID, resolved-identity dict fills). The row-expand UI
+    // relies on this fetch as its full-fidelity source — table_view search results
+    // are field-pruned — so without re-adding them the inspector shows no
+    // enrichment even though it's stored. Mirrors build_select_clause's re-add
+    // off the same MATERIALIZED_COLUMNS source of truth (NAN-1147).
+    let select = format!("*, {}", MATERIALIZED_COLUMNS.join(", "));
     if let Some(tr) = time_range {
         format!(
-            "SELECT * FROM {} WHERE id = '{}'{} AND timestamp BETWEEN '{}' AND '{}' LIMIT 1",
+            "SELECT {} FROM {} WHERE id = '{}'{}{} AND timestamp BETWEEN '{}' AND '{}' LIMIT 1",
+            select,
             table,
             escaped_id,
+            source_type_filter,
             audit_filter,
             tr.start.format("%Y-%m-%d %H:%M:%S%.6f"),
             tr.end.format("%Y-%m-%d %H:%M:%S%.6f"),
         )
     } else {
         format!(
-            "SELECT * FROM {} WHERE id = '{}'{} LIMIT 1",
-            table, escaped_id, audit_filter,
+            "SELECT {} FROM {} WHERE id = '{}'{}{} LIMIT 1",
+            select, table, escaped_id, source_type_filter, audit_filter,
         )
     }
 }
@@ -478,16 +515,38 @@ mod tests {
 
     #[test]
     fn fetch_log_sql_without_audit_exclusion_omits_source_type_filter() {
-        let sql = build_fetch_log_sql("logs", "abc-123", None, false);
-        assert_eq!(sql, "SELECT * FROM logs WHERE id = 'abc-123' LIMIT 1");
+        let sql = build_fetch_log_sql("logs", "abc-123", None, None, false);
+        assert!(sql.starts_with("SELECT *, "), "must re-add materialized cols: {sql}");
+        assert!(
+            sql.ends_with("FROM logs WHERE id = 'abc-123' LIMIT 1"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn fetch_log_sql_reads_materialized_enrichment_columns() {
+        // NAN-1147 regression: `SELECT *` excludes MATERIALIZED columns, so the
+        // row-expand inspector showed no enrichment. The fetch must name them.
+        let sql = build_fetch_log_sql("logs", "abc-123", None, None, false);
+        for col in [
+            "user_identity_department",
+            "enriched_src_country",
+            "ioc_confidence",
+            "prevalence_dest_ip",
+        ] {
+            assert!(sql.contains(col), "missing materialized column {col}: {sql}");
+        }
     }
 
     #[test]
     fn fetch_log_sql_with_audit_exclusion_filters_audit_rows() {
-        let sql = build_fetch_log_sql("logs", "abc-123", None, true);
-        assert_eq!(
-            sql,
-            "SELECT * FROM logs WHERE id = 'abc-123' AND lower(source_type) != 'audit' LIMIT 1"
+        let sql = build_fetch_log_sql("logs", "abc-123", None, None, true);
+        assert!(sql.starts_with("SELECT *, "), "must re-add materialized cols: {sql}");
+        assert!(
+            sql.ends_with(
+                "FROM logs WHERE id = 'abc-123' AND lower(source_type) != 'audit' LIMIT 1"
+            ),
+            "{sql}"
         );
     }
 
@@ -497,7 +556,7 @@ mod tests {
             start: Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap(),
             end: Utc.with_ymd_and_hms(2026, 1, 2, 4, 5, 6).unwrap(),
         };
-        let sql = build_fetch_log_sql("logs", "abc-123", Some(&tr), true);
+        let sql = build_fetch_log_sql("logs", "abc-123", Some(&tr), None, true);
         assert!(
             sql.contains("AND lower(source_type) != 'audit'"),
             "audit exclusion missing: {sql}"
@@ -510,10 +569,44 @@ mod tests {
 
     #[test]
     fn fetch_log_sql_escapes_single_quotes_in_id() {
-        let sql = build_fetch_log_sql("logs", "abc'; DROP--", None, true);
+        let sql = build_fetch_log_sql("logs", "abc'; DROP--", None, None, true);
         assert!(
             sql.contains("WHERE id = 'abc''; DROP--'"),
             "id quotes not escaped: {sql}"
+        );
+    }
+
+    #[test]
+    fn fetch_log_sql_with_source_type_adds_pk_aligned_filter() {
+        let tr = TimeRangeInput {
+            start: Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap(),
+            end: Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 7).unwrap(),
+        };
+        let sql = build_fetch_log_sql(
+            "logs",
+            "abc-123",
+            Some(&tr),
+            Some("windows_sysmon"),
+            false,
+        );
+        // source_type goes immediately after the id predicate so the PK
+        // (source_type, timestamp, ...) can do a tight range read on S3-backed
+        // historical partitions instead of scanning every source_type's marks.
+        assert!(sql.starts_with("SELECT *, "), "must re-add materialized cols: {sql}");
+        assert!(
+            sql.ends_with(
+                "FROM logs WHERE id = 'abc-123' AND source_type = 'windows_sysmon' AND timestamp BETWEEN '2026-01-02 03:04:05.000000' AND '2026-01-02 03:04:07.000000' LIMIT 1"
+            ),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn fetch_log_sql_escapes_single_quotes_in_source_type() {
+        let sql = build_fetch_log_sql("logs", "abc-123", None, Some("evil'; DROP--"), false);
+        assert!(
+            sql.contains("source_type = 'evil''; DROP--'"),
+            "source_type quotes not escaped: {sql}"
         );
     }
 }

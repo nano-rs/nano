@@ -7,9 +7,10 @@ import { formatCompact } from '../helpers';
 
 interface DnsCardProps {
   dns: AssetDossierDns;
+  onOpenTopDomains?: () => void;
 }
 
-export function DnsCard({ dns }: DnsCardProps) {
+export function DnsCard({ dns, onOpenTopDomains }: DnsCardProps) {
   const { queries, unique, nx, rare_tlds, top } = dns;
 
   if (queries === 0 && top.length === 0) {
@@ -17,6 +18,7 @@ export function DnsCard({ dns }: DnsCardProps) {
       <SectionCard
         title="DNS"
         action={<span>Top domains ↗</span>}
+        onActionClick={onOpenTopDomains}
         icon={<Globe className="w-[13px] h-[13px] text-muted-foreground/70" />}
       >
         <EmptyCell>No DNS events for this entity in range</EmptyCell>
@@ -28,6 +30,7 @@ export function DnsCard({ dns }: DnsCardProps) {
     <SectionCard
       title="DNS"
       action={<span>Top domains ↗</span>}
+      onActionClick={onOpenTopDomains}
       icon={<Globe className="w-[13px] h-[13px] text-muted-foreground/70" />}
     >
       <div className="space-y-3">

@@ -7,7 +7,7 @@
 use sqlx::PgPool;
 use std::collections::HashSet;
 use thiserror::Error;
-use tracing::instrument;
+use tracing::{instrument, warn};
 
 use super::types::*;
 use crate::crypto::EncryptionService;
@@ -28,24 +28,60 @@ pub enum IdentityRepositoryError {
     EncryptionError(String),
     #[error("Database error: {0}")]
     DatabaseError(#[from] sqlx::Error),
+    #[error("ClickHouse error: {0}")]
+    ClickHouse(#[from] clickhouse::error::Error),
 }
 
 // =============================================================================
 // Repository
 // =============================================================================
 
+/// CHUNK size for batched ClickHouse INSERTs of directory rows (mirrors the
+/// IOC/IP enrichment writers).
+const CH_INSERT_CHUNK: usize = 1000;
+
 #[derive(Clone)]
 pub struct IdentityRepository {
+    /// PostgreSQL pool — config/metadata only (identity_providers, creds,
+    /// sync_status, delta_link). NAN-1117 moved the user_registry payload off
+    /// PG into ClickHouse.
     pool: PgPool,
+    /// ClickHouse client for the user_registry directory feed (read + write).
+    /// Optional so the marketplace install path (PG-only credential push) can
+    /// construct the repo without a CH client; the payload methods error with
+    /// `ClickHouseNotConfigured` rather than silently writing PG.
+    clickhouse: Option<clickhouse::Client>,
     encryption: EncryptionService,
 }
 
 impl IdentityRepository {
+    /// Construct a PG-only repository (config/metadata; no user_registry
+    /// payload access). Used by the marketplace credential-push path.
     pub fn new(pool: PgPool) -> Self {
         Self {
             encryption: EncryptionService::from_env(),
             pool,
+            clickhouse: None,
         }
+    }
+
+    /// Construct a full repository with the ClickHouse client backing the
+    /// user_registry directory feed (NAN-1117). Used by the API state ctor.
+    pub fn new_with_clickhouse(pool: PgPool, clickhouse: clickhouse::Client) -> Self {
+        Self {
+            encryption: EncryptionService::from_env(),
+            pool,
+            clickhouse: Some(clickhouse),
+        }
+    }
+
+    /// Get the ClickHouse client or a typed error if it was never configured.
+    fn ch(&self) -> Result<&clickhouse::Client, IdentityRepositoryError> {
+        self.clickhouse.as_ref().ok_or_else(|| {
+            IdentityRepositoryError::EncryptionError(
+                "ClickHouse client not configured for identity user_registry".to_string(),
+            )
+        })
     }
 
     // ========================================================================
@@ -57,7 +93,7 @@ impl IdentityRepository {
         let providers = sqlx::query_as::<_, IdentityProvider>(
             "SELECT id, name, provider_type, enabled, credentials_encrypted, config,
                     sync_status, last_sync_at, last_sync_error, last_sync_duration_ms,
-                    user_count, delta_link, created_at, updated_at
+                    user_count, deprovisioned_count, delta_link, created_at, updated_at
              FROM identity_providers ORDER BY name",
         )
         .fetch_all(&self.pool)
@@ -73,7 +109,7 @@ impl IdentityRepository {
         sqlx::query_as::<_, IdentityProvider>(
             "SELECT id, name, provider_type, enabled, credentials_encrypted, config,
                     sync_status, last_sync_at, last_sync_error, last_sync_duration_ms,
-                    user_count, delta_link, created_at, updated_at
+                    user_count, deprovisioned_count, delta_link, created_at, updated_at
              FROM identity_providers WHERE id = $1",
         )
         .bind(id)
@@ -98,7 +134,7 @@ impl IdentityRepository {
              VALUES ($1, $2, $3, $4, $5)
              RETURNING id, name, provider_type, enabled, credentials_encrypted, config,
                        sync_status, last_sync_at, last_sync_error, last_sync_duration_ms,
-                       user_count, delta_link, created_at, updated_at",
+                       user_count, deprovisioned_count, delta_link, created_at, updated_at",
         )
         .bind(&req.id)
         .bind(&req.name)
@@ -136,7 +172,7 @@ impl IdentityRepository {
              WHERE id = $1
              RETURNING id, name, provider_type, enabled, credentials_encrypted, config,
                        sync_status, last_sync_at, last_sync_error, last_sync_duration_ms,
-                       user_count, delta_link, created_at, updated_at",
+                       user_count, deprovisioned_count, delta_link, created_at, updated_at",
         )
         .bind(id)
         .bind(&req.name)
@@ -253,7 +289,17 @@ impl IdentityRepository {
     // User Registry — Bulk Operations
     // ========================================================================
 
-    /// Upsert users from a sync. Uses sync_hash for change detection to skip no-ops.
+    /// Upsert users from a sync into the ClickHouse user_registry table.
+    ///
+    /// NAN-1117: this used to be a PG `INSERT ... ON CONFLICT DO UPDATE WHERE
+    /// sync_hash IS DISTINCT FROM`. The payload now lives in a CH
+    /// ReplacingMergeTree(version) keyed (provider_id, external_id): every sync
+    /// row is appended with `version = now_ms` and the latest wins, so
+    /// change-detection is no longer needed for correctness (cheap append +
+    /// async merge replaces the no-op skip). `sync_hash` is still written so the
+    /// field round-trips. Returns (rows_written, 0) — CH can't distinguish
+    /// created vs updated, mirroring the prior PG behavior which returned
+    /// affected-as-created.
     #[instrument(skip(self, records))]
     pub async fn upsert_users(
         &self,
@@ -263,115 +309,116 @@ impl IdentityRepository {
         if records.is_empty() {
             return Ok((0, 0));
         }
+        let ch = self.ch()?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
 
-        let mut created = 0u64;
-        let updated = 0u64;
-
-        // Process in batches of 500 to avoid query parameter limits
-        for chunk in records.chunks(500) {
-            let mut query = String::from(
-                "INSERT INTO user_registry (
-                    provider_id, external_id, username, upn, email, display_name,
-                    first_name, last_name, department, title, manager_upn, manager_display_name,
-                    company, office_location, city, country, groups,
-                    account_enabled, account_status, mfa_enabled, last_sign_in_at,
-                    created_in_directory_at, phone, employee_id, employee_type,
-                    last_synced_at, sync_hash
-                ) VALUES ",
-            );
-
-            let mut param_idx = 1u32;
-            let binds: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
-            let _ = binds; // suppress unused warning
-
-            // Build values clauses
-            let mut values_parts: Vec<String> = Vec::new();
-            for _record in chunk {
-                let placeholders: Vec<String> = (param_idx..param_idx + 27)
-                    .map(|i| format!("${}", i))
-                    .collect();
-                values_parts.push(format!("({})", placeholders.join(", ")));
-                param_idx += 27;
+        let mut written = 0u64;
+        for chunk in records.chunks(CH_INSERT_CHUNK) {
+            match Self::insert_user_rows(ch, provider_id, now_ms, chunk).await {
+                Ok(()) => written += chunk.len() as u64,
+                Err(e) => {
+                    warn!(
+                        chunk_size = chunk.len(),
+                        error = %e,
+                        "CH user_registry batch insert failed; retrying records individually"
+                    );
+                    for record in chunk {
+                        match Self::insert_user_rows(
+                            ch,
+                            provider_id,
+                            now_ms,
+                            std::slice::from_ref(record),
+                        )
+                        .await
+                        {
+                            Ok(()) => written += 1,
+                            Err(e) => {
+                                warn!(external_id = %record.external_id, error = %e, "Failed to store user_registry record");
+                            }
+                        }
+                    }
+                }
             }
-            query.push_str(&values_parts.join(", "));
-
-            query.push_str(
-                " ON CONFLICT (provider_id, external_id) DO UPDATE SET
-                    username = EXCLUDED.username,
-                    upn = EXCLUDED.upn,
-                    email = EXCLUDED.email,
-                    display_name = EXCLUDED.display_name,
-                    first_name = EXCLUDED.first_name,
-                    last_name = EXCLUDED.last_name,
-                    department = EXCLUDED.department,
-                    title = EXCLUDED.title,
-                    manager_upn = EXCLUDED.manager_upn,
-                    manager_display_name = EXCLUDED.manager_display_name,
-                    company = EXCLUDED.company,
-                    office_location = EXCLUDED.office_location,
-                    city = EXCLUDED.city,
-                    country = EXCLUDED.country,
-                    groups = EXCLUDED.groups,
-                    account_enabled = EXCLUDED.account_enabled,
-                    account_status = EXCLUDED.account_status,
-                    mfa_enabled = EXCLUDED.mfa_enabled,
-                    last_sign_in_at = EXCLUDED.last_sign_in_at,
-                    created_in_directory_at = EXCLUDED.created_in_directory_at,
-                    phone = EXCLUDED.phone,
-                    employee_id = EXCLUDED.employee_id,
-                    employee_type = EXCLUDED.employee_type,
-                    last_synced_at = EXCLUDED.last_synced_at,
-                    sync_hash = EXCLUDED.sync_hash
-                WHERE user_registry.sync_hash IS DISTINCT FROM EXCLUDED.sync_hash",
-            );
-
-            // Build the query with dynamic bindings
-            let mut q = sqlx::query(&query);
-            for record in chunk {
-                q = q
-                    .bind(provider_id)
-                    .bind(&record.external_id)
-                    .bind(&record.username)
-                    .bind(&record.upn)
-                    .bind(&record.email)
-                    .bind(&record.display_name)
-                    .bind(&record.first_name)
-                    .bind(&record.last_name)
-                    .bind(&record.department)
-                    .bind(&record.title)
-                    .bind(&record.manager_upn)
-                    .bind(&record.manager_display_name)
-                    .bind(&record.company)
-                    .bind(&record.office_location)
-                    .bind(&record.city)
-                    .bind(&record.country)
-                    .bind(&record.groups)
-                    .bind(record.account_enabled)
-                    .bind(&record.account_status)
-                    .bind(record.mfa_enabled)
-                    .bind(record.last_sign_in_at)
-                    .bind(record.created_in_directory_at)
-                    .bind(&record.phone)
-                    .bind(&record.employee_id)
-                    .bind(&record.employee_type)
-                    .bind(chrono::Utc::now())
-                    .bind(&record.sync_hash);
-            }
-
-            let result = q.execute(&self.pool).await?;
-            // rows_affected includes both inserts and updates where sync_hash changed
-            let affected = result.rows_affected();
-            // We can't distinguish created vs updated with a single query,
-            // so we count total affected and will refine in the service layer
-            created += affected;
         }
 
-        // For simplicity, return affected rows as "created" — service layer
-        // can compute more precise numbers if needed.
-        Ok((created, updated))
+        Ok((written, 0))
     }
 
-    /// Mark users from this provider that are NOT in the given set of external_ids as deleted.
+    /// Column list (and matching VALUES tuple) for a user_registry INSERT.
+    /// `version` is the ReplacingMergeTree version (ms epoch); the materialized
+    /// *_lc columns are NOT listed (CH computes them).
+    const USER_COLUMNS: &'static str = "(provider_id, external_id, username, upn, email, \
+        display_name, first_name, last_name, department, title, manager_upn, \
+        manager_display_name, company, office_location, city, country, groups, \
+        account_enabled, account_status, mfa_enabled, last_sign_in_at, \
+        created_in_directory_at, phone, employee_id, employee_type, sync_hash, \
+        last_synced_at, version)";
+    const USER_VALUE_TUPLE: &'static str =
+        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+    /// Build + execute a single multi-row INSERT for `rows` (length >= 1).
+    /// DateTime64(3) columns are bound as ms-epoch i64 (0 = unset).
+    async fn insert_user_rows(
+        ch: &clickhouse::Client,
+        provider_id: &str,
+        version_ms: i64,
+        rows: &[UserRecordUpsert],
+    ) -> Result<(), clickhouse::error::Error> {
+        let tuples = vec![Self::USER_VALUE_TUPLE; rows.len()].join(", ");
+        let sql = format!(
+            "INSERT INTO nanosiem.user_registry {} VALUES {}",
+            Self::USER_COLUMNS,
+            tuples
+        );
+        let opt_str = |v: &Option<String>| v.clone().unwrap_or_default();
+        let opt_ms = |v: &Option<chrono::DateTime<chrono::Utc>>| -> i64 {
+            v.map(|d| d.timestamp_millis()).unwrap_or(0)
+        };
+
+        let mut q = ch.query(&sql);
+        for r in rows {
+            q = q
+                .bind(provider_id)
+                .bind(&r.external_id)
+                .bind(opt_str(&r.username))
+                .bind(opt_str(&r.upn))
+                .bind(opt_str(&r.email))
+                .bind(opt_str(&r.display_name))
+                .bind(opt_str(&r.first_name))
+                .bind(opt_str(&r.last_name))
+                .bind(opt_str(&r.department))
+                .bind(opt_str(&r.title))
+                .bind(opt_str(&r.manager_upn))
+                .bind(opt_str(&r.manager_display_name))
+                .bind(opt_str(&r.company))
+                .bind(opt_str(&r.office_location))
+                .bind(opt_str(&r.city))
+                .bind(opt_str(&r.country))
+                .bind(r.groups.clone())
+                .bind(if r.account_enabled { 1u8 } else { 0u8 })
+                .bind(&r.account_status)
+                .bind(if r.mfa_enabled.unwrap_or(false) { 1u8 } else { 0u8 })
+                .bind(opt_ms(&r.last_sign_in_at))
+                .bind(opt_ms(&r.created_in_directory_at))
+                .bind(opt_str(&r.phone))
+                .bind(opt_str(&r.employee_id))
+                .bind(opt_str(&r.employee_type))
+                .bind(r.sync_hash.clone())
+                .bind(version_ms)
+                .bind(version_ms);
+        }
+        q.execute().await
+    }
+
+    /// Mark users from this provider that are NOT in the given set of
+    /// external_ids as deleted (ClickHouse).
+    ///
+    /// ReplacingMergeTree has no in-place UPDATE, so we read the current
+    /// (deduped) live rows for the provider whose external_id is absent from the
+    /// present set and re-insert each as a NEW higher-version row with
+    /// account_status='deleted', account_enabled=0 — carrying forward the full
+    /// record so the browse UI keeps the other fields (the dict drops it via
+    /// HAVING). version is bumped so the deleted row wins the argMax.
     #[instrument(skip(self, present_external_ids))]
     pub async fn mark_absent_users(
         &self,
@@ -381,21 +428,12 @@ impl IdentityRepository {
         if present_external_ids.is_empty() {
             return Ok(0);
         }
-
-        let ids: Vec<&str> = present_external_ids.iter().map(|s| s.as_str()).collect();
-        let result = sqlx::query(
-            "UPDATE user_registry
-             SET account_status = 'deleted', account_enabled = false
-             WHERE provider_id = $1
-               AND external_id != ALL($2)
-               AND account_status != 'deleted'",
-        )
-        .bind(provider_id)
-        .bind(&ids)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(result.rows_affected())
+        let live = self.fetch_live_rows_for_provider(provider_id).await?;
+        let absent: Vec<UserRegistryRow> = live
+            .into_iter()
+            .filter(|r| !present_external_ids.contains(&r.external_id))
+            .collect();
+        self.soft_delete_rows(absent).await
     }
 
     /// Get the current database server time.
@@ -408,30 +446,103 @@ impl IdentityRepository {
     }
 
     /// Mark users as deleted if they weren't touched during the current sync.
-    /// Any user whose last_synced_at is before `cutoff` wasn't in the
-    /// provider's response. This avoids collecting all external_ids in memory.
-    ///
-    /// IMPORTANT: `cutoff` must come from `db_now()`, not the application clock,
-    /// to avoid clock skew causing false deletions.
+    /// Any live user whose last_synced_at is before `cutoff` wasn't in the
+    /// provider's response. CH version of the old PG soft-delete UPDATE: read
+    /// the deduped live rows, re-insert the stale ones as a higher-version
+    /// deleted row (full record carried forward).
     #[instrument(skip(self))]
     pub async fn mark_absent_users_by_sync_time(
         &self,
         provider_id: &str,
         cutoff: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64, IdentityRepositoryError> {
-        let result = sqlx::query(
-            "UPDATE user_registry
-             SET account_status = 'deleted', account_enabled = false
-             WHERE provider_id = $1
-               AND last_synced_at < $2
-               AND account_status != 'deleted'",
-        )
-        .bind(provider_id)
-        .bind(cutoff)
-        .execute(&self.pool)
-        .await?;
+        let cutoff_ms = cutoff.timestamp_millis();
+        let live = self.fetch_live_rows_for_provider(provider_id).await?;
+        let stale: Vec<UserRegistryRow> = live
+            .into_iter()
+            .filter(|r| r.last_synced_at < cutoff_ms)
+            .collect();
+        self.soft_delete_rows(stale).await
+    }
 
-        Ok(result.rows_affected())
+    /// Read the current (deduped, non-deleted) rows for a provider via FINAL +
+    /// argMax-safe filtering. Returns the latest version of each
+    /// (provider_id, external_id) whose latest account_status is not 'deleted'.
+    async fn fetch_live_rows_for_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<Vec<UserRegistryRow>, IdentityRepositoryError> {
+        let ch = self.ch()?;
+        let rows: Vec<UserRegistryRow> = ch
+            .query(
+                "SELECT provider_id, external_id, username, upn, email, display_name, \
+                    first_name, last_name, department, title, manager_upn, \
+                    manager_display_name, company, office_location, city, country, groups, \
+                    account_enabled, account_status, mfa_enabled, \
+                    toUnixTimestamp64Milli(last_sign_in_at) AS last_sign_in_at, \
+                    toUnixTimestamp64Milli(created_in_directory_at) AS created_in_directory_at, \
+                    phone, employee_id, employee_type, sync_hash, \
+                    toUnixTimestamp64Milli(last_synced_at) AS last_synced_at, version \
+                 FROM nanosiem.user_registry FINAL \
+                 WHERE provider_id = ? AND account_status != 'deleted'",
+            )
+            .bind(provider_id)
+            .fetch_all()
+            .await?;
+        Ok(rows)
+    }
+
+    /// Re-insert the given rows as higher-version tombstones (account_status =
+    /// 'deleted', account_enabled = 0), carrying the rest of the record forward.
+    async fn soft_delete_rows(
+        &self,
+        rows: Vec<UserRegistryRow>,
+    ) -> Result<u64, IdentityRepositoryError> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let ch = self.ch()?;
+        let version_ms = chrono::Utc::now().timestamp_millis();
+        let mut count = 0u64;
+        for chunk in rows.chunks(CH_INSERT_CHUNK) {
+            let upserts: Vec<UserRecordUpsert> = chunk
+                .iter()
+                .map(|r| UserRecordUpsert {
+                    external_id: r.external_id.clone(),
+                    username: Some(r.username.clone()),
+                    upn: Some(r.upn.clone()),
+                    email: Some(r.email.clone()),
+                    display_name: Some(r.display_name.clone()),
+                    first_name: Some(r.first_name.clone()),
+                    last_name: Some(r.last_name.clone()),
+                    department: Some(r.department.clone()),
+                    title: Some(r.title.clone()),
+                    manager_upn: Some(r.manager_upn.clone()),
+                    manager_display_name: Some(r.manager_display_name.clone()),
+                    company: Some(r.company.clone()),
+                    office_location: Some(r.office_location.clone()),
+                    city: Some(r.city.clone()),
+                    country: Some(r.country.clone()),
+                    groups: r.groups.clone(),
+                    account_enabled: false,
+                    account_status: "deleted".to_string(),
+                    mfa_enabled: Some(r.mfa_enabled != 0),
+                    last_sign_in_at: chrono::DateTime::from_timestamp_millis(r.last_sign_in_at),
+                    created_in_directory_at: chrono::DateTime::from_timestamp_millis(
+                        r.created_in_directory_at,
+                    ),
+                    phone: Some(r.phone.clone()),
+                    employee_id: Some(r.employee_id.clone()),
+                    employee_type: Some(r.employee_type.clone()),
+                    sync_hash: r.sync_hash.clone(),
+                })
+                .collect();
+            // provider_id is uniform within fetch_live_rows_for_provider results.
+            let provider_id = chunk[0].provider_id.clone();
+            Self::insert_user_rows(ch, &provider_id, version_ms, &upserts).await?;
+            count += chunk.len() as u64;
+        }
+        Ok(count)
     }
 
     // ========================================================================
@@ -454,144 +565,149 @@ impl IdentityRepository {
         })
     }
 
+    /// Full SELECT column list for hydrating a `UserRegistryRow` from CH. The
+    /// DateTime64(3) columns are projected to ms-epoch i64 to match the row
+    /// struct. Used by list/lookup/get_user over `... FINAL`.
+    const SELECT_COLS: &'static str = "provider_id, external_id, username, upn, email, \
+        display_name, first_name, last_name, department, title, manager_upn, \
+        manager_display_name, company, office_location, city, country, groups, \
+        account_enabled, account_status, mfa_enabled, \
+        toUnixTimestamp64Milli(last_sign_in_at) AS last_sign_in_at, \
+        toUnixTimestamp64Milli(created_in_directory_at) AS created_in_directory_at, \
+        phone, employee_id, employee_type, sync_hash, \
+        toUnixTimestamp64Milli(last_synced_at) AS last_synced_at, version";
+
     async fn list_users_inner(
         &self,
         params: &ListUsersParams,
         offset: i64,
     ) -> Result<(Vec<UserRecord>, i64), IdentityRepositoryError> {
-        let search_term = params
+        let ch = self.ch()?;
+
+        // Build the WHERE predicate (deduped via FINAL). All user values are
+        // bound, never spliced. The optional search matches the same four
+        // fields as the old PG path, case-insensitively via lower(col) LIKE.
+        let mut conds: Vec<String> = vec!["account_status != 'deleted'".to_string()];
+        if params.provider_id.is_some() {
+            conds.push("provider_id = ?".to_string());
+        }
+        if params.account_status.is_some() {
+            conds.push("account_status = ?".to_string());
+        }
+        if params.search.is_some() {
+            conds.push(
+                "(username_lc LIKE ? OR lower(display_name) LIKE ? OR email_lc LIKE ? \
+                 OR lower(department) LIKE ?)"
+                    .to_string(),
+            );
+        }
+        let where_clause = conds.join(" AND ");
+        let search_like = params
             .search
             .as_ref()
             .map(|s| format!("%{}%", s.to_lowercase()));
 
-        // Count query
-        let total: i64 = match (&params.provider_id, &params.account_status, &search_term) {
-            (Some(pid), Some(status), Some(search)) => {
-                sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM user_registry WHERE provider_id = $1 AND account_status = $2 AND (lower(username) LIKE $3 OR lower(display_name) LIKE $3 OR lower(email) LIKE $3 OR lower(department) LIKE $3)"
-                ).bind(pid).bind(status).bind(search).fetch_one(&self.pool).await?
+        // Bind helper: applies the conditional binds in declaration order.
+        // (clickhouse::query::Query::bind consumes+returns self.)
+        let apply_binds = |mut q: clickhouse::query::Query| -> clickhouse::query::Query {
+            if let Some(pid) = &params.provider_id {
+                q = q.bind(pid.clone());
             }
-            (Some(pid), Some(status), None) => {
-                sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM user_registry WHERE provider_id = $1 AND account_status = $2"
-                ).bind(pid).bind(status).fetch_one(&self.pool).await?
+            if let Some(status) = &params.account_status {
+                q = q.bind(status.clone());
             }
-            (Some(pid), None, Some(search)) => {
-                sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM user_registry WHERE provider_id = $1 AND (lower(username) LIKE $2 OR lower(display_name) LIKE $2 OR lower(email) LIKE $2 OR lower(department) LIKE $2)"
-                ).bind(pid).bind(search).fetch_one(&self.pool).await?
+            if let Some(like) = &search_like {
+                q = q.bind(like.clone()).bind(like.clone()).bind(like.clone()).bind(like.clone());
             }
-            (None, Some(status), Some(search)) => {
-                sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM user_registry WHERE account_status = $1 AND (lower(username) LIKE $2 OR lower(display_name) LIKE $2 OR lower(email) LIKE $2 OR lower(department) LIKE $2)"
-                ).bind(status).bind(search).fetch_one(&self.pool).await?
-            }
-            (Some(pid), None, None) => {
-                sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM user_registry WHERE provider_id = $1"
-                ).bind(pid).fetch_one(&self.pool).await?
-            }
-            (None, Some(status), None) => {
-                sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM user_registry WHERE account_status = $1"
-                ).bind(status).fetch_one(&self.pool).await?
-            }
-            (None, None, Some(search)) => {
-                sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM user_registry WHERE (lower(username) LIKE $1 OR lower(display_name) LIKE $1 OR lower(email) LIKE $1 OR lower(department) LIKE $1)"
-                ).bind(search).fetch_one(&self.pool).await?
-            }
-            (None, None, None) => {
-                sqlx::query_scalar("SELECT COUNT(*) FROM user_registry")
-                    .fetch_one(&self.pool).await?
-            }
+            q
         };
 
-        // Data query
-        let users: Vec<UserRecord> = match (&params.provider_id, &params.account_status, &search_term) {
-            (Some(pid), Some(status), Some(search)) => {
-                sqlx::query_as(
-                    "SELECT * FROM user_registry WHERE provider_id = $1 AND account_status = $2 AND (lower(username) LIKE $3 OR lower(display_name) LIKE $3 OR lower(email) LIKE $3 OR lower(department) LIKE $3) ORDER BY display_name LIMIT $4 OFFSET $5"
-                ).bind(pid).bind(status).bind(search).bind(params.page_size).bind(offset).fetch_all(&self.pool).await?
-            }
-            (Some(pid), Some(status), None) => {
-                sqlx::query_as(
-                    "SELECT * FROM user_registry WHERE provider_id = $1 AND account_status = $2 ORDER BY display_name LIMIT $3 OFFSET $4"
-                ).bind(pid).bind(status).bind(params.page_size).bind(offset).fetch_all(&self.pool).await?
-            }
-            (Some(pid), None, Some(search)) => {
-                sqlx::query_as(
-                    "SELECT * FROM user_registry WHERE provider_id = $1 AND (lower(username) LIKE $2 OR lower(display_name) LIKE $2 OR lower(email) LIKE $2 OR lower(department) LIKE $2) ORDER BY display_name LIMIT $3 OFFSET $4"
-                ).bind(pid).bind(search).bind(params.page_size).bind(offset).fetch_all(&self.pool).await?
-            }
-            (None, Some(status), Some(search)) => {
-                sqlx::query_as(
-                    "SELECT * FROM user_registry WHERE account_status = $1 AND (lower(username) LIKE $2 OR lower(display_name) LIKE $2 OR lower(email) LIKE $2 OR lower(department) LIKE $2) ORDER BY display_name LIMIT $3 OFFSET $4"
-                ).bind(status).bind(search).bind(params.page_size).bind(offset).fetch_all(&self.pool).await?
-            }
-            (Some(pid), None, None) => {
-                sqlx::query_as(
-                    "SELECT * FROM user_registry WHERE provider_id = $1 ORDER BY display_name LIMIT $2 OFFSET $3"
-                ).bind(pid).bind(params.page_size).bind(offset).fetch_all(&self.pool).await?
-            }
-            (None, Some(status), None) => {
-                sqlx::query_as(
-                    "SELECT * FROM user_registry WHERE account_status = $1 ORDER BY display_name LIMIT $2 OFFSET $3"
-                ).bind(status).bind(params.page_size).bind(offset).fetch_all(&self.pool).await?
-            }
-            (None, None, Some(search)) => {
-                sqlx::query_as(
-                    "SELECT * FROM user_registry WHERE (lower(username) LIKE $1 OR lower(display_name) LIKE $1 OR lower(email) LIKE $1 OR lower(department) LIKE $1) ORDER BY display_name LIMIT $2 OFFSET $3"
-                ).bind(search).bind(params.page_size).bind(offset).fetch_all(&self.pool).await?
-            }
-            (None, None, None) => {
-                sqlx::query_as(
-                    "SELECT * FROM user_registry ORDER BY display_name LIMIT $1 OFFSET $2"
-                ).bind(params.page_size).bind(offset).fetch_all(&self.pool).await?
-            }
-        };
+        // Count over the deduped (FINAL) set.
+        let count_sql = format!(
+            "SELECT count() FROM nanosiem.user_registry FINAL WHERE {where_clause}"
+        );
+        let total: u64 = apply_binds(ch.query(&count_sql)).fetch_one().await?;
 
-        Ok((users, total))
+        // Page of rows.
+        let data_sql = format!(
+            "SELECT {cols} FROM nanosiem.user_registry FINAL WHERE {where_clause} \
+             ORDER BY display_name LIMIT ? OFFSET ?",
+            cols = Self::SELECT_COLS
+        );
+        let rows: Vec<UserRegistryRow> = apply_binds(ch.query(&data_sql))
+            .bind(params.page_size)
+            .bind(offset)
+            .fetch_all()
+            .await?;
+
+        let users: Vec<UserRecord> = rows.into_iter().map(UserRecord::from).collect();
+        Ok((users, total as i64))
     }
 
     /// Look up a user by username, UPN, or email (case-insensitive exact match).
-    /// Prefers active accounts if duplicates exist across providers.
+    /// Prefers active accounts if duplicates exist across providers. Reads the
+    /// deduped (FINAL) CH set and excludes deleted users.
     #[instrument(skip(self))]
     pub async fn lookup_user_by_identifier(
         &self,
         identifier: &str,
     ) -> Result<Option<UserRecord>, IdentityRepositoryError> {
+        let ch = self.ch()?;
         let lower = identifier.to_lowercase();
-        sqlx::query_as::<_, UserRecord>(
-            "SELECT * FROM user_registry
-             WHERE lower(username) = $1 OR lower(upn) = $1 OR lower(email) = $1
-             ORDER BY account_status = 'active' DESC, updated_at DESC
+        let sql = format!(
+            "SELECT {cols} FROM nanosiem.user_registry FINAL \
+             WHERE account_status != 'deleted' \
+               AND (username_lc = ? OR upn_lc = ? OR email_lc = ?) \
+             ORDER BY account_status = 'active' DESC, version DESC \
              LIMIT 1",
-        )
-        .bind(&lower)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(Into::into)
+            cols = Self::SELECT_COLS
+        );
+        let rows: Vec<UserRegistryRow> = ch
+            .query(&sql)
+            .bind(lower.clone())
+            .bind(lower.clone())
+            .bind(lower)
+            .fetch_all()
+            .await?;
+        Ok(rows.into_iter().next().map(UserRecord::from))
     }
 
+    /// Fetch a single user by the composite id `"{provider_id}|{external_id}"`
+    /// (NAN-1117: replaced the BIGSERIAL id — CH has no synthetic key).
     #[instrument(skip(self))]
-    pub async fn get_user(&self, id: i64) -> Result<UserRecord, IdentityRepositoryError> {
-        sqlx::query_as::<_, UserRecord>("SELECT * FROM user_registry WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?
+    pub async fn get_user(&self, id: &str) -> Result<UserRecord, IdentityRepositoryError> {
+        let ch = self.ch()?;
+        let (provider_id, external_id) = UserRecord::split_composite_id(id)
+            .ok_or_else(|| IdentityRepositoryError::ProviderNotFound(format!("User {}", id)))?;
+        let sql = format!(
+            "SELECT {cols} FROM nanosiem.user_registry FINAL \
+             WHERE provider_id = ? AND external_id = ? LIMIT 1",
+            cols = Self::SELECT_COLS
+        );
+        let rows: Vec<UserRegistryRow> = ch
+            .query(&sql)
+            .bind(provider_id)
+            .bind(external_id)
+            .fetch_all()
+            .await?;
+        rows.into_iter()
+            .next()
+            .map(UserRecord::from)
             .ok_or_else(|| IdentityRepositoryError::ProviderNotFound(format!("User {}", id)))
     }
 
     #[instrument(skip(self))]
     pub async fn get_user_count(&self, provider_id: &str) -> Result<i64, IdentityRepositoryError> {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM user_registry WHERE provider_id = $1 AND account_status != 'deleted'"
-        )
-        .bind(provider_id)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(count)
+        let ch = self.ch()?;
+        let count: u64 = ch
+            .query(
+                "SELECT count() FROM nanosiem.user_registry FINAL \
+                 WHERE provider_id = ? AND account_status != 'deleted'",
+            )
+            .bind(provider_id)
+            .fetch_one()
+            .await?;
+        Ok(count as i64)
     }
 
     // ========================================================================
@@ -600,56 +716,81 @@ impl IdentityRepository {
 
     #[instrument(skip(self))]
     pub async fn get_stats(&self) -> Result<IdentityStats, IdentityRepositoryError> {
-        let total_users: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM user_registry WHERE account_status != 'deleted'",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        let ch = self.ch()?;
 
-        let active_users: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM user_registry WHERE account_status = 'active'",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        // Aggregate counts over the deduped CH set.
+        let total_users: u64 = ch
+            .query(
+                "SELECT count() FROM nanosiem.user_registry FINAL \
+                 WHERE account_status != 'deleted'",
+            )
+            .fetch_one()
+            .await?;
+        let active_users: u64 = ch
+            .query(
+                "SELECT count() FROM nanosiem.user_registry FINAL \
+                 WHERE account_status = 'active'",
+            )
+            .fetch_one()
+            .await?;
+        let disabled_users: u64 = ch
+            .query(
+                "SELECT count() FROM nanosiem.user_registry FINAL \
+                 WHERE account_status IN ('disabled', 'suspended')",
+            )
+            .fetch_one()
+            .await?;
 
-        let disabled_users: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM user_registry WHERE account_status IN ('disabled', 'suspended')",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        // Per-provider live counts from CH (the old PG LEFT JOIN broke once the
+        // payload moved cross-DB — split: provider list + sync status from PG,
+        // counts from CH, merged in Rust).
+        #[derive(Debug, clickhouse::Row, serde::Deserialize)]
+        struct ProviderCount {
+            provider_id: String,
+            #[serde(rename = "cnt")]
+            cnt: u64,
+        }
+        let provider_counts: Vec<ProviderCount> = ch
+            .query(
+                "SELECT provider_id, count() AS cnt FROM nanosiem.user_registry FINAL \
+                 WHERE account_status != 'deleted' GROUP BY provider_id",
+            )
+            .fetch_all()
+            .await?;
+        let count_by_provider: std::collections::HashMap<String, i64> = provider_counts
+            .into_iter()
+            .map(|p| (p.provider_id, p.cnt as i64))
+            .collect();
 
+        // Provider metadata from PG (config side stays PG).
         #[derive(sqlx::FromRow)]
-        struct ProviderRow {
+        struct ProviderMetaRow {
             provider_id: String,
             provider_name: String,
             provider_type: String,
-            user_count: i64,
             last_sync_at: Option<chrono::DateTime<chrono::Utc>>,
             sync_status: Option<String>,
         }
-
-        let providers: Vec<ProviderRow> = sqlx::query_as(
-            "SELECT p.id AS provider_id, p.name AS provider_name, p.provider_type,
-                    COUNT(u.id) AS user_count, p.last_sync_at, p.sync_status
-             FROM identity_providers p
-             LEFT JOIN user_registry u ON u.provider_id = p.id AND u.account_status != 'deleted'
-             GROUP BY p.id, p.name, p.provider_type, p.last_sync_at, p.sync_status
-             ORDER BY p.name",
+        let providers: Vec<ProviderMetaRow> = sqlx::query_as(
+            "SELECT id AS provider_id, name AS provider_name, provider_type,
+                    last_sync_at, sync_status
+             FROM identity_providers
+             ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?;
 
         Ok(IdentityStats {
-            total_users,
-            active_users,
-            disabled_users,
+            total_users: total_users as i64,
+            active_users: active_users as i64,
+            disabled_users: disabled_users as i64,
             providers: providers
                 .into_iter()
                 .map(|r| ProviderStatsSummary {
+                    user_count: *count_by_provider.get(&r.provider_id).unwrap_or(&0),
                     provider_id: r.provider_id,
                     provider_name: r.provider_name,
                     provider_type: r.provider_type,
-                    user_count: r.user_count,
                     last_sync_at: r.last_sync_at,
                     sync_status: r.sync_status,
                 })

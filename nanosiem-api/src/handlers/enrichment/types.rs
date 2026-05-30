@@ -22,6 +22,8 @@ pub struct EnrichmentSourceInfo {
     pub last_sync_at: Option<String>,
     pub last_sync_status: Option<String>,
     pub record_count: i64,
+    /// NAN-1124: rows deprovisioned by the reconcile job (push sources).
+    pub deprovisioned_count: i64,
     /// Sanitized config (API keys masked)
     pub config: serde_json::Value,
 }
@@ -93,54 +95,12 @@ pub struct AutoSyncConfigResponse {
     pub next_sync_at: Option<String>,
 }
 
-/// Request to configure ThreatFox enrichment source
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct ConfigureThreatFoxRequest {
-    /// API key (optional but recommended for higher rate limits)
-    pub api_key: Option<String>,
-    /// Sync interval in hours (default: 6)
-    pub sync_interval_hours: Option<u64>,
-    /// IOC TTL in days (default: 7)
-    pub ttl_days: Option<i64>,
-    /// Enable auto-sync
-    pub auto_sync_enabled: Option<bool>,
-}
-
-/// Response for IOC lookup
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct IocLookupResponse {
-    pub value: String,
-    pub found: bool,
-    pub ioc_type: Option<String>,
-    pub source_id: Option<String>,
-    pub threat_type: Option<String>,
-    pub malware: Option<String>,
-    pub confidence_level: Option<i32>,
-    pub tags: Vec<String>,
-}
-
-/// Response for IOC statistics
-#[derive(Debug, Serialize, utoipa::ToSchema)]
-pub struct IocStatsResponse {
-    pub ip_count: i64,
-    pub domain_count: i64,
-    pub hash_count: i64,
-    pub url_count: i64,
-    pub total: i64,
-}
-
-/// Request to configure TOR Exit Nodes enrichment source
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct ConfigureTorRequest {
-    /// Sync interval in hours (default: 6)
-    pub sync_interval_hours: Option<u64>,
-    /// IOC TTL in days (default: 1)
-    pub ttl_days: Option<i64>,
-    /// Confidence level for TOR exit node IOCs (default: 85)
-    pub confidence_level: Option<i32>,
-    /// Enable auto-sync
-    pub auto_sync_enabled: Option<bool>,
-}
+// NAN-1111: ConfigureThreatFoxRequest, IocLookupResponse, IocStatsResponse,
+// and ConfigureTorRequest used to live here. Both providers sunset to the
+// marketplace + Deno (nano-rs/nano-enrichments); the IOC lookup/stats
+// endpoints they shared had no remaining UI callers and were deleted with
+// the rest. See project_ipinfo_lite_stays_native for why IPinfo Lite
+// stays native instead.
 
 /// Request to look up an artifact via agent enrichment providers
 #[derive(Debug, Deserialize, utoipa::ToSchema)]

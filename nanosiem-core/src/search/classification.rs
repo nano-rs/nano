@@ -48,10 +48,13 @@ macro_rules! p_dns {
     };
 }
 
-/// Predicate: authentication event.
+/// Predicate: authentication / identity event. Includes the `category` axis so
+/// Windows-event rows (4624/4625 fall through `auth_result`; 4634/4647/4648/4672
+/// and the 472x account-management family arrive only with `.udm.category` set
+/// by the parser) get bucketed instead of falling through to `EVENT`.
 macro_rules! p_auth {
     () => {
-        "(auth_result != '' OR lower(source_type) LIKE '%auth%' OR position(lower(action), 'login') > 0 OR position(lower(action), 'logon') > 0)"
+        "(auth_result != '' OR lower(source_type) LIKE '%auth%' OR position(lower(action), 'login') > 0 OR position(lower(action), 'logon') > 0 OR lower(category) IN ('authentication','authorization','account_management','credential_access'))"
     };
 }
 
@@ -87,7 +90,7 @@ macro_rules! p_pipe {
 /// Predicate: network event by action / source_type (proxy / firewall / connection).
 macro_rules! p_network {
     () => {
-        "(position(lower(action), 'connection') > 0 OR lower(source_type) LIKE '%proxy%' OR lower(source_type) LIKE '%firewall%')"
+        "(position(lower(action), 'connection') > 0 OR lower(source_type) LIKE '%proxy%' OR lower(source_type) LIKE '%firewall%' OR lower(category) IN ('network','firewall'))"
     };
 }
 
@@ -101,7 +104,7 @@ macro_rules! p_process {
 /// Predicate: file-system event.
 macro_rules! p_file {
     () => {
-        "(file_action != '' OR position(lower(action), 'file') > 0 OR position(lower(action), 'write') > 0)"
+        "(file_action != '' OR position(lower(action), 'file') > 0 OR position(lower(action), 'write') > 0 OR lower(category) IN ('file_access','object_access'))"
     };
 }
 
@@ -111,6 +114,33 @@ macro_rules! p_network_fallback {
         "(dest_ip != '')"
     };
 }
+
+// ---------------------------------------------------------------------------
+// Predicate exports
+//
+// The macros above produce literal `&'static str` so `concat!` can splice them
+// into `EVENT_TYPE_SQL` / `LANE_SQL`. They're also useful to non-classifier
+// callers that need to filter on "is this an auth event?" — the dossier
+// service in particular (NAN-1049) used to embed its own near-copies of these
+// predicates and drifted when NAN-1047 added the `category` axis here.
+//
+// Expose each predicate as a `pub const` so any module can splice it into a
+// SQL query. Edit the macro in one place; both the classifier and the dossier
+// service inherit the change. Do NOT re-export the macro itself — the
+// `pub const` form is enough and keeps the API smaller.
+// ---------------------------------------------------------------------------
+
+pub const ALERT_PREDICATE: &str = p_alert!();
+pub const DHCP_PREDICATE: &str = p_dhcp!();
+pub const DNS_PREDICATE: &str = p_dns!();
+pub const AUTH_PREDICATE: &str = p_auth!();
+pub const AUTH_FAIL_PREDICATE: &str = p_auth_fail!();
+pub const IMAGE_LOAD_PREDICATE: &str = p_image_load!();
+pub const REGISTRY_PREDICATE: &str = p_registry!();
+pub const PIPE_PREDICATE: &str = p_pipe!();
+pub const NETWORK_PREDICATE: &str = p_network!();
+pub const PROCESS_PREDICATE: &str = p_process!();
+pub const FILE_PREDICATE: &str = p_file!();
 
 /// Classify a log event into a UDM event-type string label.
 ///
@@ -166,6 +196,51 @@ mod tests {
         let cases = EVENT_TYPE_SQL.matches("CASE").count();
         let ends = EVENT_TYPE_SQL.matches("END").count();
         assert_eq!(cases, ends, "CASE / END count mismatch: {EVENT_TYPE_SQL}");
+    }
+
+    /// The `pub const` predicate exports must stay in sync with the underlying
+    /// macros so that downstream callers (e.g. `service::asset_dossier`) and the
+    /// classifier never operate on differently-shaped SQL fragments. If someone
+    /// edits the const directly instead of the macro, this test catches it.
+    /// (NAN-1049 — the whole point of exposing the consts was to remove a copy.)
+    #[test]
+    fn pub_const_predicates_match_macros() {
+        assert_eq!(ALERT_PREDICATE, p_alert!(), "ALERT_PREDICATE drift");
+        assert_eq!(DHCP_PREDICATE, p_dhcp!(), "DHCP_PREDICATE drift");
+        assert_eq!(DNS_PREDICATE, p_dns!(), "DNS_PREDICATE drift");
+        assert_eq!(AUTH_PREDICATE, p_auth!(), "AUTH_PREDICATE drift");
+        assert_eq!(AUTH_FAIL_PREDICATE, p_auth_fail!(), "AUTH_FAIL_PREDICATE drift");
+        assert_eq!(IMAGE_LOAD_PREDICATE, p_image_load!(), "IMAGE_LOAD_PREDICATE drift");
+        assert_eq!(REGISTRY_PREDICATE, p_registry!(), "REGISTRY_PREDICATE drift");
+        assert_eq!(PIPE_PREDICATE, p_pipe!(), "PIPE_PREDICATE drift");
+        assert_eq!(NETWORK_PREDICATE, p_network!(), "NETWORK_PREDICATE drift");
+        assert_eq!(PROCESS_PREDICATE, p_process!(), "PROCESS_PREDICATE drift");
+        assert_eq!(FILE_PREDICATE, p_file!(), "FILE_PREDICATE drift");
+    }
+
+    /// Windows-event parser sets `.udm.category` to one of `authentication`,
+    /// `authorization`, `account_management`, `credential_access` for the
+    /// 4624/4625/4634/4647/4648/4672/472x family. The classifier must key off
+    /// `category` so those rows don't fall through to the `EVENT` bucket
+    /// (NAN-1047).
+    #[test]
+    fn auth_predicate_keys_off_category() {
+        for cat in [
+            "authentication",
+            "authorization",
+            "account_management",
+            "credential_access",
+        ] {
+            let token = format!("'{cat}'");
+            assert!(
+                EVENT_TYPE_SQL.contains(&token),
+                "EVENT_TYPE_SQL missing category '{cat}': {EVENT_TYPE_SQL}"
+            );
+            assert!(
+                LANE_SQL.contains(&token),
+                "LANE_SQL missing category '{cat}': {LANE_SQL}"
+            );
+        }
     }
 
     #[test]

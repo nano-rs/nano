@@ -14,6 +14,184 @@ use super::VectorConfigError;
 use super::VectorConfigManager;
 use crate::parsers::types::Parser;
 
+/// NAN-1128/1150: report any sink in the shipped topology — the static base
+/// sources/router/combiner/pipeline plus the *candidate* enrichment lane TOML —
+/// that backpressures a shared ingest source. A sink that blocks
+/// (`buffer.when_full = "block"`) or waits on `acknowledgements.enabled = true`
+/// and whose input chain reaches a shared ingest source (`http_server` /
+/// `vector` / `splunk_hec`) would stall LOG ingestion when its target stalls
+/// (the NAN-1120 silent-halt class). Empty result = safe.
+///
+/// Shared by the build-time `shared_ingest_source_sinks_must_not_backpressure`
+/// test (passing the committed `enrichment_lane_content()`) and the deploy-time
+/// guard in `write_enrichment_config` (passing the freshly-generated lane), so
+/// the same invariant gates both `cargo test` and every live reload.
+pub(super) fn enrichment_lane_backpressure_violations(candidate_enrichment_toml: &str) -> Vec<String> {
+    use std::collections::{HashMap, HashSet};
+
+    const INGEST_SOURCE_TYPES: &[&str] = &["http_server", "vector", "splunk_hec"];
+    // Sources with their own backpressure domain (none today; add the dedicated
+    // enrichment `:8090` source here if it ships).
+    const DEDICATED_ENRICHMENT_SOURCES: &[&str] = &[];
+
+    // Vector substitutes `${VAR:-default}` before parsing TOML, so mirror that
+    // (value after `:-`, else empty) to make the raw configs parseable.
+    fn substitute_env(raw: &str) -> String {
+        let re = regex::Regex::new(r"\$\{([^}]*)\}").unwrap();
+        re.replace_all(raw, |caps: &regex::Captures| match caps[1].find(":-") {
+            Some(pos) => caps[1][pos + 2..].to_string(),
+            None => String::new(),
+        })
+        .into_owned()
+    }
+
+    fn input_list(def: &toml::Value) -> Vec<String> {
+        def.get("inputs")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default()
+    }
+
+    // Strip the named-output suffix: "source_router.generic" -> "source_router".
+    fn base(name: &str) -> String {
+        name.split('.').next().unwrap_or(name).to_string()
+    }
+
+    struct SinkInfo {
+        #[allow(dead_code)]
+        ty: String,
+        inputs: Vec<String>,
+        blocks: bool,
+        acks: bool,
+    }
+
+    let docs: [(&str, &str); 8] = [
+        ("00-base.toml", include_str!("../../../../config/vector/00-base.toml")),
+        ("01-vector-source.toml", include_str!("../../../../config/vector/01-vector-source.toml")),
+        ("02-hec-source.toml", include_str!("../../../../config/vector/02-hec-source.toml")),
+        ("92-metrics.toml", include_str!("../../../../config/vector/92-metrics.toml")),
+        ("_router.toml", include_str!("../../../../config/vector/sources/parsers/_router.toml")),
+        ("_combiner.toml", include_str!("../../../../config/vector/sources/parsers/_combiner.toml")),
+        ("pipeline_config_content()", VectorConfigManager::pipeline_config_content()),
+        ("candidate _enrichment.toml", candidate_enrichment_toml),
+    ];
+
+    let mut sources: HashMap<String, String> = HashMap::new();
+    let mut transforms: HashMap<String, Vec<String>> = HashMap::new();
+    let mut sinks: HashMap<String, SinkInfo> = HashMap::new();
+
+    for (label, raw) in docs {
+        let doc: toml::Table = match toml::from_str(&substitute_env(raw)) {
+            Ok(d) => d,
+            // A candidate that doesn't even parse is caught by `vector validate`
+            // downstream; here we only police backpressure on what parses.
+            Err(_) => return vec![format!("{label}: TOML parse failed")],
+        };
+        if let Some(tbl) = doc.get("sources").and_then(|v| v.as_table()) {
+            for (name, def) in tbl {
+                let ty = def.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+                sources.insert(name.clone(), ty.to_string());
+            }
+        }
+        if let Some(tbl) = doc.get("transforms").and_then(|v| v.as_table()) {
+            for (name, def) in tbl {
+                transforms.insert(name.clone(), input_list(def));
+            }
+        }
+        if let Some(tbl) = doc.get("sinks").and_then(|v| v.as_table()) {
+            for (name, def) in tbl {
+                let blocks = def
+                    .get("buffer")
+                    .and_then(|b| b.get("when_full"))
+                    .and_then(|v| v.as_str())
+                    == Some("block");
+                let acks = def
+                    .get("acknowledgements")
+                    .and_then(|a| a.get("enabled"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                sinks.insert(
+                    name.clone(),
+                    SinkInfo {
+                        ty: def.get("type").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                        inputs: input_list(def),
+                        blocks,
+                        acks,
+                    },
+                );
+            }
+        }
+    }
+
+    // Walk a sink's inputs back to the source terminals it can reach.
+    fn reach(
+        inputs: &[String],
+        sources: &HashMap<String, String>,
+        transforms: &HashMap<String, Vec<String>>,
+        ingest_types: &[&str],
+        dedicated: &[&str],
+    ) -> (Vec<String>, bool) {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut stack: Vec<String> = inputs.iter().map(|i| base(i)).collect();
+        let mut shared: Vec<String> = Vec::new();
+        let mut unresolved = false;
+        while let Some(node) = stack.pop() {
+            if !seen.insert(node.clone()) {
+                continue;
+            }
+            if let Some(ty) = sources.get(&node) {
+                if ingest_types.contains(&ty.as_str()) && !dedicated.contains(&node.as_str()) {
+                    shared.push(node);
+                }
+            } else if let Some(ins) = transforms.get(&node) {
+                for i in ins {
+                    stack.push(base(i));
+                }
+            } else {
+                unresolved = true;
+            }
+        }
+        shared.sort();
+        shared.dedup();
+        (shared, unresolved)
+    }
+
+    let mut violations: Vec<String> = Vec::new();
+    for (name, sink) in &sinks {
+        if !sink.blocks && !sink.acks {
+            continue;
+        }
+        let (shared, unresolved) = reach(
+            &sink.inputs,
+            &sources,
+            &transforms,
+            INGEST_SOURCE_TYPES,
+            DEDICATED_ENRICHMENT_SOURCES,
+        );
+        if shared.is_empty() && !unresolved {
+            continue;
+        }
+        let mut why = Vec::new();
+        if sink.blocks {
+            why.push("buffer.when_full=\"block\"");
+        }
+        if sink.acks {
+            why.push("acknowledgements.enabled=true");
+        }
+        let reaches = if shared.is_empty() {
+            "an unresolved upstream (treated as shared)".to_string()
+        } else {
+            format!("shared ingest source(s): {}", shared.join(", "))
+        };
+        violations.push(format!(
+            "sink `{name}` sets {} but reaches {reaches}",
+            why.join(" + ")
+        ));
+    }
+    violations.sort();
+    violations
+}
+
 impl VectorConfigManager {
     /// Remove a parser's config file from the parsers directory
     ///
@@ -48,7 +226,23 @@ impl VectorConfigManager {
         let mut expected_files: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
-        for parser in parsers {
+        // NAN-1149: enrichment parsers (kind = "enrichment") are not log sources —
+        // they don't get a per-parser source TOML or a source_router route. They
+        // generate the push enrichment lane (normalize + sink) instead. Split them
+        // out here; the per-parser loop, combiner, and router below operate on log
+        // parsers only.
+        let enrichment_parsers: Vec<Parser> = parsers
+            .iter()
+            .filter(|p| p.kind == "enrichment")
+            .cloned()
+            .collect();
+        let log_parsers: Vec<Parser> = parsers
+            .iter()
+            .filter(|p| p.kind != "enrichment")
+            .cloned()
+            .collect();
+
+        for parser in &log_parsers {
             let filename = format!("{}.toml", Self::safe_name(&parser.name));
             let filepath = self.parsers_dir.join(&filename);
 
@@ -100,17 +294,26 @@ impl VectorConfigManager {
         }
 
         // Write the combiner config that unions all parser outputs
-        self.write_combiner_config(parsers).await?;
+        self.write_combiner_config(&log_parsers).await?;
 
-        // Write the dynamic router config for routed parsers
-        self.write_router_config(parsers).await?;
+        // Write the dynamic router config for routed parsers. Enrichment
+        // parsers are passed too so the enrichment_router emits a per-source
+        // route for each (NAN-1151).
+        self.write_router_config(&log_parsers, &enrichment_parsers).await?;
 
         // Write the static pipeline config (generic parser, mapping, sink)
         // In distributed deployments, these must be in parsers_dir to get S3-synced
         // to Vector pods alongside the dynamic router and parser configs.
         self.write_pipeline_config().await?;
 
-        let enabled_count = parsers.iter().filter(|p| p.enabled).count();
+        // Write the push enrichment lane (NAN-1124/NAN-1149): when enrichment
+        // parsers are deployed, the per-kind normalize transforms are generated
+        // from their `normalize_vrl`; otherwise the committed static lane is kept
+        // verbatim (behaviour-preserving for deployments that haven't adopted
+        // dynamic enrichment parsers).
+        self.write_enrichment_config(&enrichment_parsers).await?;
+
+        let enabled_count = log_parsers.iter().filter(|p| p.enabled).count();
         tracing::info!(
             "Deployed {} parser(s) to {}",
             enabled_count,
@@ -562,6 +765,211 @@ retry_max_duration_secs = 300
         Ok(())
     }
 
+    /// Returns the push enrichment lane config (NAN-1124): per-kind normalize
+    /// transforms + dedicated ClickHouse sinks consuming the
+    /// `enrichment_router.<kind>` outputs. Single source of truth is the
+    /// committed `_enrichment.toml`, embedded via `include_str!` so it ships in
+    /// the binary and reaches every deployment (dev/compose mounted, Rackspace
+    /// GCS-synced, SaaS dynamic ConfigMap) through the same path as
+    /// `_pipeline.toml`. No drift: the const IS the file.
+    pub(super) fn enrichment_lane_content() -> &'static str {
+        include_str!("../../../../config/vector/sources/parsers/_enrichment.toml")
+    }
+
+    /// Write the push enrichment lane config alongside the static pipeline.
+    /// Must land in parsers_dir so distributed deploys sync it to Vector pods
+    /// alongside the dynamic router + pipeline (NAN-1124).
+    ///
+    /// NAN-1149: when one or more enabled enrichment parsers are deployed, the
+    /// lane is GENERATED from their `normalize_vrl` (the mapping is no longer
+    /// hard-coded in the binary). With no enrichment parsers it falls back to the
+    /// committed static lane verbatim — so deployments that haven't adopted
+    /// dynamic enrichment parsers keep the identity lane exactly as before.
+    pub(super) async fn write_enrichment_config(
+        &self,
+        enrichment_parsers: &[Parser],
+    ) -> Result<(), VectorConfigError> {
+        let enrichment_path = self.parsers_dir.join("_enrichment.toml");
+        let content = Self::enrichment_lane_config(enrichment_parsers);
+
+        // NAN-1150: deploy-time guardrails — reject a malformed enrichment lane
+        // BEFORE Vector reloads, so a bad parser can never corrupt the dict and
+        // halt logs ingestion (NAN-1120 class).
+        Self::guard_enrichment_lane(enrichment_parsers, &content)?;
+
+        fs::write(&enrichment_path, &content).await?;
+        tracing::info!(
+            "Generated push enrichment lane config at {} ({} enrichment parser(s))",
+            enrichment_path.display(),
+            enrichment_parsers.iter().filter(|p| p.enabled).count()
+        );
+        Ok(())
+    }
+
+    /// NAN-1150 deploy-time guardrails for the generated enrichment lane:
+    /// (1) each enabled parser's `normalize_vrl` must compile + satisfy the
+    /// `user_registry` encoding contract (NAN-1123), and (2) the candidate lane
+    /// TOML must not introduce a sink that backpressures the shared ingest
+    /// upstream (NAN-1114/1128). Returns `ValidationFailed` with a clear,
+    /// parser-named reason on the first violation.
+    pub(super) fn guard_enrichment_lane(
+        enrichment_parsers: &[Parser],
+        candidate_toml: &str,
+    ) -> Result<(), VectorConfigError> {
+        for p in enrichment_parsers.iter().filter(|p| p.enabled) {
+            let vrl = p.normalize_vrl.as_deref().unwrap_or("");
+            let kind = p.enrich_kind.as_deref().unwrap_or("identity");
+            crate::parsers::validator::validate_enrichment_encoding_contract(kind, vrl).map_err(
+                |e| {
+                    VectorConfigError::ValidationFailed(format!(
+                        "enrichment parser '{}' rejected at deploy: {e}",
+                        p.name
+                    ))
+                },
+            )?;
+        }
+        let backpressure = enrichment_lane_backpressure_violations(candidate_toml);
+        if !backpressure.is_empty() {
+            return Err(VectorConfigError::ValidationFailed(format!(
+                "enrichment lane would backpressure shared ingest (NAN-1114): {}",
+                backpressure.join("; ")
+            )));
+        }
+        Ok(())
+    }
+
+    /// The enrichment lane TOML for a set of enrichment parsers: generated
+    /// per-source from the enabled ones, or the committed static lane verbatim
+    /// when none are enabled (behaviour-preserving fallback). NAN-1151: shared by
+    /// the active writer (`write_enrichment_config`) and the staging writer
+    /// (`staging::write_staged_enrichment_config`) so the stage→promote path
+    /// deploys the SAME dynamic lane as startup `deploy_to_vector` — without this
+    /// the `/deploy` endpoint promoted the static lane and silently reverted
+    /// per-source enrichment parsers.
+    pub(super) fn enrichment_lane_config(enrichment_parsers: &[Parser]) -> String {
+        let enabled: Vec<&Parser> = enrichment_parsers.iter().filter(|p| p.enabled).collect();
+        if enabled.is_empty() {
+            Self::enrichment_lane_content().to_string()
+        } else {
+            Self::generate_enrichment_lane(&enabled)
+        }
+    }
+
+    /// Generate the push enrichment lane from deployed enrichment parsers
+    /// (NAN-1149). One `[transforms.enrichment_normalize_<enrich_kind>]` per
+    /// parser (keyed by `enrich_kind`; P1 assumes one parser per kind), each
+    /// feeding a dedicated ClickHouse sink per `target_table`, plus a metered
+    /// dead-letter sink unioning every normalize's `.dropped` output. The sink
+    /// discipline (memory buffer + `drop_newest` + acks off) matches
+    /// `clickhouse_logs` so an enrichment sink can never backpressure the shared
+    /// ingest upstream (NAN-1114); the `shared_ingest_source_sinks_must_not_backpressure`
+    /// lint covers this. Shape mirrors the committed `_enrichment.toml` so a
+    /// single identity parser regenerates an equivalent lane.
+    fn generate_enrichment_lane(parsers: &[&Parser]) -> String {
+        use std::collections::BTreeMap;
+
+        let mut out = String::from(
+            "# =============================================================================\n\
+             # NAN-1149: Push enrichment lane (GENERATED from deployed enrichment parsers)\n\
+             # DO NOT EDIT - regenerated on every parser deploy.\n\
+             # =============================================================================\n\n",
+        );
+
+        // target_table -> normalize transforms feeding its sink.
+        let mut by_table: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut dropped_inputs: Vec<String> = Vec::new();
+        let mut seen_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for p in parsers {
+            // NAN-1151: one normalize transform per `enrich_source`, so multiple
+            // sources of the same kind (e.g. `ad` + `entra`, both identity) each
+            // carry their own VRL. The route name + transform suffix go through
+            // the same `enrichment_route_name` the router uses, so the
+            // `enrichment_router.<source>` input always resolves. MUST key on the
+            // same field the router emits routes for (`enrich_source`) — a parser
+            // without one produces neither a route nor a transform here, so a
+            // missing source can't strand a transform on a dangling router input.
+            let source = match p.enrich_source.as_deref().filter(|s| !s.is_empty()) {
+                Some(s) => s,
+                None => {
+                    tracing::warn!(
+                        parser = %p.name,
+                        "enrichment parser has no enrich_source; skipping (no lane route)"
+                    );
+                    continue;
+                }
+            };
+            let route = super::router::enrichment_route_name(source);
+            // Skip duplicate sources rather than emit a duplicate transform name
+            // that would break the Vector reload.
+            if !seen_sources.insert(route.clone()) {
+                continue;
+            }
+            let transform = format!("enrichment_normalize_{route}");
+            let vrl = p.normalize_vrl.as_deref().unwrap_or("");
+            let table = p.target_table.as_deref().unwrap_or("user_registry").to_string();
+
+            out.push_str(&format!(
+                "[transforms.{transform}]\n\
+                 type = \"remap\"\n\
+                 inputs = [\"enrichment_router.{route}\"]\n\
+                 drop_on_abort = true\n\
+                 drop_on_error = true\n\
+                 reroute_dropped = true\n\
+                 source = '''\n{vrl}\n'''\n\n"
+            ));
+
+            by_table.entry(table).or_default().push(format!("\"{transform}\""));
+            dropped_inputs.push(format!("\"{transform}.dropped\""));
+        }
+
+        for (table, inputs) in &by_table {
+            // Sanitize the sink component id (a db-qualified or hyphenated
+            // target_table would otherwise produce an invalid Vector component
+            // name). `user_registry` is unchanged; the `table =` value stays raw.
+            let sink = format!("clickhouse_{}", Self::safe_name(table));
+            out.push_str(&format!(
+                "[sinks.{sink}]\n\
+                 type = \"clickhouse\"\n\
+                 inputs = [{inputs}]\n\
+                 endpoint = \"${{CLICKHOUSE_URL:-http://clickhouse:8123}}\"\n\
+                 database = \"${{CLICKHOUSE_DATABASE:-nanosiem}}\"\n\
+                 table = \"{table}\"\n\
+                 auth.strategy = \"basic\"\n\
+                 auth.user = \"${{CLICKHOUSE_USER:-nanosiem}}\"\n\
+                 auth.password = \"${{CLICKHOUSE_PASSWORD:-nanosiem}}\"\n\
+                 compression = \"gzip\"\n\
+                 date_time_best_effort = true\n\
+                 skip_unknown_fields = true\n\n\
+                 [sinks.{sink}.buffer]\n\
+                 type = \"memory\"\n\
+                 max_events = 50000\n\
+                 when_full = \"drop_newest\"\n\n\
+                 [sinks.{sink}.acknowledgements]\n\
+                 enabled = false\n\n\
+                 [sinks.{sink}.batch]\n\
+                 max_events = 1000\n\
+                 timeout_secs = 5\n\n\
+                 [sinks.{sink}.request]\n\
+                 concurrency = \"adaptive\"\n\
+                 timeout_secs = 60\n\
+                 retry_initial_backoff_secs = 1\n\
+                 retry_max_duration_secs = 60\n\n",
+                inputs = inputs.join(", "),
+            ));
+        }
+
+        out.push_str(&format!(
+            "[sinks.enrichment_dead_letter]\n\
+             type = \"blackhole\"\n\
+             inputs = [{}]\n\
+             print_interval_secs = 0\n",
+            dropped_inputs.join(", ")
+        ));
+
+        out
+    }
+
     /// Signal Vector to reload its configuration
     ///
     /// Note: If Vector is running with --watch-config, it will auto-reload when files change.
@@ -802,6 +1210,222 @@ mod tests {
         );
     }
 
+    /// NAN-1124: same guard as `pipeline_config_vrl_blocks_compile`, for the
+    /// push enrichment lane. A bad `??`/fallible-call in `_enrichment.toml`
+    /// would take the enrichment lane down on next regen — caught here at
+    /// `cargo test` time rather than on a live Vector reload.
+    #[test]
+    fn enrichment_lane_vrl_blocks_compile() {
+        use vrl::compiler::compile;
+        use vrl::diagnostic::Formatter;
+
+        let content = VectorConfigManager::enrichment_lane_content();
+        let blocks = extract_vrl_blocks(content);
+        assert!(
+            !blocks.is_empty(),
+            "expected ≥1 VRL block in the enrichment lane"
+        );
+
+        let fns = vrl::stdlib::all();
+        let failures: Vec<String> = blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, block)| {
+                compile(block, &fns).err().map(|diagnostics| {
+                    let formatted = Formatter::new(block, diagnostics).to_string();
+                    format!("block #{idx}:\n{formatted}")
+                })
+            })
+            .collect();
+
+        assert!(
+            failures.is_empty(),
+            "enrichment lane VRL failed to compile:\n{}",
+            failures.join("\n----\n")
+        );
+    }
+
+    /// Build a minimal enrichment `Parser` for generator tests.
+    fn enrichment_test_parser(enrich_kind: &str, target_table: &str, normalize_vrl: &str) -> Parser {
+        Parser {
+            id: uuid::Uuid::new_v4(),
+            name: format!("test_{enrich_kind}"),
+            description: None,
+            source_type: "nano_enrich".to_string(),
+            source_config: serde_json::json!({}),
+            parser_vrl: String::new(),
+            output_fields: None,
+            feed_id: None,
+            credential_id: None,
+            dispatch_source_config_id: None,
+            dispatch_route_name: None,
+            enabled: true,
+            validated: true,
+            validation_error: None,
+            category: None,
+            vendor: None,
+            product: None,
+            kind: "enrichment".to_string(),
+            enrich_kind: Some(enrich_kind.to_string()),
+            enrich_source: Some(enrich_kind.to_string()),
+            target_table: Some(target_table.to_string()),
+            normalize_vrl: Some(normalize_vrl.to_string()),
+            namespace: "default".to_string(),
+            timezone: "UTC".to_string(),
+            match_values: None,
+            sampling_ratio: None,
+            sampling_exclude_condition: None,
+            extension_vrl: None,
+            extension_enabled: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// NAN-1149: the dynamically-generated enrichment lane must produce a valid,
+    /// backpressure-safe topology — the normalize VRL compiles, the per-table
+    /// sink uses `drop_newest` + acks off (never `block`; NAN-1114), and the
+    /// dead-letter unions the normalize `.dropped` outputs.
+    #[test]
+    fn generated_enrichment_lane_is_valid_and_compliant() {
+        use vrl::compiler::compile;
+        use vrl::diagnostic::Formatter;
+
+        let normalize_vrl = "external_id = to_string(.external_id) ?? \"\"\n\
+             if external_id == \"\" { abort }\n\
+             . = { \"external_id\": external_id, \"version\": to_int(.version) ?? 0 }";
+        let parser = enrichment_test_parser("identity", "user_registry", normalize_vrl);
+
+        let lane = VectorConfigManager::generate_enrichment_lane(&[&parser]);
+
+        assert!(
+            lane.contains("[transforms.enrichment_normalize_identity]"),
+            "missing normalize transform:\n{lane}"
+        );
+        assert!(
+            lane.contains("inputs = [\"enrichment_router.identity\"]"),
+            "normalize must consume enrichment_router.identity"
+        );
+        assert!(
+            lane.contains("[sinks.clickhouse_user_registry]") && lane.contains("table = \"user_registry\""),
+            "missing per-target_table sink"
+        );
+        assert!(
+            lane.contains("when_full = \"drop_newest\""),
+            "enrichment sink must be non-blocking (NAN-1114)"
+        );
+        assert!(
+            lane.contains("enabled = false"),
+            "enrichment sink acknowledgements must be off (NAN-1114)"
+        );
+        assert!(
+            lane.contains("enrichment_normalize_identity.dropped"),
+            "dead-letter must union the normalize .dropped output"
+        );
+
+        // A repo-sourced parser must never ship VRL that Vector rejects on reload.
+        let fns = vrl::stdlib::all();
+        for (idx, block) in extract_vrl_blocks(&lane).iter().enumerate() {
+            if let Err(diags) = compile(block, &fns) {
+                panic!(
+                    "generated enrichment VRL block #{idx} failed to compile:\n{}",
+                    Formatter::new(block, diags)
+                );
+            }
+        }
+    }
+
+    /// NAN-1151: two sources of the SAME kind (ad + entra, both identity) each
+    /// get their own per-source normalize transform — the unlock route-by-kind
+    /// couldn't express — yet share the one `user_registry` sink (keyed by
+    /// target_table). Proves the per-source generator + the `enrichment_router`
+    /// input names line up.
+    #[test]
+    fn generate_enrichment_lane_is_per_source_not_per_kind() {
+        let mut ad = enrichment_test_parser("identity", "user_registry", ". = { \"external_id\": to_string(.id) ?? \"\" }");
+        ad.enrich_source = Some("ad".to_string());
+        ad.name = "ad_identity".to_string();
+        let mut entra = enrichment_test_parser("identity", "user_registry", ". = { \"external_id\": to_string(.id) ?? \"\" }");
+        entra.enrich_source = Some("entra".to_string());
+        entra.name = "entra_identity".to_string();
+
+        let lane = VectorConfigManager::generate_enrichment_lane(&[&ad, &entra]);
+
+        // One normalize transform per source, each consuming its own route.
+        assert!(lane.contains("[transforms.enrichment_normalize_ad]"), "missing ad normalize:\n{lane}");
+        assert!(lane.contains("inputs = [\"enrichment_router.ad\"]"));
+        assert!(lane.contains("[transforms.enrichment_normalize_entra]"), "missing entra normalize");
+        assert!(lane.contains("inputs = [\"enrichment_router.entra\"]"));
+        // Same target_table → a single shared sink fed by both.
+        assert_eq!(
+            lane.matches("[sinks.clickhouse_user_registry]").count(),
+            1,
+            "both identity sources must share one user_registry sink"
+        );
+        assert!(
+            lane.contains("inputs = [\"enrichment_normalize_ad\", \"enrichment_normalize_entra\"]"),
+            "the user_registry sink must union both source transforms:\n{lane}"
+        );
+    }
+
+    /// NAN-1151: the shared router block emits a per-source route for each
+    /// deployed enrichment parser, and falls back to the legacy per-kind routes
+    /// when none are deployed (so the static fallback lane's
+    /// `enrichment_router.identity` input never dangles — NAN-867).
+    #[test]
+    fn enrichment_router_block_per_source_and_kind_fallback() {
+        use crate::parsers::vector_config::router::enrichment_router_block;
+        let mut ad = enrichment_test_parser("identity", "user_registry", "");
+        ad.enrich_source = Some("ad".to_string());
+
+        let per_source = enrichment_router_block(&[&ad], "\"auth_check\"");
+        assert!(
+            per_source.contains("ad = 'downcase(to_string(.source_type) ?? \"\") == \"nano_enrich\" && downcase(to_string(.source) ?? \"\") == \"ad\"'"),
+            "expected per-source ad route:\n{per_source}"
+        );
+        assert!(!per_source.contains("downcase(to_string(.kind)"), "per-source block must not key by .kind");
+
+        let fallback = enrichment_router_block(&[], "\"auth_check\"");
+        assert!(
+            fallback.contains("identity = 'downcase(to_string(.source_type) ?? \"\") == \"nano_enrich\" && downcase(to_string(.kind) ?? \"\") == \"identity\"'"),
+            "empty parser list must fall back to legacy per-kind routes:\n{fallback}"
+        );
+    }
+
+    /// NAN-1151: `enrichment_lane_config` (shared by the active + staging writers)
+    /// generates the per-source lane when ≥1 enrichment parser is enabled, and
+    /// returns the committed static lane verbatim otherwise. This is what makes
+    /// the `/deploy` stage→promote path deploy the dynamic lane instead of
+    /// silently reverting to static.
+    #[test]
+    fn enrichment_lane_config_generates_for_enabled_else_static() {
+        let parser = enrichment_test_parser(
+            "identity",
+            "user_registry",
+            ". = { \"external_id\": to_string(.id) ?? \"\" }",
+        );
+
+        let generated = VectorConfigManager::enrichment_lane_config(&[parser.clone()]);
+        assert!(
+            generated.contains("GENERATED from deployed enrichment parsers"),
+            "enabled parser must produce the generated lane:\n{generated}"
+        );
+        assert!(generated.contains("[transforms.enrichment_normalize_identity]"));
+
+        // Empty → committed static lane verbatim.
+        assert_eq!(
+            VectorConfigManager::enrichment_lane_config(&[]),
+            VectorConfigManager::enrichment_lane_content()
+        );
+        // Disabled-only → also static (no enabled parsers to generate from).
+        let mut disabled = parser;
+        disabled.enabled = false;
+        assert_eq!(
+            VectorConfigManager::enrichment_lane_config(&[disabled]),
+            VectorConfigManager::enrichment_lane_content()
+        );
+    }
+
     /// The OOTB HEC source's `hec_normalize` VRL lifts `.event` keys onto the
     /// root. Without a reserved-key deny-list a forwarder can clobber routing
     /// fields like `.source_type` or `.auth_status` via the event body and
@@ -853,6 +1477,67 @@ mod tests {
         assert!(
             block.contains("includes(reserved,"),
             "hec_normalize must gate the .event-keys lift on the reserved-key deny-list"
+        );
+    }
+
+    /// NAN-1128 / NAN-1114: the push enrichment lane shares the `http_ingest`
+    /// / `vector_native` / `splunk_hec_ingest` upstream with the logs lane
+    /// under the one-key model. A sink that *blocks* when its ClickHouse target
+    /// stalls (`buffer.when_full = "block"`), or that waits on end-to-end
+    /// `acknowledgements.enabled = true`, would backpressure that shared source
+    /// and take *log* ingestion down with it — the same silent-halt class as
+    /// the dict-FAILED outage in NAN-1120. So every sink whose input chain can
+    /// reach a shared ingest source MUST stay non-blocking (`drop_newest` /
+    /// `drop_oldest`) with sink acks off. Only a source with its own
+    /// backpressure domain — the future dedicated enrichment lane (`:8090`,
+    /// not yet present) — may back a blocking/acking sink; add it to
+    /// `DEDICATED_ENRICHMENT_SOURCES` when it ships.
+    ///
+    /// The lint parses the *shipped* topology — the binary-embedded pipeline
+    /// (`pipeline_config_content`) and enrichment lane (`enrichment_lane_content`)
+    /// plus the static base sources and the bootstrap router/combiner — so a
+    /// regression is caught at `cargo test` time, never on a live Vector reload.
+    #[test]
+    fn shared_ingest_source_sinks_must_not_backpressure() {
+        // The committed static enrichment lane must be backpressure-safe in the
+        // shipped topology. Logic lives in the shared guard so the same check
+        // runs at deploy time (write_enrichment_config) on the generated lane.
+        let violations = super::enrichment_lane_backpressure_violations(
+            VectorConfigManager::enrichment_lane_content(),
+        );
+        assert!(
+            violations.is_empty(),
+            "shared-ingest-source backpressure lint failed:\n  {}",
+            violations.join("\n  "),
+        );
+    }
+
+    /// Positive coverage: a candidate enrichment lane whose user_registry sink
+    /// BLOCKS (and reaches the shared http_ingest via enrichment_router) MUST be
+    /// flagged — proving the guard isn't a silent no-op (NAN-1150).
+    #[test]
+    fn backpressure_guard_flags_a_blocking_enrichment_sink() {
+        let bad = r#"
+[transforms.enrichment_normalize_ad]
+type = "remap"
+inputs = ["enrichment_router.ad"]
+source = '. = {}'
+
+[sinks.clickhouse_user_registry]
+type = "clickhouse"
+inputs = ["enrichment_normalize_ad"]
+
+[sinks.clickhouse_user_registry.buffer]
+type = "memory"
+when_full = "block"
+
+[sinks.clickhouse_user_registry.acknowledgements]
+enabled = true
+"#;
+        let violations = super::enrichment_lane_backpressure_violations(bad);
+        assert!(
+            violations.iter().any(|v| v.contains("clickhouse_user_registry")),
+            "a blocking + acking user_registry sink reaching the shared ingest must be flagged, got {violations:?}"
         );
     }
 }

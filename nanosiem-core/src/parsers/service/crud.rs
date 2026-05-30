@@ -7,6 +7,24 @@ use uuid::Uuid;
 use super::ParserService;
 use super::ParserServiceError;
 use crate::parsers::types::{NewParser, Parser, UpdateParser};
+use crate::parsers::vector_config::VectorConfigManager;
+
+/// NAN-1124: the `nano_` source_type prefix is reserved for nano-internal
+/// enrichment routing (e.g. `nano_enrich`). The dynamic router emits a route
+/// `<safe_name(name)> = '.source_type == "<safe_name(name)>"'` for each parser
+/// (match_values is migration-seeded only, never settable through this API), so
+/// a parser whose name maps to a `nano_*` route would pull enrichment records
+/// out of `enrichment_router` into a log parser (double-write into the logs
+/// table). Reserve the prefix at save time — mirrors the HEC reserved-key guard
+/// (NAN-938). Returns the offending claimed source_type if reserved.
+const RESERVED_SOURCE_TYPE_PREFIX: &str = "nano_";
+
+fn reserved_route_claim(name: &str) -> Option<String> {
+    let claim = VectorConfigManager::safe_name(name);
+    claim
+        .starts_with(RESERVED_SOURCE_TYPE_PREFIX)
+        .then_some(claim)
+}
 
 impl ParserService {
     /// List all parsers
@@ -37,6 +55,13 @@ impl ParserService {
             return Err(ParserServiceError::InvalidSourceType(
                 new_parser.source_type.clone(),
             ));
+        }
+
+        // NAN-1124: reserve the `nano_` source_type namespace for enrichment routing.
+        if let Some(claim) = reserved_route_claim(&new_parser.name) {
+            return Err(ParserServiceError::InvalidSourceType(format!(
+                "parser name maps to the reserved source_type '{claim}': the 'nano_' prefix is reserved for nano-internal enrichment routing (NAN-1124). Rename the parser."
+            )));
         }
 
         // Azure Blob requires credential_id (AWS S3 can use IAM roles)
@@ -82,6 +107,16 @@ impl ParserService {
         id: Uuid,
         update: UpdateParser,
     ) -> Result<Parser, ParserServiceError> {
+        // NAN-1124: reserve the `nano_` source_type namespace (a rename to a
+        // nano_* name would otherwise claim the enrichment route).
+        if let Some(ref name) = update.name {
+            if let Some(claim) = reserved_route_claim(name) {
+                return Err(ParserServiceError::InvalidSourceType(format!(
+                    "parser name maps to the reserved source_type '{claim}': the 'nano_' prefix is reserved for nano-internal enrichment routing (NAN-1124). Rename the parser."
+                )));
+            }
+        }
+
         // Validate source type if provided
         if let Some(ref source_type) = update.source_type {
             let valid_types = crate::parsers::types::SourceType::all_types();
@@ -192,5 +227,30 @@ impl ParserService {
         }
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reserved_route_claim;
+
+    /// NAN-1124: names whose `safe_name` lands in the reserved `nano_` namespace
+    /// are rejected; everything else is allowed. `safe_name` lowercases and maps
+    /// non-alphanumerics to `_`, so spaces/dashes/case all normalize.
+    #[test]
+    fn reserves_nano_prefixed_route_claims() {
+        for name in ["nano_enrich", "Nano Enrich", "nano enrich", "nano-enrich", "NANO_IDENTITY"] {
+            assert!(
+                reserved_route_claim(name).is_some(),
+                "expected '{name}' to be reserved (safe_name starts with nano_)"
+            );
+        }
+        // Not reserved: no `nano_` prefix on the normalized route value.
+        for name in ["Apache HTTP Server", "windows_event", "nanoenrich", "nano", "okta", "nginx"] {
+            assert!(
+                reserved_route_claim(name).is_none(),
+                "expected '{name}' to be allowed (safe_name does not start nano_)"
+            );
+        }
     }
 }

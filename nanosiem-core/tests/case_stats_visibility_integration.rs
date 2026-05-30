@@ -104,6 +104,7 @@ async fn stats_total_does_not_exceed_visible_count() {
                 assigned_group: None,
                 mentioned_by: None,
                 search: None,
+                free_text: None,
                 created_after: None,
                 created_before: None,
                 visibility: None,

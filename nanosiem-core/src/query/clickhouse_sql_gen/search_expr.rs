@@ -64,16 +64,20 @@ fn build_optimized_regex_sql(
                 };
             }
             RegexOptimization::LiteralAlternation(literals) => {
+                // NAN-1026 Phase 2: each literal lowered to iLike instead of hasToken*.
+                // iLike with splitByNonAlpha gives substring-correct matching and
+                // CH 26.4's LIKE-via-dictionary-scan keeps it index-accelerated.
                 let conditions: Vec<String> = literals
                     .iter()
                     .map(|lit| {
-                        let escaped_lit = escape_string(lit);
+                        let escaped_lit = escape_string(&lit.to_lowercase());
+                        let pattern = escape_like_pattern(&escaped_lit);
                         if is_message {
-                            format!("hasToken(lower(message), '{}')", escaped_lit)
+                            format!("lower(message) iLike '%{}%'", pattern)
                         } else {
                             format!(
-                                "hasTokenCaseInsensitive(toString({}), '{}')",
-                                field_expr, escaped_lit
+                                "lower(toString({})) iLike '%{}%'",
+                                field_expr, pattern
                             )
                         }
                     })
@@ -88,17 +92,21 @@ fn build_optimized_regex_sql(
                 };
             }
             RegexOptimization::BloomGuard(token) => {
-                let escaped_token = escape_string(&token);
+                // NAN-1026 Phase 2: the guard becomes iLike (substring-correct, index-
+                // accelerated via splitByNonAlpha) instead of hasToken*. Granules where
+                // the longest literal substring isn't present get pruned, then match()
+                // verifies the full regex on survivors.
+                let escaped_token = escape_string(&token.to_lowercase());
+                let pattern = escape_like_pattern(&escaped_token);
                 let guard = if is_message {
-                    format!("hasToken(lower(message), '{}')", escaped_token)
+                    format!("lower(message) iLike '%{}%'", pattern)
                 } else {
                     format!(
-                        "hasTokenCaseInsensitive(toString({}), '{}')",
-                        field_expr, escaped_token
+                        "lower(toString({})) iLike '%{}%'",
+                        field_expr, pattern
                     )
                 };
-                // For negated: NOT (guard AND match) → we can't short-circuit, just negate the match
-                // The bloom filter wouldn't help for NOT match anyway (need to scan all)
+                // For negated: NOT (guard AND match) → can't short-circuit, just negate match.
                 if negated {
                     return format!("match({}, {}) = 0", field_expr, ci_pattern);
                 }
@@ -125,66 +133,17 @@ impl ClickHouseSqlGenerator {
                     return Ok("1".to_string());
                 }
 
+                // Bare keyword: lower to substring iLike against the message column.
+                // splitByNonAlpha text index (migration 119) + CH 26.4's
+                // LIKE-via-dictionary-scan does granule pruning, so this is both
+                // correct (substring semantics — `anom` matches `anomalous`) and
+                // index-accelerated. Pre-NAN-1026 the codegen used hasToken which
+                // silently dropped any needle that wasn't a whole CH token.
                 let escaped = escape_string(&kw.to_lowercase());
-
-                // For SIEM use cases, we need substring matching (e.g., "cmd.exe", "192.168")
-                // But we also want to leverage the bloom filter index for performance.
-                //
-                // Strategy: Use multiSearchAny with the bloom filter for pre-filtering,
-                // combined with position() for exact substring verification.
-                //
-                // The tokenbf_v1 index will help skip blocks that definitely don't contain
-                // hasToken() only works for pure alphanumeric words - it tokenizes on
-                // separators like dots, slashes, underscores. For searches containing these
-                // special chars (IPs, file paths, etc.), we use LIKE which leverages the
-                // ngrambf_v1 index for acceleration.
-                //
-                // Both the text index (for hasToken) and ngrambf_v1 (for LIKE) are used.
-
-                let has_special_chars = kw.chars().any(|c| !c.is_alphanumeric());
-
-                if has_special_chars {
-                    // Keywords with special chars (IPs, domains, file paths) need iLike
-                    // for exact substring matching. But iLike alone bypasses the bloom
-                    // index, causing full scans (32s for a bare IP over 4h).
-                    //
-                    // Bloom guard: extract the longest alphanumeric token and prepend
-                    // a hasToken() check. The bloom index skips 90%+ of granules,
-                    // then iLike verifies on the small remainder. Same results, no
-                    // false positives, massive speedup.
-                    let ilike_pattern = escaped
-                        .to_lowercase()
-                        .replace('%', "\\%")
-                        .replace('_', "\\_");
-                    let ilike_clause =
-                        format!("lower(message) iLike '%{}%'", ilike_pattern);
-
-                    // Find the longest alphanumeric token for the bloom guard
-                    let longest_token = kw
-                        .split(|c: char| !c.is_alphanumeric())
-                        .filter(|t| !t.is_empty())
-                        .max_by_key(|t| t.len());
-
-                    if let Some(token) = longest_token {
-                        if token.len() >= 3 {
-                            // Guard with hasToken for index acceleration
-                            let guard_token = escape_string(&token.to_lowercase());
-                            Ok(format!(
-                                "hasToken(lower(message), '{}') AND {}",
-                                guard_token, ilike_clause
-                            ))
-                        } else {
-                            // Token too short (e.g., "a.b") — bloom filter would match
-                            // too many granules, just use iLike alone
-                            Ok(ilike_clause)
-                        }
-                    } else {
-                        Ok(ilike_clause)
-                    }
-                } else {
-                    // Pure alphanumeric word - use hasToken on lower(message) for text index acceleration
-                    Ok(format!("hasToken(lower(message), '{}')", escaped))
-                }
+                Ok(format!(
+                    "lower(message) iLike '%{}%'",
+                    escape_like_pattern(&escaped)
+                ))
             }
             SearchExpr::FieldFilter { field, op, value } => {
                 self.generate_field_filter(field, op, value)
@@ -451,22 +410,21 @@ impl ClickHouseSqlGenerator {
 
         match op {
             Comparator::Regex => {
-                // For simple patterns (no regex metacharacters), use hasToken for index acceleration
+                // NAN-1026 Phase 2: simple regex literals lower to iLike (substring-
+                // correct + splitByNonAlpha index-accelerated) instead of hasToken*.
                 if let Value::Regex(pattern) = value {
                     if let Some(token) = extract_simple_regex_token(pattern) {
+                        let escaped = escape_string(&token.to_lowercase());
+                        let like = escape_like_pattern(&escaped);
                         if field == "message" {
-                            return Ok(format!(
-                                "hasToken(lower(message), '{}')",
-                                escape_string(&token.to_lowercase())
-                            ));
+                            return Ok(format!("lower(message) iLike '%{}%'", like));
                         }
                         return Ok(format!(
-                            "hasTokenCaseInsensitive(toString({}), '{}')",
-                            field_expr,
-                            escape_string(&token)
+                            "lower(toString({})) iLike '%{}%'",
+                            field_expr, like
                         ));
                     }
-                    // Complex regex — try bloom filter pre-filtering and pattern rewrites
+                    // Complex regex — try bloom-guard pre-filtering and pattern rewrites
                     return Ok(build_optimized_regex_sql(
                         &field_expr,
                         pattern,
@@ -477,19 +435,20 @@ impl ClickHouseSqlGenerator {
                 Ok(format!("match({}, {})", field_expr, value_sql))
             }
             Comparator::NotRegex => {
-                // For simple patterns, use NOT hasToken for index acceleration
+                // NAN-1026 Phase 2: NOT iLike instead of NOT hasToken — substring-correct.
                 if let Value::Regex(pattern) = value {
                     if let Some(token) = extract_simple_regex_token(pattern) {
+                        let escaped = escape_string(&token.to_lowercase());
+                        let like = escape_like_pattern(&escaped);
                         if field == "message" {
                             return Ok(format!(
-                                "NOT hasToken(lower(message), '{}')",
-                                escape_string(&token.to_lowercase())
+                                "lower(message) NOT iLike '%{}%'",
+                                like
                             ));
                         }
                         return Ok(format!(
-                            "NOT hasTokenCaseInsensitive(toString({}), '{}')",
-                            field_expr,
-                            escape_string(&token)
+                            "lower(toString({})) NOT iLike '%{}%'",
+                            field_expr, like
                         ));
                     }
                     // Complex regex — try pattern rewrites (bloom guard not useful for negation)
@@ -510,25 +469,21 @@ impl ClickHouseSqlGenerator {
             }
             Comparator::NotLike => Ok(format!("{} NOT iLike {}", field_expr, value_sql)),
             Comparator::Contains => {
-                // Use hasToken for index acceleration on pure alphanumeric words,
-                // iLike for values with separators (dots, slashes, etc.)
+                // NAN-1026 Phase 2: every CONTAINS lowers to substring iLike
+                // (case-insensitive, substring-correct). splitByNonAlpha indexes
+                // + CH 26.4 LIKE-via-dictionary-scan provide granule pruning so
+                // perf is comparable to the old hasToken* path on indexed columns,
+                // and the behavior is correct for fragment matches that hasToken
+                // silently dropped (`message CONTAINS "anom"` matches "anomalous";
+                // `src_host CONTAINS "dc"` matches "srv-dc01"; etc.).
                 if let Value::String(s) = value {
-                    let has_separators = s.chars().any(|c| !c.is_alphanumeric());
-                    if has_separators {
-                        let escaped = escape_string(&s.to_lowercase())
-                            .replace('%', "\\%")
-                            .replace('_', "\\_");
-                        Ok(format!("{} iLike '%{}%'", field_expr, escaped))
-                    } else if field == "message" {
-                        Ok(format!(
-                            "hasToken(lower(message), '{}')",
-                            escape_string(&s.to_lowercase())
-                        ))
+                    let escaped = escape_like_pattern(&escape_string(&s.to_lowercase()));
+                    if field == "message" {
+                        Ok(format!("lower(message) iLike '%{}%'", escaped))
                     } else {
                         Ok(format!(
-                            "hasTokenCaseInsensitive(toString({}), '{}')",
-                            field_expr,
-                            escape_string(&s.to_lowercase())
+                            "lower(toString({})) iLike '%{}%'",
+                            field_expr, escaped
                         ))
                     }
                 } else {
@@ -539,24 +494,17 @@ impl ClickHouseSqlGenerator {
                 }
             }
             Comparator::NotContains => {
-                // Negated CONTAINS: NOT hasToken / NOT iLike
+                // NAN-1026 Phase 2: negated CONTAINS → NOT iLike, never NOT hasToken*.
+                // The hasToken path used to leak DCs through `src_host NOT CONTAINS "dc"`
+                // filters when host tokens were `dc01`, not `dc`.
                 if let Value::String(s) = value {
-                    let has_separators = s.chars().any(|c| !c.is_alphanumeric());
-                    if has_separators {
-                        let escaped = escape_string(&s.to_lowercase())
-                            .replace('%', "\\%")
-                            .replace('_', "\\_");
-                        Ok(format!("{} NOT iLike '%{}%'", field_expr, escaped))
-                    } else if field == "message" {
-                        Ok(format!(
-                            "NOT hasToken(lower(message), '{}')",
-                            escape_string(&s.to_lowercase())
-                        ))
+                    let escaped = escape_like_pattern(&escape_string(&s.to_lowercase()));
+                    if field == "message" {
+                        Ok(format!("lower(message) NOT iLike '%{}%'", escaped))
                     } else {
                         Ok(format!(
-                            "NOT hasTokenCaseInsensitive(toString({}), '{}')",
-                            field_expr,
-                            escape_string(&s.to_lowercase())
+                            "lower(toString({})) NOT iLike '%{}%'",
+                            field_expr, escaped
                         ))
                     }
                 } else {
@@ -955,12 +903,23 @@ impl ClickHouseSqlGenerator {
                 if kw == "*" {
                     return Ok("1".to_string());
                 }
-                // In piped commands (search, where), keywords are text searches on message.
-                // Note: after stats/timechart where message doesn't exist, ClickHouse will
-                // return a clear "column not found" error — which is correct behavior since
-                // bare keyword searches don't make sense after aggregation.
+                // In piped commands (search, where), keywords are substring text searches
+                // on message. Use the same `lower(message) iLike '%kw%'` form as the
+                // top-level keyword path (generate_search_expr) so the splitByNonAlpha text
+                // index (idx_message_words) prunes granules. The previous
+                // `position(lower(message), 'kw') > 0` bypasses that index and
+                // full-scans/decompresses the entire message column (~100x more bytes_read,
+                // and can OOM on large windows) — yet is byte-for-byte semantically identical
+                // to the escaped iLike, verified across substring/multi-word/metachar cases
+                // (NAN-1153). escape_like_pattern keeps `%`/`_` literal for parity with
+                // position(). After stats/timechart where message no longer exists,
+                // ClickHouse returns a clear "column not found" error — correct, since bare
+                // keyword searches don't make sense after aggregation.
                 let escaped = escape_string(&kw.to_lowercase());
-                Ok(format!("position(lower(message), '{}') > 0", escaped))
+                Ok(format!(
+                    "lower(message) iLike '%{}%'",
+                    escape_like_pattern(&escaped)
+                ))
             }
             SearchExpr::FieldFilter { field, op, value } => {
                 // Normalize field name (apply aliases like command_line -> process)

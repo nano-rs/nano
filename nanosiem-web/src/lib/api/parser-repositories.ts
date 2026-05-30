@@ -64,6 +64,21 @@ export interface RepositoryParser {
   vendor: string | null;
   product: string | null;
   parser_vrl: string | null;
+  /**
+   * NAN-1149: "parser" (a log source_type parser) or "enrichment" (a
+   * push-enrichment normalizer). Enrichment parsers carry
+   * enrich_kind/enrich_source/target_table/normalize_vrl below instead of a
+   * log parser_vrl, and the import flow hides source-type/routing controls.
+   */
+  kind?: string;
+  /** Enrichment domain: identity | ip_context | asset | ioc. */
+  enrich_kind?: string | null;
+  /** Per-source discriminator the enrichment lane routes on (e.g. "ad", "entra"). */
+  enrich_source?: string | null;
+  /** Target ClickHouse table the enrichment writes (e.g. "user_registry"). */
+  target_table?: string | null;
+  /** Per-source normalize VRL emitted into the enrichment lane transform. */
+  normalize_vrl?: string | null;
   // Import status (from API enrichment)
   is_imported?: boolean;
   linked_log_source_id?: string | null;

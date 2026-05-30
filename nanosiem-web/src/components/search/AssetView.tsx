@@ -61,7 +61,7 @@ interface AssetViewProps {
     timestamp?: number;
   } | null;
   timeRange?: TimeRange;
-  onFetchLog?: (id: string, timestamp: Date) => Promise<Record<string, unknown> | null>;
+  onFetchLog?: (id: string, timestamp: Date, sourceType?: string) => Promise<Record<string, unknown> | null>;
 }
 
 // Check if a string value is meaningful (not empty, not just a dash, not whitespace-only)
@@ -549,7 +549,7 @@ interface TimelineEventProps {
   event: SearchResult;
   onDrilldown?: (filters: Record<string, unknown>) => void;
   onAddToQuery?: (field: string, value: string, exclude: boolean) => void;
-  onFetchLog?: (id: string, timestamp: Date) => Promise<Record<string, unknown> | null>;
+  onFetchLog?: (id: string, timestamp: Date, sourceType?: string) => Promise<Record<string, unknown> | null>;
   isHighlighted?: boolean;
   groupCount?: number;
   groupedEvents?: SearchResult[];
@@ -622,7 +622,7 @@ function TimelineEvent({ event, onDrilldown, onAddToQuery, onFetchLog, isHighlig
     const getFieldCat = (name: string): number => {
       if (name === 'risk_score' || name === 'risk_entity' || name === 'risk_factors' || name.startsWith('risk_')) return 1;
       if (name.startsWith('ioc_')) return 2;
-      if (name.startsWith('identity_') || name === 'is_nat_candidate') return 3;
+      if (name.includes('_identity_') || name.startsWith('identity_') || name === 'is_nat_candidate') return 3;
       if (name.startsWith('prevalence_') || name === 'host_count' || name === 'is_rare' ||
           name === 'prevalence_score' || name === 'prevalence_type' || name === 'prevalence_artifact' ||
           name === 'total_occurrences' || name === 'first_seen' || name === 'last_seen') return 4;
@@ -662,16 +662,19 @@ function TimelineEvent({ event, onDrilldown, onAddToQuery, onFetchLog, isHighlig
     UDM_COLUMNS.has(k) ? "text-sky-700 dark:text-sky-400/70" :
     "text-muted-foreground";
 
-  // Prefetch full log on hover (400ms debounce to skip scroll drive-bys)
+  // Prefetch full log on hover (400ms debounce to skip scroll drive-bys).
+  // NAN-1032: pass source_type so the backend can use the (source_type, timestamp, ...)
+  // PK index — without it, S3-backed historical lookups take 12–60s.
+  const eventSourceType = fields.source_type as string | undefined;
   const prefetchLog = React.useCallback(() => {
     if (!onFetchLog || fullLogData || isLoadingFullLog) return;
     setIsLoadingFullLog(true);
     const ts = event.timestamp instanceof Date ? event.timestamp : new Date(event.timestamp as unknown as string);
-    onFetchLog(event.id, ts)
+    onFetchLog(event.id, ts, eventSourceType)
       .then((data) => { if (data) setFullLogData(data); })
       .catch(() => {})
       .finally(() => setIsLoadingFullLog(false));
-  }, [onFetchLog, event.id, event.timestamp, fullLogData, isLoadingFullLog]);
+  }, [onFetchLog, event.id, event.timestamp, eventSourceType, fullLogData, isLoadingFullLog]);
 
   const handleMouseEnter = React.useCallback(() => {
     if (fullLogData || isLoadingFullLog) return;

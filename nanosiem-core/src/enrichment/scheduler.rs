@@ -270,18 +270,13 @@ impl EnrichmentScheduler {
                 let service = self.service.read().await;
                 let result = match source.source_type.as_str() {
                     "ipinfo_lite" => service.sync_ipinfo_lite().await,
-                    "ioc_feed" => {
-                        // Route to appropriate IOC feed based on source ID
-                        match source.id.as_str() {
-                            "threatfox" => service.sync_threatfox().await,
-                            "tor_exit_nodes" => service.sync_tor_exit_nodes().await,
-                            _ => {
-                                info!(source_id = %source.id, "Unknown IOC feed source, skipping");
-                                self.running.write().await.remove(&source.id);
-                                continue;
-                            }
-                        }
-                    }
+                    // NAN-1112: the `ioc_feed` source_type (ThreatFox + Tor
+                    // exit nodes) was sunset entirely. The legacy engine
+                    // methods + PG `ioc_enrichments` table + the orphan
+                    // `enrichment_sources` rows are gone. IOC enrichment
+                    // is now Deno-only via the marketplace path; reads
+                    // are served by `enrichment::ioc::lookup_ioc_all_sources`
+                    // against CH `custom_enrichment_results`.
                     _ => {
                         info!(source_id = %source.id, source_type = %source.source_type, "Unknown source type, skipping");
                         self.running.write().await.remove(&source.id);
@@ -360,17 +355,12 @@ impl EnrichmentScheduler {
             }
         }
 
-        // Run IOC cleanup
-        let service = self.service.read().await;
-        match service.cleanup_expired_iocs().await {
-            Ok(deleted) if deleted > 0 => {
-                info!(deleted_count = deleted, "Cleaned up expired IOCs");
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to cleanup expired IOCs");
-            }
-            _ => {}
-        }
+        // NAN-1112: legacy IOC cleanup was a PG `DELETE FROM ioc_enrichments
+        // WHERE expires_at < now()` against the now-deleted table. The
+        // marketplace path stores IOCs in CH `custom_enrichment_results`
+        // with a 30-day TTL enforced by the table's own TTL clause —
+        // no application-side cleanup needed. The `cleanup_expired_iocs`
+        // service method was deleted with the rest of the engine.
 
         Ok(synced)
     }

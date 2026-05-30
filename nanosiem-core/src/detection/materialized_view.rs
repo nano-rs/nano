@@ -10,7 +10,7 @@
 
 use crate::detection::risk::default_score_for_severity;
 use crate::models::detection_rule::DetectionRule;
-use crate::query::{parse_query, Comparator, Query, SearchExpr};
+use crate::query::{parse_query, ClickHouseSqlGenerator, Query, SearchExpr};
 use crate::udm::fields::UdmField;
 use thiserror::Error;
 use tracing::{debug, error, info};
@@ -60,6 +60,38 @@ fn validate_ddl_field_name(field: &str) -> Result<(), MaterializedViewError> {
          Must be a valid UDM field name or an ext.* extension field.",
         field
     )))
+}
+
+/// Reject search expressions that are valid for scheduled search but not eligible
+/// for a real-time materialized view.
+///
+/// Real-time eligibility must match the historical behavior exactly: `Keyword`
+/// (full-text) and `InSubsearch` filters fall back to scheduled mode. Everything
+/// else is handed to the canonical `ClickHouseSqlGenerator::generate_search_expr`.
+/// The match is exhaustive on purpose: a new `SearchExpr` variant forces a
+/// decision here rather than silently slipping into the real-time path.
+fn reject_unsupported_for_realtime(expr: &SearchExpr) -> Result<(), MaterializedViewError> {
+    match expr {
+        SearchExpr::Keyword(_) => Err(MaterializedViewError::InvalidRule(
+            "Real-time rules cannot use keyword search (requires full-text search)".to_string(),
+        )),
+        SearchExpr::InSubsearch { .. } => Err(MaterializedViewError::InvalidRule(
+            "Real-time rules cannot use subsearch (IN [...])".to_string(),
+        )),
+        SearchExpr::And(left, right) | SearchExpr::Or(left, right) => {
+            reject_unsupported_for_realtime(left)?;
+            reject_unsupported_for_realtime(right)
+        }
+        SearchExpr::Not(inner) | SearchExpr::Group(inner) => {
+            reject_unsupported_for_realtime(inner)
+        }
+        SearchExpr::FieldFilter { .. }
+        | SearchExpr::FunctionFilter { .. }
+        | SearchExpr::FieldFunctionFilter { .. }
+        | SearchExpr::InList { .. }
+        | SearchExpr::BooleanFunction(_)
+        | SearchExpr::LiteralComparison { .. } => Ok(()),
+    }
 }
 
 /// Errors that can occur during materialized view operations
@@ -407,415 +439,49 @@ WHERE {}
     ///
     /// Requirements: 4.1
     fn extract_where_clause(&self, query: &Query) -> Result<String, MaterializedViewError> {
-        match query {
-            Query::Search(search_expr) => self.search_expr_to_sql(search_expr),
-            Query::Piped { .. } => Err(MaterializedViewError::InvalidRule(
-                "Real-time rules cannot contain piped commands (stats, where, etc.)".to_string(),
-            )),
-        }
-    }
-
-    /// Convert search expression to SQL WHERE clause
-    ///
-    /// Recursively converts the search expression AST to SQL.
-    ///
-    /// # Arguments
-    /// * `expr` - The search expression to convert
-    ///
-    /// # Returns
-    /// * `Ok(String)` - The SQL WHERE clause
-    /// * `Err(MaterializedViewError)` - If the expression contains unsupported features
-    fn search_expr_to_sql(&self, expr: &SearchExpr) -> Result<String, MaterializedViewError> {
-        match expr {
-            SearchExpr::FieldFilter { field, op, value } => {
-                self.field_filter_to_sql(field, op, value)
-            }
-            SearchExpr::And(left, right) => {
-                let left_sql = self.search_expr_to_sql(left)?;
-                let right_sql = self.search_expr_to_sql(right)?;
-                Ok(format!("({} AND {})", left_sql, right_sql))
-            }
-            SearchExpr::Or(left, right) => {
-                let left_sql = self.search_expr_to_sql(left)?;
-                let right_sql = self.search_expr_to_sql(right)?;
-                Ok(format!("({} OR {})", left_sql, right_sql))
-            }
-            SearchExpr::Not(inner) => {
-                let inner_sql = self.search_expr_to_sql(inner)?;
-                Ok(format!("NOT ({})", inner_sql))
-            }
-            SearchExpr::Group(inner) => {
-                let inner_sql = self.search_expr_to_sql(inner)?;
-                Ok(format!("({})", inner_sql))
-            }
-            SearchExpr::FunctionFilter {
-                function,
-                op,
-                value,
-            } => {
-                // Convert function call to SQL and apply comparison
-                let func_sql = self.eval_expression_to_sql(function)?;
-                let value_sql = self.value_to_sql(value)?;
-                let op_sql = match op {
-                    Comparator::Eq => "=",
-                    Comparator::Ne => "!=",
-                    Comparator::Gt => ">",
-                    Comparator::Lt => "<",
-                    Comparator::Gte => ">=",
-                    Comparator::Lte => "<=",
-                    _ => {
-                        return Err(MaterializedViewError::DdlGenerationError(format!(
-                            "Unsupported operator for function filter: {:?}",
-                            op
-                        )))
-                    }
-                };
-                Ok(format!("{} {} {}", func_sql, op_sql, value_sql))
-            }
-            SearchExpr::FieldFunctionFilter {
-                field,
-                op,
-                function,
-            } => {
-                // Convert field op function(args) to SQL
-                let field_sql = format!("JSONExtractString(metadata, '{}')", field);
-                let func_sql = self.eval_expression_to_sql(function)?;
-                let op_sql = match op {
-                    Comparator::Eq => "=",
-                    Comparator::Ne => "!=",
-                    Comparator::Gt => ">",
-                    Comparator::Lt => "<",
-                    Comparator::Gte => ">=",
-                    Comparator::Lte => "<=",
-                    _ => {
-                        return Err(MaterializedViewError::DdlGenerationError(format!(
-                            "Unsupported operator for field function filter: {:?}",
-                            op
-                        )))
-                    }
-                };
-                Ok(format!("{} {} {}", field_sql, op_sql, func_sql))
-            }
-            SearchExpr::InList {
-                field,
-                values,
-                negated,
-            } => self.in_list_to_sql(field, values, *negated),
-            SearchExpr::Keyword(_) => Err(MaterializedViewError::InvalidRule(
-                "Real-time rules cannot use keyword search (requires full-text search)".to_string(),
-            )),
-            SearchExpr::BooleanFunction(function) => {
-                // Standalone boolean function predicate (e.g., isnull(field))
-                let func_sql = self.eval_expression_to_sql(function)?;
-                Ok(func_sql)
-            }
-            SearchExpr::LiteralComparison { left, op, right } => {
-                // Literal string comparison - e.g., "$user"="*"
-                // These are typically used for parameter expansion and evaluate at runtime
-                let value_sql = self.value_to_sql(right)?;
-                let op_sql = match op {
-                    Comparator::Eq => "=",
-                    Comparator::Ne => "!=",
-                    _ => {
-                        return Err(MaterializedViewError::DdlGenerationError(format!(
-                            "Unsupported operator for literal comparison: {:?}",
-                            op
-                        )))
-                    }
-                };
-                Ok(format!(
-                    "'{}' {} {}",
-                    left.replace('\'', "''"),
-                    op_sql,
-                    value_sql
+        let search_expr = match query {
+            Query::Search(search_expr) => search_expr,
+            Query::Piped { .. } => {
+                return Err(MaterializedViewError::InvalidRule(
+                    "Real-time rules cannot contain piped commands (stats, where, etc.)".to_string(),
                 ))
-            }
-            SearchExpr::InSubsearch { .. } => Err(MaterializedViewError::InvalidRule(
-                "Real-time rules cannot use subsearch (IN [...])".to_string(),
-            )),
-        }
-    }
-
-    /// Convert field filter to SQL
-    fn field_filter_to_sql(
-        &self,
-        field: &str,
-        op: &Comparator,
-        value: &crate::query::Value,
-    ) -> Result<String, MaterializedViewError> {
-        let value_sql = self.value_to_sql(value)?;
-
-        let sql = match op {
-            Comparator::Eq => format!("{} = {}", field, value_sql),
-            Comparator::Ne => format!("{} != {}", field, value_sql),
-            Comparator::Gt => format!("{} > {}", field, value_sql),
-            Comparator::Lt => format!("{} < {}", field, value_sql),
-            Comparator::Gte => format!("{} >= {}", field, value_sql),
-            Comparator::Lte => format!("{} <= {}", field, value_sql),
-            Comparator::Regex => {
-                if let crate::query::Value::Regex(pattern) = value {
-                    format!("match({}, '{}')", field, pattern.replace('\'', "''"))
-                } else {
-                    return Err(MaterializedViewError::DdlGenerationError(
-                        "Regex comparator requires regex value".to_string(),
-                    ));
-                }
-            }
-            Comparator::NotRegex => {
-                if let crate::query::Value::Regex(pattern) = value {
-                    // Use match() = 0 instead of NOT match() — ClickHouse optimizer bug
-                    format!("match({}, '{}') = 0", field, pattern.replace('\'', "''"))
-                } else {
-                    return Err(MaterializedViewError::DdlGenerationError(
-                        "NotRegex comparator requires regex value".to_string(),
-                    ));
-                }
-            }
-            Comparator::Like => format!("{} LIKE {}", field, value_sql),
-            Comparator::NotLike => format!("{} NOT LIKE {}", field, value_sql),
-            Comparator::Contains => {
-                if let crate::query::Value::String(s) = value {
-                    format!("position({}, '{}') > 0", field, s.replace('\'', "''"))
-                } else {
-                    return Err(MaterializedViewError::DdlGenerationError(
-                        "Contains comparator requires string value".to_string(),
-                    ));
-                }
-            }
-            Comparator::NotContains => {
-                if let crate::query::Value::String(s) = value {
-                    format!("NOT (position({}, '{}') > 0)", field, s.replace('\'', "''"))
-                } else {
-                    return Err(MaterializedViewError::DdlGenerationError(
-                        "NotContains comparator requires string value".to_string(),
-                    ));
-                }
-            }
-            Comparator::StartsWith => {
-                if let crate::query::Value::String(s) = value {
-                    format!("startsWith({}, '{}')", field, s.replace('\'', "''"))
-                } else {
-                    return Err(MaterializedViewError::DdlGenerationError(
-                        "StartsWith comparator requires string value".to_string(),
-                    ));
-                }
-            }
-            Comparator::NotStartsWith => {
-                if let crate::query::Value::String(s) = value {
-                    format!("NOT startsWith({}, '{}')", field, s.replace('\'', "''"))
-                } else {
-                    return Err(MaterializedViewError::DdlGenerationError(
-                        "NotStartsWith comparator requires string value".to_string(),
-                    ));
-                }
-            }
-            Comparator::EndsWith => {
-                if let crate::query::Value::String(s) = value {
-                    format!("endsWith({}, '{}')", field, s.replace('\'', "''"))
-                } else {
-                    return Err(MaterializedViewError::DdlGenerationError(
-                        "EndsWith comparator requires string value".to_string(),
-                    ));
-                }
-            }
-            Comparator::NotEndsWith => {
-                if let crate::query::Value::String(s) = value {
-                    format!("NOT endsWith({}, '{}')", field, s.replace('\'', "''"))
-                } else {
-                    return Err(MaterializedViewError::DdlGenerationError(
-                        "NotEndsWith comparator requires string value".to_string(),
-                    ));
-                }
             }
         };
 
-        Ok(sql)
-    }
+        // Real-time eligibility is intentionally narrower than scheduled search:
+        // keyword (full-text) and subsearch filters are not supported in a
+        // materialized view and must fall back to scheduled mode. Reject them up
+        // front with the historical messages...
+        reject_unsupported_for_realtime(search_expr)?;
 
-    /// Convert IN list to SQL
-    fn in_list_to_sql(
-        &self,
-        field: &str,
-        values: &[crate::query::Value],
-        negated: bool,
-    ) -> Result<String, MaterializedViewError> {
-        let values_sql: Result<Vec<String>, _> =
-            values.iter().map(|v| self.value_to_sql(v)).collect();
-
-        let values_sql = values_sql?;
-        let values_list = values_sql.join(", ");
-
-        if negated {
-            Ok(format!("{} NOT IN ({})", field, values_list))
-        } else {
-            Ok(format!("{} IN ({})", field, values_list))
-        }
-    }
-
-    /// Convert value to SQL literal
-    fn value_to_sql(&self, value: &crate::query::Value) -> Result<String, MaterializedViewError> {
-        match value {
-            crate::query::Value::String(s) => Ok(format!("'{}'", s.replace('\'', "''"))),
-            crate::query::Value::Number(n) => Ok(n.to_string()),
-            crate::query::Value::Bool(b) => Ok(if *b { "1".to_string() } else { "0".to_string() }),
-            crate::query::Value::Ip(ip) => Ok(format!("'{}'", ip)),
-            crate::query::Value::Regex(pattern) => Ok(format!("'{}'", pattern.replace('\'', "''"))),
-            crate::query::Value::Interval(duration, unit) => {
-                let seconds = duration.as_secs();
-                match unit {
-                    crate::query::IntervalUnit::Microsecond => {
-                        Ok(format!("INTERVAL {} MICROSECOND", seconds * 1_000_000))
-                    }
-                    crate::query::IntervalUnit::Millisecond => {
-                        Ok(format!("INTERVAL {} MILLISECOND", seconds * 1_000))
-                    }
-                    crate::query::IntervalUnit::Second => {
-                        Ok(format!("INTERVAL {} SECOND", seconds))
-                    }
-                    crate::query::IntervalUnit::Minute => {
-                        Ok(format!("INTERVAL {} MINUTE", seconds / 60))
-                    }
-                    crate::query::IntervalUnit::Hour => {
-                        Ok(format!("INTERVAL {} HOUR", seconds / 3600))
-                    }
-                    crate::query::IntervalUnit::Day => {
-                        Ok(format!("INTERVAL {} DAY", seconds / 86400))
-                    }
-                    crate::query::IntervalUnit::Week => {
-                        Ok(format!("INTERVAL {} WEEK", seconds / 604800))
-                    }
-                    crate::query::IntervalUnit::Month => {
-                        Ok(format!("INTERVAL {} MONTH", seconds / 2592000))
-                    }
-                    crate::query::IntervalUnit::Year => {
-                        Ok(format!("INTERVAL {} YEAR", seconds / 31536000))
-                    }
-                }
-            }
-        }
-    }
-
-    /// Convert eval expression to SQL for function calls in materialized views
-    fn eval_expression_to_sql(
-        &self,
-        expr: &crate::query::EvalExpression,
-    ) -> Result<String, MaterializedViewError> {
-        use crate::query::EvalExpression;
-
-        match expr {
-            EvalExpression::Field(field) => Ok(field.clone()),
-            EvalExpression::Literal(value) => self.value_to_sql(value),
-            EvalExpression::FunctionCall { name, args } => {
-                let arg_sqls: Result<Vec<String>, _> = args
-                    .iter()
-                    .map(|arg| self.eval_expression_to_sql(arg))
-                    .collect();
-                let arg_sqls = arg_sqls?;
-
-                // Map function names to ClickHouse equivalents
-                let clickhouse_func = match name.as_str() {
-                    // Date/time functions
-                    "now" => "now64(6)",
-                    "year" => "toYear",
-                    "month" => "toMonth",
-                    "day" => "toDayOfMonth",
-                    "hour" => "toHour",
-                    "minute" => "toMinute",
-                    "second" => "toSecond",
-                    "dayofweek" => "toDayOfWeek",
-                    "dayofyear" => "toDayOfYear",
-                    "weekofyear" => "toWeek",
-                    "date_add" => "addInterval",
-                    "date_sub" => "subtractInterval",
-                    "date_format" => "formatDateTime",
-                    "date_trunc" => "date_trunc",
-                    "unix_timestamp" => "toUnixTimestamp",
-                    "from_unixtime" => "fromUnixTimestamp",
-
-                    // String functions
-                    "upper" => "upper",
-                    "lower" => "lower",
-                    "length" => "length",
-                    "substr" => "substring",
-                    "substring" => "substring",
-                    "concat" => "concat",
-                    "replace" => "replaceAll",
-                    "trim" => "trim",
-                    "ltrim" => "trimLeft",
-                    "rtrim" => "trimRight",
-
-                    // Math functions
-                    "abs" => "abs",
-                    "ceil" => "ceil",
-                    "floor" => "floor",
-                    "round" => "round",
-                    "sqrt" => "sqrt",
-                    "pow" => "pow",
-
-                    // Conditional functions
-                    "if" => "if",
-                    "case" => "multiIf",
-                    "coalesce" => "coalesce",
-                    "nullif" => "nullIf",
-
-                    // Type conversion
-                    "tostring" => "toString",
-                    "tonumber" => "toFloat64OrNull",
-                    "toint" => "toInt64OrNull",
-
-                    // Pass through unknown functions (might be ClickHouse-specific)
-                    other => other,
-                };
-
-                if arg_sqls.is_empty() && clickhouse_func == "now64(6)" {
-                    Ok(clickhouse_func.to_string())
-                } else {
-                    Ok(format!("{}({})", clickhouse_func, arg_sqls.join(", ")))
-                }
-            }
-            EvalExpression::BinaryOp { left, op, right } => {
-                let left_sql = self.eval_expression_to_sql(left)?;
-                let right_sql = self.eval_expression_to_sql(right)?;
-                let op_sql = match op {
-                    crate::query::BinaryOperator::Add => "+",
-                    crate::query::BinaryOperator::Sub => "-",
-                    crate::query::BinaryOperator::Mul => "*",
-                    crate::query::BinaryOperator::Div => "/",
-                    crate::query::BinaryOperator::Mod => "%",
-                    crate::query::BinaryOperator::Concat => "||",
-                    crate::query::BinaryOperator::Eq => "=",
-                    crate::query::BinaryOperator::Ne => "!=",
-                    crate::query::BinaryOperator::Lt => "<",
-                    crate::query::BinaryOperator::Lte => "<=",
-                    crate::query::BinaryOperator::Gt => ">",
-                    crate::query::BinaryOperator::Gte => ">=",
-                    crate::query::BinaryOperator::And => "AND",
-                    crate::query::BinaryOperator::Or => "OR",
-                    crate::query::BinaryOperator::Contains | crate::query::BinaryOperator::Like => {
-                        ""
-                    }
-                };
-                match op {
-                    crate::query::BinaryOperator::Contains => {
-                        Ok(format!("(position({}, {}) > 0)", left_sql, right_sql))
-                    }
-                    crate::query::BinaryOperator::Like => {
-                        Ok(format!("({} LIKE {})", left_sql, right_sql))
-                    }
-                    _ => Ok(format!("({} {} {})", left_sql, op_sql, right_sql)),
-                }
-            }
-        }
+        // ...then delegate WHERE generation to the canonical generator so the
+        // real-time WHERE clause stays byte-for-byte identical to the scheduled
+        // path. This module previously carried its own SearchExpr->SQL codegen
+        // that had drifted from canonical (no lower(), no field-name
+        // normalization, no wildcard->iLike, case-sensitive regex, no hostname
+        // FQDN expansion), so a rule could match in scheduled mode yet silently
+        // never match in real-time mode (NAN-1142).
+        ClickHouseSqlGenerator::new()
+            .generate_search_expr(search_expr)
+            .map_err(|e| {
+                MaterializedViewError::DdlGenerationError(format!(
+                    "Failed to generate real-time WHERE clause: {e}"
+                ))
+            })
     }
 }
 
-#[cfg(any())]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::detection_rule::{DetectionMode, DetectionRule, Severity};
+    use crate::models::detection_rule::{AiTriageHints, AlertMode, DetectionMode, RuleMode, Severity};
     use chrono::Utc;
     use uuid::Uuid;
 
+    /// DetectionRule fixture matching the current struct shape. `DetectionRule`
+    /// has no `Default`, so every field is set explicitly; keep this in sync when
+    /// the model changes (the previous fixture rotted, which is why this whole
+    /// module was `#[cfg(any())]`-disabled before NAN-1142).
     fn create_test_rule() -> DetectionRule {
         DetectionRule {
             id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
@@ -826,8 +492,7 @@ mod tests {
             mitre_tactics: vec![],
             mitre_techniques: vec![],
             schedule_cron: None,
-            enabled: true,
-            mode: crate::models::detection_rule::RuleMode::Alerting,
+            mode: RuleMode::Alerting,
             narrative: None,
             reference_url: None,
             author: None,
@@ -846,71 +511,102 @@ mod tests {
             match_count: 0,
             live_match_count: 0,
             archived: false,
+            folder: None,
+            ai_triage_hints: sqlx::types::Json(AiTriageHints::default()),
             lookback_minutes: None,
             auto_tuning_enabled: true,
             auto_tuning_min_confidence: 0.8,
             auto_tuning_critical: false,
             auto_tuning_disabled_until: None,
+            case_visibility: "private".to_string(),
+            case_assigned_group: None,
+            alert_mode: AlertMode::default(),
+            next_run_at: None,
+            claimed_by: None,
+            claimed_at: None,
+            playbook_selector_mode: "none".to_string(),
+            playbook_id: None,
         }
+    }
+
+    /// The WHERE body the canonical (scheduled) generator produces for `query`.
+    /// The real-time MV WHERE must equal this exactly — that invariant is the
+    /// entire point of NAN-1142.
+    fn canonical_where(query: &str) -> String {
+        let parsed = parse_query(query).expect("query should parse");
+        let expr = match parsed {
+            Query::Search(expr) => expr,
+            Query::Piped { .. } => panic!("not a search query: {query}"),
+        };
+        ClickHouseSqlGenerator::new()
+            .generate_search_expr(&expr)
+            .expect("canonical generation should succeed")
+    }
+
+    /// Assert the generated DDL embeds exactly the canonical WHERE for `query`.
+    fn assert_where_matches_canonical(query: &str) {
+        let mut rule = create_test_rule();
+        rule.query = query.to_string();
+        let generator = MaterializedViewGenerator::new(clickhouse::Client::default());
+        let ddl = generator
+            .generate_view_ddl(&rule)
+            .unwrap_or_else(|e| panic!("DDL generation failed for {query:?}: {e}"));
+        let expected = canonical_where(query);
+        assert!(
+            ddl.contains(&format!("WHERE {expected}")),
+            "real-time WHERE drifted from canonical\n  query:     {query}\n  canonical: {expected}\n  ddl:\n{ddl}"
+        );
     }
 
     #[test]
     fn test_generate_view_name() {
         let rule = create_test_rule();
         let view_name = MaterializedViewGenerator::generate_view_name(&rule);
-        assert_eq!(
-            view_name,
-            "mv_rt_detection_550e8400e29b41d4a716446655440000"
-        );
+        assert_eq!(view_name, "mv_rt_detection_550e8400e29b41d4a716446655440000");
     }
 
     #[test]
-    fn test_generate_view_ddl_simple_filter() {
+    fn test_generate_view_ddl_shape() {
         let rule = create_test_rule();
         let generator = MaterializedViewGenerator::new(clickhouse::Client::default());
-
         let ddl = generator.generate_view_ddl(&rule).unwrap();
-
         assert!(ddl
             .contains("CREATE MATERIALIZED VIEW mv_rt_detection_550e8400e29b41d4a716446655440000"));
         assert!(ddl.contains("TO signals"));
-        assert!(ddl.contains("dest_ip = '192.0.2.1'"));
         assert!(ddl.contains("src_ip AS risk_entity"));
         assert!(ddl.contains("75 AS risk_score"));
+        assert!(ddl.contains("AND timestamp >= now() - INTERVAL 1 HOUR"));
+    }
+
+    /// NAN-1142: the real-time WHERE clause must be byte-for-byte identical to the
+    /// canonical scheduled-path WHERE across a representative spread of rule shapes.
+    /// Before the fix the MV path emitted case-sensitive / wildcard-literal /
+    /// non-normalized SQL, so these rules silently failed to match in real-time mode.
+    #[test]
+    fn test_realtime_where_matches_canonical() {
+        for q in [
+            "process_name=\"Mimikatz\"",                          // case folding
+            "process_name=/mimikatz/",                            // regex -> (?i)/iLike
+            "command_line=\"*powershell*\"",                      // wildcard -> iLike
+            "src_host=\"dc01\"",                                  // FQDN expansion
+            "dest_ip=\"192.0.2.1\"",                              // IP equality
+            "dest_port=443",                                      // numeric equality
+            "user=\"alice\" AND action=\"login\"",               // AND
+            "dest_ip=\"192.0.2.1\" OR dest_ip=\"198.51.100.1\"", // OR
+            "NOT process_name=\"explorer.exe\"",                  // NOT
+            "dest_ip IN (\"192.0.2.1\", \"198.51.100.1\")",       // IN-list
+        ] {
+            assert_where_matches_canonical(q);
+        }
     }
 
     #[test]
-    fn test_generate_view_ddl_auto_detects_risk_entity() {
+    fn test_auto_detect_risk_entity_from_query() {
         let mut rule = create_test_rule();
-        rule.risk_entity_field = None; // Should auto-detect based on query
-
+        rule.risk_entity_field = None; // query is dest_ip=... -> auto-detect dest_ip
         let generator = MaterializedViewGenerator::new(clickhouse::Client::default());
-        let result = generator.generate_view_ddl(&rule);
-
-        assert!(result.is_ok(), "Should succeed with auto-detection");
-        let ddl = result.unwrap();
-        // Query has dest_ip, so should auto-detect dest_ip
-        assert!(
-            ddl.contains("dest_ip AS risk_entity"),
-            "Should auto-detect dest_ip as risk entity from query"
-        );
-    }
-
-    #[test]
-    fn test_auto_detect_src_ip() {
-        let mut rule = create_test_rule();
-        rule.query = "src_ip=\"10.0.0.1\"".to_string();
-        rule.risk_entity_field = None;
-
-        let generator = MaterializedViewGenerator::new(clickhouse::Client::default());
-        let result = generator.generate_view_ddl(&rule);
-
-        assert!(result.is_ok());
-        let ddl = result.unwrap();
-        assert!(
-            ddl.contains("src_ip AS risk_entity"),
-            "Should detect src_ip from query"
-        );
+        let ddl = generator.generate_view_ddl(&rule).unwrap();
+        assert!(ddl.contains("dest_ip AS risk_entity"));
     }
 
     #[test]
@@ -918,173 +614,86 @@ mod tests {
         let mut rule = create_test_rule();
         rule.query = "src_user=\"alice\"".to_string();
         rule.risk_entity_field = None;
-
         let generator = MaterializedViewGenerator::new(clickhouse::Client::default());
-        let result = generator.generate_view_ddl(&rule);
-
-        assert!(result.is_ok());
-        let ddl = result.unwrap();
-        assert!(
-            ddl.contains("src_user AS risk_entity"),
-            "Should detect src_user from query"
-        );
+        let ddl = generator.generate_view_ddl(&rule).unwrap();
+        assert!(ddl.contains("src_user AS risk_entity"));
     }
 
     #[test]
-    fn test_auto_detect_user() {
-        let mut rule = create_test_rule();
-        rule.query = "user=\"bob\" AND action=\"login\"".to_string();
-        rule.risk_entity_field = None;
-
-        let generator = MaterializedViewGenerator::new(clickhouse::Client::default());
-        let result = generator.generate_view_ddl(&rule);
-
-        assert!(result.is_ok());
-        let ddl = result.unwrap();
-        assert!(
-            ddl.contains("user AS risk_entity"),
-            "Should detect user from query"
-        );
-    }
-
-    #[test]
-    fn test_auto_detect_empty_string() {
+    fn test_auto_detect_empty_string_triggers_detection() {
         let mut rule = create_test_rule();
         rule.query = "src_user=\"alice\"".to_string();
-        rule.risk_entity_field = Some("".to_string()); // Empty string should trigger auto-detect
-
-        let generator = MaterializedViewGenerator::new(clickhouse::Client::default());
-        let result = generator.generate_view_ddl(&rule);
-
-        assert!(result.is_ok());
-        let ddl = result.unwrap();
-        assert!(
-            ddl.contains("src_user AS risk_entity"),
-            "Empty string should trigger auto-detection"
-        );
-    }
-
-    #[test]
-    fn test_generate_view_ddl_with_and() {
-        let mut rule = create_test_rule();
-        rule.query = "dest_ip=\"192.0.2.1\" AND dest_port=443".to_string();
-
+        rule.risk_entity_field = Some(String::new()); // empty -> auto-detect
         let generator = MaterializedViewGenerator::new(clickhouse::Client::default());
         let ddl = generator.generate_view_ddl(&rule).unwrap();
-
-        assert!(ddl.contains("dest_ip = '192.0.2.1' AND dest_port = 443"));
+        assert!(ddl.contains("src_user AS risk_entity"));
     }
 
-    #[test]
-    fn test_generate_view_ddl_with_or() {
-        let mut rule = create_test_rule();
-        rule.query = "dest_ip=\"192.0.2.1\" OR dest_ip=\"198.51.100.1\"".to_string();
-
-        let generator = MaterializedViewGenerator::new(clickhouse::Client::default());
-        let ddl = generator.generate_view_ddl(&rule).unwrap();
-
-        assert!(ddl.contains("dest_ip = '192.0.2.1' OR dest_ip = '198.51.100.1'"));
-    }
+    // --- real-time eligibility: unsupported shapes must still fall back to scheduled ---
 
     #[test]
-    fn test_generate_view_ddl_with_in_list() {
-        let mut rule = create_test_rule();
-        rule.query = "dest_ip IN (\"192.0.2.1\", \"198.51.100.1\", \"203.0.113.1\")".to_string();
-
-        let generator = MaterializedViewGenerator::new(clickhouse::Client::default());
-        let ddl = generator.generate_view_ddl(&rule).unwrap();
-
-        assert!(ddl.contains("dest_ip IN ('192.0.2.1', '198.51.100.1', '203.0.113.1')"));
-    }
-
-    #[test]
-    fn test_generate_view_ddl_rejects_piped_commands() {
+    fn test_rejects_piped_commands() {
         let mut rule = create_test_rule();
         rule.query = "dest_ip=\"192.0.2.1\" | stats count by src_ip".to_string();
-
         let generator = MaterializedViewGenerator::new(clickhouse::Client::default());
-        let result = generator.generate_view_ddl(&rule);
-
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            MaterializedViewError::InvalidRule(_) => {}
-            e => panic!("Expected InvalidRule error, got: {:?}", e),
-        }
+        assert!(matches!(
+            generator.generate_view_ddl(&rule),
+            Err(MaterializedViewError::InvalidRule(_))
+        ));
     }
 
     #[test]
-    fn test_generate_view_ddl_rejects_keyword_search() {
+    fn test_rejects_keyword_search() {
         let mut rule = create_test_rule();
         rule.query = "malware".to_string();
-
         let generator = MaterializedViewGenerator::new(clickhouse::Client::default());
-        let result = generator.generate_view_ddl(&rule);
-
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            MaterializedViewError::InvalidRule(_) => {}
-            e => panic!("Expected InvalidRule error, got: {:?}", e),
-        }
+        assert!(matches!(
+            generator.generate_view_ddl(&rule),
+            Err(MaterializedViewError::InvalidRule(_))
+        ));
     }
 
-    // --- SQL injection prevention tests ---
+    #[test]
+    fn test_rejects_nested_keyword_search() {
+        // keyword buried inside AND must also reject — the pre-pass is recursive
+        let mut rule = create_test_rule();
+        rule.query = "dest_ip=\"192.0.2.1\" AND malware".to_string();
+        let generator = MaterializedViewGenerator::new(clickhouse::Client::default());
+        assert!(matches!(
+            generator.generate_view_ddl(&rule),
+            Err(MaterializedViewError::InvalidRule(_))
+        ));
+    }
+
+    // --- DDL field-name validation (risk_entity injection guard) ---
 
     #[test]
-    fn test_validate_ddl_field_name_accepts_udm_fields() {
+    fn test_validate_ddl_field_name_accepts_udm_and_ext() {
         assert!(validate_ddl_field_name("src_ip").is_ok());
-        assert!(validate_ddl_field_name("dest_ip").is_ok());
-        assert!(validate_ddl_field_name("user").is_ok());
-        assert!(validate_ddl_field_name("src_host").is_ok());
         assert!(validate_ddl_field_name("process_name").is_ok());
-    }
-
-    #[test]
-    fn test_validate_ddl_field_name_accepts_ext_fields() {
         assert!(validate_ddl_field_name("ext.custom_field").is_ok());
-        assert!(validate_ddl_field_name("ext.my_app_status").is_ok());
     }
 
     #[test]
-    fn test_validate_ddl_field_name_rejects_sql_injection() {
-        // The specific attack vector from the issue
+    fn test_validate_ddl_field_name_rejects_injection_and_unknown() {
         assert!(validate_ddl_field_name("concat(currentDatabase(), ':', version())").is_err());
-        // Other injection attempts
         assert!(validate_ddl_field_name("1; DROP TABLE logs--").is_err());
         assert!(validate_ddl_field_name("src_ip' OR '1'='1").is_err());
-        assert!(validate_ddl_field_name("toString(now())").is_err());
         assert!(validate_ddl_field_name("").is_err());
-        assert!(validate_ddl_field_name("SRC_IP").is_err()); // uppercase not allowed
-    }
-
-    #[test]
-    fn test_validate_ddl_field_name_rejects_unknown_fields() {
-        // Valid identifier format but not a known UDM field or ext.* field
+        assert!(validate_ddl_field_name("SRC_IP").is_err());
         assert!(validate_ddl_field_name("not_a_real_field").is_err());
-        assert!(validate_ddl_field_name("ext.").is_err()); // ext. with nothing after
+        assert!(validate_ddl_field_name("ext.").is_err());
     }
 
     #[test]
-    fn test_generate_view_ddl_rejects_malicious_risk_entity_field() {
+    fn test_rejects_malicious_risk_entity_field() {
         let mut rule = create_test_rule();
         rule.risk_entity_field = Some("concat(currentDatabase(), ':', version())".to_string());
-
         let generator = MaterializedViewGenerator::new(clickhouse::Client::default());
-        let result = generator.generate_view_ddl(&rule);
-
-        assert!(
-            result.is_err(),
-            "Should reject SQL injection in risk_entity_field"
-        );
-        let err = result.unwrap_err();
-        match err {
-            MaterializedViewError::InvalidRule(msg) => {
-                assert!(
-                    msg.contains("concat"),
-                    "Error should mention the invalid field: {}",
-                    msg
-                );
-            }
-            e => panic!("Expected InvalidRule error, got: {:?}", e),
+        match generator.generate_view_ddl(&rule) {
+            Err(MaterializedViewError::InvalidRule(msg)) => assert!(msg.contains("concat")),
+            other => panic!("expected InvalidRule, got {other:?}"),
         }
     }
 }
+

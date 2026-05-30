@@ -42,6 +42,7 @@ impl ParserRepository {
                 source_config, parser_vrl, output_fields,
                 credential_id, dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
+                kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 created_at, updated_at
             FROM log_sources
             ORDER BY name
@@ -61,6 +62,7 @@ impl ParserRepository {
                 source_config, parser_vrl, output_fields,
                 credential_id, dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
+                kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 created_at, updated_at
             FROM log_sources
             WHERE enabled = true
@@ -81,6 +83,7 @@ impl ParserRepository {
                 source_config, parser_vrl, output_fields,
                 credential_id, dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
+                kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 created_at, updated_at
             FROM log_sources
             WHERE id = $1
@@ -102,6 +105,7 @@ impl ParserRepository {
                 source_config, parser_vrl, output_fields,
                 credential_id, dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
+                kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 created_at, updated_at
             FROM log_sources
             WHERE name = $1
@@ -135,6 +139,7 @@ impl ParserRepository {
                 source_config, parser_vrl, output_fields,
                 credential_id, dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
+                kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 created_at, updated_at
             "#
         )
@@ -192,6 +197,7 @@ impl ParserRepository {
                 source_config, parser_vrl, output_fields,
                 credential_id, dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
+                kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 created_at, updated_at
             "#,
         )
@@ -240,6 +246,7 @@ impl ParserRepository {
                 source_config, parser_vrl, output_fields,
                 credential_id, dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
+                kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 created_at, updated_at
             "#,
         )
@@ -262,6 +269,7 @@ impl ParserRepository {
                 source_config, parser_vrl, output_fields,
                 credential_id, dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
+                kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 created_at, updated_at
             "#,
         )
@@ -283,6 +291,7 @@ impl ParserRepository {
                 source_config, parser_vrl, output_fields,
                 credential_id, dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
+                kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 created_at, updated_at
             "#,
         )
@@ -379,6 +388,7 @@ impl ParserRepository {
                 source_config, parser_vrl, output_fields,
                 credential_id, dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
+                kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 created_at, updated_at
             "#,
         )
@@ -409,6 +419,7 @@ impl ParserRepository {
                 source_config, parser_vrl, output_fields,
                 credential_id, dispatch_source_config_id, enabled, validated, validation_error,
                 namespace, timezone, match_values, category, vendor, product,
+                kind, enrich_kind, enrich_source, target_table, normalize_vrl,
                 created_at, updated_at
             "#,
         )
@@ -551,6 +562,14 @@ fn row_to_parser(row: &sqlx::postgres::PgRow) -> Parser {
         category: row.get("category"),
         vendor: row.get("vendor"),
         product: row.get("product"),
+        // NAN-1149: try_get so rows predating migration 198 still load as logs.
+        kind: row
+            .try_get("kind")
+            .unwrap_or_else(|_| "log".to_string()),
+        enrich_kind: row.try_get("enrich_kind").unwrap_or(None),
+        enrich_source: row.try_get("enrich_source").unwrap_or(None),
+        target_table: row.try_get("target_table").unwrap_or(None),
+        normalize_vrl: row.try_get("normalize_vrl").unwrap_or(None),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
@@ -912,6 +931,11 @@ mod tests {
             category: None,
             vendor: None,
             product: None,
+            kind: "log".to_string(),
+            enrich_kind: None,
+            enrich_source: None,
+            target_table: None,
+            normalize_vrl: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

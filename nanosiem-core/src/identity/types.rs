@@ -104,6 +104,9 @@ pub struct IdentityProvider {
     pub last_sync_error: Option<String>,
     pub last_sync_duration_ms: Option<i64>,
     pub user_count: Option<i32>,
+    /// NAN-1124: users soft-deleted by mark-absent / the reconcile job for this provider.
+    #[sqlx(default)]
+    pub deprovisioned_count: Option<i64>,
     #[serde(skip_serializing)]
     pub delta_link: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -140,6 +143,7 @@ pub struct IdentityProviderSummary {
     pub last_sync_error: Option<String>,
     pub last_sync_duration_ms: Option<i64>,
     pub user_count: Option<i32>,
+    pub deprovisioned_count: Option<i64>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -158,6 +162,7 @@ impl From<IdentityProvider> for IdentityProviderSummary {
             last_sync_error: p.last_sync_error,
             last_sync_duration_ms: p.last_sync_duration_ms,
             user_count: p.user_count,
+            deprovisioned_count: p.deprovisioned_count,
             created_at: p.created_at,
             updated_at: p.updated_at,
         }
@@ -197,10 +202,19 @@ pub struct UpdateIdentityProviderCredentials {
 // User Record (database row)
 // =============================================================================
 
-/// A unified user record from any identity provider
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, utoipa::ToSchema)]
+/// A unified user record from any identity provider.
+///
+/// NAN-1117: the `user_registry` payload moved from a PG OLTP table to a CH
+/// ReplacingMergeTree. CH has no BIGSERIAL, so the synthetic `id: i64` is
+/// replaced by a stable composite string key `"{provider_id}|{external_id}"`
+/// (see [`UserRecord::composite_id`]) — this is the value `GET
+/// /api/identity/users/{id}` now takes. CH also has no row triggers, so
+/// `created_at` is dropped and `updated_at` is derived from `last_synced_at`.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UserRecord {
-    pub id: i64,
+    /// Stable composite key `"{provider_id}|{external_id}"` (replaces the old
+    /// BIGSERIAL id). Used as the path param for GET /api/identity/users/{id}.
+    pub id: String,
     pub provider_id: String,
     pub external_id: String,
     pub username: Option<String>,
@@ -228,8 +242,104 @@ pub struct UserRecord {
     pub employee_type: Option<String>,
     pub last_synced_at: Option<DateTime<Utc>>,
     pub sync_hash: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
+    /// Derived from `last_synced_at` (CH has no PG `updated_at` trigger).
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+impl UserRecord {
+    /// Build the stable composite id from its parts.
+    pub fn composite_id(provider_id: &str, external_id: &str) -> String {
+        format!("{provider_id}|{external_id}")
+    }
+
+    /// Split a composite id back into (provider_id, external_id). Returns None
+    /// if the id is not in the expected `provider|external` shape.
+    pub fn split_composite_id(id: &str) -> Option<(&str, &str)> {
+        id.split_once('|')
+    }
+}
+
+/// ClickHouse row for `nanosiem.user_registry`. Deserialized via the
+/// `clickhouse` crate (RowBinary), then mapped into [`UserRecord`]. Non-nullable
+/// CH columns deserialize into plain (non-Option) Rust types; empty strings map
+/// back to None in the API shape to preserve the prior PG nullability contract.
+#[derive(Debug, Clone, clickhouse::Row, Deserialize)]
+pub struct UserRegistryRow {
+    pub provider_id: String,
+    pub external_id: String,
+    pub username: String,
+    pub upn: String,
+    pub email: String,
+    pub display_name: String,
+    pub first_name: String,
+    pub last_name: String,
+    pub department: String,
+    pub title: String,
+    pub manager_upn: String,
+    pub manager_display_name: String,
+    pub company: String,
+    pub office_location: String,
+    pub city: String,
+    pub country: String,
+    pub groups: Vec<String>,
+    pub account_enabled: u8,
+    pub account_status: String,
+    pub mfa_enabled: u8,
+    /// Unix-ms epoch (CH DateTime64(3)); 0 = unset.
+    pub last_sign_in_at: i64,
+    pub created_in_directory_at: i64,
+    pub phone: String,
+    pub employee_id: String,
+    pub employee_type: String,
+    pub sync_hash: String,
+    pub last_synced_at: i64,
+    pub version: u64,
+}
+
+impl From<UserRegistryRow> for UserRecord {
+    fn from(r: UserRegistryRow) -> Self {
+        let opt = |s: String| if s.is_empty() { None } else { Some(s) };
+        // CH DateTime64(3) values arrive as ms-epoch i64; 0 means unset.
+        let opt_ts = |ms: i64| -> Option<DateTime<Utc>> {
+            if ms == 0 {
+                None
+            } else {
+                DateTime::<Utc>::from_timestamp_millis(ms)
+            }
+        };
+        let id = UserRecord::composite_id(&r.provider_id, &r.external_id);
+        UserRecord {
+            id,
+            provider_id: r.provider_id,
+            external_id: r.external_id,
+            username: opt(r.username),
+            upn: opt(r.upn),
+            email: opt(r.email),
+            display_name: opt(r.display_name),
+            first_name: opt(r.first_name),
+            last_name: opt(r.last_name),
+            department: opt(r.department),
+            title: opt(r.title),
+            manager_upn: opt(r.manager_upn),
+            manager_display_name: opt(r.manager_display_name),
+            company: opt(r.company),
+            office_location: opt(r.office_location),
+            city: opt(r.city),
+            country: opt(r.country),
+            groups: Some(r.groups),
+            account_enabled: Some(r.account_enabled != 0),
+            account_status: opt(r.account_status),
+            mfa_enabled: Some(r.mfa_enabled != 0),
+            last_sign_in_at: opt_ts(r.last_sign_in_at),
+            created_in_directory_at: opt_ts(r.created_in_directory_at),
+            phone: opt(r.phone),
+            employee_id: opt(r.employee_id),
+            employee_type: opt(r.employee_type),
+            last_synced_at: opt_ts(r.last_synced_at),
+            sync_hash: opt(r.sync_hash),
+            updated_at: opt_ts(r.last_synced_at),
+        }
+    }
 }
 
 /// Fields written during a sync operation (no auto-generated IDs/timestamps)
@@ -279,10 +389,11 @@ pub struct IdentitySyncResult {
     pub is_delta: bool,
 }
 
-/// Result from a delta sync operation
+/// Result from a delta sync operation.
+/// NAN-1151: `users` are RAW provider objects emitted onto the enrichment lane.
 #[derive(Debug, Clone)]
 pub struct DeltaSyncResult {
-    pub users: Vec<UserRecordUpsert>,
+    pub users: Vec<serde_json::Value>,
     pub new_delta_link: Option<String>,
 }
 
@@ -360,82 +471,12 @@ pub struct ActiveDirectoryCredentials {
     pub collector_token: String,
 }
 
-// =============================================================================
-// Push Request (for AD collector)
-// =============================================================================
-
-/// Request body for pushing users from an AD collector
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct PushUsersRequest {
-    pub users: Vec<PushUserRecord>,
-}
-
-/// A single user record pushed from an AD collector
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct PushUserRecord {
-    pub external_id: String,
-    pub username: Option<String>,
-    pub upn: Option<String>,
-    pub email: Option<String>,
-    pub display_name: Option<String>,
-    pub first_name: Option<String>,
-    pub last_name: Option<String>,
-    pub department: Option<String>,
-    pub title: Option<String>,
-    pub manager_upn: Option<String>,
-    pub manager_display_name: Option<String>,
-    pub company: Option<String>,
-    pub office_location: Option<String>,
-    pub city: Option<String>,
-    pub country: Option<String>,
-    pub groups: Option<Vec<String>>,
-    pub account_enabled: Option<bool>,
-    pub mfa_enabled: Option<bool>,
-    pub phone: Option<String>,
-    pub employee_id: Option<String>,
-    pub employee_type: Option<String>,
-}
-
-impl PushUserRecord {
-    /// Convert to a UserRecordUpsert with sync_hash
-    pub fn into_upsert(self) -> UserRecordUpsert {
-        use sha2::{Digest, Sha256};
-        let raw = serde_json::to_string(&self).unwrap_or_default();
-        let hash = hex::encode(Sha256::digest(raw.as_bytes()));
-
-        UserRecordUpsert {
-            external_id: self.external_id,
-            username: self.username,
-            upn: self.upn,
-            email: self.email,
-            display_name: self.display_name,
-            first_name: self.first_name,
-            last_name: self.last_name,
-            department: self.department,
-            title: self.title,
-            manager_upn: self.manager_upn,
-            manager_display_name: self.manager_display_name,
-            company: self.company,
-            office_location: self.office_location,
-            city: self.city,
-            country: self.country,
-            groups: self.groups.unwrap_or_default(),
-            account_enabled: self.account_enabled.unwrap_or(true),
-            account_status: if self.account_enabled.unwrap_or(true) {
-                "active".into()
-            } else {
-                "disabled".into()
-            },
-            mfa_enabled: self.mfa_enabled,
-            last_sign_in_at: None,
-            created_in_directory_at: None,
-            phone: self.phone,
-            employee_id: self.employee_id,
-            employee_type: self.employee_type,
-            sync_hash: hash,
-        }
-    }
-}
+// NAN-1151 (3d): `PushUsersRequest` / `PushUserRecord` (the AD /push request
+// types) and `into_upsert` (the hard-coded AD→user_registry field map) are all
+// gone. AD identity now flows through the nano_enrich lane like every other
+// source — the external collector POSTs nano_enrich records and the
+// repo-sourced `enrichments/identity/ad` VRL maps them. No hard-coded identity
+// mapping or in-app AD ingestion path remains anywhere in core.
 
 // =============================================================================
 // User list query params

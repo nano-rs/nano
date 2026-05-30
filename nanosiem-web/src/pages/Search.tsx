@@ -1932,18 +1932,20 @@ export function Search() {
   }, [handleTablePageChange]);
 
   // Fetch full log data on row expand (table_view mode)
-  // Uses narrow time window around event timestamp for efficient partition pruning
-  const fetchLog = useCallback(async (logId: string, eventTimestamp: Date): Promise<Record<string, unknown> | null> => {
+  // Uses narrow time window around event timestamp for efficient partition pruning.
+  // NAN-1032: sourceType lets ClickHouse use the (source_type, timestamp, ...) PK
+  // for a tight range read — without it, S3-backed historical lookups take 12–60s.
+  const fetchLog = useCallback(async (logId: string, eventTimestamp: Date, sourceType?: string): Promise<Record<string, unknown> | null> => {
     try {
       // Create a 2-second window around the event timestamp for efficient lookup
       // This narrows the query to a single partition instead of the full search range
       const start = new Date(eventTimestamp.getTime() - 1000);
       const end = new Date(eventTimestamp.getTime() + 1000);
       const narrowTimeRange = { start: start.toISOString(), end: end.toISOString() };
-      const response = await api.fetchLog(logId, narrowTimeRange);
+      const response = await api.fetchLog(logId, narrowTimeRange, sourceType);
       if (response.event) return response.event;
       // Narrow time window missed — retry without time range constraint
-      const fallback = await api.fetchLog(logId);
+      const fallback = await api.fetchLog(logId, undefined, sourceType);
       return fallback.event;
     } catch (error) {
       console.error('Failed to fetch log:', error);
@@ -2229,13 +2231,27 @@ export function Search() {
     // Fields to exclude from drilldown filters
     // - timestamp: already constrained by time range picker, exact string match is fragile
     // - bytes_out/bytes_in: numeric fields that shouldn't be exact-matched
-    // - _identityClause: handled separately as a raw query fragment
-    const excludeFromDrilldown = new Set(['timestamp', 'bytes_out', 'bytes_in', 'bytes', 'duration', 'response_time', '_identityClause', '_tableCommand']);
+    // - _identityClause / _tableCommand / _timeRangeOverride: handled separately
+    const excludeFromDrilldown = new Set([
+      'timestamp', 'bytes_out', 'bytes_in', 'bytes', 'duration', 'response_time',
+      '_identityClause', '_tableCommand', '_timeRangeOverride',
+    ]);
 
     // Check for identity clause (pre-built OR expression from asset view)
     const identityClause = filters._identityClause as string | undefined;
     // Check for table command (pre-built | table from asset view drilldown)
     const tableCommand = filters._tableCommand as string | undefined;
+    // Check for time-range override (per-bucket timeline drill — NAN-1050)
+    const timeRangeOverride = filters._timeRangeOverride as
+      | { start: string; end: string }
+      | undefined;
+    const overrideTimeRange: TimeRangeValue | null = timeRangeOverride
+      ? {
+          type: 'custom',
+          start: new Date(timeRangeOverride.start),
+          end: new Date(timeRangeOverride.end),
+        }
+      : null;
 
     // Build filter clauses from the row's grouping fields
     const filterClauses = Object.entries(filters)
@@ -2277,6 +2293,12 @@ export function Search() {
     // Update query and force re-search
     setQuery(newQuery);
     setQueryMode('piped');
+    // Narrow the time picker to the bucket window when drilling from the
+    // timeline (NAN-1050). The user sees their narrowed range and can widen
+    // back out from the time picker.
+    if (overrideTimeRange) {
+      setTimeRange(overrideTimeRange);
+    }
     const isAggregate = checkIfAggregateQuery(newQuery);
     setIsAggregateQuery(isAggregate);
     if (!isAggregate) {
@@ -2286,7 +2308,7 @@ export function Search() {
     setTablePage(0); // Reset pagination
     setSearchResults([]); // Clear current results
     setServerFieldStats(null); // Clear server field stats
-    
+
     // Use a ref to track the new query and trigger search
     setTimeout(() => {
       // Manually trigger search with the new query
@@ -2295,14 +2317,19 @@ export function Search() {
         setIsSearching(true);
         // Don't clear histogram here - keep showing previous data while loading
         setCurrentPage(1);
-        
+
+        // Effective range for this drilldown — the override wins over the
+        // (just-updated) state because React state updates are async and we
+        // need the bucket window in this synchronous closure.
+        const effectiveTimeRange = overrideTimeRange ?? timeRange;
+
         // Update URL and add to search history
-        updateUrl(newQuery, 'piped', timeRange, undefined, true);
-        addToSearchHistory({ query: newQuery, queryMode: 'piped', timeRange });
+        updateUrl(newQuery, 'piped', effectiveTimeRange, undefined, true);
+        addToSearchHistory({ query: newQuery, queryMode: 'piped', timeRange: effectiveTimeRange });
         refreshHistory();
-        
+
         try {
-          const apiTimeRange = toApiTimeRange(timeRange);
+          const apiTimeRange = toApiTimeRange(effectiveTimeRange);
           // Strip comments from query before sending to API
           const cleanQuery = stripComments(newQuery);
           const response = await search({ query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset: 0 });
@@ -3995,7 +4022,7 @@ export function Search() {
                     hasSearched={hasSearched}
                     isAggregateQuery={isAggregateQuery}
                     displayType={displayType}
-                    histogramHasData={histogramData && histogramData.length > 0}
+                    histogramHasData={histogramData?.some((b) => b.count > 0) ?? false}
                     query={query}
                     executedQuery={executedQuery}
                     onAddToQuery={addToQuery}
@@ -4015,7 +4042,7 @@ export function Search() {
                     onFetchLog={fetchLog}
                     columnOrder={columnOrder}
                     assetPrevalenceFilter={assetPrevalenceFilter}
-                    timeRange={toApiTimeRange(timeRange)}
+                    timeRange={apiTimeRange}
                     melodEnabled={melodStatus?.connected || false}
                     onSummarize={() => setAnalyzeActive(true)}
                     asyncJobId={asyncJobId}

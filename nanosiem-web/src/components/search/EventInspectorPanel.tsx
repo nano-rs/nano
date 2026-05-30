@@ -103,7 +103,7 @@ function flattenFields(fields: Record<string, unknown>, prefix = ''): [string, u
     if (fieldName === 'risk_score' || fieldName === 'risk_entity' ||
         fieldName === 'risk_factors' || fieldName.startsWith('risk_')) return 1;
     if (fieldName.startsWith('ioc_')) return 2;
-    if (fieldName.startsWith('identity_') || fieldName === 'is_nat_candidate') return 3;
+    if (fieldName.includes('_identity_') || fieldName.startsWith('identity_') || fieldName === 'is_nat_candidate') return 3;
     if (fieldName.startsWith('prevalence_') || fieldName === '_prevalence' ||
         fieldName.startsWith('_prevalence.') || fieldName === 'host_count' ||
         fieldName === 'is_rare' || fieldName === 'prevalence_score' ||
@@ -155,13 +155,17 @@ function isLookupField(fieldName: string): boolean {
 }
 
 function isIdentityField(fieldName: string): boolean {
-  return fieldName.startsWith('identity_') || fieldName === 'is_nat_candidate';
+  // Resolved-identity dict fills are named `user_identity_*`, `src_user_identity_*`,
+  // `dest_user_identity_*` (NAN-1147). The legacy `identity_*` / `is_nat_candidate`
+  // forms are kept for back-compat. NAN-1154.
+  return fieldName.includes('_identity_') || fieldName.startsWith('identity_') ||
+         fieldName === 'is_nat_candidate';
 }
 
 function isExtField(fieldName: string): boolean {
   return !UDM_COLUMNS.has(fieldName) && !fieldName.startsWith('enriched_') &&
          !fieldName.startsWith('ioc_') && !fieldName.startsWith('lookup_') &&
-         !fieldName.startsWith('metadata_') && !fieldName.startsWith('identity_') &&
+         !fieldName.startsWith('metadata_') && !fieldName.includes('_identity_') && !fieldName.startsWith('identity_') &&
          !fieldName.startsWith('prevalence_') && !fieldName.startsWith('_prevalence') &&
          !fieldName.startsWith('risk_') && fieldName !== 'is_nat_candidate';
 }
@@ -173,7 +177,7 @@ const ENRICHMENT_CATEGORIES: Record<string, (k: string) => boolean> = {
   prevalence: (k) => isPrevalenceField(k),
   lookup: (k) => k.startsWith('lookup_') && !k.startsWith('lookup_custom_'),
   geo: (k) => k.startsWith('enriched_'),
-  identity: (k) => k.startsWith('identity_') || k === 'is_nat_candidate',
+  identity: (k) => k.includes('_identity_') || k.startsWith('identity_') || k === 'is_nat_candidate',
   metadata: (k) => k.startsWith('metadata_'),
 };
 
@@ -350,7 +354,7 @@ export function EventInspectorPanel({
       { label: 'Core', color: NEUTRAL, tooltip: 'Indexed UDM columns with bloom filters for fast search', fields: [] },
       { label: 'Risk', color: ACCENT, tooltip: 'Risk scores and factors from detection rules', fields: [] },
       { label: 'IOC', color: ACCENT, tooltip: 'Indicators of compromise from threat intelligence feeds', fields: [] },
-      { label: 'Identity', color: ACCENT, tooltip: 'Identity resolution fields (NAT detection, user mapping)', fields: [] },
+      { label: 'Identity', color: ACCENT, tooltip: 'Resolved identity from the user registry (department, title, groups, account status)', fields: [] },
       { label: 'Prevalence', color: ACCENT, tooltip: 'Rarity metrics — how common this artifact is across your environment', fields: [] },
       { label: 'Lookup', color: ACCENT, tooltip: 'Enrichments from lookup tables', fields: [] },
       { label: 'Enrichment', color: ACCENT, tooltip: 'Auto-enriched fields (geo, ASN, reputation)', fields: [] },

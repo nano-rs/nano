@@ -302,6 +302,10 @@ pub struct KafkaCredentials {
     pub tls_ca_cert: Option<String>,
 }
 
+fn default_parser_kind() -> String {
+    "log".to_string()
+}
+
 /// A parser definition
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Parser {
@@ -346,6 +350,26 @@ pub struct Parser {
     pub vendor: Option<String>,
     /// Product name (e.g., "Windows Event Log", "Firewall")
     pub product: Option<String>,
+    /// NAN-1149: parser flavor. "log" (default) = a normal log-source parser;
+    /// "enrichment" = a push-enrichment normalizer that carries `normalize_vrl`
+    /// + `enrich_kind`/`enrich_source`/`target_table` instead of routing a
+    /// `source_type`. The Vector config generator splits on this.
+    #[serde(default = "default_parser_kind")]
+    pub kind: String,
+    /// Enrichment kind (identity | ip_context | asset | ioc); set when kind = "enrichment".
+    #[serde(default)]
+    pub enrich_kind: Option<String>,
+    /// Per-source discriminator the enrichment lane routes `.source` by
+    /// (e.g. "ad", "entra"); emitted as `enrichment_normalize_<enrich_source>`.
+    #[serde(default)]
+    pub enrich_source: Option<String>,
+    /// Target ClickHouse table the enrichment writes (e.g. "user_registry").
+    #[serde(default)]
+    pub target_table: Option<String>,
+    /// Per-source normalize VRL for enrichment parsers — the remap body emitted
+    /// as `[transforms.enrichment_normalize_<enrich_source>]` (NAN-1149).
+    #[serde(default)]
+    pub normalize_vrl: Option<String>,
     /// Network namespace for identity resolution (from log_sources)
     pub namespace: String,
     /// IANA timezone for timestamps without offset info (e.g., "America/New_York")

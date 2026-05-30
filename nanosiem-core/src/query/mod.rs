@@ -18,6 +18,7 @@ pub mod validation;
 
 pub use ast::*;
 pub(crate) use clickhouse_sql_gen::is_explicit_column;
+pub(crate) use clickhouse_sql_gen::MATERIALIZED_COLUMNS;
 pub use clickhouse_sql_gen::{ClickHouseSqlGenerator, QueryOptions};
 pub use parser::{parse_query, ParseError};
 pub use pretty_print::PrettyPrint;

@@ -152,7 +152,12 @@ const ParserRepositories = lazyWithRetryNamed(() => import('@/pages/ParserReposi
 // ============================================================================
 const OnboardingWizard = lazyWithRetryNamed(() => import('@/pages/OnboardingWizard'), 'OnboardingWizard');
 const EntityPage = lazyWithRetryNamed(() => import('@/enterprise/pages/EntityPage'), 'EntityPage');
-const Cases = lazyWithRetryNamed(() => import('@/enterprise/pages/Cases'), 'Cases');
+// NAN-1070: Cases.tsx is no longer routed — /cases redirects to /inbox.
+// The module is kept in the tree so we can revive if needed.
+// NAN-1071: Case search — cross-cutting query surface under the Cases nav.
+// `CaseSearch.tsx` ships only a default export, so use the plain
+// `lazyWithRetry` here. (NAN-1071 originally used the named variant.)
+const CaseSearch = lazyWithRetry(() => import('@/enterprise/pages/CaseSearch'));
 // NAN-443: Playbooks library (read-only surface)
 const Playbooks = lazyWithRetryNamed(() => import('@/enterprise/pages/Playbooks'), 'Playbooks');
 // NAN-444: Playbook authoring wizard (three-phase: Start / Build / Review)
@@ -161,7 +166,10 @@ const PlaybookNew = lazyWithRetryNamed(() => import('@/enterprise/pages/Playbook
 const PlaybookRepositories = lazyWithRetryNamed(() => import('@/enterprise/pages/PlaybookRepositories'), 'PlaybookRepositories');
 const Marketplace = lazyWithRetryNamed(() => import('@/pages/Marketplace'), 'Marketplace');
 const EnrichmentDetail = lazyWithRetryNamed(() => import('@/pages/Settings/EnrichmentDetail'), 'EnrichmentDetail');
-const AgentEnrichmentDetail = lazyWithRetryNamed(() => import('@/enterprise/pages/AgentEnrichmentDetail'), 'AgentEnrichmentDetail');
+// NAN-1111: AgentEnrichmentDetail (and the only provider it dispatched,
+// VirusTotal) sunset to the marketplace path; the route is now handled by
+// LegacyAgentEnrichmentRedirect below. The lazy import is intentionally
+// removed alongside the deletion of the file.
 const Credentials = lazyWithRetryNamed(() => import('@/pages/Credentials'), 'Credentials');
 // NAN-998: Upload.tsx is a default export — must use lazyWithRetry, not the
 // Named variant. Previously crashed with React error #306 on /upload because
@@ -317,6 +325,71 @@ function RuleRedirect() {
 function SsoEditRedirect() {
   const { id } = useParams();
   return <Navigate to={`/settings/access-control?tab=sso&provider=${encodeURIComponent(id ?? '')}`} replace />;
+}
+
+// NAN-1111: the legacy /enrichments/:id deep-link used to render
+// pre-marketplace per-provider Settings UIs. ThreatFox + Tor moved to
+// the marketplace; IPinfo Lite stays native (binary-volume + non-IOC
+// schema — see project_ipinfo_lite_stays_native memory). Map the legacy
+// IDs to marketplace slugs and redirect; pass the IPinfo path through
+// to the still-active EnrichmentDetail component.
+const LEGACY_ENRICHMENT_TO_MARKETPLACE: Record<string, string> = {
+  threatfox: 'threatfox',
+  tor: 'tor-exit-nodes',
+  tor_exit_nodes: 'tor-exit-nodes',
+};
+
+function LegacyEnrichmentRoute() {
+  const { id } = useParams();
+  if (id && LEGACY_ENRICHMENT_TO_MARKETPLACE[id]) {
+    // Pure redirect: do NOT gate behind enrichments:view. A user with
+    // marketplace permission but no legacy enrichments permission still
+    // deserves to follow an old bookmark; the marketplace route enforces
+    // its own permission downstream.
+    return (
+      <Navigate
+        to={`/marketplace?slug=${encodeURIComponent(LEGACY_ENRICHMENT_TO_MARKETPLACE[id])}`}
+        replace
+      />
+    );
+  }
+  // IPinfo Lite and any other still-native source render the legacy
+  // Settings detail page, gated by enrichments:view. EnrichmentDetail
+  // itself shows a "not available" fallback for unknown source types so
+  // unknown IDs don't 500.
+  return (
+    <PermissionRoute
+      permission="enrichments:view"
+      element={
+        <Suspense fallback={<DetailPageLoadingFallback />}>
+          <EnrichmentDetail />
+        </Suspense>
+      }
+    />
+  );
+}
+
+// NAN-1111: the agent-enrichment deep-link only ever dispatched
+// VirusTotal, which is now a marketplace agent enrichment. Map and
+// redirect; the AgentEnrichmentDetail component itself was deleted.
+const LEGACY_AGENT_ENRICHMENT_TO_MARKETPLACE: Record<string, string> = {
+  virustotal: 'virustotal',
+};
+
+function LegacyAgentEnrichmentRoute() {
+  const { id } = useParams();
+  const slug = id ? LEGACY_AGENT_ENRICHMENT_TO_MARKETPLACE[id] : undefined;
+  // Unknown IDs fall back to the catalog grid rather than 404. This
+  // wrapper is pure `<Navigate>` — no stateful child — which is why it
+  // doesn't take `key={resetKey}` like LegacyEnrichmentRoute does. The
+  // route below intentionally omits PermissionRoute for the same reason
+  // as LegacyEnrichmentRoute's redirect branch: don't gate a redirect.
+  return (
+    <Navigate
+      to={slug ? `/marketplace?slug=${encodeURIComponent(slug)}` : '/marketplace'}
+      replace
+    />
+  );
 }
 
 // Redirect to user's preferred landing page (or onboarding for first-time users)
@@ -572,13 +645,21 @@ function ProtectedAppRoutes() {
               </Suspense>
             } />
           } />
-          <Route path="/cases" element={
+          {/* NAN-1071: Case search — cross-cutting query surface. Must
+              come before the /cases redirect so /cases/search matches first. */}
+          <Route path="/cases/search" element={
             <PermissionRoute permission="cases:view" element={
               <Suspense fallback={<ListPageLoadingFallback />}>
-                <Cases key={resetKey} />
+                <CaseSearch key={resetKey} />
               </Suspense>
             } />
           } />
+          {/* NAN-1070: /cases is redundant with the inbox — the All tab on
+              SignalInbox covers full case browsing now. Redirect rather
+              than route to <Cases /> so deep-linked references migrate
+              automatically. Cases.tsx stays in the tree for the moment so
+              we can revive if something turns out to need it. */}
+          <Route path="/cases" element={<Navigate to="/inbox" replace />} />
           {/* NAN-443: Playbooks library (Phase 2 — read-only) */}
           <Route path="/playbooks" element={
             <PermissionRoute permission="playbooks:view" element={
@@ -650,24 +731,21 @@ function ProtectedAppRoutes() {
               </Suspense>
             } />
           } />
-          {/* Legacy /enrichments → /marketplace; deep-link routes (/enrichments/:id, /enrichments/agent/:id, /enrichments/custom/*) preserved below. */}
+          {/* Legacy /enrichments → /marketplace. Deep-link routes
+              (/enrichments/:id, /enrichments/agent/:id, /enrichments/custom/*)
+              preserved below; the :id and /agent/:id routes now redirect
+              sunset providers to the marketplace drawer and only IPinfo
+              Lite continues to render the legacy Settings UI (NAN-1111). */}
           <Route path="/enrichments" element={<Navigate to="/marketplace" replace />} />
-          <Route path="/enrichments/:id" element={
-            <PermissionRoute permission="enrichments:view" element={
-              <Suspense fallback={<DetailPageLoadingFallback />}>
-                <EnrichmentDetail key={resetKey} />
-              </Suspense>
-            } />
-          } />
+          {/* LegacyEnrichmentRoute handles the permission check itself:
+              the IPinfo pass-through path is gated by enrichments:view,
+              but the redirect branch deliberately is not (see comment
+              in the wrapper). */}
+          <Route path="/enrichments/:id" element={<LegacyEnrichmentRoute key={resetKey} />} />
 
-          {/* Agent Enrichments */}
-          <Route path="/enrichments/agent/:id" element={
-            <PermissionRoute permission="enrichments:view" element={
-              <Suspense fallback={<DetailPageLoadingFallback />}>
-                <AgentEnrichmentDetail key={resetKey} />
-              </Suspense>
-            } />
-          } />
+          {/* Agent Enrichments — VirusTotal redirects to marketplace (NAN-1111).
+              Pure redirect; no permission gate (marketplace enforces its own). */}
+          <Route path="/enrichments/agent/:id" element={<LegacyAgentEnrichmentRoute />} />
 
           {/* Custom Enrichments */}
           <Route path="/enrichments/custom/new" element={

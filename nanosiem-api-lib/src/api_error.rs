@@ -597,6 +597,9 @@ impl From<nanosiem_core::identity::IdentityServiceError> for ApiError {
             IdentityServiceError::Repository(IdentityRepositoryError::DatabaseError(e)) => {
                 ApiError::DatabaseError(e.to_string())
             }
+            IdentityServiceError::Repository(IdentityRepositoryError::ClickHouse(e)) => {
+                ApiError::DatabaseError(format!("ClickHouse error: {}", e))
+            }
             IdentityServiceError::Sync(e) => ApiError::InternalError(format!("Sync error: {}", e)),
         }
     }

@@ -9,6 +9,9 @@ interface AssetActivityTimelineProps {
   spanLabel: string;
   /** Optional markers — rendered as pills above the grid (unused until we derive them). */
   markers?: { label: string; severity: 'critical' | 'warn' }[];
+  /** Click a non-empty cell to drill into events for that lane. Bucket index
+   *  is passed for future per-bucket time-range narrowing. */
+  onCellClick?: (lane: string, bucketIdx: number) => void;
 }
 
 const LANE_LABELS: Record<string, string> = {
@@ -23,6 +26,7 @@ export function AssetActivityTimeline({
   timeline,
   spanLabel,
   markers = [],
+  onCellClick,
 }: AssetActivityTimelineProps) {
   const { buckets, lanes, points } = timeline;
   // Build lane × bucket → weight lookup
@@ -62,9 +66,11 @@ export function AssetActivityTimeline({
             </span>
           ))}
         </div>
-        <div className="text-[10.5px] text-muted-foreground/70 font-mono">
-          hover cells to drill in
-        </div>
+        {onCellClick && (
+          <div className="text-[10.5px] text-muted-foreground/70 font-mono">
+            click cells to drill in
+          </div>
+        )}
       </div>
 
       <div className="flex">
@@ -97,12 +103,30 @@ export function AssetActivityTimeline({
                   : w === 2
                   ? 'oklch(72% 0.14 240)'
                   : 'oklch(75% 0.18 240)';
+                const lane = lanes[laneIdx];
+                const laneLabel = LANE_LABELS[lane] ?? lane;
+                const isClickable = !!onCellClick && w > 0;
+                const titleText = `${laneLabel} · bucket ${b} · intensity ${w}${isClickable ? ' — click to drill' : ''}`;
+                const baseClass = 'h-[14px] rounded-[2px] transition-colors';
+                if (isClickable) {
+                  return (
+                    <button
+                      key={b}
+                      type="button"
+                      onClick={() => onCellClick(lane, b)}
+                      className={cn(baseClass, 'cursor-pointer hover:outline hover:outline-1 hover:outline-primary focus:outline-none focus-visible:outline focus-visible:outline-1 focus-visible:outline-primary')}
+                      style={{ background: bg, opacity: 0.9 }}
+                      title={titleText}
+                      aria-label={titleText}
+                    />
+                  );
+                }
                 return (
                   <div
                     key={b}
-                    className="h-[14px] rounded-[2px] transition-colors cursor-pointer hover:outline hover:outline-1 hover:outline-primary"
+                    className={cn(baseClass, 'cursor-default')}
                     style={{ background: bg, opacity: w === 0 ? 0.4 : 0.9 }}
-                    title={`${LANE_LABELS[lanes[laneIdx]] ?? lanes[laneIdx]} · bucket ${b} · intensity ${w}`}
+                    title={titleText}
                   />
                 );
               })}

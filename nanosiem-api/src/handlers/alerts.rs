@@ -30,6 +30,21 @@ use crate::{
     state::AppState,
 };
 
+/// Resolve the authenticated user into a stable display string for the
+/// `acknowledged_by` / `closed_by` columns. Looks up the email from the
+/// users table (JWT no longer carries PII — see `handlers/auth.rs:734`
+/// for the same pattern). Falls back to the user UUID if the lookup
+/// fails so we never block the action; the lookup only fails when the
+/// caller's row is mid-delete, which is rare. NAN-1068.
+async fn resolve_actor_display(state: &AppState, user_id: Uuid) -> String {
+    state
+        .user_repo
+        .get_user_by_id(user_id)
+        .await
+        .map(|u| u.email)
+        .unwrap_or_else(|_| user_id.to_string())
+}
+
 /// Recursively remove null, empty strings, and empty arrays/objects from JSON
 fn strip_empty_values(value: serde_json::Value) -> serde_json::Value {
     match value {
@@ -108,16 +123,11 @@ pub struct AlertStreamResponse {
     pub has_more: bool,
 }
 
-/// Request for acknowledging an alert
-#[derive(Debug, Deserialize, utoipa::ToSchema)]
-pub struct AcknowledgeRequest {
-    pub acknowledged_by: String,
-}
-
-/// Request for closing an alert
+/// Request for closing an alert. NAN-1068: the actor (`closed_by`) is
+/// derived server-side from the JWT — only the disposition is supplied
+/// by the client.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CloseRequest {
-    pub closed_by: String,
     pub disposition: Disposition,
 }
 
@@ -127,14 +137,14 @@ pub struct AssignRequest {
     pub assigned_to: String,
 }
 
-/// Request for bulk operations
+/// Request for bulk operations. NAN-1068: the actor is derived
+/// server-side from the JWT.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct BulkRequest {
     #[serde(alias = "alert_ids", with = "nanosiem_core::typeid::alert::vec")]
     #[schema(value_type = Vec<String>)]
     pub ids: Vec<Uuid>,
     pub action: BulkAction,
-    pub user: String,
     pub disposition: Option<Disposition>,
 }
 
@@ -339,7 +349,8 @@ pub async fn get_alert(
     Ok(Json(alert))
 }
 
-/// Acknowledge an alert
+/// Acknowledge an alert. The actor (`acknowledged_by`) is derived
+/// server-side from the JWT — no request body is required (NAN-1068).
 #[utoipa::path(
     post,
     path = "/api/alerts/{id}/acknowledge",
@@ -347,7 +358,6 @@ pub async fn get_alert(
     params(
         ("id" = String, Path, description = "Alert ID")
     ),
-    request_body = AcknowledgeRequest,
     responses(
         (status = 200, description = "Alert acknowledged", body = Alert),
         (status = 403, description = "Forbidden", body = ErrorResponse),
@@ -360,7 +370,6 @@ pub async fn acknowledge_alert(
     Extension(auth): Extension<AuthContext>,
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
-    Json(request): Json<AcknowledgeRequest>,
 ) -> Result<Json<Alert>, ApiError> {
     check_permission(&auth, permissions::ALERTS_ACKNOWLEDGE)
         .map_err(|_| ApiError::Forbidden("Missing permission: alerts:acknowledge".to_string()))?;
@@ -376,9 +385,10 @@ pub async fn acknowledge_alert(
         }
     }
 
+    let actor = resolve_actor_display(&state, auth.user_id()).await;
     let alert = state
         .detection_service
-        .acknowledge_alert(*id, &request.acknowledged_by)
+        .acknowledge_alert(*id, &actor)
         .await?;
 
     state.emit_audit(
@@ -430,9 +440,10 @@ pub async fn close_alert(
         }
     }
 
+    let actor = resolve_actor_display(&state, auth.user_id()).await;
     let alert = state
         .detection_service
-        .close_alert(*id, &request.closed_by, request.disposition)
+        .close_alert(*id, &actor, request.disposition)
         .await?;
 
     state.emit_audit(
@@ -614,11 +625,12 @@ pub async fn bulk_alerts(
         request.ids.clone()
     };
 
+    let actor = resolve_actor_display(&state, auth.user_id()).await;
     let affected = match request.action {
         BulkAction::Acknowledge => {
             state
                 .detection_service
-                .bulk_acknowledge_alerts(&ids, &request.user)
+                .bulk_acknowledge_alerts(&ids, &actor)
                 .await?
         }
         BulkAction::Close => {
@@ -627,7 +639,7 @@ pub async fn bulk_alerts(
             })?;
             state
                 .detection_service
-                .bulk_close_alerts(&ids, &request.user, disposition)
+                .bulk_close_alerts(&ids, &actor, disposition)
                 .await?
         }
     };
@@ -857,7 +869,6 @@ impl utoipa::OpenApi for AlertsApiDoc {
             ),
             components(schemas(
                 AlertStreamResponse,
-                AcknowledgeRequest,
                 CloseRequest,
                 AssignRequest,
                 BulkRequest,

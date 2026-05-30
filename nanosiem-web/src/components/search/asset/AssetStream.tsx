@@ -61,13 +61,16 @@ export function AssetStream({
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const reqRef = useRef(0);
 
-  // Initial fetch
+  // Initial fetch. Deps are intentionally granular: keying on the full
+  // `timeRange` object would re-fire on every parent render that allocates a
+  // new {start, end} reference (see NAN-1054 — Search.tsx had this exact bug),
+  // wiping the event list each pass. We also leave `events`/`data` in place
+  // while a new request is in flight so the panel doesn't blink between
+  // identifier switches — the reqRef guard discards stale responses.
   useEffect(() => {
     if (!timeRange) return;
     const myReq = ++reqRef.current;
     setLoading(true);
-    setEvents([]);
-    setData(null);
 
     const req: AssetEventsRequest = {
       identifier_field: identifierField,
@@ -91,7 +94,7 @@ export function AssetStream({
         if (myReq !== reqRef.current) return;
         setLoading(false);
       });
-  }, [identifierField, identifierValue, identities, timeRange]);
+  }, [identifierField, identifierValue, identities, timeRange?.start, timeRange?.end]);
 
   const loadMore = async () => {
     if (!data || !data.has_more || !timeRange || loadingMore) return;
@@ -416,6 +419,8 @@ function EventDetail({
 
     // 2-second window around the event timestamp keeps the lookup pinned
     // to a single ClickHouse partition. Falls back to no-window on miss.
+    // NAN-1032: pass source_type so the (source_type, timestamp, ...) PK can do a
+    // tight range read — without it, S3-backed historical lookups take 12–60s.
     const ts = parseAsUTC(timestamp);
     const narrow = ts && !Number.isNaN(ts.getTime())
       ? {
@@ -423,13 +428,14 @@ function EventDetail({
           end: new Date(ts.getTime() + 1000).toISOString(),
         }
       : undefined;
+    const sourceType = details?.source_type as string | undefined;
 
     (async () => {
       try {
-        let resp = await api.fetchLog(id, narrow);
+        let resp = await api.fetchLog(id, narrow, sourceType);
         if (!resp.event && narrow) {
           // Narrow window missed — retry without time bound.
-          resp = await api.fetchLog(id);
+          resp = await api.fetchLog(id, undefined, sourceType);
         }
         if (cancelled) return;
         if (resp.event) setFullLog(resp.event);
@@ -444,7 +450,7 @@ function EventDetail({
     return () => {
       cancelled = true;
     };
-  }, [id, timestamp]);
+  }, [id, timestamp, details]);
 
   const source = fullLog ?? details;
   const entries = Object.entries(source).filter(([k, v]) => {
@@ -481,7 +487,7 @@ function EventDetail({
             : 'text-str';
         return (
           <div key={k} className="text-[11px] font-mono flex gap-2">
-            <span className="text-muted-foreground text-right w-[120px] shrink-0">{k}:</span>
+            <span className="text-muted-foreground text-right w-[170px] shrink-0">{k}:</span>
             <span className={`${valueClass} break-all`}>
               {typeof v === 'string' ? v : JSON.stringify(v)}
             </span>
@@ -560,7 +566,18 @@ function classifyEventType(fields: Record<string, unknown>): string {
     return 'DNS';
   }
 
-  if (authResult || sourceType.includes('auth') || action.includes('login') || action.includes('logon')) {
+  const isAuthCategory =
+    category === 'authentication' ||
+    category === 'authorization' ||
+    category === 'account_management' ||
+    category === 'credential_access';
+  if (
+    authResult ||
+    sourceType.includes('auth') ||
+    action.includes('login') ||
+    action.includes('logon') ||
+    isAuthCategory
+  ) {
     if (authResult.includes('fail') || action.includes('fail')) return 'AUTH_FAILURE';
     return 'AUTH_SUCCESS';
   }
@@ -572,13 +589,15 @@ function classifyEventType(fields: Record<string, unknown>): string {
   if (
     action.includes('connection') ||
     sourceType.includes('firewall') ||
-    sourceType.includes('proxy')
+    sourceType.includes('proxy') ||
+    category === 'network' ||
+    category === 'firewall'
   ) {
     return 'NETWORK';
   }
 
   if (processName || action.includes('process') || action.includes('exec')) return 'PROCESS';
-  if (fileAction || action.includes('file')) return 'FILE';
+  if (fileAction || action.includes('file') || category === 'file_access' || category === 'object_access') return 'FILE';
   if (destIp) return 'NETWORK';
   return 'EVENT';
 }

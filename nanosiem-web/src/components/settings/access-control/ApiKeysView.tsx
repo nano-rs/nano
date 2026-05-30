@@ -5,15 +5,14 @@
  *
  * Mirrors `design-ref/shadcn/settings-keys.jsx`:
  *   • Master: 320px filterable key list with status pill, mono prefix, mono "used N ago".
- *   • Detail: header with prefix + created/expires, Rotate / Revoke actions; 4-up
- *     meta; usage card with 14-day sparkline (empty until backend ships call-volume);
- *     scopes chip strip; danger-zone revoke card.
+ *   • Detail: header with prefix + created/expires, Edit / Rotate / Revoke actions;
+ *     4-up meta; 14-day call-volume sparkline (`CallVolumeChart`); scopes chip strip;
+ *     danger-zone revoke card.
  *   • Create dialog has reveal-once secret screen with Copy and "I've stored it."
+ *   • Edit dialog (`EditApiKeyDialog`) changes name / description / scopes in place.
  *
  * Mockup features parked until backend support lands:
  *   • IP allowlist — `ApiKeySummary` has no `ip_ranges` field.
- *   • Per-key call-volume sparkline / 24h-7d-30d totals — no /api/api-keys/:id/usage endpoint.
- *   These render as muted "Coming soon" placeholders rather than fake data.
  */
 
 import { useEffect, useMemo, useState } from 'react';
@@ -27,6 +26,7 @@ import {
   Check,
   Loader2,
   ShieldOff,
+  Pencil,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
@@ -50,6 +50,8 @@ import {
 } from '@/components/ui/alert-dialog';
 import { formatUTC, formatRelativeCompact } from '@/lib/date-utils';
 import { CreateApiKeyDialog } from './CreateApiKeyDialog';
+import { EditApiKeyDialog } from './EditApiKeyDialog';
+import { CallVolumeChart } from './CallVolumeChart';
 
 type DerivedStatus = 'active' | 'expiring' | 'unused' | 'revoked';
 
@@ -136,13 +138,14 @@ function ApiKeyListItem({ apiKey, selected, onSelect }: ApiKeyListItemProps) {
 interface ApiKeyDetailProps {
   apiKey: ApiKeySummary;
   permissions: PermissionInfo[];
+  onEdit: () => void;
   onRotate: () => void;
   onRevoke: () => void;
   onEnable: () => void;
   onDelete: () => void;
 }
 
-function ApiKeyDetail({ apiKey, permissions, onRotate, onRevoke, onEnable, onDelete }: ApiKeyDetailProps) {
+function ApiKeyDetail({ apiKey, permissions, onEdit, onRotate, onRevoke, onEnable, onDelete }: ApiKeyDetailProps) {
   const { hasPermission } = useAuth();
   const canEdit = hasPermission('apikeys:edit');
   const canDelete = hasPermission('apikeys:delete');
@@ -182,6 +185,12 @@ function ApiKeyDetail({ apiKey, permissions, onRotate, onRevoke, onEnable, onDel
             </div>
           </div>
           <div className="flex items-center gap-2 shrink-0">
+            {canEdit && (
+              <Button size="sm" variant="outline" className="h-7 text-[11.5px] px-2.5" onClick={onEdit}>
+                <Pencil className="w-[11px] h-[11px] mr-1" />
+                Edit
+              </Button>
+            )}
             {canEdit && apiKey.enabled && (
               <Button size="sm" variant="outline" className="h-7 text-[11.5px] px-2.5" onClick={onRotate}>
                 <RefreshCw className="w-[11px] h-[11px] mr-1" />
@@ -222,20 +231,7 @@ function ApiKeyDetail({ apiKey, permissions, onRotate, onRevoke, onEnable, onDel
           <Labeled label="Expires" mono>{apiKey.expires_at ? formatUTC(apiKey.expires_at) : 'Never'}</Labeled>
         </div>
 
-        {/* Usage placeholder — backend doesn't expose per-key call volume yet */}
-        <div>
-          <div className="flex items-center gap-2 mb-2">
-            <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-medium">Call volume</div>
-          </div>
-          <div className="rounded-md border border-dashed border-border bg-card/40 px-4 py-6 text-center">
-            <div className="text-[11.5px] text-muted-foreground">
-              Per-key usage analytics ship in a follow-up.
-            </div>
-            <div className="text-[10.5px] text-muted-foreground/70 mt-1">
-              `last_used_at` is the only signal currently available — see the meta row above.
-            </div>
-          </div>
-        </div>
+        <CallVolumeChart apiKeyId={apiKey.id} />
 
         {/* Scopes */}
         <div>
@@ -342,6 +338,7 @@ export function ApiKeysView() {
   const [query, setQuery] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
+  const [showEdit, setShowEdit] = useState(false);
   const [createdSecret, setCreatedSecret] = useState<ApiKeyCreatedResponse | null>(null);
   const [pendingRevoke, setPendingRevoke] = useState<ApiKeySummary | null>(null);
   const [pendingDelete, setPendingDelete] = useState<ApiKeySummary | null>(null);
@@ -522,6 +519,7 @@ export function ApiKeysView() {
           <ApiKeyDetail
             apiKey={selected}
             permissions={permissions}
+            onEdit={() => setShowEdit(true)}
             onRotate={() => setPendingRotate(selected)}
             onRevoke={() => setPendingRevoke(selected)}
             onEnable={() => handleEnable(selected)}
@@ -544,6 +542,19 @@ export function ApiKeysView() {
           await fetchAll();
         }}
       />
+
+      {selected && (
+        <EditApiKeyDialog
+          open={showEdit}
+          apiKey={selected}
+          permissions={permissions}
+          onClose={() => setShowEdit(false)}
+          onSaved={async () => {
+            setShowEdit(false);
+            await fetchAll();
+          }}
+        />
+      )}
 
       <AlertDialog open={!!pendingRevoke} onOpenChange={(open) => !open && setPendingRevoke(null)}>
         <AlertDialogContent>

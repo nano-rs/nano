@@ -42,6 +42,10 @@ export interface MarketplaceCatalogEntry {
   last_sync_status?: string;
   last_error?: string;
   record_count: number;
+  /** True when a sync is currently in flight for this entry. Derived
+   *  per-query on the backend from custom_enrichment_runs. Drives the
+   *  catalog card's footer-state badge (NAN-1108). */
+  is_syncing?: boolean;
   changelog?: string;
   created_at: string;
   updated_at: string;

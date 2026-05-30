@@ -16,14 +16,37 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use tracing::{debug, info, warn};
 
-/// TTL for cached search results (7 days)
-const CACHE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+/// TTL for cached search results.
+///
+/// NAN-1027: shortened from 7 days to 90 seconds. SIEM data is live —
+/// late-arriving events change query results constantly. A multi-day cache
+/// risks serving "we're clean" results long after a real detection lands
+/// in the data. 90s is enough to dedupe page refreshes / dashboard panel
+/// re-renders / shared-link follows within a working session.
+const CACHE_TTL_SECS: u64 = 90;
 
 /// Max result size to cache (1MB compressed)
 const MAX_CACHE_SIZE: usize = 1_024 * 1_024;
 
 /// Max rows to cache (results larger than this are not cached)
 const MAX_CACHEABLE_ROWS: usize = 10_000;
+
+/// Decide whether a response is cacheable. Returns `Some(reason)` when the
+/// response should be skipped, or `None` when it's safe to cache.
+///
+/// NAN-1027: empty results are never cached. For a SIEM a stale "0 hits"
+/// is the most dangerous cache entry — analysts conclude "we're clean"
+/// when late-arriving data would actually match. The recompute cost on
+/// an empty query is trivial vs. the correctness risk.
+fn skip_cache_reason(response: &SearchResponse) -> Option<&'static str> {
+    if response.results.is_empty() {
+        return Some("empty result set (NAN-1027)");
+    }
+    if response.results.len() > MAX_CACHEABLE_ROWS {
+        return Some("result row count exceeds MAX_CACHEABLE_ROWS");
+    }
+    None
+}
 
 /// Search result cache backed by Dragonfly/Redis
 #[derive(Clone)]
@@ -172,13 +195,8 @@ impl SearchResultCache {
 
     /// Store a search response in the cache.
     pub async fn set(&self, request: &SearchRequest, response: &SearchResponse) {
-        // Don't cache oversized results
-        if response.results.len() > MAX_CACHEABLE_ROWS {
-            debug!(
-                "Skipping cache: {} rows exceeds limit of {}",
-                response.results.len(),
-                MAX_CACHEABLE_ROWS
-            );
+        if let Some(reason) = skip_cache_reason(response) {
+            debug!("Skipping cache: {}", reason);
             return;
         }
 
@@ -235,5 +253,101 @@ impl SearchResultCache {
                 warn!("Cache SET error for {}: {}", key, e);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nanosiem_core::search::TimeRangeInput;
+
+    fn make_response(rows: usize) -> SearchResponse {
+        let results: Vec<serde_json::Value> = (0..rows)
+            .map(|i| serde_json::json!({ "id": format!("row-{}", i) }))
+            .collect();
+        SearchResponse {
+            results,
+            total_count: rows as u64,
+            execution_time_ms: 10,
+            fields: Vec::new(),
+            generated_sql: None,
+            histogram: None,
+            warnings: None,
+            cost_score: None,
+            display_type: None,
+            column_order: None,
+        }
+    }
+
+    #[test]
+    fn empty_response_is_not_cached() {
+        // NAN-1027: a stale "0 hits" cached for hours/days is the worst
+        // possible cache entry for a SIEM — analysts get false-clear signal.
+        let resp = make_response(0);
+        assert_eq!(
+            skip_cache_reason(&resp),
+            Some("empty result set (NAN-1027)")
+        );
+    }
+
+    #[test]
+    fn non_empty_response_is_cached() {
+        for n in [1, 2, 3, 5, 100, MAX_CACHEABLE_ROWS] {
+            let resp = make_response(n);
+            assert_eq!(
+                skip_cache_reason(&resp),
+                None,
+                "n={n} should be cacheable"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_response_is_not_cached() {
+        let resp = make_response(MAX_CACHEABLE_ROWS + 1);
+        assert_eq!(
+            skip_cache_reason(&resp),
+            Some("result row count exceeds MAX_CACHEABLE_ROWS")
+        );
+    }
+
+    #[test]
+    fn cache_ttl_does_not_outlive_a_working_session() {
+        // NAN-1027: live SIEM data invalidates results constantly. Cache
+        // must dedupe page refreshes / shared links, not survive overnight.
+        assert!(
+            CACHE_TTL_SECS <= 300,
+            "TTL {CACHE_TTL_SECS}s risks serving stale 'no hits' for an hour+ \
+             after late-arriving data lands"
+        );
+    }
+
+    #[test]
+    fn cache_key_distinguishes_limit() {
+        let mk = |limit: usize| SearchRequest {
+            query: "foo".into(),
+            time_range: TimeRangeInput {
+                start: chrono::Utc::now(),
+                end: chrono::Utc::now() + chrono::Duration::hours(1),
+            },
+            limit: Some(limit),
+            offset: None,
+            include_sql: None,
+            skip_histogram: false,
+            skip_field_stats: false,
+            use_cache: false,
+            table_view: false,
+            request_id: None,
+            async_mode: false,
+            priority: None,
+        };
+        assert_ne!(
+            SearchResultCache::cache_key(&mk(1)),
+            SearchResultCache::cache_key(&mk(2))
+        );
+        assert_ne!(
+            SearchResultCache::cache_key(&mk(2)),
+            SearchResultCache::cache_key(&mk(3))
+        );
     }
 }

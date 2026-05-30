@@ -19,6 +19,7 @@ import type {
   CreateApiKeyRequest,
   UpdateApiKeyRequest,
   ApiKeyCreatedResponse,
+  ApiKeyUsageResponse,
   SessionListResponse,
   OidcProviderSummary,
   OidcProviderListResponse,
@@ -158,6 +159,10 @@ export class AccessControlApi {
 
   async getApiKey(id: string): Promise<ApiKeySummary> {
     return this.request(`/api/api-keys/${id}`);
+  }
+
+  async getApiKeyUsage(id: string, days = 14): Promise<ApiKeyUsageResponse> {
+    return this.request(`/api/api-keys/${id}/usage?days=${days}`);
   }
 
   async updateApiKey(id: string, request: UpdateApiKeyRequest): Promise<ApiKeySummary> {

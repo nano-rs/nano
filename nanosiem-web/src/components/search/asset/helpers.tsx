@@ -222,3 +222,95 @@ export function formatDate(iso: string | null | undefined): string {
   if (!d) return iso ?? '';
   return d.toISOString().slice(0, 10);
 }
+
+// ---------------------------------------------------------------------------
+// Identity-aware drilldown
+//
+// Build a filter dict for `handleDrilldown` (in pages/Search.tsx) that scopes
+// the resulting search to every known identifier of an asset (ip / hostname /
+// user), rather than only the primary identifier the user clicked through to.
+//
+// IMPORTANT: only the identity values flow through `escDQ` here. Any other
+// user/server-provided value that callers want to interpolate must be added as
+// a top-level key in the filter dict (which `handleDrilldown` then escapes) —
+// do NOT inline it into a `_tableCommand` string, since those are appended
+// verbatim. The legacy `components/search/AssetView.tsx:1105` helper does the
+// same shape; converge fixes here so both surfaces stay in sync.
+// ---------------------------------------------------------------------------
+
+interface AssetIdentityRecordLike {
+  ip?: string | null;
+  hostname?: string | null;
+  user?: string | null;
+}
+
+const escDQ = (s: string) => s.replace(/"/g, '\\"');
+
+export function buildIdentityClause(
+  identities: AssetIdentityRecordLike[] | undefined,
+): string | null {
+  const ips = new Set<string>();
+  const hostnames = new Set<string>();
+  const users = new Set<string>();
+  for (const id of identities ?? []) {
+    const ip = id.ip?.trim();
+    const hostname = id.hostname?.trim();
+    const user = id.user?.trim();
+    if (ip) ips.add(ip);
+    if (hostname) hostnames.add(hostname);
+    if (user) users.add(user);
+  }
+  const clauses: string[] = [];
+  for (const ip of ips) clauses.push(`src_ip="${escDQ(ip)}"`);
+  for (const ip of ips) clauses.push(`dest_ip="${escDQ(ip)}"`);
+  for (const h of hostnames) clauses.push(`src_host="${escDQ(h)}"`);
+  for (const h of hostnames) clauses.push(`dest_host="${escDQ(h)}"`);
+  for (const u of users) clauses.push(`user="${escDQ(u)}"`);
+  if (clauses.length === 0) return null;
+  return `(${clauses.join(' OR ')})`;
+}
+
+/**
+ * Compute the [start, end] ISO window for bucket `bucketIdx` of an asset
+ * activity timeline. The timeline divides `timeRange` into `bucketCount`
+ * equal-width slices; bucket 0 is oldest, bucket `bucketCount - 1` is newest.
+ *
+ * Returns `null` if the inputs are degenerate (NaN range, zero bucketCount,
+ * out-of-range index). Used by `handleTimelineCellClick` in `asset/index.tsx`
+ * to pass `_timeRangeOverride` through to `handleDrilldown` (NAN-1050).
+ */
+export function computeBucketWindow(
+  timeRange: { start: string; end: string },
+  bucketCount: number,
+  bucketIdx: number,
+): { start: string; end: string } | null {
+  if (bucketCount <= 0) return null;
+  if (bucketIdx < 0 || bucketIdx >= bucketCount) return null;
+  const startMs = Date.parse(timeRange.start);
+  const endMs = Date.parse(timeRange.end);
+  if (Number.isNaN(startMs) || Number.isNaN(endMs) || endMs <= startMs) return null;
+  const span = (endMs - startMs) / bucketCount;
+  const bStart = new Date(startMs + bucketIdx * span);
+  const bEnd = new Date(startMs + (bucketIdx + 1) * span);
+  return { start: bStart.toISOString(), end: bEnd.toISOString() };
+}
+
+/**
+ * Merge an asset's identity clause into a drilldown filter dict. If no
+ * identities are resolved, falls back to a direct `{primaryField: primaryValue}`
+ * match so the drilldown still scopes to this asset.
+ */
+export function withAssetIdentity(
+  filters: Record<string, unknown>,
+  identities: AssetIdentityRecordLike[] | undefined,
+  primary?: { field: string; value: string } | null,
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...filters };
+  const clause = buildIdentityClause(identities);
+  if (clause) {
+    merged._identityClause = clause;
+  } else if (primary?.field && primary.value) {
+    merged[primary.field] = primary.value;
+  }
+  return merged;
+}

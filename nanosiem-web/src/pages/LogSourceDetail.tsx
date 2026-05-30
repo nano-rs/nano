@@ -89,18 +89,12 @@ import type {
   UpdateLogSource,
 } from '@/lib/api';
 import { formatUTCCompact } from '@/lib/date-utils';
+import {
+  SOURCE_TYPE_LABELS,
+  logSourceTransportLabel,
+} from '@/lib/log-source-transports';
 import { cn } from '@/lib/utils';
 import { useQuery } from '@tanstack/react-query';
-
-const SOURCE_TYPE_LABELS: Record<string, string> = {
-  routed: 'HTTP',
-  http: 'HTTP',
-  vector: 'Vector',
-  kafka: 'Kafka',
-  aws_s3: 'AWS S3',
-  gcp_pubsub: 'GCP Pub/Sub',
-  splunk_hec: 'Splunk HEC',
-};
 
 const CONFIG_TYPE_TO_SOURCE_TYPE: Record<string, string> = {
   http: 'routed',
@@ -801,7 +795,7 @@ function LogSourceHero({
   onClone: () => void;
   onViewLogs: () => void;
 }) {
-  const transportLabel = SOURCE_TYPE_LABELS[source.source_type] || source.source_type;
+  const transportLabel = logSourceTransportLabel(source);
   return (
     <div className="shrink-0 border-b border-border bg-card/40">
       {/* Top band */}

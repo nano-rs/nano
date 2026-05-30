@@ -38,6 +38,7 @@ export function AssetIdentityHeader({
   onInvestigate,
 }: AssetIdentityHeaderProps) {
   const [scoreOpen, setScoreOpen] = useState(false);
+  const [shareCopied, setShareCopied] = useState(false);
   // Risk service can emit scores > 100 (uncapped sum of contributing factors);
   // the display surface is 0-100 so we clamp here.
   const displayScore = Math.min(100, Math.max(0, Math.round(risk?.risk_score ?? 0)));
@@ -232,10 +233,12 @@ export function AssetIdentityHeader({
             />
             <HeaderAction
               icon={<Share2 className="w-[12px] h-[12px]" />}
-              label=""
-              title="Copy link"
+              label={shareCopied ? 'Copied' : ''}
+              title={shareCopied ? 'Link copied' : 'Copy link'}
               onClick={() => {
                 void navigator.clipboard?.writeText(window.location.href);
+                setShareCopied(true);
+                window.setTimeout(() => setShareCopied(false), 1200);
               }}
             />
           </div>

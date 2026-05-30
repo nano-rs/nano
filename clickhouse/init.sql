@@ -26,6 +26,9 @@ CREATE TABLE IF NOT EXISTS nanosiem.custom_enrichment_results (
     threat_type LowCardinality(String) DEFAULT '',
     malware LowCardinality(String) DEFAULT '',
     confidence UInt8 DEFAULT 0,
+    -- Provenance: 1 = OOTB marketplace feed (routes to ioc_*), 0 = user-created
+    -- custom enrichment (routes to custom_ioc_*). See migration 122 (NAN-1114).
+    is_marketplace UInt8 DEFAULT 0,
     INDEX idx_risk_score risk_score TYPE minmax GRANULARITY 4,
     INDEX idx_tags tags TYPE bloom_filter GRANULARITY 4,
     INDEX idx_key_value key_value TYPE bloom_filter GRANULARITY 4
@@ -40,9 +43,39 @@ SETTINGS index_granularity = 8192;
 -- DICTIONARIES (must be created BEFORE tables that reference them in DEFAULT)
 -- =============================================================================
 
+-- IP Enrichment payload table (ClickHouse-sourced as of NAN-1117).
+-- Mirrors the columns ip_enrichment_dict reads. ReplacingMergeTree keyed by
+-- (source_id, network) gives last-write-wins per CIDR; `updated_at` is the
+-- version, `deleted` is a tombstone for CIDRs a newer feed dropped. `network`
+-- MUST stay a CIDR String — IP_TRIE builds its trie from the CIDR text.
+-- Created BEFORE the dict so the dict always references an existing table
+-- (an empty-but-LOADED dict returns defaults; a missing-table dict THROWS on
+-- every logs insert — see migration 123 / NAN-1114).
+CREATE TABLE IF NOT EXISTS nanosiem.ip_enrichments
+(
+    network         String,
+    source_id       LowCardinality(String) DEFAULT 'ipinfo_lite',
+    country         String DEFAULT '',
+    country_code    String DEFAULT '',
+    continent       String DEFAULT '',
+    continent_code  String DEFAULT '',
+    asn             String DEFAULT '',
+    as_name         String DEFAULT '',
+    as_domain       String DEFAULT '',
+    updated_at      DateTime64(3) DEFAULT now64(3),
+    deleted         UInt8 DEFAULT 0
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY (source_id, network);
+
 -- IP Enrichment Dictionary
--- Loads GeoIP/ASN data from PostgreSQL ip_enrichments table
--- Works with empty data - will just return empty strings until enrichment is enabled
+-- Loads GeoIP/ASN data from the ClickHouse ip_enrichments table (NAN-1117;
+-- was PostgreSQL-sourced — moved to CH for the same ingestion-halt reason as
+-- the IOC dict in migration 122 / NAN-1114). The 14 nanosiem.logs enriched_*
+-- MATERIALIZED columns call dictGetOrDefault on this dict on every insert.
+-- Works with empty data - returns empty strings until enrichment is synced.
+-- Disabling the source blanks the dict by deleting its CH rows (the old PG
+-- `WHERE enabled = true` gate is preserved write-side, EnrichmentService).
 CREATE DICTIONARY IF NOT EXISTS nanosiem.ip_enrichment_dict
 (
     network String,
@@ -55,21 +88,25 @@ CREATE DICTIONARY IF NOT EXISTS nanosiem.ip_enrichment_dict
     as_domain String DEFAULT ''
 )
 PRIMARY KEY network
-SOURCE(POSTGRESQL(
-    host 'postgres'
-    port 5432
-    user 'nanosiem'
-    password 'nanosiem'
-    db 'nanosiem'
-    query 'SELECT host(network) || ''/'' || masklen(network) as network, COALESCE(country, '''') as country, COALESCE(country_code, '''') as country_code, COALESCE(continent, '''') as continent, COALESCE(continent_code, '''') as continent_code, COALESCE(asn, '''') as asn, COALESCE(as_name, '''') as as_name, COALESCE(as_domain, '''') as as_domain FROM ip_enrichments ie JOIN enrichment_sources es ON ie.source_id = es.id WHERE es.enabled = true'
-    invalidate_query 'SELECT COALESCE(EXTRACT(EPOCH FROM MAX(updated_at))::bigint, 0) FROM enrichment_sources WHERE source_type = ''ipinfo_lite'''
+SOURCE(CLICKHOUSE(
+    HOST '{clickhouse_self_host}'
+    PORT {clickhouse_self_port}
+    USER '{clickhouse_self_user}'
+    PASSWORD '{clickhouse_self_password}'
+    DB 'nanosiem'
+    QUERY 'SELECT network, argMax(country, updated_at) AS country, argMax(country_code, updated_at) AS country_code, argMax(continent, updated_at) AS continent, argMax(continent_code, updated_at) AS continent_code, argMax(asn, updated_at) AS asn, argMax(as_name, updated_at) AS as_name, argMax(as_domain, updated_at) AS as_domain FROM nanosiem.ip_enrichments GROUP BY network HAVING argMax(deleted, updated_at) = 0'
 ))
 LIFETIME(MIN 300 MAX 600)
 LAYOUT(IP_TRIE());
 
 -- IOC Enrichment Dictionary
--- Loads threat intel IOCs from PostgreSQL ioc_enrichments table
--- Works with empty data - will just return empty values until IOC feeds are enabled
+-- OOTB marketplace IOC feeds (e.g. ThreatFox) populate nanosiem.logs `ioc_*`
+-- columns via this dictionary. Sourced from ClickHouse custom_enrichment_results
+-- filtered to marketplace-provided rows (is_marketplace = 1). The legacy
+-- PostgreSQL source (ioc_enrichments table) was removed in NAN-1112; see
+-- migration 122 (NAN-1114) for the repoint + incident write-up. User-created
+-- IOC enrichments route through custom_ioc_enrichment_dict (is_marketplace = 0).
+-- Works with empty data - returns empty values until a marketplace IOC feed syncs.
 CREATE DICTIONARY IF NOT EXISTS nanosiem.ioc_enrichment_dict
 (
     ioc_value String,
@@ -81,16 +118,28 @@ CREATE DICTIONARY IF NOT EXISTS nanosiem.ioc_enrichment_dict
     tags String DEFAULT ''
 )
 PRIMARY KEY ioc_value
-SOURCE(POSTGRESQL(
-    host 'postgres'
-    port 5432
-    user 'nanosiem'
-    password 'nanosiem'
-    db 'nanosiem'
-    query 'SELECT ioc_value, ioc_type::text as ioc_type, ie.source_id, COALESCE(threat_type, '''') as threat_type, COALESCE(malware, '''') as malware, COALESCE(confidence_level, 0) as confidence_level, COALESCE(array_to_string(tags, '',''), '''') as tags FROM ioc_enrichments ie JOIN enrichment_sources es ON ie.source_id = es.id WHERE es.enabled = true AND ie.expires_at > NOW()'
-    invalidate_query 'SELECT COALESCE(EXTRACT(EPOCH FROM GREATEST(MAX(ie.updated_at), MAX(es.updated_at)))::bigint, 0) FROM ioc_enrichments ie, enrichment_sources es WHERE es.source_type = ''ioc_feed'''
+SOURCE(CLICKHOUSE(
+    HOST '{clickhouse_self_host}'
+    PORT {clickhouse_self_port}
+    USER '{clickhouse_self_user}'
+    PASSWORD '{clickhouse_self_password}'
+    DB 'nanosiem'
+    QUERY 'SELECT
+        key_value AS ioc_value,
+        anyLast(key_type) AS ioc_type,
+        anyLast(enrichment_name) AS source_id,
+        anyLast(threat_type) AS threat_type,
+        anyLast(malware) AS malware,
+        toInt32(anyLast(confidence)) AS confidence_level,
+        arrayStringConcat(groupUniqArrayArray(tags), '','') AS tags
+    FROM (
+        SELECT * FROM nanosiem.custom_enrichment_results
+        WHERE expires_at > now() AND is_ioc = 1 AND is_marketplace = 1
+        ORDER BY confidence DESC
+    )
+    GROUP BY key_value'
 ))
-LIFETIME(MIN 60 MAX 120)
+LIFETIME(MIN 60 MAX 300)
 LAYOUT(HASHED());
 
 -- Prevalence aggregation tables (must exist before dictionaries that source from them)
@@ -289,7 +338,7 @@ SOURCE(CLICKHOUSE(
         groupUniqArray(enrichment_name) as enrichment_names
     FROM (
         SELECT * FROM nanosiem.custom_enrichment_results
-        WHERE expires_at > now() AND is_ioc = 1
+        WHERE expires_at > now() AND is_ioc = 1 AND is_marketplace = 0
         ORDER BY confidence DESC
     )
     GROUP BY key_type, key_value'
@@ -400,7 +449,63 @@ SOURCE(CLICKHOUSE(
 LIFETIME(MIN 900 MAX 1800)
 LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 5000000));
 
--- Dictionary: user_registry_dict (keyed by username, sources from PostgreSQL)
+-- Identity enrichment (user_registry) payload table — ClickHouse-sourced as of
+-- NAN-1117 (was a PG table feeding a PG-sourced dict; moved to CH for the same
+-- ingestion-halt reason as the IP/IOC dicts in migrations 122/123/NAN-1114).
+-- This is the directory ENRICHMENT feed only — NOT the public.users auth table.
+-- ReplacingMergeTree(version) keyed on (provider_id, external_id) so re-syncs
+-- collapse to the latest version; account_status='deleted'/'anonymized' rows
+-- are KEPT and filtered out by the dict QUERY. Materialized *_lc lookup keys
+-- mirror the PG lower() indexes the dict + exact-match lookup used.
+-- Created BEFORE the dict (and well before the logs table) so the dict always
+-- references an existing table — an empty-but-LOADED dict returns defaults; a
+-- missing-table dict THROWS on every logs insert.
+CREATE TABLE IF NOT EXISTS nanosiem.user_registry
+(
+    provider_id        LowCardinality(String),
+    external_id        String,
+    username           String DEFAULT '',
+    upn                String DEFAULT '',
+    email              String DEFAULT '',
+    display_name       String DEFAULT '',
+    first_name         String DEFAULT '',
+    last_name          String DEFAULT '',
+    department         String DEFAULT '',
+    title              String DEFAULT '',
+    manager_upn        String DEFAULT '',
+    manager_display_name String DEFAULT '',
+    company            String DEFAULT '',
+    office_location    String DEFAULT '',
+    city               String DEFAULT '',
+    country            String DEFAULT '',
+    groups             Array(String) DEFAULT [],
+    account_enabled    UInt8 DEFAULT 1,
+    account_status     LowCardinality(String) DEFAULT 'active',
+    mfa_enabled        UInt8 DEFAULT 0,
+    last_sign_in_at    DateTime64(3) DEFAULT toDateTime64(0, 3),
+    created_in_directory_at DateTime64(3) DEFAULT toDateTime64(0, 3),
+    phone              String DEFAULT '',
+    employee_id        String DEFAULT '',
+    employee_type      LowCardinality(String) DEFAULT 'employee',
+    sync_hash          String DEFAULT '',
+    last_synced_at     DateTime64(3) DEFAULT now64(3),
+    version            UInt64,
+    username_lc        String MATERIALIZED lower(username),
+    upn_lc             String MATERIALIZED lower(upn),
+    email_lc           String MATERIALIZED lower(email)
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY (provider_id, external_id);
+
+-- Dictionary: user_registry_dict (keyed by lowercased username, sources from
+-- the ClickHouse user_registry table — NAN-1117; was PostgreSQL-sourced).
+-- Attributes/key/LAYOUT(HASHED()) are byte-identical to the prior PG dict so
+-- the 24 nanosiem.logs user_identity_* columns keep resolving unchanged.
+-- argMax(..., version) GROUP BY username_lc dedups ReplacingMergeTree rows at
+-- load time (merges are async); HAVING account_status != 'deleted' + the
+-- username_lc != '' WHERE reproduce the old PG dict filter. groups is
+-- comma-joined to keep user_identity_groups a String (matching PG
+-- array_to_string(groups, ',')).
 CREATE DICTIONARY IF NOT EXISTS nanosiem.user_registry_dict
 (
     username String,
@@ -420,14 +525,13 @@ CREATE DICTIONARY IF NOT EXISTS nanosiem.user_registry_dict
     office_location String DEFAULT ''
 )
 PRIMARY KEY username
-SOURCE(POSTGRESQL(
-    host 'postgres'
-    port 5432
-    user 'nanosiem'
-    password 'nanosiem'
-    db 'nanosiem'
-    query 'SELECT lower(username) AS username, COALESCE(email, '''') AS email, COALESCE(display_name, '''') AS display_name, COALESCE(department, '''') AS department, COALESCE(title, '''') AS title, COALESCE(manager_upn, '''') AS manager_upn, COALESCE(manager_display_name, '''') AS manager_display_name, COALESCE(company, '''') AS company, COALESCE(array_to_string(groups, '',''), '''') AS groups, CASE WHEN account_enabled THEN 1 ELSE 0 END AS account_enabled, COALESCE(account_status, '''') AS account_status, CASE WHEN mfa_enabled THEN 1 ELSE 0 END AS mfa_enabled, COALESCE(employee_type, '''') AS employee_type, COALESCE(country, '''') AS country, COALESCE(office_location, '''') AS office_location FROM user_registry WHERE account_status != ''deleted'' AND username IS NOT NULL AND username != '''''
-    invalidate_query 'SELECT COALESCE(EXTRACT(EPOCH FROM MAX(updated_at))::bigint, 0) FROM user_registry'
+SOURCE(CLICKHOUSE(
+    HOST '{clickhouse_self_host}'
+    PORT {clickhouse_self_port}
+    USER '{clickhouse_self_user}'
+    PASSWORD '{clickhouse_self_password}'
+    DB 'nanosiem'
+    QUERY 'SELECT * FROM (SELECT username_lc AS username, argMax(email, version) AS email, argMax(display_name, version) AS display_name, argMax(department, version) AS department, argMax(title, version) AS title, argMax(manager_upn, version) AS manager_upn, argMax(manager_display_name, version) AS manager_display_name, argMax(company, version) AS company, argMax(arrayStringConcat(groups, '',''), version) AS groups, argMax(account_enabled, version) AS account_enabled, argMax(account_status, version) AS account_status, argMax(mfa_enabled, version) AS mfa_enabled, argMax(employee_type, version) AS employee_type, argMax(country, version) AS country, argMax(office_location, version) AS office_location FROM nanosiem.user_registry WHERE username_lc != '''' GROUP BY username_lc) WHERE account_status != ''deleted'''
 ))
 LIFETIME(MIN 300 MAX 600)
 LAYOUT(HASHED());
@@ -659,28 +763,34 @@ CREATE TABLE IF NOT EXISTS nanosiem.logs
     INDEX idx_src_mac src_mac TYPE bloom_filter GRANULARITY 4,
     INDEX idx_dest_mac dest_mac TYPE bloom_filter GRANULARITY 4,
     INDEX idx_user user TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_user_words lower(user) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_src_user src_user TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_src_user_words lower(src_user) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_dest_user dest_user TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_dest_user_words lower(dest_user) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_user_id user_id TYPE bloom_filter GRANULARITY 4,
     INDEX idx_process_name process_name TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_process_name_words lower(process_name) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_process_hash process_hash TYPE bloom_filter GRANULARITY 4,
     INDEX idx_process_guid process_guid TYPE bloom_filter GRANULARITY 4,
     INDEX idx_command_line command_line TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_command_line_words lower(command_line) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_parent_command_line parent_command_line TYPE bloom_filter GRANULARITY 4,
-    INDEX idx_file_path file_path TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 4,
+    INDEX idx_parent_command_line_words lower(parent_command_line) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
+    INDEX idx_file_path_words lower(file_path) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_file_hash file_hash TYPE bloom_filter GRANULARITY 4,
     INDEX idx_file_name file_name TYPE bloom_filter GRANULARITY 4,
-    INDEX idx_registry_path registry_path TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 4,
+    INDEX idx_registry_path_words lower(registry_path) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_url_domain url_domain TYPE bloom_filter GRANULARITY 4,
     INDEX idx_http_method http_method TYPE set(20) GRANULARITY 4,
-    INDEX idx_http_user_agent http_user_agent TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 4,
-    INDEX idx_query query TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 4,
+    INDEX idx_http_user_agent_words lower(http_user_agent) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
+    INDEX idx_query_words lower(query) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_answer answer TYPE bloom_filter GRANULARITY 4,
     INDEX idx_sender sender TYPE bloom_filter GRANULARITY 4,
     INDEX idx_sender_domain sender_domain TYPE bloom_filter GRANULARITY 4,
     INDEX idx_recipient recipient TYPE bloom_filter GRANULARITY 4,
     INDEX idx_recipient_domain recipient_domain TYPE bloom_filter GRANULARITY 4,
-    INDEX idx_subject subject TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 4,
+    INDEX idx_subject_words lower(subject) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_message_id message_id TYPE bloom_filter GRANULARITY 4,
     INDEX idx_signature signature TYPE bloom_filter GRANULARITY 4,
     INDEX idx_signature_id signature_id TYPE bloom_filter GRANULARITY 4,
@@ -693,8 +803,7 @@ CREATE TABLE IF NOT EXISTS nanosiem.logs
     INDEX idx_severity severity TYPE set(20) GRANULARITY 4,
     INDEX idx_category category TYPE set(100) GRANULARITY 4,
     INDEX idx_risk_entity risk_entity TYPE bloom_filter GRANULARITY 4,
-    INDEX idx_message_ft lower(message) TYPE text(tokenizer = ngrams(3)) GRANULARITY 1,
-    INDEX idx_message_tokens lower(message) TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 4,
+    INDEX idx_message_words lower(message) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_inserted_at _inserted_at TYPE minmax GRANULARITY 4,
     -- Enrichment field indexes (GeoIP / ASN lookups)
     INDEX idx_enriched_src_country enriched_src_country TYPE set(200) GRANULARITY 4,
@@ -718,11 +827,13 @@ CREATE TABLE IF NOT EXISTS nanosiem.logs
     INDEX idx_cloud_region cloud_region TYPE set(100) GRANULARITY 4,
     INDEX idx_cloud_service cloud_service TYPE set(200) GRANULARITY 4,
     INDEX idx_resource_id resource_id TYPE bloom_filter GRANULARITY 4,
-    INDEX idx_resource_name resource_name TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 4,
+    INDEX idx_resource_name_words lower(resource_name) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_resource_type resource_type TYPE set(200) GRANULARITY 4,
     INDEX idx_change_type change_type TYPE set(20) GRANULARITY 4,
     INDEX idx_src_host src_host TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_src_host_words lower(src_host) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_dest_host dest_host TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_dest_host_words lower(dest_host) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_enrichment_value_1 enrichment_value_1 TYPE bloom_filter GRANULARITY 4,
     INDEX idx_enrichment_value_2 enrichment_value_2 TYPE bloom_filter GRANULARITY 4,
     INDEX idx_enrichment_value_3 enrichment_value_3 TYPE bloom_filter GRANULARITY 4

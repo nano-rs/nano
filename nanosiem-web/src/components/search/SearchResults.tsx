@@ -121,7 +121,7 @@ function flattenFieldsForExpand(fields: Record<string, unknown>, prefix = ''): [
     if (fieldName === 'risk_score' || fieldName === 'risk_entity' ||
         fieldName === 'risk_factors' || fieldName.startsWith('risk_')) return 1;
     if (fieldName.startsWith('ioc_')) return 2;
-    if (fieldName.startsWith('identity_') || fieldName === 'is_nat_candidate') return 3;
+    if (fieldName.includes('_identity_') || fieldName.startsWith('identity_') || fieldName === 'is_nat_candidate') return 3;
     if (fieldName.startsWith('prevalence_') || fieldName === '_prevalence' ||
         fieldName.startsWith('_prevalence.') || fieldName === 'host_count' ||
         fieldName === 'is_rare' || fieldName === 'prevalence_score' ||
@@ -168,7 +168,7 @@ const ENRICHMENT_CATEGORIES_EXPAND: Record<string, (k: string) => boolean> = {
   prevalence: (k) => isPrevalenceFieldExpand(k),
   lookup: (k) => k.startsWith('lookup_') && !k.startsWith('lookup_custom_'),
   geo: (k) => k.startsWith('enriched_'),
-  identity: (k) => k.startsWith('identity_') || k === 'is_nat_candidate',
+  identity: (k) => k.includes('_identity_') || k.startsWith('identity_') || k === 'is_nat_candidate',
   metadata: (k) => k.startsWith('metadata_'),
 };
 
@@ -384,7 +384,7 @@ interface SearchResultsProps {
   onAddToNotebook?: (entityType: string, value: string) => void;
   onAddAllEntitiesToNotebook?: (entities: Array<{ type: string; value: string }>) => void;
   // Table view mode - fetch full log on row expand
-  onFetchLog?: (id: string, timestamp: Date) => Promise<Record<string, unknown> | null>;
+  onFetchLog?: (id: string, timestamp: Date, sourceType?: string) => Promise<Record<string, unknown> | null>;
   // Column order from backend (for | table command)
   columnOrder?: string[];
   // Asset prevalence filter (for filtering asset timeline by prevalence artifacts)
@@ -988,11 +988,13 @@ export function SearchResults({
   const sharedLoadingLogsRef = React.useRef(sharedLoadingLogs);
   sharedLoadingLogsRef.current = sharedLoadingLogs;
 
-  // Prefetch full log data — called by RawView on hover and by inspector on selection
-  const sharedPrefetchLog = React.useCallback((id: string, logId?: string, timestamp?: Date) => {
+  // Prefetch full log data — called by RawView on hover and by inspector on selection.
+  // sourceType (NAN-1032) lets the backend use the (source_type, timestamp, ...) PK
+  // for a tight range read on S3-backed historical partitions.
+  const sharedPrefetchLog = React.useCallback((id: string, logId?: string, timestamp?: Date, sourceType?: string) => {
     if (!onFetchLog || !logId || !timestamp || sharedFullLogDataRef.current.has(id) || sharedLoadingLogsRef.current.has(id)) return;
     setSharedLoadingLogs(prev => new Set(prev).add(id));
-    onFetchLog(logId, timestamp)
+    onFetchLog(logId, timestamp, sourceType)
       .then(fullData => {
         if (fullData) {
           setSharedFullLogData(prev => new Map(prev).set(id, fullData));
@@ -1014,7 +1016,7 @@ export function SearchResults({
     setSelectedEvent(event);
     setSelectedEventIndex(index);
     // Trigger full data fetch for the selected event
-    sharedPrefetchLog(event.id, event.fields?.id as string, event.timestamp);
+    sharedPrefetchLog(event.id, event.fields?.id as string, event.timestamp, event.fields?.source_type as string | undefined);
   }, [sharedPrefetchLog]);
 
   const handleCloseInspector = React.useCallback(() => {
@@ -1029,7 +1031,7 @@ export function SearchResults({
       const event = results[newIndex];
       setSelectedEvent(event);
       setSelectedEventIndex(newIndex);
-      sharedPrefetchLog(event.id, event.fields?.id as string, event.timestamp);
+      sharedPrefetchLog(event.id, event.fields?.id as string, event.timestamp, event.fields?.source_type as string | undefined);
     }
   }, [selectedEventIndex, results, sharedPrefetchLog]);
 
@@ -1671,6 +1673,7 @@ const ENRICHMENT_CATEGORIES = {
   ioc: { label: 'IOC (Threat Intel)', description: 'Threat intelligence indicators' },
   custom: { label: 'Custom Enrichments', description: 'User-defined enrichments' },
   prevalence: { label: 'Prevalence', description: 'Prevalence/rarity data' },
+  identity: { label: 'Identity', description: 'Resolved identity from the user registry' },
   geo: { label: 'Geo/ASN', description: 'Geographic and network info' },
   lookup: { label: 'Lookup Tables', description: 'Lookup table enrichments' },
   ext: { label: 'Extended Fields', description: 'Parser-extracted fields (ext JSON)' },
@@ -1719,7 +1722,7 @@ function RawView({
   totalCount?: number;
   isSearching?: boolean;
   onLoadMore?: () => void;
-  onFetchLog?: (id: string, timestamp: Date) => Promise<Record<string, unknown> | null>;
+  onFetchLog?: (id: string, timestamp: Date, sourceType?: string) => Promise<Record<string, unknown> | null>;
   /** Currently selected event ID (for inspector panel highlighting) */
   selectedEventId?: string;
   /** Callback when an event row is clicked to open inspector */
@@ -1729,7 +1732,7 @@ function RawView({
   /** Shared loading state for full log fetches */
   loadingLogs?: Set<string>;
   /** Shared prefetch function (lifted to SearchResults) */
-  onPrefetchLog?: (id: string, logId?: string, timestamp?: Date) => void;
+  onPrefetchLog?: (id: string, logId?: string, timestamp?: Date, sourceType?: string) => void;
   /** Detail view mode - panel (side drawer) or inline (expand in place) */
   detailViewMode?: DetailViewMode;
 }) {
@@ -1753,10 +1756,12 @@ function RawView({
     setExpandedMessages(prev => new Set(prev).add(id));
   };
 
-  // Prefetch: delegate to shared parent handler
-  const prefetchLog = useCallback((id: string, logId?: string, timestamp?: Date) => {
+  // Prefetch: delegate to shared parent handler.
+  // sourceType (NAN-1032) lets the backend use the (source_type, timestamp, ...) PK
+  // for a tight range read on S3-backed historical partitions.
+  const prefetchLog = useCallback((id: string, logId?: string, timestamp?: Date, sourceType?: string) => {
     if (onPrefetchLog) {
-      onPrefetchLog(id, logId, timestamp);
+      onPrefetchLog(id, logId, timestamp, sourceType);
     }
   }, [onPrefetchLog]);
 
@@ -1765,11 +1770,11 @@ function RawView({
   const isScrollingRef = useRef(false);
   const scrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const handleRowMouseEnter = useCallback((id: string, logId?: string, timestamp?: Date) => {
+  const handleRowMouseEnter = useCallback((id: string, logId?: string, timestamp?: Date, sourceType?: string) => {
     if (fullLogDataRef.current?.has(id) || loadingLogsRef.current?.has(id) || isScrollingRef.current) return;
     hoverTimerRef.current = setTimeout(() => {
       if (!isScrollingRef.current) {
-        prefetchLog(id, logId, timestamp);
+        prefetchLog(id, logId, timestamp, sourceType);
       }
     }, 400);
   }, [prefetchLog]);
@@ -1782,7 +1787,7 @@ function RawView({
   }, []);
 
   // Toggle inline expand for a row
-  const toggleFields = useCallback((id: string, logId?: string, timestamp?: Date) => {
+  const toggleFields = useCallback((id: string, logId?: string, timestamp?: Date, sourceType?: string) => {
     const isExpanding = !expandedFields.has(id);
     setExpandedFields(prev => {
       const next = new Set(prev);
@@ -1794,17 +1799,18 @@ function RawView({
       return next;
     });
     if (isExpanding) {
-      prefetchLog(id, logId, timestamp);
+      prefetchLog(id, logId, timestamp, sourceType);
     }
   }, [expandedFields, prefetchLog]);
 
   // Handle row click - select event for inspector panel or toggle inline expand
   const handleRowClick = useCallback((result: SearchResult, index: number) => {
+    const sourceType = result.fields?.source_type as string | undefined;
     if (isInlineMode) {
-      toggleFields(result.id, result.fields?.id as string, result.timestamp);
+      toggleFields(result.id, result.fields?.id as string, result.timestamp, sourceType);
     } else if (onSelectEvent) {
       onSelectEvent(result, index);
-      prefetchLog(result.id, result.fields?.id as string, result.timestamp);
+      prefetchLog(result.id, result.fields?.id as string, result.timestamp, sourceType);
     }
   }, [isInlineMode, toggleFields, onSelectEvent, prefetchLog]);
 
@@ -1930,7 +1936,7 @@ function RawView({
                   ? 'border-l-2 border-l-primary'
                   : 'hover:bg-muted/20'
               }`}
-              onMouseEnter={() => handleRowMouseEnter(result.id, result.fields?.id as string, result.timestamp)}
+              onMouseEnter={() => handleRowMouseEnter(result.id, result.fields?.id as string, result.timestamp, result.fields?.source_type as string | undefined)}
               onMouseLeave={handleRowMouseLeave}
               onClick={() => handleRowClick(result, virtualRow.index)}
             >

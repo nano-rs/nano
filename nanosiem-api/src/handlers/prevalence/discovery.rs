@@ -382,28 +382,33 @@ pub async fn get_artifact_detail(
     }
 }
 
-/// Look the artifact up in every configured IOC enrichment source and
-/// attach one verdict per source to `response.threat_intel`. Errors are
-/// logged at debug level — the rest of the response still renders.
+/// Look the artifact up in every Deno IOC enrichment that currently has
+/// rows in `nanosiem.custom_enrichment_results` (`is_ioc=1`, not expired)
+/// and attach one verdict per (enrichment, key_type, threat_type,
+/// malware, confidence) to `response.threat_intel`. Errors are logged at
+/// debug level — the rest of the response still renders.
 ///
-/// Uses `lookup_ioc_all_sources` (drops the LIMIT-1 cap that the ingestion
-/// `lookup_ioc` uses) so ThreatFox + VirusTotal + AbuseIPDB hits on the
-/// same artifact each show up as their own row in the UI.
+/// NAN-1112 swapped the source-of-truth from PG `ioc_enrichments`
+/// (populated by the now-deleted `sync_threatfox` / `sync_tor_exit_nodes`
+/// engine) to CH `custom_enrichment_results` (populated by every Deno
+/// marketplace IOC enrichment). Same return shape; the helper lives in
+/// `nanosiem_core::enrichment::ioc` and takes a `&clickhouse::Client`
+/// directly so it doesn't need to thread CH through `EnrichmentService`.
 async fn populate_threat_intel(
     state: &AppState,
     response: &mut nanosiem_core::prevalence::ArtifactDetailResponse,
 ) {
+    use nanosiem_core::enrichment::ioc::lookup_ioc_all_sources;
     use nanosiem_core::prevalence::ArtifactThreatIntelEntry;
 
-    let enrichment = state.enrichment.read().await;
-    let hits = match enrichment.lookup_ioc_all_sources(&response.artifact).await {
+    let ch = state.dual_pool.clickhouse();
+    let hits = match lookup_ioc_all_sources(ch, &response.artifact).await {
         Ok(v) => v,
         Err(e) => {
             tracing::debug!("IOC lookup failed (best-effort): {}", e);
             return;
         }
     };
-    drop(enrichment);
 
     for hit in hits {
         // Build a compact human-readable verdict line; the raw fields ride

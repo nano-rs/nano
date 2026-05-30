@@ -5,10 +5,18 @@
 //! Split into focused submodules by domain:
 //! - `types` — request/response types
 //! - `sources` — source listing, enable/disable, stats, auto-sync
-//! - `ipinfo` — IPinfo configure, sync, IP lookup
-//! - `threatfox` — ThreatFox configure, sync, IOC lookup, IOC stats
-//! - `tor` — TOR exit nodes configure, sync
-//! - `agent` — agent enrichment lookup (Deno providers)
+//! - `ipinfo` — IPinfo Lite configure, sync, IP lookup (the one
+//!   pre-built provider that stays native — see
+//!   `project_ipinfo_lite_stays_native` for the volume + schema
+//!   rationale)
+//! - `agent` — generic agent enrichment lookup runtime (Deno providers)
+//!
+//! NAN-1111 sunset the per-provider ThreatFox and TOR Exit Nodes
+//! handlers (and the dead `/api/enrichment/ioc/{lookup,stats}` endpoints
+//! that lived in `threatfox.rs`) — both providers now run via the
+//! marketplace + nano-rs/nano-enrichments. Their legacy deep-link
+//! routes redirect to the marketplace from `App.tsx`'s
+//! `LegacyEnrichmentRoute`.
 
 // Agent enrichment lookup uses agent_enrichment + custom_enrichment::sandbox,
 // both of which moved to nanosiem-enterprise in Phase 3.3 (NAN-744).
@@ -16,16 +24,12 @@
 mod agent;
 mod ipinfo;
 mod sources;
-mod threatfox;
-mod tor;
 mod types;
 
 #[cfg(feature = "enterprise")]
 pub use agent::*;
 pub use ipinfo::*;
 pub use sources::*;
-pub use threatfox::*;
-pub use tor::*;
 pub use types::*;
 
 use chrono::{DateTime, Utc};
@@ -133,12 +137,6 @@ impl utoipa::OpenApi for EnrichmentApiDoc {
                 configure_auto_sync,
                 get_enrichment_stats,
                 lookup_ip,
-                configure_threatfox,
-                sync_threatfox,
-                lookup_ioc,
-                get_ioc_stats,
-                configure_tor_exit_nodes,
-                sync_tor_exit_nodes,
             ),
             components(schemas(
                 EnrichmentSourcesResponse,
@@ -150,10 +148,6 @@ impl utoipa::OpenApi for EnrichmentApiDoc {
                 IpLookupResponse,
                 AutoSyncConfigRequest,
                 AutoSyncConfigResponse,
-                ConfigureThreatFoxRequest,
-                IocLookupResponse,
-                IocStatsResponse,
-                ConfigureTorRequest,
             ))
         )]
         struct ApiDoc;

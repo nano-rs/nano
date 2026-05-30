@@ -10,11 +10,13 @@
 //! - Auto-sync scheduler for automatic updates
 
 pub mod ioc;
+pub mod lane_client;
 pub mod repository;
 pub mod scheduler;
 pub mod service;
 pub mod types;
 
+pub use lane_client::{EnrichmentLaneClient, EnrichmentLaneError, ENRICH_SOURCE_TYPE};
 pub use repository::{EnrichmentRepository, EnrichmentRepositoryError};
 pub use scheduler::{EnrichmentScheduler, EnrichmentSchedulerConfig};
 pub use service::{EnrichmentError, EnrichmentService, EnrichmentSyncResult, LogEnrichment};

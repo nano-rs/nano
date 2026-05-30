@@ -9,9 +9,11 @@ import { SectionCard, EmptyCell } from './_shared';
 interface AlertsCardProps {
   alerts: EntityAlertSummary[];
   total?: number;
+  onAlertClick?: (alertRowId: string) => void;
+  onOpenSequence?: () => void;
 }
 
-export function AlertsCard({ alerts, total }: AlertsCardProps) {
+export function AlertsCard({ alerts, total, onAlertClick, onOpenSequence }: AlertsCardProps) {
   const bySev = {
     critical: alerts.filter((a) => a.severity.toLowerCase() === 'critical').length,
     high: alerts.filter((a) => a.severity.toLowerCase() === 'high').length,
@@ -35,6 +37,7 @@ export function AlertsCard({ alerts, total }: AlertsCardProps) {
       title="Alerts"
       count={total ?? alerts.length}
       action={<span className="text-[11px]">Open sequence ↗</span>}
+      onActionClick={onOpenSequence}
       icon={<AlertTriangle className="w-[13px] h-[13px] text-muted-foreground/70" />}
     >
       {alerts.length === 0 ? (
@@ -51,27 +54,44 @@ export function AlertsCard({ alerts, total }: AlertsCardProps) {
             </span>
           </div>
           <ul className="space-y-2">
-            {top.map((a) => (
-              <li key={a.id} className="flex items-start gap-2.5">
-                <span
-                  className="w-1.5 h-1.5 rounded-full mt-[7px] shrink-0"
-                  style={{ background: sevTone(a.severity).dot }}
-                />
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-baseline gap-2">
-                    <div className="text-[12.5px] text-foreground truncate font-medium">
-                      {a.rule_name ?? '(rule deleted)'}
+            {top.map((a) => {
+              const inner = (
+                <>
+                  <span
+                    className="w-1.5 h-1.5 rounded-full mt-[7px] shrink-0"
+                    style={{ background: sevTone(a.severity).dot }}
+                  />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-baseline gap-2">
+                      <div className="text-[12.5px] text-foreground truncate font-medium">
+                        {a.rule_name ?? '(rule deleted)'}
+                      </div>
+                      <SevPill sev={a.severity} />
                     </div>
-                    <SevPill sev={a.severity} />
+                    <div className="text-[10.5px] font-mono text-muted-foreground/70 mt-0.5">
+                      {a.alert_id.slice(0, 8)} · {formatTimeRelative(a.created_at)} ·{' '}
+                      <span className="text-foreground/70">{a.status}</span>
+                    </div>
                   </div>
-                  <div className="text-[10.5px] font-mono text-muted-foreground/70 mt-0.5">
-                    {a.alert_id.slice(0, 8)} · {formatTimeRelative(a.created_at)} ·{' '}
-                    <span className="text-foreground/70">{a.status}</span>
-                  </div>
-                </div>
-                <ExternalLink className="w-3 h-3 text-muted-foreground/50 opacity-0 group-hover:opacity-100 shrink-0 mt-1" />
-              </li>
-            ))}
+                  <ExternalLink className="w-3 h-3 text-muted-foreground/50 opacity-0 group-hover:opacity-100 shrink-0 mt-1" />
+                </>
+              );
+              return (
+                <li key={a.id}>
+                  {onAlertClick ? (
+                    <button
+                      type="button"
+                      onClick={() => onAlertClick(a.alert_id)}
+                      className="w-full flex items-start gap-2.5 text-left -mx-2 px-2 py-1 rounded hover:bg-foreground/5 focus:outline-none focus-visible:ring-1 focus-visible:ring-primary"
+                    >
+                      {inner}
+                    </button>
+                  ) : (
+                    <div className="flex items-start gap-2.5">{inner}</div>
+                  )}
+                </li>
+              );
+            })}
             {alerts.length > top.length && (
               <li className="text-[11px] text-muted-foreground/70 pl-3.5 pt-1">
                 Show {alerts.length - top.length} more →

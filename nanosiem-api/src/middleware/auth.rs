@@ -83,13 +83,9 @@ fn is_public_endpoint(path: &str) -> bool {
         }
     }
 
-    // Identity provider push endpoint: /api/identity-providers/{id}/push
-    // Uses its own bearer token auth (collector_token), not JWT.
-    if let Some(rest) = path.strip_prefix("/api/identity-providers/") {
-        if rest.ends_with("/push") {
-            return true;
-        }
-    }
+    // NAN-1151 (3d): the AD /push endpoint (the only collector-token-auth'd
+    // identity endpoint) is retired — AD identity now flows through the
+    // nano_enrich lane. No identity-provider path is auth-exempt anymore.
 
     // Demo session public endpoints (only exist on DEPLOYMENT_MODE=demo deployments):
     // - POST /api/demo/session (create session)

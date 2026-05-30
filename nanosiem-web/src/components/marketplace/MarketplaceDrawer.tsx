@@ -104,6 +104,12 @@ export function MarketplaceDrawer({ slug, open, onOpenChange, onUpdated }: Marke
     try {
       await api.marketplace.syncEnrichment(entry.slug);
       toast({ title: 'Sync triggered', description: 'Data sync is running' });
+      // NAN-1108: fire the parent refetch so the catalog page sees
+      // is_syncing=true on the next load and kicks off polling. Without
+      // this, the card stays on `synced Xago` until the user navigates
+      // away — the polling effect waits for a positive signal that never
+      // arrives.
+      onUpdated();
     } catch {
       toast({ title: 'Error', description: 'Failed to trigger sync', variant: 'destructive' });
     } finally {

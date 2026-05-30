@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.539"
+version = "0.1.584"
 edition = "2021"
 authors = ["NanoSIEM Team"]
 license = "AGPL-3.0-or-later"

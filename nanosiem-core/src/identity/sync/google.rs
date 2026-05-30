@@ -6,12 +6,11 @@
 //! to fetch users from the Google Admin Directory API.
 
 use async_trait::async_trait;
-use sha2::{Digest, Sha256};
 use tracing::{info, instrument};
 
 use super::{SyncError, SyncProvider};
 use crate::identity::types::{
-    ConnectionTestResult, DeltaSyncResult, GoogleWorkspaceCredentials, UserRecordUpsert,
+    ConnectionTestResult, DeltaSyncResult, GoogleWorkspaceCredentials,
 };
 
 pub struct GoogleWorkspaceSync {
@@ -105,108 +104,13 @@ impl GoogleWorkspaceSync {
             .ok_or_else(|| SyncError::AuthError("No access_token in response".into()))
     }
 
-    /// Convert a Google Directory user JSON to a UserRecordUpsert
-    fn map_directory_user(user: &serde_json::Value) -> Option<UserRecordUpsert> {
-        let external_id = user["id"].as_str()?.to_string();
-        let email = user["primaryEmail"].as_str().map(|s| s.to_string());
-        let username = email
-            .as_ref()
-            .map(|e| e.split('@').next().unwrap_or(e).to_string());
-
-        let suspended = user["suspended"].as_bool().unwrap_or(false);
-        let archived = user["archived"].as_bool().unwrap_or(false);
-        let account_enabled = !suspended && !archived;
-        let account_status = if suspended {
-            "suspended"
-        } else if archived {
-            "disabled"
-        } else {
-            "active"
-        }
-        .to_string();
-
-        let last_login = user["lastLoginTime"]
-            .as_str()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
-
-        let created_at = user["creationTime"]
-            .as_str()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
-
-        let mfa_enabled = user["isEnrolledIn2Sv"].as_bool();
-
-        // Extract phone from phones array
-        let phone = user["phones"]
-            .as_array()
-            .and_then(|phones| phones.first())
-            .and_then(|p| p["value"].as_str())
-            .map(|s| s.to_string());
-
-        // Extract org unit info
-        let org = user["organizations"]
-            .as_array()
-            .and_then(|orgs| orgs.first());
-        let department = org
-            .and_then(|o| o["department"].as_str())
-            .map(|s| s.to_string());
-        let title = org.and_then(|o| o["title"].as_str()).map(|s| s.to_string());
-        let company = org.and_then(|o| o["name"].as_str()).map(|s| s.to_string());
-
-        // Manager from relations
-        let manager_email = user["relations"]
-            .as_array()
-            .and_then(|rels| rels.iter().find(|r| r["type"].as_str() == Some("manager")))
-            .and_then(|r| r["value"].as_str())
-            .map(|s| s.to_string());
-
-        let raw = serde_json::to_string(user).unwrap_or_default();
-        let hash = hex::encode(Sha256::digest(raw.as_bytes()));
-
-        Some(UserRecordUpsert {
-            external_id,
-            username,
-            upn: email.clone(), // Google uses email as UPN equivalent
-            email,
-            display_name: user["name"]["fullName"].as_str().map(|s| s.to_string()),
-            first_name: user["name"]["givenName"].as_str().map(|s| s.to_string()),
-            last_name: user["name"]["familyName"].as_str().map(|s| s.to_string()),
-            department,
-            title,
-            manager_upn: manager_email,
-            manager_display_name: None, // Would need separate lookup
-            company,
-            office_location: None,
-            city: None,
-            country: None,
-            groups: Vec::new(), // Populated via separate group membership API
-            account_enabled,
-            account_status,
-            mfa_enabled,
-            last_sign_in_at: last_login,
-            created_in_directory_at: created_at,
-            phone,
-            employee_id: user["externalIds"]
-                .as_array()
-                .and_then(|ids| {
-                    ids.iter()
-                        .find(|i| i["type"].as_str() == Some("organization"))
-                })
-                .and_then(|i| i["value"].as_str())
-                .map(|s| s.to_string()),
-            employee_type: None,
-            sync_hash: hash,
-        })
-    }
-
     /// Fetch a single page from the Google Directory API
     async fn fetch_page(
         &self,
         token: &str,
         domain: &str,
         page_token: Option<&str>,
-    ) -> Result<(Vec<UserRecordUpsert>, Option<String>), SyncError> {
+    ) -> Result<(Vec<serde_json::Value>, Option<String>), SyncError> {
         let mut url = format!(
             "https://admin.googleapis.com/admin/directory/v1/users?customer=my_customer&domain={}&maxResults=500&projection=full",
             domain
@@ -246,9 +150,7 @@ impl GoogleWorkspaceSync {
         let mut users = Vec::new();
         if let Some(user_list) = body["users"].as_array() {
             for user in user_list {
-                if let Some(record) = Self::map_directory_user(user) {
-                    users.push(record);
-                }
+                users.push(user.clone());
             }
         }
 
@@ -264,7 +166,7 @@ impl SyncProvider for GoogleWorkspaceSync {
         &self,
         credentials: &serde_json::Value,
         config: &serde_json::Value,
-    ) -> Result<Vec<UserRecordUpsert>, SyncError> {
+    ) -> Result<Vec<serde_json::Value>, SyncError> {
         let creds: GoogleWorkspaceCredentials = serde_json::from_value(credentials.clone())
             .map_err(|e| SyncError::InvalidCredentials(e.to_string()))?;
 
@@ -390,9 +292,7 @@ impl SyncProvider for GoogleWorkspaceSync {
 
             if let Some(user_list) = body["users"].as_array() {
                 for user in user_list {
-                    if let Some(record) = Self::map_directory_user(user) {
-                        users.push(record);
-                    }
+                    users.push(user.clone());
                 }
             }
 

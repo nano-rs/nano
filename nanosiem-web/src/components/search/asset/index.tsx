@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { api } from '@/lib/api';
 import { useAssetDossier } from '@/hooks/use-api';
 import type {
@@ -18,7 +19,32 @@ import { FilesCard } from './sections/FilesCard';
 import { DnsCard } from './sections/DnsCard';
 import { AssetPrevalenceCard } from './AssetPrevalenceCard';
 import { AssetStream } from './AssetStream';
-import { formatTimestampHMS } from './helpers';
+import { computeBucketWindow, formatTimestampHMS, withAssetIdentity } from './helpers';
+
+// nPL `| where` snippets used by more than one drilldown. Keep these as
+// module-level consts so future edits land in one place.
+const NPL_TOP_DOMAINS = '| where query!="" | stats count by query | sort -count';
+// NEW_DOMAINS mirrors the backend tile: uniqExactIf(dest_host, prevalence_dest_domain < 5).
+// Don't reuse NPL_TOP_DOMAINS — that aggregates the DNS-question field, which is
+// empty on the asset's network rows.
+const NPL_NEW_DOMAINS =
+  '| where dest_host!="" AND prevalence_dest_domain<5 | stats count by dest_host | sort -count';
+const NPL_TOP_DESTINATIONS_BY_BYTES =
+  '| where dest_ip!="" | stats count, sum(bytes_out) as bytes by dest_ip, dest_host | sort -bytes';
+const NPL_TOP_DESTINATIONS_BY_COUNT =
+  '| where dest_ip!="" | stats count by dest_ip, dest_host | sort -count';
+const NPL_PROCESS_TREE = '| where process_name!="" | tree process';
+const NPL_FILE_EVENTS = '| where file_action!=""';
+const NPL_AUTH_INTERACTIVE =
+  '| where category="authentication" AND lower(auth_type) LIKE "%interactive%"';
+const NPL_AUTH_NETWORK_OR_LATERAL =
+  '| where category="authentication" AND (lower(auth_type) LIKE "%network%" OR lower(auth_type) LIKE "%lateral%")';
+// Timeline lane → drilldown command. AUTH/PROC/NET/FILE use `| where`; ALERT
+// uses a base-search filter on source_type.
+const NPL_LANE_AUTH = '| where category="authentication" OR category="authorization"';
+const NPL_LANE_PROC = '| where process_name!=""';
+const NPL_LANE_NET = '| where dest_ip!=""';
+const NPL_LANE_FILE = '| where file_action!=""';
 
 // ---------------------------------------------------------------------------
 // Types (mirrors the shape SearchResults passes today)
@@ -55,7 +81,7 @@ export interface AssetViewProps {
     timestamp?: number;
   } | null;
   timeRange?: TimeRange;
-  onFetchLog?: (id: string, timestamp: Date) => Promise<Record<string, unknown> | null>;
+  onFetchLog?: (id: string, timestamp: Date, sourceType?: string) => Promise<Record<string, unknown> | null>;
   /** Current visible-fields count for the Fields restore pill (22 in the mockup) */
   fieldsCollapsedCount?: number;
   /** Callback to expand the Fields panel */
@@ -110,6 +136,68 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
     };
   }, [identifierField, identifierValue, identities, timeRange]);
   const { data: dossier, loading: dossierLoading } = useAssetDossier(dossierRequest);
+
+  // Identity-aware drilldown — see `helpers.tsx:withAssetIdentity`. Wrapped in
+  // a callback so each card can route clicks through one call.
+  const handleAssetDrilldown = useCallback(
+    (filters: Record<string, unknown>) => {
+      if (!onDrilldown) return;
+      onDrilldown(
+        withAssetIdentity(
+          filters,
+          identities as { ip?: string | null; hostname?: string | null; user?: string | null }[],
+          identifierField && identifierValue ? { field: identifierField, value: identifierValue } : null,
+        ),
+      );
+    },
+    [onDrilldown, identities, identifierField, identifierValue],
+  );
+
+  const navigate = useNavigate();
+  const handleAlertClick = useCallback(
+    (alertRowId: string) => {
+      navigate(`/alerts/${alertRowId}`);
+    },
+    [navigate],
+  );
+
+  // Map a timeline lane (auth/proc/net/file/alert) + bucket index to a
+  // lane-scoped, time-narrowed drilldown. Each bucket spans
+  // (timeRange / dossier.timeline.buckets) of wall-clock time; we pass the
+  // bucket's [start, end] as `_timeRangeOverride` so handleDrilldown in
+  // Search.tsx narrows the time picker to that window (NAN-1050).
+  const handleTimelineCellClick = useCallback(
+    (lane: string, bucketIdx: number) => {
+      const bucketCount = dossier?.timeline.buckets;
+      const bucketWindow =
+        timeRange && bucketCount && bucketCount > 0
+          ? computeBucketWindow(timeRange, bucketCount, bucketIdx)
+          : undefined;
+      const extras: Record<string, unknown> = bucketWindow
+        ? { _timeRangeOverride: bucketWindow }
+        : {};
+      switch (lane) {
+        case 'auth':
+          handleAssetDrilldown({ ...extras, _tableCommand: NPL_LANE_AUTH });
+          return;
+        case 'proc':
+          handleAssetDrilldown({ ...extras, _tableCommand: NPL_LANE_PROC });
+          return;
+        case 'net':
+          handleAssetDrilldown({ ...extras, _tableCommand: NPL_LANE_NET });
+          return;
+        case 'file':
+          handleAssetDrilldown({ ...extras, _tableCommand: NPL_LANE_FILE });
+          return;
+        case 'alert':
+          handleAssetDrilldown({ ...extras, source_type: 'signal' });
+          return;
+        default:
+          handleAssetDrilldown(extras);
+      }
+    },
+    [handleAssetDrilldown, dossier?.timeline.buckets, timeRange],
+  );
 
   // Entity context (risk + alerts + cases) fetched in parallel from nanosiem-api
   const [entityContext, setEntityContext] = useState<EntityContextResponse | null>(null);
@@ -195,6 +283,7 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
                 <AssetActivityTimeline
                   timeline={dossier.timeline}
                   spanLabel={spanLabel}
+                  onCellClick={onDrilldown ? handleTimelineCellClick : undefined}
                 />
               )}
 
@@ -202,12 +291,71 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
                 <AlertsCard
                   alerts={entityContext?.alerts ?? []}
                   total={entityContext?.alert_count}
+                  onAlertClick={handleAlertClick}
+                  onOpenSequence={onDrilldown ? () => handleAssetDrilldown({ source_type: 'signal' }) : undefined}
                 />
-                {dossier && <ProcessesCard processes={dossier.processes} />}
-                {dossier && <NetworkCard network={dossier.network} />}
-                {dossier && <AuthCard auth={dossier.auth} />}
-                {dossier && <FilesCard files={dossier.files} />}
-                {dossier && <DnsCard dns={dossier.dns} />}
+                {dossier && (
+                  <ProcessesCard
+                    processes={dossier.processes}
+                    onOpenTree={onDrilldown ? () => handleAssetDrilldown({ _tableCommand: NPL_PROCESS_TREE }) : undefined}
+                  />
+                )}
+                {dossier && (
+                  <NetworkCard
+                    network={dossier.network}
+                    onOpenTopDestinations={onDrilldown ? () => handleAssetDrilldown({ _tableCommand: NPL_TOP_DESTINATIONS_BY_BYTES }) : undefined}
+                    onStatClick={onDrilldown ? (key, ctx) => {
+                      switch (key) {
+                        case 'UNIQ_DSTS':
+                          handleAssetDrilldown({ _tableCommand: NPL_TOP_DESTINATIONS_BY_COUNT });
+                          return;
+                        case 'NEW_DOMAINS':
+                          handleAssetDrilldown({ _tableCommand: NPL_NEW_DOMAINS });
+                          return;
+                        case 'RARE_COUNTRY':
+                          // Dossier returns enriched_dest_country_code (e.g. "CN"),
+                          // not the full name in enriched_dest_country — filter the
+                          // column the value came from.
+                          if (ctx?.country) handleAssetDrilldown({ enriched_dest_country_code: ctx.country });
+                          return;
+                      }
+                    } : undefined}
+                  />
+                )}
+                {dossier && (
+                  <AuthCard
+                    auth={dossier.auth}
+                    onOpenAll={onDrilldown ? () => handleAssetDrilldown({ category: 'authentication' }) : undefined}
+                    onStatClick={onDrilldown ? (key) => {
+                      switch (key) {
+                        case 'SUCCESS':
+                          handleAssetDrilldown({ category: 'authentication', auth_result: 'success' });
+                          return;
+                        case 'FAILURE':
+                          handleAssetDrilldown({ category: 'authentication', auth_result: 'failure' });
+                          return;
+                        case 'INTERACT':
+                          handleAssetDrilldown({ _tableCommand: NPL_AUTH_INTERACTIVE });
+                          return;
+                        case 'NETWORK':
+                          handleAssetDrilldown({ _tableCommand: NPL_AUTH_NETWORK_OR_LATERAL });
+                          return;
+                      }
+                    } : undefined}
+                  />
+                )}
+                {dossier && (
+                  <FilesCard
+                    files={dossier.files}
+                    onOpenAll={onDrilldown ? () => handleAssetDrilldown({ _tableCommand: NPL_FILE_EVENTS }) : undefined}
+                  />
+                )}
+                {dossier && (
+                  <DnsCard
+                    dns={dossier.dns}
+                    onOpenTopDomains={onDrilldown ? () => handleAssetDrilldown({ _tableCommand: NPL_TOP_DOMAINS }) : undefined}
+                  />
+                )}
               </div>
             </>
           )}

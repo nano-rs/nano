@@ -441,13 +441,29 @@ pub async fn sync_enrichment(
             #[cfg(feature = "enterprise")]
             {
                 if let Some(ce_id) = entry.custom_enrichment_id {
-                    let _ = super::custom_enrichment::trigger_run(
-                        State(state.clone()),
-                        Extension(auth),
-                        Extension(client.clone()),
-                        Path(TypeIdParam(ce_id)),
-                    )
-                    .await?;
+                    // Fire-and-forget: a Deno sync (fetch + thousands of CH
+                    // inserts) can take minutes. Awaiting it inline blocked the
+                    // HTTP response and — worse — tied the run to the request
+                    // lifecycle, so a client disconnect cancelled the handler
+                    // future before `complete_run()` fired and orphaned the run
+                    // in `status='running'` (NAN-1113). Spawn it like the
+                    // `native` branch; the run record + is_syncing polling
+                    // (NAN-1108) surface progress.
+                    let state_spawn = state.clone();
+                    let client_spawn = client.clone();
+                    let slug_spawn = slug.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = super::custom_enrichment::trigger_run(
+                            State(state_spawn),
+                            Extension(auth),
+                            Extension(client_spawn),
+                            Path(TypeIdParam(ce_id)),
+                        )
+                        .await
+                        {
+                            tracing::error!(slug = %slug_spawn, error = %e, "Deno enrichment sync failed");
+                        }
+                    });
                 } else {
                     return Err(ApiError::BadRequest(
                         "Deno enrichment has no custom_enrichment_id".to_string(),
@@ -463,8 +479,15 @@ pub async fn sync_enrichment(
             }
         }
         "identity" => {
+            // Same fire-and-forget treatment as the deno path (NAN-1113):
+            // don't block the HTTP response on the provider sync.
             let install_service = MarketplaceInstallService::new(state.pool.clone());
-            install_service.trigger_sync(&slug).await?;
+            let slug_spawn = slug.clone();
+            tokio::spawn(async move {
+                if let Err(e) = install_service.trigger_sync(&slug_spawn).await {
+                    tracing::error!(slug = %slug_spawn, error = %e, "Identity provider sync failed");
+                }
+            });
         }
         _ => {
             return Err(ApiError::BadRequest(format!(

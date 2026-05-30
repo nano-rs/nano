@@ -267,14 +267,21 @@ impl RepositoryParsersRepository {
         vendor: Option<&str>,
         product: Option<&str>,
         parser_vrl: Option<&str>,
+        // NAN-1149: enrichment-parser fields (kind defaults "parser" for logs).
+        kind: &str,
+        enrich_kind: Option<&str>,
+        enrich_source: Option<&str>,
+        target_table: Option<&str>,
+        normalize_vrl: Option<&str>,
     ) -> Result<RepositoryParser, RepositoryParsersRepositoryError> {
         let result = sqlx::query_as::<_, RepositoryParser>(
             r#"
             INSERT INTO repository_parsers (
                 repository_id, file_path, file_sha, raw_content,
-                name, display_name, description, version, category, vendor, product, parser_vrl
+                name, display_name, description, version, category, vendor, product, parser_vrl,
+                kind, enrich_kind, enrich_source, target_table, normalize_vrl
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             ON CONFLICT (repository_id, file_path) DO UPDATE SET
                 file_sha = EXCLUDED.file_sha,
                 raw_content = EXCLUDED.raw_content,
@@ -286,6 +293,11 @@ impl RepositoryParsersRepository {
                 vendor = EXCLUDED.vendor,
                 product = EXCLUDED.product,
                 parser_vrl = EXCLUDED.parser_vrl,
+                kind = EXCLUDED.kind,
+                enrich_kind = EXCLUDED.enrich_kind,
+                enrich_source = EXCLUDED.enrich_source,
+                target_table = EXCLUDED.target_table,
+                normalize_vrl = EXCLUDED.normalize_vrl,
                 updated_at = NOW()
             RETURNING *
             "#,
@@ -302,6 +314,11 @@ impl RepositoryParsersRepository {
         .bind(vendor)
         .bind(product)
         .bind(parser_vrl)
+        .bind(kind)
+        .bind(enrich_kind)
+        .bind(enrich_source)
+        .bind(target_table)
+        .bind(normalize_vrl)
         .fetch_one(&self.pool)
         .await?;
 

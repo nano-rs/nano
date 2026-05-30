@@ -6,11 +6,15 @@ import { cn } from '@/lib/utils';
 import { SectionCard, EmptyCell, StatCell } from './_shared';
 import { formatCompact } from '../helpers';
 
+export type AuthStatKey = 'SUCCESS' | 'FAILURE' | 'INTERACT' | 'NETWORK';
+
 interface AuthCardProps {
   auth: AssetDossierAuth;
+  onOpenAll?: () => void;
+  onStatClick?: (key: AuthStatKey) => void;
 }
 
-export function AuthCard({ auth }: AuthCardProps) {
+export function AuthCard({ auth, onOpenAll, onStatClick }: AuthCardProps) {
   const { success, failure, interactive, network, lateral, recent } = auth;
   const total = success + failure;
 
@@ -19,6 +23,7 @@ export function AuthCard({ auth }: AuthCardProps) {
       <SectionCard
         title="Authentication"
         action={<span>All auth events ↗</span>}
+        onActionClick={onOpenAll}
         icon={<ShieldCheck className="w-[13px] h-[13px] text-muted-foreground/70" />}
       >
         <EmptyCell>No auth events for this entity in range</EmptyCell>
@@ -30,6 +35,7 @@ export function AuthCard({ auth }: AuthCardProps) {
     <SectionCard
       title="Authentication"
       action={<span>All auth events ↗</span>}
+      onActionClick={onOpenAll}
       icon={<ShieldCheck className="w-[13px] h-[13px] text-muted-foreground/70" />}
     >
       <div className="space-y-3">
@@ -47,10 +53,31 @@ export function AuthCard({ auth }: AuthCardProps) {
         </div>
 
         <div className="grid grid-cols-4 gap-2">
-          <StatCell value={success} label="SUCCESS" />
-          <StatCell value={failure} label="FAILURE" tone={failure > 0 ? 'warn' : 'default'} />
-          <StatCell value={interactive} label="INTERACT." />
-          <StatCell value={network + lateral} label="NETWORK" />
+          <StatCell
+            value={success}
+            label="SUCCESS"
+            onClick={onStatClick ? () => onStatClick('SUCCESS') : undefined}
+            disabled={success === 0}
+          />
+          <StatCell
+            value={failure}
+            label="FAILURE"
+            tone={failure > 0 ? 'warn' : 'default'}
+            onClick={onStatClick ? () => onStatClick('FAILURE') : undefined}
+            disabled={failure === 0}
+          />
+          <StatCell
+            value={interactive}
+            label="INTERACT."
+            onClick={onStatClick ? () => onStatClick('INTERACT') : undefined}
+            disabled={interactive === 0}
+          />
+          <StatCell
+            value={network + lateral}
+            label="NETWORK"
+            onClick={onStatClick ? () => onStatClick('NETWORK') : undefined}
+            disabled={network + lateral === 0}
+          />
         </div>
 
         {recent.length > 0 && (

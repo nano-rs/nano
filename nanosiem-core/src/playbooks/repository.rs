@@ -943,7 +943,7 @@ impl PlaybookRepository {
                  FROM cases c
                  JOIN case_alerts ca ON ca.case_id = c.id
                  JOIN alerts a       ON a.id = ca.alert_id
-                 LEFT JOIN detection_rules r ON r.id = a.detection_rule_id
+                 LEFT JOIN detection_rules r ON r.id = a.rule_id
                 WHERE c.id = $1
                 ORDER BY a.created_at DESC
                 LIMIT 1"#,
@@ -965,7 +965,7 @@ impl PlaybookRepository {
                  FROM cases c
                  JOIN case_alerts ca ON ca.case_id = c.id
                  JOIN alerts a       ON a.id = ca.alert_id
-                 LEFT JOIN detection_rules r ON r.id = a.detection_rule_id
+                 LEFT JOIN detection_rules r ON r.id = a.rule_id
                 WHERE c.id = $1
                 ORDER BY a.created_at DESC
                 LIMIT 1"#,

@@ -35,6 +35,10 @@ pub(crate) fn row_to_log_source(row: &sqlx::postgres::PgRow) -> LogSource {
         // NAN-928: try_get keeps reads working against tenants that have not
         // yet applied migration 189; the column simply reads as None.
         dispatch_source_config_id: row.try_get("dispatch_source_config_id").unwrap_or(None),
+        // NAN-1084: only present when the SELECT joins source_configurations.
+        dispatch_source_config_type: row
+            .try_get("dispatch_source_config_type")
+            .unwrap_or(None),
         parser_vrl: row.get("parser_vrl"),
         output_fields: row.get("output_fields"),
         category: row.get("category"),
@@ -57,6 +61,17 @@ pub(crate) fn row_to_log_source(row: &sqlx::postgres::PgRow) -> LogSource {
         extension_vrl: row.try_get("extension_vrl").unwrap_or(None),
         extension_enabled: row.try_get("extension_enabled").unwrap_or(false),
         parser_only: row.try_get("parser_only").unwrap_or(false),
+        // NAN-1149: enrichment-parser flavor. try_get so read paths whose
+        // SELECT omits these columns (or tenants pre-migration 198) default to
+        // kind="log" with no enrich routing; the deploy-path SELECTs include
+        // them so an enrichment source stages into the push enrichment lane.
+        kind: row
+            .try_get("kind")
+            .unwrap_or_else(|_| "log".to_string()),
+        enrich_kind: row.try_get("enrich_kind").unwrap_or(None),
+        enrich_source: row.try_get("enrich_source").unwrap_or(None),
+        target_table: row.try_get("target_table").unwrap_or(None),
+        normalize_vrl: row.try_get("normalize_vrl").unwrap_or(None),
         source_parser_repository_id: row.try_get("source_parser_repository_id").unwrap_or(None),
         source_parser_path: row.try_get("source_parser_path").unwrap_or(None),
         source_parser_linked: row.try_get("source_parser_linked").unwrap_or(false),

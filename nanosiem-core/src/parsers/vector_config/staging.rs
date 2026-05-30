@@ -65,6 +65,12 @@ impl VectorConfigManager {
         // Stage the static pipeline config (normalization, CH mapping, sink)
         self.write_staged_pipeline_config().await?;
 
+        // Stage the push enrichment lane (NAN-1124) so `vector validate` sees it
+        // and promote_staged copies it to the active parsers dir. Pass parsers
+        // so the staged lane is generated per-source (NAN-1151), matching the
+        // active writer — not the static fallback.
+        self.write_staged_enrichment_config(parsers).await?;
+
         let enabled_count = parsers.iter().filter(|p| p.enabled).count();
         tracing::info!(
             "Staged {} parser(s) to {} with full config context",
@@ -207,9 +213,25 @@ impl VectorConfigManager {
             .map(|s| format!("\"{}\"", s))
             .collect::<Vec<_>>()
             .join(", ");
+        // NAN-1124: also exclude `nano_enrich` (push-enrichment) from the generic
+        // log route — kept in lockstep with router.rs::write_router_config, since
+        // promote_staged copies this file over the active _router.toml.
         config.push_str(&format!(
-            "generic = '!includes([{}], .source_type)'\n\n",
+            "generic = '!includes([{}], .source_type) && !starts_with(downcase(to_string(.source_type) ?? \"\"), \"nano_enrich\")'\n\n",
             exclusion_list
+        ));
+
+        // NAN-1124 / NAN-1151: enrichment lane router. Built via the SAME shared
+        // helper as the active writer (router.rs) so the staged file can't
+        // byte-drift from it (promote_staged copies this over the active
+        // _router.toml). Routes nano_enrich records to per-source outputs.
+        let enabled_enrichment: Vec<&Parser> = parsers
+            .iter()
+            .filter(|p| p.enabled && p.kind == "enrichment")
+            .collect();
+        config.push_str(&super::router::enrichment_router_block(
+            &enabled_enrichment,
+            &inputs_formatted,
         ));
 
         // Add placeholder transforms for built-in types without parsers
@@ -232,11 +254,13 @@ impl VectorConfigManager {
 
         // Placeholder combiner
         if placeholder_inputs.is_empty() {
-            // No placeholders — use filter that drops everything (empty inputs rejected by Vector)
+            // NAN-1083: no-op filter sharing the same upstream-input fix as
+            // `router.rs::write_router_config` (prior `prepare_output` input
+            // formed a cycle). Keep both writers in lockstep.
             config.push_str(
                 "[transforms.placeholder_combiner]\n\
                  type = \"filter\"\n\
-                 inputs = [\"prepare_output\"]\n\
+                 inputs = [\"source_router.generic\"]\n\
                  condition = \"false\"\n",
             );
         } else {
@@ -315,6 +339,33 @@ impl VectorConfigManager {
         fs::create_dir_all(&staging_parsers_dir).await?;
         let pipeline_path = staging_parsers_dir.join("_pipeline.toml");
         fs::write(&pipeline_path, Self::pipeline_config_content()).await?;
+        Ok(())
+    }
+
+    /// Write the push enrichment lane config to staging (NAN-1124). Mirror of
+    /// write_staged_pipeline_config so promote_staged copies it to the active
+    /// parsers dir alongside _pipeline.toml.
+    async fn write_staged_enrichment_config(
+        &self,
+        parsers: &[Parser],
+    ) -> Result<(), VectorConfigError> {
+        let staging_parsers_dir = self.staging_dir.join("sources").join("parsers");
+        fs::create_dir_all(&staging_parsers_dir).await?;
+        let enrichment_path = staging_parsers_dir.join("_enrichment.toml");
+        // NAN-1151: stage the SAME per-source lane the active writer generates
+        // (was the static `enrichment_lane_content`, so stage→promote silently
+        // reverted dynamic enrichment parsers to the committed static lane).
+        let enrichment_parsers: Vec<Parser> = parsers
+            .iter()
+            .filter(|p| p.kind == "enrichment")
+            .cloned()
+            .collect();
+        let content = Self::enrichment_lane_config(&enrichment_parsers);
+        // NAN-1150: same deploy-time guardrails as the active writer, so a
+        // malformed enrichment parser is rejected at the stage→validate→promote
+        // path too — never promoted to the active lane.
+        Self::guard_enrichment_lane(&enrichment_parsers, &content)?;
+        fs::write(&enrichment_path, content).await?;
         Ok(())
     }
 

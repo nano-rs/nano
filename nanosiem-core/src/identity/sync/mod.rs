@@ -11,28 +11,36 @@ pub mod google;
 pub mod okta;
 pub mod workday;
 
-use super::types::{ConnectionTestResult, DeltaSyncResult, UserRecordUpsert};
+use super::types::{ConnectionTestResult, DeltaSyncResult};
 use async_trait::async_trait;
 
 /// Callback that receives each page of users during a paged sync.
 /// Returns the count of users processed for progress tracking.
+///
+/// NAN-1151: pages are now the provider's RAW user objects
+/// (`serde_json::Value`), not pre-mapped `UserRecordUpsert`s — the caller emits
+/// them onto the `nano_enrich` lane where the repo-sourced per-source VRL does
+/// the mapping. The hard-coded Rust mappers are gone.
 pub type PageCallback<'a> = &'a (dyn Fn(
-    Vec<UserRecordUpsert>,
+    Vec<serde_json::Value>,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<u64, SyncError>> + Send + 'a>,
 > + Send
          + Sync);
 
-/// Trait for identity provider sync implementations
+/// Trait for identity provider sync implementations.
+///
+/// NAN-1151: providers fetch and yield RAW provider user objects; mapping to
+/// `user_registry` happens in VRL on the enrichment lane, not here.
 #[async_trait]
 pub trait SyncProvider: Send + Sync {
-    /// Perform a full sync — fetch all users from the provider.
+    /// Perform a full sync — fetch all users from the provider as raw JSON.
     /// Default implementation used as fallback for providers that don't support paged sync.
     async fn full_sync(
         &self,
         credentials: &serde_json::Value,
         config: &serde_json::Value,
-    ) -> Result<Vec<UserRecordUpsert>, SyncError>;
+    ) -> Result<Vec<serde_json::Value>, SyncError>;
 
     /// Perform a full sync, yielding pages to a callback as they arrive.
     /// Each page is dropped after the callback processes it, keeping memory bounded.

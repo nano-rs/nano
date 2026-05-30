@@ -110,8 +110,9 @@ export class IdentityApi {
     return this.request(`/api/identity/users${qs ? `?${qs}` : ''}`);
   }
 
-  async getUser(id: number): Promise<IdentityUser> {
-    return this.request(`/api/identity/users/${id}`);
+  // NAN-1117: id is now the composite "provider_id|external_id" string.
+  async getUser(id: string): Promise<IdentityUser> {
+    return this.request(`/api/identity/users/${encodeURIComponent(id)}`);
   }
 
   async lookupUser(identifier: string): Promise<IdentityUser | null> {

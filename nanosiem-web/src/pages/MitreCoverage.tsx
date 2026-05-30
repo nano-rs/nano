@@ -169,7 +169,7 @@ function SummaryStrip({ pct, covered, total, tiers, coverageGaps, totalGapCount,
             <div className="text-[10px] font-mono text-muted-foreground">
               {totalGapCount === 0
                 ? 'no gaps'
-                : `${totalGapCount} ${totalGapCount === 1 ? 'technique' : 'techniques'} · 0 live rules`}
+                : `${totalGapCount} ${totalGapCount === 1 ? 'technique' : 'techniques'} uncovered`}
             </div>
           </div>
           <div className="flex-1 flex flex-wrap gap-1 content-start">

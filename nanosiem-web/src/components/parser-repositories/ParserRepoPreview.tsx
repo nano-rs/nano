@@ -317,6 +317,10 @@ function OverviewPane({
   onViewDiff: (logSourceId: string) => void;
 }) {
   const linkedId = parser.raw.linked_log_source_id ?? null;
+  // NAN-1149: enrichment parsers don't describe a log source_type/transport;
+  // they route a per-source mapping into a target table. Surface that pair
+  // instead of the log-routing fields.
+  const isEnrichment = parser.raw.kind === 'enrichment';
   return (
     <div className="p-4 space-y-4">
       <div>
@@ -329,14 +333,33 @@ function OverviewPane({
       </div>
 
       <div className="grid grid-cols-2 gap-3">
-        <Meta
-          k="Source type"
-          v={<span className="font-mono">{parser.sourceType}</span>}
-        />
-        <Meta
-          k="Transport"
-          v={parser.transport ? <TransportChip t={parser.transport} /> : <span>—</span>}
-        />
+        {isEnrichment ? (
+          <>
+            <Meta
+              k="Enrich kind"
+              v={<span className="font-mono">{parser.raw.enrich_kind || '—'}</span>}
+            />
+            <Meta
+              k="Enrich source"
+              v={<span className="font-mono">{parser.raw.enrich_source || '—'}</span>}
+            />
+            <Meta
+              k="Target table"
+              v={<span className="font-mono">{parser.raw.target_table || '—'}</span>}
+            />
+          </>
+        ) : (
+          <>
+            <Meta
+              k="Source type"
+              v={<span className="font-mono">{parser.sourceType}</span>}
+            />
+            <Meta
+              k="Transport"
+              v={parser.transport ? <TransportChip t={parser.transport} /> : <span>—</span>}
+            />
+          </>
+        )}
         <Meta
           k="Category"
           v={parser.category ? <CategoryChip cat={parser.category} /> : <span>—</span>}
@@ -449,12 +472,17 @@ function Meta({ k, v }: { k: string; v: React.ReactNode }) {
 // ==================================================================
 
 function VrlPane({ parser }: { parser: RepoParserView }) {
-  const vrl = parser.raw.parser_vrl ?? '';
+  // NAN-1149: enrichment parsers carry their logic in `normalize_vrl` (the
+  // mapping emitted into the enrichment lane), not a log `parser_vrl`.
+  const isEnrichment = parser.raw.kind === 'enrichment';
+  const vrl = (isEnrichment ? parser.raw.normalize_vrl : parser.raw.parser_vrl) ?? '';
   const tokens = useMemo(() => tokenizeVrl(vrl), [vrl]);
   if (!vrl) {
     return (
       <div className="p-4 text-[11.5px] text-muted-foreground">
-        No VRL source available for this parser.
+        {isEnrichment
+          ? 'No normalize VRL available for this enrichment parser.'
+          : 'No VRL source available for this parser.'}
       </div>
     );
   }
@@ -652,6 +680,10 @@ function ImportOptionsPane({
   onChangeSourceType: (s: string) => void;
   configs: SourceConfiguration[];
 }) {
+  // NAN-1149: enrichment imports have no source_type / dispatch-config routing
+  // — the lane routes by enrich_source into target_table, both fixed by the
+  // parser definition. Hide the log-routing controls and show that mapping.
+  const isEnrichment = parser.raw.kind === 'enrichment';
   return (
     <div className="p-4 space-y-4">
       {previewLoading && (
@@ -692,7 +724,25 @@ function ImportOptionsPane({
         </div>
       </div>
 
+      {/* Enrichment routing summary — replaces dispatch/source-type below */}
+      {isEnrichment && (
+        <div className="rounded-md border border-border bg-card px-3 py-2.5 space-y-1">
+          <div className="flex items-center gap-1.5 text-[11.5px] font-medium text-foreground/80 mb-1">
+            <Info className="w-[12px] h-[12px]" strokeWidth={1.5} />
+            Enrichment routing
+          </div>
+          <div className="text-[10.5px] text-muted-foreground leading-relaxed">
+            This parser normalizes pushed <span className="font-mono text-foreground">{parser.raw.enrich_source || '—'}</span>{' '}
+            {parser.raw.enrich_kind || ''} records into{' '}
+            <span className="font-mono text-foreground">{parser.raw.target_table || '—'}</span>. Routing is
+            fixed by the parser definition — there is no source-type or dispatch config to pick.
+          </div>
+        </div>
+      )}
+
       {/* Target config */}
+      {!isEnrichment && (
+      <>
       <div>
         <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">
           Dispatch from
@@ -777,6 +827,8 @@ function ImportOptionsPane({
           )}
         </div>
       </div>
+      </>
+      )}
 
       {/* Proposed metadata from preview */}
       {preview && !preview.already_imported && (

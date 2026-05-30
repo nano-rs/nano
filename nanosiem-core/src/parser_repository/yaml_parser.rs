@@ -15,6 +15,21 @@ pub struct ParserYaml {
     pub product: Option<String>,
     pub parser_vrl: Option<String>,
     pub match_values: Option<Vec<String>>,
+    // NAN-1149: enrichment-parser flavor. When `kind: enrichment`, this parser
+    // normalizes a pushed `nano_enrich` record into `target_table` via
+    // `normalize_vrl`, rather than parsing a log `source_type`. `kind`,
+    // `enrich_kind`, and `enrich_source` may be set explicitly here or inferred
+    // from the repo path `enrichments/<enrich_kind>/<enrich_source>/parser.yaml`.
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub enrich_kind: Option<String>,
+    #[serde(default)]
+    pub enrich_source: Option<String>,
+    #[serde(default)]
+    pub target_table: Option<String>,
+    #[serde(default)]
+    pub normalize_vrl: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -105,5 +120,35 @@ display_name: Test
 "#;
         let result = parse_parser_yaml(yaml);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_enrichment_parser_yaml() {
+        let yaml = r#"
+name: ad_identity
+kind: enrichment
+enrich_kind: identity
+enrich_source: ad
+target_table: user_registry
+normalize_vrl: |
+  external_id = to_string(.external_id) ?? ""
+  . = { "external_id": external_id }
+"#;
+        let result = parse_parser_yaml(yaml).unwrap();
+        assert_eq!(result.name, "ad_identity");
+        assert_eq!(result.kind.as_deref(), Some("enrichment"));
+        assert_eq!(result.enrich_kind.as_deref(), Some("identity"));
+        assert_eq!(result.enrich_source.as_deref(), Some("ad"));
+        assert_eq!(result.target_table.as_deref(), Some("user_registry"));
+        assert!(result.normalize_vrl.is_some());
+    }
+
+    #[test]
+    fn test_log_parser_yaml_has_no_enrichment_fields() {
+        let yaml = "name: apache\nparser_vrl: |\n  .udm = {}\n";
+        let result = parse_parser_yaml(yaml).unwrap();
+        assert_eq!(result.kind, None);
+        assert_eq!(result.enrich_kind, None);
+        assert_eq!(result.target_table, None);
     }
 }

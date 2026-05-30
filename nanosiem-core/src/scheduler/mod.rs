@@ -13,8 +13,8 @@ pub mod types;
 
 pub use repository::{JobStats, SchedulerRepository, SchedulerRepositoryError};
 pub use service::{
-    calculate_next_run, calculate_next_runs, describe_cron, validate_cron, SchedulerError,
-    SchedulerService,
+    calculate_next_run, calculate_next_runs, describe_cron, normalize_cron, validate_cron,
+    SchedulerError, SchedulerService,
 };
 pub use types::{
     JobExecution, JobFilter, JobStatus, NewScheduledJob, RetryPolicy, ScheduledJob,

@@ -8,12 +8,12 @@
  * `RevealOnceCard` over the list once the dialog dismisses) to keep this
  * dialog single-purpose.
  *
- * Scope picker offers presets + custom mode. Presets are derived from the
- * permission catalogue at runtime so they stay in sync with the backend.
+ * Scope selection is delegated to the shared `ScopeSelector` so create + edit
+ * stay in lockstep.
  */
 
-import { useEffect, useMemo, useState } from 'react';
-import { KeyRound, Search as SearchIcon, Check, Loader2 } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { KeyRound, Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useToast } from '@/hooks/use-toast';
 import {
@@ -30,6 +30,7 @@ import {
   SheetDescription,
   SheetFooter,
 } from '@/components/ui/sheet';
+import { ScopeSelector } from './ScopeSelector';
 
 interface CreateApiKeyDialogProps {
   open: boolean;
@@ -45,51 +46,11 @@ const EXPIRES_OPTIONS = [
   { id: 'never', label: 'Never', days: null },
 ] as const;
 
-interface ScopePreset {
-  id: string;
-  label: string;
-  desc: string;
-  match: (p: PermissionInfo) => boolean;
-}
-
-const PRESETS: ScopePreset[] = [
-  {
-    id: 'readonly',
-    label: 'Read-only',
-    desc: 'view-only access across resources',
-    match: p => p.id.endsWith(':view') || p.id.endsWith(':read'),
-  },
-  {
-    id: 'detection-ci',
-    label: 'Detection CI/CD',
-    desc: 'rules + repos for git-driven authoring',
-    match: p => p.id.startsWith('detections:') || p.id.startsWith('rules:') || p.id.startsWith('parsers:'),
-  },
-  {
-    id: 'ingest',
-    label: 'Event ingest',
-    desc: 'event ingestion + read access for verification',
-    match: p =>
-      p.id === 'events:ingest'
-      || p.id === 'search:read'
-      || p.id === 'search:view'
-      || p.id.startsWith('log_sources:'),
-  },
-  {
-    id: 'custom',
-    label: 'Custom',
-    desc: 'pick scopes individually',
-    match: () => false,
-  },
-];
-
 export function CreateApiKeyDialog({ open, permissions, onClose, onCreated }: CreateApiKeyDialogProps) {
   const { toast } = useToast();
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
-  const [presetId, setPresetId] = useState<string>('readonly');
-  const [customScopes, setCustomScopes] = useState<Set<string>>(new Set());
-  const [scopeQuery, setScopeQuery] = useState('');
+  const [scopes, setScopes] = useState<string[]>([]);
   const [expiresId, setExpiresId] = useState<string>('90');
   const [rateLimit, setRateLimit] = useState<string>('');
   const [saving, setSaving] = useState(false);
@@ -98,43 +59,12 @@ export function CreateApiKeyDialog({ open, permissions, onClose, onCreated }: Cr
     if (!open) return;
     setName('');
     setDescription('');
-    setPresetId('readonly');
-    setCustomScopes(new Set());
-    setScopeQuery('');
     setExpiresId('90');
     setRateLimit('');
   }, [open]);
 
-  const presetScopes = useMemo(() => {
-    const out: Record<string, string[]> = {};
-    for (const p of PRESETS) {
-      out[p.id] = p.id === 'custom' ? [] : permissions.filter(perm => p.match(perm)).map(perm => perm.id);
-    }
-    return out;
-  }, [permissions]);
-
-  const activeScopes = presetId === 'custom' ? [...customScopes] : presetScopes[presetId] || [];
-
-  const filteredScopes = useMemo(() => {
-    const q = scopeQuery.trim().toLowerCase();
-    if (!q) return permissions;
-    return permissions.filter(p =>
-      p.id.toLowerCase().includes(q)
-      || p.description.toLowerCase().includes(q),
-    );
-  }, [scopeQuery, permissions]);
-
-  const toggleScope = (id: string) => {
-    setCustomScopes(prev => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  };
-
   const nameValid = name.trim().length >= 2;
-  const scopeValid = activeScopes.length > 0;
+  const scopeValid = scopes.length > 0;
   const canSubmit = nameValid && scopeValid && !saving;
 
   const handleSubmit = async () => {
@@ -149,11 +79,11 @@ export function CreateApiKeyDialog({ open, permissions, onClose, onCreated }: Cr
       const res = await api.createApiKey({
         name: name.trim(),
         description: description.trim() || undefined,
-        permissions: activeScopes,
+        permissions: scopes,
         expires_at,
         rate_limit: rl && !Number.isNaN(rl) && rl > 0 ? rl : undefined,
       });
-      toast({ title: 'Key created', description: `${name.trim()} · ${activeScopes.length} scope(s)` });
+      toast({ title: 'Key created', description: `${name.trim()} · ${scopes.length} scope(s)` });
       await onCreated(res);
     } catch (err) {
       toast({
@@ -207,76 +137,13 @@ export function CreateApiKeyDialog({ open, permissions, onClose, onCreated }: Cr
 
           <div>
             <label className="block text-[11px] font-medium text-foreground/80 mb-1.5">Scopes</label>
-            <div className="grid grid-cols-2 gap-2 mb-2">
-              {PRESETS.map(p => (
-                <button
-                  key={p.id}
-                  type="button"
-                  onClick={() => setPresetId(p.id)}
-                  className={cn(
-                    'text-left px-2.5 py-2 rounded-md border transition-colors',
-                    presetId === p.id
-                      ? 'border-primary/50 bg-primary/5'
-                      : 'border-border bg-card hover:border-foreground/20',
-                  )}
-                >
-                  <div className={cn('text-[11.5px] font-medium', presetId === p.id ? 'text-primary' : 'text-foreground')}>
-                    {p.label}
-                  </div>
-                  <div className="text-[10.5px] text-muted-foreground leading-tight mt-0.5">
-                    {p.id === 'custom' ? p.desc : `${(presetScopes[p.id] || []).length} scopes · ${p.desc}`}
-                  </div>
-                </button>
-              ))}
-            </div>
-
-            {presetId === 'custom' && (
-              <div className="rounded-md border border-border overflow-hidden">
-                <div className="h-7 px-2.5 flex items-center gap-2 border-b border-border bg-card/50">
-                  <SearchIcon className="w-[11px] h-[11px] text-muted-foreground" />
-                  <input
-                    value={scopeQuery}
-                    onChange={e => setScopeQuery(e.target.value)}
-                    placeholder="Filter scopes…"
-                    className="flex-1 bg-transparent outline-none text-[11px] text-foreground placeholder:text-muted-foreground/70"
-                  />
-                  <span className="font-mono text-[10px] text-muted-foreground/70 tabular-nums">{customScopes.size}</span>
-                </div>
-                <div className="max-h-[200px] overflow-y-auto scrollbar-thin">
-                  {filteredScopes.slice(0, 100).map(p => {
-                    const on = customScopes.has(p.id);
-                    return (
-                      <button
-                        key={p.id}
-                        type="button"
-                        role="checkbox"
-                        aria-checked={on}
-                        aria-label={`${p.id} — ${p.description}`}
-                        onClick={() => toggleScope(p.id)}
-                        className={cn(
-                          'w-full flex items-center gap-2 px-2.5 h-8 border-b border-border/50 last:border-b-0 transition-colors text-left',
-                          on ? 'bg-primary/8' : 'hover:bg-foreground/[0.025]',
-                        )}
-                      >
-                        <div className={cn(
-                          'w-3.5 h-3.5 rounded-sm border flex items-center justify-center shrink-0',
-                          on ? 'border-primary bg-primary text-primary-foreground' : 'border-border bg-card',
-                        )}>
-                          {on && <Check className="w-[9px] h-[9px]" />}
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <div className="font-mono text-[11px] text-foreground truncate">{p.id}</div>
-                          <div className="text-[10.5px] text-muted-foreground truncate leading-tight">{p.description}</div>
-                        </div>
-                      </button>
-                    );
-                  })}
-                  {filteredScopes.length === 0 && (
-                    <div className="px-3 py-4 text-center text-[11px] text-muted-foreground">No scopes match.</div>
-                  )}
-                </div>
-              </div>
-            )}
+            <ScopeSelector
+              key={open ? 'open' : 'closed'}
+              permissions={permissions}
+              initialScopes={[]}
+              defaultPresetId="readonly"
+              onChange={setScopes}
+            />
             {!scopeValid && (
               <div className="text-[10.5px] text-yellow-500 mt-1.5">
                 Pick at least one scope. A key with no scopes can't call any API.

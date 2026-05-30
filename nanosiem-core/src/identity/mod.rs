@@ -17,6 +17,6 @@ pub use service::{IdentityServiceError, IdentitySyncService};
 pub use types::{
     ConnectionTestResult, CreateIdentityProvider, IdentityProvider, IdentityProviderSummary,
     IdentityProviderType, IdentityStats, IdentitySyncResult, ListUsersParams, ProviderStatsSummary,
-    PushUserRecord, PushUsersRequest, UpdateIdentityProvider, UpdateIdentityProviderCredentials,
+    UpdateIdentityProvider, UpdateIdentityProviderCredentials,
     UserListResponse, UserRecord, UserRecordUpsert,
 };

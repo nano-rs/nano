@@ -31,14 +31,31 @@ impl ClickHouseMigrator {
             .await
             .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
 
-        let (on_cluster, engine) = if let Some(Some(ref cluster)) = self.cluster {
-            let zoo_path = format!("/clickhouse/tables/{{shard}}/{}/_migrations", self.database);
-            (
-                format!(" ON CLUSTER '{}'", cluster),
-                format!("ReplicatedMergeTree('{}', '{{replica}}')", zoo_path),
-            )
-        } else {
-            (String::new(), "MergeTree".to_string())
+        // Pick the engine + ON CLUSTER form to match the deployment topology.
+        // Three modes — same shape as `transform_for_cluster` post-NAN-1092:
+        //   - CH Cloud OR self-hosted Replicated database (cluster == db name):
+        //     Replicated engine manages zoo paths automatically. Empty args, no
+        //     ON CLUSTER. Cloud rejects explicit args with BAD_ARGUMENTS (36),
+        //     and the Replicated DB auto-propagates DDL so ON CLUSTER would be
+        //     redundant. See NAN-1094.
+        //   - Explicit operator-managed cluster (e.g. nanosiem_cluster from the
+        //     CH operator): supply zoo path + replica macro + ON CLUSTER.
+        //   - No cluster (single-node): plain MergeTree.
+        let is_cloud = self.is_cloud.unwrap_or(false);
+        let (on_cluster, engine) = match self.cluster.as_ref().and_then(|c| c.as_ref()) {
+            Some(cluster) if is_cloud || cluster == &self.database => (
+                String::new(),
+                "ReplicatedMergeTree()".to_string(),
+            ),
+            Some(cluster) => {
+                let zoo_path =
+                    format!("/clickhouse/tables/{{shard}}/{}/_migrations", self.database);
+                (
+                    format!(" ON CLUSTER '{}'", cluster),
+                    format!("ReplicatedMergeTree('{}', '{{replica}}')", zoo_path),
+                )
+            }
+            None => (String::new(), "MergeTree".to_string()),
         };
 
         let sql = format!(

@@ -105,6 +105,19 @@ export function Marketplace() {
   const categoryFilter = (searchParams.get('category') as CategoryFilter | null) || 'all';
   const installedOnly = searchParams.get('installed') === 'true';
 
+  // NAN-1111: legacy deep-link routes (/enrichments/threatfox etc.) redirect
+  // here with `?slug=<slug>` so the drawer opens directly on the right entry
+  // instead of dumping users onto the catalog grid. Strip the param after
+  // opening so a refresh of the marketplace page doesn't keep re-opening it.
+  useEffect(() => {
+    const slug = searchParams.get('slug');
+    if (!slug) return;
+    setDetailSlug(slug);
+    const next = new URLSearchParams(searchParams);
+    next.delete('slug');
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
+
   const mountedRef = useRef(true);
   useEffect(() => () => { mountedRef.current = false; }, []);
 
@@ -169,6 +182,28 @@ export function Marketplace() {
   }, [categoryFilter, installedOnly, toast]);
 
   useEffect(() => { void loadAll(); }, [loadAll]);
+
+  // NAN-1108: while any entry is mid-sync, refetch the catalog every ~3.5s
+  // so the card transitions from `syncing…` → `synced just now` without the
+  // user having to refresh. `anySyncing` is a plain boolean so the effect
+  // only re-runs when the syncing-vs-not state itself flips, not on every
+  // catalog refresh. Caps at 2 minutes to avoid burning CPU on a stuck run
+  // — at that point the user can refresh manually.
+  const anySyncing = useMemo(() => entries.some(e => e.is_syncing), [entries]);
+  useEffect(() => {
+    if (!anySyncing) return;
+    const startedAt = Date.now();
+    const MAX_MS = 2 * 60_000;
+    const POLL_MS = 3_500;
+    const interval = setInterval(() => {
+      if (Date.now() - startedAt > MAX_MS) {
+        clearInterval(interval);
+        return;
+      }
+      void loadAll();
+    }, POLL_MS);
+    return () => clearInterval(interval);
+  }, [anySyncing, loadAll]);
 
   const filtered = useMemo(() => {
     if (!searchQuery.trim()) return entries;

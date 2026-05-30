@@ -248,6 +248,15 @@ pub struct MarketplaceCatalogEntry {
     pub last_sync_status: Option<String>,
     pub last_error: Option<String>,
     pub record_count: i64,
+    /// True when a sync is currently in flight for this entry (a row exists
+    /// in `custom_enrichment_runs` with `status='running'` and a null
+    /// `completed_at`). Lets the catalog card distinguish "actively fetching
+    /// right now" from "configured and healthy" — both used to look the
+    /// same as a green "running" pill (NAN-1108). Derived per-query in
+    /// `hydrate_with_run_state`, not stored on `marketplace_catalog`.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub is_syncing: bool,
 
     // Changelog (from manifest, shown on update notifications)
     pub changelog: Option<String>,

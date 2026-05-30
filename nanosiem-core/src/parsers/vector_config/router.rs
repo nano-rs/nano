@@ -71,20 +71,15 @@ pub fn hec_normalize_present() -> bool {
 }
 
 /// Built-in source types that get placeholder routes when no parser is deployed.
-pub(super) const BUILTIN_TYPES: [&str; 12] = [
-    "windows_event",
-    "sysmon",
-    "palo_alto",
-    "fortinet",
-    "cisco_asa",
-    "syslog",
-    "aws_cloudtrail",
-    "aws_guardduty",
-    "azure_activity",
-    "azure_signin",
-    "okta",
-    "nginx",
-];
+///
+/// NAN-1083: emptied. The SIEM ships with zero opinionated pre-seeded routes —
+/// users install parsers (hand-rolled or pulled from the managed parser repo)
+/// and `match_values` on each parser drives all routing. Existing call sites
+/// iterate over this slice and degrade to no-ops; the "no placeholders" branch
+/// in `write_router_config` already handles the zero-case by emitting a no-op
+/// filter for `placeholder_combiner` (which `_pipeline.toml`'s `normalize`
+/// still requires as a named input).
+pub(super) const BUILTIN_TYPES: [&str; 0] = [];
 
 /// NAN-923: return true iff the file's TOML content declares the named
 /// route transform. Uses a simple substring search rather than parsing
@@ -247,6 +242,74 @@ pub(super) fn build_router_inputs_with_claim_dedupe(
     (final_inputs, filter_blocks)
 }
 
+/// Sanitize an `enrich_source` into a Vector component-id-safe route name.
+/// The route key (`enrichment_router.<name>`) and the generated normalize
+/// transform suffix (`enrichment_normalize_<name>`) MUST agree, so both
+/// `enrichment_router_block` here and `generate_enrichment_lane` in deploy.rs
+/// route through this one function. Real sources (`ad`, `entra`, `okta`,
+/// `google`, `workday`) pass through unchanged.
+pub(super) fn enrichment_route_name(source: &str) -> String {
+    source
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+/// Emit the `[transforms.enrichment_router]` block (NAN-1124 / NAN-1151).
+///
+/// Routes `nano_enrich` records to per-`source` outputs
+/// (`enrichment_router.<source>`) — one route per deployed enrichment parser's
+/// `enrich_source` — which the generated lane's
+/// `enrichment_normalize_<source>` transforms consume. When NO enrichment
+/// parsers are deployed, `write_enrichment_config` falls back to the committed
+/// static `_enrichment.toml` (which consumes the legacy per-`kind` outputs), so
+/// we emit those per-kind routes in that case to keep its inputs from dangling
+/// (NAN-867). Shared by the active writer (`router.rs`) and the staging writer
+/// (`staging.rs`) so the two can never byte-drift.
+pub(super) fn enrichment_router_block(
+    enrichment_parsers: &[&Parser],
+    inputs_formatted: &str,
+) -> String {
+    let mut out = format!(
+        "# =============================================================================\n\
+         # NAN-1124/NAN-1151: Enrichment lane router (nano_enrich -> per-source outputs)\n\
+         # =============================================================================\n\
+         [transforms.enrichment_router]\n\
+         type = \"route\"\n\
+         inputs = [{inputs_formatted}]\n\n\
+         [transforms.enrichment_router.route]\n"
+    );
+
+    // Deployed enrichment parsers' sources, deduped + stable-ordered.
+    let mut sources: Vec<&str> = enrichment_parsers
+        .iter()
+        .filter_map(|p| p.enrich_source.as_deref())
+        .filter(|s| !s.is_empty())
+        .collect();
+    sources.sort_unstable();
+    sources.dedup();
+
+    if sources.is_empty() {
+        // Static-fallback lane consumes the legacy per-kind outputs.
+        for kind in ["identity", "ip_context", "ioc", "asset"] {
+            out.push_str(&format!(
+                "{kind} = 'downcase(to_string(.source_type) ?? \"\") == \"nano_enrich\" && downcase(to_string(.kind) ?? \"\") == \"{kind}\"'\n"
+            ));
+        }
+    } else {
+        for source in sources {
+            let route = enrichment_route_name(source);
+            // Match the raw `.source` value; the route KEY is the sanitized name
+            // so the lane's `enrichment_router.<route>` input resolves.
+            out.push_str(&format!(
+                "{route} = 'downcase(to_string(.source_type) ?? \"\") == \"nano_enrich\" && downcase(to_string(.source) ?? \"\") == \"{source}\"'\n"
+            ));
+        }
+    }
+    out.push('\n');
+    out
+}
+
 impl VectorConfigManager {
     /// Get the directory for source configuration files
     fn source_configs_dir(&self) -> PathBuf {
@@ -347,6 +410,7 @@ impl VectorConfigManager {
     pub(super) async fn write_router_config(
         &self,
         parsers: &[Parser],
+        enrichment_parsers: &[Parser],
     ) -> Result<(), VectorConfigError> {
         // Write router to parsers_dir so it gets included in the S3 config sync.
         // In distributed deployments (Rackspace), the API sidecar syncs sources/ to S3,
@@ -530,10 +594,29 @@ impl VectorConfigManager {
             .map(|s| format!("\"{}\"", s))
             .collect::<Vec<_>>()
             .join(", ");
+        // NAN-1124: also exclude `nano_enrich` so push-enrichment records never
+        // fall through to the generic log parser (they're claimed by
+        // enrichment_router below). Matches the downcased source_type so a
+        // mixed-case body value can't leak into the logs pipeline.
         config.push_str(&format!(
-            "generic = '!includes([{}], .source_type)'\n\n",
+            "generic = '!includes([{}], .source_type) && !starts_with(downcase(to_string(.source_type) ?? \"\"), \"nano_enrich\")'\n\n",
             exclusion_list
         ));
+
+        // NAN-1124: enrichment lane router — a sibling to source_router with the
+        // IDENTICAL inputs, routing `nano_enrich` records by `.kind` to outputs
+        // consumed by config/vector/03-enrichment-lane.toml. Non-enrichment
+        // events fall to `enrichment_router._unmatched` (unconsumed → dropped);
+        // `nano_enrich` is excluded from `source_router.generic` above, so
+        // enrichment records never reach the logs pipeline and log events never
+        // reach the enrichment sinks. Emitted UNCONDITIONALLY (every kind route
+        // present) so the static lane file's `enrichment_router.<kind>` inputs
+        // can never dangle on startup (NAN-867 dangling-input class).
+        // NAN-1151: per-source enrichment routes from deployed enrichment
+        // parsers (shared helper keeps router.rs + staging.rs in lockstep).
+        let enabled_enrichment: Vec<&Parser> =
+            enrichment_parsers.iter().filter(|p| p.enabled).collect();
+        config.push_str(&enrichment_router_block(&enabled_enrichment, &inputs_formatted));
 
         // Add placeholder transforms
         config.push_str(
@@ -567,11 +650,18 @@ impl VectorConfigManager {
         );
 
         if placeholder_inputs.is_empty() {
-            // No placeholders — use filter that drops everything (empty inputs rejected by Vector)
+            // No placeholders — emit a no-op filter so `_pipeline.toml`'s
+            // `normalize` still has a valid named input. Input must be an
+            // upstream node; `source_router.generic` qualifies (it's already
+            // routed by this transform's own `route` block earlier in the
+            // file). NAN-1083: the prior `inputs = ["prepare_output"]` formed
+            // a cycle (prepare_output → ... → normalize → placeholder_combiner
+            // → prepare_output) and was never exercised because BUILTIN_TYPES
+            // was non-empty.
             config.push_str(
                 "[transforms.placeholder_combiner]\n\
                  type = \"filter\"\n\
-                 inputs = [\"prepare_output\"]\n\
+                 inputs = [\"source_router.generic\"]\n\
                  condition = \"false\"\n",
             );
         } else {
@@ -749,6 +839,11 @@ source = ".source_type = \"foo\""
             category: None,
             vendor: None,
             product: None,
+            kind: "log".to_string(),
+            enrich_kind: None,
+            enrich_source: None,
+            target_table: None,
+            normalize_vrl: None,
             namespace: "default".to_string(),
             timezone: "UTC".to_string(),
             match_values: Some(vec!["apache_access".to_string(), "apache".to_string()]),

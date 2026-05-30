@@ -482,17 +482,25 @@ fn eval_function_to_sql(
                 ))
         }
         "entropy" => {
-            // Shannon entropy calculation for strings (scalar version)
-            // H = -Σ(p(x) * log2(p(x))) where p(x) is probability of each character
-            // Use extractAll(str, '.') to split into individual characters
-            // (splitByString('', str) is invalid in ClickHouse - empty delimiter not supported)
+            // Shannon entropy over the character array of the argument:
+            //   H = -Σ p(c) * log2(p(c)) for each distinct character c.
+            // extractAll(str, '.') splits into individual characters (regex . = any char).
+            // The previous form wrapped this in a scalar subquery
+            //   (SELECT ... FROM (SELECT extractAll(arg,'.') AS chars))
+            // which failed with Code 48 (NOT_IMPLEMENTED) on a real column — the column
+            // could not be correlated into the derived table (NAN-1144). This inline form
+            // binds the char array exactly once by mapping a single-element array
+            // [extractAll(arg,'.')] through a lambda and taking element [1], so there is no
+            // subquery and extractAll is evaluated only once. Empty/single-char strings yield 0
+            // (the countEqual=0 guard avoids log2(0)/NaN).
             let arg = arg_sqls
                 .first()
                 .ok_or_else(|| SqlGenError::InvalidQuery("entropy() requires 1 argument".into()))?;
             Ok(format!(
-                "(SELECT arrayReduce('sum', arrayMap(x -> if(x > 0, -x * log2(x), 0), \
-                     arrayMap(c -> countEqual(chars, c) / length(chars), arrayDistinct(chars)))) \
-                     FROM (SELECT extractAll({}, '.') AS chars))",
+                "arrayMap(arr -> arrayReduce('sum', arrayMap(c -> \
+                 if(countEqual(arr, c) = 0, 0, \
+                 -(countEqual(arr, c) / length(arr)) * log2(countEqual(arr, c) / length(arr))), \
+                 arrayDistinct(arr))), [extractAll({}, '.')])[1]",
                 arg
             ))
         }
@@ -600,14 +608,54 @@ fn eval_function_to_sql(
                 )),
             }
         }
-        "date_part" | "datepart" | "extract" => {
-            // date_part(part, timestamp) - extract part from timestamp
-            if arg_sqls.len() != 2 {
+        "date_part" | "datepart" => {
+            // date_part(part, timestamp) - extract a calendar/clock component from a timestamp.
+            // args[0] MUST be a string literal naming the part; dispatch it to the matching
+            // ClickHouse to* function applied to the lowered timestamp expression (arg_sqls[1]).
+            // ClickHouse `extract` is a REGEX function (see the "extract" arm below), so date_part
+            // must NOT lower to extract(...) — doing so returned Code 43 on every part (NAN-1144).
+            if args.len() != 2 {
                 return Err(SqlGenError::InvalidQuery(
                     "date_part() requires 2 arguments (part, timestamp)".into(),
                 ));
             }
-            // Map common parts to ClickHouse functions
+            let part = match &args[0] {
+                EvalExpression::Literal(Value::String(s)) => s.to_lowercase(),
+                _ => {
+                    return Err(SqlGenError::InvalidQuery(
+                        "date_part() requires a string literal part name as the first argument \
+                         (e.g. \"hour\", \"day\", \"month\")"
+                            .into(),
+                    ));
+                }
+            };
+            let ts = &arg_sqls[1];
+            match part.as_str() {
+                "hour" => Ok(format!("toHour({})", ts)),
+                "minute" => Ok(format!("toMinute({})", ts)),
+                "second" => Ok(format!("toSecond({})", ts)),
+                "day" => Ok(format!("toDayOfMonth({})", ts)),
+                "month" => Ok(format!("toMonth({})", ts)),
+                "year" => Ok(format!("toYear({})", ts)),
+                "week" => Ok(format!("toISOWeek({})", ts)),
+                "dayofweek" => Ok(format!("toDayOfWeek({})", ts)),
+                "dayofyear" => Ok(format!("toDayOfYear({})", ts)),
+                other => Err(SqlGenError::InvalidQuery(format!(
+                    "date_part() unsupported part '{}' (supported: hour, minute, second, \
+                     day, month, year, week, dayofweek, dayofyear)",
+                    other
+                ))),
+            }
+        }
+        "extract" => {
+            // ClickHouse-native regex extract: extract(haystack, pattern) returns the first
+            // capture group. This is distinct from date_part (above) — the two were previously
+            // aliased together, which broke date_part. Keep the regex form intact (NAN-1144).
+            if arg_sqls.len() != 2 {
+                return Err(SqlGenError::InvalidQuery(
+                    "extract() requires 2 arguments (string, pattern)".into(),
+                ));
+            }
             Ok(format!("extract({}, {})", arg_sqls[0], arg_sqls[1]))
         }
         "year" => {
@@ -701,7 +749,31 @@ fn eval_function_to_sql(
         },
         "to_date" | "todate" => match arg_sqls.len() {
             1 => Ok(format!("toDate({})", arg_sqls[0])),
-            2 => Ok(format!("parseDateTimeBestEffort({})", arg_sqls[0])),
+            2 => {
+                // Honor the explicit format instead of dropping it (the old
+                // parseDateTimeBestEffort ignored arg 1, silently misparsing ambiguous
+                // dates — NAN-1144). args[1] must be a string literal so we can statically
+                // translate strftime codes to ClickHouse codes via the shared helper.
+                // Read the RAW literal from `args` (arg_sqls[1] is the already-quoted SQL form).
+                let format_str = match &args[1] {
+                    EvalExpression::Literal(Value::String(s)) => s,
+                    _ => {
+                        return Err(SqlGenError::InvalidQuery(
+                            "to_date() format (2nd argument) must be a string literal".into(),
+                        ))
+                    }
+                };
+                let ch_format = convert_strftime_to_clickhouse(format_str);
+                // Escape exactly as a SQL string literal (mirrors Literal(Value::String) lowering).
+                let escaped_format = ch_format.replace('\\', "\\\\").replace('\'', "''");
+                // parseDateTimeOrNull honors the explicit format and returns NULL on rows that
+                // don't match (no whole-query failure); wrap in toDate so the 2-arg form returns
+                // a Date like the 1-arg form. Result type is Nullable(Date).
+                Ok(format!(
+                    "toDate(parseDateTimeOrNull({}, '{}'))",
+                    arg_sqls[0], escaped_format
+                ))
+            }
             _ => Err(SqlGenError::InvalidQuery(
                 "to_date() requires 1 or 2 arguments".into(),
             )),
@@ -770,14 +842,22 @@ fn eval_function_to_sql(
             ))
         }
         "make_time" | "maketime" => {
-            // make_time(hour, minute, second)
+            // make_time(hour, minute, second) -> a usable time-of-day value.
+            // ClickHouse has no standalone time type and toTime(String) fails (Code 43 on
+            // CH 26.4: toTimeWithFixedDate only accepts Date/DateTime — NAN-1144). Build a
+            // DateTime on the epoch date carrying the requested HH:MM:SS via makeDateTime,
+            // which is downstream-usable with toHour/toMinute/toSecond/formatDateTime.
+            // Components are coerced with toUInt8OrNull(toString(...)) so both numeric literals
+            // and string-typed field refs work (makeDateTime rejects String args), degrading
+            // invalid input to NULL (Nullable(DateTime)) rather than erroring the whole query.
             if arg_sqls.len() != 3 {
                 return Err(SqlGenError::InvalidQuery(
                     "make_time() requires 3 arguments (hour, minute, second)".into(),
                 ));
             }
             Ok(format!(
-                "toTime(concat({}, ':', {}, ':', {}))",
+                "makeDateTime(1970, 1, 1, toUInt8OrNull(toString({})), \
+                 toUInt8OrNull(toString({})), toUInt8OrNull(toString({})))",
                 arg_sqls[0], arg_sqls[1], arg_sqls[2]
             ))
         }
@@ -1196,12 +1276,28 @@ fn eval_function_to_sql(
             Ok(format!("{}[{} + 1]", arg_sqls[0], arg_sqls[1]))
         }
         "mvfilter" => {
-            // Filter multivalue field by predicate: mvfilter(expr) → arrayFilter(x -> expr, field)
-            // In practice, the expression is already compiled as a sub-expression
-            let arg = arg_sqls.first().ok_or_else(|| {
+            // mvfilter(predicate) cannot be correctly lowered at this layer. Splunk evaluates
+            // `predicate` per-element of the multivalue field referenced inside it; that is an
+            // arrayFilter lambda whose variable is bound INSIDE the predicate
+            // (e.g. arrayFilter(x -> match(x, '^-'), parts)). But by the time we reach this arm
+            // the predicate has been lowered to scalar SQL with the source field baked in as a
+            // bare column, so we can recover neither the source array nor the per-element binding.
+            // The old emission `arrayFilter(x -> <pred>, x)` left the source array `x` unbound and
+            // crashed at runtime with Code 47 (UNKNOWN_IDENTIFIER) — i.e. it generated Ok but the
+            // query always failed in ClickHouse (NAN-1144). Reject up front with an actionable
+            // message instead of emitting broken SQL. (Arity is validated first to preserve the
+            // historical single-argument contract.)
+            let _pred = arg_sqls.first().ok_or_else(|| {
                 SqlGenError::InvalidQuery("mvfilter() requires 1 argument".into())
             })?;
-            Ok(format!("arrayFilter(x -> {}, x)", arg))
+            Err(SqlGenError::InvalidQuery(
+                "mvfilter() is not supported: a multivalue predicate cannot be translated to \
+                 ClickHouse at this layer because the source array and the per-element binding \
+                 cannot be recovered from the lowered predicate. Rewrite it as an explicit array \
+                 filter (e.g. arrayFilter/arrayExists over a split() field) or filter with \
+                 `where match(field, \"...\")` instead."
+                    .into(),
+            ))
         }
         "mvdedup" => {
             // Deduplicate multivalue field: mvdedup(field) → arrayDistinct(field)

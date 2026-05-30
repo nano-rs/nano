@@ -1,0 +1,99 @@
+name: enrichment-lane gate
+
+# NAN-1143 — live ClickHouse + Vector fault-injection + dict-safety gate for the
+# push enrichment lane (the runtime companion to the build-time
+# `shared_ingest_source_sinks_must_not_backpressure` test). It stands up a real
+# ClickHouse + Vector, applies the schema with the canonical migrator (built
+# from this checkout's Dockerfile = the latest build), then runs
+# scripts/verify-enrichment-lane-isolation.sh:
+#   - Inject A: deny user_registry writes, prove logs keep ingesting.
+#   - Inject B: corrupt rows dead-letter, user_registry_dict stays LOADED.
+#
+# Opt-in (workflow_dispatch) by design so it never auto-fires on the build
+# pipeline — run it manually before merging enrichment-lane / config/vector
+# changes. Can later be promoted to a paths-filtered `pull_request` trigger if
+# the team wants it gating every such PR automatically.
+on:
+  workflow_dispatch:
+    inputs:
+      reload_wait:
+        description: "Seconds to wait for each Vector --watch-config reload"
+        default: "14"
+        required: false
+      land_timeout:
+        description: "Seconds to poll for a row to land in ClickHouse"
+        default: "60"
+        required: false
+
+concurrency:
+  group: enrichment-lane-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    # Self-hosted only (repo rule — never ubuntu-latest). Needs docker + cargo
+    # toolchain available on the runner for the image build. Assumes a dedicated
+    # runner: the compose services use fixed container_names (nanosiem-*), so
+    # this must not run on a host that already has a nanosiem compose stack up.
+    runs-on: [self-hosted, X64]
+    timeout-minutes: 45
+    env:
+      # Isolate this run's containers/network from anything else on the runner.
+      COMPOSE_PROJECT_NAME: nan1143-gate-${{ github.run_id }}
+      RELOAD_WAIT: ${{ github.event.inputs.reload_wait || '14' }}
+      LAND_TIMEOUT: ${{ github.event.inputs.land_timeout || '60' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Apply ClickHouse schema (build api image + run clickhouse_migrator)
+        # The compose `clickhouse-migrate` service builds nanosiem-api from this
+        # checkout's Dockerfile (target: api) and runs the migrator one-shot —
+        # the canonical way the CH schema (user_registry, user_registry_dict,
+        # and the dictGetOrDefault columns on `logs`) is applied. Brings up its
+        # postgres + clickhouse deps and waits for them healthy.
+        run: |
+          docker compose build clickhouse-migrate
+          docker compose run --rm clickhouse-migrate
+
+      - name: Start Vector (+ ensure ClickHouse up) and wait for readiness
+        run: |
+          docker compose up -d clickhouse vector
+          echo "Waiting for ClickHouse + Vector to be ready..."
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8123/ping 2>/dev/null | grep -q 'Ok.' \
+               && curl -fsS http://localhost:8686/health 2>/dev/null | grep -q '"ok":true'; then
+              echo "ClickHouse + Vector are ready."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::ClickHouse/Vector did not become ready in time"
+          docker compose ps
+          exit 1
+
+      - name: Run enrichment-lane isolation gate
+        # Defaults target localhost via the compose port mappings; ENRICHMENT_TOML
+        # defaults to this checkout's config/vector/sources/parsers/_enrichment.toml,
+        # which is exactly what the compose Vector mounts.
+        run: ./scripts/verify-enrichment-lane-isolation.sh
+
+      - name: Container logs on failure
+        if: failure()
+        run: |
+          echo "::group::vector";     docker compose logs --tail=300 vector     || true; echo "::endgroup::"
+          echo "::group::clickhouse"; docker compose logs --tail=200 clickhouse || true; echo "::endgroup::"
+
+      - name: Tear down and reclaim workspace
+        if: always()
+        run: |
+          docker compose down -v --remove-orphans || true
+          # Vector mounts config/vector (and sub-dirs rw) as root; reclaim any
+          # root-owned files so the next host-side workflow can clean the
+          # workspace (NAN-773 self-hosted runner discipline). Do it via a
+          # throwaway container to avoid depending on host sudo.
+          docker run --rm -v "$PWD:/ws" -w /ws alpine \
+            chown -R "$(id -u):$(id -g)" config/vector 2>/dev/null || true
+          # Restore any working-tree edits the gate's fault-injection left behind
+          # (it restores _enrichment.toml itself, but be defensive).
+          git checkout -- config/vector 2>/dev/null || true

@@ -378,9 +378,11 @@ class ApiClient {
     return this._search.explainQuery(query, timeRange);
   }
 
-  // Fetch single log by ID (for table_view mode row expansion)
-  async fetchLog(id: string, timeRange?: import('./types').TimeRange): Promise<{ event: Record<string, unknown> | null }> {
-    return this._search.fetchLog(id, timeRange);
+  // Fetch single log by ID (for table_view mode row expansion).
+  // NAN-1032: sourceType lets ClickHouse use the (source_type, timestamp, ...) PK
+  // for a tight range read — without it, S3-backed historical lookups take 12–60s.
+  async fetchLog(id: string, timeRange?: import('./types').TimeRange, sourceType?: string): Promise<{ event: Record<string, unknown> | null }> {
+    return this._search.fetchLog(id, timeRange, sourceType);
   }
 
   async getFieldStats(request: import('./types').FieldStatsRequest): Promise<import('./types').FieldStatsResponse> {
@@ -929,6 +931,20 @@ class ApiClient {
   // Cases
   async listCases(params?: import('./types').CaseFilter): Promise<import('./types').CaseListResponse> {
     return this._cases.listCases(params);
+  }
+
+  // NAN-1093: Signal Inbox aggregation endpoints — see CasesApi.
+  async getInboxCounts(params?: {
+    queue_group?: string;
+    groups?: string[];
+  }): Promise<import('./types').InboxCountsResponse> {
+    return this._cases.getInboxCounts(params);
+  }
+
+  async getInboxIncidents(params?: {
+    queue_group?: string;
+  }): Promise<import('./types').InboxIncidentsResponse> {
+    return this._cases.getInboxIncidents(params);
   }
 
   async getMyCases(limit?: number): Promise<import('./types').CaseSummary[]> {
@@ -1570,6 +1586,10 @@ class ApiClient {
     return this._accessControl.getApiKey(id);
   }
 
+  async getApiKeyUsage(id: string, days = 14): Promise<import('./types').ApiKeyUsageResponse> {
+    return this._accessControl.getApiKeyUsage(id, days);
+  }
+
   async updateApiKey(id: string, request: import('./types').UpdateApiKeyRequest): Promise<import('./types').ApiKeySummary> {
     return this._accessControl.updateApiKey(id, request);
   }
@@ -1886,7 +1906,7 @@ class ApiClient {
     return this._identity.listUsers(params);
   }
 
-  async getIdentityUser(id: number): Promise<import('./types').IdentityUser> {
+  async getIdentityUser(id: string): Promise<import('./types').IdentityUser> {
     return this._identity.getUser(id);
   }
 
@@ -1902,31 +1922,11 @@ class ApiClient {
     return this._identity.resolveIdentity(ip, timestamp);
   }
 
-  // ThreatFox IOC Enrichment
-  async configureThreatFox(config: import('./types').ThreatFoxConfig): Promise<{ success: boolean; message: string }> {
-    return this._enrichment.configureThreatFox(config);
-  }
-
-  async syncThreatFox(): Promise<import('./enrichment').SyncStartResult> {
-    return this._enrichment.syncThreatFox();
-  }
-
-  // TOR Exit Nodes Enrichment
-  async configureTorExitNodes(config: import('./types').TorExitNodesConfig): Promise<{ success: boolean; message: string }> {
-    return this._enrichment.configureTorExitNodes(config);
-  }
-
-  async syncTorExitNodes(): Promise<import('./enrichment').SyncStartResult> {
-    return this._enrichment.syncTorExitNodes();
-  }
-
-  async lookupIoc(value: string): Promise<import('./types').IocLookupResult> {
-    return this._enrichment.lookupIoc(value);
-  }
-
-  async getIocStats(sourceId: string): Promise<import('./types').IocStats> {
-    return this._enrichment.getIocStats(sourceId);
-  }
+  // NAN-1111: ThreatFox + TOR Exit Nodes delegate methods and the shared
+  // lookupIoc / getIocStats delegates were deleted alongside the legacy
+  // backend routes. Both providers moved to the marketplace + Deno
+  // (nano-rs/nano-enrichments). See project_ipinfo_lite_stays_native for
+  // why IPinfo Lite (above) stays native.
 
   // Custom Enrichments
   async listCustomEnrichments(enrichmentType?: 'data' | 'agent'): Promise<import('@/enterprise/api/custom-enrichment').CustomEnrichmentSummary[]> {

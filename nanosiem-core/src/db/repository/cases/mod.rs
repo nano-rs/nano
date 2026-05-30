@@ -23,11 +23,11 @@ pub use workflow::CaseWorkflowRepository;
 pub(crate) use crate::models::case::{
     AddAlertToCase, AssignCase, Case, CaseAffectedUser, CaseAlert, CaseAlertDetail,
     CaseDisposition, CaseEntity, CaseFilter, CaseFullResponse, CaseGroupingRule, CaseRelation,
-    CaseResponseStats, CaseShareResult, CaseStats, CaseSummary, CaseWallEntry,
+    CaseResponseStats, CaseShareResult, CaseSort, CaseStats, CaseSummary, CaseWallEntry,
     CaseWallEntryWithCreator, CaseWithDetails, CaseWithDetailsRow, ChangeCaseStatus,
     EntityTypeSummary, NewCase, NewCaseEntity, NewCaseGroupingRule, NewCaseRelation,
     DuplicateCandidate, NewCaseWallEntry, RelatedCaseSummary, ShareCaseRequest, SharedGroup,
-    UpdateCase, UpdateCaseGroupingRule, UpdateEntityEnrichment,
+    SlaTargets, UpdateCase, UpdateCaseGroupingRule, UpdateEntityEnrichment,
 };
 
 #[derive(Error, Debug)]

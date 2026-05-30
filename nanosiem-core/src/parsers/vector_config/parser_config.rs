@@ -379,6 +379,11 @@ mod tests {
             category: None,
             vendor: None,
             product: None,
+            kind: "log".to_string(),
+            enrich_kind: None,
+            enrich_source: None,
+            target_table: None,
+            normalize_vrl: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

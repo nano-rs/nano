@@ -24,10 +24,19 @@ impl LogSourceService {
             id
         );
 
-        // Step 1: Validate VRL syntax
+        // Step 1: Validate VRL syntax. NAN-1149: an enrichment source carries
+        // its logic in `normalize_vrl` (the lane mapping), not the log
+        // `parser_vrl` — validate that one instead, or the empty parser_vrl
+        // trips "VRL code cannot be empty" and the deploy never reaches the
+        // enrichment lane.
+        let vrl_to_validate: &str = if log_source.kind == "enrichment" {
+            log_source.normalize_vrl.as_deref().unwrap_or("")
+        } else {
+            &log_source.parser_vrl
+        };
         let vrl_result = self
             .vrl_validator
-            .validate_vrl(&log_source.parser_vrl)
+            .validate_vrl(vrl_to_validate)
             .await
             .map_err(|e| LogSourceServiceError::VrlValidationFailed(e.to_string()))?;
 

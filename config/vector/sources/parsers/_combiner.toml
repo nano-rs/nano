@@ -1,9 +1,15 @@
 # Auto-generated combiner for all DB parsers
 # DO NOT EDIT - changes will be overwritten
+#
+# NAN-1083: bootstrap state — no parsers shipped, no parser outputs to combine.
+# `db_parsers_combined` must exist because `_pipeline.toml`'s `clickhouse_mapping`
+# names it as an input; we present-but-inert it with a filter that drops
+# everything. `prepare_output` is a safe upstream input here (unlike for
+# `placeholder_combiner`) because `db_parsers_combined` is terminal alongside
+# `prepare_output` — both feed the sink, neither feeds back into the chain.
+# Mirrors `staging.rs::write_staged_combiner_config` empty-parsers branch.
 
 [transforms.db_parsers_combined]
-type = "remap"
-inputs = ["aws_cloudtrail_output", "squid_proxy_output"]
-source = '''
-. = .
-'''
+type = "filter"
+inputs = ["prepare_output"]
+condition = "false"

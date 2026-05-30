@@ -26,15 +26,14 @@
 use axum::{
     Extension, Json,
     extract::{Path, Query, State},
-    http::HeaderMap,
 };
 use chrono::{DateTime, NaiveDateTime, Utc};
-use nanosiem_core::audit::{AuditEvent, AuditSource, ClientContext, IDENTITY_USERS_PUSHED};
+use nanosiem_core::audit::{AuditEvent, AuditSource};
 use nanosiem_core::auth::{permissions, repository::audit_actions};
 use nanosiem_core::identity::types::ConnectionTestResult;
 use nanosiem_core::identity::{
-    CreateIdentityProvider, IdentityProviderSummary, IdentityStats, IdentitySyncResult,
-    ListUsersParams, PushUsersRequest, UpdateIdentityProvider, UserListResponse, UserRecord,
+    CreateIdentityProvider, IdentityProviderSummary, IdentityStats, ListUsersParams,
+    UpdateIdentityProvider, UserListResponse, UserRecord,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -430,55 +429,11 @@ pub async fn trigger_identity_sync(
     }))
 }
 
-// ============================================================================
-// AD Push Endpoint
-// ============================================================================
-
-/// Push users from an Active Directory collector
-///
-/// This endpoint uses bearer token authentication (the collector_token from
-/// the AD provider's credentials), NOT JWT authentication.
-#[utoipa::path(
-    post,
-    path = "/api/identity-providers/{id}/push",
-    tag = "identity",
-    params(("id" = String, Path, description = "Provider ID")),
-    request_body = PushUsersRequest,
-    responses(
-        (status = 200, description = "Users pushed", body = IdentitySyncResult),
-        (status = 401, description = "Invalid collector token"),
-        (status = 404, description = "Provider not found"),
-    ),
-    security(("api_key" = []))
-)]
-pub async fn push_identity_users(
-    State(state): State<AppState>,
-    Extension(client): Extension<ClientContext>,
-    Path(id): Path<String>,
-    headers: HeaderMap,
-    Json(req): Json<PushUsersRequest>,
-) -> Result<Json<IdentitySyncResult>, ApiError> {
-    // Extract bearer token from Authorization header
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or_else(|| ApiError::Unauthorized("Missing or invalid Authorization header".into()))?;
-
-    let result = state
-        .identity_service
-        .push_users(&id, token, req.users)
-        .await?;
-
-    state.emit_audit(
-        AuditEvent::builder(AuditSource::Identity, IDENTITY_USERS_PUSHED)
-            .resource("identity_provider", None, Some(id.clone()))
-            .client_context(&client)
-            .build(),
-    );
-
-    Ok(Json(result))
-}
+// NAN-1151 (3d): the AD `/push` endpoint is retired. AD identity now flows
+// through the nano_enrich lane like every other source — the external collector
+// POSTs nano_enrich records (kind=identity, source=ad) to the Vector ingest
+// endpoint, normalized by the repo-sourced enrichments/identity/ad parser. No
+// in-app ingestion path or hard-coded mapping remains.
 
 // ============================================================================
 // User Lookup
@@ -750,7 +705,7 @@ pub async fn list_identity_users(
     get,
     path = "/api/identity/users/{id}",
     tag = "identity",
-    params(("id" = i64, Path, description = "User registry ID")),
+    params(("id" = String, Path, description = "Composite user id 'provider_id|external_id' (NAN-1117: replaced the legacy numeric id)")),
     responses(
         (status = 200, description = "User details", body = UserRecord),
         (status = 403, description = "Forbidden"),
@@ -761,12 +716,12 @@ pub async fn list_identity_users(
 pub async fn get_identity_user(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
-    Path(id): Path<i64>,
+    Path(id): Path<String>,
 ) -> Result<Json<UserRecord>, ApiError> {
     check_permission(&auth, permissions::ENRICHMENTS_VIEW)
         .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:view".into()))?;
 
-    let user = state.identity_service.get_user(id).await?;
+    let user = state.identity_service.get_user(&id).await?;
     Ok(Json(user))
 }
 
@@ -807,7 +762,6 @@ pub async fn get_identity_stats(
         update_identity_credentials,
         test_identity_connection,
         trigger_identity_sync,
-        push_identity_users,
         lookup_identity_user,
         resolve_identity_ip,
         list_identity_users,

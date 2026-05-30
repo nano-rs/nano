@@ -117,6 +117,16 @@ pub(super) fn log_source_to_parser(ls: LogSource) -> Parser {
         category: ls.category,
         vendor: ls.vendor,
         product: ls.product,
+        // NAN-1149: carry the enrichment-parser flavor through so an
+        // enrichment source published via LogSourceService::deploy stages into
+        // the push enrichment lane (write_enrichment_config) instead of being
+        // misrouted as a log parser. For ordinary log sources these are the
+        // schema defaults (kind="log", rest None) — behaviour-preserving.
+        kind: ls.kind,
+        enrich_kind: ls.enrich_kind,
+        enrich_source: ls.enrich_source,
+        target_table: ls.target_table,
+        normalize_vrl: ls.normalize_vrl,
         extension_vrl: ls.extension_vrl,
         extension_enabled: ls.extension_enabled,
         created_at: ls.created_at,

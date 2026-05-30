@@ -30,6 +30,20 @@ pub trait ShadowInvestigationHook: Send + Sync {
         alert: &Alert,
         notebook_id: Option<Uuid>,
     ) -> Result<(), ExtensionError>;
+
+    /// Invoked when one or more alerts are added to an EXISTING case (manual
+    /// add via API, or auto-grouping). The implementation is expected to
+    /// coalesce bursts (multiple adds within a short window become one
+    /// investigation) and is gated by the same settings/credit checks as
+    /// `on_case_created`. Default impl is a no-op so open-core builds and
+    /// other hook impls don't have to know about this.
+    async fn on_alerts_added(
+        &self,
+        _case_id: Uuid,
+        _new_alert_ids: Vec<Uuid>,
+    ) -> Result<(), ExtensionError> {
+        Ok(())
+    }
 }
 
 /// No-op hook used by open-core builds.

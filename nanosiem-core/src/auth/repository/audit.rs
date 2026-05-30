@@ -18,6 +18,17 @@ pub enum AuditRepositoryError {
     NotFound(Uuid),
 }
 
+/// One UTC calendar day's count of audited actions attributed to an actor.
+///
+/// Backs the per-API-key call-volume endpoint. This counts *audited* actions
+/// (mutations + authorization denials carrying the actor's `api_key_id`), not
+/// raw request volume — read-only traffic is not audited.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DailyActionCount {
+    pub day: chrono::NaiveDate,
+    pub count: i64,
+}
+
 /// Well-known audit actions
 pub mod audit_actions {
     // Authentication events
@@ -236,6 +247,35 @@ impl AuditRepository {
         Ok(total_deleted)
     }
 
+    /// Count audited actions performed by an API key, bucketed by UTC calendar
+    /// day, for the window starting at `start` (inclusive).
+    ///
+    /// Returns only days with activity (sparse) ordered oldest-first; callers
+    /// densify into a continuous series. See [`DailyActionCount`] for the
+    /// caveat on what "audited actions" covers.
+    pub async fn get_api_key_daily_usage(
+        &self,
+        api_key_id: Uuid,
+        start: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<DailyActionCount>, AuditRepositoryError> {
+        let rows = sqlx::query_as::<_, DailyActionCount>(
+            r#"
+            SELECT (timestamp AT TIME ZONE 'UTC')::date AS day,
+                   COUNT(*)::bigint AS count
+            FROM audit_logs
+            WHERE api_key_id = $1
+              AND timestamp >= $2
+            GROUP BY day
+            ORDER BY day
+            "#,
+        )
+        .bind(api_key_id)
+        .bind(start)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
 }
 
 // Implement FromRow for AuditLogWithNames manually since it has nested fields

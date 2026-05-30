@@ -6,9 +6,10 @@
 
 use chrono::{DateTime, Utc};
 use rand::Rng;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::entity::Entity;
+use crate::entity::{Entity, Process};
 use crate::event::Event;
 use crate::profiles::{self, ProcessChain, ProfileData};
 
@@ -70,6 +71,65 @@ impl SysmonGenerator {
             "TerminalSessionId": "1",
             "IntegrityLevel": "Medium",
             "Hashes": format!("SHA256={}", chain.process_hash),
+            "ParentProcessGuid": format!("{{{}}}", parent.guid),
+            "ParentProcessId": parent.pid.to_string(),
+            "ParentImage": parent.path,
+            "ParentCommandLine": parent.cmdline,
+            "ParentUser": format!("{}\\{}", entity.domain.to_uppercase(), entity.user.split('\\').last().unwrap_or(&entity.user)),
+        });
+
+        self.build_event(ts, entity, 1, "Process Create", event_data, &child.name)
+    }
+
+    /// Event ID 1: Process Create — from explicit (child, parent) pair.
+    ///
+    /// NAN-1058: counterpart to `process_create` that does NOT sample a random
+    /// chain. Used by the injector's scripted attack scenarios, where each step
+    /// constructs a specific (process_name, path, command_line) via
+    /// `Entity::spawn_process` and needs the resulting wire event to actually
+    /// carry those values so detection rules can match. Prior to this helper,
+    /// every scripted step called `generate(ts, entity, rng)` and the spawned
+    /// (child, parent) tuple was thrown away — events sailed past the wire with
+    /// completely unrelated profile-sampled command lines.
+    ///
+    /// `process_hash` lets a caller pass a real published binary hash for a
+    /// scripted LOLBin (comsvcs.dll, certutil.exe, etc.) so prevalence /
+    /// signature-based hunts can hit. When `None`, a deterministic SHA-256 is
+    /// derived from `path|name` — same binary across runs hashes consistently,
+    /// which the prevalence pipeline needs to age into the dictionary.
+    pub fn process_create_from(
+        &self,
+        ts: DateTime<Utc>,
+        entity: &Entity,
+        child: &Process,
+        parent: &Process,
+        process_hash: Option<&str>,
+    ) -> Event {
+        let mut rng = rand::rng();
+
+        let hash = process_hash
+            .map(str::to_string)
+            .unwrap_or_else(|| deterministic_process_hash(&child.path, &child.name));
+
+        let event_data = serde_json::json!({
+            "RuleName": "ProcessCreate",
+            "UtcTime": ts.format("%Y-%m-%d %H:%M:%S.%3f").to_string(),
+            "ProcessGuid": format!("{{{}}}", child.guid),
+            "ProcessId": child.pid.to_string(),
+            "Image": child.path,
+            "FileVersion": "-",
+            "Description": "-",
+            "Product": "-",
+            "Company": "-",
+            "OriginalFileName": child.name,
+            "CommandLine": child.cmdline,
+            "CurrentDirectory": r"C:\Windows\system32\",
+            "User": format!("{}\\{}", entity.domain.to_uppercase(), entity.user.split('\\').last().unwrap_or(&entity.user)),
+            "LogonGuid": format!("{{{}}}", Uuid::now_v7()),
+            "LogonId": format!("0x{:X}", rng.random_range(0x10000u32..0xFFFFF)),
+            "TerminalSessionId": "1",
+            "IntegrityLevel": "Medium",
+            "Hashes": format!("SHA256={}", hash),
             "ParentProcessGuid": format!("{{{}}}", parent.guid),
             "ParentProcessId": parent.pid.to_string(),
             "ParentImage": parent.path,
@@ -427,5 +487,105 @@ impl SysmonGenerator {
             source_type: "windows_sysmon".to_string(),
             display_label: format!("[sysmon:{}] {} {}", event_id, entity.hostname, label),
         }
+    }
+}
+
+/// NAN-1058: deterministic SHA-256 from a binary's path + name.
+///
+/// Used as the `Hashes` field when a scripted scenario step doesn't supply a
+/// real published binary hash. Determinism matters because the prevalence
+/// pipeline ages identifiers into a dictionary; if every run hashed the same
+/// binary differently, prevalence-based detections would never converge.
+fn deterministic_process_hash(path: &str, name: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(path.as_bytes());
+    hasher.update(b"|");
+    hasher.update(name.as_bytes());
+    // sha2 0.11 returns a GenericArray; UpperHex/LowerHex aren't derived on it,
+    // so format the bytes directly. Result matches `sha256sum`-style uppercase
+    // hex used by Sysmon's `Hashes` field.
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        out.push_str(&format!("{:02X}", byte));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entity::WorldState;
+
+    #[test]
+    fn deterministic_hash_is_stable_across_calls() {
+        let h1 = deterministic_process_hash(r"C:\Windows\System32\comsvcs.dll", "comsvcs.dll");
+        let h2 = deterministic_process_hash(r"C:\Windows\System32\comsvcs.dll", "comsvcs.dll");
+        assert_eq!(h1, h2, "same path|name must produce the same hash on repeat calls");
+        assert_eq!(h1.len(), 64, "SHA-256 hex must be 64 chars; got {}: {h1}", h1.len());
+    }
+
+    #[test]
+    fn deterministic_hash_differs_between_binaries() {
+        let a = deterministic_process_hash(r"C:\Windows\System32\comsvcs.dll", "comsvcs.dll");
+        let b = deterministic_process_hash(r"C:\Windows\System32\certutil.exe", "certutil.exe");
+        assert_ne!(a, b, "different binaries must hash to different values");
+    }
+
+    /// Critical NAN-1058 regression: process_create_from must put the SPAWNED
+    /// command line on the wire, not a random profile-sampled one. The prior
+    /// code path threw away the (child, parent) pair and emitted noise that no
+    /// detection rule could match.
+    #[test]
+    fn process_create_from_carries_spawned_command_line_to_wire() {
+        let world = WorldState::new(1);
+        let entity = world.entities().first().expect("WorldState::new(1) yields one entity");
+        let (child, parent) = entity.spawn_process(
+            "rundll32.exe",
+            r"C:\Windows\System32\rundll32.exe",
+            r"rundll32.exe C:\Windows\System32\comsvcs.dll, MiniDump 624 C:\temp\lsass.dmp full",
+            None,
+        );
+        let gen = SysmonGenerator::new();
+        let event = gen.process_create_from(Utc::now(), entity, &child, &parent, None);
+
+        assert!(
+            event.message.contains("comsvcs"),
+            "wire payload missing scripted comsvcs token: {}",
+            event.message
+        );
+        assert!(
+            event.message.contains("MiniDump"),
+            "wire payload missing scripted MiniDump token: {}",
+            event.message
+        );
+        assert!(
+            event.message.contains("rundll32.exe"),
+            "wire payload missing scripted process name: {}",
+            event.message
+        );
+        assert_eq!(event.source_type, "windows_sysmon");
+    }
+
+    #[test]
+    fn process_create_from_uses_explicit_hash_when_provided() {
+        let world = WorldState::new(1);
+        let entity = world.entities().first().expect("WorldState::new(1) yields one entity");
+        let (child, parent) = entity.spawn_process(
+            "certutil.exe",
+            r"C:\Windows\System32\certutil.exe",
+            "certutil",
+            None,
+        );
+        let known_hash = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+        let gen = SysmonGenerator::new();
+        let event = gen.process_create_from(Utc::now(), entity, &child, &parent, Some(known_hash));
+
+        assert!(
+            event.message.to_lowercase().contains(known_hash),
+            "wire payload should include the explicitly-supplied LOLBin hash: {}",
+            event.message
+        );
     }
 }

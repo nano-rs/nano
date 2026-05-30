@@ -153,7 +153,7 @@ pub async fn get_source_types(
     Extension(auth): Extension<AuthContext>,
     Query(query): Query<FieldValuesQuery>,
 ) -> Result<Json<Vec<(String, i64)>>, ApiError> {
-    check_permission(&auth, permissions::FEEDS_VIEW)
+    check_permission(&auth, permissions::SEARCH_VIEW)
         .map_err(|_| ApiError::Forbidden("Missing permission: search:view".to_string()))?;
 
     let time_range = query.time_range();

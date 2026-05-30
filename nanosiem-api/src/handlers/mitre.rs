@@ -17,6 +17,25 @@ use nanosiem_core::mitre::{
     MitreTechnique,
 };
 
+/// Ensure the ATT&CK catalog is populated, lazily syncing it from upstream on
+/// first use. The catalog (`mitre_tactics` / `mitre_techniques`) is not seeded
+/// by migration, so it must be synced at runtime. Sync failures are logged and
+/// swallowed so the caller still returns a (possibly empty) response rather
+/// than a 500 — the catalog is retried on the next request. Shared by
+/// `get_mitre_data` and `get_mitre_coverage` so every MITRE surface self-seeds,
+/// not just the rule-editor data endpoint (NAN-1103).
+async fn ensure_mitre_catalog(pool: &sqlx::PgPool) {
+    let sync = MitreSync::new(MitreRepository::new(pool.clone()));
+    match sync.sync_if_empty().await {
+        Ok(true) => tracing::info!("MITRE catalog was empty — lazily synced from upstream"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(
+            "MITRE catalog lazy sync failed (will retry on next request): {}",
+            e
+        ),
+    }
+}
+
 /// Response containing all MITRE data for frontend dropdowns
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct MitreDataResponse {
@@ -44,29 +63,11 @@ pub async fn get_mitre_data(
     check_permission(&auth, permissions::MITRE_VIEW)
         .map_err(|(status, json)| (status, json.0.message))?;
 
+    // Lazily seed the ATT&CK catalog on first use. If the sync fails, the
+    // queries below return empty vecs — same graceful-empty result as before.
+    ensure_mitre_catalog(&state.pool).await;
+
     let repo = MitreRepository::new(state.pool.clone());
-
-    // Check if we have data, if not trigger a sync
-    let has_data = repo.has_data().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-    })?;
-
-    if !has_data {
-        // Trigger initial sync
-        let sync = MitreSync::new(MitreRepository::new(state.pool.clone()));
-        if let Err(e) = sync.sync().await {
-            tracing::warn!("Failed to sync MITRE data: {}", e);
-            // Return empty data rather than error
-            return Ok(Json(MitreDataResponse {
-                tactics: vec![],
-                techniques: vec![],
-                last_sync: None,
-            }));
-        }
-    }
 
     let tactics = repo.get_tactics().await.map_err(|e| {
         (
@@ -169,6 +170,10 @@ pub async fn get_mitre_coverage(
 ) -> Result<Json<MitreCoverageResponse>, (StatusCode, String)> {
     check_permission(&auth, permissions::MITRE_VIEW)
         .map_err(|(status, json)| (status, json.0.message))?;
+
+    // Lazily seed the ATT&CK catalog so the Coverage page is self-sufficient
+    // and never renders a phantom 0/0 before the first /api/mitre hit (NAN-1103).
+    ensure_mitre_catalog(&state.pool).await;
 
     let repo = MitreRepository::new(state.pool.clone());
 

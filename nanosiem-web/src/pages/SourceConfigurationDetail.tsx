@@ -994,7 +994,7 @@ function SourceConfigHeader({
             mono
             hint={
               bytesPerDay == null
-                ? 'Lands when NAN-531 backend telemetry ships.'
+                ? 'Awaiting backend telemetry.'
                 : undefined
             }
           />
@@ -1005,7 +1005,7 @@ function SourceConfigHeader({
             mono
             hint={
               lastEventAt == null
-                ? 'Lands when NAN-531 backend telemetry ships.'
+                ? 'Awaiting backend telemetry.'
                 : undefined
             }
           />

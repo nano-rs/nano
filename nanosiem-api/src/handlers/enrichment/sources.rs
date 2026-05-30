@@ -57,6 +57,7 @@ pub async fn list_enrichment_sources(
             last_sync_at: s.last_sync_at.map(|t| t.to_rfc3339()),
             last_sync_status: s.last_sync_status,
             record_count: s.record_count,
+            deprovisioned_count: s.deprovisioned_count,
             config: sanitize_config(s.config),
         })
         .collect();
@@ -148,6 +149,24 @@ pub async fn disable_enrichment_source(
         .set_source_enabled(&source_id, false)
         .await
         .map_err(|e| ApiError::NotFound(format!("Source not found: {}", e)))?;
+
+    // NAN-1117: the ip_enrichment_dict source is now ClickHouse and can't join
+    // PG's `enabled` flag. To preserve the legacy "disable -> enrichment blanks"
+    // UX, tombstone this source's CH payload rows so the dict drops them, then
+    // reload the dict so the change takes effect immediately rather than after
+    // its LIFETIME. Best-effort: a CH hiccup must not fail the config write.
+    if let Err(e) = enrichment.clear_ip_enrichments_for_source(&source_id).await {
+        tracing::warn!(source_id = %source_id, error = %e, "Failed to tombstone CH IP enrichment rows on disable");
+    } else if let Err(e) = state
+        .dual_pool
+        .clickhouse()
+        .query("SYSTEM RELOAD DICTIONARY nanosiem.ip_enrichment_dict")
+        .execute()
+        .await
+    {
+        tracing::warn!(error = %e, "Failed to reload ip_enrichment_dict after disable");
+    }
+    drop(enrichment);
 
     state.emit_audit(
         AuditEvent::builder(AuditSource::Enrichment, ENRICHMENT_DISABLED)

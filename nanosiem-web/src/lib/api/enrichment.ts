@@ -5,10 +5,6 @@ import type {
   IpinfoConfig,
   AutoSyncConfig,
   IpLookupResult,
-  IocLookupResult,
-  IocStats,
-  ThreatFoxConfig,
-  TorExitNodesConfig,
   AgentEnrichmentProvider,
   ListAgentEnrichmentProvidersResponse,
   CreateAgentEnrichmentProviderRequest,
@@ -159,67 +155,12 @@ export class EnrichmentApi {
     });
   }
 
-  // ThreatFox IOC Enrichment
-
-  async configureThreatFox(config: ThreatFoxConfig): Promise<{ success: boolean; message: string }> {
-    return this.request('/api/enrichment/threatfox/configure', {
-      method: 'POST',
-      body: JSON.stringify(config),
-    });
-  }
-
-  /**
-   * Start an async ThreatFox sync
-   * Returns immediately with 202 Accepted or 409 Conflict
-   */
-  async syncThreatFox(): Promise<SyncStartResult> {
-    return this.startAsyncSync('/api/enrichment/threatfox/sync');
-  }
-
-  /**
-   * Start ThreatFox sync and wait for completion (convenience method)
-   * @param maxWaitMs Maximum time to wait (default: 30 minutes)
-   * @returns The final EnrichmentSource state
-   */
-  async syncThreatFoxAndWait(maxWaitMs: number = 1800000): Promise<EnrichmentSource | null> {
-    await this.startAsyncSync('/api/enrichment/threatfox/sync');
-    return this.waitForSync('threatfox', maxWaitMs);
-  }
-
-  // TOR Exit Nodes Enrichment
-
-  async configureTorExitNodes(config: TorExitNodesConfig): Promise<{ success: boolean; message: string }> {
-    return this.request('/api/enrichment/tor/configure', {
-      method: 'POST',
-      body: JSON.stringify(config),
-    });
-  }
-
-  /**
-   * Start an async TOR Exit Nodes sync
-   * Returns immediately with 202 Accepted or 409 Conflict
-   */
-  async syncTorExitNodes(): Promise<SyncStartResult> {
-    return this.startAsyncSync('/api/enrichment/tor/sync');
-  }
-
-  /**
-   * Start TOR Exit Nodes sync and wait for completion (convenience method)
-   * @param maxWaitMs Maximum time to wait (default: 30 minutes)
-   * @returns The final EnrichmentSource state
-   */
-  async syncTorExitNodesAndWait(maxWaitMs: number = 1800000): Promise<EnrichmentSource | null> {
-    await this.startAsyncSync('/api/enrichment/tor/sync');
-    return this.waitForSync('tor_exit_nodes', maxWaitMs);
-  }
-
-  async lookupIoc(value: string): Promise<IocLookupResult> {
-    return this.request(`/api/enrichment/ioc/lookup/${encodeURIComponent(value)}`);
-  }
-
-  async getIocStats(sourceId: string): Promise<IocStats> {
-    return this.request(`/api/enrichment/ioc/stats/${encodeURIComponent(sourceId)}`);
-  }
+  // NAN-1111: ThreatFox and TOR Exit Nodes configure / sync methods,
+  // plus the shared `/api/enrichment/ioc/{lookup,stats}` endpoints,
+  // lived here. Both providers moved to the marketplace + Deno
+  // (nano-rs/nano-enrichments); the IOC lookup endpoints had no
+  // remaining UI callers. See project_ipinfo_lite_stays_native for
+  // why IPinfo Lite (above) stays native instead.
 
   // Agent Enrichment Providers (AI-powered)
 

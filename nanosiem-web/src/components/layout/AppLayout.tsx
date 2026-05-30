@@ -225,10 +225,12 @@ const navigation: NavItem[] = [
 ];
 
 // Cases is an expandable group (per design-ref/shadcn/playbook-new-app.jsx)
-// with Investigate (the SignalInbox workspace) + Playbooks as children.
-// `/cases` is reachable as the table view via "Browse all" inside the inbox.
+// with Investigate (the SignalInbox workspace) + Case search + Playbooks as
+// children. NAN-1070 dropped the legacy `/cases` table route in favor of the
+// inbox; NAN-1071 added the search surface for cross-cutting queries.
 const casesNavigation: NavItem[] = [
   { name: 'Investigate', href: '/inbox', icon: Inbox, permissions: 'cases:view', capability: 'cases' },
+  { name: 'Case search', href: '/cases/search', icon: NavSearch, permissions: 'cases:view', capability: 'cases' },
   { name: 'Playbooks', href: '/playbooks', icon: List, permissions: 'playbooks:view', capability: 'playbooks' },
 ];
 

@@ -6,11 +6,15 @@ import { cn } from '@/lib/utils';
 import { SectionCard, EmptyCell, StatCell } from './_shared';
 import { formatBytes, formatCompact } from '../helpers';
 
+export type NetworkStatKey = 'UNIQ_DSTS' | 'NEW_DOMAINS' | 'RARE_COUNTRY' | 'LATERAL';
+
 interface NetworkCardProps {
   network: AssetDossierNetwork;
+  onOpenTopDestinations?: () => void;
+  onStatClick?: (key: NetworkStatKey, ctx?: { country?: string }) => void;
 }
 
-export function NetworkCard({ network }: NetworkCardProps) {
+export function NetworkCard({ network, onOpenTopDestinations, onStatClick }: NetworkCardProps) {
   const { total_conns, bytes_in, bytes_out, unique_dsts, new_domains, top_dsts, rare_countries } =
     network;
 
@@ -19,6 +23,7 @@ export function NetworkCard({ network }: NetworkCardProps) {
       <SectionCard
         title="Network"
         action={<span>Top destinations ↗</span>}
+        onActionClick={onOpenTopDestinations}
         icon={<Globe className="w-[13px] h-[13px] text-muted-foreground/70" />}
       >
         <EmptyCell>No network events for this entity in range</EmptyCell>
@@ -33,6 +38,7 @@ export function NetworkCard({ network }: NetworkCardProps) {
     <SectionCard
       title="Network"
       action={<span>Top destinations ↗</span>}
+      onActionClick={onOpenTopDestinations}
       icon={<Globe className="w-[13px] h-[13px] text-muted-foreground/70" />}
     >
       <div className="space-y-3">
@@ -44,22 +50,35 @@ export function NetworkCard({ network }: NetworkCardProps) {
         </div>
 
         <div className="grid grid-cols-4 gap-2">
-          <StatCell value={unique_dsts} label="UNIQ DSTS" />
+          <StatCell
+            value={unique_dsts}
+            label="UNIQ DSTS"
+            onClick={onStatClick ? () => onStatClick('UNIQ_DSTS') : undefined}
+            disabled={unique_dsts === 0}
+          />
           <StatCell
             value={new_domains}
             label="NEW DOMAINS"
             tone={new_domains > 0 ? 'warn' : 'default'}
+            onClick={onStatClick ? () => onStatClick('NEW_DOMAINS') : undefined}
+            disabled={new_domains === 0}
           />
           {rareCountry ? (
             <StatCell
               value={rareCountry.country}
               label="RARE COUNTRY"
               tone="critical"
+              onClick={onStatClick ? () => onStatClick('RARE_COUNTRY', { country: rareCountry.country }) : undefined}
             />
           ) : (
-            <StatCell value={0} label="RARE CTRY" />
+            <StatCell value={0} label="RARE CTRY" disabled />
           )}
-          <StatCell value={0} label="LATERAL" />
+          <StatCell
+            value={0}
+            label="LATERAL"
+            disabled
+            title="Lateral-movement detection not yet wired"
+          />
         </div>
 
         {top_dsts.length > 0 && (

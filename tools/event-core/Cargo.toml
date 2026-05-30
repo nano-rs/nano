@@ -23,3 +23,7 @@ rand = "0.9"
 
 # Fast concurrent data structures
 parking_lot = "0.12"
+
+# Deterministic SHA-256 for scripted-process Hashes field when no real binary
+# hash is supplied (NAN-1058). Same major version as the other workspace crates.
+sha2 = "0.11"

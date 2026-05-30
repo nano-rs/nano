@@ -10,7 +10,7 @@
 //!   docker run -d --rm --name test-ch-nan811 -p 18123:8123 \
 //!     -e CLICKHOUSE_USER=admin -e CLICKHOUSE_PASSWORD=admin \
 //!     -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
-//!     clickhouse/clickhouse-server:26.3
+//!     clickhouse/clickhouse-server:26.4
 //!
 //! Run: cargo test -p nanosiem-core --test migrator_bootstrap -- --nocapture
 
@@ -68,7 +68,7 @@ async fn migrator_creates_target_database_when_missing() {
              (start with: docker run -d --rm --name test-ch-nan811 \
              -p 18123:8123 -e CLICKHOUSE_USER=admin -e CLICKHOUSE_PASSWORD=admin \
              -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
-             clickhouse/clickhouse-server:26.3)",
+             clickhouse/clickhouse-server:26.4)",
             CH_URL
         );
         return;

@@ -754,6 +754,276 @@ impl VrlValidator {
     }
 }
 
+// =============================================================================
+// NAN-1150: deploy-time encoding-contract guard for enrichment parsers
+// =============================================================================
+
+/// Deploy-time encoding-contract guard, dispatched on `enrich_kind` — each
+/// enrichment kind writes a different target table with its own invariants.
+/// Runs the parser's `normalize_vrl` against representative records and returns
+/// `Err(reason)` if it would emit a row that violates the contract, so a
+/// malformed parser is rejected BEFORE Vector reloads (the NAN-1120 halt class).
+pub(crate) fn validate_enrichment_encoding_contract(
+    enrich_kind: &str,
+    normalize_vrl: &str,
+) -> Result<(), String> {
+    match enrich_kind {
+        "identity" => validate_identity_contract(normalize_vrl),
+        "ip_context" => validate_ip_context_contract(normalize_vrl),
+        // A kind we don't yet have a target schema for: can't assert fields we
+        // don't know, but the VRL must still compile + run on a record without
+        // erroring (catches syntax / runtime breakage at deploy).
+        _ => validate_compiles_and_runs(normalize_vrl),
+    }
+}
+
+/// `user_registry` (identity) contract (NAN-1123): `external_id` required
+/// (record with none must abort, not emit an empty id), `version` a non-zero
+/// integer-ms, `last_synced_at` formatted `%Y-%m-%d %H:%M:%S%.3f`,
+/// `account_status ∈ {active,disabled,deleted,anonymized}`, `groups` an Array —
+/// verified on a valid AND a type-corrupt record (the VRL must sanitise).
+fn validate_identity_contract(normalize_vrl: &str) -> Result<(), String> {
+    // A generic identity-shaped record carrying every common external_id source
+    // key (`.external_id` AD, `.id` Graph/Okta/Google, `.Worker_ID` Workday) so
+    // any provider parser extracts an id and runs its full envelope.
+    let valid = serde_json::json!({
+        "external_id": "ENC_CONTRACT_1", "id": "ENC_CONTRACT_1", "Worker_ID": "ENC_CONTRACT_1",
+        "userPrincipalName": "u@example.com", "primaryEmail": "u@example.com",
+        "profile": { "login": "u@example.com" },
+        "account_enabled": true, "status": "ACTIVE", "Active_Status": "Active"
+    });
+    let out = run_normalize_for_contract(normalize_vrl, &valid)
+        .map_err(|e| format!("normalize VRL failed on a valid record: {e}"))?;
+    assert_user_registry_contract(&out, "valid record")?;
+
+    // Type-corrupt: the VRL must SANITISE these, not pass them through.
+    let mut corrupt = valid.clone();
+    corrupt["version"] = serde_json::json!("not-a-number");
+    corrupt["groups"] = serde_json::json!("not-an-array");
+    corrupt["account_status"] = serde_json::json!("DEFINITELY_NOT_VALID");
+    corrupt["account_enabled"] = serde_json::json!("maybe");
+    let out = run_normalize_for_contract(normalize_vrl, &corrupt).map_err(|e| {
+        format!("normalize VRL errored on a type-corrupt record (it must sanitise, not fail): {e}")
+    })?;
+    assert_user_registry_contract(&out, "type-corrupt record")?;
+
+    // Missing external_id: the parser MUST reject (abort), not emit an empty id.
+    let missing = serde_json::json!({ "username": "no-id", "account_enabled": true });
+    match run_normalize_for_contract(normalize_vrl, &missing) {
+        Err(_) => Ok(()), // aborted — correct (record dead-letters)
+        Ok(out) => {
+            let ext = out.get("external_id").and_then(|v| v.as_str()).unwrap_or("");
+            if ext.is_empty() {
+                Err("normalize VRL emitted a row with empty external_id instead of \
+                     aborting — external_id is required (NAN-1123)"
+                    .to_string())
+            } else {
+                Err(format!(
+                    "normalize VRL invented an external_id ({ext:?}) for a record that had none \
+                     — it must abort on missing external_id"
+                ))
+            }
+        }
+    }
+}
+
+/// `ip_enrichments` (ip_context, NAN-1137) contract: `network` required + a
+/// valid CIDR (record with none/invalid must abort — never a `0.0.0.0/0`
+/// default), `source_id` non-empty, `updated_at` formatted `%Y-%m-%d
+/// %H:%M:%S%.3f` and NOT far-future (it's the ReplacingMergeTree version AND
+/// the dict argMax key — a far-future value permanently wins, NAN-1137),
+/// `deleted ∈ {0,1}`. Verified on a valid AND a type-corrupt record.
+fn validate_ip_context_contract(normalize_vrl: &str) -> Result<(), String> {
+    let valid = serde_json::json!({
+        "network": "203.0.113.0/24", "source_id": "greynoise",
+        "country": "US", "asn": "AS64496", "as_name": "Example", "deleted": 0
+    });
+    let out = run_normalize_for_contract(normalize_vrl, &valid)
+        .map_err(|e| format!("normalize VRL failed on a valid ip_context record: {e}"))?;
+    assert_ip_context_contract(&out, "valid record")?;
+
+    // Type-corrupt: must sanitise (not propagate), not error.
+    let mut corrupt = valid.clone();
+    corrupt["updated_at"] = serde_json::json!("garbage-not-a-timestamp");
+    corrupt["deleted"] = serde_json::json!("maybe");
+    let out = run_normalize_for_contract(normalize_vrl, &corrupt).map_err(|e| {
+        format!("normalize VRL errored on a type-corrupt ip_context record (must sanitise): {e}")
+    })?;
+    assert_ip_context_contract(&out, "type-corrupt record")?;
+
+    // Missing/invalid network: the parser MUST reject (abort), not emit a row
+    // with an empty or garbage CIDR (a bad CIDR poisons the IP_TRIE dict).
+    for bad in [serde_json::json!({ "source_id": "x" }), serde_json::json!({ "network": "not-a-cidr", "source_id": "x" })] {
+        match run_normalize_for_contract(normalize_vrl, &bad) {
+            Err(_) => {} // aborted — correct
+            Ok(out) => {
+                let net = out.get("network").and_then(|v| v.as_str()).unwrap_or("");
+                if !is_cidr(net) {
+                    return Err(format!(
+                        "ip_context normalize emitted network {net:?} (not a valid CIDR) instead \
+                         of aborting — network must be a validated CIDR (NAN-1137)"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn assert_ip_context_contract(out: &serde_json::Value, ctx: &str) -> Result<(), String> {
+    let obj = out
+        .as_object()
+        .ok_or_else(|| format!("{ctx}: normalize output is not a JSON object"))?;
+    let network = obj.get("network").and_then(|v| v.as_str()).unwrap_or("");
+    if !is_cidr(network) {
+        return Err(format!("{ctx}: network {network:?} is not a valid CIDR"));
+    }
+    let source_id = obj.get("source_id").and_then(|v| v.as_str()).unwrap_or("");
+    if source_id.is_empty() {
+        return Err(format!("{ctx}: source_id is missing or empty (the feed discriminator)"));
+    }
+    let updated_at = obj.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
+    if !last_synced_at_well_formed(updated_at) {
+        return Err(format!(
+            "{ctx}: updated_at must be formatted '%Y-%m-%d %H:%M:%S%.3f', got {updated_at:?}"
+        ));
+    }
+    // Never far-future: updated_at is the version + dict argMax key (NAN-1137).
+    if updated_at.as_bytes().first() == Some(&b'9') {
+        return Err(format!(
+            "{ctx}: updated_at {updated_at:?} is far-future — it would permanently win the \
+             ReplacingMergeTree/dict argMax and bury real updates (NAN-1137)"
+        ));
+    }
+    match obj.get("deleted") {
+        Some(d) if d.as_u64() == Some(0) || d.as_u64() == Some(1) => {}
+        other => return Err(format!("{ctx}: deleted must be 0 or 1, got {other:?}")),
+    }
+    Ok(())
+}
+
+/// Minimal CIDR check: `<ip>/<prefix>` with a parseable IP and numeric prefix.
+fn is_cidr(s: &str) -> bool {
+    match s.split_once('/') {
+        Some((ip, prefix)) => {
+            ip.parse::<std::net::IpAddr>().is_ok() && prefix.parse::<u8>().is_ok()
+        }
+        None => false,
+    }
+}
+
+/// Fallback for kinds without a known target schema: the VRL must compile and
+/// run on a representative record without erroring, and emit a JSON object.
+fn validate_compiles_and_runs(normalize_vrl: &str) -> Result<(), String> {
+    let sample = serde_json::json!({
+        "external_id": "X", "id": "X", "network": "203.0.113.0/24", "source_id": "x"
+    });
+    let out = run_normalize_for_contract(normalize_vrl, &sample)
+        .map_err(|e| format!("normalize VRL failed to compile/run: {e}"))?;
+    if !out.is_object() {
+        return Err("normalize VRL output is not a JSON object".to_string());
+    }
+    Ok(())
+}
+
+/// Assert one normalize output row meets the `user_registry` encoding contract.
+fn assert_user_registry_contract(out: &serde_json::Value, ctx: &str) -> Result<(), String> {
+    let obj = out
+        .as_object()
+        .ok_or_else(|| format!("{ctx}: normalize output is not a JSON object"))?;
+
+    let ext = obj.get("external_id").and_then(|v| v.as_str()).unwrap_or("");
+    if ext.is_empty() {
+        return Err(format!("{ctx}: external_id is missing or empty"));
+    }
+    // version: integer-ms, non-zero (NAN-1123 — never 0, never a float/string).
+    let version = obj
+        .get("version")
+        .ok_or_else(|| format!("{ctx}: version is missing"))?;
+    let v = version
+        .as_i64()
+        .or_else(|| version.as_u64().map(|u| u as i64))
+        .ok_or_else(|| {
+            format!("{ctx}: version must be an integer-ms timestamp, got {version} (NAN-1123)")
+        })?;
+    if v <= 0 {
+        return Err(format!("{ctx}: version must be a non-zero integer-ms timestamp, got {v}"));
+    }
+    // last_synced_at: "YYYY-MM-DD HH:MM:SS.mmm"
+    let lsa = obj.get("last_synced_at").and_then(|v| v.as_str()).unwrap_or("");
+    if !last_synced_at_well_formed(lsa) {
+        return Err(format!(
+            "{ctx}: last_synced_at must be formatted '%Y-%m-%d %H:%M:%S%.3f', got {lsa:?}"
+        ));
+    }
+    // account_status enum.
+    let status = obj.get("account_status").and_then(|v| v.as_str()).unwrap_or("");
+    if !["active", "disabled", "deleted", "anonymized"].contains(&status) {
+        return Err(format!(
+            "{ctx}: account_status {status:?} not in {{active,disabled,deleted,anonymized}}"
+        ));
+    }
+    // groups must be an Array (the CH column is Array(String)).
+    if !obj.get("groups").map(|g| g.is_array()).unwrap_or(false) {
+        return Err(format!("{ctx}: groups must be an array"));
+    }
+    Ok(())
+}
+
+fn last_synced_at_well_formed(s: &str) -> bool {
+    // %Y-%m-%d %H:%M:%S%.3f — exact width, digits + separators.
+    let b = s.as_bytes();
+    if b.len() != 23 {
+        return false;
+    }
+    let digit = |i: usize| b[i].is_ascii_digit();
+    (0..4).all(digit)
+        && b[4] == b'-'
+        && digit(5) && digit(6)
+        && b[7] == b'-'
+        && digit(8) && digit(9)
+        && b[10] == b' '
+        && digit(11) && digit(12)
+        && b[13] == b':'
+        && digit(14) && digit(15)
+        && b[16] == b':'
+        && digit(17) && digit(18)
+        && b[19] == b'.'
+        && digit(20) && digit(21) && digit(22)
+}
+
+/// Compile + run a normalize VRL against one JSON record, returning the
+/// transformed JSON (or an error string, which includes the `abort` path).
+fn run_normalize_for_contract(
+    vrl_code: &str,
+    input: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use vrl::compiler::{compile, TargetValue};
+    use vrl::diagnostic::Formatter;
+    use vrl::value::{Secrets, Value};
+
+    let fns = safe_vrl_functions();
+    let result = compile(vrl_code, &fns).map_err(|diagnostics| {
+        diagnostics
+            .into_iter()
+            .map(|d| Formatter::new(vrl_code, d).to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    })?;
+
+    let mut target = TargetValue {
+        value: json_to_vrl_value(input),
+        metadata: Value::Object(BTreeMap::new()),
+        secrets: Secrets::default(),
+    };
+    let timezone = vrl::compiler::TimeZone::Local;
+    let mut runtime = vrl::compiler::runtime::Runtime::default();
+    match runtime.resolve(&mut target, &result.program, &timezone) {
+        Ok(_) => Ok(vrl_value_to_json(&target.value)),
+        Err(e) => Err(format!("VRL runtime error/abort: {e}")),
+    }
+}
+
 /// Build a `(VrlValidationResult, Vec<String>)` for the single-error
 /// pre-compile failure case. Used by [`VrlValidator::validate_vrl_collect_errors`]
 /// so each early-return branch is a one-liner.
@@ -824,6 +1094,149 @@ fn vrl_value_to_json(value: &vrl::value::Value) -> serde_json::Value {
             }
             serde_json::Value::Object(map)
         }
+    }
+}
+
+#[cfg(test)]
+mod enrichment_contract_tests {
+    use super::validate_enrichment_encoding_contract;
+
+    // identity-kind shorthand for the existing cases.
+    fn check(vrl: &str) -> Result<(), String> {
+        validate_enrichment_encoding_contract("identity", vrl)
+    }
+
+    // A well-formed envelope (mirrors the shipped identity parsers): extracts
+    // external_id from any common source key, stamps version/last_synced_at,
+    // derives account_status, aborts on missing id.
+    const GOOD: &str = r#"
+external_id = to_string(.external_id) ?? to_string(.id) ?? to_string(.Worker_ID) ?? ""
+if external_id == "" { abort }
+version = to_int(.version) ?? 0
+if version <= 0 { version = to_unix_timestamp(now(), unit: "milliseconds") }
+last_synced_at = format_timestamp!(from_unix_timestamp!(version, unit: "milliseconds"), "%Y-%m-%d %H:%M:%S%.3f")
+account_status = downcase(to_string(.account_status) ?? "active")
+if !includes(["active","disabled","deleted","anonymized"], account_status) { account_status = "active" }
+groups = .groups
+if !is_array(groups) { groups = [] }
+. = { "external_id": external_id, "version": version, "last_synced_at": last_synced_at, "account_status": account_status, "groups": groups }
+"#;
+
+    #[test]
+    fn accepts_a_well_formed_envelope() {
+        assert!(check(GOOD).is_ok(), "{:?}", check(GOOD));
+    }
+
+    #[test]
+    fn rejects_zero_version() {
+        // Emits version 0 (NAN-1123 violation: must be non-zero integer-ms).
+        let vrl = r#"
+external_id = to_string(.external_id) ?? to_string(.id) ?? ""
+if external_id == "" { abort }
+. = { "external_id": external_id, "version": 0, "last_synced_at": "2026-01-01 00:00:00.000", "account_status": "active", "groups": [] }
+"#;
+        assert!(check(vrl).unwrap_err().contains("version"));
+    }
+
+    #[test]
+    fn rejects_bad_account_status() {
+        let vrl = r#"
+external_id = to_string(.external_id) ?? to_string(.id) ?? ""
+if external_id == "" { abort }
+. = { "external_id": external_id, "version": 1717000000000, "last_synced_at": "2026-01-01 00:00:00.000", "account_status": "BOGUS", "groups": [] }
+"#;
+        assert!(check(vrl).unwrap_err().contains("account_status"));
+    }
+
+    #[test]
+    fn rejects_non_array_groups() {
+        let vrl = r#"
+external_id = to_string(.external_id) ?? to_string(.id) ?? ""
+if external_id == "" { abort }
+. = { "external_id": external_id, "version": 1717000000000, "last_synced_at": "2026-01-01 00:00:00.000", "account_status": "active", "groups": "nope" }
+"#;
+        assert!(check(vrl).unwrap_err().contains("groups"));
+    }
+
+    #[test]
+    fn rejects_parser_that_does_not_require_external_id() {
+        // No abort on missing id → emits an empty external_id row.
+        let vrl = r#"
+external_id = to_string(.external_id) ?? to_string(.id) ?? ""
+. = { "external_id": external_id, "version": 1717000000000, "last_synced_at": "2026-01-01 00:00:00.000", "account_status": "active", "groups": [] }
+"#;
+        assert!(check(vrl).unwrap_err().contains("external_id"));
+    }
+
+    #[test]
+    fn rejects_malformed_last_synced_at() {
+        let vrl = r#"
+external_id = to_string(.external_id) ?? to_string(.id) ?? ""
+if external_id == "" { abort }
+. = { "external_id": external_id, "version": 1717000000000, "last_synced_at": "2026/01/01T00:00:00", "account_status": "active", "groups": [] }
+"#;
+        assert!(check(vrl).unwrap_err().contains("last_synced_at"));
+    }
+
+    #[test]
+    fn rejects_uncompilable_vrl() {
+        assert!(check("this is not ( valid vrl").is_err());
+    }
+
+    // ---- ip_context (NAN-1137) contract -------------------------------------
+
+    // A well-formed ip_context envelope: requires + validates the CIDR, carries
+    // source_id, stamps a non-far-future updated_at, normalizes deleted to 0/1.
+    const GOOD_IP: &str = r#"
+network = to_string(.network) ?? ""
+if !match(network, r'^[0-9a-fA-F:.]+/[0-9]+$') { abort }
+source_id = to_string(.source_id) ?? ""
+if source_id == "" { abort }
+updated_at = format_timestamp!(now(), "%Y-%m-%d %H:%M:%S%.3f")
+deleted = to_int(.deleted) ?? 0
+if deleted != 1 { deleted = 0 }
+. = { "network": network, "source_id": source_id, "country": to_string(.country) ?? "", "asn": to_string(.asn) ?? "", "as_name": to_string(.as_name) ?? "", "updated_at": updated_at, "deleted": deleted }
+"#;
+
+    #[test]
+    fn accepts_well_formed_ip_context() {
+        let r = validate_enrichment_encoding_contract("ip_context", GOOD_IP);
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[test]
+    fn rejects_ip_context_with_invalid_cidr() {
+        // No CIDR guard → emits a bad network for the "not-a-cidr" sample.
+        let vrl = r#"
+network = to_string(.network) ?? ""
+source_id = to_string(.source_id) ?? "x"
+. = { "network": network, "source_id": source_id, "updated_at": format_timestamp!(now(), "%Y-%m-%d %H:%M:%S%.3f"), "deleted": 0 }
+"#;
+        assert!(validate_enrichment_encoding_contract("ip_context", vrl)
+            .unwrap_err()
+            .contains("CIDR"));
+    }
+
+    #[test]
+    fn rejects_ip_context_far_future_updated_at() {
+        let vrl = r#"
+network = to_string(.network) ?? ""
+if !match(network, r'^[0-9a-fA-F:.]+/[0-9]+$') { abort }
+. = { "network": network, "source_id": to_string(.source_id) ?? "x", "updated_at": "9999-12-31 23:59:59.999", "deleted": 0 }
+"#;
+        assert!(validate_enrichment_encoding_contract("ip_context", vrl)
+            .unwrap_err()
+            .contains("far-future"));
+    }
+
+    #[test]
+    fn unknown_kind_only_requires_compile_and_object() {
+        // A future kind with no known schema: passes if it compiles + emits an
+        // object, without the identity/ip_context field assertions.
+        let vrl = r#". = { "anything": "goes", "x": to_int(.whatever) ?? 0 }"#;
+        assert!(validate_enrichment_encoding_contract("some_future_kind", vrl).is_ok());
+        // ...but a non-compiling one is still rejected.
+        assert!(validate_enrichment_encoding_contract("some_future_kind", "((").is_err());
     }
 }
 

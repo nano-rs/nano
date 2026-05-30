@@ -377,6 +377,20 @@ pub(crate) fn escape_regex_pattern(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "''")
 }
 
+/// Escape `%` and `_` for use inside an `iLike '%X%'` pattern body.
+/// The input is expected to already be SQL-escaped (single quotes doubled,
+/// backslashes doubled) — this only adds the LIKE-specific escaping so that
+/// literal `%` / `_` from user input don't act as wildcards.
+///
+/// Use this for the codegen path that lowered to `hasToken*` pre-NAN-1026 —
+/// `hasToken` is whole-token semantic and silently drops fragments like
+/// `/dc/` not matching `srv-dc01`; iLike with the splitByNonAlpha text index
+/// (CH 26.4's LIKE-via-dictionary-scan) gives both correct substring
+/// semantics AND granule pruning.
+pub(crate) fn escape_like_pattern(escaped: &str) -> String {
+    escaped.replace('%', "\\%").replace('_', "\\_")
+}
+
 /// Validate a regex pattern for complexity to prevent ReDoS attacks.
 ///
 /// Checks maximum length, nesting depth, and attempts compilation with a size limit

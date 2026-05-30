@@ -195,6 +195,15 @@ pub struct AppState {
     /// concurrent test prevents click-spam from amplifying that into a
     /// thundering herd against the database.
     pub rule_test_in_flight: Arc<dashmap::DashMap<uuid::Uuid, ()>>,
+    /// Shared shadow-investigation hook. On enterprise this is the live
+    /// `ShadowInvestigationService` (also wired into detection_service /
+    /// signal_processor / realtime_evaluator). On open-core it's the no-op
+    /// hook so the cases handlers can blindly call it. Held here so the
+    /// per-request `CaseService` built in handlers can pick it up via
+    /// `CasesAppState::shadow_investigation_hook`, which is what makes the
+    /// add-alert re-triage path (NAN-1059) fire.
+    pub shadow_investigation_hook:
+        Arc<dyn nanosiem_core::extensions::ShadowInvestigationHook>,
 }
 
 impl AppState {
@@ -522,6 +531,9 @@ impl nanosiem_enterprise::handlers::custom_enrichment::CustomEnrichmentAppState 
     fn melod_service(&self) -> &Arc<RwLock<Option<Arc<MelodService>>>> {
         &self.melod_service
     }
+    fn encryption_service(&self) -> &Arc<nanosiem_core::crypto::EncryptionService> {
+        &self.encryption_service
+    }
 }
 
 #[cfg(feature = "enterprise")]
@@ -563,6 +575,11 @@ impl nanosiem_enterprise::handlers::cases::CasesAppState for AppState {
     }
     fn presence_tracker(&self) -> &Arc<nanosiem_enterprise::PresenceTracker> {
         &self.presence_tracker
+    }
+    fn shadow_investigation_hook(
+        &self,
+    ) -> Arc<dyn nanosiem_core::extensions::ShadowInvestigationHook> {
+        self.shadow_investigation_hook.clone()
     }
     fn track_demo_resource(
         &self,

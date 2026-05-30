@@ -3,20 +3,23 @@
 /**
  * Enrichment Provider Components
  *
- * Each provider has its own configuration component that handles
- * the specific setup and management UI for that enrichment source.
+ * Per-provider configuration UIs for *native* enrichment sources — the
+ * ones that don't fit the Deno marketplace contract.
  *
- * To add a new provider:
- * 1. Create a new component file (e.g., MaxMindProvider.tsx)
- * 2. Export it from this index file
- * 3. Add the mapping in EnrichmentDetail.tsx
+ * IPinfo Lite is the only resident: its few-million-row gzipped-CSV
+ * download + atomic staging→prod swap exceeds the marketplace's
+ * single-shot `{records: [...]}` output ceiling. See the
+ * `project_ipinfo_lite_stays_native` memory for the rationale.
+ *
+ * ThreatFox / Tor / VirusTotal moved to the marketplace in NAN-1111
+ * (their providers were deleted from this directory). Anything that
+ * fits the marketplace contract (`{records: [...]}`, heap-sized, IOC
+ * or non-IOC schema) belongs in nano-rs/nano-enrichments instead.
+ *
+ * To add a new native provider:
+ * 1. Create the component file (e.g., MaxMindProvider.tsx)
+ * 2. Export it here
+ * 3. Wire it into EnrichmentDetail.tsx's PROVIDER_BY_TYPE / PROVIDER_BY_ID maps
  */
 
 export { IPinfoLiteProvider } from './IPinfoLiteProvider';
-export { ThreatFoxProvider } from './ThreatFoxProvider';
-export { TorExitNodesProvider } from './TorExitNodesProvider';
-
-// Future providers can be added here:
-// export { MaxMindProvider } from './MaxMindProvider';
-// export { VirusTotalProvider } from './VirusTotalProvider';
-// export { AbuseIPDBProvider } from './AbuseIPDBProvider';

@@ -34,6 +34,10 @@ pub enum EnrichmentError {
     IoError(#[from] std::io::Error),
     #[error("Source not configured: {0}")]
     SourceNotConfigured(String),
+    #[error("ClickHouse error: {0}")]
+    ClickHouseError(#[from] clickhouse::error::Error),
+    #[error("ClickHouse client not configured")]
+    ClickHouseNotConfigured,
 }
 
 /// Result of an enrichment sync operation
@@ -111,6 +115,12 @@ pub struct EnrichmentService {
     config: EnrichmentConfig,
     /// In-memory cache for fast lookups during ingestion
     cache: Arc<RwLock<IpEnrichmentCache>>,
+    /// ClickHouse client. The IP enrichment payload + lookups live in CH as of
+    /// NAN-1117 (ip_enrichment_dict was repointed off PostgreSQL — see CH
+    /// migration 123). Optional so the service can still be constructed in
+    /// contexts without a CH pool, but the sync writer / lookups error if it's
+    /// absent rather than silently no-op'ing.
+    clickhouse_client: Option<clickhouse::Client>,
 }
 
 /// Simple in-memory cache for IP enrichments
@@ -215,12 +225,30 @@ impl EnrichmentService {
             repository,
             config,
             cache: Arc::new(RwLock::new(IpEnrichmentCache::default())),
+            clickhouse_client: None,
         }
     }
 
     /// Create with default configuration
     pub fn with_defaults(repository: EnrichmentRepository) -> Self {
         Self::new(repository, EnrichmentConfig::default())
+    }
+
+    /// Attach the ClickHouse client used for the IP enrichment payload table,
+    /// dictGet lookups, and the record-count stat (NAN-1117). This MUST be set
+    /// before the service is wrapped in the shared `Arc<RwLock<>>`, because the
+    /// auto-sync scheduler runs `sync_ipinfo_lite` against that same Arc — if
+    /// the client is absent the sync writer errors instead of writing PG.
+    pub fn with_clickhouse(mut self, client: clickhouse::Client) -> Self {
+        self.clickhouse_client = Some(client);
+        self
+    }
+
+    /// Get the ClickHouse client or a typed error if it was never configured.
+    fn ch(&self) -> Result<&clickhouse::Client, EnrichmentError> {
+        self.clickhouse_client
+            .as_ref()
+            .ok_or(EnrichmentError::ClickHouseNotConfigured)
     }
 
     /// Configure IPinfo Lite URL
@@ -486,6 +514,17 @@ impl EnrichmentService {
     ) -> Result<u64, EnrichmentError> {
         const BATCH_SIZE: usize = 10_000;
 
+        let ch = self.ch()?;
+
+        // One run timestamp stamps every row inserted by this sync as a single
+        // ReplacingMergeTree generation. After the stream completes we
+        // lightweight-DELETE any CIDR for this source whose `updated_at` is
+        // older than `run_ms` — i.e. CIDRs the new feed dropped. The dict's
+        // argMax(updated_at) resolves a CIDR present in both generations to the
+        // newest row, so correctness holds even before the async DELETE mutation
+        // lands. Scoping the DELETE by source_id avoids clobbering other sources.
+        let run_ms = chrono::Utc::now().timestamp_millis() as u64;
+
         // SSRF defense-in-depth: every hop (initial + each redirect) is
         // re-validated with DNS resolution and dialed against a freshly
         // pinned client. See `fetch_with_validated_redirects` for the
@@ -503,9 +542,6 @@ impl EnrichmentService {
         let stream_reader = StreamReader::new(byte_stream);
         let gzip_decoder = GzipDecoder::new(BufReader::new(stream_reader));
         let mut lines = BufReader::new(gzip_decoder).lines();
-
-        // Clear staging table once
-        self.repository.clear_staging(source_id).await?;
 
         let mut total_inserted = 0u64;
         let mut batch = Vec::with_capacity(BATCH_SIZE);
@@ -543,10 +579,8 @@ impl EnrichmentService {
 
             // Flush batch when full
             if batch.len() >= BATCH_SIZE {
-                let inserted = self
-                    .repository
-                    .insert_staging_batch(source_id, &batch)
-                    .await?;
+                let inserted =
+                    Self::insert_ch_batch(ch, source_id, run_ms, &batch).await?;
                 total_inserted += inserted;
                 batch.clear();
 
@@ -558,341 +592,289 @@ impl EnrichmentService {
 
         // Flush remaining records
         if !batch.is_empty() {
-            let inserted = self
-                .repository
-                .insert_staging_batch(source_id, &batch)
-                .await?;
+            let inserted = Self::insert_ch_batch(ch, source_id, run_ms, &batch).await?;
             total_inserted += inserted;
         }
 
         info!(
             total_inserted,
-            "Streaming insert complete, swapping to production"
+            "Streaming insert into ClickHouse complete"
         );
 
-        // Atomic swap from staging to production
-        let swapped = self.repository.swap_staging(source_id).await?;
+        // Empty-feed footgun: a sync that yields zero rows must NOT delete the
+        // prior generation, or the dict reloads empty and all enrichment goes
+        // blank. This mirrors the old PG behavior, where swap_enrichment_staging
+        // only ran after a successful, non-empty stream.
+        if total_inserted > 0 {
+            // Lightweight delete of CIDRs the new feed dropped. Async mutation;
+            // the dict's argMax keeps correctness during the brief window where
+            // both generations coexist.
+            // NAN-1123: `updated_at` is DateTime64(3); a raw integer in a
+            // `updated_at < ?` comparison is coerced by ClickHouse as SECONDS
+            // (far-future), so `< run_ms` matched every row just inserted and
+            // the purge wiped the whole generation. fromUnixTimestamp64Milli
+            // makes the ms scale explicit (matches the INSERT below).
+            ch.query(
+                "ALTER TABLE nanosiem.ip_enrichments \
+                 DELETE WHERE source_id = ? AND updated_at < fromUnixTimestamp64Milli(toInt64(?))",
+            )
+            .bind(source_id)
+            .bind(run_ms)
+            .execute()
+            .await?;
+            info!(source_id, "Stale IP enrichment CIDRs removed (lightweight delete)");
+        } else {
+            warn!(
+                source_id,
+                "IPinfo Lite sync produced zero rows; keeping prior generation"
+            );
+        }
 
-        info!(swapped, "IPinfo Lite data swapped to production");
-        Ok(swapped)
+        Ok(total_inserted)
     }
 
-    // ========================================================================
-    // ThreatFox IOC Sync Operations
-    // ========================================================================
+    /// Insert one batch of IPinfo records into the CH payload table.
+    ///
+    /// Mirrors the batched multi-row INSERT pattern in
+    /// `nanosiem-enterprise/src/custom_enrichment/results_store.rs`: build one
+    /// `INSERT ... VALUES (?),(?),...` per chunk, falling back to per-row
+    /// inserts if a chunk fails so one malformed CIDR can't sink the whole
+    /// batch. `network` is inserted verbatim as a CIDR String (IP_TRIE keys on
+    /// the CIDR text — do NOT convert to a CH IP type).
+    async fn insert_ch_batch(
+        ch: &clickhouse::Client,
+        source_id: &str,
+        run_ms: u64,
+        records: &[IpInfoLiteRecord],
+    ) -> Result<u64, EnrichmentError> {
+        const CHUNK_SIZE: usize = 5000;
+        // (network, source_id, country, country_code, continent, continent_code,
+        //  asn, as_name, as_domain, updated_at, deleted)
+        const COLUMNS: &str = "(network, source_id, country, country_code, continent, \
+             continent_code, asn, as_name, as_domain, updated_at, deleted)";
+        // updated_at (10th col) is DateTime64(3); wrap the bound ms value in
+        // fromUnixTimestamp64Milli so storage uses the explicit ms scale that
+        // the purge DELETE compares against (NAN-1123).
+        const VALUE_TUPLE: &str =
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, fromUnixTimestamp64Milli(toInt64(?)), ?)";
 
-    /// Sync ThreatFox IOC data from abuse.ch API
-    #[instrument(skip(self))]
-    pub async fn sync_threatfox(&self) -> Result<EnrichmentSyncResult, EnrichmentError> {
-        use super::ioc::{
-            fetch_threatfox_iocs, parse_threatfox_ioc, IocRepository, ThreatFoxConfig,
-        };
+        if records.is_empty() {
+            return Ok(0);
+        }
 
-        let start = std::time::Instant::now();
-        let source_id = "threatfox";
-
-        // Load source from database to get config
-        let source = self.repository.get_source(source_id).await?;
-
-        // Extract config from source's JSONB config
-        let api_key = source
-            .config
-            .get("api_key")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let ttl_days = source
-            .config
-            .get("ttl_days")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(7);
-
-        // Always fetch the full TTL window since we do a complete replace on sync.
-        // Dynamic query_days doesn't work with DELETE+INSERT strategy.
-        let query_days = ttl_days as i32;
-
-        let config = ThreatFoxConfig {
-            api_key,
-            query_days,
-            ..Default::default()
-        };
-
-        info!(
-            query_days = query_days,
-            ttl_days = ttl_days,
-            "Starting ThreatFox IOC sync"
-        );
-
-        // Update status to in_progress
-        self.repository
-            .update_sync_status(source_id, SyncStatus::InProgress, None, None, None)
-            .await?;
-
-        // Fetch from ThreatFox API
-        match fetch_threatfox_iocs(&config).await {
-            Ok(raw_iocs) => {
-                info!(
-                    raw_ioc_count = raw_iocs.len(),
-                    "Received IOCs from ThreatFox, parsing..."
-                );
-
-                // Parse and normalize IOCs (extract IPs from URLs, etc.)
-                let parsed: Vec<_> = raw_iocs
-                    .iter()
-                    .flat_map(|ioc| parse_threatfox_ioc(ioc, ttl_days))
-                    .collect();
-
-                info!(
-                    raw_count = raw_iocs.len(),
-                    parsed_count = parsed.len(),
-                    "Parsed ThreatFox IOCs"
-                );
-
-                // Insert into database using staging table
-                let ioc_repo = IocRepository::new(self.repository.pool().clone());
-                let inserted = ioc_repo
-                    .insert_iocs_staged(source_id, &parsed, ttl_days)
-                    .await
-                    .map_err(|e| EnrichmentError::RepositoryError(e.into()))?;
-
-                // Update status
-                self.repository
-                    .update_sync_status(
-                        source_id,
-                        SyncStatus::Success,
-                        None,
-                        Some(inserted as i64),
-                        None,
-                    )
-                    .await?;
-
-                // Enable the source
-                self.repository.set_source_enabled(source_id, true).await?;
-
-                let duration_ms = start.elapsed().as_millis() as u64;
-                info!(
-                    records = inserted,
-                    duration_ms, "ThreatFox IOC sync completed"
-                );
-
-                Ok(EnrichmentSyncResult {
-                    source_id: source_id.to_string(),
-                    success: true,
-                    records_loaded: inserted,
-                    duration_ms,
-                    error: None,
-                })
-            }
-            Err(e) => {
-                let error_msg = e.to_string();
-                warn!(error = %error_msg, "ThreatFox sync failed");
-
-                self.repository
-                    .update_sync_status(source_id, SyncStatus::Failed, Some(&error_msg), None, None)
-                    .await?;
-
-                Ok(EnrichmentSyncResult {
-                    source_id: source_id.to_string(),
-                    success: false,
-                    records_loaded: 0,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    error: Some(error_msg),
-                })
+        let mut inserted = 0u64;
+        for chunk in records.chunks(CHUNK_SIZE) {
+            match Self::insert_ch_rows(ch, source_id, run_ms, COLUMNS, VALUE_TUPLE, chunk).await {
+                Ok(()) => inserted += chunk.len() as u64,
+                Err(e) => {
+                    warn!(
+                        chunk_size = chunk.len(),
+                        error = %e,
+                        "CH IP enrichment batch insert failed; retrying records individually"
+                    );
+                    for record in chunk {
+                        match Self::insert_ch_rows(
+                            ch,
+                            source_id,
+                            run_ms,
+                            COLUMNS,
+                            VALUE_TUPLE,
+                            std::slice::from_ref(record),
+                        )
+                        .await
+                        {
+                            Ok(()) => inserted += 1,
+                            Err(e) => {
+                                warn!(network = %record.network, error = %e, "Failed to store IP enrichment record");
+                            }
+                        }
+                    }
+                }
             }
         }
+        Ok(inserted)
     }
 
-    // ========================================================================
-    // TOR Exit Nodes Sync Operations
-    // ========================================================================
+    /// Build + execute a single multi-row INSERT for `rows` (length >= 1).
+    async fn insert_ch_rows(
+        ch: &clickhouse::Client,
+        source_id: &str,
+        run_ms: u64,
+        columns: &str,
+        value_tuple: &str,
+        rows: &[IpInfoLiteRecord],
+    ) -> Result<(), clickhouse::error::Error> {
+        let tuples = vec![value_tuple; rows.len()].join(", ");
+        let sql = format!("INSERT INTO nanosiem.ip_enrichments {columns} VALUES {tuples}");
 
-    /// Sync TOR exit node IPs from the Tor Project Onionoo API
-    #[instrument(skip(self))]
-    pub async fn sync_tor_exit_nodes(&self) -> Result<EnrichmentSyncResult, EnrichmentError> {
-        use super::ioc::{fetch_tor_exit_nodes, IocRepository, TorConfig};
-
-        let start = std::time::Instant::now();
-        let source_id = "tor_exit_nodes";
-
-        // Load source from database to get config
-        let source = self.repository.get_source(source_id).await?;
-
-        // Extract config from source's JSONB config
-        let ttl_days = source
-            .config
-            .get("ttl_days")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(1); // TOR exit nodes change frequently, default 1 day TTL
-
-        let confidence_level = source
-            .config
-            .get("confidence_level")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(85) as i32;
-
-        let timeout_secs = source
-            .config
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(120);
-
-        let config = TorConfig {
-            confidence_level,
-            timeout_secs,
-            ..Default::default()
-        };
-
-        info!(
-            ttl_days = ttl_days,
-            confidence_level = confidence_level,
-            "Starting TOR exit nodes sync"
-        );
-
-        // Update status to in_progress
-        self.repository
-            .update_sync_status(source_id, SyncStatus::InProgress, None, None, None)
-            .await?;
-
-        // Fetch from Onionoo API
-        match fetch_tor_exit_nodes(&config).await {
-            Ok(parsed_iocs) => {
-                info!(
-                    ioc_count = parsed_iocs.len(),
-                    "Received TOR exit node IOCs, inserting..."
-                );
-
-                // Insert into database using staging table
-                let ioc_repo = IocRepository::new(self.repository.pool().clone());
-                let inserted = ioc_repo
-                    .insert_iocs_staged(source_id, &parsed_iocs, ttl_days)
-                    .await
-                    .map_err(|e| EnrichmentError::RepositoryError(e.into()))?;
-
-                // Update status
-                self.repository
-                    .update_sync_status(
-                        source_id,
-                        SyncStatus::Success,
-                        None,
-                        Some(inserted as i64),
-                        None,
-                    )
-                    .await?;
-
-                // Enable the source
-                self.repository.set_source_enabled(source_id, true).await?;
-
-                let duration_ms = start.elapsed().as_millis() as u64;
-                info!(
-                    records = inserted,
-                    duration_ms, "TOR exit nodes sync completed"
-                );
-
-                Ok(EnrichmentSyncResult {
-                    source_id: source_id.to_string(),
-                    success: true,
-                    records_loaded: inserted,
-                    duration_ms,
-                    error: None,
-                })
-            }
-            Err(e) => {
-                let error_msg = e.to_string();
-                warn!(error = %error_msg, "TOR exit nodes sync failed");
-
-                self.repository
-                    .update_sync_status(source_id, SyncStatus::Failed, Some(&error_msg), None, None)
-                    .await?;
-
-                Ok(EnrichmentSyncResult {
-                    source_id: source_id.to_string(),
-                    success: false,
-                    records_loaded: 0,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    error: Some(error_msg),
-                })
-            }
+        let mut q = ch.query(&sql);
+        for record in rows {
+            q = q
+                .bind(&record.network)
+                .bind(source_id)
+                .bind(&record.country)
+                .bind(&record.country_code)
+                .bind(&record.continent)
+                .bind(&record.continent_code)
+                .bind(&record.asn)
+                .bind(&record.as_name)
+                .bind(&record.as_domain)
+                .bind(run_ms)
+                .bind(0u8);
         }
+        q.execute().await
     }
 
-    /// Lookup IOC enrichment for a single value (IP, domain, or hash).
-    /// Returns the highest-confidence verdict across all enabled sources.
-    /// Used by the ingestion path where one verdict per log row is enough.
-    #[instrument(skip(self))]
-    pub async fn lookup_ioc(
-        &self,
-        value: &str,
-    ) -> Result<Option<super::ioc::IocLookupResult>, EnrichmentError> {
-        use super::ioc::IocRepository;
-
-        let ioc_repo = IocRepository::new(self.repository.pool().clone());
-        ioc_repo
-            .lookup_ioc(value, None)
-            .await
-            .map_err(|e| EnrichmentError::RepositoryError(e.into()))
-    }
-
-    /// Lookup all enabled-source IOC verdicts for a single value.
-    /// Used by the prevalence threat-intel surface (NAN-849) which wants
-    /// the full multi-source view (ThreatFox + VirusTotal + AbuseIPDB can
-    /// all flag the same artifact), not just the highest-confidence one.
-    #[instrument(skip(self))]
-    pub async fn lookup_ioc_all_sources(
-        &self,
-        value: &str,
-    ) -> Result<Vec<super::ioc::IocLookupResult>, EnrichmentError> {
-        use super::ioc::IocRepository;
-
-        let ioc_repo = IocRepository::new(self.repository.pool().clone());
-        ioc_repo
-            .lookup_ioc_all_sources(value, None)
-            .await
-            .map_err(|e| EnrichmentError::RepositoryError(e.into()))
-    }
-
-    /// Get IOC statistics for a source
-    #[instrument(skip(self))]
-    pub async fn get_ioc_stats(
+    /// Purge a source's CH IP enrichment rows by writing tombstones (deleted=1)
+    /// for every CIDR it currently has. This preserves the legacy "disable the
+    /// source -> dict blanks on next reload" UX (NAN-1117): the old PG dict
+    /// source filtered `WHERE enabled = true`; CH can't join PG, so disabling a
+    /// source instead tombstones its payload so the dict's `HAVING deleted = 0`
+    /// drops it. Re-enabling repopulates on the next sync.
+    ///
+    /// Tombstones (rather than a hard ALTER DELETE) keep this cheap and
+    /// merge-friendly: a new tombstone row per CIDR with a fresh `updated_at`
+    /// wins the ReplacingMergeTree argMax against the prior live row.
+    pub async fn clear_ip_enrichments_for_source(
         &self,
         source_id: &str,
-    ) -> Result<super::ioc::IocStats, EnrichmentError> {
-        use super::ioc::IocRepository;
-
-        let ioc_repo = IocRepository::new(self.repository.pool().clone());
-        ioc_repo
-            .get_stats(source_id)
-            .await
-            .map_err(|e| EnrichmentError::RepositoryError(e.into()))
-    }
-
-    /// Cleanup expired IOCs
-    #[instrument(skip(self))]
-    pub async fn cleanup_expired_iocs(&self) -> Result<u64, EnrichmentError> {
-        use super::ioc::IocRepository;
-
-        let ioc_repo = IocRepository::new(self.repository.pool().clone());
-        ioc_repo
-            .cleanup_expired()
-            .await
-            .map_err(|e| EnrichmentError::RepositoryError(e.into()))
+    ) -> Result<(), EnrichmentError> {
+        let ch = self.ch()?;
+        let run_ms = chrono::Utc::now().timestamp_millis() as u64;
+        ch.query(
+            "INSERT INTO nanosiem.ip_enrichments \
+             (network, source_id, country, country_code, continent, continent_code, \
+              asn, as_name, as_domain, updated_at, deleted) \
+             SELECT network, source_id, country, country_code, continent, continent_code, \
+              asn, as_name, as_domain, ?, 1 \
+             FROM nanosiem.ip_enrichments \
+             WHERE source_id = ? AND deleted = 0",
+        )
+        .bind(run_ms)
+        .bind(source_id)
+        .execute()
+        .await?;
+        info!(source_id, "Tombstoned IP enrichment rows for disabled source");
+        Ok(())
     }
 
     // ========================================================================
     // Lookup Operations (for ingestion-time enrichment)
     // ========================================================================
 
-    /// Lookup enrichment for a single IP
+    /// Lookup enrichment for a single IP via the ClickHouse dictionary.
+    ///
+    /// Uses `dictGetOrDefault` against `ip_enrichment_dict` so on-demand lookups
+    /// resolve identically to ingest-time enrichment (same dict, same IP_TRIE
+    /// longest-prefix match, same toIPv4OrDefault/toIPv6OrDefault keying for
+    /// v4 vs v6). NAN-1117 moved this off the PG `lookup_ip_enrichment`
+    /// function.
     #[instrument(skip(self))]
     pub async fn lookup_ip(&self, ip: &str) -> Result<Option<IpEnrichmentResult>, EnrichmentError> {
-        Ok(self.repository.lookup_ip(ip).await?)
+        if ip.is_empty() {
+            return Ok(None);
+        }
+        let mut map = self.lookup_ips_bulk(&[ip]).await?;
+        Ok(map.remove(ip))
     }
 
-    /// Bulk lookup enrichments for multiple IPs (optimized for batch ingestion)
+    /// Bulk lookup enrichments for multiple IPs (optimized for batch ingestion).
+    ///
+    /// One ClickHouse round-trip: for each IP we evaluate the 8 dict attributes
+    /// with `dictGetOrDefault`, branching on `isIPv4String` to key the IP_TRIE
+    /// with `toIPv4OrDefault` / `toIPv6OrDefault` exactly as the nanosiem.logs
+    /// enriched_* MATERIALIZED columns do (init.sql:557-570) — so v6 lookups
+    /// don't silently miss. An all-empty result for an IP is treated as "no
+    /// enrichment" and omitted from the map, matching the PG behavior.
     #[instrument(skip(self, ips))]
     pub async fn lookup_ips_bulk(
         &self,
         ips: &[&str],
     ) -> Result<std::collections::HashMap<String, IpEnrichmentResult>, EnrichmentError> {
-        Ok(self.repository.lookup_ips_bulk(ips).await?)
+        use std::collections::{HashMap, HashSet};
+
+        let mut results: HashMap<String, IpEnrichmentResult> = HashMap::new();
+
+        let unique_ips: Vec<String> = ips
+            .iter()
+            .filter(|ip| !ip.is_empty())
+            .map(|ip| ip.to_string())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        if unique_ips.is_empty() {
+            return Ok(results);
+        }
+
+        let ch = self.ch()?;
+
+        // Build a SELECT over an injected array of IPs. The IP value is bound
+        // as a parameter (no string splicing of user data into SQL). Each
+        // attribute branches on isIPv4String to pick the right trie key type.
+        const DICT: &str = "nanosiem.ip_enrichment_dict";
+        let attr = |name: &str| -> String {
+            format!(
+                "if(isIPv4String(ip), \
+                   dictGetOrDefault('{DICT}', '{name}', toIPv4OrDefault(ip), ''), \
+                   dictGetOrDefault('{DICT}', '{name}', toIPv6OrDefault(ip), ''))"
+            )
+        };
+
+        let sql = format!(
+            "SELECT \
+                ip, \
+                {country}, {country_code}, {continent}, {continent_code}, \
+                {asn}, {as_name}, {as_domain} \
+             FROM (SELECT arrayJoin(?) AS ip)",
+            country = attr("country"),
+            country_code = attr("country_code"),
+            continent = attr("continent"),
+            continent_code = attr("continent_code"),
+            asn = attr("asn"),
+            as_name = attr("as_name"),
+            as_domain = attr("as_domain"),
+        );
+
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+        )> = ch
+            .query(&sql)
+            .bind(&unique_ips)
+            .fetch_all()
+            .await?;
+
+        for (ip, country, country_code, continent, continent_code, asn, as_name, as_domain) in rows
+        {
+            // Skip IPs the dict had no entry for (all attributes default to '').
+            if country.is_empty() && asn.is_empty() {
+                continue;
+            }
+            let to_opt = |s: String| if s.is_empty() { None } else { Some(s) };
+            results.insert(
+                ip,
+                IpEnrichmentResult {
+                    source_id: Some("ipinfo_lite".to_string()),
+                    network: None,
+                    country: to_opt(country),
+                    country_code: to_opt(country_code),
+                    continent: to_opt(continent),
+                    continent_code: to_opt(continent_code),
+                    asn: to_opt(asn),
+                    as_name: to_opt(as_name),
+                    as_domain: to_opt(as_domain),
+                },
+            );
+        }
+
+        Ok(results)
     }
 
     /// Enrich a log record with IP geolocation data
@@ -921,8 +903,8 @@ impl EnrichmentService {
             return Ok(enrichment);
         }
 
-        // Bulk lookup
-        let results = self.repository.lookup_ips_bulk(&ips_to_lookup).await?;
+        // Bulk lookup (CH dictGet path — NAN-1117)
+        let results = self.lookup_ips_bulk(&ips_to_lookup).await?;
 
         // Apply results
         if let Some(ip) = src_ip {
@@ -948,9 +930,31 @@ impl EnrichmentService {
         Ok(self.repository.list_sources().await?)
     }
 
-    /// Get enrichment statistics
+    /// Get enrichment statistics.
+    ///
+    /// Hybrid since NAN-1117: `enabled_sources` is a PG count from
+    /// enrichment_sources (config/metadata stays in PG); `total_ip_records` is
+    /// a CH count of live (non-tombstoned) IP enrichment rows.
     pub async fn get_stats(&self) -> Result<super::repository::EnrichmentStats, EnrichmentError> {
-        Ok(self.repository.get_stats().await?)
+        let enabled_sources = self.repository.count_enabled_sources().await?;
+
+        let total_ip_records = match self.ch() {
+            Ok(ch) => {
+                let count: u64 = ch
+                    .query("SELECT count(DISTINCT network) FROM nanosiem.ip_enrichments WHERE deleted = 0")
+                    .fetch_one::<u64>()
+                    .await?;
+                count as i64
+            }
+            // No CH client (constructed without a pool): report 0 rather than
+            // failing the whole stats endpoint.
+            Err(_) => 0,
+        };
+
+        Ok(super::repository::EnrichmentStats {
+            enabled_sources,
+            total_ip_records,
+        })
     }
 }
 

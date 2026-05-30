@@ -313,6 +313,11 @@ pub struct FetchLogRequest {
     pub id: String,
     /// Time range hint (for partition pruning)
     pub time_range: Option<TimeRangeInput>,
+    /// Source type hint (NAN-1032). When provided, the query can use the
+    /// `(source_type, timestamp, ...)` PK index for a tight range read instead
+    /// of scanning every source_type's marks within the time window. Without
+    /// this hint, S3-backed historical lookups take 12–60s vs <1s with it.
+    pub source_type: Option<String>,
 }
 
 /// Response for fetch_log endpoint
@@ -350,7 +355,12 @@ pub async fn fetch_log(
     let start = Instant::now();
     let result = state
         .search
-        .fetch_log_by_id(&request.id, request.time_range.as_ref(), exclude_audit)
+        .fetch_log_by_id(
+            &request.id,
+            request.time_range.as_ref(),
+            request.source_type.as_deref(),
+            exclude_audit,
+        )
         .await;
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
