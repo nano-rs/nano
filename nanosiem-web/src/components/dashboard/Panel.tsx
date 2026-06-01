@@ -33,16 +33,7 @@ import {
   SheetHeader,
   SheetTitle,
 } from '@/components/ui/sheet';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import {
   RefreshCw,
   MoreVertical,
@@ -427,30 +418,24 @@ export function Panel({
       </Dialog>
 
       {/* Delete Confirmation Dialog */}
-      <AlertDialog open={showDeleteConfirm} onOpenChange={setShowDeleteConfirm}>
-        <AlertDialogContent className="bg-card border-border max-w-md">
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete panel?</AlertDialogTitle>
-            <AlertDialogDescription className="text-[12px] text-muted-foreground">
-              Are you sure you want to delete &ldquo;{config.title}&rdquo;? This action cannot be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel className="h-[28px] text-[12px]">
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => {
-                onDelete?.();
-                setShowDeleteConfirm(false);
-              }}
-              className="h-[28px] text-[12px] bg-rose-600 hover:bg-rose-700"
-            >
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDialog
+        open={showDeleteConfirm}
+        onOpenChange={setShowDeleteConfirm}
+        variant="danger"
+        title="Delete panel?"
+        description={
+          <>
+            Are you sure you want to delete &ldquo;
+            <span className="text-foreground font-medium">{config.title}</span>&rdquo;? This action
+            cannot be undone.
+          </>
+        }
+        confirmLabel="Delete"
+        onConfirm={() => {
+          onDelete?.();
+          setShowDeleteConfirm(false);
+        }}
+      />
     </>
   );
 }

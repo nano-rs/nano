@@ -20,7 +20,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import {
   Loader2,
@@ -892,22 +892,15 @@ export function LookupTableView() {
       )}
 
       {/* Delete Ingestion Confirmation */}
-      <AlertDialog open={deleteIngestionDialog} onOpenChange={setDeleteIngestionDialog}>
-        <AlertDialogContent className="bg-card border-border text-foreground rounded-lg">
-          <AlertDialogHeader>
-            <AlertDialogTitle>Remove ingestion</AlertDialogTitle>
-            <AlertDialogDescription className="text-muted-foreground">
-              Remove the automated ingestion config? The table data will not be affected.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel className="rounded-md">Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={handleDeleteIngestion} className="bg-destructive text-destructive-foreground hover:bg-destructive/90 rounded-md">
-              Remove
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDialog
+        open={deleteIngestionDialog}
+        onOpenChange={setDeleteIngestionDialog}
+        variant="danger"
+        title="Remove ingestion"
+        description="Remove the automated ingestion config? The table data will not be affected."
+        confirmLabel="Remove"
+        onConfirm={handleDeleteIngestion}
+      />
 
       {/* Search bar — lookup by primary key */}
       <div className="flex items-center gap-2">
@@ -1147,22 +1140,15 @@ export function LookupTableView() {
       )}
 
       {/* Delete Confirmation */}
-      <AlertDialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
-        <AlertDialogContent className="bg-card border-border text-foreground rounded-lg">
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete row</AlertDialogTitle>
-            <AlertDialogDescription className="text-muted-foreground">
-              Permanently delete this row? This action cannot be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel className="rounded-md">Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={handleDelete} className="bg-destructive text-destructive-foreground hover:bg-destructive/90 rounded-md">
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDialog
+        open={deleteDialogOpen}
+        onOpenChange={setDeleteDialogOpen}
+        variant="danger"
+        title="Delete row"
+        description="Permanently delete this row? This action cannot be undone."
+        confirmLabel="Delete"
+        onConfirm={handleDelete}
+      />
 
       {/* Paste Data Dialog */}
       <Sheet open={pasteDialogOpen} onOpenChange={setPasteDialogOpen}>
@@ -1260,23 +1246,20 @@ export function LookupTableView() {
         onDelete={() => setDeleteTableDialog(true)}
       />
     )}
-    <AlertDialog open={deleteTableDialog} onOpenChange={setDeleteTableDialog}>
-      <AlertDialogContent className="bg-card border-border text-foreground rounded-lg">
-        <AlertDialogHeader>
-          <AlertDialogTitle>Delete lookup table</AlertDialogTitle>
-          <AlertDialogDescription className="text-muted-foreground">
-            Permanently delete <span className="font-mono">{table.name}</span>? All rows
-            and ingestion config are removed; rules referencing it will fail until rewired.
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <AlertDialogFooter>
-          <AlertDialogCancel className="rounded-md">Cancel</AlertDialogCancel>
-          <AlertDialogAction onClick={handleDeleteTable} className="bg-destructive text-destructive-foreground hover:bg-destructive/90 rounded-md">
-            Delete
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
+    <ConfirmDialog
+      open={deleteTableDialog}
+      onOpenChange={setDeleteTableDialog}
+      variant="danger"
+      title="Delete lookup table"
+      description={
+        <>
+          Permanently delete <span className="font-mono">{table.name}</span>? All rows
+          and ingestion config are removed; rules referencing it will fail until rewired.
+        </>
+      }
+      confirmLabel="Delete"
+      onConfirm={handleDeleteTable}
+    />
     </div>
   );
 }

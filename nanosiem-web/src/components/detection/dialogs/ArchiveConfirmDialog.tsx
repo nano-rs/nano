@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 
 interface ArchiveConfirmDialogProps {
   open: boolean;
@@ -31,56 +22,43 @@ export function ArchiveConfirmDialog({
   if (isArchived) {
     // Unarchive dialog
     return (
-      <AlertDialog open={open} onOpenChange={onOpenChange}>
-        <AlertDialogContent className="bg-card border-border text-foreground">
-          <AlertDialogHeader>
-            <AlertDialogTitle>Unarchive Detection Rule?</AlertDialogTitle>
-            <AlertDialogDescription className="text-muted-foreground">
-              This will unarchive the detection rule "{ruleName}" and move it to staging mode.
-              You can then edit and test the rule before enabling it.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel className="bg-accent/50 border-border text-foreground hover:bg-accent" disabled={loading}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={onConfirm}
-              disabled={loading}
-              className=""
-            >
-              Unarchive Rule
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDialog
+        open={open}
+        onOpenChange={onOpenChange}
+        variant="default"
+        title="Unarchive Detection Rule?"
+        description={
+          <>
+            This will unarchive the detection rule "
+            <span className="text-foreground font-medium">{ruleName}</span>" and move it to staging
+            mode. You can then edit and test the rule before enabling it.
+          </>
+        }
+        confirmLabel="Unarchive Rule"
+        loading={loading}
+        onConfirm={onConfirm}
+      />
     );
   }
 
   // Archive dialog
   return (
-    <AlertDialog open={open} onOpenChange={onOpenChange}>
-      <AlertDialogContent className="bg-card border-border text-foreground">
-        <AlertDialogHeader>
-          <AlertDialogTitle>Archive Detection Rule?</AlertDialogTitle>
-          <AlertDialogDescription className="text-muted-foreground">
-            This will archive the detection rule "{ruleName}". Archived rules are hidden by default
-            and must be unarchived before they can be activated. The rule will be set to staging mode.
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <AlertDialogFooter>
-          <AlertDialogCancel className="bg-accent/50 border-border text-foreground hover:bg-accent" disabled={loading}>
-            Cancel
-          </AlertDialogCancel>
-          <AlertDialogAction
-            onClick={onConfirm}
-            disabled={loading}
-            className="bg-yellow-600 hover:bg-yellow-700 text-foreground"
-          >
-            Archive Rule
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
+    <ConfirmDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      variant="warning"
+      title="Archive Detection Rule?"
+      description={
+        <>
+          This will archive the detection rule "
+          <span className="text-foreground font-medium">{ruleName}</span>". Archived rules are
+          hidden by default and must be unarchived before they can be activated. The rule will be set
+          to staging mode.
+        </>
+      }
+      confirmLabel="Archive Rule"
+      loading={loading}
+      onConfirm={onConfirm}
+    />
   );
 }

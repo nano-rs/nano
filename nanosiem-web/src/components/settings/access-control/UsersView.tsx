@@ -26,16 +26,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import { useTierContext } from '@/hooks/use-tier';
 import { api, type UserDetail, type GroupDetail } from '@/lib/api';
 import { Button } from '@/components/ui/button';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { formatUTC } from '@/lib/date-utils';
 import { TierUsageBar } from '@/components/TierUsageBar';
 import { InviteUserDialog } from './InviteUserDialog';
@@ -527,46 +518,48 @@ export function UsersView() {
         }}
       />
 
-      <AlertDialog open={!!pending} onOpenChange={(open) => !open && setPending(null)}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              {pending?.kind === 'delete' && 'Delete user'}
-              {pending?.kind === 'disable' && 'Disable user'}
-              {pending?.kind === 'enable' && 'Enable user'}
-              {pending?.kind === 'unlock' && 'Unlock user'}
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              {pending?.kind === 'delete' && (
-                <>Permanently delete <span className="text-foreground font-medium">{pending?.user.name}</span>? This cannot be undone.</>
-              )}
-              {pending?.kind === 'disable' && (
-                <>Disable <span className="text-foreground font-medium">{pending?.user.name}</span>? They won't be able to sign in until re-enabled.</>
-              )}
-              {pending?.kind === 'enable' && (
-                <>Re-enable <span className="text-foreground font-medium">{pending?.user.name}</span>? They'll regain access to the platform.</>
-              )}
-              {pending?.kind === 'unlock' && (
-                <>Unlock <span className="text-foreground font-medium">{pending?.user.name}</span>? They'll be able to sign in again.</>
-              )}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={performPending}
-              disabled={actionLoading}
-              className={pending?.kind === 'delete' ? 'bg-destructive hover:bg-destructive/90 text-destructive-foreground' : ''}
-            >
-              {actionLoading && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
-              {pending?.kind === 'delete' && 'Delete'}
-              {pending?.kind === 'disable' && 'Disable'}
-              {pending?.kind === 'enable' && 'Enable'}
-              {pending?.kind === 'unlock' && 'Unlock'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDialog
+        open={!!pending}
+        onOpenChange={(open) => !open && setPending(null)}
+        variant={
+          pending?.kind === 'delete'
+            ? 'danger'
+            : pending?.kind === 'disable'
+              ? 'warning'
+              : 'default'
+        }
+        title={
+          pending?.kind === 'delete'
+            ? 'Delete user'
+            : pending?.kind === 'disable'
+              ? 'Disable user'
+              : pending?.kind === 'enable'
+                ? 'Enable user'
+                : 'Unlock user'
+        }
+        description={
+          pending?.kind === 'delete' ? (
+            <>Permanently delete <span className="text-foreground font-medium">{pending?.user.name}</span>? This cannot be undone.</>
+          ) : pending?.kind === 'disable' ? (
+            <>Disable <span className="text-foreground font-medium">{pending?.user.name}</span>? They won't be able to sign in until re-enabled.</>
+          ) : pending?.kind === 'enable' ? (
+            <>Re-enable <span className="text-foreground font-medium">{pending?.user.name}</span>? They'll regain access to the platform.</>
+          ) : (
+            <>Unlock <span className="text-foreground font-medium">{pending?.user.name}</span>? They'll be able to sign in again.</>
+          )
+        }
+        confirmLabel={
+          pending?.kind === 'delete'
+            ? 'Delete'
+            : pending?.kind === 'disable'
+              ? 'Disable'
+              : pending?.kind === 'enable'
+                ? 'Enable'
+                : 'Unlock'
+        }
+        loading={actionLoading}
+        onConfirm={performPending}
+      />
     </>
   );
 }

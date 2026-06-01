@@ -24,16 +24,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import {
   Accordion,
   AccordionContent,
@@ -473,28 +464,17 @@ export function ApiKeyForm() {
       </Card>
 
       {/* Reset Key Confirmation Dialog */}
-      <AlertDialog open={resetDialogOpen} onOpenChange={setResetDialogOpen}>
-        <AlertDialogContent className="bg-card border-border rounded-2xl">
-          <AlertDialogHeader>
-            <AlertDialogTitle className="text-foreground">Reset API Key</AlertDialogTitle>
-            <AlertDialogDescription className="text-muted-foreground">
-              Are you sure you want to reset this API key? This will generate a new key value and
-              immediately invalidate the old one. Any services using the current key will need to be updated.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel className="rounded-xl border-border">Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleResetKey}
-              disabled={resetting}
-              className="bg-orange-600 hover:bg-orange-700 rounded-xl"
-            >
-              {resetting && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
-              Reset Key
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDialog
+        open={resetDialogOpen}
+        onOpenChange={setResetDialogOpen}
+        variant="danger"
+        title="Reset API Key"
+        description="Are you sure you want to reset this API key? This will generate a new key value and immediately invalidate the old one. Any services using the current key will need to be updated."
+        confirmLabel="Reset Key"
+        loadingLabel="Resetting…"
+        loading={resetting}
+        onConfirm={handleResetKey}
+      />
 
       {/* Key Created/Reset Dialog - Shows the key only once */}
       <Dialog open={keyDialogOpen} onOpenChange={(open) => {

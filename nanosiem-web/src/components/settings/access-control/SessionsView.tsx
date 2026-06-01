@@ -26,16 +26,7 @@ import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/AuthContext';
 import { api, type SessionInfo, type UserDetail } from '@/lib/api';
 import { Button } from '@/components/ui/button';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { formatRelativeCompact } from '@/lib/date-utils';
 
 function deviceFromUA(ua: string | undefined): string {
@@ -263,49 +254,29 @@ export function SessionsView() {
         </div>
       </div>
 
-      <AlertDialog open={!!pendingRevoke} onOpenChange={(open) => !open && setPendingRevoke(null)}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Revoke session</AlertDialogTitle>
-            <AlertDialogDescription>
-              End this session immediately? The user will need to sign in again.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleRevoke}
-              disabled={actionLoading}
-              className="bg-destructive hover:bg-destructive/90 text-destructive-foreground"
-            >
-              {actionLoading && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
-              Revoke
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDialog
+        open={!!pendingRevoke}
+        onOpenChange={(open) => !open && setPendingRevoke(null)}
+        variant="danger"
+        title="Revoke session"
+        description="End this session immediately? The user will need to sign in again."
+        confirmLabel="Revoke"
+        loadingLabel="Revoking…"
+        loading={actionLoading}
+        onConfirm={handleRevoke}
+      />
 
-      <AlertDialog open={revokeAll} onOpenChange={(open) => !open && setRevokeAll(false)}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Revoke all other sessions</AlertDialogTitle>
-            <AlertDialogDescription>
-              End every active session except your current one. Affected users will need to sign in again.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleRevokeAll}
-              disabled={actionLoading}
-              className="bg-destructive hover:bg-destructive/90 text-destructive-foreground"
-            >
-              {actionLoading && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
-              Revoke all
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDialog
+        open={revokeAll}
+        onOpenChange={(open) => !open && setRevokeAll(false)}
+        variant="danger"
+        title="Revoke all other sessions"
+        description="End every active session except your current one. Affected users will need to sign in again."
+        confirmLabel="Revoke all"
+        loadingLabel="Revoking…"
+        loading={actionLoading}
+        onConfirm={handleRevokeAll}
+      />
     </>
   );
 }

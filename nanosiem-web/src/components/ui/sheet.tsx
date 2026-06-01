@@ -137,7 +137,7 @@ function SheetTitle({
   return (
     <SheetPrimitive.Title
       ref={ref}
-      className={cn('text-lg font-semibold text-foreground', className)}
+      className={cn('text-[14px] font-semibold text-foreground', className)}
       {...props}
     />
   );
@@ -153,7 +153,7 @@ function SheetDescription({
   return (
     <SheetPrimitive.Description
       ref={ref}
-      className={cn('text-sm text-muted-foreground', className)}
+      className={cn('text-[11.5px] text-muted-foreground', className)}
       {...props}
     />
   );

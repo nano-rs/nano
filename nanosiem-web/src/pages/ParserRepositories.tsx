@@ -26,16 +26,7 @@ import { useNavigate } from 'react-router-dom';
 import { useSyncCompleteEffect } from '@/hooks/use-sync-complete';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, ArrowUpRight, ChevronDown, Eye, Loader2, Rocket } from 'lucide-react';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
@@ -718,26 +709,15 @@ export function ParserRepositories() {
           />
         )}
 
-        <AlertDialog open={!!deleteRepoId} onOpenChange={() => setDeleteRepoId(null)}>
-          <AlertDialogContent>
-            <AlertDialogHeader>
-              <AlertDialogTitle>Remove repository</AlertDialogTitle>
-              <AlertDialogDescription>
-                The repository and its cached parsers will be removed. Imported log sources keep
-                running locally — they will only stop tracking upstream changes.
-              </AlertDialogDescription>
-            </AlertDialogHeader>
-            <AlertDialogFooter>
-              <AlertDialogCancel>Cancel</AlertDialogCancel>
-              <AlertDialogAction
-                onClick={() => deleteRepoId && deleteMutation.mutate(deleteRepoId)}
-                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              >
-                Remove
-              </AlertDialogAction>
-            </AlertDialogFooter>
-          </AlertDialogContent>
-        </AlertDialog>
+        <ConfirmDialog
+          open={!!deleteRepoId}
+          onOpenChange={() => setDeleteRepoId(null)}
+          variant="danger"
+          title="Remove repository"
+          description="The repository and its cached parsers will be removed. Imported log sources keep running locally — they will only stop tracking upstream changes."
+          confirmLabel="Remove"
+          onConfirm={() => deleteRepoId && deleteMutation.mutate(deleteRepoId)}
+        />
       </div>
     </TooltipProvider>
   );

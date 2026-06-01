@@ -12,16 +12,7 @@ import { useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, ArrowUpRight } from 'lucide-react';
 import { useSyncCompleteEffect } from '@/hooks/use-sync-complete';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useToast } from '@/hooks/use-toast';
@@ -618,25 +609,15 @@ export function RuleRepositories() {
         }}
       />
 
-      <AlertDialog open={!!deleteRepoId} onOpenChange={() => setDeleteRepoId(null)}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Remove repository</AlertDialogTitle>
-            <AlertDialogDescription>
-              All cached rules will be deleted. You can re-add it later to sync again.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => deleteRepoId && deleteMutation.mutate(deleteRepoId)}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              Remove
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDialog
+        open={!!deleteRepoId}
+        onOpenChange={() => setDeleteRepoId(null)}
+        variant="danger"
+        title="Remove repository"
+        description="All cached rules will be deleted. You can re-add it later to sync again."
+        confirmLabel="Remove"
+        onConfirm={() => deleteRepoId && deleteMutation.mutate(deleteRepoId)}
+      />
       </div>
     </TooltipProvider>
   );

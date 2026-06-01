@@ -15,16 +15,7 @@ import { Badge } from '@/components/ui/badge';
 import { Switch } from '@/components/ui/switch';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import {
   Globe,
   RefreshCw,
@@ -630,109 +621,82 @@ export function IPinfoLiteProvider({ source, onRefresh }: IPinfoLiteProviderProp
       </Card>
 
       {/* Confirmation Dialogs */}
-      <AlertDialog open={showEnableDialog} onOpenChange={setShowEnableDialog}>
-        <AlertDialogContent className="bg-card border-border">
-          <AlertDialogHeader>
-            <AlertDialogTitle className="text-foreground">Enable IP Enrichment?</AlertDialogTitle>
-            <AlertDialogDescription className="text-muted-foreground">
-              This will enable automatic IP enrichment for all incoming logs. IP addresses will be enriched with geolocation (country, continent) and ASN information.
-              <br /><br />
-              Make sure you have synced the enrichment data first.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel className="bg-accent/50 border-border text-foreground hover:bg-accent">
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleEnableConfirm}
-              className=""
-            >
-              Enable Enrichment
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDialog
+        open={showEnableDialog}
+        onOpenChange={setShowEnableDialog}
+        variant="default"
+        title="Enable IP Enrichment?"
+        description={
+          <>
+            This will enable automatic IP enrichment for all incoming logs. IP addresses will be
+            enriched with geolocation (country, continent) and ASN information.
+            <br /><br />
+            Make sure you have synced the enrichment data first.
+          </>
+        }
+        confirmLabel="Enable Enrichment"
+        onConfirm={handleEnableConfirm}
+      />
 
-      <AlertDialog open={showDisableDialog} onOpenChange={setShowDisableDialog}>
-        <AlertDialogContent className="bg-card border-border">
-          <AlertDialogHeader>
-            <AlertDialogTitle className="text-foreground">Disable IP Enrichment?</AlertDialogTitle>
-            <AlertDialogDescription className="text-muted-foreground">
-              This will disable IP enrichment. New logs will no longer be enriched with geolocation and ASN data.
-              <br /><br />
-              Existing enriched logs will not be affected.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel className="bg-accent/50 border-border text-foreground hover:bg-accent">
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleDisableConfirm}
-              className="bg-red-600 hover:bg-red-700 text-foreground"
-            >
-              Disable Enrichment
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDialog
+        open={showDisableDialog}
+        onOpenChange={setShowDisableDialog}
+        variant="danger"
+        title="Disable IP Enrichment?"
+        description={
+          <>
+            This will disable IP enrichment. New logs will no longer be enriched with geolocation
+            and ASN data.
+            <br /><br />
+            Existing enriched logs will not be affected.
+          </>
+        }
+        confirmLabel="Disable Enrichment"
+        onConfirm={handleDisableConfirm}
+      />
 
-      <AlertDialog open={showConfigureDialog} onOpenChange={setShowConfigureDialog}>
-        <AlertDialogContent className="bg-card border-border">
-          <AlertDialogHeader>
-            <AlertDialogTitle className="text-foreground">Save Configuration?</AlertDialogTitle>
-            <AlertDialogDescription className="text-muted-foreground">
-              This will save the IPinfo download URL. After saving, you'll need to click "Sync Now" to download and load the enrichment data.
-              <br /><br />
-              <span className="text-amber-400">Make sure your token is correct before saving.</span>
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel className="bg-accent/50 border-border text-foreground hover:bg-accent">
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleConfigureConfirm}
-              className="bg-primary hover:bg-primary/90 text-foreground"
-            >
-              Save Configuration
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDialog
+        open={showConfigureDialog}
+        onOpenChange={setShowConfigureDialog}
+        variant="default"
+        title="Save Configuration?"
+        description={
+          <>
+            This will save the IPinfo download URL. After saving, you'll need to click "Sync Now" to
+            download and load the enrichment data.
+            <br /><br />
+            <span className="text-amber-400">Make sure your token is correct before saving.</span>
+          </>
+        }
+        confirmLabel="Save Configuration"
+        onConfirm={handleConfigureConfirm}
+      />
 
-      <AlertDialog open={showSyncDialog} onOpenChange={setShowSyncDialog}>
-        <AlertDialogContent className="bg-card border-border">
-          <AlertDialogHeader>
-            <AlertDialogTitle className="text-foreground">Sync Enrichment Data?</AlertDialogTitle>
-            <AlertDialogDescription className="text-muted-foreground">
-              This will download the IPinfo database and load it into nano. This process may take 30-60 seconds depending on your connection speed.
-              <br /><br />
-              {source.record_count > 0 ? (
-                <span className="text-amber-400">
-                  This will replace the existing {formatNumber(source.record_count)} records with fresh data.
-                </span>
-              ) : (
-                <span className="text-muted-foreground">
-                  This is the initial data load.
-                </span>
-              )}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel className="bg-accent/50 border-border text-foreground hover:bg-accent">
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleSyncConfirm}
-              className="bg-ai hover:bg-ai-muted text-foreground"
-            >
-              Start Sync
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDialog
+        open={showSyncDialog}
+        onOpenChange={setShowSyncDialog}
+        variant="default"
+        title="Sync Enrichment Data?"
+        description={
+          <>
+            This will download the IPinfo database and load it into nano. This process may take
+            30-60 seconds depending on your connection speed.
+            <br /><br />
+            {source.record_count > 0 ? (
+              <span className="text-amber-400">
+                This will replace the existing {formatNumber(source.record_count)} records with
+                fresh data.
+              </span>
+            ) : (
+              <span className="text-muted-foreground">
+                This is the initial data load.
+              </span>
+            )}
+          </>
+        }
+        confirmLabel="Start Sync"
+        onConfirm={handleSyncConfirm}
+      />
     </>
   );
 }

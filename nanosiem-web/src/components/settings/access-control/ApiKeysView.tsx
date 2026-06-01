@@ -48,6 +48,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { formatUTC, formatRelativeCompact } from '@/lib/date-utils';
 import { CreateApiKeyDialog } from './CreateApiKeyDialog';
 import { EditApiKeyDialog } from './EditApiKeyDialog';
@@ -556,51 +557,40 @@ export function ApiKeysView() {
         />
       )}
 
-      <AlertDialog open={!!pendingRevoke} onOpenChange={(open) => !open && setPendingRevoke(null)}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Revoke API key</AlertDialogTitle>
-            <AlertDialogDescription>
-              Revoke <span className="text-foreground font-medium">{pendingRevoke?.name}</span>?
-              {' '}This is reversible — you can re-enable the key from its detail panel.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleRevoke}
-              disabled={actionLoading}
-              className="bg-destructive hover:bg-destructive/90 text-destructive-foreground"
-            >
-              {actionLoading && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
-              Revoke
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDialog
+        open={!!pendingRevoke}
+        onOpenChange={(open) => !open && setPendingRevoke(null)}
+        variant="danger"
+        title="Revoke API key"
+        description={
+          <>
+            Revoke <span className="text-foreground font-medium">{pendingRevoke?.name}</span>? This
+            is reversible — you can re-enable the key from its detail panel.
+          </>
+        }
+        confirmLabel="Revoke"
+        loadingLabel="Revoking…"
+        loading={actionLoading}
+        onConfirm={handleRevoke}
+      />
 
-      <AlertDialog open={!!pendingDelete} onOpenChange={(open) => !open && setPendingDelete(null)}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete API key</AlertDialogTitle>
-            <AlertDialogDescription>
-              Permanently delete <span className="text-foreground font-medium">{pendingDelete?.name}</span>?
-              {' '}This cannot be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleDelete}
-              disabled={actionLoading}
-              className="bg-destructive hover:bg-destructive/90 text-destructive-foreground"
-            >
-              {actionLoading && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDialog
+        open={!!pendingDelete}
+        onOpenChange={(open) => !open && setPendingDelete(null)}
+        variant="danger"
+        title="Delete API key"
+        description={
+          <>
+            Permanently delete{' '}
+            <span className="text-foreground font-medium">{pendingDelete?.name}</span>? This cannot
+            be undone.
+          </>
+        }
+        confirmLabel="Delete"
+        loadingLabel="Deleting…"
+        loading={actionLoading}
+        onConfirm={handleDelete}
+      />
 
       <AlertDialog open={!!pendingRotate} onOpenChange={(open) => !open && setPendingRotate(null)}>
         <AlertDialogContent className="max-w-[440px] p-0 gap-0 overflow-hidden">

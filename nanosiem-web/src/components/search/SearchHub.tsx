@@ -57,6 +57,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import {
   Compass,
   Search,
@@ -1071,30 +1072,26 @@ export function SearchHub({
       )}
 
       {/* Delete Confirmation Dialog */}
-      <AlertDialog open={!!deleteConfirmSearch} onOpenChange={(open) => !open && setDeleteConfirmSearch(null)}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete saved search</AlertDialogTitle>
-            <AlertDialogDescription>
-              Are you sure you want to delete "{deleteConfirmSearch?.name}"? This action cannot be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              onClick={() => {
-                if (deleteConfirmSearch && onDeleteSavedSearch) {
-                  onDeleteSavedSearch(deleteConfirmSearch.id);
-                }
-                setDeleteConfirmSearch(null);
-              }}
-            >
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDialog
+        open={!!deleteConfirmSearch}
+        onOpenChange={(open) => !open && setDeleteConfirmSearch(null)}
+        variant="danger"
+        title="Delete saved search"
+        description={
+          <>
+            Are you sure you want to delete "
+            <span className="text-foreground font-medium">{deleteConfirmSearch?.name}</span>"? This
+            action cannot be undone.
+          </>
+        }
+        confirmLabel="Delete"
+        onConfirm={() => {
+          if (deleteConfirmSearch && onDeleteSavedSearch) {
+            onDeleteSavedSearch(deleteConfirmSearch.id);
+          }
+          setDeleteConfirmSearch(null);
+        }}
+      />
 
       {/* Share Dialog */}
       <AlertDialog open={!!shareSearch} onOpenChange={(open) => !open && setShareSearch(null)}>

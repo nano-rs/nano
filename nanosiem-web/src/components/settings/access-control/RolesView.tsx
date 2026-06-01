@@ -35,16 +35,7 @@ import {
   type UserDetail,
 } from '@/lib/api';
 import { Button } from '@/components/ui/button';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { CreateRoleDialog } from './CreateRoleDialog';
 
 const CANONICAL_ACTIONS = ['view', 'create', 'edit', 'delete'] as const;
@@ -659,28 +650,23 @@ export function RolesView() {
         }}
       />
 
-      <AlertDialog open={!!pendingDelete} onOpenChange={(open) => !open && setPendingDelete(null)}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete role</AlertDialogTitle>
-            <AlertDialogDescription>
-              Permanently delete <span className="text-foreground font-medium">{pendingDelete?.name}</span>?
-              {' '}Anyone holding this role loses its permissions. This cannot be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleDelete}
-              disabled={actionLoading}
-              className="bg-destructive hover:bg-destructive/90 text-destructive-foreground"
-            >
-              {actionLoading && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDialog
+        open={!!pendingDelete}
+        onOpenChange={(open) => !open && setPendingDelete(null)}
+        variant="danger"
+        title="Delete role"
+        description={
+          <>
+            Permanently delete{' '}
+            <span className="text-foreground font-medium">{pendingDelete?.name}</span>? Anyone
+            holding this role loses its permissions. This cannot be undone.
+          </>
+        }
+        confirmLabel="Delete"
+        loadingLabel="Deleting…"
+        loading={actionLoading}
+        onConfirm={handleDelete}
+      />
     </>
   );
 }

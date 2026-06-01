@@ -31,16 +31,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 
 type Scope = 'all' | 'used' | 'unused' | 'mine';
 type SortKey = 'updated' | 'name' | 'rows' | 'used';
@@ -259,26 +250,20 @@ export function LookupTables() {
       </div>
 
       {/* Delete confirmation */}
-      <AlertDialog open={!!tableToDelete} onOpenChange={(open) => !open && setTableToDelete(null)}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete lookup table</AlertDialogTitle>
-            <AlertDialogDescription>
-              Permanently delete <span className="font-mono">{tableToDelete?.name}</span>? All rows
-              and ingestion config are removed; rules referencing it will fail until rewired.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleDelete}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDialog
+        open={!!tableToDelete}
+        onOpenChange={(open) => !open && setTableToDelete(null)}
+        variant="danger"
+        title="Delete lookup table"
+        description={
+          <>
+            Permanently delete <span className="font-mono">{tableToDelete?.name}</span>? All rows
+            and ingestion config are removed; rules referencing it will fail until rewired.
+          </>
+        }
+        confirmLabel="Delete"
+        onConfirm={handleDelete}
+      />
     </div>
   );
 }

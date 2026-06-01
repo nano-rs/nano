@@ -31,16 +31,7 @@ import {
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import {
   ContextMenu,
   ContextMenuContent,
@@ -798,55 +789,42 @@ export function RuleRail({ rules, selectedId, draft, draftSelected, onSelect, on
           are derived from rules + folder_settings; deleting drops the
           settings row, and any rules still in the folder get moved to
           Uncategorized so the folder really disappears. */}
-      <AlertDialog
-        open={deleteFolderName !== null}
-        onOpenChange={(o) => { if (!o) setDeleteFolderName(null); }}
-      >
-        <AlertDialogContent>
-          {(() => {
-            const target = deleteFolderName ?? '';
-            const ruleCount = rules.filter(
-              (r) => folderOf(r).toLowerCase() === target.toLowerCase(),
-            ).length;
-            return (
-              <>
-                <AlertDialogHeader>
-                  <AlertDialogTitle>Delete folder "{target}"?</AlertDialogTitle>
-                  <AlertDialogDescription>
-                    {ruleCount === 0
-                      ? 'This folder has no rules. Deleting removes its icon override and the folder itself.'
-                      : `This folder contains ${ruleCount} rule${ruleCount === 1 ? '' : 's'}. Deleting moves ${ruleCount === 1 ? 'it' : 'them'} to Uncategorized and removes the folder.`}
-                  </AlertDialogDescription>
-                </AlertDialogHeader>
-                <AlertDialogFooter>
-                  <AlertDialogCancel>Cancel</AlertDialogCancel>
-                  <AlertDialogAction
-                    onClick={async () => {
-                      const name = target;
-                      // Move rules out first so the folder really vanishes.
-                      // Each move is its own API call — small batch in the
-                      // common case (analysts maintain folders as they go).
-                      if (ruleCount > 0 && onMoveRule) {
-                        const targets = rules.filter(
-                          (r) => folderOf(r).toLowerCase() === name.toLowerCase(),
-                        );
-                        await Promise.all(targets.map((r) => Promise.resolve(onMoveRule(r.id, ''))));
-                      }
-                      // Drop the icon override (also removes the
-                      // folder_settings row that was the persistence signal).
-                      onSetFolderIcon?.(name, undefined);
-                      setDeleteFolderName(null);
-                    }}
-                    className="bg-[var(--destructive)] text-white hover:bg-[var(--destructive)]/90"
-                  >
-                    Delete folder
-                  </AlertDialogAction>
-                </AlertDialogFooter>
-              </>
-            );
-          })()}
-        </AlertDialogContent>
-      </AlertDialog>
+      {(() => {
+        const target = deleteFolderName ?? '';
+        const ruleCount = rules.filter(
+          (r) => folderOf(r).toLowerCase() === target.toLowerCase(),
+        ).length;
+        return (
+          <ConfirmDialog
+            open={deleteFolderName !== null}
+            onOpenChange={(o) => { if (!o) setDeleteFolderName(null); }}
+            variant="danger"
+            title={`Delete folder "${target}"?`}
+            description={
+              ruleCount === 0
+                ? 'This folder has no rules. Deleting removes its icon override and the folder itself.'
+                : `This folder contains ${ruleCount} rule${ruleCount === 1 ? '' : 's'}. Deleting moves ${ruleCount === 1 ? 'it' : 'them'} to Uncategorized and removes the folder.`
+            }
+            confirmLabel="Delete folder"
+            onConfirm={async () => {
+              const name = target;
+              // Move rules out first so the folder really vanishes.
+              // Each move is its own API call — small batch in the
+              // common case (analysts maintain folders as they go).
+              if (ruleCount > 0 && onMoveRule) {
+                const targets = rules.filter(
+                  (r) => folderOf(r).toLowerCase() === name.toLowerCase(),
+                );
+                await Promise.all(targets.map((r) => Promise.resolve(onMoveRule(r.id, ''))));
+              }
+              // Drop the icon override (also removes the
+              // folder_settings row that was the persistence signal).
+              onSetFolderIcon?.(name, undefined);
+              setDeleteFolderName(null);
+            }}
+          />
+        );
+      })()}
     </aside>
   );
 }

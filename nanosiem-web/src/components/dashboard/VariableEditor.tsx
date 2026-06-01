@@ -20,16 +20,7 @@ import {
   SheetHeader,
   SheetTitle,
 } from '@/components/ui/sheet';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import {
   Select,
   SelectContent,
@@ -474,32 +465,26 @@ export function VariableEditor({
     </Sheet>
 
     {/* Remove Variable Confirmation */}
-    <AlertDialog open={removeIndex !== null} onOpenChange={() => setRemoveIndex(null)}>
-      <AlertDialogContent className="bg-card border-border max-w-md">
-        <AlertDialogHeader>
-          <AlertDialogTitle>Remove variable?</AlertDialogTitle>
-          <AlertDialogDescription className="text-[12px] text-muted-foreground">
-            Are you sure you want to remove
-            {removeIndex !== null && formVariables[removeIndex]
-              ? ` "${formVariables[removeIndex].label || formVariables[removeIndex].name || `Variable ${removeIndex + 1}`}"`
-              : ' this variable'}
-            ? Panels referencing it may break.
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <AlertDialogFooter>
-          <AlertDialogCancel className="h-[28px] text-[12px]">Cancel</AlertDialogCancel>
-          <AlertDialogAction
-            onClick={() => {
-              if (removeIndex !== null) handleRemoveVariable(removeIndex);
-              setRemoveIndex(null);
-            }}
-            className="h-[28px] text-[12px] bg-rose-600 hover:bg-rose-700"
-          >
-            Remove
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
+    <ConfirmDialog
+      open={removeIndex !== null}
+      onOpenChange={() => setRemoveIndex(null)}
+      variant="danger"
+      title="Remove variable?"
+      description={
+        <>
+          Are you sure you want to remove
+          {removeIndex !== null && formVariables[removeIndex]
+            ? ` "${formVariables[removeIndex].label || formVariables[removeIndex].name || `Variable ${removeIndex + 1}`}"`
+            : ' this variable'}
+          ? Panels referencing it may break.
+        </>
+      }
+      confirmLabel="Remove"
+      onConfirm={() => {
+        if (removeIndex !== null) handleRemoveVariable(removeIndex);
+        setRemoveIndex(null);
+      }}
+    />
     </>
   );
 }

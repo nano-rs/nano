@@ -193,15 +193,8 @@ const MelodSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settin
 const RetentionSettings = lazyWithRetryNamed(() => import('@/pages/Settings/RetentionSettings'), 'RetentionSettings');
 const RiskSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/RiskSettings'), 'RiskSettings');
 const OidcProvidersPage = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/OidcProviders'), 'OidcProvidersPage');
-const ApiKeysPage = lazyWithRetryNamed(() => import('@/pages/Settings/ApiKeys'), 'ApiKeysPage');
-const SessionsPage = lazyWithRetryNamed(() => import('@/pages/Settings/Sessions'), 'SessionsPage');
 const AuditLogPage = lazyWithRetryNamed(() => import('@/pages/Settings/AuditLog'), 'AuditLogPage');
-const UsersPage = lazyWithRetryNamed(() => import('@/pages/Settings/Users'), 'UsersPage');
-const GroupsPage = lazyWithRetryNamed(() => import('@/pages/Settings/Groups'), 'GroupsPage');
-const RolesPage = lazyWithRetryNamed(() => import('@/pages/Settings/Roles'), 'RolesPage');
 const AccessControlPage = lazyWithRetryNamed(() => import('@/pages/Settings/AccessControl'), 'AccessControlPage');
-const GroupForm = lazyWithRetryNamed(() => import('@/pages/Settings/GroupForm'), 'GroupForm');
-const RoleForm = lazyWithRetryNamed(() => import('@/pages/Settings/RoleForm'), 'RoleForm');
 const ApiKeyForm = lazyWithRetryNamed(() => import('@/pages/Settings/ApiKeyForm'), 'ApiKeyForm');
 const PrevalenceSettings = lazyWithRetryNamed(() => import('@/pages/Settings/PrevalenceSettings'), 'PrevalenceSettings');
 const CaseSettings = lazyWithRetryNamed(() => import('@/enterprise/pages/Settings/CaseSettings'), 'CaseSettings');
@@ -925,34 +918,20 @@ function ProtectedAppRoutes() {
             <Navigate to="/settings/access-control?tab=sessions" replace />
           } />
 
-          {/* Access Control Form Pages */}
+          {/* NAN-1192: the legacy GroupForm/RoleForm pages were retired — the
+              dense GroupsView/RolesView create & edit inline via dialogs. Old
+              deep links to the form pages redirect to the matching tab. */}
           <Route path="/settings/access-control/groups/new" element={
-            <PermissionRoute permission="groups:create" element={
-              <Suspense fallback={<SettingsLoadingFallback />}>
-                <GroupForm key={resetKey} />
-              </Suspense>
-            } />
+            <Navigate to="/settings/access-control?tab=groups" replace />
           } />
           <Route path="/settings/access-control/groups/:id" element={
-            <PermissionRoute permission="groups:edit" element={
-              <Suspense fallback={<SettingsLoadingFallback />}>
-                <GroupForm key={resetKey} />
-              </Suspense>
-            } />
+            <Navigate to="/settings/access-control?tab=groups" replace />
           } />
           <Route path="/settings/access-control/roles/new" element={
-            <PermissionRoute permission="roles:create" element={
-              <Suspense fallback={<SettingsLoadingFallback />}>
-                <RoleForm key={resetKey} />
-              </Suspense>
-            } />
+            <Navigate to="/settings/access-control?tab=roles" replace />
           } />
           <Route path="/settings/access-control/roles/:id" element={
-            <PermissionRoute permission="roles:edit" element={
-              <Suspense fallback={<SettingsLoadingFallback />}>
-                <RoleForm key={resetKey} />
-              </Suspense>
-            } />
+            <Navigate to="/settings/access-control?tab=roles" replace />
           } />
           {/* Legacy form routes redirect into the right-side flyout (NAN-557). */}
           <Route path="/settings/access-control/sso/new" element={
@@ -976,26 +955,16 @@ function ProtectedAppRoutes() {
             } />
           } />
 
+          {/* NAN-1192: legacy standalone list pages retired in favour of the
+              dense Access Control tabbed surface. */}
           <Route path="/settings/users" element={
-            <PermissionRoute permission="users:view" element={
-              <Suspense fallback={<ListPageLoadingFallback />}>
-                <UsersPage key={resetKey} />
-              </Suspense>
-            } />
+            <Navigate to="/settings/access-control?tab=users" replace />
           } />
           <Route path="/settings/groups" element={
-            <PermissionRoute permission="groups:view" element={
-              <Suspense fallback={<ListPageLoadingFallback />}>
-                <GroupsPage key={resetKey} />
-              </Suspense>
-            } />
+            <Navigate to="/settings/access-control?tab=groups" replace />
           } />
           <Route path="/settings/roles" element={
-            <PermissionRoute permission="roles:view" element={
-              <Suspense fallback={<ListPageLoadingFallback />}>
-                <RolesPage key={resetKey} />
-              </Suspense>
-            } />
+            <Navigate to="/settings/access-control?tab=roles" replace />
           } />
           <Route path="/settings/oidc" element={
             <PermissionRoute permission="settings:system" element={
@@ -1010,18 +979,10 @@ function ProtectedAppRoutes() {
             <Navigate to="/settings/oidc" replace />
           } />
           <Route path="/settings/api-keys" element={
-            <PermissionRoute permission="apikeys:view" element={
-              <Suspense fallback={<ListPageLoadingFallback />}>
-                <ApiKeysPage key={resetKey} />
-              </Suspense>
-            } />
+            <Navigate to="/settings/access-control?tab=api-keys" replace />
           } />
           <Route path="/settings/sessions" element={
-            <PermissionRoute permission="users:view" element={
-              <Suspense fallback={<ListPageLoadingFallback />}>
-                <SessionsPage key={resetKey} />
-              </Suspense>
-            } />
+            <Navigate to="/settings/access-control?tab=sessions" replace />
           } />
           <Route path="/settings/audit" element={
             <PermissionRoute permission="audit:view" element={

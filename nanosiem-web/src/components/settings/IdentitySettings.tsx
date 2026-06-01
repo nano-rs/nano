@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
@@ -171,6 +172,7 @@ export function IdentitySettings() {
   const [usersTotal, setUsersTotal] = useState(0);
   const [usersPage, setUsersPage] = useState(1);
   const [usersLoading, setUsersLoading] = useState(false);
+  const [deleteProviderId, setDeleteProviderId] = useState<string | null>(null);
 
   const fetchProviders = useCallback(async () => {
     try {
@@ -307,11 +309,16 @@ export function IdentitySettings() {
     setSyncing(null);
   };
 
-  const handleDelete = async (providerId: string) => {
-    if (!confirm('Delete this provider? All synced user records will be removed.')) return;
+  const handleDelete = (providerId: string) => {
+    setDeleteProviderId(providerId);
+  };
+
+  const confirmDelete = async () => {
+    if (!deleteProviderId) return;
     try {
-      await api.deleteIdentityProvider(providerId);
+      await api.deleteIdentityProvider(deleteProviderId);
       toast({ title: 'Deleted', description: 'Provider removed' });
+      setDeleteProviderId(null);
       await Promise.all([fetchProviders(), fetchStats(), fetchUsers()]);
     } catch (e) {
       toast({ title: 'Error', description: `Delete failed: ${e}`, variant: 'destructive' });
@@ -646,6 +653,16 @@ export function IdentitySettings() {
           </SheetFooter>
         </SheetContent>
       </Sheet>
+
+      <ConfirmDialog
+        open={!!deleteProviderId}
+        onOpenChange={(open) => !open && setDeleteProviderId(null)}
+        variant="danger"
+        title="Delete provider"
+        description="Delete this provider? All synced user records will be removed."
+        confirmLabel="Delete"
+        onConfirm={confirmDelete}
+      />
     </div>
   );
 }

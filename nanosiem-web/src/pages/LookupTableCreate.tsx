@@ -46,16 +46,7 @@ import type {
 import { parseValueForType } from '@/lib/lookup-utils';
 import { cn } from '@/lib/utils';
 import { Checkbox } from '@/components/ui/checkbox';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 
 
 // --------------------------------------------------------------------
@@ -756,51 +747,45 @@ function UploadMode({ onBack, onCancel, initialName, isUpdate }: UploadModeProps
 
       {/* NAN-515 — last-line-of-defense confirm dialog. Fires if the user
           pushes Save while a name collision is still active in append mode. */}
-      <AlertDialog open={collisionConfirmOpen} onOpenChange={setCollisionConfirmOpen}>
-        <AlertDialogContent className="bg-card border-border text-foreground rounded-lg">
-          <AlertDialogHeader>
-            <AlertDialogTitle>Append into existing table?</AlertDialogTitle>
-            <AlertDialogDescription className="text-muted-foreground">
-              <span className="font-mono">{trimmedName}</span> already exists with{' '}
-              <span className="font-mono tabular-nums">{collidingTable?.row_count.toLocaleString()}</span> rows. Saving will append{' '}
-              <span className="font-mono tabular-nums">{preview?.total_rows_estimate.toLocaleString() ?? '?'}</span> new rows
-              into it. Choose a different name to create a new table instead, or switch to Replace mode to drop existing rows first.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter className="gap-2">
-            <AlertDialogCancel
-              className="rounded-md"
-              onClick={() => {
-                setCollisionConfirmOpen(false);
-                nameInputRef.current?.focus();
-                nameInputRef.current?.select();
-              }}
-            >
-              Use a different name
-            </AlertDialogCancel>
-            <button
-              type="button"
-              onClick={() => {
-                setMode('replace');
-                setCollisionConfirmOpen(false);
-                handleSave();
-              }}
-              className="h-[36px] px-3 rounded-md border border-[color-mix(in_srgb,var(--warning)_30%,transparent)] bg-[color-mix(in_srgb,var(--warning)_10%,transparent)] text-[var(--warning)] text-[12px] font-mono hover:brightness-110"
-            >
-              Replace existing data
-            </button>
-            <AlertDialogAction
-              onClick={() => {
-                setCollisionConfirmOpen(false);
-                handleSave();
-              }}
-              className="bg-primary text-[var(--brand-ink)] hover:bg-primary/90 rounded-md"
-            >
-              Append anyway
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDialog
+        open={collisionConfirmOpen}
+        onOpenChange={setCollisionConfirmOpen}
+        title="Append into existing table?"
+        description={
+          <>
+            <span className="font-mono">{trimmedName}</span> already exists with{' '}
+            <span className="font-mono tabular-nums">{collidingTable?.row_count.toLocaleString()}</span> rows. Saving will append{' '}
+            <span className="font-mono tabular-nums">{preview?.total_rows_estimate.toLocaleString() ?? '?'}</span> new rows
+            into it. Choose a different name to create a new table instead, or switch to Replace mode to drop existing rows first.
+          </>
+        }
+        cancelLabel="Use a different name"
+        confirmLabel="Append anyway"
+        onCancel={() => {
+          // Restore the NAN-515 affordance: refocus + select the name field so
+          // the user can immediately type a new, non-colliding table name.
+          nameInputRef.current?.focus();
+          nameInputRef.current?.select();
+        }}
+        onConfirm={() => {
+          setCollisionConfirmOpen(false);
+          handleSave();
+        }}
+      >
+        {/* Third action — switch to Replace mode instead of appending. Lives in
+            the body because ConfirmDialog's footer only renders Cancel + Confirm. */}
+        <button
+          type="button"
+          onClick={() => {
+            setMode('replace');
+            setCollisionConfirmOpen(false);
+            handleSave();
+          }}
+          className="h-[36px] px-3 rounded-md border border-[color-mix(in_srgb,var(--warning)_30%,transparent)] bg-[color-mix(in_srgb,var(--warning)_10%,transparent)] text-[var(--warning)] text-[12px] font-mono hover:brightness-110"
+        >
+          Replace existing data
+        </button>
+      </ConfirmDialog>
     </div>
   );
 }

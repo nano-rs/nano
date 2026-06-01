@@ -23,16 +23,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import { useToast } from '@/hooks/use-toast';
 import { api } from '@/lib/api';
 import type { DailyStat, DetectionRule } from '@/lib/api/types';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 
 import { BANDS, bandOf, buildRuleView, primaryTactic, type BandId, type SeverityKey } from '@/components/rules/helpers';
 import { RulesOverview } from '@/components/rules/RulesOverview';
@@ -468,45 +459,31 @@ export function Rules() {
         />
       )}
 
-      <AlertDialog
-        open={deleteConfirmOpen}
-        onOpenChange={(v) => {
-          setDeleteConfirmOpen(v);
-          if (!v) setDeleteTarget(null);
-        }}
-      >
-        <AlertDialogContent>
-          {(() => {
-            const count = deleteTarget ? 1 : selected.size;
-            const plural = count === 1 ? '' : 's';
-            return (
+      {(() => {
+        const count = deleteTarget ? 1 : selected.size;
+        const plural = count === 1 ? '' : 's';
+        return (
+          <ConfirmDialog
+            open={deleteConfirmOpen}
+            onOpenChange={(v) => {
+              setDeleteConfirmOpen(v);
+              if (!v) setDeleteTarget(null);
+            }}
+            variant="danger"
+            title={`Delete ${count} rule${plural}?`}
+            description={
               <>
-                <AlertDialogHeader>
-                  <AlertDialogTitle className="text-[14px] font-semibold">
-                    Delete {count} rule{plural}?
-                  </AlertDialogTitle>
-                  <AlertDialogDescription className="text-[11.5px] text-muted-foreground">
-                    This permanently removes the selected detection rule{plural}, their
-                    configuration, and their materialized-view bindings. Historical
-                    signal logs stay in ClickHouse but future matches stop immediately.
-                    This cannot be undone.
-                  </AlertDialogDescription>
-                </AlertDialogHeader>
-                <AlertDialogFooter>
-                  <AlertDialogCancel disabled={bulkUpdating}>Cancel</AlertDialogCancel>
-                  <AlertDialogAction
-                    disabled={bulkUpdating}
-                    onClick={confirmDelete}
-                    className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                  >
-                    Delete {count} rule{plural}
-                  </AlertDialogAction>
-                </AlertDialogFooter>
+                This permanently removes the selected detection rule{plural}, their
+                configuration, and their materialized-view bindings. Historical signal logs
+                stay in ClickHouse but future matches stop immediately. This cannot be undone.
               </>
-            );
-          })()}
-        </AlertDialogContent>
-      </AlertDialog>
+            }
+            confirmLabel={`Delete ${count} rule${plural}`}
+            loading={bulkUpdating}
+            onConfirm={confirmDelete}
+          />
+        );
+      })()}
     </div>
   );
 }

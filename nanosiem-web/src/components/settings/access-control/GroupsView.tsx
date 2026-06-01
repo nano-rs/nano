@@ -30,16 +30,7 @@ import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/AuthContext';
 import { api, type GroupDetail, type RoleSummary, type UserDetail } from '@/lib/api';
 import { Button } from '@/components/ui/button';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { formatUTC } from '@/lib/date-utils';
 import { CreateGroupDialog } from './CreateGroupDialog';
 
@@ -423,28 +414,22 @@ export function GroupsView() {
         }}
       />
 
-      <AlertDialog open={!!pendingDelete} onOpenChange={(open) => !open && setPendingDelete(null)}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete group</AlertDialogTitle>
-            <AlertDialogDescription>
-              Permanently delete <span className="text-foreground font-medium">{pendingDelete?.name}</span>?
-              {' '}All members lose this group's role assignment. This cannot be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleDelete}
-              disabled={actionLoading}
-              className="bg-destructive hover:bg-destructive/90 text-destructive-foreground"
-            >
-              {actionLoading && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDialog
+        open={!!pendingDelete}
+        onOpenChange={(open) => !open && setPendingDelete(null)}
+        variant="danger"
+        title="Delete group"
+        description={
+          <>
+            Permanently delete <span className="text-foreground font-medium">{pendingDelete?.name}</span>?
+            {' '}All members lose this group's role assignment. This cannot be undone.
+          </>
+        }
+        confirmLabel="Delete"
+        loadingLabel="Deleting…"
+        loading={actionLoading}
+        onConfirm={handleDelete}
+      />
 
       {/* Suppress unused-import lint — X is used in the future drag-to-remove
           interaction once the backend exposes member-mutation endpoints. */}

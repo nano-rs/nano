@@ -2,16 +2,7 @@
 
 import { useState } from 'react';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { Button } from '@/components/ui/button';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
@@ -135,52 +126,38 @@ export function SearchHistory({
     </Dialog>
 
     {/* Delete Entry Confirmation */}
-    <AlertDialog open={!!deleteEntryId} onOpenChange={() => setDeleteEntryId(null)}>
-      <AlertDialogContent>
-        <AlertDialogHeader>
-          <AlertDialogTitle>Delete History Entry</AlertDialogTitle>
-          <AlertDialogDescription>
-            Are you sure you want to remove this search from your history?
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <AlertDialogFooter>
-          <AlertDialogCancel>Cancel</AlertDialogCancel>
-          <AlertDialogAction
-            onClick={() => {
-              if (deleteEntryId) onDeleteEntry(deleteEntryId);
-              setDeleteEntryId(null);
-            }}
-            className="bg-red-600 hover:bg-red-700"
-          >
-            Delete
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
+    <ConfirmDialog
+      open={!!deleteEntryId}
+      onOpenChange={() => setDeleteEntryId(null)}
+      variant="danger"
+      title="Delete history entry"
+      description="Are you sure you want to remove this search from your history?"
+      confirmLabel="Delete"
+      onConfirm={() => {
+        if (deleteEntryId) onDeleteEntry(deleteEntryId);
+        setDeleteEntryId(null);
+      }}
+    />
 
     {/* Clear All Confirmation */}
-    <AlertDialog open={showClearConfirm} onOpenChange={setShowClearConfirm}>
-      <AlertDialogContent>
-        <AlertDialogHeader>
-          <AlertDialogTitle>Clear All History</AlertDialogTitle>
-          <AlertDialogDescription>
-            Are you sure you want to clear all search history? This will remove {searchHistory.length} {searchHistory.length === 1 ? 'entry' : 'entries'} and cannot be undone.
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <AlertDialogFooter>
-          <AlertDialogCancel>Cancel</AlertDialogCancel>
-          <AlertDialogAction
-            onClick={() => {
-              onClearAll();
-              setShowClearConfirm(false);
-            }}
-            className="bg-red-600 hover:bg-red-700"
-          >
-            Clear All
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
+    <ConfirmDialog
+      open={showClearConfirm}
+      onOpenChange={setShowClearConfirm}
+      variant="danger"
+      title="Clear all history"
+      description={
+        <>
+          Are you sure you want to clear all search history? This will remove{' '}
+          {searchHistory.length} {searchHistory.length === 1 ? 'entry' : 'entries'} and cannot be
+          undone.
+        </>
+      }
+      confirmLabel="Clear All"
+      onConfirm={() => {
+        onClearAll();
+        setShowClearConfirm(false);
+      }}
+    />
     </>
   );
 }
