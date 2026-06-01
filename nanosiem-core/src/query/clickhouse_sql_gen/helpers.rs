@@ -377,10 +377,18 @@ pub(crate) fn escape_regex_pattern(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "''")
 }
 
-/// Escape `%` and `_` for use inside an `iLike '%X%'` pattern body.
-/// The input is expected to already be SQL-escaped (single quotes doubled,
-/// backslashes doubled) — this only adds the LIKE-specific escaping so that
-/// literal `%` / `_` from user input don't act as wildcards.
+/// Add LIKE-pattern escaping on top of an already SQL-escaped string (single
+/// quotes doubled, backslashes doubled by `escape_string`) so that it matches
+/// as a literal substring inside an `iLike '%X%'` body.
+///
+/// In ClickHouse LIKE/iLike, `\` is the pattern escape character, so a literal
+/// backslash needs `\\` *in the pattern value* — which, after the string-literal
+/// layer, is `\\\\` in the SQL text. `escape_string` only produced `\\` (one
+/// backslash in the pattern value), which iLike then consumed as an escape,
+/// silently matching nothing — so every `CONTAINS`/keyword over a Windows path
+/// (`C:\Windows\System32\`, `\NETLOGON\`, …) failed to match. We therefore
+/// double the (already-doubled) backslashes here, and escape `%`/`_` so literal
+/// wildcards from user input don't act as wildcards. NAN-1157.
 ///
 /// Use this for the codegen path that lowered to `hasToken*` pre-NAN-1026 —
 /// `hasToken` is whole-token semantic and silently drops fragments like
@@ -388,7 +396,13 @@ pub(crate) fn escape_regex_pattern(s: &str) -> String {
 /// (CH 26.4's LIKE-via-dictionary-scan) gives both correct substring
 /// semantics AND granule pruning.
 pub(crate) fn escape_like_pattern(escaped: &str) -> String {
-    escaped.replace('%', "\\%").replace('_', "\\_")
+    // Backslash first: each `\` (the SQL-escape layer already made them pairs)
+    // becomes `\\` in the pattern value so iLike matches it literally. The `\\`
+    // we add for `%`/`_` is then NOT re-doubled (it's added after this step).
+    escaped
+        .replace('\\', "\\\\")
+        .replace('%', "\\\\%")
+        .replace('_', "\\\\_")
 }
 
 /// Validate a regex pattern for complexity to prevent ReDoS attacks.

@@ -57,16 +57,6 @@ impl IpAllowlistRepository {
         Ok(rows.iter().map(row_to_entry).collect())
     }
 
-    /// Check if any enabled rules exist (for any scope)
-    pub async fn has_enabled_rules(&self) -> Result<bool, IpAllowlistRepositoryError> {
-        let row = sqlx::query(
-            "SELECT EXISTS(SELECT 1 FROM ip_allowlists WHERE enabled = TRUE) as has_rules",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(row.get::<bool, _>("has_rules"))
-    }
 
     /// Get a single entry by ID
     pub async fn get(&self, id: Uuid) -> Result<IpAllowlistEntry, IpAllowlistRepositoryError> {

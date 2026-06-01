@@ -821,11 +821,19 @@ fn eval_function_to_sql(
         }
         "make_timestamp" | "maketimestamp" => {
             // make_timestamp(year, month, day, hour, minute, second)
+            // Build via makeDateTime (numeric constructor) rather than
+            // toDateTime(concat(...)): the concat form emits an unpadded string like
+            // '2024-1-1 12:30:0' that toDateTime cannot parse (Code 6 CANNOT_PARSE_TEXT),
+            // so every make_timestamp call errored. Mirrors make_time's coercion so both
+            // numeric literals and string-typed field refs work; year needs a wider cast
+            // (toUInt8OrNull caps at 255 and would null out 2024).
             if arg_sqls.len() != 6 {
                 return Err(SqlGenError::InvalidQuery("make_timestamp() requires 6 arguments (year, month, day, hour, minute, second)".into()));
             }
             Ok(format!(
-                "toDateTime(concat({}, '-', {}, '-', {}, ' ', {}, ':', {}, ':', {}))",
+                "makeDateTime(toUInt16OrNull(toString({})), toUInt8OrNull(toString({})), \
+                 toUInt8OrNull(toString({})), toUInt8OrNull(toString({})), \
+                 toUInt8OrNull(toString({})), toUInt8OrNull(toString({})))",
                 arg_sqls[0], arg_sqls[1], arg_sqls[2], arg_sqls[3], arg_sqls[4], arg_sqls[5]
             ))
         }
@@ -1247,15 +1255,20 @@ fn eval_function_to_sql(
             ))
         }
         "mvfind" => {
-            // Find index of first match in multivalue: mvfind(field, pattern) → indexOf(arrayFilter(x -> x LIKE pattern, field), 1)
-            // Simplified: return position of first matching element (0 if not found)
+            // Find index of first match in multivalue: mvfind(field, pattern) →
+            // indexOf(arrayMap(x -> match(x, pattern), field), 1) — 1-based position of
+            // the first matching element, 0 if none.
+            // Must be arrayMap, not arrayFilter: arrayFilter returns the matching String
+            // elements, so indexOf(<String array>, 1) compares String vs the integer 1 →
+            // Code 386 NO_COMMON_TYPE and the whole query errored. arrayMap yields a 0/1
+            // UInt8 array whose first `1` is exactly the first-match position.
             if arg_sqls.len() != 2 {
                 return Err(SqlGenError::InvalidQuery(
                     "mvfind() requires 2 arguments (field, pattern)".into(),
                 ));
             }
             Ok(format!(
-                "indexOf(arrayFilter(x -> match(x, {}), {}), 1)",
+                "indexOf(arrayMap(x -> match(x, {}), {}), 1)",
                 arg_sqls[1], arg_sqls[0]
             ))
         }

@@ -80,41 +80,6 @@ pub struct LogSourceService {
 }
 
 impl LogSourceService {
-    pub fn new(pool: PgPool) -> Self {
-        Self {
-            pool,
-            ch_client: None,
-            logs_table: "logs",
-            table_names: crate::db::TableNames::new(false),
-            vector_config: Arc::new(VectorConfigManager::with_defaults()),
-            vrl_validator: Arc::new(VrlValidator::new()),
-        }
-    }
-
-    /// Create with DualPool (ClickHouse for log stats)
-    pub fn with_dual_pool(dual_pool: &DualPool) -> Self {
-        Self {
-            pool: dual_pool.postgres().clone(),
-            ch_client: Some(dual_pool.clickhouse().clone()),
-            logs_table: dual_pool.logs_table(),
-            table_names: dual_pool.table_names(),
-            vector_config: Arc::new(VectorConfigManager::with_defaults()),
-            vrl_validator: Arc::new(VrlValidator::new()),
-        }
-    }
-
-    /// Create with a custom Vector config directory
-    pub fn with_vector_config_dir(pool: PgPool, config_dir: impl AsRef<std::path::Path>) -> Self {
-        Self {
-            pool,
-            ch_client: None,
-            logs_table: "logs",
-            table_names: crate::db::TableNames::new(false),
-            vector_config: Arc::new(VectorConfigManager::new(config_dir)),
-            vrl_validator: Arc::new(VrlValidator::new()),
-        }
-    }
-
     /// Create with DualPool and custom Vector config directory
     pub fn with_dual_pool_and_config_dir(
         dual_pool: &DualPool,

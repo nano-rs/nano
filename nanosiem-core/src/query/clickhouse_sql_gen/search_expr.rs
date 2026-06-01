@@ -516,28 +516,44 @@ impl ClickHouseSqlGenerator {
             }
             Comparator::StartsWith => {
                 let pattern = match value {
-                    Value::String(s) => format!("'{}%'", escape_string(&s.to_lowercase())),
+                    Value::String(s) => {
+                        // NAN-1160: escape_like_pattern so a literal `_`/`%` in the value is
+                        // matched literally, not as an iLike wildcard (mirrors Contains:480).
+                        format!("'{}%'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                    }
                     _ => format!("concat(lower({}), '%')", value_sql),
                 };
                 Ok(format!("{} iLike {}", field_expr, pattern))
             }
             Comparator::NotStartsWith => {
                 let pattern = match value {
-                    Value::String(s) => format!("'{}%'", escape_string(&s.to_lowercase())),
+                    Value::String(s) => {
+                        // NAN-1160: escape_like_pattern so a literal `_`/`%` in the value is
+                        // matched literally, not as an iLike wildcard (mirrors Contains:480).
+                        format!("'{}%'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                    }
                     _ => format!("concat(lower({}), '%')", value_sql),
                 };
                 Ok(format!("{} NOT iLike {}", field_expr, pattern))
             }
             Comparator::EndsWith => {
                 let pattern = match value {
-                    Value::String(s) => format!("'%{}'", escape_string(&s.to_lowercase())),
+                    Value::String(s) => {
+                        // NAN-1160: escape_like_pattern so a literal `_`/`%` in the value is
+                        // matched literally, not as an iLike wildcard (mirrors Contains:480).
+                        format!("'%{}'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                    }
                     _ => format!("concat('%', lower({}))", value_sql),
                 };
                 Ok(format!("{} iLike {}", field_expr, pattern))
             }
             Comparator::NotEndsWith => {
                 let pattern = match value {
-                    Value::String(s) => format!("'%{}'", escape_string(&s.to_lowercase())),
+                    Value::String(s) => {
+                        // NAN-1160: escape_like_pattern so a literal `_`/`%` in the value is
+                        // matched literally, not as an iLike wildcard (mirrors Contains:480).
+                        format!("'%{}'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                    }
                     _ => format!("concat('%', lower({}))", value_sql),
                 };
                 Ok(format!("{} NOT iLike {}", field_expr, pattern))
@@ -657,6 +673,15 @@ impl ClickHouseSqlGenerator {
             format!("ext.{}", sanitize_json_path(&field_path))
         };
 
+        // String/pattern comparisons compare against toString(field) so a missing ext key
+        // (JSON null) becomes '' rather than NULL. Otherwise a negated match (`NOT iLike`,
+        // `!=`, or an outer `NOT (... iLike ...)`) evaluates `NOT NULL` = NULL and silently
+        // drops every row where the key is absent — e.g. `NOT integrity_level CONTAINS "x"`
+        // returned only the rows that HAVE the field. The post-pipe `| where` path already
+        // does this. Numeric comparisons keep the raw field (toString would break them), and
+        // build_optimized_regex_sql is passed the raw field_expr (it wraps internally). NAN-1161.
+        let field_str = format!("toString({})", field_expr);
+
         // Check if the value contains wildcards (* or ?) and we're using Eq/Ne
         if let Value::String(s) = value {
             if (s.contains('*') || s.contains('?')) && matches!(op, Comparator::Eq | Comparator::Ne)
@@ -676,19 +701,26 @@ impl ClickHouseSqlGenerator {
                 } else {
                     "NOT iLike"
                 };
-                return Ok(format!("{} {} '{}'", field_expr, sql_op, pattern));
+                return Ok(format!("{} {} '{}'", field_str, sql_op, pattern));
             }
         }
 
+        // NAN-1161: string/pattern arms compare `field_str` (= toString(field_expr)) so a
+        // missing ext key reads as '' not NULL — see the binding above. build_optimized_regex_sql
+        // gets the raw field_expr (it wraps internally); the numeric arm stays raw.
         match op {
             Comparator::Regex => {
-                // For simple patterns (no regex metacharacters), use hasTokenCaseInsensitive()
+                // For simple patterns (no regex metacharacters), use substring iLike.
                 if let Value::Regex(pattern) = value {
                     if let Some(token) = extract_simple_regex_token(pattern) {
+                        // NAN-1160: substring iLike, not hasTokenCaseInsensitive. hasToken
+                        // matches whole tokens only (`dc` never matches `dc01`) and ext is
+                        // native JSON with no token index (idx_ext_text dropped, migration 118),
+                        // so hasToken under-matched AND bought no acceleration.
                         return Ok(format!(
-                            "hasTokenCaseInsensitive(toString({}), '{}')",
-                            field_expr,
-                            escape_string(&token)
+                            "{} iLike '%{}%'",
+                            field_str,
+                            escape_like_pattern(&escape_string(&token.to_lowercase()))
                         ));
                     }
                     // Complex regex — try bloom filter pre-filtering and pattern rewrites
@@ -699,16 +731,16 @@ impl ClickHouseSqlGenerator {
                         false,
                     ));
                 }
-                Ok(format!("match({}, {})", field_expr, value_to_sql(value)))
+                Ok(format!("match({}, {})", field_str, value_to_sql(value)))
             }
             Comparator::NotRegex => {
-                // For simple patterns, use NOT hasTokenCaseInsensitive()
+                // For simple patterns, use substring NOT iLike (see Regex above, NAN-1160).
                 if let Value::Regex(pattern) = value {
                     if let Some(token) = extract_simple_regex_token(pattern) {
                         return Ok(format!(
-                            "NOT hasTokenCaseInsensitive(toString({}), '{}')",
-                            field_expr,
-                            escape_string(&token)
+                            "{} NOT iLike '%{}%'",
+                            field_str,
+                            escape_like_pattern(&escape_string(&token.to_lowercase()))
                         ));
                     }
                     // Complex regex — try pattern rewrites
@@ -716,93 +748,96 @@ impl ClickHouseSqlGenerator {
                 }
                 Ok(format!(
                     "match({}, {}) = 0",
-                    field_expr,
+                    field_str,
                     value_to_sql(value)
                 ))
             }
-            Comparator::Like => Ok(format!("{} iLike {}", field_expr, value_to_sql(value))),
-            Comparator::NotLike => Ok(format!("{} NOT iLike {}", field_expr, value_to_sql(value))),
+            Comparator::Like => Ok(format!("{} iLike {}", field_str, value_to_sql(value))),
+            Comparator::NotLike => Ok(format!("{} NOT iLike {}", field_str, value_to_sql(value))),
             Comparator::Contains => {
                 if let Value::String(s) = value {
-                    let has_separators = s.chars().any(|c| !c.is_alphanumeric());
-                    if has_separators {
-                        let escaped = escape_string(&s.to_lowercase())
-                            .replace('%', "\\%")
-                            .replace('_', "\\_");
-                        Ok(format!("{} iLike '%{}%'", field_expr, escaped))
-                    } else {
-                        Ok(format!(
-                            "hasTokenCaseInsensitive(toString({}), '{}')",
-                            field_expr,
-                            escape_string(&s.to_lowercase())
-                        ))
-                    }
+                    // NAN-1160: always substring iLike, never hasTokenCaseInsensitive. hasToken
+                    // matched whole tokens only (`medi` never matches `Medium`) and ext is native
+                    // JSON with no token index (idx_ext_text dropped, migration 118) — wrong AND
+                    // no faster. Mirrors the UDM Contains path.
+                    let escaped = escape_like_pattern(&escape_string(&s.to_lowercase()));
+                    Ok(format!("{} iLike '%{}%'", field_str, escaped))
                 } else {
                     Ok(format!(
                         "{} iLike concat('%', {}, '%')",
-                        field_expr,
+                        field_str,
                         value_to_sql(value)
                     ))
                 }
             }
             Comparator::NotContains => {
                 if let Value::String(s) = value {
-                    let has_separators = s.chars().any(|c| !c.is_alphanumeric());
-                    if has_separators {
-                        let escaped = escape_string(&s.to_lowercase())
-                            .replace('%', "\\%")
-                            .replace('_', "\\_");
-                        Ok(format!("{} NOT iLike '%{}%'", field_expr, escaped))
-                    } else {
-                        Ok(format!(
-                            "NOT hasTokenCaseInsensitive(toString({}), '{}')",
-                            field_expr,
-                            escape_string(&s.to_lowercase())
-                        ))
-                    }
+                    // NAN-1160: NOT iLike, never NOT hasTokenCaseInsensitive — the token form
+                    // leaked sub-token matches through the exclusion (e.g. `NOT CONTAINS "medi"`
+                    // failed to exclude `Medium`).
+                    let escaped = escape_like_pattern(&escape_string(&s.to_lowercase()));
+                    Ok(format!("{} NOT iLike '%{}%'", field_str, escaped))
                 } else {
                     Ok(format!(
                         "{} NOT iLike concat('%', {}, '%')",
-                        field_expr,
+                        field_str,
                         value_to_sql(value)
                     ))
                 }
             }
             Comparator::StartsWith => {
                 let pattern = match value {
-                    Value::String(s) => format!("'{}%'", escape_string(&s.to_lowercase())),
+                    Value::String(s) => {
+                        // NAN-1160: escape_like_pattern so a literal `_`/`%` in the value is
+                        // matched literally, not as an iLike wildcard (mirrors Contains:480).
+                        format!("'{}%'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                    }
                     _ => format!("concat(lower({}), '%')", value_to_sql(value)),
                 };
-                Ok(format!("{} iLike {}", field_expr, pattern))
+                Ok(format!("{} iLike {}", field_str, pattern))
             }
             Comparator::NotStartsWith => {
                 let pattern = match value {
-                    Value::String(s) => format!("'{}%'", escape_string(&s.to_lowercase())),
+                    Value::String(s) => {
+                        // NAN-1160: escape_like_pattern so a literal `_`/`%` in the value is
+                        // matched literally, not as an iLike wildcard (mirrors Contains:480).
+                        format!("'{}%'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                    }
                     _ => format!("concat(lower({}), '%')", value_to_sql(value)),
                 };
-                Ok(format!("{} NOT iLike {}", field_expr, pattern))
+                Ok(format!("{} NOT iLike {}", field_str, pattern))
             }
             Comparator::EndsWith => {
                 let pattern = match value {
-                    Value::String(s) => format!("'%{}'", escape_string(&s.to_lowercase())),
+                    Value::String(s) => {
+                        // NAN-1160: escape_like_pattern so a literal `_`/`%` in the value is
+                        // matched literally, not as an iLike wildcard (mirrors Contains:480).
+                        format!("'%{}'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                    }
                     _ => format!("concat('%', lower({}))", value_to_sql(value)),
                 };
-                Ok(format!("{} iLike {}", field_expr, pattern))
+                Ok(format!("{} iLike {}", field_str, pattern))
             }
             Comparator::NotEndsWith => {
                 let pattern = match value {
-                    Value::String(s) => format!("'%{}'", escape_string(&s.to_lowercase())),
+                    Value::String(s) => {
+                        // NAN-1160: escape_like_pattern so a literal `_`/`%` in the value is
+                        // matched literally, not as an iLike wildcard (mirrors Contains:480).
+                        format!("'%{}'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                    }
                     _ => format!("concat('%', lower({}))", value_to_sql(value)),
                 };
-                Ok(format!("{} NOT iLike {}", field_expr, pattern))
+                Ok(format!("{} NOT iLike {}", field_str, pattern))
             }
             Comparator::Eq | Comparator::Ne => {
-                // Case-insensitive string comparison
+                // Case-insensitive string comparison. NAN-1161: lower(toString(field)) so a
+                // missing key compares as '' — `field != "x"` keeps absent-key rows (NULL != x
+                // would drop them).
                 let sql_op = comparator_to_sql(op);
                 match value {
                     Value::String(s) => Ok(format!(
                         "lower({}) {} '{}'",
-                        field_expr,
+                        field_str,
                         sql_op,
                         escape_string(&s.to_lowercase())
                     )),
@@ -960,13 +995,16 @@ impl ClickHouseSqlGenerator {
 
                 match op {
                     Comparator::Regex => {
-                        // For simple patterns, use hasTokenCaseInsensitive() for better performance
+                        // For simple patterns, use substring iLike (NAN-1160).
                         if let Value::Regex(pattern) = value {
                             if let Some(token) = extract_simple_regex_token(pattern) {
+                                // NAN-1160: substring iLike, not hasTokenCaseInsensitive —
+                                // post-stats columns are unindexed CTE intermediates, so
+                                // hasToken under-matched (`dc` ≠ `dc01`) for zero index gain.
                                 return Ok(format!(
-                                    "hasTokenCaseInsensitive(toString({}), '{}')",
+                                    "toString({}) iLike '%{}%'",
                                     column_ref,
-                                    escape_string(&token)
+                                    escape_like_pattern(&escape_string(&token.to_lowercase()))
                                 ));
                             }
                             // Complex regex — try bloom filter pre-filtering and pattern rewrites
@@ -976,13 +1014,13 @@ impl ClickHouseSqlGenerator {
                         Ok(format!("match(toString({}), {})", column_ref, value_sql))
                     }
                     Comparator::NotRegex => {
-                        // For simple patterns, use NOT hasTokenCaseInsensitive()
+                        // For simple patterns, use substring NOT iLike (NAN-1160).
                         if let Value::Regex(pattern) = value {
                             if let Some(token) = extract_simple_regex_token(pattern) {
                                 return Ok(format!(
-                                    "NOT hasTokenCaseInsensitive(toString({}), '{}')",
+                                    "toString({}) NOT iLike '%{}%'",
                                     column_ref,
-                                    escape_string(&token)
+                                    escape_like_pattern(&escape_string(&token.to_lowercase()))
                                 ));
                             }
                             // Complex regex — try pattern rewrites
@@ -1000,19 +1038,11 @@ impl ClickHouseSqlGenerator {
                     }
                     Comparator::Contains => {
                         if let Value::String(s) = value {
-                            let has_separators = s.chars().any(|c| !c.is_alphanumeric());
-                            if has_separators {
-                                let escaped = escape_string(&s.to_lowercase())
-                                    .replace('%', "\\%")
-                                    .replace('_', "\\_");
-                                Ok(format!("toString({}) iLike '%{}%'", column_ref, escaped))
-                            } else {
-                                Ok(format!(
-                                    "hasTokenCaseInsensitive(toString({}), '{}')",
-                                    column_ref,
-                                    escape_string(&s.to_lowercase())
-                                ))
-                            }
+                            // NAN-1160: always substring iLike, never hasTokenCaseInsensitive —
+                            // post-stats columns are unindexed CTE intermediates, so hasToken
+                            // matched whole tokens only (`medi` ≠ `Medium`) for zero index gain.
+                            let escaped = escape_like_pattern(&escape_string(&s.to_lowercase()));
+                            Ok(format!("toString({}) iLike '%{}%'", column_ref, escaped))
                         } else {
                             Ok(format!(
                                 "toString({}) iLike concat('%', {}, '%')",
@@ -1022,22 +1052,13 @@ impl ClickHouseSqlGenerator {
                     }
                     Comparator::NotContains => {
                         if let Value::String(s) = value {
-                            let has_separators = s.chars().any(|c| !c.is_alphanumeric());
-                            if has_separators {
-                                let escaped = escape_string(&s.to_lowercase())
-                                    .replace('%', "\\%")
-                                    .replace('_', "\\_");
-                                Ok(format!(
-                                    "toString({}) NOT iLike '%{}%'",
-                                    column_ref, escaped
-                                ))
-                            } else {
-                                Ok(format!(
-                                    "NOT hasTokenCaseInsensitive(toString({}), '{}')",
-                                    column_ref,
-                                    escape_string(&s.to_lowercase())
-                                ))
-                            }
+                            // NAN-1160: NOT iLike, never NOT hasTokenCaseInsensitive — the token
+                            // form leaked sub-token matches through the exclusion filter.
+                            let escaped = escape_like_pattern(&escape_string(&s.to_lowercase()));
+                            Ok(format!(
+                                "toString({}) NOT iLike '%{}%'",
+                                column_ref, escaped
+                            ))
                         } else {
                             Ok(format!(
                                 "toString({}) NOT iLike concat('%', {}, '%')",
@@ -1047,28 +1068,44 @@ impl ClickHouseSqlGenerator {
                     }
                     Comparator::StartsWith => {
                         let pattern = match value {
-                            Value::String(s) => format!("'{}%'", escape_string(&s.to_lowercase())),
+                            Value::String(s) => {
+                                // NAN-1160: escape_like_pattern so a literal `_`/`%` in the
+                                // value is matched literally, not as an iLike wildcard.
+                                format!("'{}%'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                            }
                             _ => format!("concat(lower({}), '%')", value_sql),
                         };
                         Ok(format!("toString({}) iLike {}", column_ref, pattern))
                     }
                     Comparator::NotStartsWith => {
                         let pattern = match value {
-                            Value::String(s) => format!("'{}%'", escape_string(&s.to_lowercase())),
+                            Value::String(s) => {
+                                // NAN-1160: escape_like_pattern so a literal `_`/`%` in the
+                                // value is matched literally, not as an iLike wildcard.
+                                format!("'{}%'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                            }
                             _ => format!("concat(lower({}), '%')", value_sql),
                         };
                         Ok(format!("toString({}) NOT iLike {}", column_ref, pattern))
                     }
                     Comparator::EndsWith => {
                         let pattern = match value {
-                            Value::String(s) => format!("'%{}'", escape_string(&s.to_lowercase())),
+                            Value::String(s) => {
+                                // NAN-1160: escape_like_pattern so a literal `_`/`%` in the
+                                // value is matched literally, not as an iLike wildcard.
+                                format!("'%{}'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                            }
                             _ => format!("concat('%', lower({}))", value_sql),
                         };
                         Ok(format!("toString({}) iLike {}", column_ref, pattern))
                     }
                     Comparator::NotEndsWith => {
                         let pattern = match value {
-                            Value::String(s) => format!("'%{}'", escape_string(&s.to_lowercase())),
+                            Value::String(s) => {
+                                // NAN-1160: escape_like_pattern so a literal `_`/`%` in the
+                                // value is matched literally, not as an iLike wildcard.
+                                format!("'%{}'", escape_like_pattern(&escape_string(&s.to_lowercase())))
+                            }
                             _ => format!("concat('%', lower({}))", value_sql),
                         };
                         Ok(format!("toString({}) NOT iLike {}", column_ref, pattern))

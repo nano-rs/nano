@@ -25,13 +25,8 @@ impl SearchService {
         let offset = request.offset.unwrap_or(0);
         let sql = request.sql.trim().trim_end_matches(';');
 
-        // Execute the query based on backend
-        let (results, total_count) = match self.backend {
-            SearchBackend::ClickHouse => {
-                self.execute_clickhouse_raw_sql(sql, limit, offset).await?
-            }
-            SearchBackend::PostgreSQL => self.execute_postgres_sql(sql, limit, offset).await?,
-        };
+        // Execute the query
+        let (results, total_count) = self.execute_clickhouse_raw_sql(sql, limit, offset).await?;
 
         // Calculate field statistics
         let mut stats = FieldStatistics::new();
@@ -118,16 +113,10 @@ impl SearchService {
             table_view,
             ..Default::default()
         };
-        let mut sql = match self.backend {
-            SearchBackend::ClickHouse => self
-                .ch_sql_generator
-                .generate_with_options(&query_for_sql, &tr, &options)
-                .map_err(|e| SearchError::SqlGenError(e.to_string()))?,
-            SearchBackend::PostgreSQL => self
-                .pg_sql_generator
-                .generate(&query_for_sql, &tr)
-                .map_err(|e| SearchError::SqlGenError(e.to_string()))?,
-        };
+        let mut sql = self
+            .ch_sql_generator
+            .generate_with_options(&query_for_sql, &tr, &options)
+            .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
 
         // Add a note about post-prevalence commands if any were stripped
         if !post_prevalence.commands.is_empty() {
@@ -240,16 +229,6 @@ impl SearchService {
         );
 
         Ok((results?, total_count?))
-    }
-
-    /// Execute SQL against PostgreSQL and return results with total count
-    pub(crate) async fn execute_postgres_sql(
-        &self,
-        sql: &str,
-        limit: usize,
-        offset: usize,
-    ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
-        self.pg_executor.execute_sql(sql, limit, offset).await
     }
 
     /// Validate that SQL is a SELECT statement only

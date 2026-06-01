@@ -7,8 +7,8 @@ use nom::{
     bytes::complete::tag,
     bytes::complete::tag_no_case,
     bytes::complete::take_while,
-    bytes::complete::{escaped, take_while1},
-    character::complete::{anychar, char, digit1, multispace1, none_of},
+    bytes::complete::take_while1,
+    character::complete::{char, digit1, multispace1},
     combinator::{map, map_res, opt, recognize, value},
     sequence::{delimited, pair},
     IResult, Parser,
@@ -116,35 +116,33 @@ pub(crate) fn quoted_string(input: &str) -> ParseResult<'_, String> {
     alt((double_quoted_string, single_quoted_string)).parse(input)
 }
 
-/// Parse double-quoted string with escape sequences
-/// Allows any character after backslash to support regex patterns like \. \d \w etc.
+/// Parse double-quoted string. The closing `"` always terminates — a backslash
+/// is a literal character and does NOT escape the quote. This is what a SIEM
+/// wants: Windows paths like `"C:\Windows\System32\"` (note the trailing `\`)
+/// parse correctly instead of the `\"` being read as an escaped quote that
+/// leaves the string unterminated (NAN-1157). `\\` still collapses to `\` for
+/// back-compat, and regex escapes (`\.` `\d` `\w`) pass through untouched. To
+/// match a literal `"`, use a single-quoted string.
 fn double_quoted_string(input: &str) -> ParseResult<'_, String> {
     delimited(
         char('"'),
-        map(
-            opt(escaped(none_of("\\\""), '\\', anychar)),
-            |s: Option<&str>| {
-                // Only unescape standard string escapes, preserve regex escapes
-                s.unwrap_or("").replace("\\\"", "\"").replace("\\\\", "\\")
-            },
-        ),
+        map(take_while(|c: char| c != '"'), |s: &str| {
+            s.replace("\\\\", "\\")
+        }),
         char('"'),
     )
     .parse(input)
 }
 
-/// Parse single-quoted string with escape sequences
-/// Allows any character after backslash to support regex patterns like \. \d \w etc.
+/// Parse single-quoted string. The closing `'` always terminates (backslash is
+/// literal, never an escape) — mirror of `double_quoted_string`. `\\` collapses
+/// to `\`; to match a literal `'`, use a double-quoted string. NAN-1157.
 fn single_quoted_string(input: &str) -> ParseResult<'_, String> {
     delimited(
         char('\''),
-        map(
-            opt(escaped(none_of("\\'"), '\\', anychar)),
-            |s: Option<&str>| {
-                // Only unescape standard string escapes, preserve regex escapes
-                s.unwrap_or("").replace("\\'", "'").replace("\\\\", "\\")
-            },
-        ),
+        map(take_while(|c: char| c != '\''), |s: &str| {
+            s.replace("\\\\", "\\")
+        }),
         char('\''),
     )
     .parse(input)

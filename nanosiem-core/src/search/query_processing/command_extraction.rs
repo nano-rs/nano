@@ -1170,6 +1170,31 @@ mod tests {
         );
     }
 
+    /// NAN-1179: a leading-pipe query has no base filter, so `extract_base_query`
+    /// returns the empty string. The histogram path must treat this as match-all
+    /// rather than parsing "" (which fails with "Empty query" and drops the
+    /// timeline). This locks the trigger condition and verifies the wildcard
+    /// substitute generates valid SQL — exactly what `generate_histogram` does.
+    #[test]
+    fn test_leading_pipe_base_query_falls_back_to_wildcard() {
+        use crate::query::{ClickHouseSqlGenerator, Query, SearchExpr, TimeRange};
+
+        for q in ["| stats count by src_ip", "| timechart span=1h count"] {
+            assert_eq!(extract_base_query(q), "", "leading-pipe base must be empty: {q}");
+        }
+
+        // The match-all substitute the histogram path uses for an empty base.
+        let parsed = Query::Search(SearchExpr::Keyword("*".to_string()));
+        let time_range = TimeRange {
+            start: "2024-01-01T00:00:00Z".parse().unwrap(),
+            end: "2024-01-02T00:00:00Z".parse().unwrap(),
+        };
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&parsed, &time_range)
+            .expect("wildcard match-all must generate valid SQL");
+        assert!(!sql.trim().is_empty(), "wildcard SQL must not be empty");
+    }
+
     #[test]
     fn test_extract_prevalence_commands_enrichment() {
         let query = parse_query("error | prevalence enrich=true").unwrap();

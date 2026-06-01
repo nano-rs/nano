@@ -38,7 +38,6 @@ metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 # OpenAPI / Swagger documentation
 utoipa.workspace = true
-utoipa-axum.workspace = true
 utoipa-swagger-ui.workspace = true
 
 # Search result cache (Dragonfly/Redis)

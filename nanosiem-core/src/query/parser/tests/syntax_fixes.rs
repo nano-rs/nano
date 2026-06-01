@@ -162,3 +162,60 @@ fn sequence_without_maxgap() {
     // Backward compat
     assert_parses("error | sequence by user maxspan=15m [status=200] [status=500]");
 }
+
+// ---------------------------------------------------------------------------
+// NAN-1157: backslash is literal inside strings; the matching quote always
+// closes. Windows paths with a trailing backslash previously failed to parse
+// ("Unexpected token") because the trailing `\"` was read as an escaped quote
+// that left the string unterminated. A whole class of persistence/defense-
+// evasion rules (startup folder, NETLOGON, \Windows\System32\, \pipe\, ...)
+// hit this.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn windows_path_trailing_backslash_parses() {
+    assert_parses(r#"process_path CONTAINS "C:\Windows\System32\""#);
+}
+
+#[test]
+fn startup_folder_rule_path_parses() {
+    assert_parses(
+        r#"source_type=windows_sysmon | where file_path CONTAINS "\Start Menu\Programs\Startup\""#,
+    );
+}
+
+#[test]
+fn netlogon_trailing_backslash_parses() {
+    assert_parses(r#"source_type=windows_security | where file_path CONTAINS "\NETLOGON\""#);
+}
+
+#[test]
+fn regex_escapes_in_string_still_pass_through() {
+    // `\.` `\d` etc. must survive (backslash literal, not consumed as escape).
+    assert_parses(r#"message="a\.b\d\w""#);
+}
+
+#[test]
+fn trailing_backslash_value_is_literal() {
+    use crate::query::{Query, SearchExpr, Value};
+    fn first_str(q: &Query) -> Option<String> {
+        fn walk(e: &SearchExpr) -> Option<String> {
+            match e {
+                SearchExpr::FieldFilter { value: Value::String(s), .. } => Some(s.clone()),
+                SearchExpr::And(a, b) | SearchExpr::Or(a, b) => walk(a).or_else(|| walk(b)),
+                SearchExpr::Not(x) | SearchExpr::Group(x) => walk(x),
+                _ => None,
+            }
+        }
+        match q {
+            Query::Search(s) => walk(s),
+            Query::Piped { source, .. } => first_str(source),
+        }
+    }
+    // Trailing single backslash is preserved literally.
+    let q = parse_query(r#"file_path="C:\tmp\""#).expect("trailing-backslash path parses");
+    assert_eq!(first_str(&q).as_deref(), Some(r"C:\tmp\"));
+    // `\\` still collapses to a single backslash (back-compat).
+    let q2 = parse_query(r#"file_path="a\\b""#).expect("escaped-backslash parses");
+    assert_eq!(first_str(&q2).as_deref(), Some(r"a\b"));
+}

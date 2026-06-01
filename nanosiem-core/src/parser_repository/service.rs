@@ -70,11 +70,6 @@ impl ParserRepositoryService {
         }
     }
 
-    pub fn with_config(mut self, config: ParserRepositoryServiceConfig) -> Self {
-        self.config = config;
-        self
-    }
-
     /// Compatibility check between a `source_configurations.config_type`
     /// and a parser's `ingestion_method`. NAN-943.
     ///

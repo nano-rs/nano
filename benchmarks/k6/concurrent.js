@@ -67,9 +67,9 @@ const PERSONAS = [
   {
     name: "threat_hunter",
     queries: [
-      'source_type=defender_edr action=process_create | stats count by process_name | sort -count | head 20',
+      'source_type=windows_sysmon action=process_create | stats count by process_name | sort -count | head 20',
       'command_line=/powershell.*-enc.*/i',
-      'source_type=defender_edr action=login | stats count by src_ip, user | where count > 3',
+      'source_type=windows_event action=logon_failure | stats count by src_ip, user | where count > 3',
       '| stats count by src_ip | where count > 1000 | sort -count',
     ],
     think_time: [3, 8], // seconds between queries
@@ -81,7 +81,7 @@ const PERSONAS = [
       "error OR fail OR denied",
       'http_status_code>=400 | stats count by src_ip | sort -count | head 10',
       'source_type=apache_access | timechart span=15m count',
-      'auth_result=failure | stats count by user | sort -count',
+      'source_type=windows_event action=logon_failure | stats count by user | sort -count',
     ],
     think_time: [2, 5],
     time_range_hours: 1,
@@ -89,10 +89,10 @@ const PERSONAS = [
   {
     name: "incident_responder",
     queries: [
-      'src_ip="10.1.0.1" OR dest_ip="10.1.0.1"',
-      'user="admin" | stats count by action, source_type',
-      'src_ip="10.1.0.1" | timechart span=5m count by action',
-      'src_host="WKS-0001" source_type=defender_edr',
+      'src_ip="10.0.0.51" OR dest_ip="10.0.0.51"',
+      'user="admin-ops" | stats count by action, source_type',
+      'src_ip="10.0.0.51" | timechart span=5m count by action',
+      'src_host="ws-exec-087.corp.local" source_type=windows_sysmon',
     ],
     think_time: [1, 4],
     time_range_hours: 72,
@@ -111,10 +111,10 @@ const PERSONAS = [
   {
     name: "detection_engineer",
     queries: [
-      'source_type=defender_edr action=process_create command_line=/.*rundll32.*/i',
+      'source_type=windows_sysmon action=process_create command_line=/.*rundll32.*/i',
       '| stats count by process_name, action | where count < 5',
-      'source_type=defender_edr | stats dc(src_host) as host_count by process_name | where host_count = 1',
-      'action=login auth_result=failure | stats count by user | where count > 10',
+      'source_type=windows_sysmon | stats dc(src_host) as host_count by process_name | where host_count = 1',
+      'source_type=windows_event action=logon_failure | stats count by user | where count > 10',
     ],
     think_time: [5, 15],
     time_range_hours: 168, // 7 days

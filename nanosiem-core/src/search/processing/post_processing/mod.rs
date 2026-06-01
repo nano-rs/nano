@@ -40,7 +40,6 @@ use self::stats::{
     apply_stats_post_processing_with_limit, apply_timechart_post_processing,
     apply_top_rare_post_processing,
 };
-// apply_stats_post_processing (no limit param) is available via apply_post_prevalence_commands default path
 use self::rex::apply_rex_post_processing;
 
 use crate::search::field_utils::normalize_field_alias;

@@ -301,11 +301,35 @@ export function DashboardEditor({
     }
   }, [executePanelQuery, timeRange, substituteVariables]);
 
-  // Fetch data for all panels (re-fetches when variables change)
+  // Fetch data for all panels in batches (re-fetches when variables change).
+  // Cap concurrent queries at CONCURRENCY_LIMIT to stay under the backend
+  // per-user search admission limit (per_user_limit=5); otherwise a dashboard
+  // with >5 panels self-sheds (429 AdmissionDenied) on open / variable change.
+  // Mirrors DashboardView.refreshAllPanels. (NAN-1182)
   useEffect(() => {
-    panels.forEach(panel => {
-      fetchPanelData(panel);
+    let cancelled = false;
+    const CONCURRENCY_LIMIT = 4;
+    // Above-the-fold panels (lowest Y, then X) load first.
+    const sortedPanels = [...panels].sort((a, b) => {
+      const aLayout = layout.items.find(l => l.i === a.id);
+      const bLayout = layout.items.find(l => l.i === b.id);
+      const aY = aLayout?.y ?? Infinity;
+      const bY = bLayout?.y ?? Infinity;
+      if (aY === bY) {
+        return (aLayout?.x ?? 0) - (bLayout?.x ?? 0);
+      }
+      return aY - bY;
     });
+    (async () => {
+      for (let i = 0; i < sortedPanels.length; i += CONCURRENCY_LIMIT) {
+        if (cancelled) return;
+        const batch = sortedPanels.slice(i, i + CONCURRENCY_LIMIT);
+        await Promise.all(batch.map(panel => fetchPanelData(panel)));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
     // Re-fetch when panels change or when substituteVariables changes (due to variable changes)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [panels, substituteVariables]);

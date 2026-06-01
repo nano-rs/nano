@@ -159,8 +159,34 @@ pub struct EnrichmentMetrics {
     pub ioc_hit_pct: f64,
     /// % of events with user-identity enrichment (`user_identity_department`).
     pub identity_fill_pct: f64,
+    /// Identity fill % over the *prior* 24h window (24-48h ago). Lets a
+    /// consumer distinguish "identity was never configured" (prior also 0 →
+    /// not a finding, or LOW) from "identity enrichment was flowing and
+    /// stopped" (prior > 0, now 0 → a real regression). NAN-1178.
+    #[serde(default)]
+    pub identity_fill_prior_pct: f64,
     /// Per-source coverage (top sources by event volume).
     pub per_source_coverage: Vec<EnrichmentCoverageMetric>,
+    /// Installed marketplace/custom enrichment providers and their run status.
+    /// Lets the analyzer ground a low coverage number: a 0% IOC hit rate or 0%
+    /// identity fill means "no provider installed → expected" vs "provider
+    /// installed but failing → actionable", depending on this list. GeoIP/ASN
+    /// is native (IPinfo Lite) and does NOT appear here. NAN-1178.
+    #[serde(default)]
+    pub providers: Vec<EnrichmentProviderStatus>,
+}
+
+/// Status of one installed marketplace/custom enrichment provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnrichmentProviderStatus {
+    /// Display name, e.g. "ThreatFox IOC Feed".
+    pub name: String,
+    /// Provider category: "data" (IOC/lookup feeds), "agent", "identity", ...
+    pub enrichment_type: String,
+    /// Whether the operator has this provider enabled.
+    pub enabled: bool,
+    /// Last run outcome: "success", "failed", "running", or `None` if never run.
+    pub last_run_status: Option<String>,
 }
 
 /// Per-source enrichment coverage row.
@@ -178,6 +204,12 @@ pub struct EnrichmentCoverageMetric {
 pub struct DetectionMetrics {
     /// Total enabled rules
     pub total_enabled_rules: i64,
+    /// Total detection matches today (sum of `detection_daily_stats.match_count`).
+    /// Distinguishes "engine is actively firing detections" from "nothing is
+    /// matching" — used so a detections-only deployment (rules in Live mode,
+    /// no alerting) isn't mistaken for an alerting outage. NAN-1178.
+    #[serde(default)]
+    pub total_matches_24h: i64,
     /// Total rules in each mode
     pub rules_by_mode: Vec<RulesByMode>,
     /// Rules that haven't matched in 30+ days

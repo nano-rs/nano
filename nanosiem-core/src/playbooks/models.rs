@@ -3,7 +3,7 @@
 //! Data models for the playbook library
 
 use chrono::{DateTime, NaiveDate, Utc};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use sqlx::FromRow;
 use std::collections::HashMap;
 use utoipa::ToSchema;
@@ -489,18 +489,6 @@ where
         Some(s) => NaiveDate::parse_from_str(&s, "%Y-%m-%d")
             .map(Some)
             .map_err(serde::de::Error::custom),
-    }
-}
-
-/// Helper for serializing an optional NaiveDate back out (unused yet, but kept for symmetry).
-#[allow(dead_code)]
-fn serialize_optional_naive_date<S: Serializer>(
-    d: &Option<NaiveDate>,
-    s: S,
-) -> Result<S::Ok, S::Error> {
-    match d {
-        Some(d) => s.serialize_some(&d.format("%Y-%m-%d").to_string()),
-        None => s.serialize_none(),
     }
 }
 

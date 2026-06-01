@@ -8,7 +8,7 @@
 //! - Calculates field statistics from results
 //! - Supports UDM field querying across sources
 //! - Enriches results with lookup table data
-//! - Supports both PostgreSQL and ClickHouse backends
+//! - Executes log search on ClickHouse (PostgreSQL is metadata-only)
 //! - Supports prevalence filtering and enrichment
 
 use sqlx::{PgPool, Row};
@@ -23,15 +23,14 @@ use crate::prevalence::{PrevalenceData, PrevalenceService, TimeWindow as Prevale
 use crate::query::{
     analyze_query_cost, parse_query, AggFunc, ClickHouseSqlGenerator, Command, ParseError, PrevalenceField,
     PrevalenceOperator, PrevalenceThreshold, PrevalenceTimeWindow as AstTimeWindow, Query,
-    SqlGenerator, TimeRange, WarningSeverity,
+    TimeRange, WarningSeverity,
 };
 use crate::udm::UdmField;
 
 use super::config::{SearchBackend, SearchConfig};
 use super::evaluator::helpers::{escape_like_pattern, escape_sql_string};
 use super::execution::{
-    escape_question_marks_in_strings, validate_sql_query, ClickHouseExecutor, PostgresExecutor,
-    SqlExecutor,
+    escape_question_marks_in_strings, validate_sql_query, ClickHouseExecutor, SqlExecutor,
 };
 use super::processing::{
     apply_inputlookup_enrichment, apply_lookup_enrichment, apply_post_prevalence_commands,
@@ -478,8 +477,6 @@ pub struct SearchService {
     ch_client: Option<clickhouse::Client>,
     /// Service configuration
     config: SearchConfig,
-    /// PostgreSQL SQL generator
-    pg_sql_generator: SqlGenerator,
     /// ClickHouse SQL generator
     ch_sql_generator: ClickHouseSqlGenerator,
     /// Lookup service for enrichment (uses PostgreSQL)
@@ -490,8 +487,6 @@ pub struct SearchService {
     inputlookup_service: Option<InputLookupService>,
     /// Backend to use for log queries
     backend: SearchBackend,
-    /// PostgreSQL executor
-    pg_executor: PostgresExecutor,
     /// ClickHouse executor (if configured)
     ch_executor: Option<ClickHouseExecutor>,
     /// Query tracker for cancellation support (local instance monitoring)
@@ -518,122 +513,6 @@ pub struct SearchService {
 }
 
 impl SearchService {
-    /// Create a new search service with PostgreSQL only (legacy)
-    pub fn new(pool: PgPool) -> Self {
-        let pg_executor = PostgresExecutor::new(pool.clone());
-        Self {
-            pg_pool: pool,
-            ch_client: None,
-            config: SearchConfig::default(),
-            pg_sql_generator: SqlGenerator::new(),
-            ch_sql_generator: ClickHouseSqlGenerator::new(),
-            lookup_service: None,
-            prevalence_service: None,
-            inputlookup_service: None,
-            backend: SearchBackend::PostgreSQL,
-            pg_executor,
-            ch_executor: None,
-            query_tracker: super::query_tracking::QueryTracker::new(),
-            job_store: std::sync::Arc::new(super::jobs::InMemoryJobStore::new()),
-            admission_controller: None,
-            active_ch_settings: None,
-            ai_client: std::sync::Arc::new(NoopAiClient),
-            cloud_risk: std::sync::Arc::new(NoopCloudRiskProvider),
-            table_names: TableNames::new(false),
-            query_limits: std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::settings::SearchQueryLimitsConfig::default(),
-            )),
-        }
-    }
-
-    /// Create a new search service with custom configuration (PostgreSQL only)
-    pub fn with_config(pool: PgPool, config: SearchConfig) -> Self {
-        let pg_executor = PostgresExecutor::new(pool.clone());
-        Self {
-            pg_pool: pool,
-            ch_client: None,
-            config,
-            pg_sql_generator: SqlGenerator::new(),
-            ch_sql_generator: ClickHouseSqlGenerator::new(),
-            lookup_service: None,
-            prevalence_service: None,
-            inputlookup_service: None,
-            backend: SearchBackend::PostgreSQL,
-            pg_executor,
-            ch_executor: None,
-            query_tracker: super::query_tracking::QueryTracker::new(),
-            job_store: std::sync::Arc::new(super::jobs::InMemoryJobStore::new()),
-            admission_controller: None,
-            active_ch_settings: None,
-            ai_client: std::sync::Arc::new(NoopAiClient),
-            cloud_risk: std::sync::Arc::new(NoopCloudRiskProvider),
-            table_names: TableNames::new(false),
-            query_limits: std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::settings::SearchQueryLimitsConfig::default(),
-            )),
-        }
-    }
-
-    /// Create a new search service with lookup support (PostgreSQL only)
-    pub fn with_lookup(pool: PgPool, lookup_service: LookupService) -> Self {
-        let pg_executor = PostgresExecutor::new(pool.clone());
-        Self {
-            pg_pool: pool,
-            ch_client: None,
-            config: SearchConfig::default(),
-            pg_sql_generator: SqlGenerator::new(),
-            ch_sql_generator: ClickHouseSqlGenerator::new(),
-            lookup_service: Some(lookup_service),
-            prevalence_service: None,
-            inputlookup_service: None,
-            backend: SearchBackend::PostgreSQL,
-            pg_executor,
-            ch_executor: None,
-            query_tracker: super::query_tracking::QueryTracker::new(),
-            job_store: std::sync::Arc::new(super::jobs::InMemoryJobStore::new()),
-            admission_controller: None,
-            active_ch_settings: None,
-            ai_client: std::sync::Arc::new(NoopAiClient),
-            cloud_risk: std::sync::Arc::new(NoopCloudRiskProvider),
-            table_names: TableNames::new(false),
-            query_limits: std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::settings::SearchQueryLimitsConfig::default(),
-            )),
-        }
-    }
-
-    /// Create a new search service with custom configuration and lookup support (PostgreSQL only)
-    pub fn with_config_and_lookup(
-        pool: PgPool,
-        config: SearchConfig,
-        lookup_service: LookupService,
-    ) -> Self {
-        let pg_executor = PostgresExecutor::new(pool.clone());
-        Self {
-            pg_pool: pool,
-            ch_client: None,
-            config,
-            pg_sql_generator: SqlGenerator::new(),
-            ch_sql_generator: ClickHouseSqlGenerator::new(),
-            lookup_service: Some(lookup_service),
-            prevalence_service: None,
-            inputlookup_service: None,
-            backend: SearchBackend::PostgreSQL,
-            pg_executor,
-            ch_executor: None,
-            query_tracker: super::query_tracking::QueryTracker::new(),
-            job_store: std::sync::Arc::new(super::jobs::InMemoryJobStore::new()),
-            admission_controller: None,
-            active_ch_settings: None,
-            ai_client: std::sync::Arc::new(NoopAiClient),
-            cloud_risk: std::sync::Arc::new(NoopCloudRiskProvider),
-            table_names: TableNames::new(false),
-            query_limits: std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::settings::SearchQueryLimitsConfig::default(),
-            )),
-        }
-    }
-
     /// Build a ClickHouse SQL generator using the appropriate table from DualPool.
     fn ch_generator_for_pool(dual_pool: &DualPool) -> ClickHouseSqlGenerator {
         ClickHouseSqlGenerator::with_table(dual_pool.table_names().read_bare("logs"))
@@ -641,19 +520,16 @@ impl SearchService {
 
     /// Create a new search service with DualPool (ClickHouse for logs, PostgreSQL for lookups)
     pub fn with_dual_pool(dual_pool: &DualPool) -> Self {
-        let pg_executor = PostgresExecutor::new(dual_pool.postgres().clone());
         let ch_executor = Some(ClickHouseExecutor::new(dual_pool.clickhouse().clone()));
         Self {
             pg_pool: dual_pool.postgres().clone(),
             ch_client: Some(dual_pool.clickhouse().clone()),
             config: SearchConfig::default(),
-            pg_sql_generator: SqlGenerator::new(),
             ch_sql_generator: Self::ch_generator_for_pool(dual_pool),
             lookup_service: None,
             prevalence_service: None,
             inputlookup_service: None,
             backend: SearchBackend::ClickHouse,
-            pg_executor,
             ch_executor,
             query_tracker: super::query_tracking::QueryTracker::new(),
             job_store: std::sync::Arc::new(super::jobs::InMemoryJobStore::new()),
@@ -667,149 +543,22 @@ impl SearchService {
             )),
         }
     }
-
-    /// Create a new search service with DualPool and custom configuration
-    pub fn with_dual_pool_and_config(dual_pool: &DualPool, config: SearchConfig) -> Self {
-        let pg_executor = PostgresExecutor::new(dual_pool.postgres().clone());
-        let ch_executor = Some(ClickHouseExecutor::new(dual_pool.clickhouse().clone()));
-        Self {
-            pg_pool: dual_pool.postgres().clone(),
-            ch_client: Some(dual_pool.clickhouse().clone()),
-            config,
-            pg_sql_generator: SqlGenerator::new(),
-            ch_sql_generator: Self::ch_generator_for_pool(dual_pool),
-            lookup_service: None,
-            prevalence_service: None,
-            inputlookup_service: None,
-            backend: SearchBackend::ClickHouse,
-            pg_executor,
-            ch_executor,
-            query_tracker: super::query_tracking::QueryTracker::new(),
-            job_store: std::sync::Arc::new(super::jobs::InMemoryJobStore::new()),
-            admission_controller: None,
-            active_ch_settings: None,
-            ai_client: std::sync::Arc::new(NoopAiClient),
-            cloud_risk: std::sync::Arc::new(NoopCloudRiskProvider),
-            table_names: dual_pool.table_names(),
-            query_limits: std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::settings::SearchQueryLimitsConfig::default(),
-            )),
-        }
-    }
-
-    /// Create a new search service with DualPool and lookup support
-    pub fn with_dual_pool_and_lookup(dual_pool: &DualPool, lookup_service: LookupService) -> Self {
-        let pg_executor = PostgresExecutor::new(dual_pool.postgres().clone());
-        let ch_executor = Some(ClickHouseExecutor::new(dual_pool.clickhouse().clone()));
-        Self {
-            pg_pool: dual_pool.postgres().clone(),
-            ch_client: Some(dual_pool.clickhouse().clone()),
-            config: SearchConfig::default(),
-            pg_sql_generator: SqlGenerator::new(),
-            ch_sql_generator: Self::ch_generator_for_pool(dual_pool),
-            lookup_service: Some(lookup_service),
-            prevalence_service: None,
-            inputlookup_service: None,
-            backend: SearchBackend::ClickHouse,
-            pg_executor,
-            ch_executor,
-            query_tracker: super::query_tracking::QueryTracker::new(),
-            job_store: std::sync::Arc::new(super::jobs::InMemoryJobStore::new()),
-            admission_controller: None,
-            active_ch_settings: None,
-            ai_client: std::sync::Arc::new(NoopAiClient),
-            cloud_risk: std::sync::Arc::new(NoopCloudRiskProvider),
-            table_names: dual_pool.table_names(),
-            query_limits: std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::settings::SearchQueryLimitsConfig::default(),
-            )),
-        }
-    }
-
-    /// Create a new search service with DualPool, custom configuration, and lookup support
-    pub fn with_dual_pool_config_and_lookup(
-        dual_pool: &DualPool,
-        config: SearchConfig,
-        lookup_service: LookupService,
-    ) -> Self {
-        let pg_executor = PostgresExecutor::new(dual_pool.postgres().clone());
-        let ch_executor = Some(ClickHouseExecutor::new(dual_pool.clickhouse().clone()));
-        Self {
-            pg_pool: dual_pool.postgres().clone(),
-            ch_client: Some(dual_pool.clickhouse().clone()),
-            config,
-            pg_sql_generator: SqlGenerator::new(),
-            ch_sql_generator: Self::ch_generator_for_pool(dual_pool),
-            lookup_service: Some(lookup_service),
-            prevalence_service: None,
-            inputlookup_service: None,
-            backend: SearchBackend::ClickHouse,
-            pg_executor,
-            ch_executor,
-            query_tracker: super::query_tracking::QueryTracker::new(),
-            job_store: std::sync::Arc::new(super::jobs::InMemoryJobStore::new()),
-            admission_controller: None,
-            active_ch_settings: None,
-            ai_client: std::sync::Arc::new(NoopAiClient),
-            cloud_risk: std::sync::Arc::new(NoopCloudRiskProvider),
-            table_names: dual_pool.table_names(),
-            query_limits: std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::settings::SearchQueryLimitsConfig::default(),
-            )),
-        }
-    }
-
-    /// Create a new search service with DualPool and prevalence support
-    pub fn with_dual_pool_and_prevalence(
-        dual_pool: &DualPool,
-        prevalence_service: PrevalenceService,
-    ) -> Self {
-        let pg_executor = PostgresExecutor::new(dual_pool.postgres().clone());
-        let ch_executor = Some(ClickHouseExecutor::new(dual_pool.clickhouse().clone()));
-        Self {
-            pg_pool: dual_pool.postgres().clone(),
-            ch_client: Some(dual_pool.clickhouse().clone()),
-            config: SearchConfig::default(),
-            pg_sql_generator: SqlGenerator::new(),
-            ch_sql_generator: Self::ch_generator_for_pool(dual_pool),
-            lookup_service: None,
-            prevalence_service: Some(prevalence_service),
-            inputlookup_service: None,
-            backend: SearchBackend::ClickHouse,
-            pg_executor,
-            ch_executor,
-            query_tracker: super::query_tracking::QueryTracker::new(),
-            job_store: std::sync::Arc::new(super::jobs::InMemoryJobStore::new()),
-            admission_controller: None,
-            active_ch_settings: None,
-            ai_client: std::sync::Arc::new(NoopAiClient),
-            cloud_risk: std::sync::Arc::new(NoopCloudRiskProvider),
-            table_names: dual_pool.table_names(),
-            query_limits: std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::settings::SearchQueryLimitsConfig::default(),
-            )),
-        }
-    }
-
     /// Create a new search service with DualPool, lookup, and prevalence support
     pub fn with_dual_pool_lookup_and_prevalence(
         dual_pool: &DualPool,
         lookup_service: LookupService,
         prevalence_service: PrevalenceService,
     ) -> Self {
-        let pg_executor = PostgresExecutor::new(dual_pool.postgres().clone());
         let ch_executor = Some(ClickHouseExecutor::new(dual_pool.clickhouse().clone()));
         Self {
             pg_pool: dual_pool.postgres().clone(),
             ch_client: Some(dual_pool.clickhouse().clone()),
             config: SearchConfig::default(),
-            pg_sql_generator: SqlGenerator::new(),
             ch_sql_generator: Self::ch_generator_for_pool(dual_pool),
             lookup_service: Some(lookup_service),
             prevalence_service: Some(prevalence_service),
             inputlookup_service: None,
             backend: SearchBackend::ClickHouse,
-            pg_executor,
             ch_executor,
             query_tracker: super::query_tracking::QueryTracker::new(),
             job_store: std::sync::Arc::new(super::jobs::InMemoryJobStore::new()),
@@ -823,86 +572,10 @@ impl SearchService {
             )),
         }
     }
-
-    /// Create a new search service with all options
-    pub fn with_all_options(
-        dual_pool: &DualPool,
-        config: SearchConfig,
-        lookup_service: Option<LookupService>,
-        prevalence_service: Option<PrevalenceService>,
-    ) -> Self {
-        let pg_executor = PostgresExecutor::new(dual_pool.postgres().clone());
-        let ch_executor = Some(ClickHouseExecutor::new(dual_pool.clickhouse().clone()));
-        Self {
-            pg_pool: dual_pool.postgres().clone(),
-            ch_client: Some(dual_pool.clickhouse().clone()),
-            config,
-            pg_sql_generator: SqlGenerator::new(),
-            ch_sql_generator: Self::ch_generator_for_pool(dual_pool),
-            lookup_service,
-            prevalence_service,
-            inputlookup_service: None,
-            backend: SearchBackend::ClickHouse,
-            pg_executor,
-            ch_executor,
-            query_tracker: super::query_tracking::QueryTracker::new(),
-            job_store: std::sync::Arc::new(super::jobs::InMemoryJobStore::new()),
-            admission_controller: None,
-            active_ch_settings: None,
-            ai_client: std::sync::Arc::new(NoopAiClient),
-            cloud_risk: std::sync::Arc::new(NoopCloudRiskProvider),
-            table_names: dual_pool.table_names(),
-            query_limits: std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::settings::SearchQueryLimitsConfig::default(),
-            )),
-        }
-    }
-
-    /// Create a new search service with all options including inputlookup
-    pub fn with_all_services(
-        dual_pool: &DualPool,
-        config: SearchConfig,
-        lookup_service: Option<LookupService>,
-        prevalence_service: Option<PrevalenceService>,
-        inputlookup_service: Option<InputLookupService>,
-    ) -> Self {
-        let pg_executor = PostgresExecutor::new(dual_pool.postgres().clone());
-        let ch_executor = Some(ClickHouseExecutor::new(dual_pool.clickhouse().clone()));
-        Self {
-            pg_pool: dual_pool.postgres().clone(),
-            ch_client: Some(dual_pool.clickhouse().clone()),
-            config,
-            pg_sql_generator: SqlGenerator::new(),
-            ch_sql_generator: Self::ch_generator_for_pool(dual_pool),
-            lookup_service,
-            prevalence_service,
-            inputlookup_service,
-            backend: SearchBackend::ClickHouse,
-            pg_executor,
-            ch_executor,
-            query_tracker: super::query_tracking::QueryTracker::new(),
-            job_store: std::sync::Arc::new(super::jobs::InMemoryJobStore::new()),
-            admission_controller: None,
-            active_ch_settings: None,
-            ai_client: std::sync::Arc::new(NoopAiClient),
-            cloud_risk: std::sync::Arc::new(NoopCloudRiskProvider),
-            table_names: dual_pool.table_names(),
-            query_limits: std::sync::Arc::new(tokio::sync::RwLock::new(
-                crate::settings::SearchQueryLimitsConfig::default(),
-            )),
-        }
-    }
-
     /// Get the current backend type
     pub fn backend(&self) -> SearchBackend {
         self.backend
     }
-
-    /// Set the backend type
-    pub fn set_backend(&mut self, backend: SearchBackend) {
-        self.backend = backend;
-    }
-
     /// Set the prevalence service
     pub fn set_prevalence_service(&mut self, prevalence_service: PrevalenceService) {
         self.prevalence_service = Some(prevalence_service);
@@ -986,7 +659,7 @@ mod tests {
 
     #[test]
     fn test_explain_query() {
-        let sql_generator = SqlGenerator::new();
+        let sql_generator = ClickHouseSqlGenerator::new();
         let time_range = TimeRange::new(
             "2024-01-01T00:00:00Z".parse().unwrap(),
             "2024-01-02T00:00:00Z".parse().unwrap(),

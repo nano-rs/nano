@@ -57,17 +57,6 @@ impl LicenseRepository {
 
         Ok(())
     }
-
-    /// Update the last heartbeat timestamp.
-    pub async fn update_heartbeat_at(&self) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE license_status SET last_heartbeat_at = NOW(), updated_at = NOW() WHERE id = TRUE"
-        )
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
 }
 
 #[derive(sqlx::FromRow)]

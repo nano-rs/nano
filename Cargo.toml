@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.584"
+version = "0.1.589"
 edition = "2021"
 authors = ["NanoSIEM Team"]
 license = "AGPL-3.0-or-later"
@@ -67,5 +67,4 @@ feed-rs = "2.3"
 
 # OpenAPI / Swagger documentation
 utoipa = { version = "5", features = ["chrono", "uuid", "axum_extras"] }
-utoipa-axum = "0.2"
 utoipa-swagger-ui = { version = "9", features = ["axum"] }

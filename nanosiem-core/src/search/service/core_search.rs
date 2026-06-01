@@ -641,29 +641,23 @@ impl SearchService {
             q
         };
 
-        // Generate SQL based on backend
-        let sql = match self.backend {
-            SearchBackend::ClickHouse => {
-                use crate::query::QueryOptions;
-                let options = QueryOptions {
-                    use_cache: request.use_cache,
-                    table_view: request.table_view,
-                    limit: Some(limit),
-                };
-                // Apply current query safety limits to the SQL generator
-                let ch_gen = self
-                    .ch_sql_generator
-                    .clone()
-                    .with_max_group_array_size(query_limits.max_group_array_size as usize)
-                    .with_max_mvexpand_rows(query_limits.max_mvexpand_rows as usize);
-                ch_gen
-                    .generate_with_options(&query_for_sql, &time_range, &options)
-                    .map_err(|e| SearchError::SqlGenError(e.to_string()))?
-            }
-            SearchBackend::PostgreSQL => self
-                .pg_sql_generator
-                .generate(&query_for_sql, &time_range)
-                .map_err(|e| SearchError::SqlGenError(e.to_string()))?,
+        // Generate SQL
+        let sql = {
+            use crate::query::QueryOptions;
+            let options = QueryOptions {
+                use_cache: request.use_cache,
+                table_view: request.table_view,
+                limit: Some(limit),
+            };
+            // Apply current query safety limits to the SQL generator
+            let ch_gen = self
+                .ch_sql_generator
+                .clone()
+                .with_max_group_array_size(query_limits.max_group_array_size as usize)
+                .with_max_mvexpand_rows(query_limits.max_mvexpand_rows as usize);
+            ch_gen
+                .generate_with_options(&query_for_sql, &time_range, &options)
+                .map_err(|e| SearchError::SqlGenError(e.to_string()))?
         };
 
         debug!("Generated SQL (backend={:?}): {}", self.backend, sql);
@@ -698,10 +692,9 @@ impl SearchService {
             && !is_asset_query
             && !request.skip_field_stats;
 
-        let (mut results, total_count, server_field_stats) = match self.backend {
-            SearchBackend::ClickHouse => {
-                if should_run_server_field_stats {
-                    let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
+        let (mut results, total_count, server_field_stats) = {
+            if should_run_server_field_stats {
+                let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
                         SearchError::DatabaseError(sqlx::Error::Configuration(
                             "ClickHouse client not configured".into(),
                         ))
@@ -776,11 +769,6 @@ impl SearchService {
                             None,
                         )
                         .await?;
-                    (results, total_count, None)
-                }
-            }
-            SearchBackend::PostgreSQL => {
-                let (results, total_count) = self.execute_postgres_sql(&sql, limit, offset).await?;
                 (results, total_count, None)
             }
         };

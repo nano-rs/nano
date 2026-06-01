@@ -101,14 +101,11 @@ fn strip_comments(input: &str) -> String {
 
         if in_string {
             result.push(c);
+            // The matching quote always closes the string; a backslash is a
+            // literal char and does NOT escape it (mirrors values.rs — so a
+            // trailing `\` in a Windows path doesn't swallow the close). NAN-1157.
             if c == string_char {
                 in_string = false;
-            } else if c == '\\' {
-                // Handle escape sequences in strings
-                if let Some(&next) = chars.peek() {
-                    result.push(next);
-                    chars.next();
-                }
             }
             continue;
         }

@@ -12,6 +12,38 @@ use super::types::ClickHouseExecutor;
 use crate::query::is_explicit_column;
 use crate::search::{parse_clickhouse_error, FieldInfo, SearchError};
 
+/// Build the SQL that enumerates top-level ext (JSON) field names from recent data.
+///
+/// `ext` is a native ClickHouse `JSON` column. We use the native `distinctJSONPaths`
+/// aggregate, which collapses distinct paths in a single pass — NOT
+/// `toString(ext)` + `JSONExtractKeys` (reserializes every row; the original hang,
+/// NAN-1172) and NOT `arrayJoin(JSONAllPaths(ext))` over the raw window either: that
+/// explodes one row per path before `DISTINCT`, which on a busy tenant (~22M rows/24h
+/// on demo) blew past the execution cap and the swallowed-error read loop turned the
+/// timeout into a silent `200 []` (NAN-1177).
+///
+/// The window is bounded to 3h — `distinctJSONPaths` cost scales with rows scanned,
+/// and on a continuously-ingesting tenant 3h surfaces the full key set (verified 80/80
+/// on demo, 0.75s) while keeping ~13x headroom under `max_execution_time`. Paths are
+/// dotted (`a.b.c`); the query-bar tokenizer matches bare identifiers, so each is
+/// reduced to its top-level segment — the same key form the results-driven field list
+/// registers. The cap keeps this best-effort, fire-and-forget query from ever hanging.
+fn build_ext_field_names_sql(table: &str) -> String {
+    format!(
+        "SELECT DISTINCT splitByChar('.', path)[1] AS name \
+         FROM ( \
+             SELECT arrayJoin(distinctJSONPaths(ext)) AS path \
+             FROM {} \
+             WHERE timestamp >= now() - INTERVAL 3 HOUR \
+         ) \
+         WHERE name != '' \
+         ORDER BY name \
+         LIMIT 512 \
+         SETTINGS max_execution_time = 10",
+        table
+    )
+}
+
 impl ClickHouseExecutor {
     /// Get list of queryable columns from the logs table schema
     /// Excludes arrays, maps, and internal columns (starting with _)
@@ -305,16 +337,9 @@ impl ClickHouseExecutor {
     }
 
     /// Get distinct ext field names from recent data.
-    /// Returns field names that exist in the ext JSON column (last 24h).
+    /// Returns field names that exist in the ext JSON column (last 3h).
     pub async fn get_ext_field_names(&self, table: &str) -> Result<Vec<String>, SearchError> {
-        let sql = format!(
-            "SELECT DISTINCT arrayJoin(JSONExtractKeys(ext)) AS name \
-             FROM {} \
-             WHERE timestamp >= now() - INTERVAL 24 HOUR \
-               AND ext != '{{}}' AND ext != '' \
-             LIMIT 200",
-            table
-        );
+        let sql = build_ext_field_names_sql(table);
 
         debug!("Querying ext field names: {}", sql);
 
@@ -326,11 +351,23 @@ impl ClickHouseExecutor {
             .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
 
         let mut response_bytes = Vec::new();
-        while let Ok(Some(chunk)) = cursor.next().await {
-            if response_bytes.len() + chunk.len() > 1024 * 1024 {
-                break; // 1MB safety limit
+        loop {
+            match cursor.next().await {
+                Ok(Some(chunk)) => {
+                    if response_bytes.len() + chunk.len() > 1024 * 1024 {
+                        break; // 1MB safety limit
+                    }
+                    response_bytes.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    // Don't swallow it: a mid-stream error (e.g. the
+                    // max_execution_time cap firing) would otherwise return an
+                    // empty list as a 200 and mask the failure (NAN-1177).
+                    warn!("ext field names query failed mid-stream: {}", e);
+                    break;
+                }
             }
-            response_bytes.extend_from_slice(&chunk);
         }
 
         let response_str = String::from_utf8(response_bytes).map_err(|e| {
@@ -508,5 +545,37 @@ impl ClickHouseExecutor {
         }
 
         Ok(values)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ext_field_names_sql_is_bounded_and_native() {
+        let sql = build_ext_field_names_sql("nanosiem.logs");
+
+        // Targets the resolved table.
+        assert!(sql.contains("FROM nanosiem.logs"), "sql: {sql}");
+
+        // Uses the native distinctJSONPaths aggregate (single-pass, no row-explosion)
+        // — NOT the per-row toString(ext) reserialize that hung the endpoint
+        // (NAN-1172), and NOT arrayJoin(JSONAllPaths(ext)) over the raw window, which
+        // exploded a row per path and timed out at scale (NAN-1177).
+        assert!(sql.contains("distinctJSONPaths(ext)"), "sql: {sql}");
+        assert!(!sql.contains("toString(ext)"), "sql: {sql}");
+        assert!(!sql.contains("JSONExtractKeys"), "sql: {sql}");
+        assert!(!sql.contains("JSONAllPaths"), "sql: {sql}");
+
+        // Reduces dotted JSON paths to the bare top-level key the query-bar tokenizer
+        // matches (it looks up bare identifiers, not dotted paths).
+        assert!(sql.contains("splitByChar('.', path)[1]"), "sql: {sql}");
+
+        // Bounded three ways: short recent window, result cap, and a hard server-side
+        // execution cap so a slow ClickHouse can never hang the request.
+        assert!(sql.contains("INTERVAL 3 HOUR"), "sql: {sql}");
+        assert!(sql.contains("LIMIT 512"), "sql: {sql}");
+        assert!(sql.contains("max_execution_time"), "sql: {sql}");
     }
 }

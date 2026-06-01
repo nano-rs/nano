@@ -3,7 +3,6 @@
 //! Query execution utilities for SQL validation and database operations
 
 pub mod clickhouse_executor;
-pub mod postgres_executor;
 pub mod traits;
 pub mod validation;
 
@@ -11,6 +10,5 @@ pub mod validation;
 pub use clickhouse_executor::{
     escape_question_marks_in_strings, ClickHouseExecutor, ClickHouseLogReadRow,
 };
-pub use postgres_executor::PostgresExecutor;
 pub use traits::SqlExecutor;
 pub use validation::{inject_audit_filter, validate_sql_query};

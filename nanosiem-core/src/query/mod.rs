@@ -7,7 +7,8 @@
 //! - Parser using nom combinators
 //! - Pretty-printer for AST to query string conversion
 //! - SQL generator for PostgreSQL
-//! - SQL generator for ClickHouse
+//! - SQL generator for ClickHouse (`clickhouse_sql_gen`; `sql_gen` holds the shared
+//!   `TimeRange`/`SqlGenError` types)
 
 mod ast;
 mod clickhouse_sql_gen;
@@ -22,7 +23,7 @@ pub(crate) use clickhouse_sql_gen::MATERIALIZED_COLUMNS;
 pub use clickhouse_sql_gen::{ClickHouseSqlGenerator, QueryOptions};
 pub use parser::{parse_query, ParseError};
 pub use pretty_print::PrettyPrint;
-pub use sql_gen::{SqlGenError, SqlGenerator, TimeRange};
+pub use sql_gen::{SqlGenError, TimeRange};
 pub use validation::{
     // Query cost analysis (query cost analysis)
     analyze_query_cost,

@@ -44,8 +44,6 @@ impl Default for SearchConfig {
 /// Backend type for the search service
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchBackend {
-    /// Use PostgreSQL for log queries (legacy)
-    PostgreSQL,
     /// Use ClickHouse for log queries
     ClickHouse,
 }
@@ -77,7 +75,5 @@ mod tests {
     #[test]
     fn test_search_backend_equality() {
         assert_eq!(SearchBackend::ClickHouse, SearchBackend::ClickHouse);
-        assert_eq!(SearchBackend::PostgreSQL, SearchBackend::PostgreSQL);
-        assert_ne!(SearchBackend::ClickHouse, SearchBackend::PostgreSQL);
     }
 }

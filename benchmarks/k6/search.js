@@ -51,7 +51,7 @@ const queriesExecuted = new Counter("queries_executed");
 const SEARCH_URL = __ENV.SEARCH_URL || "http://localhost:3002";
 const API_KEY = __ENV.API_KEY || "";
 const JWT_TOKEN = __ENV.JWT_TOKEN || "";
-const TIME_RANGE_PARAM = __ENV.TIME_RANGE || "24h";
+const TIME_RANGE_PARAM = __ENV.TIME_RANGE || "6h";
 
 export const options = {
   scenarios: {
@@ -169,19 +169,31 @@ const QUERIES = [
   {
     name: "ip_search",
     type: "simple",
-    query: 'src_ip="10.1.0.1"',
+    query: 'src_ip="10.0.0.51"',
     limit: 100,
   },
   {
     name: "user_search",
     type: "simple",
-    query: 'user="admin"',
+    query: 'user="admin-ops"',
     limit: 100,
   },
   {
     name: "multi_field",
     type: "simple",
-    query: 'source_type=defender_edr action=process_create',
+    query: 'source_type=windows_sysmon action=process_create',
+    limit: 100,
+  },
+  {
+    name: "proxy_denied",
+    type: "simple",
+    query: 'source_type=conduit_proxy action=deny',
+    limit: 100,
+  },
+  {
+    name: "cloudtrail_assumerole",
+    type: "simple",
+    query: 'source_type=aws_cloudtrail action=assumerole',
     limit: 100,
   },
 
@@ -249,7 +261,7 @@ const QUERIES = [
   {
     name: "hunt_lateral_movement",
     type: "filter_chain",
-    query: 'source_type=defender_edr action=login | stats count by src_ip, dest_ip | where count > 5 | sort -count',
+    query: 'source_type=windows_event action=logon_success | stats count by src_ip, user | where count > 5 | sort -count',
     limit: 1000,
   },
   {
@@ -261,7 +273,13 @@ const QUERIES = [
   {
     name: "hunt_process_chain",
     type: "filter_chain",
-    query: 'source_type=defender_edr action=process_create | stats count by process_name | sort -count | head 20',
+    query: 'source_type=windows_sysmon action=process_create | stats count by process_name | sort -count | head 20',
+    limit: 1000,
+  },
+  {
+    name: "hunt_failed_logons",
+    type: "filter_chain",
+    query: 'source_type=windows_event action=logon_failure | stats count by user, src_host | where count > 5 | sort -count',
     limit: 1000,
   },
 
@@ -281,7 +299,7 @@ const QUERIES = [
   {
     name: "prevalence_new_hashes",
     type: "prevalence",
-    query: 'source_type=defender_edr | where prevalence_file_hash < 5',
+    query: 'source_type=windows_sysmon | where prevalence_file_hash < 5',
     limit: 100,
   },
   // Eval queries (compute functions)
@@ -318,7 +336,7 @@ const QUERIES = [
   {
     name: "eval_long_commands",
     type: "eval",
-    query: 'source_type=defender_edr | eval cmd_len = len(command_line) | where cmd_len > 200 | head 50',
+    query: 'source_type=windows_sysmon action=process_create | eval cmd_len = len(command_line) | where cmd_len > 200 | head 50',
     limit: 100,
   },
 
@@ -326,19 +344,19 @@ const QUERIES = [
   {
     name: "dedup_users",
     type: "advanced",
-    query: 'source_type=defender_edr action=login | dedup user | table user, src_ip, src_host',
+    query: 'source_type=windows_event action=logon_success | dedup user | table user, src_ip, src_host',
     limit: 1000,
   },
   {
     name: "top_processes",
     type: "advanced",
-    query: 'source_type=defender_edr | top limit=20 process_name',
+    query: 'source_type=windows_sysmon | top limit=20 process_name',
     limit: 1000,
   },
   {
     name: "rare_processes",
     type: "advanced",
-    query: 'source_type=defender_edr | rare limit=20 process_name',
+    query: 'source_type=windows_sysmon | rare limit=20 process_name',
     limit: 1000,
   },
   {

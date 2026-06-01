@@ -1047,7 +1047,10 @@ fn doc_rex_key_w_value_s() {
 
 #[test]
 fn doc_rex_user_user_action_action() {
-    npl("* | rex \"\\\"user\\\":\\\"(?<user>[^\\\"]+)\\\",\\\"action\\\":\\\"(?<action>[^\\\"]+)\\\"\" | table user, action");
+    // NAN-1157/NAN-1160: a literal `"` in the pattern must use a single-quoted rex string —
+    // inside a double-quoted string the closing `"` always terminates (so Windows paths like
+    // "C:\dir\" parse). This example was stale pre-NAN-1157 double-quoted `\"` syntax.
+    npl("* | rex '\"user\":\"(?<user>[^\"]+)\",\"action\":\"(?<action>[^\"]+)\"' | table user, action");
 }
 
 #[test]
@@ -2529,7 +2532,9 @@ fn doc_severity_error_5() {
 
 #[test]
 fn doc_source_type_apache() {
-    npl("source_type=\"apache\" | rex \"(?<method>\\w+) (?<url>[^\\s]+) HTTP/(?<version>[\\d.]+)\\\" (?<status>\\d{3})\" | stats count() by method, status");
+    // NAN-1157/NAN-1160: single-quoted rex so the literal `"` in the apache log format is
+    // matched (double-quoted strings terminate at `"`). Was stale `\"` double-quoted syntax.
+    npl("source_type=\"apache\" | rex '(?<method>\\w+) (?<url>[^\\s]+) HTTP/(?<version>[\\d.]+)\" (?<status>\\d{3})' | stats count() by method, status");
 }
 
 #[test]

@@ -223,6 +223,25 @@ impl ClickHouseSqlGenerator {
 
         let dict_lookups = dict_lookup_parts.join(",\n    ");
 
+        // ASOF equi-join key. For user/hostname (text) reverse lookups, lower() BOTH sides so a
+        // mixed-case event identifier (e.g. Windows `JDoe`) matches the as-ingested observation
+        // (`jdoe`) — the dict-key lookup above already lowercases, so the join must too or the
+        // same field resolves inconsistently. IP joins stay raw equality (case-irrelevant, and
+        // lowering would defeat the index).
+        let asof_equi = if is_reverse {
+            format!(
+                "lower(main.{field}) = lower(i.{join_col})",
+                field = field_escaped,
+                join_col = join_col
+            )
+        } else {
+            format!(
+                "main.{field} = i.{join_col}",
+                field = field_escaped,
+                join_col = join_col
+            )
+        };
+
         Ok(format!(
             r#"  SELECT
     {select_main},
@@ -240,15 +259,15 @@ impl ClickHouseSqlGenerator {
     {dict_lookups}
   FROM {source} AS main
   ASOF LEFT JOIN identity_observations AS i
-    ON main.{field} = i.{join_col}
+    ON {asof_equi}
     AND main.timestamp >= i.observed_at
   WHERE i.observed_at IS NULL
-     OR i.observed_at > main.timestamp - INTERVAL {max_age_secs} SECOND"#,
+     OR i.observed_at > main.timestamp - INTERVAL {max_age_secs} SECOND
+  SETTINGS join_use_nulls = 1"#,
             select_main = select_main,
             fill_clause = fill_clause,
             dict_lookups = dict_lookups,
-            field = field_escaped,
-            join_col = join_col,
+            asof_equi = asof_equi,
             source = source,
             max_age_secs = max_age_secs
         ))

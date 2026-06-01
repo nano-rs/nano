@@ -45,7 +45,7 @@ pub fn fallback_report(metrics: &CollectedMetrics) -> AnalysisResult {
     let parsing_score = score_parsing(&metrics.parsing);
     let enrichment_score = score_enrichment(&metrics.enrichment);
     let detection_score = score_detection(&metrics.detection);
-    let alerting_score = score_alerting(&metrics.alerting);
+    let alerting_score = score_alerting(&metrics.alerting, &metrics.detection);
     let overall_score = (ingestion_score as f64 * 0.25
         + parsing_score as f64 * 0.20
         + enrichment_score as f64 * 0.15
@@ -271,9 +271,12 @@ fn score_enrichment(m: &EnrichmentMetrics) -> i32 {
         // No events yet — don't penalize an empty deployment.
         return 50;
     }
-    // Weight GeoIP highest (most universally applicable), ASN second,
-    // identity third. IOC hit rate is informational, not a scoring signal.
-    let weighted = m.geoip_fill_pct * 0.5 + m.asn_fill_pct * 0.3 + m.identity_fill_pct * 0.2;
+    // Score on GeoIP + ASN, the universally-applicable network enrichments,
+    // now measured over geo-eligible rows (NAN-1178). Identity enrichment and
+    // IOC hit rate are informational, not scoring signals: most deployments
+    // never populate a user registry, so weighting identity (the old 0.2)
+    // dragged otherwise-healthy enrichment into the Warning band.
+    let weighted = m.geoip_fill_pct * 0.6 + m.asn_fill_pct * 0.4;
     weighted.clamp(0.0, 100.0) as i32
 }
 
@@ -293,12 +296,33 @@ fn score_detection(m: &DetectionMetrics) -> i32 {
     (100 - stale_penalty - noise_penalty).clamp(0, 100)
 }
 
-fn score_alerting(m: &AlertingMetrics) -> i32 {
+fn score_alerting(m: &AlertingMetrics, d: &DetectionMetrics) -> i32 {
+    // Detections-only posture: when no rule is in Alerting mode, zero alerts is
+    // correct *by design*. Per the Staging → Live → Alerting lifecycle, Live-mode
+    // rules count matches and log signals but never raise alerts. Many
+    // deployments run this way deliberately. Flagging it as a pipeline outage
+    // (the old behaviour) was a false alarm — NAN-1178.
+    let alerting_mode_rules: i64 = d
+        .rules_by_mode
+        .iter()
+        .filter(|r| r.mode.eq_ignore_ascii_case("alerting"))
+        .map(|r| r.count)
+        .sum();
+
+    if alerting_mode_rules == 0 {
+        // Engine actively firing detections, just not wired to alert → healthy.
+        // Otherwise nothing is matching either → mild warning, not critical.
+        return if d.total_matches_24h > 0 { 90 } else { 70 };
+    }
+
+    // At least one rule is in Alerting mode → alerts ARE expected here. Run the
+    // health heuristic, including the genuine outage signal.
     let mut score: i32 = 80;
 
-    // Volume signal — zero alerts when prior 24h had alerts is a red flag.
+    // Volume signal — alerts stopped despite alerting-mode rules that fired
+    // yesterday is a real outage. Now correctly gated on alerting-mode rules.
     if m.total_alerts_24h == 0 && m.total_alerts_prior_24h > 0 {
-        score -= 30;
+        score -= 50;
     }
 
     // MTTA signal: reward fast acks, penalize slow ones.
@@ -446,10 +470,13 @@ mod tests {
                 asn_fill_pct: 0.0,
                 ioc_hit_pct: 0.0,
                 identity_fill_pct: 0.0,
+                identity_fill_prior_pct: 0.0,
                 per_source_coverage: vec![],
+                providers: vec![],
             },
             detection: DetectionMetrics {
                 total_enabled_rules: 0,
+                total_matches_24h: 0,
                 rules_by_mode: vec![],
                 stale_rules: vec![],
                 noisy_rules: vec![],
@@ -467,5 +494,102 @@ mod tests {
             },
             collected_at: chrono::Utc::now(),
         }
+    }
+
+    fn detection_with(alerting_rules: i64, matches: i64) -> DetectionMetrics {
+        let mut rules_by_mode = vec![RulesByMode {
+            mode: "live".to_string(),
+            count: 26,
+        }];
+        if alerting_rules > 0 {
+            rules_by_mode.push(RulesByMode {
+                mode: "alerting".to_string(),
+                count: alerting_rules,
+            });
+        }
+        DetectionMetrics {
+            total_enabled_rules: 26 + alerting_rules,
+            total_matches_24h: matches,
+            rules_by_mode,
+            stale_rules: vec![],
+            noisy_rules: vec![],
+            alerts_24h_by_severity: vec![],
+        }
+    }
+
+    fn alerting_zeroed() -> AlertingMetrics {
+        AlertingMetrics {
+            total_alerts_24h: 0,
+            total_alerts_prior_24h: 0,
+            by_status: vec![],
+            mean_mtta_minutes: None,
+            active_webhooks: 0,
+            webhook_deliveries_24h: 0,
+            webhook_success_pct: None,
+            active_routing_rules: 0,
+        }
+    }
+
+    /// NAN-1178: detections-only deployment — Live-mode rules firing thousands
+    /// of matches, no rule in Alerting mode, zero alerts. That is correct by
+    /// design and must score Healthy, NOT flag an outage.
+    #[test]
+    fn detections_only_with_matches_is_healthy() {
+        let det = detection_with(0, 8_778);
+        let score = score_alerting(&alerting_zeroed(), &det);
+        assert!(
+            score >= 80,
+            "detections firing + no alerting-mode rules must be Healthy, got {score}"
+        );
+    }
+
+    /// No alerting-mode rules AND nothing matching → mild Warning, not critical.
+    #[test]
+    fn detections_only_but_quiet_is_warning_not_critical() {
+        let det = detection_with(0, 0);
+        let score = score_alerting(&alerting_zeroed(), &det);
+        assert!(
+            (50..80).contains(&score),
+            "no alerting rules + no matches should be Warning band, got {score}"
+        );
+    }
+
+    /// A genuine outage — a rule IS in Alerting mode and alerts fired yesterday
+    /// but stopped today — must still be penalized into the critical band.
+    #[test]
+    fn alerting_mode_rule_gone_silent_is_critical() {
+        let det = detection_with(3, 5_000);
+        let mut alerting = alerting_zeroed();
+        alerting.total_alerts_prior_24h = 40; // fired yesterday, zero today
+        let score = score_alerting(&alerting, &det);
+        assert!(
+            score < 50,
+            "alerting-mode rule that went silent must be critical, got {score}"
+        );
+    }
+
+    /// NAN-1178: enrichment is scored on GeoIP + ASN only; a deployment with
+    /// healthy network enrichment but no user-registry (identity 0%) must not
+    /// be dragged into the Warning band by the missing identity signal.
+    #[test]
+    fn enrichment_healthy_geo_asn_scores_healthy_without_identity() {
+        let mut m = EnrichmentMetrics {
+            total_events_24h: 1_000_000,
+            geoip_fill_pct: 95.0,
+            asn_fill_pct: 90.0,
+            ioc_hit_pct: 0.0,
+            identity_fill_pct: 0.0,
+            identity_fill_prior_pct: 0.0,
+            per_source_coverage: vec![],
+            providers: vec![],
+        };
+        assert!(
+            score_enrichment(&m) >= 80,
+            "healthy geo+asn must score Healthy regardless of identity"
+        );
+        // And a real geo gap still drags the score down.
+        m.geoip_fill_pct = 10.0;
+        m.asn_fill_pct = 10.0;
+        assert!(score_enrichment(&m) < 50, "genuinely low geo/asn is still bad");
     }
 }

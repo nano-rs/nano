@@ -525,9 +525,6 @@ export function Search() {
   const [showAiSuggestion, setShowAiSuggestion] = useState(false);
   const aiSuggestionTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // AI hint popup - shows once to educate users about natural language search
-  const [showAiHint, setShowAiHint] = useState(false);
-
   // Detect tree visualization mode - hide fields panel when in tree mode
   const isTreeView = searchResults.length > 0 && searchResults[0]?.fields?._display_type === 'tree';
 
@@ -863,30 +860,6 @@ export function Search() {
       }
     };
   }, [query, melodStatus?.connected, looksLikeNaturalLanguage]);
-
-  // Show AI hint popup once when meloD is connected (stored in localStorage)
-  useEffect(() => {
-    if (!melodStatus?.connected) return;
-
-    const hasSeenHint = localStorage.getItem('nanosiem_ai_hint_seen');
-    if (hasSeenHint) return;
-
-    // Show hint after a short delay
-    const showTimer = setTimeout(() => {
-      setShowAiHint(true);
-      localStorage.setItem('nanosiem_ai_hint_seen', 'true');
-    }, 1000);
-
-    // Auto-hide after 6 seconds
-    const hideTimer = setTimeout(() => {
-      setShowAiHint(false);
-    }, 7000);
-
-    return () => {
-      clearTimeout(showTimer);
-      clearTimeout(hideTimer);
-    };
-  }, [melodStatus?.connected]);
 
   // URL management - pushHistory=true creates a new browser history entry (for back button)
   const updateUrl = useCallback((q: string, mode: 'piped' | 'sql', time: TimeRangeValue, shortId?: string, pushHistory: boolean = false, prevalence?: number) => {
@@ -2693,16 +2666,24 @@ export function Search() {
   }, [availableFields]);
 
   // Fetch ext field names once authenticated so they're available for syntax
-  // highlighting before the user runs their first search
+  // highlighting before the user runs their first search. Fire at most once per
+  // mount — isAuthenticated can flip false->true during boot (token refresh), and
+  // there's no need to re-seed the (slowly-changing) ext key list on each toggle.
+  const extFieldsFetchedRef = useRef(false);
   useEffect(() => {
-    if (!isAuthenticated) return;
+    if (!isAuthenticated || extFieldsFetchedRef.current) return;
+    extFieldsFetchedRef.current = true;
     api.getExtFieldNames()
       .then((names: string[]) => {
         if (names.length > 0) {
           registerDynamicFields(names);
         }
       })
-      .catch(() => {}); // Silently fail — ext fields are optional
+      .catch(() => {
+        // Best-effort: ext-field highlighting is optional. Permit a retry on the
+        // next auth change if this attempt failed.
+        extFieldsFetchedRef.current = false;
+      });
   }, [isAuthenticated]);
 
   // Auto-run effect - when navigating to search with run=true (e.g., from AI suggestions)
@@ -3113,27 +3094,6 @@ export function Search() {
                 <GitBranch className="w-3 h-3 mr-1" />
                 Tree Trace
               </Badge>
-            </div>
-          )}
-
-          {/* AI hint popup - shows once to educate users */}
-          {showAiHint && !showAiSuggestion && !aiLoading && !showAiThinking && (
-            <div className="flex justify-center animate-in fade-in slide-in-from-top-2 duration-300">
-              <div className="relative bg-ai text-ai-foreground px-4 py-2.5 rounded-xl shadow-lg shadow-ai-shadow">
-                <div className="absolute -top-2 left-1/2 -translate-x-1/2 w-0 h-0 border-l-8 border-r-8 border-b-8 border-transparent border-b-ai" />
-                <div className="flex items-center gap-2">
-                  <PivtIcon className="w-4 h-4 flex-shrink-0" />
-                  <p className="text-sm">
-                    <span className="font-medium">Tip:</span> Try typing in natural language like "show me failed logins from yesterday"
-                  </p>
-                  <button
-                    onClick={() => setShowAiHint(false)}
-                    className="ml-2 text-ai-foreground/70 hover:text-ai-foreground flex-shrink-0"
-                  >
-                    <X className="w-4 h-4" />
-                  </button>
-                </div>
-              </div>
             </div>
           )}
 

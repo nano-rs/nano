@@ -114,20 +114,6 @@ impl LookupRepository {
 
     /// Get a lookup table by ID
     #[instrument(skip(self))]
-    pub async fn get_table_by_id(&self, id: Uuid) -> Result<LookupTable, LookupRepositoryError> {
-        let sql = format!(
-            "SELECT {} {} WHERE lt.id = $1",
-            Self::LOOKUP_TABLES_SELECT,
-            Self::LOOKUP_TABLES_FROM_JOIN,
-        );
-        let row = sqlx::query_as::<_, LookupTableRow>(&sql)
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or_else(|| LookupRepositoryError::TableNotFound(id.to_string()))?;
-
-        Ok(LookupTable::from(row))
-    }
 
     /// Check if a lookup table exists by name
     #[instrument(skip(self))]

@@ -103,6 +103,24 @@ export function DashboardView() {
 
   const autoRefreshRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // NAN-1183 lazy-load: run panel queries on demand as panels scroll into view.
+  // The dashboard body (overflow-auto) is the IntersectionObserver root.
+  const [scrollRoot, setScrollRoot] = useState<HTMLElement | null>(null);
+  const visiblePanelIds = useRef<Set<string>>(new Set());       // panels currently in view
+  const inFlightPanels = useRef<Set<string>>(new Set());        // dedup guard
+  const loadedEpoch = useRef<Map<string, number>>(new Map());   // params-epoch each panel last loaded at
+  const paramsEpoch = useRef(0);                                // bumped on refresh / time-range / variable change
+  const panelDataRef = useRef(panelData);                       // mirror, for the observer-failure safety net
+  useEffect(() => {
+    panelDataRef.current = panelData;
+  }, [panelData]);
+  // Live mirror of hasRunOnce so the visibility callback reads the committed
+  // value, not a value captured before a queued setHasRunOnce(true) flushes.
+  const hasRunOnceRef = useRef(hasRunOnce);
+  useEffect(() => {
+    hasRunOnceRef.current = hasRunOnce;
+  }, [hasRunOnce]);
+
   // Track dashboard view in recently viewed list (local + server)
   useEffect(() => {
     if (id && dashboard && !isEditMode) {
@@ -311,39 +329,43 @@ export function DashboardView() {
     }
   }, [executePanelQuery, timeRange, substituteVariables]);
 
-  // Fetch data for all panels with batched loading
-  // Limits concurrent queries to avoid overwhelming ClickHouse and browser connection limits
+  // NAN-1183: load one panel, de-duplicated against in-flight requests, stamping
+  // the params-epoch it was fetched at so a later refresh/visibility check knows
+  // whether it's stale. Stamps on completion (success or error) to avoid loops.
+  const loadPanel = useCallback(async (panel: PanelConfig) => {
+    if (inFlightPanels.current.has(panel.id)) return;
+    inFlightPanels.current.add(panel.id);
+    const epoch = paramsEpoch.current;
+    try {
+      await fetchPanelData(panel);
+    } finally {
+      inFlightPanels.current.delete(panel.id);
+      loadedEpoch.current.set(panel.id, epoch);
+    }
+  }, [fetchPanelData]);
+
+  // Refresh panels with batched loading (limits concurrency under the backend
+  // per-user admission cap). NAN-1183: lazy — only (re)loads panels currently in
+  // view; off-screen panels load on demand when scrolled to. Bumps the epoch so
+  // off-screen panels re-fetch with current params next time they become visible.
   const refreshAllPanels = useCallback(async () => {
     if (!dashboard?.panels || dashboard.panels.length === 0) return;
 
     const CONCURRENCY_LIMIT = 4;
 
-    // Sort panels by Y position (top of dashboard loads first)
-    // This ensures "above the fold" panels appear first
-    const sortedPanels = [...dashboard.panels].sort((a, b) => {
-      const aLayout = dashboard.layout.items.find(l => l.i === a.id);
-      const bLayout = dashboard.layout.items.find(l => l.i === b.id);
-      const aY = aLayout?.y ?? Infinity;
-      const bY = bLayout?.y ?? Infinity;
-      // Secondary sort by X position for same row
-      if (aY === bY) {
-        const aX = aLayout?.x ?? 0;
-        const bX = bLayout?.x ?? 0;
-        return aX - bX;
-      }
-      return aY - bY;
-    });
+    const targets = sortPanelsByLayout(dashboard.panels, dashboard.layout.items)
+      .filter(panel => visiblePanelIds.current.has(panel.id));
+    if (targets.length === 0) return; // nothing visible yet — observers drive the initial load
 
+    // Bump the epoch only once we know we're reloading something, so off-screen
+    // panels aren't marked stale by a refresh that loaded nothing.
+    paramsEpoch.current += 1;
     setIsRefreshing(true);
-
-    // Process panels in batches to limit concurrent ClickHouse queries
-    for (let i = 0; i < sortedPanels.length; i += CONCURRENCY_LIMIT) {
-      const batch = sortedPanels.slice(i, i + CONCURRENCY_LIMIT);
-      await Promise.all(batch.map(panel => fetchPanelData(panel)));
+    for (let i = 0; i < targets.length; i += CONCURRENCY_LIMIT) {
+      await Promise.all(targets.slice(i, i + CONCURRENCY_LIMIT).map(loadPanel));
     }
-
     setIsRefreshing(false);
-  }, [dashboard?.panels, dashboard?.layout.items, fetchPanelData]);
+  }, [dashboard?.panels, dashboard?.layout.items, loadPanel]);
 
   // NAN-711: only opt into the initial auto-fetch when the dashboard's layout
   // explicitly sets autoRun=true. Otherwise the user has to click Run, which
@@ -356,6 +378,13 @@ export function DashboardView() {
   // into a fresh one.
   useEffect(() => {
     if (!dashboard?.panels || isEditMode) return;
+    // NAN-1183: reset lazy-load tracking when switching dashboards in place
+    // (same component instance, new id) so stale visibility / epoch state from
+    // the previous dashboard can't suppress or stale-gate the new one's panels.
+    visiblePanelIds.current.clear();
+    inFlightPanels.current.clear();
+    loadedEpoch.current.clear();
+    paramsEpoch.current = 0;
     const shouldAutoRun = dashboard?.layout?.autoRun === true;
     setHasRunOnce(shouldAutoRun);
     if (shouldAutoRun) {
@@ -401,6 +430,40 @@ export function DashboardView() {
       }
     };
   }, [autoRefresh, refreshAllPanels, isEditMode, hasRunOnce]);
+
+  // NAN-1183: a panel entered/left the viewport. On enter, load it if the user
+  // has run the dashboard and it isn't already current for this params-epoch.
+  const onPanelVisibilityChange = useCallback((panelId: string, visible: boolean) => {
+    if (!visible) {
+      visiblePanelIds.current.delete(panelId);
+      return;
+    }
+    visiblePanelIds.current.add(panelId);
+    if (!hasRunOnceRef.current) return;
+    if (loadedEpoch.current.get(panelId) === paramsEpoch.current) return;
+    const panel = dashboard?.panels.find(p => p.id === panelId);
+    if (panel) void loadPanel(panel);
+  }, [dashboard?.panels, loadPanel]);
+
+  // NAN-1183 safety net: if the IntersectionObserver never reports any panel
+  // visible (e.g. an unexpected scroll-root), fall back to eager batched loading
+  // so the dashboard still populates — worst case behaves like the pre-lazy path.
+  useEffect(() => {
+    if (!hasRunOnce || isEditMode || !dashboard?.panels?.length) return;
+    const timer = setTimeout(() => {
+      // Only fall back if nothing is loaded or in flight — i.e. the observer
+      // genuinely never fired. Off-screen panels staying lazy is intended.
+      if (panelDataRef.current.size > 0 || inFlightPanels.current.size > 0) return;
+      const sorted = sortPanelsByLayout(dashboard.panels, dashboard.layout.items);
+      void (async () => {
+        for (let i = 0; i < sorted.length; i += 4) {
+          await Promise.all(sorted.slice(i, i + 4).map(loadPanel));
+        }
+      })();
+    }, 1500);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasRunOnce, isEditMode, dashboard?.id]);
 
   // Handle edit mode toggle
   const handleEnterEditMode = useCallback(() => {
@@ -624,8 +687,8 @@ export function DashboardView() {
         </div>
       )}
 
-      {/* Body — grid of panels (or empty state) */}
-      <div className="flex-1 min-h-0 overflow-auto">
+      {/* Body — grid of panels (or empty state). ref = IntersectionObserver root for lazy panel loading (NAN-1183). */}
+      <div ref={setScrollRoot} className="flex-1 min-h-0 overflow-auto">
         {dashboard.panels.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center gap-3 p-10 text-center">
             <LayoutDashboard className="w-10 h-10 text-muted-foreground/40" />
@@ -657,7 +720,9 @@ export function DashboardView() {
             <DashboardGrid
               dashboard={dashboard}
               panelData={panelData}
-              onRefreshPanel={fetchPanelData}
+              onRefreshPanel={loadPanel}
+              onPanelVisibilityChange={onPanelVisibilityChange}
+              scrollRoot={scrollRoot}
               timeRange={timeRange}
               onDrilldown={handleDrilldown}
               hasRunOnce={hasRunOnce}
@@ -763,10 +828,25 @@ export function DashboardView() {
   );
 }
 
+// Sort panels top-to-bottom (then left-to-right) by grid layout position, so
+// "above the fold" panels load first.
+function sortPanelsByLayout(panels: PanelConfig[], layoutItems: LayoutItem[]): PanelConfig[] {
+  return [...panels].sort((a, b) => {
+    const aLayout = layoutItems.find(l => l.i === a.id);
+    const bLayout = layoutItems.find(l => l.i === b.id);
+    const aY = aLayout?.y ?? Infinity;
+    const bY = bLayout?.y ?? Infinity;
+    if (aY === bY) return (aLayout?.x ?? 0) - (bLayout?.x ?? 0);
+    return aY - bY;
+  });
+}
+
 interface DashboardGridProps {
   dashboard: Dashboard;
   panelData: Map<string, PanelDataState>;
   onRefreshPanel: (panel: PanelConfig) => void;
+  onPanelVisibilityChange?: (panelId: string, visible: boolean) => void;
+  scrollRoot?: Element | null;
   timeRange: TimeRangeValue;
   isEditing?: boolean;
   onLayoutChange?: (layout: LayoutItem[]) => void;
@@ -778,6 +858,8 @@ function DashboardGrid({
   dashboard,
   panelData,
   onRefreshPanel,
+  onPanelVisibilityChange,
+  scrollRoot,
   timeRange,
   isEditing = false,
   onLayoutChange,
@@ -807,6 +889,8 @@ function DashboardGrid({
         timeRange={timeRange}
         isEditing={isEditing}
         onRefresh={() => onRefreshPanel(panel)}
+        onVisibilityChange={onPanelVisibilityChange}
+        scrollRoot={scrollRoot}
         onDrilldown={drilldownEnabled ? onDrilldown : undefined}
         hasRunOnce={hasRunOnce}
       >
@@ -820,7 +904,7 @@ function DashboardGrid({
         )}
       </Panel>
     );
-  }, [panelData, onRefreshPanel, timeRange, isEditing, onDrilldown, hasRunOnce]);
+  }, [panelData, onRefreshPanel, onPanelVisibilityChange, scrollRoot, timeRange, isEditing, onDrilldown, hasRunOnce]);
 
   return (
     <GridLayout

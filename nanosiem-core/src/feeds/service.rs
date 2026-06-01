@@ -37,16 +37,6 @@ pub struct FeedService {
 }
 
 impl FeedService {
-    /// Create a new feed service with PostgreSQL only (legacy mode)
-    pub fn new(pool: PgPool) -> Self {
-        Self {
-            pool,
-            ch_client: None,
-            table_names: crate::db::TableNames::new(false),
-            pattern_cache: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-
     /// Create a new feed service with DualPool (ClickHouse for log stats)
     pub fn with_dual_pool(dual_pool: &DualPool) -> Self {
         Self {

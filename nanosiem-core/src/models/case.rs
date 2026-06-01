@@ -607,13 +607,6 @@ pub struct NewCaseEntity {
     pub is_primary: bool,
 }
 
-/// Input for updating entity enrichment
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct UpdateEntityEnrichment {
-    pub risk_score: Option<i32>,
-    pub enrichment_data: Option<serde_json::Value>,
-}
-
 // =============================================================================
 // CASE WALL MODEL
 // =============================================================================

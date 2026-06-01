@@ -128,12 +128,6 @@ impl VrlValidator {
         Self {}
     }
 
-    /// Create a validator with a custom container name (legacy API, ignored)
-    #[deprecated(note = "Docker is no longer used; use new() instead")]
-    pub fn with_container(_container_name: impl Into<String>) -> Self {
-        Self::new()
-    }
-
     /// Create a validator that doesn't use Docker (legacy API, now same as new())
     #[deprecated(note = "Docker is no longer used; use new() instead")]
     pub fn without_docker() -> Self {
@@ -1018,7 +1012,20 @@ fn run_normalize_for_contract(
     };
     let timezone = vrl::compiler::TimeZone::Local;
     let mut runtime = vrl::compiler::runtime::Runtime::default();
-    match runtime.resolve(&mut target, &result.program, &timezone) {
+    // NAN-1163: the negative-path contract samples (missing external_id, bad
+    // CIDR) trip the normalize VRL's `log("… dead-lettering", level: "warn")`
+    // guard *before* it `abort`s — which is the PASSING outcome we assert below.
+    // That guard is correct in the live Vector lane, but here the VRL `log()`
+    // (vrl stdlib -> `tracing::warn!`) would surface on the api's subscriber and
+    // make a green deploy look broken. Swallow VRL log output for this
+    // validation resolve only via a thread-local no-op subscriber; the real lane
+    // keeps its WARNs. (`execute_vrl`, the parser-test path, is left untouched so
+    // users testing a parser still see its log output.)
+    let resolved = tracing::subscriber::with_default(
+        tracing::subscriber::NoSubscriber::default(),
+        || runtime.resolve(&mut target, &result.program, &timezone),
+    );
+    match resolved {
         Ok(_) => Ok(vrl_value_to_json(&target.value)),
         Err(e) => Err(format!("VRL runtime error/abort: {e}")),
     }
@@ -1237,6 +1244,67 @@ if !match(network, r'^[0-9a-fA-F:.]+/[0-9]+$') { abort }
         assert!(validate_enrichment_encoding_contract("some_future_kind", vrl).is_ok());
         // ...but a non-compiling one is still rejected.
         assert!(validate_enrichment_encoding_contract("some_future_kind", "((").is_err());
+    }
+
+    // ---- NAN-1163: deploy-time validation must not leak the VRL dead-letter
+    // WARN onto the api's subscriber (a passing self-test would look broken) ----
+
+    // A normalize VRL that mirrors the shipped identity guard: it `log()`s a WARN
+    // *before* it `abort`s on the missing-external_id sample the validator feeds.
+    const LOGS_THEN_ABORTS: &str = r#"
+external_id = to_string(.external_id) ?? to_string(.id) ?? ""
+if external_id == "" {
+    log("identity record missing external_id; dead-lettering", level: "warn")
+    abort
+}
+version = to_int(.version) ?? 0
+if version <= 0 { version = to_unix_timestamp(now(), unit: "milliseconds") }
+last_synced_at = format_timestamp!(from_unix_timestamp!(version, unit: "milliseconds"), "%Y-%m-%d %H:%M:%S%.3f")
+account_status = downcase(to_string(.account_status) ?? "active")
+if !includes(["active","disabled","deleted","anonymized"], account_status) { account_status = "active" }
+groups = .groups
+if !is_array(groups) { groups = [] }
+. = { "external_id": external_id, "version": version, "last_synced_at": last_synced_at, "account_status": account_status, "groups": groups }
+"#;
+
+    #[test]
+    fn contract_validation_suppresses_vrl_log_noise() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // Counts every event/WARN that escapes onto the (thread-local) subscriber.
+        struct CountingSubscriber(Arc<AtomicUsize>);
+        impl tracing::Subscriber for CountingSubscriber {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+        // The validator feeds a missing-external_id sample → the VRL above logs a
+        // WARN then aborts (the passing path). `run_normalize_for_contract` must
+        // swallow that log, so our subscriber sees zero events.
+        let result = tracing::subscriber::with_default(CountingSubscriber(count.clone()), || {
+            validate_enrichment_encoding_contract("identity", LOGS_THEN_ABORTS)
+        });
+
+        assert!(result.is_ok(), "contract should pass (abort is the expected outcome): {result:?}");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "VRL log() during deploy-time contract validation must be suppressed (NAN-1163) — \
+             remove the with_default(NoSubscriber) wrap and this should fail"
+        );
     }
 }
 

@@ -4,7 +4,6 @@
 
 use chrono::{DateTime, Utc};
 use serde_json;
-use sqlx::Row;
 use std::cmp::Ordering;
 use tracing::debug;
 
@@ -78,72 +77,6 @@ pub fn escape_like_pattern(s: &str) -> String {
         .replace('%', "\\%")
         .replace('_', "\\_")
         .replace('\'', "''")
-}
-
-/// Convert a SQLx PostgreSQL row to a JSON value
-pub fn pg_row_to_json(row: &sqlx::postgres::PgRow) -> serde_json::Value {
-    use sqlx::Column;
-    use sqlx::TypeInfo;
-
-    let mut map = serde_json::Map::new();
-
-    for column in row.columns() {
-        let name = column.name();
-        let type_info = column.type_info();
-        let type_name = type_info.name();
-
-        let value: serde_json::Value = match type_name {
-            "INT2" | "INT4" | "INT8" => row
-                .try_get::<i64, _>(name)
-                .map(serde_json::Value::from)
-                .unwrap_or(serde_json::Value::Null),
-            "FLOAT4" | "FLOAT8" => row
-                .try_get::<f64, _>(name)
-                .map(serde_json::Value::from)
-                .unwrap_or(serde_json::Value::Null),
-            "NUMERIC" => {
-                // NUMERIC in PostgreSQL - use rust_decimal::Decimal and convert to f64
-                use rust_decimal::prelude::ToPrimitive;
-                use rust_decimal::Decimal;
-                row.try_get::<Decimal, _>(name)
-                    .ok()
-                    .and_then(|d| {
-                        // Round to 2 decimal places for cleaner output
-                        let rounded = d.round_dp(2);
-                        rounded.to_f64()
-                    })
-                    .map(serde_json::Value::from)
-                    .unwrap_or(serde_json::Value::Null)
-            }
-            "BOOL" => row
-                .try_get::<bool, _>(name)
-                .map(serde_json::Value::from)
-                .unwrap_or(serde_json::Value::Null),
-            "TIMESTAMPTZ" | "TIMESTAMP" => row
-                .try_get::<DateTime<Utc>, _>(name)
-                .map(|dt| serde_json::Value::String(dt.to_rfc3339()))
-                .unwrap_or(serde_json::Value::Null),
-            "JSONB" | "JSON" => row
-                .try_get::<serde_json::Value, _>(name)
-                .unwrap_or(serde_json::Value::Null),
-            "INET" => {
-                // INET type - get as string representation
-                row.try_get::<String, _>(name)
-                    .map(serde_json::Value::String)
-                    .unwrap_or(serde_json::Value::Null)
-            }
-            _ => {
-                // Default to string for unknown types
-                row.try_get::<String, _>(name)
-                    .map(serde_json::Value::String)
-                    .unwrap_or(serde_json::Value::Null)
-            }
-        };
-
-        map.insert(name.to_string(), value);
-    }
-
-    serde_json::Value::Object(map)
 }
 
 /// Strip empty/default values from a result JSON object to reduce response size.

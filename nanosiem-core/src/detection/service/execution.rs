@@ -343,42 +343,4 @@ impl DetectionService {
             }
         }
     }
-
-    /// Test a rule against historical data without creating an alert
-    ///
-    /// Uses SearchService to query logs (ClickHouse when DualPool is configured).
-    /// This is useful for validating rule queries before enabling them.
-    #[instrument(skip(self))]
-    pub async fn test_rule(
-        &self,
-        query: &str,
-        time_range: TimeRangeInput,
-    ) -> Result<Vec<serde_json::Value>, DetectionError> {
-        // Validate the query
-        self.validate_query(query)?;
-
-        // Execute the query
-        let request = SearchRequest {
-            query: query.to_string(),
-            time_range,
-            limit: Some(self.config.max_events_per_alert),
-            offset: None,
-            include_sql: Some(false),
-            skip_histogram: true,
-            skip_field_stats: true,
-            use_cache: false,
-            table_view: false,
-            request_id: None,
-            async_mode: false,
-            priority: None,
-        };
-
-        let response = self
-            .search_service
-            .search(request)
-            .await
-            .map_err(|e| DetectionError::SearchError(e.to_string()))?;
-
-        Ok(response.results)
-    }
 }

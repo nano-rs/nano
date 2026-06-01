@@ -1,0 +1,1028 @@
+{
+  "domains": [
+    {
+      "domain": "Endpoint / EDR (windows_sysmon)",
+      "key": "endpoint_sysmon",
+      "queries": [
+        {
+          "use_case": "Encoded PowerShell execution",
+          "tier": "triage",
+          "mitre": "T1059.001 PowerShell",
+          "query": "source_type=windows_sysmon action=process_create command_line=/EncodedCommand/i | stats count by src_host, user | sort -count | head 30",
+          "window": "1h",
+          "exec_ms": 40,
+          "rows": 22,
+          "catches": "Hosts/users launching -EncodedCommand PowerShell (base64 obfuscation) in the last hour - top of every endpoint triage shift."
+        },
+        {
+          "use_case": "LOLBin process spawn (rundll32/regsvr32/mshta)",
+          "tier": "triage",
+          "mitre": "T1218 System Binary Proxy Execution",
+          "query": "source_type=windows_sysmon action=process_create (process_name=rundll32.exe OR process_name=regsvr32.exe OR process_name=mshta.exe) | stats count by process_name, src_host | sort -count | head 40",
+          "window": "6h",
+          "exec_ms": 209,
+          "rows": 40,
+          "catches": "Signed-binary proxy execution per host; baseline the LOLBin fleet and spot the host running mshta/regsvr32 it never normally would."
+        },
+        {
+          "use_case": "Outbound network connection from a LOLBin/shell",
+          "tier": "hunt",
+          "mitre": "T1071 Application Layer Protocol",
+          "query": "source_type=windows_sysmon action=network_connection (process_name=powershell.exe OR process_name=rundll32.exe OR process_name=regsvr32.exe OR process_name=mshta.exe OR process_name=cmd.exe) | stats count by process_name, dest_ip, src_host | sort -count | head 40",
+          "window": "6h",
+          "exec_ms": 93,
+          "rows": 40,
+          "catches": "src_host->dest_ip pairs where a shell/LOLBin (rundll32/powershell/cmd) talks to external IPs - direct C2/download-cradle indicator; pivot each dest_ip to threat intel."
+        },
+        {
+          "use_case": "Rare process names across the fleet",
+          "tier": "hunt",
+          "mitre": "T1204 User Execution",
+          "query": "source_type=windows_sysmon action=process_create | rare limit=25 process_name",
+          "window": "24h",
+          "exec_ms": 80,
+          "rows": 25,
+          "catches": "Long-tail process executions (lowest-frequency binaries) - surfaces the one-off dropper/tool that hides under high-volume svchost/edge noise."
+        },
+        {
+          "use_case": "Process_access (handle open) from shells/LOLBins",
+          "tier": "hunt",
+          "mitre": "T1003 OS Credential Dumping",
+          "query": "source_type=windows_sysmon action=process_access (process_name=powershell.exe OR process_name=rundll32.exe OR process_name=cmd.exe OR process_name=wscript.exe OR process_name=mshta.exe) | stats count by process_name, src_host | sort -count | head 30",
+          "window": "6h",
+          "exec_ms": 99,
+          "rows": 30,
+          "catches": "Shells/LOLBins opening handles into other processes (memory-access primitive). TargetImage/GrantedAccess live in message JSON not a UDM column, so direct lsass= filtering yields 0 here - rank by source proc, then drill into message for TargetImage/GrantedAccess."
+        },
+        {
+          "use_case": "Registry Run-key / autorun persistence writes",
+          "tier": "ir",
+          "mitre": "T1547.001 Registry Run Keys / Startup Folder",
+          "query": "source_type=windows_sysmon action=registry_value_set CurrentVersion | top limit=20 src_host",
+          "window": "24h",
+          "exec_ms": 1545,
+          "rows": 20,
+          "catches": "Hosts with the most CurrentVersion (Run/autostart) registry writes - autorun persistence. Full-text scan (~1.5s) because TargetObject is in message JSON; read message for the exact TargetObject/Image after ranking."
+        },
+        {
+          "use_case": "PowerShell beaconing fan-out to many destinations",
+          "tier": "hunt",
+          "mitre": "T1071 Application Layer Protocol",
+          "query": "source_type=windows_sysmon action=network_connection process_name=powershell.exe | stats count as conns, dc(dest_ip) as distinct_dst by src_host | where conns > 1 | sort -distinct_dst | head 30",
+          "window": "24h",
+          "exec_ms": 849,
+          "rows": 30,
+          "catches": "Hosts where powershell.exe fans out to many distinct external IPs - C2 beaconing / staged exfil; rank by distinct_dst to prioritize the worst host."
+        },
+        {
+          "use_case": "Shared C2 infrastructure across hosts (retro IR)",
+          "tier": "ir",
+          "mitre": "T1071 Application Layer Protocol",
+          "query": "source_type=windows_sysmon action=network_connection (process_name=rundll32.exe OR process_name=regsvr32.exe OR process_name=mshta.exe) | stats dc(src_host) as hosts, count as conns by dest_ip | where hosts >= 2 | sort -hosts | head 30",
+          "window": "7d",
+          "exec_ms": 1208,
+          "rows": 4,
+          "catches": "External IPs contacted by the same LOLBin from 2+ hosts over a week - shared-infrastructure pivot that scopes the full blast radius of a campaign for IR."
+        }
+      ]
+    },
+    {
+      "domain": "Identity / Authentication (windows_event)",
+      "key": "identity_auth",
+      "queries": [
+        {
+          "use_case": "Brute force by account",
+          "tier": "triage",
+          "mitre": "T1110 Brute Force",
+          "query": "source_type=windows_event action=logon_failure | stats count as failures, dc(src_ip) as src_ips by user | where failures > 20 | sort -failures | head 25",
+          "window": "1h",
+          "exec_ms": 33,
+          "rows": 25,
+          "catches": "Accounts taking a high volume of failed logons in the last hour, with how many distinct source IPs are hitting each \u2014 classic brute-force / lockout triage."
+        },
+        {
+          "use_case": "Failed-then-succeeded accounts",
+          "tier": "hunt",
+          "mitre": "T1110 Brute Force",
+          "query": "source_type=windows_event action=logon_failure OR source_type=windows_event action=logon_success | stats count(eval(action=\"logon_failure\")) as fails, count(eval(action=\"logon_success\")) as wins by user | where fails > 30 AND wins > 0 | sort -fails | head 25",
+          "window": "6h",
+          "exec_ms": 79,
+          "rows": 25,
+          "catches": "Accounts with heavy failures that also have at least one success \u2014 the credential-stuffing / guessing-then-in signature analysts pivot on first."
+        },
+        {
+          "use_case": "Privilege escalation (special privileges)",
+          "tier": "triage",
+          "mitre": "T1078 Valid Accounts / T1068",
+          "query": "source_type=windows_event action=special_privileges_assigned | stats count as priv_grants, dc(src_host) as hosts by user | where priv_grants > 50 | sort -priv_grants | head 25",
+          "window": "1h",
+          "exec_ms": 30,
+          "rows": 6,
+          "catches": "Users being assigned special/sensitive privileges (4672) across multiple hosts in a tight window \u2014 admin-equivalent token grants worth a glance."
+        },
+        {
+          "use_case": "Service-account interactive logons",
+          "tier": "hunt",
+          "mitre": "T1078.002 Valid Accounts: Domain Accounts",
+          "query": "source_type=windows_event action=logon_success user=/^svc_/ auth_type=/Interactive/ | stats count as logons, dc(src_host) as hosts by user,auth_type | sort -logons | head 25",
+          "window": "6h",
+          "exec_ms": 233,
+          "rows": 25,
+          "catches": "svc_* accounts logging on Interactive/RemoteInteractive (should be Network/Service/Batch only) \u2014 hands-on-keyboard use of a service identity, a top lateral-movement tell."
+        },
+        {
+          "use_case": "Anomalous RDP (RemoteInteractive) logon success",
+          "tier": "hunt",
+          "mitre": "T1021.001 Remote Services: RDP",
+          "query": "source_type=windows_event action=logon_success auth_type=RemoteInteractive | stats count as rdp_logons, dc(src_host) as dst_hosts, dc(src_ip) as src_ips by user | where rdp_logons > 100 | sort -dst_hosts | head 25",
+          "window": "6h",
+          "exec_ms": 50,
+          "rows": 25,
+          "catches": "Users with successful RDP logons fanning out to many distinct destination hosts/IPs \u2014 off-hours sweep / interactive lateral movement across the estate."
+        },
+        {
+          "use_case": "NTLM logon failures pounding a host",
+          "tier": "hunt",
+          "mitre": "T1110 Brute Force / T1557 NTLM Relay",
+          "query": "source_type=windows_event action=logon_failure authentication_method=NTLM | stats count as ntlm_fails, dc(user) as users, dc(src_ip) as src_ips by dest_host | where ntlm_fails > 50 | sort -ntlm_fails | head 25",
+          "window": "6h",
+          "exec_ms": 92,
+          "rows": 25,
+          "catches": "Target hosts absorbing heavy NTLM (not Kerberos) auth failures \u2014 surfaces downgrade/relay pressure and which endpoints are being hammered over the legacy protocol."
+        },
+        {
+          "use_case": "Compromise-then-escalate correlation",
+          "tier": "ir",
+          "mitre": "T1078 Valid Accounts + T1068 Priv Esc",
+          "query": "source_type=windows_event | stats count(eval(action=\"logon_failure\")) as fails, count(eval(action=\"logon_success\")) as wins, count(eval(action=\"special_privileges_assigned\")) as priv_grants, dc(src_ip) as src_ips by user | where fails > 100 AND priv_grants > 100 | sort -priv_grants | head 25",
+          "window": "24h",
+          "exec_ms": 62,
+          "rows": 25,
+          "catches": "Single-pass profile of accounts that saw heavy failures, succeeded, AND received special privileges over a day \u2014 the compromise->access->escalate triad for IR scoping."
+        },
+        {
+          "use_case": "Password spray rare-event detector",
+          "tier": "ir",
+          "mitre": "T1110.003 Password Spraying",
+          "query": "source_type=windows_event action=logon_failure failure_reason=wrong_password | stats count as fails, dc(user) as users_sprayed by src_ip | where users_sprayed >= 5 | sort -users_sprayed | head 25",
+          "window": "24h",
+          "exec_ms": 173,
+          "rows": 0,
+          "catches": "One source IP failing bad-password against 5+ distinct accounts \u2014 the true spray fan-out shape. Returns 0 on this benign data (no spray present), exactly how a clean-baseline detector should read; flip-to-rows means investigate now."
+        }
+      ]
+    },
+    {
+      "domain": "Network / Proxy egress (conduit_proxy)",
+      "key": "network_proxy",
+      "queries": [
+        {
+          "use_case": "Blocked egress overview",
+          "tier": "triage",
+          "mitre": "T1071.001 Application Layer Protocol: Web",
+          "query": "source_type=conduit_proxy action=deny OR action=blocked | stats count by action,dest_host | sort -count | head 25",
+          "window": "1h",
+          "exec_ms": 24,
+          "rows": 25,
+          "catches": "Top destinations the proxy denied/blocked in the last hour - first-glance triage of policy-violating egress attempts."
+        },
+        {
+          "use_case": "Hard-blocked egress by source IP",
+          "tier": "triage",
+          "mitre": "T1071 Application Layer Protocol",
+          "query": "source_type=conduit_proxy action=blocked | stats count by src_ip,dest_host | sort -count | head 20",
+          "window": "1h",
+          "exec_ms": 25,
+          "rows": 20,
+          "catches": "Which internal hosts hit the rare hard-block action (98 events/24h) and where - a host repeatedly here is reaching for something the policy explicitly forbids."
+        },
+        {
+          "use_case": "Data exfil by bytes_out volume per host->dest",
+          "tier": "hunt",
+          "mitre": "T1048 Exfiltration Over Alternative Protocol",
+          "query": "source_type=conduit_proxy action=allow | stats sum(bytes_out) as bytes_out_total, count as reqs by src_ip,dest_host | sort -bytes_out_total | head 20",
+          "window": "6h",
+          "exec_ms": 48,
+          "rows": 20,
+          "catches": "Ranks src_ip->dest_host pairs by total uploaded bytes - surfaces large outbound transfers (top talker pushed ~11MB to one CDN host)."
+        },
+        {
+          "use_case": "Rare egress destinations (novel C2 / beacon discovery)",
+          "tier": "hunt",
+          "mitre": "T1071.001 Web Protocols",
+          "query": "source_type=conduit_proxy | rare limit=20 dest_host",
+          "window": "24h",
+          "exec_ms": 178,
+          "rows": 20,
+          "catches": "Lowest-frequency destinations across the fleet - unusual/one-off dest_hosts are where new C2 or data-staging infra first shows up before it has volume."
+        },
+        {
+          "use_case": "Beaconing regularity (high-request, low-URL-diversity)",
+          "tier": "hunt",
+          "mitre": "T1071.001 Web Protocols",
+          "query": "source_type=conduit_proxy action=allow | stats count as reqs, sum(bytes_out) as bytes_out_total, dc(url) as distinct_urls by src_ip,dest_host | where reqs > 30 | sort -reqs | head 20",
+          "window": "6h",
+          "exec_ms": 64,
+          "rows": 20,
+          "catches": "Host->dest pairs with many requests but few distinct URLs - the request-count / low-URL-diversity signature of automated beaconing vs. human browsing."
+        },
+        {
+          "use_case": "Denied-domain breakdown via extract_domain",
+          "tier": "hunt",
+          "mitre": "T1071 Application Layer Protocol",
+          "query": "source_type=conduit_proxy action=deny OR action=blocked | eval dom=extract_domain(dest_host) | stats count by dom,action | sort -count | head 25",
+          "window": "24h",
+          "exec_ms": 83,
+          "rows": 25,
+          "catches": "Rolls blocked/denied traffic up to the registered domain (extract_domain) so risky-category access is grouped by domain rather than scattered per-subdomain."
+        },
+        {
+          "use_case": "Single-host egress timeline",
+          "tier": "ir",
+          "mitre": "T1048 Exfiltration Over Alternative Protocol",
+          "query": "source_type=conduit_proxy src_ip=10.1.5.242 | timechart span=1h sum(bytes_out) as bytes_out_total",
+          "window": "24h",
+          "exec_ms": 489,
+          "rows": 24,
+          "catches": "Hourly outbound-byte profile for one suspect host - pinpoints the exfil burst window (a 12MB spike at 09:00Z stands out) for IR scoping. Slowest query; widen span= or shorten window if pressed."
+        },
+        {
+          "use_case": "Fleet exfil outliers above mean egress",
+          "tier": "ir",
+          "mitre": "T1048 Exfiltration Over Alternative Protocol",
+          "query": "source_type=conduit_proxy action=allow | stats sum(bytes_out) as bytes_out_total by src_ip | eventstats avg(bytes_out_total) as fleet_avg | where bytes_out_total > fleet_avg | sort -bytes_out_total | head 20",
+          "window": "24h",
+          "exec_ms": 61,
+          "rows": 20,
+          "catches": "Computes a fleet-average egress baseline (eventstats) and returns only hosts exceeding it - retro IR ranking of who uploaded abnormally more than peers over the day."
+        }
+      ]
+    },
+    {
+      "domain": "Cloud / AWS CloudTrail (aws_cloudtrail) \u2014 STS, Secrets Manager, KMS, S3 enumeration, IAM recon",
+      "key": "cloud_aws",
+      "queries": [
+        {
+          "use_case": "Failed AssumeRole triage",
+          "tier": "triage",
+          "mitre": "T1078.004 Valid Accounts: Cloud Accounts",
+          "query": "source_type=aws_cloudtrail action=assumerole status=failure | stats count by user,src_ip | sort -count | head 50",
+          "window": "1h",
+          "exec_ms": 43,
+          "rows": 13,
+          "catches": "Ranks principals/IPs failing STS AssumeRole right now; intern01@45.155.205.233 (Russia) and contractor-acme@89.248.167.131 (NL) top the list \u2014 stolen-cred role-assumption probing."
+        },
+        {
+          "use_case": "Secrets Manager / KMS bulk pull by principal",
+          "tier": "triage",
+          "mitre": "T1552.001 Unsecured Credentials: Credentials In Files",
+          "query": "source_type=aws_cloudtrail action=getsecretvalue OR action=decrypt | stats count as calls, dc(resource_name) as secrets by user,src_ip | where calls > 100 | sort -calls | head 50",
+          "window": "6h",
+          "exec_ms": 413,
+          "rows": 13,
+          "catches": "Surfaces principals making >100 GetSecretValue/Decrypt calls spanning many distinct secrets \u2014 high-volume secret harvesting / KMS data-key abuse staging exfil."
+        },
+        {
+          "use_case": "Describe* recon burst by single principal",
+          "tier": "hunt",
+          "mitre": "T1580 Cloud Infrastructure Discovery",
+          "query": "source_type=aws_cloudtrail action=/describe.*/ | stats count as recon_calls, dc(action) as distinct_apis by user,src_ip | where distinct_apis >= 8 | sort -recon_calls | head 50",
+          "window": "6h",
+          "exec_ms": 37,
+          "rows": 13,
+          "catches": "Finds one identity sweeping 8+ distinct Describe* APIs (EC2/RDS/VPC/SG/ELB) in thousands of calls \u2014 automated environment mapping after a foothold."
+        },
+        {
+          "use_case": "S3 ListBuckets enumeration from foreign IP",
+          "tier": "hunt",
+          "mitre": "T1619 Cloud Storage Object Discovery",
+          "query": "source_type=aws_cloudtrail action=listbuckets enriched_src_country!=\"\" | stats count by user,src_ip,enriched_src_country | sort -count | head 50",
+          "window": "24h",
+          "exec_ms": 436,
+          "rows": 2,
+          "catches": "Cleanest signal in the set \u2014 only 2 rows, both attacker IPs (intern01/Russia, contractor-acme/Netherlands) repeatedly enumerating S3 buckets; geo-enrichment strips all internal noise."
+        },
+        {
+          "use_case": "Unusual-geo API activity by principal + ASN",
+          "tier": "hunt",
+          "mitre": "T1535 Unused/Unsupported Cloud Regions",
+          "query": "source_type=aws_cloudtrail enriched_src_country=Russia OR enriched_src_country=\"The Netherlands\" | stats count as calls, dc(action) as apis by user,src_ip,enriched_src_country,enriched_src_as_name | sort -calls | head 50",
+          "window": "24h",
+          "exec_ms": 319,
+          "rows": 50,
+          "catches": "Two principals fire 115K calls across 120 distinct APIs from abuse-friendly hosters (Cloud.ru AS, IP Volume inc) vs 1-2-call background \u2014 pinpoints compromised identities by ASN."
+        },
+        {
+          "use_case": "AccessDenied spike per principal (priv-esc/enum)",
+          "tier": "ir",
+          "mitre": "T1078 Valid Accounts",
+          "query": "source_type=aws_cloudtrail status=failure | stats count as denials, dc(action) as denied_apis by user,src_ip | where denials > 200 | sort -denials | head 50",
+          "window": "24h",
+          "exec_ms": 269,
+          "rows": 13,
+          "catches": "Aggregates authorization failures by identity; contractor-acme (57.8K) and intern01 (57.3K) show ~2.5x the denial volume of legit principals across 120 APIs \u2014 brute-forcing permission boundaries."
+        },
+        {
+          "use_case": "Attacker-IP activity timeline (IR scoping)",
+          "tier": "ir",
+          "mitre": "T1580 Cloud Infrastructure Discovery",
+          "query": "source_type=aws_cloudtrail src_ip=45.155.205.233 OR src_ip=89.248.167.131 | timechart span=1h count by user",
+          "window": "24h",
+          "exec_ms": 96,
+          "rows": 50,
+          "catches": "Hourly volume-by-user from the two confirmed bad IPs \u2014 establishes dwell time / first-seen / activity cadence to scope the incident and bound the breach window."
+        },
+        {
+          "use_case": "Sensitive APIs from multiple source IPs (session theft)",
+          "tier": "ir",
+          "mitre": "T1550.001 Use Alternate Auth Material: Application Access Token",
+          "query": "source_type=aws_cloudtrail action=getsecretvalue OR action=assumerole OR action=decrypt | stats dc(action) as sensitive_apis, count as calls, dc(src_ip) as ips by user | where ips > 1 | sort -calls | head 50",
+          "window": "7d",
+          "exec_ms": 388,
+          "rows": 1,
+          "catches": "Single hit: intern01 runs 45.6K STS/Secrets/KMS calls from 2 distinct source IPs over 7d \u2014 impossible-travel / stolen session-token reuse on the same identity."
+        }
+      ]
+    },
+    {
+      "domain": "Web access logs (apache_access) \u2014 auth abuse, path scanning/enumeration, admin-path access, 5xx error-rate spikes, anomalous response sizes",
+      "key": "web_apache",
+      "queries": [
+        {
+          "use_case": "Auth-failure triage by path",
+          "tier": "triage",
+          "mitre": "T1110 Brute Force",
+          "query": "source_type=apache_access (http_status_code=401 OR http_status_code=403) | stats count by uri_path,http_status_code | sort -count | head 20",
+          "window": "1h",
+          "exec_ms": 20,
+          "rows": 20,
+          "catches": "Where 401/403 auth failures concentrate by endpoint \u2014 fast first look at which protected paths are being hammered."
+        },
+        {
+          "use_case": "5xx error-rate spike timechart",
+          "tier": "triage",
+          "mitre": "-",
+          "query": "source_type=apache_access (http_status_code=500 OR http_status_code=502 OR http_status_code=503) | timechart span=1h count by http_status_code",
+          "window": "24h",
+          "exec_ms": 31,
+          "rows": 72,
+          "catches": "Hourly 500/502/503 trend \u2014 surfaces server-error spikes (outage, exploitation, or backend abuse) against a 24h baseline."
+        },
+        {
+          "use_case": "Admin-path access posture",
+          "tier": "triage",
+          "mitre": "T1190 Exploit Public-Facing Application",
+          "query": "source_type=apache_access uri_path=/admin* | stats count by http_status_code | sort -count",
+          "window": "1h",
+          "exec_ms": 18,
+          "rows": 11,
+          "catches": "Status-code breakdown of all /admin* hits \u2014 flags whether admin endpoints are returning 200s to the public internet vs 401/403 denials."
+        },
+        {
+          "use_case": "404 path-enumeration hunt",
+          "tier": "hunt",
+          "mitre": "T1595.003 Active Scanning: Wordlist Scanning",
+          "query": "source_type=apache_access http_status_code=404 | stats count, dc(src_ip) as clients by uri_path | sort -count | head 15",
+          "window": "6h",
+          "exec_ms": 31,
+          "rows": 15,
+          "catches": "Most-probed non-existent paths with distinct-client spread \u2014 reveals scanner wordlists hitting /api/v2/ingest, hidden admin paths, etc."
+        },
+        {
+          "use_case": "Anomalous large responses (exfil/dump)",
+          "tier": "hunt",
+          "mitre": "T1530 Data from Cloud Storage / Exfil over Web",
+          "query": "source_type=apache_access http_status_code=200 | eventstats avg(bytes_out) as avg_b by uri_path | where bytes_out > 45000 | table src_ip,uri_path,bytes_out,avg_b | sort -bytes_out | head 20",
+          "window": "1h",
+          "exec_ms": 54,
+          "rows": 20,
+          "catches": "Per-path baseline via eventstats, then responses far above the per-URI average \u2014 catches oversized data pulls from API/report/admin endpoints."
+        },
+        {
+          "use_case": "Per-IP 401 brute-force detector",
+          "tier": "hunt",
+          "mitre": "T1110.001 Brute Force: Password Guessing",
+          "query": "source_type=apache_access http_status_code=401 | stats count by src_ip | where count > 20 | sort -count | head 20",
+          "window": "24h",
+          "exec_ms": 39,
+          "rows": 0,
+          "catches": "Single source IP with >20 auth failures in 24h. 0 rows = all-clear (no clustered brute-force present); the detector that fires the moment one does."
+        },
+        {
+          "use_case": "Failed admin POST by geo+ASN (retro IR)",
+          "tier": "ir",
+          "mitre": "T1190 Exploit Public-Facing Application",
+          "query": "source_type=apache_access uri_path=/admin* action=post http_status_code!=200 | stats count, dc(uri_path) as paths by enriched_src_country,enriched_src_asn | sort -count | head 15",
+          "window": "24h",
+          "exec_ms": 51,
+          "rows": 15,
+          "catches": "Geo/ASN attribution of failed admin POST attempts \u2014 IR pivot to pin which networks are probing privileged write endpoints. Note: 24h scan, keep window tight."
+        },
+        {
+          "use_case": "5xx error source by country",
+          "tier": "ir",
+          "mitre": "-",
+          "query": "source_type=apache_access http_status_code>=500 | stats count, dc(uri_path) as paths by enriched_src_country | sort -count | head 12",
+          "window": "6h",
+          "exec_ms": 28,
+          "rows": 12,
+          "catches": "Server-error volume attributed by source country with path breadth \u2014 separates broad geo noise from a single-region client triggering backend failures."
+        }
+      ]
+    },
+    {
+      "domain": "Advanced cross-source IR: single-entity pivots (host/user) across sysmon, windows_event, aws_cloudtrail, conduit_proxy, apache_access \u2014 auth\u2192process\u2192network correlation, chronological timelines, longer-window retro investigations",
+      "key": "cross_source_ir",
+      "queries": [
+        {
+          "use_case": "Encoded-PowerShell command hunt across the fleet",
+          "tier": "hunt",
+          "mitre": "T1059.001 PowerShell",
+          "query": "source_type=windows_sysmon action=process_create command_line=/-enc/i | table timestamp,src_host,process_name,command_line | sort timestamp | head 50",
+          "window": "24h",
+          "exec_ms": 125,
+          "rows": 50,
+          "catches": "Surfaces every host running PowerShell -EncodedCommand (incl. cmd.exe and rundll32 launchers) in chronological order \u2014 a sparse, high-fidelity obfuscated-execution signal across 13M sysmon rows."
+        },
+        {
+          "use_case": "Per-user auth-failure timeline (brute-force / spray triage)",
+          "tier": "triage",
+          "mitre": "T1110 Brute Force",
+          "query": "source_type=windows_event action=logon_failure user=\"svc_mon\" | timechart span=10m count",
+          "window": "1h",
+          "exec_ms": 24,
+          "rows": 5,
+          "catches": "Bins one identity's logon failures into 10m buckets so an analyst sees the burst shape \u2014 a flat trickle vs the 13-in-one-bucket spike that flags a password attempt against a service account."
+        },
+        {
+          "use_case": "Single-host activity timeline by action (cross-source)",
+          "tier": "ir",
+          "mitre": "T1059 Command and Scripting Interpreter",
+          "query": "src_host=\"ws-exec-087.corp.local\" | timechart span=1h count by action",
+          "window": "6h",
+          "exec_ms": 36,
+          "rows": 61,
+          "catches": "Pivots on one workstation across sysmon+windows_event and plots process_create / network_connection / registry / logon / special_privileges_assigned per hour \u2014 the at-a-glance behavioral profile that anchors a host investigation."
+        },
+        {
+          "use_case": "AWS credential-access by user (secrets/keys/decrypt/assumerole)",
+          "tier": "hunt",
+          "mitre": "T1555 Credentials from Password Stores",
+          "query": "source_type=aws_cloudtrail action=getsecretvalue OR action=createaccesskey OR action=decrypt OR action=assumerole | stats count as ops, dc(action) as distinct_actions, dc(src_ip) as src_ips by user | where ops > 100 | sort -ops | head 15",
+          "window": "24h",
+          "exec_ms": 168,
+          "rows": 12,
+          "catches": "Ranks identities by sensitive credential-access volume and flags source-IP fan-out \u2014 intern01 shows 19k ops from 2 distinct src_ips, an account whose credential reach exceeds its role."
+        },
+        {
+          "use_case": "Proxy egress top-talkers by destination (exfil candidates)",
+          "tier": "hunt",
+          "mitre": "T1048 Exfiltration Over Alternative Protocol",
+          "query": "source_type=conduit_proxy action=allow | stats sum(bytes_out) as out, count as reqs, dc(src_ip) as srcs by dest_host | sort -out | head 15",
+          "window": "6h",
+          "exec_ms": 61,
+          "rows": 15,
+          "catches": "Aggregates outbound bytes per destination to expose where data is going \u2014 a 12GB CDN top-talker plus the fan-out of internal hosts per dest, so an analyst can separate normal SaaS from a single low-and-slow exfil sink."
+        },
+        {
+          "use_case": "Web admin-path probing (401/403/404/5xx on /admin)",
+          "tier": "triage",
+          "mitre": "T1190 Exploit Public-Facing Application",
+          "query": "source_type=apache_access http_status_code>=400 uri_path=/admin/i | stats count by src_ip,uri_path,http_status_code | sort -count | head 20",
+          "window": "1h",
+          "exec_ms": 30,
+          "rows": 20,
+          "catches": "Groups failed/erroring requests to /admin* by source IP, path, and status \u2014 external IPs hitting /admin/users and /admin/settings with 404/500/503 are the recon-and-probe footprint against the app tier."
+        },
+        {
+          "use_case": "Full single-host cross-source chronological sweep (auth->process->network)",
+          "tier": "ir",
+          "mitre": "T1071 Application Layer Protocol",
+          "query": "src_host=\"ws-exec-087.corp.local\" action=process_create OR action=network_connection OR action=logon_success OR action=logon_failure OR action=special_privileges_assigned | table timestamp,source_type,action,user,process_name,command_line,dest_ip | sort timestamp | head 60",
+          "window": "24h",
+          "exec_ms": 115,
+          "rows": 60,
+          "catches": "Interleaves a host's logons, privilege grants, process launches, and outbound connections into one time-ordered table \u2014 the raw IR timeline that lets you read login -> process -> dest_ip causality on a single asset."
+        },
+        {
+          "use_case": "rundll32 making external network connections (LOLBin C2)",
+          "tier": "hunt",
+          "mitre": "T1218.011 Rundll32",
+          "query": "source_type=windows_sysmon action=network_connection process_name=rundll32.exe | stats count by src_host,dest_ip | sort -count | head 15",
+          "window": "6h",
+          "exec_ms": 56,
+          "rows": 15,
+          "catches": "Isolates a signed LOLBin (rundll32.exe) initiating outbound connections and pairs each host with its external dest_ip \u2014 rundll32 talking to the internet is rarely benign and is a classic proxied-execution / C2 beacon indicator."
+        }
+      ]
+    },
+    {
+      "domain": "PERSISTENCE \u2014 Windows host persistence breadth (Scheduled Tasks, Services, WMI, Run-keys, encoded PowerShell droppers) over windows_sysmon process_create + registry actions",
+      "key": "persistence",
+      "queries": [
+        {
+          "use_case": "Triage: any new scheduled-task creation (schtasks /create or at.exe) \u2014 classic persistence/exec scheduling. A 0-row result is the expected clean-baseline state; any row is immediately actionable.",
+          "tier": "triage",
+          "mitre": "T1053.005 - Scheduled Task/Job: Scheduled Task",
+          "query": "source_type=windows_sysmon action=process_create command_line=/(schtasks|at\\.exe).*(\\/create|\\/sc )/i | table src_host,user,process_name,command_line | sort -src_host",
+          "window": "24h",
+          "exec_ms": 128,
+          "rows": 0,
+          "catches": "True rare-event detector: 0 rows over 24h on the demo (no schtasks /create or at.exe scheduling present) \u2014 fires loudly the moment any scheduled-task persistence is created; command_line is a real UDM column so the regex runs server-side."
+        },
+        {
+          "use_case": "Triage: service-based persistence via sc.exe create/config/failure/binPath \u2014 attackers install or re-point a Windows service to a malicious binary. Demo sc.exe traffic is all benign 'sc start', so this isolates the dangerous verbs.",
+          "tier": "triage",
+          "mitre": "T1543.003 - Create or Modify System Process: Windows Service",
+          "query": "source_type=windows_sysmon action=process_create process_name=sc.exe command_line=/(create|config|failure|binpath)/i | stats count by src_host,command_line | sort -count",
+          "window": "24h",
+          "exec_ms": 154,
+          "rows": 0,
+          "catches": "Rare-event detector: 0 rows over 24h though sc.exe itself fires 1,753x/day (all 'sc start' / 'sc query') \u2014 the create|config|binPath filter strips the benign baseline so any hit is a real service-install persistence event."
+        },
+        {
+          "use_case": "Hunt: rank processes that write a CurrentVersion\\Run autostart value across the fleet and surface the rarest writers (a malicious dropper writing its own Run key shows up as a low-frequency, low-host-spread process the analyst doesn't recognize).",
+          "tier": "hunt",
+          "mitre": "T1547.001 - Boot or Logon Autostart Execution: Registry Run Keys / Startup Folder",
+          "query": "source_type=windows_sysmon action=registry_value_set CurrentVersion Run | stats count as writes, dc(src_host) as hosts by process_name | where writes < 30 | sort writes",
+          "window": "6h",
+          "exec_ms": 465,
+          "rows": 11,
+          "catches": "11 rarest Run-key-writing processes surfaced (DismHost.exe/WindowsTerminal.exe/wsl.exe etc., 17-29 writes); the Run TargetObject lives in message JSON but the 'CurrentVersion Run' full-text tokens prune to true autostart writes \u2014 an unknown process here is the persistence lead."
+        },
+        {
+          "use_case": "Hunt: enumerate hosts/users running PowerShell with -EncodedCommand (base64 payloads), the most common delivery for fileless persistence and Run-key/scheduled-task droppers. Per-host/user tally with distinct-variant count flags repeated or multi-variant encoded execution.",
+          "tier": "hunt",
+          "mitre": "T1059.001 - Command and Scripting Interpreter: PowerShell",
+          "query": "source_type=windows_sysmon action=process_create command_line=/-enc/i | stats count as execs, dc(command_line) as variants by src_host,user | sort -variants",
+          "window": "6h",
+          "exec_ms": 110,
+          "rows": 144,
+          "catches": "144 host/user pairs ran -EncodedCommand PowerShell in 6h (confirmed real base64 payloads in command_line incl. on domain controllers srv-dc03); the variants column lets an analyst pivot from benign single-shot Ansible wrappers to anomalous repeated/unique encoded blobs."
+        },
+        {
+          "use_case": "Hunt: remote process creation via WMIC (`wmic /node:<host> process call create`) \u2014 lateral movement that stages persistence on remote hosts. Aggregates source hosts initiating remote WMI exec.",
+          "tier": "hunt",
+          "mitre": "T1047 - Windows Management Instrumentation",
+          "query": "source_type=windows_sysmon action=process_create process_name=WMIC.exe command_line=/node:.*call create/i | stats count by src_host,user | sort -count",
+          "window": "6h",
+          "exec_ms": 59,
+          "rows": 497,
+          "catches": "497 hosts firing remote 'wmic /node:WS-*-074 process call create cmd.exe /c whoami' in 6h \u2014 a fan-out lateral/persistence-staging pattern (one operator hitting many -074 hosts); 59ms because process_name=WMIC.exe + command_line regex prunes hard."
+        },
+        {
+          "use_case": "Retro IR: single-pass sweep over all four persistence-tooling signatures (encoded PS, wmic remote call-create, sc binPath, schtasks) anchored by one full-text regex, tallying hits and distinct command variants per host+user to find machines where persistence tooling ran more than once.",
+          "tier": "ir",
+          "mitre": "T1053.005 - Scheduled Task/Job: Scheduled Task",
+          "query": "source_type=windows_sysmon action=process_create command_line=/(-enc|node:.*call create|sc.*binpath|schtasks)/i | stats dc(command_line) as distinct_cmds, count as hits by src_host,user | where hits > 1 | sort -hits",
+          "window": "24h",
+          "exec_ms": 125,
+          "rows": 160,
+          "catches": "160 host/user pairs ran persistence tooling 2+ times in 24h (combined -enc/wmic-call-create/sc-binPath/schtasks regex); distinct_cmds vs hits separates a repeated benign wrapper from multi-technique tradecraft on one box. Note: count(eval(regex)) per-technique columns return 0 in this nPL build, so this single-regex tally is the working retro form."
+        }
+      ]
+    },
+    {
+      "domain": "Defense Evasion (Windows endpoint / Sysmon) - T1070.001 log clearing, T1562.001 Defender/AV tampering, T1197 BITS jobs, T1070.004 indicator removal, T1027/T1059.001 obfuscated PowerShell execution",
+      "key": "defense_evasion",
+      "queries": [
+        {
+          "use_case": "Triage: encoded/obfuscated PowerShell or cmd execution on any endpoint in the last hour (defense-evasion via obfuscated interpreter). Pivot from src_host+process_name to the full command_line for analyst eyes.",
+          "tier": "triage",
+          "mitre": "T1027.010 Command Obfuscation / T1059.001 PowerShell",
+          "query": "source_type=windows_sysmon action=process_create command_line=/-[Ee]ncoded[Cc]ommand|-enc /i | stats count by src_host,process_name | sort -count",
+          "window": "1h",
+          "exec_ms": 37,
+          "rows": 22,
+          "catches": "22 hosts ran -EncodedCommand/-enc in 1h (powershell.exe AND cmd.exe); real base64 blobs that decode to nested PowerShell - the strongest live evasion signal in the demo."
+        },
+        {
+          "use_case": "Hunt: roll up EncodedCommand process_create volume per parent interpreter over 6h and count distinct hosts, to separate a noisy admin tool (few hosts, many execs) from lateral spread (many hosts).",
+          "tier": "hunt",
+          "mitre": "T1027.010 Command Obfuscation / T1059.001 PowerShell",
+          "query": "source_type=windows_sysmon action=process_create command_line=/-[Ee]ncoded[Cc]ommand/i | stats count as enc_execs, dc(src_host) as hosts by process_name | sort -enc_execs",
+          "window": "6h",
+          "exec_ms": 53,
+          "rows": 2,
+          "catches": "2 interpreters (powershell.exe, cmd.exe) carry -EncodedCommand across many hosts in 6h; dc(src_host) exposes fleet-wide spread vs single-host admin use."
+        },
+        {
+          "use_case": "Hunt: process_create invoking PowerShell with -ExecutionPolicy Unrestricted/Bypass more than once per host in 24h - the security-control-bypass half of evasion that frequently rides with EncodedCommand.",
+          "tier": "hunt",
+          "mitre": "T1562.001 Impair Defenses / T1059.001 PowerShell",
+          "query": "source_type=windows_sysmon action=process_create command_line=/-[Ee]xecution[Pp]olicy (Unrestricted|Bypass)/i | stats count by src_host,process_name | where count > 1 | sort -count",
+          "window": "24h",
+          "exec_ms": 114,
+          "rows": 43,
+          "catches": "43 hosts repeatedly bypass PowerShell execution policy (Unrestricted/Bypass) in 24h; control-evasion flag that correlates with the encoded-command hosts from Q1/Q2."
+        },
+        {
+          "use_case": "Retro IR: hunt file_delete bursts - a single process deleting >6 files on one host in 6h, the indicator-removal pattern left behind after tooling/log cleanup (T1070.004).",
+          "tier": "ir",
+          "mitre": "T1070.004 File Deletion",
+          "query": "source_type=windows_sysmon action=file_delete | stats count by src_host,process_name | where count > 6 | sort -count",
+          "window": "6h",
+          "exec_ms": 53,
+          "rows": 27,
+          "catches": "27 host+process pairs exceed 6 file_delete events in 6h; baseline here is svchost-driven (~7-9/host) so the threshold surfaces deletion bursts above normal OS churn for triage."
+        },
+        {
+          "use_case": "Retro IR: 7-day sweep for the classic high-fidelity evasion indicators - event-log clearing (wevtutil cl / Clear-EventLog), Defender tampering (Set-MpPreference / DisableRealtimeMonitoring / WinDefend / MsMpEng), and BITS abuse (bitsadmin) - in command_line.",
+          "tier": "ir",
+          "mitre": "T1070.001 Clear Windows Event Logs / T1562.001 Impair Defenses / T1197 BITS Jobs",
+          "query": "source_type=windows_sysmon command_line=/wevtutil|Clear-EventLog|Set-MpPreference|DisableRealtimeMonitoring|bitsadmin|MsMpEng|WinDefend/i | stats count by src_host,command_line | sort -count",
+          "window": "7d",
+          "exec_ms": 599,
+          "rows": 0,
+          "catches": "0 hits across 7d - environment is clean of classic log-clear/AV-tamper/BITS strings (demo lacks them); a validated zero-row rare-event detector, ready to fire the moment any of these appears."
+        }
+      ]
+    },
+    {
+      "domain": "lateral_movement",
+      "key": "lateral_movement",
+      "queries": [
+        {
+          "use_case": "Triage: surface every WMI/PsExec/admin-share remote-exec command line in the last hour, grouped by origin host and process so a SOC analyst can fast-scan for the highest-volume launchers.",
+          "tier": "triage",
+          "mitre": "T1047 Windows Management Instrumentation",
+          "query": "command_line=/node:|psexec|paexec|admin\\$|ipc\\$/i | stats count by process_name,src_host | sort -count",
+          "window": "1h",
+          "exec_ms": 33,
+          "rows": 77,
+          "catches": "77 host/process pairs running remote-exec cmdlines (all WMIC.exe /node: at the top); single full-text regex covers wmic, psexec/paexec and ADMIN$/IPC$ share use in one triage pass. NOTE: regex uses no literal '/' because a forward slash terminates the nPL regex literal."
+        },
+        {
+          "use_case": "Triage: spot hosts opening SMB(445) or RDP(3389) connections in the last 15 minutes, broken down by destination port and source host, as the first-look lateral-movement port board.",
+          "tier": "triage",
+          "mitre": "T1021.002 Remote Services: SMB/Windows Admin Shares",
+          "query": "action=network_connection (dest_port=445 or dest_port=3389) | stats count by dest_port,src_host | sort -count",
+          "window": "15m",
+          "exec_ms": 37,
+          "rows": 2418,
+          "catches": "2418 src_host rows split across 445 and 3389 in 15m (4244 conns/port); sysmon network_connection on dest_port is the cheapest indexed lateral-movement signal (37ms)."
+        },
+        {
+          "use_case": "Hunt: detect RDP fan-out where one user authenticates RemoteInteractive across many distinct target hosts over 6h - the classic credentialed-pivot / admin-sprawl pattern.",
+          "tier": "hunt",
+          "mitre": "T1021.001 Remote Services: Remote Desktop Protocol",
+          "query": "action=logon_success auth_type=RemoteInteractive | stats dc(src_host) as target_hosts, count as logons by user | where target_hosts > 8 | sort -target_hosts",
+          "window": "6h",
+          "exec_ms": 39,
+          "rows": 134,
+          "catches": "134 users RDP-ing into >8 distinct hosts in 6h (top user mmartinez = 21 hosts / 196 logons); dc(src_host) per user isolates fan-out from normal single-jumpbox use."
+        },
+        {
+          "use_case": "Hunt: find SMB sweep / share-enumeration where a single source host hammers many distinct destination IPs on 445 over 6h (worm-like or recon spread).",
+          "tier": "hunt",
+          "mitre": "T1021.002 Remote Services: SMB/Windows Admin Shares",
+          "query": "action=network_connection dest_port=445 | stats dc(dest_ip) as targets, count as conns by src_host | where targets > 20 | sort -targets",
+          "window": "6h",
+          "exec_ms": 98,
+          "rows": 359,
+          "catches": "359 hosts touched >20 distinct SMB targets in 6h (top ws-mkt-055 = 36 targets); dc(dest_ip)>20 separates a sweeping host from routine file-server access."
+        },
+        {
+          "use_case": "Hunt: enumerate WMIC remote-process-create (/node:) execution per source host over 24h, counting distinct command variants to flag scripted multi-target remote exec.",
+          "tier": "hunt",
+          "mitre": "T1047 Windows Management Instrumentation",
+          "query": "process_name=WMIC.exe command_line=/node:/i | stats count as execs, dc(command_line) as variants by src_host | sort -execs",
+          "window": "24h",
+          "exec_ms": 421,
+          "rows": 1296,
+          "catches": "1296 source hosts launched WMIC /node: remote exec in 24h (e.g. 'wmic /node:WS-OPS-039 process call create cmd.exe /c whoami'); per-host variant count exposes scripted node-list fan-out vs one-off admin use."
+        },
+        {
+          "use_case": "Retro IR: consolidate net.exe ADMIN$/C$/IPC$ mounts that pass explicit /user: credentials across 7 days, collapsing identical cmdlines to expose a single credential-reuse blast radius for incident scoping.",
+          "tier": "ir",
+          "mitre": "T1021.002 Remote Services: SMB/Windows Admin Shares",
+          "query": "process_name=net.exe command_line=/use .*(admin|c|ipc)\\$.*user:/i | stats count as uses, dc(src_host) as src_hosts by command_line | sort -uses",
+          "window": "7d",
+          "exec_ms": 375,
+          "rows": 1,
+          "catches": "Collapses to 1 signature - 'net use \\\\dl-srv01\\C$ /user:lab\\domainadmin' executed 1113 times from 859 distinct source hosts in 7d: a single hardcoded domainadmin credential reused for admin-share mounts org-wide, exactly the artifact IR needs to scope the compromise."
+        }
+      ]
+    },
+    {
+      "domain": "Exfiltration & Staging (TA0010 / TA0009)",
+      "key": "exfil_staging",
+      "queries": [
+        {
+          "use_case": "Archive/staging tool execution prior to exfil (7z/rar/tar/Compress-Archive/makecab creating .zip/.rar/.7z)",
+          "tier": "triage",
+          "mitre": "T1560.001 - Archive Collected Data: Archive via Utility",
+          "query": "source_type=windows_sysmon action=process_create command_line=/7z\\.exe|7za\\.exe|rar\\.exe|winrar|tar\\.exe -c|Compress-Archive|makecab|\\.zip|\\.rar|\\.7z/i | table src_host,user,process_name,command_line | head 200",
+          "window": "24h",
+          "exec_ms": 300,
+          "rows": 0,
+          "catches": "Anchored regex on real archive-tool invocations + archive file extensions; 0 rows = demo has no staging activity, so any hit is a high-fidelity T1560 alert (an unanchored /tar|rar/ version returned 200 pure-substring false positives from 'Start'/'Framework' - do NOT use it)."
+        },
+        {
+          "use_case": "Large outbound web-proxy transfer to many destinations (data egress over allowed HTTP/S)",
+          "tier": "hunt",
+          "mitre": "T1048 - Exfiltration Over Alternative Protocol",
+          "query": "source_type=conduit_proxy action=allow | stats sum(bytes_out) as total_out, count as reqs, dc(dest_host) as dests by src_ip,user | where total_out > 5000000 | sort -total_out | head 50",
+          "window": "6h",
+          "exec_ms": 71,
+          "rows": 50,
+          "catches": "Ranks internal src_ips by total proxy-allowed bytes_out with destination fan-out; top talkers push ~50MB across 30-40 dest_hosts in 6h - rank/baseline these to separate backup/CDN sync from staged exfil."
+        },
+        {
+          "use_case": "Endpoints resolving DNS directly against external/public resolvers (C2-over-DNS / DNS exfil channel)",
+          "tier": "hunt",
+          "mitre": "T1071.004 - Application Layer Protocol: DNS",
+          "query": "source_type=windows_sysmon action=network_connection dest_port=53 | eval ext=if(is_private_ip(dest_ip),\"internal\",\"external\") | where ext=\"external\" | stats count as ext_dns, dc(dest_ip) as resolvers by src_host | sort -resolvers | head 50",
+          "window": "6h",
+          "exec_ms": 102,
+          "rows": 50,
+          "catches": "is_private_ip eval isolates DNS (port 53) sent to non-corporate resolvers; surfaces 50 hosts each hitting 29-32 DISTINCT external resolvers - the bypass-internal-DNS pattern of tunneling/exfil tooling (raw per-host volume detector returned 0 because DNS is ~1-2 conns/host; the external-resolver-cardinality angle is the real signal)."
+        },
+        {
+          "use_case": "DNS-tunneling beacons: abnormally long DNS query labels (encoded data in subdomain)",
+          "tier": "hunt",
+          "mitre": "T1048.003 - Exfiltration Over Unencrypted Non-C2 Protocol",
+          "query": "source_type=windows_sysmon action=dns_query query=/[a-z0-9]{30,}/i | table src_host,process_name,query | head 100",
+          "window": "6h",
+          "exec_ms": 54,
+          "rows": 0,
+          "catches": "Regex on the promoted dns_query 'query' field for 30+ char alphanumeric labels (base32/hex-encoded exfil chunks); 0 rows = no tunneling-length domains in the clean demo, so this is a sleeping rare-event detector that fires on the first iodine/dnscat-style burst."
+        },
+        {
+          "use_case": "Cloud credential/secret/bucket harvesting indicating staged data theft from AWS",
+          "tier": "ir",
+          "mitre": "T1530 - Data from Cloud Storage",
+          "query": "source_type=aws_cloudtrail action=/getsecretvalue|listbuckets|getobject|decrypt/ | stats count as calls, dc(action) as ops by user,src_ip | where calls > 5 | sort -calls | head 50",
+          "window": "24h",
+          "exec_ms": 60,
+          "rows": 13,
+          "catches": "Buckets GetSecretValue/ListBuckets/GetObject/Decrypt per identity+src_ip; 13 principals (incl. intern01, jane.doe, admin-ops, deploy-pipeline) at ~9k calls each over 24h - pivot to src_ip+enriched_src_country to flag human users running service-account-scale secret enumeration."
+        },
+        {
+          "use_case": "Retro IR: high web-server response egress by external source country (data pulled out via Apache)",
+          "tier": "ir",
+          "mitre": "T1048 - Exfiltration Over Alternative Protocol",
+          "query": "source_type=apache_access http_status_code=200 | stats sum(bytes_out) as egress, count as hits by src_ip,enriched_src_country | where egress > 50000 | sort -egress | head 50",
+          "window": "24h",
+          "exec_ms": 161,
+          "rows": 38,
+          "catches": "Sums successful (200) Apache response bytes by client IP + geo; threshold tuned to the real demo ceiling (~88KB top talker, so 10MB found 0 - empirically lowered to 50KB) yielding 38 egress-heavy external IPs across US/Japan/China for geo-anomaly triage."
+        }
+      ]
+    },
+    {
+      "domain": "CLOUD IAM ABUSE / PERSISTENCE (aws_cloudtrail)",
+      "key": "cloud_iam",
+      "queries": [
+        {
+          "use_case": "Triage: new IAM principals/keys/login-profiles created, grouped by principal and source country, to catch backdoor-account/long-term-credential persistence",
+          "tier": "triage",
+          "mitre": "T1098 - Account Manipulation",
+          "query": "source_type=aws_cloudtrail (action=createuser OR action=createaccesskey OR action=createloginprofile) enriched_src_country!=\"\" | stats count(eval(action=\"createuser\")) as new_users, count(eval(action=\"createaccesskey\")) as new_keys, count(eval(action=\"createloginprofile\")) as new_logins, dc(src_ip) as ips by user,enriched_src_country | where new_keys > 0 OR new_users > 0 | sort -new_keys | head 30",
+          "window": "6h",
+          "exec_ms": 298,
+          "rows": 2,
+          "catches": "Surfaces exactly the two planted attacker principals (intern01 from Russia, contractor-acme from The Netherlands) each minting hundreds of new keys/users/login-profiles; legit principals stay below threshold."
+        },
+        {
+          "use_case": "Triage: AccessDenied bursts on IAM write APIs from a single principal/IP = permission-boundary probing / privilege discovery after credential theft",
+          "tier": "triage",
+          "mitre": "T1098 - Account Manipulation",
+          "query": "source_type=aws_cloudtrail event_source=iam.amazonaws.com status=failure | stats count as denied, dc(action) as distinct_actions by user,src_ip,enriched_src_country | where denied > 20 | sort -denied | head 30",
+          "window": "1h",
+          "exec_ms": 43,
+          "rows": 13,
+          "catches": "Both attacker IPs hit ~634/632 denied IAM writes across 21 distinct actions in 1h, ~7x the legit baseline of ~80; cleanly separates the two compromised principals from normal Terraform/CI noise."
+        },
+        {
+          "use_case": "Hunt: privilege-escalation chaining - a single principal performing multiple distinct policy-attach + assume-role-trust + policy-version techniques (putuserpolicy absent in demo; attach/updateassumerolepolicy/createpolicyversion are the validated present surrogates)",
+          "tier": "hunt",
+          "mitre": "T1098 - Account Manipulation",
+          "query": "source_type=aws_cloudtrail (action=attachuserpolicy OR action=attachrolepolicy OR action=updateassumerolepolicy OR action=createpolicyversion) | stats count(eval(action=\"attachuserpolicy\")) as attach_user, count(eval(action=\"attachrolepolicy\")) as attach_role, count(eval(action=\"updateassumerolepolicy\")) as trust_change, count(eval(action=\"createpolicyversion\")) as policy_ver, dc(action) as distinct_techniques by user,enriched_src_country | where distinct_techniques >= 2 | sort -trust_change | head 30",
+          "window": "6h",
+          "exec_ms": 64,
+          "rows": 13,
+          "catches": "Ranks the two attackers top (4/4 techniques, ~537-567 assume-role trust changes each) far above legit principals (~110); updateassumerolepolicy is the high-signal cross-account-trust backdoor primitive."
+        },
+        {
+          "use_case": "Hunt: IAM persistence/escalation writes originating from hosting/bulletproof ASNs rather than corporate networks (enrichment-based infra attribution)",
+          "tier": "hunt",
+          "mitre": "T1098 - Account Manipulation",
+          "query": "source_type=aws_cloudtrail (action=createaccesskey OR action=createuser OR action=attachuserpolicy OR action=updateassumerolepolicy) enriched_src_asn!=\"\" | stats count as iam_writes, dc(action) as techniques, dc(user) as users by enriched_src_asn,enriched_src_country | where iam_writes > 50 | sort -iam_writes | head 30",
+          "window": "24h",
+          "exec_ms": 160,
+          "rows": 2,
+          "catches": "Isolates the two bulletproof-hosting source ASNs (AS208677 Cloud.ru/Russia, AS202425/The Netherlands) each driving 6.6k+ IAM writes across 4 techniques from one principal - attribution needs no IP allowlist."
+        },
+        {
+          "use_case": "Retro IR: destructive defense-evasion / anti-forensics cleanup (delete trail/secret/policy/bucket/service) attributed by principal and country",
+          "tier": "ir",
+          "mitre": "T1485 - Data Destruction",
+          "query": "source_type=aws_cloudtrail (action=deletebucket OR action=deletesecret OR action=deletepolicy OR action=deletetrail OR action=stoplogging OR action=deleteservice) | stats count by action,user,enriched_src_country | sort -count | head 30",
+          "window": "24h",
+          "exec_ms": 162,
+          "rows": 30,
+          "catches": "intern01/contractor-acme dominate every destructive action (4836/4775 deletepolicy, 1836/1821 deletesecret, ~358/316 deletebucket) - same principals doing escalation also do cleanup. stoplogging/deletetrail confirmed ABSENT (0 rows) but kept in the OR as a forward-looking logging-tamper tripwire."
+        },
+        {
+          "use_case": "IR: hour-by-hour kill-chain reconstruction for a confirmed-compromised principal across persistence, escalation, secret-theft and destruction",
+          "tier": "ir",
+          "mitre": "T1098 - Account Manipulation",
+          "query": "source_type=aws_cloudtrail user=intern01 (action=createuser OR action=createaccesskey OR action=createloginprofile OR action=attachuserpolicy OR action=updateassumerolepolicy OR action=deletetrail OR action=deletepolicy OR action=getsecretvalue) | timechart span=1h count by action",
+          "window": "6h",
+          "exec_ms": 30,
+          "rows": 42,
+          "catches": "Reconstructs intern01's timeline showing concurrent createuser/createloginprofile (persistence), attachuserpolicy/updateassumerolepolicy (escalation), getsecretvalue (collection) and deletepolicy (evasion) per hour - the scoped pivot once a principal is flagged by triage. Fastest query at 30ms."
+        }
+      ]
+    },
+    {
+      "domain": "Impossible Travel / Geo-Velocity (one identity authenticating from multiple countries/ASNs in a short window) + foreign-country privileged access, using enriched_src_country/enriched_src_asn on aws_cloudtrail, windows_event, and apache_access.",
+      "key": "impossible_travel",
+      "queries": [
+        {
+          "use_case": "Triage: AWS identity authenticating/acting from more than one distinct country in the last 6h (classic impossible-travel detector). dc(enriched_src_country) counts the empty/internal-IP bucket as a distinct value, so >1 means an internal/unenriched origin PLUS at least one foreign country for the same user.",
+          "tier": "triage",
+          "mitre": "T1078.004 - Valid Accounts: Cloud Accounts",
+          "query": "source_type=aws_cloudtrail | stats dc(enriched_src_country) as countries, dc(src_ip) as ips, dc(enriched_src_asn) as asns, count by user | where countries > 1 | sort -countries",
+          "window": "6h",
+          "exec_ms": 44,
+          "rows": 1,
+          "catches": "Single anomaly intern01 (countries=2: internal + Russia AS208677, ips=2); all other 11 AWS principals are single-country/single-IP, so this fires clean with zero noise."
+        },
+        {
+          "use_case": "Triage->Hunt: privileged IAM/secrets actions (createuser, createaccesskey, putuserpolicy, attachuserpolicy, getsecretvalue, decrypt, assumerole, createpolicy) executed from any foreign (non-empty country) source IP over 24h. Catches foreign-country admin access even when the actor only ever appears from abroad (no impossible-travel pair required).",
+          "tier": "triage",
+          "mitre": "T1098 - Account Manipulation (persistence via IAM from foreign soil)",
+          "query": "source_type=aws_cloudtrail enriched_src_country=/.+/ action=/createuser|createaccesskey|putuserpolicy|attachuserpolicy|getsecretvalue|decrypt|assumerole|createpolicy/ | stats dc(action) as priv_actions, count by user, enriched_src_country, enriched_src_asn, src_ip | sort -count",
+          "window": "24h",
+          "exec_ms": 67,
+          "rows": 2,
+          "catches": "Two real hits: contractor-acme from Netherlands (89.248.167.131/AS202425) and intern01 from Russia (45.155.205.233/AS208677), each running 10 distinct privileged IAM/KMS actions - both flagged even though contractor-acme is NOT an impossible-travel case."
+        },
+        {
+          "use_case": "Hunt: web-facing geo-spray - distinct foreign source IPs and ASNs hitting Apache from high-risk countries, aggregated to country level so it stays actionable at scale. Apache has no populated user field, so this is the IP/country footprint angle of the same geo-velocity gap (external attack-surface reconnaissance/exploitation by geography).",
+          "tier": "hunt",
+          "mitre": "T1190 - Exploit Public-Facing Application",
+          "query": "source_type=apache_access enriched_src_country=/China|Russia|Iran|North Korea|South Korea|Nigeria|Brazil/ | stats dc(src_ip) as foreign_ips, dc(enriched_src_asn) as asns, count as hits by enriched_src_country | sort -foreign_ips",
+          "window": "24h",
+          "exec_ms": 231,
+          "rows": 6,
+          "catches": "6 high-risk-country rows; China dominates (167,178 distinct foreign IPs / 452 ASNs), then South Korea (56k), Brazil (42k), Russia (22k), Iran (5.2k), Nigeria (1.5k) - a clear distributed foreign-source web-traffic baseline to triage admin-path subsets from."
+        },
+        {
+          "use_case": "Hunt: per-user foreign-origin footprint - for every AWS principal seen from a non-empty (foreign) country, summarize the country, ASN, distinct actions and IPs. Confirms which identities ever touch foreign soil and what they do there, the enrichment-fed pre-stage for the impossible-travel triage.",
+          "tier": "hunt",
+          "mitre": "T1078.004 - Valid Accounts: Cloud Accounts",
+          "query": "source_type=aws_cloudtrail enriched_src_country=/.+/ | stats dc(action) as actions, dc(src_ip) as ips, count by user, enriched_src_country, enriched_src_asn | sort -count",
+          "window": "24h",
+          "exec_ms": 47,
+          "rows": 2,
+          "catches": "Exactly two principals operate from abroad: contractor-acme@Netherlands (AS202425, 120 distinct actions, 115k events) and intern01@Russia (AS208677, 120 distinct actions, 115k events) - a broad-action foreign footprint consistent with account takeover rather than a single stray call."
+        },
+        {
+          "use_case": "Retro IR: ASN pivot across all auth-bearing sources (CloudTrail + Windows event logon) over 7d - scope the full blast radius of hostile ASNs by counting distinct users, actions and IPs per (ASN, country). Answers 'which networks touched our identities and how much' for incident scoping.",
+          "tier": "ir",
+          "mitre": "T1078 - Valid Accounts (cross-source ASN attribution)",
+          "query": "(source_type=aws_cloudtrail OR source_type=windows_event) enriched_src_asn=/.+/ | stats dc(user) as users, dc(action) as actions, dc(src_ip) as ips, count by enriched_src_asn, enriched_src_country | sort -count",
+          "window": "7d",
+          "exec_ms": 397,
+          "rows": 2,
+          "catches": "Two hostile ASNs over the week: AS208677/Russia (255,103 events, 1 user, 120 actions) and AS202425/Netherlands (255,061 events, 1 user, 120 actions); confirms Windows logons have zero foreign origin (all 10.x) so the cloud plane is the entire foreign-access surface."
+        },
+        {
+          "use_case": "Retro IR: low-and-slow impossible travel over a full 7-day window - same dc(country)>1 detector widened so geo-velocity that splits across days (one country Monday, another Friday) still surfaces. Catches travel the 6h triage window structurally cannot.",
+          "tier": "ir",
+          "mitre": "T1078.004 - Valid Accounts: Cloud Accounts",
+          "query": "source_type=aws_cloudtrail | stats dc(enriched_src_country) as countries, dc(src_ip) as ips, dc(enriched_src_asn) as asns, count by user | where countries > 1 | sort -countries",
+          "window": "7d",
+          "exec_ms": 209,
+          "rows": 2,
+          "catches": "Widening to 7d surfaces a SECOND impossible-travel identity the 6h triage missed: contractor-acme (countries=2: internal + Netherlands, asns=2) joins intern01 (countries=2, ips=2, Russia) - proving the longer retro window is worth running for delayed geo-velocity."
+        }
+      ]
+    },
+    {
+      "domain": "C2 / Beaconing \u2014 DNS-based C2 and rare-destination / beacon-regularity detection (windows_sysmon)",
+      "key": "c2_dns_beacon",
+      "queries": [
+        {
+          "use_case": "Triage: external Sysmon network_connection to non-standard / known-C2 ports (4444, 8080, 8443, 1080, 9001) \u2014 surfaces the listener ports HTTP/HTTPS-tunneling beacons favor, grouped by host+dest+port with ASN/country context for fast analyst pivoting.",
+          "tier": "triage",
+          "mitre": "T1071.001 Application Layer Protocol: Web Protocols",
+          "query": "source_type=windows_sysmon action=network_connection | eval priv=is_private_ip(dest_ip) | where priv=false | where dest_port=4444 or dest_port=8443 or dest_port=8080 or dest_port=1080 or dest_port=9001 | stats count by src_host,dest_ip,dest_port,enriched_dest_country,enriched_dest_as_name | sort -count | head 20",
+          "window": "1h",
+          "exec_ms": 132,
+          "rows": 20,
+          "catches": "20 external connections on C2-favored ports enriched with ASN/country; every group count=1 here (no demo beacon), so a count>=N escalation cleanly separates one-off traffic from a repeating implant."
+        },
+        {
+          "use_case": "Triage / periodicity baseline: hourly volume of external Sysmon network_connections bucketed by dest_port \u2014 establishes the steady-rate baseline an analyst compares a suspected beacon against; flat per-hour counts per port reveal regularity vs spikes.",
+          "tier": "triage",
+          "mitre": "T1071 Application Layer Protocol",
+          "query": "source_type=windows_sysmon action=network_connection | eval priv=is_private_ip(dest_ip) | where priv=false | timechart span=1h count by dest_port",
+          "window": "6h",
+          "exec_ms": 72,
+          "rows": 52,
+          "catches": "Per-port hourly series (52 buckets) showing ~5k/hr steady external rate per port \u2014 the baseline shape; a true beacon appears as a low-count port held perfectly constant across every bucket."
+        },
+        {
+          "use_case": "Hunt: DNS C2 domain \u2014 a single host repeatedly resolving a domain no other host in the fleet queries (low fan-out, high volume), the classic covert-channel / DGA-callback fingerprint. Uses the promoted Sysmon dns_query 'query' field.",
+          "tier": "hunt",
+          "mitre": "T1071.004 Application Layer Protocol: DNS",
+          "query": "source_type=windows_sysmon action=dns_query | stats count as queries, dc(src_host) as hosts by query | where queries >= 8 | where hosts <= 1 | sort -queries | head 20",
+          "window": "24h",
+          "exec_ms": 131,
+          "rows": 0,
+          "catches": "0 rows \u2014 clean demo: every domain is broadly resolved (max host->domain count is 4/24h, no single-host high-volume domain). Genuine rare-event C2 detector; non-zero output = strong covert-DNS-channel candidate."
+        },
+        {
+          "use_case": "Hunt: high-entropy / long DNS label detection \u2014 DGA and DNS-tunneling encode payload into abnormally long query names. Flags any Sysmon dns_query whose name length >= 30 chars, surfacing host + full domain + length for triage.",
+          "tier": "hunt",
+          "mitre": "T1071.004 Application Layer Protocol: DNS",
+          "query": "source_type=windows_sysmon action=dns_query | eval qlen=len(query) | where qlen >= 30 | stats count by src_host,query,qlen | sort -qlen | head 20",
+          "window": "24h",
+          "exec_ms": 142,
+          "rows": 0,
+          "catches": "0 rows \u2014 longest legit domain in the demo is 25 chars, so >=30 has no benign hits. Rare-event detector: any future row is an immediate DGA/DNS-tunnel lead with near-zero false-positive cost."
+        },
+        {
+          "use_case": "Hunt: beacon regularity \u2014 the same internal host re-connecting to the same external dest_ip:dest_port >=3 times, the steady-callback signature of an implant phoning home. Groups Sysmon network_connection by host+dest+port over a 6h window.",
+          "tier": "hunt",
+          "mitre": "T1571 Non-Standard Port / T1071 Application Layer Protocol",
+          "query": "source_type=windows_sysmon action=network_connection | eval priv=is_private_ip(dest_ip) | where priv=false | stats count by src_host,dest_ip,dest_port | where count >= 3 | sort -count | head 20",
+          "window": "6h",
+          "exec_ms": 105,
+          "rows": 0,
+          "catches": "0 rows \u2014 every external destination in the demo is a unique singleton (no repeated host->dest:port pair), so this confirms no beacon present. Real beacons trip it instantly; tune threshold to expected callback interval."
+        },
+        {
+          "use_case": "Retro IR: rare external destinations (prevalence_dest_ip < 50) reached on non-web ports (not 80/443) \u2014 scopes a fleet-wide hunt for first-seen / low-prevalence egress that bypasses normal web traffic, the residue of a C2 channel after the fact.",
+          "tier": "ir",
+          "mitre": "T1071 Application Layer Protocol / T1571 Non-Standard Port",
+          "query": "source_type=windows_sysmon action=network_connection prevalence_dest_ip<50 | eval priv=is_private_ip(dest_ip) | where priv=false | where dest_port!=443 | where dest_port!=80 | stats count by src_host,dest_ip,dest_port,enriched_dest_country,prevalence_dest_ip | sort -count | head 20",
+          "window": "24h",
+          "exec_ms": 288,
+          "rows": 20,
+          "catches": "20 rare-egress hits (prevalence_dest_ip=1) to non-web ports 8443/3389/5985/445 across CN/UK/US \u2014 exactly the low-prevalence first-seen destinations a post-incident sweep prioritizes; pair with auth logs on the same src_host to scope blast radius."
+        }
+      ]
+    },
+    {
+      "domain": "DISCOVERY / RECON - host, account, domain & trust enumeration via native Windows tooling",
+      "key": "discovery_recon",
+      "queries": [
+        {
+          "use_case": "Recon-binary activity per host",
+          "tier": "triage",
+          "mitre": "T1087/T1057/T1016 Account/Process/Network Discovery",
+          "window": "6h",
+          "query": "source_type=windows_sysmon action=process_create command_line=/(whoami|nltest|systeminfo|ipconfig|tasklist|net view|net user|net group)/i | stats count by src_host, user | sort -count | head 30",
+          "catches": "Hosts/users running native discovery tooling (whoami/net/nltest/systeminfo) - first-stage recon after a foothold.",
+          "exec_ms": 107,
+          "rows": 30
+        },
+        {
+          "use_case": "AD account & group enumeration",
+          "tier": "triage",
+          "mitre": "T1087.002 Account Discovery: Domain Account",
+          "window": "24h",
+          "query": "source_type=windows_sysmon action=process_create command_line=/net1?\\s+(user|group|localgroup)/i | stats count by src_host, command_line | sort -count | head 30",
+          "catches": "net user/group/localgroup invocations - direct domain account & privileged-group enumeration.",
+          "exec_ms": 113,
+          "rows": 0
+        },
+        {
+          "use_case": "Recon tool diversity (staging signal)",
+          "tier": "hunt",
+          "mitre": "T1082 System Information Discovery",
+          "window": "6h",
+          "query": "source_type=windows_sysmon action=process_create command_line=/(whoami|nltest|systeminfo|ipconfig|tasklist|net view|net user)/i | stats dc(process_name) as tools, count as runs by src_host | where runs > 5 | sort -runs | head 30",
+          "catches": "Hosts running many distinct recon binaries in a tight window - the rapid-enumeration burst of an operator orienting on a new box.",
+          "exec_ms": 70,
+          "rows": 0
+        },
+        {
+          "use_case": "Domain trust / DC enumeration via nltest",
+          "tier": "hunt",
+          "mitre": "T1018 Remote System Discovery",
+          "window": "24h",
+          "query": "source_type=windows_sysmon action=process_create command_line=/nltest.*(dclist|domain_trusts|dsgetdc)/i | table src_host,user,command_line | head 50",
+          "catches": "nltest /dclist /domain_trusts - mapping domain controllers & trusts ahead of lateral movement (rare-event detector).",
+          "exec_ms": 202,
+          "rows": 0
+        },
+        {
+          "use_case": "Per-host recon sweep (retro IR)",
+          "tier": "ir",
+          "mitre": "T1033/T1087 System Owner & Account Discovery",
+          "window": "24h",
+          "query": "source_type=windows_sysmon action=process_create command_line=/(whoami|nltest|systeminfo|ipconfig|tasklist|net |quser|arp -a)/i | stats count as recon_cmds, dc(process_name) as tools by src_host | where recon_cmds > 10 | sort -recon_cmds | head 30",
+          "catches": "Hosts with heavy multi-tool recon volume over 24h - scopes which machines an intruder enumerated from.",
+          "exec_ms": 178,
+          "rows": 0
+        }
+      ]
+    }
+  ]
+}

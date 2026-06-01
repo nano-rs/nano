@@ -76,7 +76,6 @@ pub use case::{
     SlaTargets,
     UpdateCase,
     UpdateCaseGroupingRule,
-    UpdateEntityEnrichment,
 };
 pub use dashboard::{
     Dashboard, DashboardAffectedUser, DashboardShareResult, DashboardSharedGroup,

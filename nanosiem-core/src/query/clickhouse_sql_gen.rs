@@ -1690,6 +1690,41 @@ mod tests {
         );
     }
 
+    /// NAN-1157: a literal backslash in a CONTAINS/keyword must reach `\\` in the
+    /// iLike pattern *value* — i.e. `\\\\` in the SQL text — or ClickHouse iLike
+    /// consumes the backslash as its escape char and the Windows-path filter
+    /// silently matches nothing (every `\Windows\System32\`-style rule did).
+    /// Verified against real data: the 4-backslash form matches 552k sysmon
+    /// rows; the 2-backslash form matches 0.
+    #[test]
+    fn backslash_contains_quad_escapes_for_ilike() {
+        let query = parse_query(r#"process_path CONTAINS "C:\Windows\System32\""#).unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains(r"c:\\\\windows\\\\system32\\\\"),
+            "literal backslashes must be 4x-escaped in the SQL text for iLike, got:\n{}",
+            sql
+        );
+
+        // The `| where … CONTAINS` command is a SEPARATE codegen path
+        // (generate_where_condition) that inlined the escaping — it must get the
+        // same 4-backslash form, or the rules (which all use `| where`) match 0.
+        let piped = parse_query(
+            r#"source_type="windows_sysmon" | where process_path CONTAINS "C:\Windows\System32\""#,
+        )
+        .unwrap();
+        let psql = ClickHouseSqlGenerator::new()
+            .generate(&piped, &time_range())
+            .unwrap();
+        assert!(
+            psql.contains(r"c:\\\\windows\\\\system32\\\\"),
+            "| where CONTAINS must also 4x-escape backslashes, got:\n{}",
+            psql
+        );
+    }
+
     /// `src_host != /ws/` should NOT iLike — same fragment concern, just negated.
     /// Pre-fix: workstations `ws-mkt-088` were correctly excluded but WSUS hosts
     /// `srv-wsus01` (tokens `[srv, wsus01, corp, local]`) leaked through because

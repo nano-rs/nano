@@ -24,15 +24,21 @@ impl ClickHouseSqlGenerator {
         // e.g. `min(timestamp) AS timestamp` — ClickHouse inlines CTEs and expands
         // aliases, so downstream stages would see `min(timestamp)` instead of a plain
         // column, causing ILLEGAL_AGGREGATION errors.
+        //
+        // NAN-1160: this MUST use the same key as the inline `shadows_field` predicate
+        // below — `agg.output_alias()` (which has func-name and values_/list_ fallbacks),
+        // NOT the raw `agg.alias`. Keying off the explicit alias alone missed the
+        // un-aliased func-named-field case (`stats count(count) by x`): output_alias()
+        // falls back to `count`, the inline guard renamed the column to `_agg_count`, but
+        // no outer rename-back was emitted — so a downstream `count` reference (including
+        // the NAN-806 auto-injected `ORDER BY count`) hit UNKNOWN_IDENTIFIER.
         let shadowed_aliases: Vec<String> = aggregations
             .iter()
             .filter_map(|agg| {
-                let alias_name = agg.alias.as_ref().cloned().unwrap_or_default();
-                if !alias_name.is_empty() {
-                    if let Some(field) = &agg.field {
-                        if normalize_field_name(field) == alias_name {
-                            return Some(alias_name);
-                        }
+                let alias_name = agg.output_alias();
+                if let Some(field) = &agg.field {
+                    if normalize_field_name(field) == alias_name {
+                        return Some(alias_name);
                     }
                 }
                 None

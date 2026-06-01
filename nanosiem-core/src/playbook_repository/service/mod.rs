@@ -65,11 +65,6 @@ impl PlaybookRepositoryService {
         }
     }
 
-    pub fn with_config(mut self, config: PlaybookRepositoryServiceConfig) -> Self {
-        self.config = config;
-        self
-    }
-
     pub(crate) fn allowed_repos() -> &'static [&'static str] {
         ALLOWED_REPOSITORIES
     }

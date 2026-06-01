@@ -82,15 +82,6 @@ impl ParserService {
         }
     }
 
-    /// Create with a custom VRL validator (useful for testing)
-    pub fn with_validator(pool: PgPool, validator: VrlValidator) -> Self {
-        Self {
-            pool,
-            vector_config: Arc::new(VectorConfigManager::with_defaults()),
-            vrl_validator: Arc::new(validator),
-        }
-    }
-
     /// Hand out a clone of the inner `VectorConfigManager`'s deploy lock.
     /// Lets other services (e.g. `SourceConfigService`) serialize their
     /// `_router.toml` mutations against this service's parser deploys.

@@ -15,6 +15,36 @@ import type {
   ValidateCronResponse,
 } from './types';
 
+// Retry panel queries that the search admission controller sheds (HTTP 429
+// TOO_MANY_REQUESTS / AdmissionDenied). The backend caps concurrent queries per
+// user (per_user_limit), so a burst — e.g. a dashboard's panels loading — can be
+// briefly denied. Scoped to panelQuery only: it is read-only and idempotent, so
+// this can never retry a mutation.
+const PANEL_MAX_ATTEMPTS = 3;
+const PANEL_BASE_DELAY_MS = 400;
+const PANEL_MAX_DELAY_MS = 4000;
+
+function isAdmissionDenied(err: unknown): boolean {
+  const e = err as { status?: number; code?: string } | null;
+  return !!e && (e.status === 429 || e.code === 'TOO_MANY_REQUESTS' || e.code === 'ADMISSION_DENIED');
+}
+
+const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+async function retryOn429<T>(fn: () => Promise<T>): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt >= PANEL_MAX_ATTEMPTS || !isAdmissionDenied(err)) throw err;
+      // Exponential backoff with full jitter, so panels denied simultaneously
+      // don't retry in lockstep and re-collide on the same admission slots.
+      const ceil = Math.min(PANEL_BASE_DELAY_MS * 2 ** (attempt - 1), PANEL_MAX_DELAY_MS);
+      await sleep(Math.random() * ceil);
+    }
+  }
+}
+
 export class DashboardsApi {
   constructor(
     private request: <T>(endpoint: string, options?: RequestInit) => Promise<T>
@@ -56,10 +86,12 @@ export class DashboardsApi {
   }
 
   async panelQuery(request: PanelQueryRequest): Promise<PanelQueryResponse> {
-    return this.request('/api/dashboards/panel/query', {
-      method: 'POST',
-      body: JSON.stringify(request),
-    });
+    return retryOn429(() =>
+      this.request<PanelQueryResponse>('/api/dashboards/panel/query', {
+        method: 'POST',
+        body: JSON.stringify(request),
+      })
+    );
   }
 
   async exportDashboard(id: string): Promise<DashboardExport> {

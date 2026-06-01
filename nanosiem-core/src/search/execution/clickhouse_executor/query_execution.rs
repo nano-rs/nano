@@ -196,14 +196,24 @@ impl ClickHouseExecutor {
         // Count queries should be small, but add limit as safeguard
         const MAX_COUNT_RESPONSE_SIZE: usize = 1024 * 1024; // 1MB
         let mut response_bytes = Vec::new();
-        while let Ok(Some(chunk)) = cursor.next().await {
-            if response_bytes.len() + chunk.len() > MAX_COUNT_RESPONSE_SIZE {
-                return Err(SearchError::ResponseTooLarge(
-                    response_bytes.len() + chunk.len(),
-                    MAX_COUNT_RESPONSE_SIZE,
-                ));
+        // NAN-1160: must distinguish a stream Err from end-of-stream. The old
+        // `while let Ok(Some(chunk))` treated a ClickHouse error identically to EOF, so a
+        // failing count query fell through to `Ok(0)` — masking the failure and defeating the
+        // caller's `count_result.unwrap_or(results.len())` fallback (total_count silently 0).
+        loop {
+            match cursor.next().await {
+                Ok(Some(chunk)) => {
+                    if response_bytes.len() + chunk.len() > MAX_COUNT_RESPONSE_SIZE {
+                        return Err(SearchError::ResponseTooLarge(
+                            response_bytes.len() + chunk.len(),
+                            MAX_COUNT_RESPONSE_SIZE,
+                        ));
+                    }
+                    response_bytes.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(e) => return Err(parse_clickhouse_error(&e.to_string())),
             }
-            response_bytes.extend_from_slice(&chunk);
         }
 
         let response_str = String::from_utf8(response_bytes).map_err(|e| {
@@ -223,7 +233,13 @@ impl ClickHouseExecutor {
             }
         }
 
-        Ok(0)
+        // NAN-1160: a count(*) query always returns exactly one row with the count, so reaching
+        // here means the response was empty/unparseable/missing the column — an error, not a
+        // legitimate 0. Return Err so the caller's results.len() fallback engages instead of
+        // reporting a false total_count of 0.
+        Err(SearchError::DatabaseError(sqlx::Error::Protocol(
+            "count query returned no parseable count column".to_string(),
+        )))
     }
 
     /// Execute a dynamic query with a custom query_id

@@ -852,19 +852,6 @@ impl DetectionPatternRepository {
         Ok(row_to_detection_pattern(&row))
     }
 
-    /// Delete a detection pattern
-    pub async fn delete_detection_pattern(&self, id: Uuid) -> Result<(), ParserRepositoryError> {
-        let result = sqlx::query("DELETE FROM detection_patterns WHERE id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(ParserRepositoryError::NotFound(id));
-        }
-
-        Ok(())
-    }
 }
 
 /// Convert a database row to a ParserLibraryEntry struct

@@ -238,13 +238,15 @@ impl TierLimits {
                 ai_credits_per_month: Some(50_000),
                 ai_model_tier: AiModelTier::Full,
             },
+            // "Business" tier (canonical `tiers.ts` key `starter`). Sells at
+            // 50 GB/day / 770 EPS — double Team. Do not copy Team's 25/385 here.
             OrganizationTier::Starter => Self {
                 tier,
                 max_data_sources: None,
                 max_detection_rules: None,
                 max_team_members: None,
-                max_daily_gb: Some(25.0),
-                max_eps: Some(385),
+                max_daily_gb: Some(50.0),
+                max_eps: Some(770),
                 api_access: ApiAccessLevel::Full,
                 sso_enabled: true,
                 ha_enabled: true,
@@ -929,8 +931,8 @@ mod tests {
         assert_eq!(limits.max_data_sources, None);
         assert_eq!(limits.max_detection_rules, None);
         assert_eq!(limits.max_team_members, None);
-        assert_eq!(limits.max_daily_gb, Some(25.0));
-        assert_eq!(limits.max_eps, Some(385));
+        assert_eq!(limits.max_daily_gb, Some(50.0));
+        assert_eq!(limits.max_eps, Some(770));
         assert_eq!(limits.api_access, ApiAccessLevel::Full);
         assert!(limits.sso_enabled);
         assert!(limits.ha_enabled);

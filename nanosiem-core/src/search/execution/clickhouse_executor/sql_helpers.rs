@@ -5,8 +5,6 @@
 //! Free functions for SQL analysis and transformation: aggregation detection,
 //! LIMIT/OFFSET injection, COUNT query building, and question mark escaping.
 
-use regex::Regex;
-
 /// Check if a SQL query is an aggregation query that needs all data
 pub(crate) fn is_aggregation_query(sql: &str) -> bool {
     let sql_upper = sql.to_uppercase();
@@ -68,23 +66,23 @@ pub fn wrap_query_for_count(sql: &str) -> String {
     format!("SELECT count(*) AS cnt FROM ({}) AS subquery", sql)
 }
 
-/// Build a COUNT query from a data query by extracting the FROM/PREWHERE/WHERE clauses
+/// Build a COUNT query from a data query by wrapping it in a counting subquery.
 pub(crate) fn build_count_query(sql: &str) -> String {
-    // Use regex to extract the FROM clause and conditions, excluding ORDER BY and SETTINGS
-    let re = Regex::new(r"(?is)FROM\s+(\S+)(.*?)(?:\s+ORDER\s+BY|\s+SETTINGS|\s*$)").unwrap();
-
-    if let Some(caps) = re.captures(sql) {
-        let table = caps.get(1).map_or("logs", |m| m.as_str());
-        let conditions = caps.get(2).map_or("", |m| m.as_str());
-        format!("SELECT count(*) as cnt FROM {}{}", table, conditions)
-    } else {
-        // Fallback: wrap in subquery (less efficient but always works)
-        let sql_no_settings = sql.split(" SETTINGS ").next().unwrap_or(sql);
-        let sql_no_order = Regex::new(r"(?is)\s+ORDER\s+BY\s+.*$")
-            .unwrap()
-            .replace(sql_no_settings, "");
-        format!("SELECT count(*) as cnt FROM ({}) as subquery", sql_no_order)
-    }
+    // Always wrap the full query in a counting subquery rather than regex-slicing the
+    // FROM/WHERE out of it.
+    //
+    // The old extraction regex grabbed the first `FROM <tbl>` and a non-greedy `.*?` that
+    // stopped at the first whitespace-bounded `ORDER BY`/`SETTINGS` keyword — INCLUDING one
+    // inside a string literal (e.g. `message iLike '%alpha order by beta%'`). That truncated
+    // the WHERE clause mid-literal into unbalanced-quote SQL, the count query errored, and
+    // total_count silently read 0 while the data rows looked fine. CTE queries already wrapped
+    // (NAN-1159); the single-FROM literal-truncation case is NAN-1160.
+    //
+    // Wrapping is literal-safe and correct for both CTE and single-FROM queries. `sql` carries
+    // no user pagination LIMIT here (LIMIT/OFFSET is injected separately into the data query,
+    // not the count input — see paginated.rs), so counting the wrapped result yields the true
+    // pre-pagination total (bounded only by the base query's default safety limit).
+    wrap_query_for_count(sql)
 }
 
 /// Escape `?` characters within SQL string literals for the clickhouse-rs crate.
@@ -147,6 +145,52 @@ mod tests {
         assert_eq!(
             wrapped,
             "SELECT count(*) AS cnt FROM (SELECT user, count(*) FROM logs GROUP BY user) AS subquery"
+        );
+    }
+
+    /// NAN-1159: CTE/multi-stage queries (every `| where`/`| stats` pipe) must be
+    /// subquery-wrapped for count. The FROM-extraction regex grabs the inner
+    /// `FROM logs` of stage_0 and emits malformed SQL → count errors → total_count
+    /// silently 0.
+    #[test]
+    fn count_query_wraps_cte_multistage() {
+        let cte = "WITH stage_0 AS (SELECT * FROM logs WHERE source_type = 'x') \
+                   SELECT * FROM stage_0 WHERE toString(process_path) iLike '%c:%' ORDER BY timestamp";
+        let count = build_count_query(cte);
+        assert!(
+            count.starts_with("SELECT count(*) AS cnt FROM (WITH stage_0"),
+            "CTE query must be subquery-wrapped, got: {count}"
+        );
+    }
+
+    /// NAN-1160: a simple single-FROM query is now subquery-wrapped too (no more regex
+    /// extraction), so literal-safe counting applies uniformly.
+    #[test]
+    fn count_query_wraps_simple_single_from() {
+        let simple = "SELECT * FROM logs PREWHERE timestamp >= '2026-01-01' WHERE source_type = 'x'";
+        let count = build_count_query(simple);
+        assert!(
+            count.starts_with("SELECT count(*) AS cnt FROM (SELECT * FROM logs"),
+            "simple query should be subquery-wrapped, got: {count}"
+        );
+    }
+
+    /// NAN-1160: a string literal containing a whitespace-bounded ` order by` / ` settings`
+    /// keyword must NOT truncate the count query. The old extraction regex cut the WHERE clause
+    /// mid-literal into unbalanced-quote SQL, so the count errored and total_count silently
+    /// read 0 while the data rows looked fine.
+    #[test]
+    fn count_query_preserves_in_literal_keywords() {
+        let sql = "SELECT * FROM logs WHERE lower(message) iLike '%alpha order by beta%' \
+                   ORDER BY timestamp DESC SETTINGS max_threads=16";
+        let count = build_count_query(sql);
+        assert!(
+            count.contains("alpha order by beta"),
+            "in-literal `order by` must be preserved, got: {count}"
+        );
+        assert!(
+            count.contains("SETTINGS max_threads=16"),
+            "trailing clauses must be preserved inside the wrap, got: {count}"
         );
     }
 }

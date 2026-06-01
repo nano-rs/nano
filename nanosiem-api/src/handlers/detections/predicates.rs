@@ -18,7 +18,7 @@ use axum::{
     Extension, Json,
 };
 use nanosiem_core::auth::permissions;
-use nanosiem_core::query::{parse_query, Aggregation, Command, Comparator, Query, SearchExpr, Value};
+use nanosiem_core::query::{parse_query, Aggregation, Command, Query, SearchExpr, Value};
 use nanosiem_core::typeid::TypeIdParam;
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -428,10 +428,4 @@ fn format_value(v: &Value) -> String {
         Value::Regex(p) => format!("/{}/", p),
         Value::Interval(d, _) => format!("{}s", d.as_secs()),
     }
-}
-
-/// Comparator string helper used by both predicate kinds to keep output stable.
-#[allow(dead_code)]
-fn op_str(c: Comparator) -> &'static str {
-    c.as_str()
 }

@@ -34,31 +34,6 @@ const PREVALENCE_FIELDS_TO_PRESERVE: &[(&str, AggFunc)] = &[
 /// Default cap on post-processing group count to prevent OOM from high-cardinality GROUP BY
 const DEFAULT_MAX_POST_PROCESSING_GROUPS: usize = 1_000_000;
 
-/// Apply stats aggregation as post-processing
-///
-/// # Arguments
-/// * `results` - The results to aggregate
-/// * `aggregations` - The aggregation functions to apply
-/// * `group_by` - Optional fields to group by
-/// * `max_groups` - Optional cap on number of groups (default: 1M)
-///
-/// # Returns
-/// * `Ok(Vec<serde_json::Value>)` - The aggregated results
-/// * `Err(SearchError)` - If aggregation fails
-#[allow(dead_code)]
-pub fn apply_stats_post_processing(
-    results: &[serde_json::Value],
-    aggregations: &[Aggregation],
-    group_by: Option<&Vec<String>>,
-) -> Result<(Vec<serde_json::Value>, bool), SearchError> {
-    apply_stats_post_processing_with_limit(
-        results,
-        aggregations,
-        group_by,
-        DEFAULT_MAX_POST_PROCESSING_GROUPS,
-    )
-}
-
 /// Apply stats aggregation with a configurable group limit
 pub fn apply_stats_post_processing_with_limit(
     results: &[serde_json::Value],

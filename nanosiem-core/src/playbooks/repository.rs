@@ -12,8 +12,8 @@ use uuid::Uuid;
 use super::error::PlaybookError;
 use super::models::{
     CreatePlaybookRequest, ForkPlaybookRequest, ListPlaybooksQuery, Playbook, PlaybookApproval,
-    PlaybookCategory, PlaybookPermission, PlaybookRun, PlaybookScope, PlaybookStatus,
-    PlaybookVersion, UpdatePlaybookRequest,
+    PlaybookPermission, PlaybookRun, PlaybookScope, PlaybookStatus, PlaybookVersion,
+    UpdatePlaybookRequest,
 };
 
 /// NAN-469 — bundle of inputs required to build a manual-attach
@@ -590,12 +590,6 @@ fn build_metadata_snapshot(pb: &Playbook) -> Value {
         "owner_team": pb.owner_team,
         "status": pb.status,
     })
-}
-
-// Silence unused warnings — these helpers are exposed for the service layer.
-#[allow(dead_code)]
-fn _coerce_cat(s: &str) -> Option<PlaybookCategory> {
-    PlaybookCategory::parse(s)
 }
 
 // ============================================================================

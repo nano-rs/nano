@@ -297,7 +297,6 @@ impl EnrichmentScheduler {
                             if let Some(ref ch) = self.clickhouse_client {
                                 let dict_name = match source.source_type.as_str() {
                                     "ipinfo_lite" => Some("nanosiem.ip_enrichment_dict"),
-                                    "ioc_feed" => Some("nanosiem.ioc_enrichment_dict"),
                                     _ => None,
                                 };
                                 if let Some(dict) = dict_name {

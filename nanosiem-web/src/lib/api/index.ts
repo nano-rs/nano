@@ -75,7 +75,9 @@ export class ApiClientError extends Error {
   constructor(
     message: string,
     public code: string,
-    public details?: unknown
+    public details?: unknown,
+    /** HTTP status code, when the error originated from an HTTP response. */
+    public status?: number
   ) {
     super(message);
     this.name = 'ApiClientError';
@@ -333,7 +335,7 @@ class ApiClient {
           throw new ApiClientError(error.message, 'IP_DENIED');
         }
 
-        throw new ApiClientError(error.message || 'Request failed', error.code, error.details);
+        throw new ApiClientError(error.message || 'Request failed', error.code, error.details, response.status);
       }
 
       // Handle 204 No Content responses (e.g., DELETE operations)

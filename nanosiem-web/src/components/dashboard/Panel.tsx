@@ -10,7 +10,8 @@
  * Requirements: 8.1, 11.1, 11.2, 11.3, 11.4, 11.5
  */
 
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { useInView } from '@/hooks/use-in-view';
 import { Button } from '@/components/ui/button';
 import {
   DropdownMenu,
@@ -105,6 +106,13 @@ export interface PanelProps {
   onDrilldown?: (filter: DrilldownFilter) => void;
   onRefresh: () => void;
   /**
+   * NAN-1183 lazy-load: fired when this panel enters/leaves the viewport so the
+   * dashboard can run its query only once it scrolls into view. `scrollRoot` is
+   * the dashboard's scrolling container, used as the IntersectionObserver root.
+   */
+  onVisibilityChange?: (panelId: string, visible: boolean) => void;
+  scrollRoot?: Element | null;
+  /**
    * NAN-780: true once the user has clicked Run at least once for this
    * dashboard. Until then, panels render a calm "Run query to show
    * results" idle state instead of the loading skeleton — otherwise
@@ -139,6 +147,8 @@ export function Panel({
   onDelete,
   onDrilldown,
   onRefresh,
+  onVisibilityChange,
+  scrollRoot,
   hasRunOnce,
   children,
 }: PanelProps) {
@@ -147,6 +157,20 @@ export function Panel({
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [isHovered, setIsHovered] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
+
+  // NAN-1183 lazy-load: report this panel's viewport visibility to the parent
+  // loader (observer root = the dashboard's scrolling container).
+  const [panelEl, setPanelEl] = useState<HTMLDivElement | null>(null);
+  const inView = useInView(panelEl, { root: scrollRoot ?? null });
+  const prevInView = useRef(false);
+  useEffect(() => {
+    // Report only real visibility transitions — skip the initial `false` and
+    // re-runs caused purely by `onVisibilityChange` identity changes, which
+    // would otherwise churn the parent loader (NAN-1183).
+    if (prevInView.current === inView) return;
+    prevInView.current = inView;
+    onVisibilityChange?.(config.id, inView);
+  }, [inView, config.id, onVisibilityChange]);
 
   const handleRefresh = async () => {
     setIsRefreshing(true);
@@ -171,6 +195,7 @@ export function Panel({
   return (
     <>
       <div
+        ref={setPanelEl}
         className="rounded-md border border-border bg-card h-full flex flex-col overflow-hidden group"
         onMouseEnter={() => setIsHovered(true)}
         onMouseLeave={() => setIsHovered(false)}

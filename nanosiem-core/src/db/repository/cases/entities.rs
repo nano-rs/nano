@@ -6,7 +6,6 @@ use uuid::Uuid;
 
 use super::{
     CaseEntity, CaseRepository, CaseRepositoryError, EntityTypeSummary, NewCaseEntity,
-    UpdateEntityEnrichment,
 };
 
 impl CaseRepository {
@@ -75,31 +74,5 @@ impl CaseRepository {
             .collect();
 
         Ok(summaries)
-    }
-
-    /// Update entity enrichment data
-    pub async fn update_entity_enrichment(
-        &self,
-        entity_id: Uuid,
-        enrichment: &UpdateEntityEnrichment,
-    ) -> Result<CaseEntity, CaseRepositoryError> {
-        let result = sqlx::query_as::<_, CaseEntity>(
-            r#"
-            UPDATE case_entities SET
-                risk_score = COALESCE($2, risk_score),
-                enrichment_data = COALESCE($3, enrichment_data),
-                enrichment_updated_at = NOW()
-            WHERE id = $1
-            RETURNING *
-            "#,
-        )
-        .bind(entity_id)
-        .bind(enrichment.risk_score)
-        .bind(&enrichment.enrichment_data)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(CaseRepositoryError::EntityNotFound(entity_id))?;
-
-        Ok(result)
     }
 }

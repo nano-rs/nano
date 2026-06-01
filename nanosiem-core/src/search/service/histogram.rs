@@ -13,29 +13,24 @@ impl SearchService {
         // Extract base filter (everything before the first pipe command)
         let base_query = extract_base_query(query);
 
-        // Parse the base query to generate SQL for histogram
-        let parsed = parse_query(base_query).map_err(|e| convert_parse_error(e))?;
+        // A leading-pipe query (e.g. `| stats count by src_ip`) has no base
+        // filter, so `base_query` is empty. Mirror the main parser's `query()`,
+        // which substitutes an implicit match-all wildcard for a leading `|`;
+        // parsing the empty string instead would fail with "Empty query" and
+        // silently drop the timeline (NAN-1179).
+        let parsed = if base_query.is_empty() {
+            Query::Search(crate::query::SearchExpr::Keyword("*".to_string()))
+        } else {
+            parse_query(base_query).map_err(|e| convert_parse_error(e))?
+        };
 
         let tr = TimeRange::new(time_range.start, time_range.end);
 
         // Calculate appropriate bucket interval based on time range
         let duration_secs = (time_range.end - time_range.start).num_seconds();
-        let (trunc_unit, bucket_secs) = self.calculate_histogram_interval(duration_secs);
 
-        match self.backend {
-            SearchBackend::ClickHouse => {
-                self.generate_clickhouse_histogram(&parsed, &tr, duration_secs)
-                    .await
-            }
-            SearchBackend::PostgreSQL => {
-                let base_sql = self
-                    .pg_sql_generator
-                    .generate(&parsed, &tr)
-                    .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
-                self.generate_postgres_histogram(&base_sql, &tr, trunc_unit, bucket_secs)
-                    .await
-            }
-        }
+        self.generate_clickhouse_histogram(&parsed, &tr, duration_secs)
+            .await
     }
 
     /// Generate histogram for ClickHouse backend
@@ -166,86 +161,15 @@ impl SearchService {
         Ok(histogram)
     }
 
-    /// Generate histogram for PostgreSQL backend
-    async fn generate_postgres_histogram(
-        &self,
-        base_sql: &str,
-        time_range: &TimeRange,
-        trunc_unit: &str,
-        bucket_secs: i64,
-    ) -> Result<Vec<HistogramBucket>, SearchError> {
-        // Generate histogram query with custom bucket sizes
-        let histogram_sql = if bucket_secs == 60 || bucket_secs == 3600 || bucket_secs == 86400 {
-            // Standard intervals - use date_trunc for efficiency
-            format!(
-                r#"
-                SELECT 
-                    date_trunc('{}', timestamp) as time_bucket,
-                    COUNT(*) as count
-                FROM ({}) as base_query
-                GROUP BY time_bucket
-                ORDER BY time_bucket ASC
-                "#,
-                trunc_unit, base_sql
-            )
-        } else {
-            // Custom intervals - use epoch-based bucketing
-            format!(
-                r#"
-                SELECT 
-                    to_timestamp(floor(extract(epoch from timestamp) / {}) * {}) as time_bucket,
-                    COUNT(*) as count
-                FROM ({}) as base_query
-                GROUP BY time_bucket
-                ORDER BY time_bucket ASC
-                "#,
-                bucket_secs, bucket_secs, base_sql
-            )
-        };
-
-        debug!("PostgreSQL histogram SQL: {}", histogram_sql);
-
-        let rows = sqlx::query(&histogram_sql).fetch_all(&self.pg_pool).await?;
-
-        let mut histogram: Vec<HistogramBucket> = rows
-            .iter()
-            .filter_map(|row| {
-                let time: Option<chrono::DateTime<chrono::Utc>> = row.try_get("time_bucket").ok();
-                let count: Option<i64> = row.try_get("count").ok();
-                match (time, count) {
-                    (Some(t), Some(c)) => Some(HistogramBucket {
-                        time: t,
-                        count: c as u64,
-                    }),
-                    _ => None,
-                }
-            })
-            .collect();
-
-        // Fill in missing buckets with zero counts
-        histogram = self.fill_histogram_gaps(histogram, time_range, bucket_secs);
-
-        Ok(histogram)
-    }
-
     /// Generate histogram for a time range (used for raw SQL queries)
     pub(crate) async fn generate_histogram_for_time_range(
         &self,
         time_range: &TimeRangeInput,
     ) -> Result<Vec<HistogramBucket>, SearchError> {
         let duration_secs = (time_range.end - time_range.start).num_seconds();
-        let (trunc_unit, bucket_secs) = self.calculate_histogram_interval(duration_secs);
 
-        match self.backend {
-            SearchBackend::ClickHouse => {
-                self.generate_clickhouse_histogram_for_time_range(time_range, duration_secs)
-                    .await
-            }
-            SearchBackend::PostgreSQL => {
-                self.generate_postgres_histogram_for_time_range(time_range, trunc_unit, bucket_secs)
-                    .await
-            }
-        }
+        self.generate_clickhouse_histogram_for_time_range(time_range, duration_secs)
+            .await
     }
 
     /// Generate histogram for ClickHouse for a time range
@@ -315,91 +239,6 @@ impl SearchService {
         histogram = self.fill_histogram_gaps(histogram, &tr, interval_secs);
 
         Ok(histogram)
-    }
-
-    /// Generate histogram for PostgreSQL for a time range
-    async fn generate_postgres_histogram_for_time_range(
-        &self,
-        time_range: &TimeRangeInput,
-        trunc_unit: &str,
-        bucket_secs: i64,
-    ) -> Result<Vec<HistogramBucket>, SearchError> {
-        let histogram_sql = if bucket_secs == 60 || bucket_secs == 3600 || bucket_secs == 86400 {
-            format!(
-                r#"
-                SELECT 
-                    date_trunc('{}', timestamp) as time_bucket,
-                    COUNT(*) as count
-                FROM logs
-                WHERE timestamp BETWEEN $1 AND $2
-                GROUP BY time_bucket
-                ORDER BY time_bucket ASC
-                "#,
-                trunc_unit
-            )
-        } else {
-            format!(
-                r#"
-                SELECT 
-                    to_timestamp(floor(extract(epoch from timestamp) / {}) * {}) as time_bucket,
-                    COUNT(*) as count
-                FROM logs
-                WHERE timestamp BETWEEN $1 AND $2
-                GROUP BY time_bucket
-                ORDER BY time_bucket ASC
-                "#,
-                bucket_secs, bucket_secs
-            )
-        };
-
-        let rows = sqlx::query(&histogram_sql)
-            .bind(time_range.start)
-            .bind(time_range.end)
-            .fetch_all(&self.pg_pool)
-            .await?;
-
-        let mut histogram: Vec<HistogramBucket> = rows
-            .iter()
-            .filter_map(|row| {
-                let time: Option<chrono::DateTime<chrono::Utc>> = row.try_get("time_bucket").ok();
-                let count: Option<i64> = row.try_get("count").ok();
-                match (time, count) {
-                    (Some(t), Some(c)) => Some(HistogramBucket {
-                        time: t,
-                        count: c as u64,
-                    }),
-                    _ => None,
-                }
-            })
-            .collect();
-
-        // Fill in missing buckets with zero counts
-        let tr = TimeRange {
-            start: time_range.start,
-            end: time_range.end,
-        };
-        histogram = self.fill_histogram_gaps(histogram, &tr, bucket_secs);
-
-        Ok(histogram)
-    }
-
-    /// Calculate appropriate histogram interval based on time range duration
-    /// Returns (interval_for_date_trunc, bucket_seconds) for flexible bucketing
-    fn calculate_histogram_interval(&self, duration_secs: i64) -> (&'static str, i64) {
-        match duration_secs {
-            d if d <= 300 => ("second", 5), // <= 5 min: 5 second buckets (max 60)
-            d if d <= 900 => ("second", 10), // <= 15 min: 10 second buckets (max 90)
-            d if d <= 1800 => ("second", 30), // <= 30 min: 30 second buckets (max 60)
-            d if d <= 3600 => ("minute", 60), // <= 1 hour: 1 minute buckets (max 60)
-            d if d <= 7200 => ("minute", 60), // <= 2 hours: 1 minute buckets (max 120)
-            d if d <= 21600 => ("minute", 300), // <= 6 hours: 5 minute buckets (max 72)
-            d if d <= 43200 => ("minute", 300), // <= 12 hours: 5 minute buckets (max 144) - Changed from 10 to 5
-            d if d <= 86400 => ("minute", 300), // <= 1 day: 5 minute buckets (max 288) - Changed from 15 to 5
-            d if d <= 172800 => ("minute", 600), // <= 2 days: 10 minute buckets (max 288) - Changed from 30 to 10
-            d if d <= 604800 => ("minute", 1800), // <= 1 week: 30 minute buckets (max 336) - Changed from 1 hour to 30 min
-            d if d <= 2592000 => ("hour", 3600), // <= 30 days: 1 hour buckets - Changed from 1 day to 1 hour
-            _ => ("hour", 3600), // > 30 days: 1 hour buckets - Changed from 1 day to 1 hour
-        }
     }
 
     /// Fill in missing histogram buckets with zero counts to show complete time range

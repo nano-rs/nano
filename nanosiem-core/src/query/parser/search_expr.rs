@@ -45,10 +45,11 @@ pub(super) fn parse_paren_search_expr(input: &str) -> ParseResult<'_, SearchExpr
                 in_regex = false;
             }
         } else if in_quote {
+            // The matching quote always closes; backslash is literal inside
+            // strings (no escape), so a trailing `\` doesn't swallow the close.
+            // Regex (above) keeps its `\/` escape. NAN-1157.
             if bytes[i] == quote_char {
                 in_quote = false;
-            } else if bytes[i] == b'\\' {
-                i += 1; // skip escaped char in string
             }
         } else {
             match bytes[i] {

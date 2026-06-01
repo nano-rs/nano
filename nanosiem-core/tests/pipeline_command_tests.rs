@@ -142,7 +142,7 @@ fn resolve_identity_max_age() {
 fn resolve_identity_field_user() {
     let sql = npl("* | resolve_identity field=user");
     assert!(
-        sql.contains("main.\"user\" = i.user"),
+        sql.contains("lower(main.\"user\") = lower(i.user)"),
         "Should join on i.user for user field"
     );
     assert!(
@@ -153,13 +153,20 @@ fn resolve_identity_field_user() {
         sql.contains("identity_confidence"),
         "Missing identity_confidence column"
     );
+    // NAN-1160: without join_use_nulls=1 the ASOF LEFT JOIN silently degrades to INNER
+    // (CH default fills the non-nullable i.observed_at with epoch, not NULL), dropping
+    // every unmatched event. The fragment must set it so the IS NULL guard works.
+    assert!(
+        sql.contains("join_use_nulls = 1"),
+        "resolve_identity must set join_use_nulls=1 so unmatched events survive the LEFT join"
+    );
 }
 
 #[test]
 fn resolve_identity_field_dest_user() {
     let sql = npl("* | resolve_identity field=dest_user");
     assert!(
-        sql.contains("main.dest_user = i.user"),
+        sql.contains("lower(main.dest_user) = lower(i.user)"),
         "Should join on i.user for dest_user field"
     );
 }
@@ -168,7 +175,7 @@ fn resolve_identity_field_dest_user() {
 fn resolve_identity_field_src_host() {
     let sql = npl("* | resolve_identity field=src_host");
     assert!(
-        sql.contains("main.src_host = i.hostname"),
+        sql.contains("lower(main.src_host) = lower(i.hostname)"),
         "Should join on i.hostname for src_host field"
     );
     assert!(
@@ -181,7 +188,7 @@ fn resolve_identity_field_src_host() {
 fn resolve_identity_field_dest_host() {
     let sql = npl("* | resolve_identity field=dest_host");
     assert!(
-        sql.contains("main.dest_host = i.hostname"),
+        sql.contains("lower(main.dest_host) = lower(i.hostname)"),
         "Should join on i.hostname for dest_host field"
     );
 }
@@ -204,7 +211,7 @@ fn resolve_identity_user_after_table() {
     // After table prunes columns, reverse lookup should still work
     let sql = npl("* | table timestamp, user, process_name | resolve_identity field=user");
     assert!(
-        sql.contains("main.\"user\" = i.user"),
+        sql.contains("lower(main.\"user\") = lower(i.user)"),
         "Should join on i.user"
     );
     assert!(

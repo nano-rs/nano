@@ -170,19 +170,13 @@ impl SearchService {
         debug!("Fetching log by ID: {}", sql);
 
         // Execute query
-        let results = match self.backend {
-            SearchBackend::ClickHouse => {
-                let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
-                    SearchError::DatabaseError(sqlx::Error::Configuration(
-                        "ClickHouse client not configured".into(),
-                    ))
-                })?;
-                ch_executor.execute_sql_to_json(&sql).await?
-            }
-            SearchBackend::PostgreSQL => {
-                let (results, _) = self.execute_postgres_sql(&sql, 1, 0).await?;
-                results
-            }
+        let results = {
+            let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
+                SearchError::DatabaseError(sqlx::Error::Configuration(
+                    "ClickHouse client not configured".into(),
+                ))
+            })?;
+            ch_executor.execute_sql_to_json(&sql).await?
         };
 
         Ok(results.into_iter().next())
@@ -212,11 +206,8 @@ impl SearchService {
             .min(self.config.max_limit);
         let offset = request.offset.unwrap_or(0);
 
-        // Execute the query based on backend
-        let (results, total_count) = match self.backend {
-            SearchBackend::ClickHouse => self.execute_clickhouse_sql(&sql, limit, offset).await?,
-            SearchBackend::PostgreSQL => self.execute_postgres_sql(&sql, limit, offset).await?,
-        };
+        // Execute the query
+        let (results, total_count) = self.execute_clickhouse_sql(&sql, limit, offset).await?;
 
         // Calculate field statistics
         let mut stats = FieldStatistics::new();
