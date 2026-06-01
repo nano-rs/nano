@@ -11,12 +11,21 @@ import { useEffect, useState } from 'react';
 import { AlertTriangle, Lock, X } from 'lucide-react';
 import { api } from '../lib/api';
 import type { LicenseStatusResponse } from '../lib/api';
+import { useCapabilities } from '@/hooks/use-capabilities';
 
 export function LicenseBanner() {
+  // License enforcement is enterprise-only — the open edition strips the
+  // /api/license endpoint entirely (NAN-1193), so skip the poll (and the
+  // 404s it would otherwise generate) and never render in open builds.
+  const { edition } = useCapabilities();
+  const isEnterprise = edition === 'enterprise';
+
   const [status, setStatus] = useState<LicenseStatusResponse | null>(null);
   const [dismissed, setDismissed] = useState(false);
 
   useEffect(() => {
+    if (!isEnterprise) return;
+
     const fetchStatus = async () => {
       try {
         const s = await api.getLicenseStatus();
@@ -30,10 +39,10 @@ export function LicenseBanner() {
     // Re-check every 5 minutes
     const interval = setInterval(fetchStatus, 5 * 60_000);
     return () => clearInterval(interval);
-  }, []);
+  }, [isEnterprise]);
 
   // Don't show anything if not enforced, active, or no status yet
-  if (!status || !status.enforcement_enabled || status.state === 'active') {
+  if (!isEnterprise || !status || !status.enforcement_enabled || status.state === 'active') {
     return null;
   }
 

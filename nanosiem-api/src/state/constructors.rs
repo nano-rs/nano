@@ -342,6 +342,7 @@ impl AppState {
             ingestion_paused,
             identity_service,
             demo_service: None,
+            #[cfg(feature = "enterprise")]
             license_status: Arc::new(RwLock::new(nanosiem_core::license::LicenseStatus::default())),
             encryption_service: Arc::new(nanosiem_core::crypto::EncryptionService::from_env()),
             #[cfg(feature = "enterprise")]

@@ -13,6 +13,7 @@ pub mod audit_authz;
 pub mod auth;
 pub mod demo_guard;
 pub mod ip_allowlist;
+#[cfg(feature = "enterprise")]
 pub mod license_guard;
 pub mod logging;
 pub mod rate_limit;
@@ -28,6 +29,7 @@ pub use auth::{
 };
 pub use demo_guard::demo_guard;
 pub use ip_allowlist::{ip_allowlist_middleware, IpAllowlistState};
+#[cfg(feature = "enterprise")]
 pub use license_guard::license_guard;
 pub use logging::request_logging_layer;
 pub use rate_limit::{

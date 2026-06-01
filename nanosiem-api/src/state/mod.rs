@@ -166,7 +166,9 @@ pub struct AppState {
     pub onboarding_repo: OnboardingRepository,
     /// Demo service (only initialized when DEPLOYMENT_MODE=demo)
     pub demo_service: Option<std::sync::Arc<nanosiem_core::demo::DemoService>>,
-    /// Cached license status for BYOC enforcement (shared with middleware)
+    /// Cached license status for BYOC enforcement (shared with middleware).
+    /// Enterprise-only: stripped from the open edition (NAN-1193).
+    #[cfg(feature = "enterprise")]
     pub license_status: Arc<RwLock<nanosiem_core::license::LicenseStatus>>,
     /// Encryption service for MFA secrets and other sensitive data
     pub encryption_service: Arc<nanosiem_core::crypto::EncryptionService>,

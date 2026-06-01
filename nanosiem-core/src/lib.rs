@@ -37,6 +37,9 @@ pub mod ingestion;
 pub mod inputlookup;
 pub mod ip_allowlist;
 pub mod leader;
+// Enterprise-only: license / phone-home machinery is stripped from the open
+// edition entirely (NAN-1193), not merely runtime-disabled.
+#[cfg(feature = "enterprise")]
 pub mod license;
 pub mod log_sources;
 pub mod log_telemetry;
@@ -194,6 +197,7 @@ pub use ip_allowlist::{
     UpdateIpAllowlistEntry,
 };
 pub use leader::LeaderElection;
+#[cfg(feature = "enterprise")]
 pub use license::{
     LicenseChecker, LicenseRepository, LicenseResponse, LicenseState, LicenseStatus,
 };

@@ -167,7 +167,6 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
         handlers::siem_health::SiemHealthApiDoc::openapi(),
         handlers::siem_health_suppressions::SiemHealthSuppressionsApiDoc::openapi(),
         handlers::system::SystemApiDoc::openapi(),
-        handlers::license::LicenseApiDoc::openapi(),
     ];
 
     // Enterprise-only sub-docs. Their handler modules (`melod`, `notebooks`,
@@ -176,6 +175,9 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
     // here too — open builds simply omit these endpoints from the spec.
     #[cfg(feature = "enterprise")]
     {
+        // License / phone-home (NAN-1193): stripped from the open edition, so
+        // the open spec omits the /api/license path entirely.
+        sub_docs.push(handlers::license::LicenseApiDoc::openapi());
         // Phase 3.2 (NAN-744): cases + incidents lifted to enterprise.
         sub_docs.push(handlers::cases::CasesApiDoc::openapi());
         sub_docs.push(handlers::incidents::IncidentsApiDoc::openapi());

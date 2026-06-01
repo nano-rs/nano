@@ -10,8 +10,12 @@
 use anyhow::Result;
 use nanosiem_api::{ApiConfig, AppMetrics, AppState};
 use nanosiem_core::leader::lock_ids;
+#[cfg(feature = "enterprise")]
 use nanosiem_core::license::checker::LicenseCheckerConfig;
-use nanosiem_core::{LeaderElection, LicenseChecker};
+use nanosiem_core::LeaderElection;
+#[cfg(feature = "enterprise")]
+use nanosiem_core::LicenseChecker;
+#[cfg(feature = "enterprise")]
 use std::sync::Arc;
 
 #[tokio::main]
@@ -64,6 +68,9 @@ async fn main() -> Result<()> {
     }
 
     // === License enforcement (24h check) ===
+    // Enterprise-only: the open edition ships no license / phone-home machinery
+    // (NAN-1193). The checker (and its 24h GET /license/status call) is absent.
+    #[cfg(feature = "enterprise")]
     if state.config.is_license_enabled() {
         let license_url = state.config.license_url.clone().unwrap();
         let license_token = state.config.license_token.clone().unwrap();

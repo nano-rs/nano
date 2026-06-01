@@ -114,6 +114,9 @@ async fn main() -> Result<()> {
     }
 
     // === License status poller (reads cached status from PG, written by nanosiem-jobs) ===
+    // Enterprise-only: the open edition ships no license / phone-home machinery
+    // and runs unrestricted by construction (NAN-1193).
+    #[cfg(feature = "enterprise")]
     if state.config.is_license_enabled() {
         let license_repo = nanosiem_core::LicenseRepository::new(state.pool.clone());
         // Load cached status on startup

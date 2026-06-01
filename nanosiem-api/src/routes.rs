@@ -217,8 +217,6 @@ pub fn create_router(state: AppState) -> Router {
         .route("/health", get(handlers::health_check))
         // Detailed health check (authenticated - full diagnostics)
         .route("/health/detailed", get(handlers::health_check_detailed))
-        // License status (exempt from license guard so frontend can check it)
-        .route("/api/license", get(handlers::license::get_license_status))
         // Build edition + capability flags (public; the SPA hits this on boot
         // before login to decide which surfaces to render). NAN-745.
         .route("/api/capabilities", get(handlers::capabilities::get_capabilities))
@@ -479,6 +477,13 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/alerts/{id}/close", post(handlers::close_alert))
         .route("/api/alerts/{id}/assign", post(handlers::assign_alert));
+
+    // License status (exempt from license guard so the frontend can check it).
+    // Enterprise-only: the open edition ships no license handler (NAN-1193).
+    #[cfg(feature = "enterprise")]
+    {
+        app = app.route("/api/license", get(handlers::license::get_license_status));
+    }
 
     // Cases + queues + queue-routing-rules + incidents — Phase 3.2 (NAN-744)
     // lifted nanosiem-core/src/cases/ + incidents/ to nanosiem-enterprise.
@@ -2416,7 +2421,8 @@ pub fn create_router(state: AppState) -> Router {
     if let Some(demo) = demo_routes {
         app = app.merge(demo);
     }
-    let app = app
+    #[cfg_attr(not(feature = "enterprise"), allow(unused_mut))]
+    let mut app = app
         // Add state
         .with_state(state.clone())
         // Demo guard (runs after auth, blocks admin endpoints for demo users)
@@ -2441,12 +2447,22 @@ pub fn create_router(state: AppState) -> Router {
         .layer(axum_middleware::from_fn_with_state(
             auth_state,
             auth_middleware,
-        ))
-        // License enforcement (runs before auth — locked deployments get 403 immediately)
-        .layer(axum_middleware::from_fn_with_state(
+        ));
+
+    // License enforcement (runs before auth — locked deployments get 403
+    // immediately). Enterprise-only: the open edition has no license guard, so
+    // requests are never gated on license state (NAN-1193). Kept at this exact
+    // point in the layer sequence so the enterprise stack is byte-for-byte
+    // identical to before.
+    #[cfg(feature = "enterprise")]
+    {
+        app = app.layer(axum_middleware::from_fn_with_state(
             state.license_status.clone(),
             crate::middleware::license_guard,
-        ))
+        ));
+    }
+
+    let app = app
         // IP allowlist middleware (runs before auth — denied IPs never hit authentication)
         .layer(axum_middleware::from_fn_with_state(
             ip_allowlist_state,

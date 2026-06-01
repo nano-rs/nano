@@ -66,6 +66,12 @@ vrl = "0.30"
 # Structured TOML emission for generated Vector source configs (NAN-689)
 toml = "0.9"
 
+[features]
+# Enterprise-only modules that are stripped from the open edition. Enabled
+# transitively by nanosiem-api's `enterprise` feature. NAN-1193: gates the
+# license / phone-home machinery out of open-edition builds entirely.
+enterprise = []
+
 [dev-dependencies]
 proptest.workspace = true
 wiremock = "0.6"

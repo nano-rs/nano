@@ -58,6 +58,7 @@ pub mod identity;
 #[cfg(feature = "enterprise")]
 pub use nanosiem_enterprise::handlers::incidents;
 pub mod ip_allowlist;
+#[cfg(feature = "enterprise")]
 pub mod license;
 pub mod log_sources;
 pub mod lookup;
