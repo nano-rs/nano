@@ -80,6 +80,29 @@ For non-interactive installs, pre-set `NANO_ADMIN_EMAIL`,
 piping. See [`.env.opensource.example`](./.env.opensource.example) for
 the full env-var surface.
 
+### HTTPS / TLS
+
+The default stack serves plain HTTP on port 80. To serve HTTPS, bring your
+own certificate — drop a cert chain and private key into `config/nginx/ssl/`:
+
+```
+config/nginx/ssl/fullchain.pem   # certificate (leaf + intermediates)
+config/nginx/ssl/privkey.pem     # private key
+```
+
+Get them however you like — Let's Encrypt/certbot, your own CA, or a
+self-signed pair for testing (`./config/nginx/generate-ssl.sh`). Both `*.pem`
+files are gitignored. Then bring the stack up with the TLS overlay:
+
+```sh
+docker compose -f docker-compose.opensource.yml -f docker-compose.tls.yml up -d
+```
+
+nginx serves HTTPS on :443 and redirects :80 → :443. Set `BASE_URL=https://your.domain`
+in `.env` so login cookies get the `Secure` flag. Renew certs out of band and
+`docker compose ... restart nginx` to pick them up. See
+[`config/nginx/ssl/README.md`](./config/nginx/ssl/README.md) for details.
+
 ## What's in the box
 
 - **Ingestion** — Vector-based collectors with VRL parsers (HTTP push,
