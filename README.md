@@ -52,7 +52,7 @@ available from [nano.rs](https://nano.rs).
 One command on any host with Docker:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/nano-rs/nano/main/install.sh | bash
+curl -fsSL https://get.nano.rs | bash
 ```
 
 <p align="center">

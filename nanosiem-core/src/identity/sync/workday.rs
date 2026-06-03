@@ -25,6 +25,7 @@ impl WorkdaySync {
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(120)) // RaaS reports can be large
+                .redirect(super::restricted_redirect_policy())
                 .build()
                 .unwrap_or_default(),
         }
@@ -68,6 +69,9 @@ impl WorkdaySync {
             url = format!("{}{}format=json", url, sep);
         }
 
+        // NAN-1196: `report_url` is fully admin-controlled; validate the
+        // destination before basic-auth credentials are sent to it.
+        super::guard_outbound_url(&url).await?;
         let resp = self
             .client
             .get(&url)
@@ -176,6 +180,16 @@ impl SyncProvider for WorkdaySync {
             url = format!("{}{}format=json", url, sep);
         }
 
+        // NAN-1196: reject a hostile `report_url` (SSRF/credential exfil) before
+        // sending basic-auth; surface it as a failed connection test.
+        if let Err(e) = super::guard_outbound_url(&url).await {
+            return Ok(ConnectionTestResult {
+                success: false,
+                response_time_ms: Some(start.elapsed().as_millis() as u64),
+                error: Some(e.to_string()),
+                user_count_sample: None,
+            });
+        }
         let resp = self
             .client
             .get(&url)

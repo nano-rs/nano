@@ -94,6 +94,24 @@ impl LogSourceService {
             }
         }
 
+        // NAN-1197: an enrichment source's `normalize_vrl` is embedded verbatim
+        // into the generated Vector lane TOML. The deploy-time chokepoint
+        // (`guard_enrichment_lane`) already rejects a `'''`/TOML-header breakout,
+        // but validate here too so the API caller gets an immediate, clear error
+        // at save time instead of a later opaque deploy failure (the log-source
+        // update path historically validated `parser_vrl` only).
+        if let Some(ref nvrl) = update.normalize_vrl {
+            if !nvrl.trim().is_empty() {
+                if let Err(e) =
+                    crate::parsers::VrlValidator::new().check_normalize_vrl_safety(nvrl)
+                {
+                    return Err(LogSourceServiceError::InvalidVrl(format!(
+                        "normalize_vrl: {e}"
+                    )));
+                }
+            }
+        }
+
         let log_source = self.repository().update(id, &update).await?;
 
         // If VRL was updated, validate and set the correct status

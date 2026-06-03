@@ -20,6 +20,7 @@ impl OktaSync {
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
+                .redirect(super::restricted_redirect_policy())
                 .build()
                 .unwrap_or_default(),
         }
@@ -52,6 +53,10 @@ impl OktaSync {
         creds: &OktaCredentials,
         url: &str,
     ) -> Result<(Vec<serde_json::Value>, Option<String>), SyncError> {
+        // NAN-1196: `url` derives from the admin-supplied `domain` (and Okta's
+        // own pagination Link header); validate the destination before sending
+        // the SSWS token to it.
+        super::guard_outbound_url(url).await?;
         let resp = self
             .client
             .get(url)
@@ -225,6 +230,16 @@ impl SyncProvider for OktaSync {
             .map_err(|e| SyncError::InvalidCredentials(e.to_string()))?;
 
         let url = format!("{}?limit=1", Self::users_url(&creds.domain));
+        // NAN-1196: block SSRF/credential-exfil via a hostile `domain` before
+        // the SSWS token leaves the process; surface it as a failed test.
+        if let Err(e) = super::guard_outbound_url(&url).await {
+            return Ok(ConnectionTestResult {
+                success: false,
+                response_time_ms: Some(start.elapsed().as_millis() as u64),
+                error: Some(e.to_string()),
+                user_count_sample: None,
+            });
+        }
         let resp = self
             .client
             .get(&url)

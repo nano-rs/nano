@@ -17,11 +17,19 @@ pub struct GoogleWorkspaceSync {
     client: reqwest::Client,
 }
 
+/// NAN-1196: percent-encode a credential-supplied value before interpolating it
+/// into a Google Directory API query string, so it cannot inject additional
+/// query parameters (the host is the fixed `admin.googleapis.com`).
+fn enc(s: &str) -> String {
+    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
 impl GoogleWorkspaceSync {
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
+                .redirect(super::restricted_redirect_policy())
                 .build()
                 .unwrap_or_default(),
         }
@@ -49,9 +57,12 @@ impl GoogleWorkspaceSync {
             SyncError::InvalidCredentials("Missing private_key in service account JSON".into())
         })?;
 
-        let token_uri = sa["token_uri"]
-            .as_str()
-            .unwrap_or("https://oauth2.googleapis.com/token");
+        // NAN-1196: pin the Google token endpoint rather than trusting the
+        // uploaded service-account JSON's `token_uri` — an attacker-supplied
+        // value would otherwise receive the signed JWT assertion (SSRF +
+        // assertion capture). Real Google service accounts always use this URL,
+        // and it is also the `aud` the assertion must be minted for.
+        let token_uri = "https://oauth2.googleapis.com/token";
 
         // Build and sign JWT using jsonwebtoken crate
         let now = chrono::Utc::now().timestamp() as u64;
@@ -113,7 +124,7 @@ impl GoogleWorkspaceSync {
     ) -> Result<(Vec<serde_json::Value>, Option<String>), SyncError> {
         let mut url = format!(
             "https://admin.googleapis.com/admin/directory/v1/users?customer=my_customer&domain={}&maxResults=500&projection=full",
-            domain
+            enc(domain)
         );
         if let Some(pt) = page_token {
             url.push_str(&format!("&pageToken={}", pt));
@@ -267,7 +278,7 @@ impl SyncProvider for GoogleWorkspaceSync {
         loop {
             let mut url = format!(
                 "https://admin.googleapis.com/admin/directory/v1/users?customer=my_customer&domain={}&maxResults=500&projection=full&query=updatedMin='{}'",
-                domain, updated_min
+                enc(domain), updated_min
             );
             if let Some(ref token) = page_token {
                 url.push_str(&format!("&pageToken={}", token));
@@ -341,7 +352,7 @@ impl SyncProvider for GoogleWorkspaceSync {
             .client
             .get(format!(
                 "https://admin.googleapis.com/admin/directory/v1/users?customer=my_customer&domain={}&maxResults=1",
-                creds.domain
+                enc(&creds.domain)
             ))
             .bearer_auth(&token)
             .send()

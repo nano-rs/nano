@@ -271,7 +271,7 @@ function RecentChangesPreview() {
         <div className="flex-1 h-px bg-border/60 mx-1" />
         <span className="text-[10.5px] text-muted-foreground/70">last 6</span>
       </div>
-      <div className="rounded-lg border border-border/60 bg-card divide-y divide-border/60">
+      <div className="rounded-lg border border-border/60 bg-card divide-y divide-border/60 overflow-hidden">
         {loading && entries.length === 0 && (
           <div className="px-3 py-6 text-center text-[11px] text-muted-foreground">Loading…</div>
         )}
@@ -303,8 +303,8 @@ function RecentChangesPreview() {
               <span className="font-mono text-[10.5px] text-foreground/80 shrink-0 truncate max-w-[80px]">
                 {ev.user_name || 'system'}
               </span>
-              <span className="text-[10.5px] text-muted-foreground shrink-0">{ev.action}</span>
-              <span className="text-[10.5px] text-foreground/90 truncate">{ev.message || ev.resource_name}</span>
+              <span className="text-[10.5px] text-muted-foreground min-w-0 truncate">{ev.action}</span>
+              <span className="text-[10.5px] text-foreground/90 flex-1 min-w-0 truncate">{ev.message || ev.resource_name}</span>
               {ev.resource_type && (
                 <span className="text-[10px] text-muted-foreground/70 ml-auto shrink-0 uppercase tracking-wider">
                   {ev.resource_type.replace(/_/g, ' ')}
@@ -320,13 +320,14 @@ function RecentChangesPreview() {
 
 export function SettingsLanding() {
   useDocumentTitle('Settings');
-  const { hasPermission, hasAnyPermission } = useAuth();
+  const { hasPermission, hasAnyPermission, isDemoUser } = useAuth();
   const { capabilities } = useCapabilities();
 
   const visibleSections = useMemo(() => {
     return SETTINGS_SECTIONS
       .map(s => {
         if (s.capability && !capabilities[s.capability]) return null;
+        if (s.demoHidden && isDemoUser) return null;
         const ok = !s.permissions
           || (Array.isArray(s.permissions) ? hasAnyPermission(s.permissions) : hasPermission(s.permissions));
         if (!ok) return null;
@@ -334,7 +335,7 @@ export function SettingsLanding() {
       })
       .filter((s): s is SettingsSection => s !== null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasPermission, hasAnyPermission, capabilities]);
+  }, [hasPermission, hasAnyPermission, isDemoUser, capabilities]);
 
   const attention = useAttentionItems(visibleSections);
 

@@ -15,11 +15,23 @@ pub struct EntraIdSync {
     client: reqwest::Client,
 }
 
+/// NAN-1196: an Entra `tenant_id` is a GUID or a verified domain. Restrict it to
+/// that charset (alphanumerics, dot, hyphen) so it can never introduce a slash,
+/// `@`, `#`, whitespace or other control character into the request URL path.
+fn is_valid_entra_tenant_id(tenant_id: &str) -> bool {
+    !tenant_id.is_empty()
+        && tenant_id.len() <= 128
+        && tenant_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
 impl EntraIdSync {
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
+                .redirect(super::restricted_redirect_policy())
                 .build()
                 .unwrap_or_default(),
         }
@@ -27,6 +39,15 @@ impl EntraIdSync {
 
     /// Obtain an OAuth2 access token using client credentials grant
     async fn get_access_token(&self, creds: &EntraIdCredentials) -> Result<String, SyncError> {
+        // NAN-1196: `tenant_id` is interpolated into the token URL path. The host
+        // stays the fixed `login.microsoftonline.com`, but constrain the value to
+        // a GUID/domain charset so it can't smuggle path/query control characters.
+        if !is_valid_entra_tenant_id(&creds.tenant_id) {
+            return Err(SyncError::InvalidCredentials(format!(
+                "invalid tenant_id {:?} (expected a GUID or domain)",
+                creds.tenant_id
+            )));
+        }
         let url = format!(
             "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
             creds.tenant_id

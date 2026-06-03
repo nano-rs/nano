@@ -79,6 +79,14 @@ export interface SettingsSection {
   attentionMsg?: string;
   /** Set to true if the page hasn't been built yet — rail still shows it; clicking lands on a stub. */
   comingSoon?: boolean;
+  /**
+   * Hide this section from demo users (`demo_analyst`). Use when a section is
+   * gated on a permission demo users hold for an unrelated reason — e.g. the AI
+   * section keys on `settings:ai`, which demo users have only as a read-only
+   * meloD-availability probe for natural-language search, not to view/manage AI
+   * settings (NAN-1198). Backend access stays governed by `demo_guard`.
+   */
+  demoHidden?: boolean;
   children?: SettingsSectionChild[];
 }
 
@@ -187,6 +195,9 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     href: '/settings/ai',
     permissions: 'settings:ai',
     capability: 'melod',
+    // Demo users hold `settings:ai` only for the meloD-availability probe; the
+    // section is otherwise demo-restricted by demo_guard, so hide it (NAN-1198).
+    demoHidden: true,
     status: 'ok',
     children: [
       {

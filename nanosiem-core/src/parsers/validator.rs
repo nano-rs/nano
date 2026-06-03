@@ -134,6 +134,32 @@ impl VrlValidator {
         Self::new()
     }
 
+    /// NAN-1197: source-text security check for an enrichment parser's
+    /// `normalize_vrl`.
+    ///
+    /// The generated enrichment lane embeds this VRL verbatim into a Vector TOML
+    /// `source = '''…'''` literal (`vector_config::deploy::generate_enrichment_lane`).
+    /// Unlike a log parser's `parser_vrl`, `normalize_vrl` reaches the active
+    /// config through `guard_enrichment_lane`, which only *compiles* the VRL and
+    /// asserts its output shape — it never ran the source-text checks that block
+    /// a `'''` / TOML-section-header breakout. A `normalize_vrl` that compiles to
+    /// a valid record but contains `…''' \n[sinks.exfil]…` inside a VRL string
+    /// literal would close the TOML literal and append an attacker sink. This
+    /// runs exactly the `'''` / blocked-function / TOML-header checks
+    /// `validate_vrl` applies to `parser_vrl`, without re-compiling (the
+    /// encoding-contract guard compiles separately).
+    pub fn check_normalize_vrl_safety(&self, vrl_code: &str) -> Result<(), VrlValidatorError> {
+        if vrl_code.len() > MAX_VRL_SIZE {
+            return Err(VrlValidatorError::SecurityViolation(format!(
+                "normalize VRL exceeds maximum size of {MAX_VRL_SIZE} bytes (got {} bytes)",
+                vrl_code.len()
+            )));
+        }
+        self.check_security_patterns(vrl_code)?;
+        self.check_toml_injection(vrl_code)?;
+        Ok(())
+    }
+
     /// Validate VRL code for syntax and security issues
     ///
     /// This performs:
@@ -1311,6 +1337,28 @@ if !is_array(groups) { groups = [] }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_normalize_vrl_safety_blocks_breakouts_allows_real_mapping() {
+        let v = VrlValidator::new();
+        // Realistic identity normalize VRL — must NOT be a false positive.
+        let legit = r#"
+            id = to_string(.id) ?? to_string(.external_id) ?? ""
+            if id == "" { abort }
+            . = {
+                "external_id": id,
+                "version": to_unix_timestamp(now(), unit: "milliseconds"),
+                "account_status": if .account_enabled == true { "active" } else { "disabled" },
+                "groups": array(.groups) ?? [],
+            }
+        "#;
+        assert!(v.check_normalize_vrl_safety(legit).is_ok(), "legit normalize VRL must pass");
+
+        // `'''` breakout and a TOML section header must be rejected.
+        assert!(v.check_normalize_vrl_safety("x = \"a ''' b\"").is_err());
+        assert!(v.check_normalize_vrl_safety("[sinks.exfil]\n. = {}").is_err());
+        assert!(v.check_normalize_vrl_safety(". = get_env_var(\"SECRET\")").is_err());
+    }
 
     fn validator() -> VrlValidator {
         VrlValidator::new()

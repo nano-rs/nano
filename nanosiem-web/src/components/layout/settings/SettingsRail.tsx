@@ -117,7 +117,7 @@ interface SettingsRailProps {
 
 export function SettingsRail({ onBackToApp }: SettingsRailProps) {
   const location = useLocation();
-  const { hasPermission, hasAnyPermission, user } = useAuth();
+  const { hasPermission, hasAnyPermission, isDemoUser, user } = useAuth();
   const { capabilities } = useCapabilities();
   const [query, setQuery] = useState('');
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({ access: true });
@@ -143,6 +143,7 @@ export function SettingsRail({ onBackToApp }: SettingsRailProps) {
     return SETTINGS_SECTIONS
       .map((s): SettingsSection | null => {
         if (s.capability && !capabilities[s.capability]) return null;
+        if (s.demoHidden && isDemoUser) return null;
         const sectionVisible = !s.permissions
           || (Array.isArray(s.permissions) ? hasAnyPermission(s.permissions) : hasPermission(s.permissions));
         if (!sectionVisible) return null;
@@ -154,7 +155,7 @@ export function SettingsRail({ onBackToApp }: SettingsRailProps) {
       })
       .filter((s): s is SettingsSection => s !== null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasPermission, hasAnyPermission, capabilities]);
+  }, [hasPermission, hasAnyPermission, isDemoUser, capabilities]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();

@@ -4,7 +4,7 @@
 #
 # Designed to be piped from curl:
 #
-#   curl -fsSL https://raw.githubusercontent.com/nano-rs/nano/main/install.sh | bash
+#   curl -fsSL https://get.nano.rs | bash
 #
 # What it does:
 #   1. Validates prerequisites (docker, docker compose v2, git, openssl, curl)
@@ -12,10 +12,12 @@
 #   3. Prompts for admin email / password / public BASE_URL (reads /dev/tty
 #      even when stdin is piped from curl)
 #   4. Generates strong random secrets and writes .env
-#   5. Pulls images from ghcr.io/nano-rs and brings the stack up
-#   6. Waits for the API to report healthy
-#   7. POSTs to /api/setup/initialize to create the first admin account
-#   8. Prints the login URL
+#   5. Pulls images from ghcr.io/nano-rs
+#   6. Verifies the pulled first-party image digests against images.lock
+#   7. Brings the stack up
+#   8. Waits for the API to report healthy
+#   9. POSTs to /api/setup/initialize to create the first admin account
+#  10. Prints the login URL
 #
 # Non-interactive use: set the prompt values as env vars before running.
 #   NANO_ADMIN_EMAIL, NANO_ADMIN_NAME, NANO_ADMIN_PASSWORD, NANO_BASE_URL
@@ -81,6 +83,58 @@ json_escape() {
     python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.argv[1]))' "$1" 2>/dev/null \
         || node -e 'process.stdout.write(JSON.stringify(process.argv[1]))' -- "$1" 2>/dev/null \
         || fail "Neither python3 nor node is available to JSON-escape the admin password. Install one and retry."
+}
+
+# Verify that the first-party images we just pulled match the sha256 manifest
+# digests recorded in images.lock (generated + committed by CI). Docker already
+# checksum-verifies layers on pull, but that only proves the bytes are internally
+# consistent — it does NOT prove the tag wasn't re-pushed with different content.
+# Pinning to the CI-vouched digest closes that supply-chain gap. Only the
+# ghcr.io/nano-rs/* images are listed; stock third-party images are out of scope.
+verify_image_digests() {
+    local lockfile="images.lock"
+
+    if [[ ! -f "$lockfile" ]]; then
+        warn "images.lock not found — skipping image digest verification."
+        return 0
+    fi
+
+    # images.lock tracks the latest release on this branch, so a user-pinned
+    # NANO_VERSION won't match it. Only enforce on the default 'latest'; for a
+    # pinned release, check out the matching git tag (its images.lock matches).
+    if [[ "$NANO_VERSION" != "latest" ]]; then
+        warn "NANO_VERSION is pinned to '$NANO_VERSION' — skipping images.lock verification (lockfile tracks 'latest')."
+        return 0
+    fi
+
+    log "Verifying pulled image digests against images.lock"
+    local repo expected actual mismatch=0 verified=0
+    while read -r repo expected; do
+        [[ -z "$repo" || "$repo" == \#* ]] && continue
+        # RepoDigests records the manifest(-list) digest the tag resolved to on
+        # pull — the same value CI writes to images.lock. Pick the entry for this
+        # repo and strip everything up to the '@'.
+        actual=$(docker image inspect "${repo}:${NANO_VERSION}" \
+            --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
+            | grep -F "${repo}@" | head -1)
+        actual="${actual##*@}"
+        if [[ -z "$actual" ]]; then
+            fail "No registry digest found for ${repo}:${NANO_VERSION} — cannot verify it against images.lock. Refusing to start with unverifiable images."
+        fi
+        if [[ "$actual" != "$expected" ]]; then
+            warn "DIGEST MISMATCH for $repo"
+            warn "  expected (images.lock): $expected"
+            warn "  actual   (pulled):      $actual"
+            mismatch=1
+        else
+            verified=$((verified + 1))
+        fi
+    done < "$lockfile"
+
+    if [[ "$mismatch" == "1" ]]; then
+        fail "Image digest verification failed: pulled images do not match images.lock. Refusing to start. If you deliberately changed image versions this is expected — otherwise it may indicate a tampered or re-pushed tag."
+    fi
+    ok "Verified $verified first-party image digest(s) against images.lock"
 }
 
 # ----------------------------------------------------------------------------
@@ -216,6 +270,8 @@ log "Pulling images from ghcr.io/nano-rs (this may take a minute on first run)"
 if ! docker compose -f "$COMPOSE_FILE" pull; then
     fail "docker compose pull failed. If you see '401 Unauthorized', the GHCR packages may still be private — run 'docker login ghcr.io' or wait for nano-rs to flip them public."
 fi
+
+verify_image_digests
 
 log "Starting services"
 docker compose -f "$COMPOSE_FILE" up -d
