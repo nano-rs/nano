@@ -15,7 +15,7 @@ pub mod repository;
 pub mod scheduler;
 pub mod types;
 
-pub use ai_monitor::AiMonitor;
+pub use ai_monitor::{AiMonitor, AiProviderConnectivityChecker};
 pub use feed_monitor::FeedMonitor;
 pub use repository::{HealthRepository, HealthRepositoryError};
 pub use scheduler::HealthScheduler;

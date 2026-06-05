@@ -63,6 +63,40 @@ export NANO_TIER="${NANO_TIER:-unrestricted}"
 # Deployment mode (selfhosted, managed, demo)
 export DEPLOYMENT_MODE="${DEPLOYMENT_MODE:-selfhosted}"
 
+# Air-gap mode (NAN-1201). AIRGAP_MODE=true runs the stack as a zero-egress
+# deployment: the marketplace hides cloud-install / repo-sync, badges providers
+# "available offline" vs "requires connectivity", surfaces import-from-file, and
+# the enrichment/repo-sync endpoints refuse cleanly instead of attempting egress.
+# Signed offline bundles are verified against the embedded Ed25519 public key.
+#   ./scripts/start-microservices-dev.sh                # normal
+#   AIRGAP_MODE=true ./scripts/start-microservices-dev.sh
+export AIRGAP_MODE="${AIRGAP_MODE:-false}"
+
+# Air-gap bundle signing PUBLIC key (NAN-1210), embedded by nanosiem-core
+# build.rs at compile time so verify_bundle trusts it. OPTIONAL in dev: a debug
+# build keeps the dev placeholder key active (the refuse-placeholder guard only
+# fires in release), so you can sign test bundles with the dev seed (32 bytes of
+# 0x01) and they verify with nothing injected. To test with the REAL key, set
+# AIRGAP_BUNDLE_PUBLIC_KEY_HEX (64 hex chars) — e.g. pull it from Doppler:
+#   AIRGAP_BUNDLE_PUBLIC_KEY_HEX=$(doppler secrets get AIRGAP_BUNDLE_PUBLIC_KEY_HEX \
+#       --project nano-platform --config dev_gke --plain) \
+#       AIRGAP_MODE=true ./scripts/start-microservices-dev.sh
+# An empty value is treated as "not set" so build.rs doesn't try to decode it.
+if [ -n "${AIRGAP_BUNDLE_PUBLIC_KEY_HEX:-}" ]; then
+    export AIRGAP_BUNDLE_PUBLIC_KEY_HEX
+else
+    unset AIRGAP_BUNDLE_PUBLIC_KEY_HEX
+fi
+
+if [ "$AIRGAP_MODE" = "true" ]; then
+    echo -e "${YELLOW}🔒 AIRGAP_MODE enabled — offline-only marketplace/enrichment${NC}"
+    if [ -n "${AIRGAP_BUNDLE_PUBLIC_KEY_HEX:-}" ]; then
+        echo -e "${GREEN}✓${NC} Embedding injected AIRGAP_BUNDLE_PUBLIC_KEY_HEX at build time"
+    else
+        echo -e "${YELLOW}   No key injected — debug build uses the dev placeholder (sign test bundles with the dev seed 0x01..01)${NC}"
+    fi
+fi
+
 export CORS_ORIGINS="${CORS_ORIGINS:-http://localhost:5173,http://localhost:3000,http://localhost:3001,http://localhost:3002}"
 export NRT_LAG_BUFFER_SECS="${NRT_LAG_BUFFER_SECS:-60}"
 export NRT_MAX_BATCH_SIZE="${NRT_MAX_BATCH_SIZE:-100000}"
@@ -81,9 +115,15 @@ export DISK_PRESSURE_PAUSE_INGESTION="${DISK_PRESSURE_PAUSE_INGESTION:-false}"
 # Service health check URLs for Main API
 export SEARCH_SERVICE_URL="http://localhost:3002/health"
 
-# Cloudflare AI Gateway settings
-export CLOUDFLARE_AI_GATEWAY_URL="${CLOUDFLARE_AI_GATEWAY_URL:-https://gateway.ai.cloudflare.com/v1/156f6c44a634420513a63a3929ea201d/nano}"
-export CF_AIG_AUTH_TOKEN="${CF_AIG_AUTH_TOKEN:-cfut_YyrNMUOzJ2PD8CPioBxmXnZrqEMXfJZCpj9zU90Rdc8f74ab}"
+# Cloudflare AI Gateway settings — these reach the internet, so SKIP them in
+# air-gap mode. A real air-gap install has no CLOUDFLARE_AI_GATEWAY_URL; AI runs
+# only via an on-prem provider base_url (Settings → AI providers, NAN-1207).
+if [ "$AIRGAP_MODE" = "true" ]; then
+    echo -e "${YELLOW}   AIRGAP_MODE: not setting Cloudflare AI Gateway env — configure an on-prem AI endpoint in Settings → AI providers${NC}"
+else
+    export CLOUDFLARE_AI_GATEWAY_URL="${CLOUDFLARE_AI_GATEWAY_URL:-https://gateway.ai.cloudflare.com/v1/156f6c44a634420513a63a3929ea201d/nano}"
+    export CF_AIG_AUTH_TOKEN="${CF_AIG_AUTH_TOKEN:-cfut_YyrNMUOzJ2PD8CPioBxmXnZrqEMXfJZCpj9zU90Rdc8f74ab}"
+fi
 
 # AI behaviour flags. Both are read directly from process env at the call
 # site; we set them explicitly here so dev runs are reproducible regardless
@@ -103,9 +143,12 @@ export NANOSIEM_ANTHROPIC_NATIVE="${NANOSIEM_ANTHROPIC_NATIVE:-1}"
 #   parked until we have a reason to re-evaluate. Set to `1` to opt in.
 export NANOSIEM_PARSER_TOOL_LOOP="${NANOSIEM_PARSER_TOOL_LOOP:-0}"
 
-# Docs RAG settings (product documentation retrieval for AI chat)
-export DOCS_RAG_URL="${DOCS_RAG_URL:-https://siem-rag.nano.rs}"
-export DOCS_RAG_TOKEN="${DOCS_RAG_TOKEN:-nsiem-docs-ca25fd841aa2213987887249055be498}"
+# Docs RAG (product-doc retrieval for AI chat) — reaches the internet, so SKIP
+# in air-gap. docs_rag.rs no-ops gracefully when DOCS_RAG_URL is unset.
+if [ "$AIRGAP_MODE" != "true" ]; then
+    export DOCS_RAG_URL="${DOCS_RAG_URL:-https://siem-rag.nano.rs}"
+    export DOCS_RAG_TOKEN="${DOCS_RAG_TOKEN:-nsiem-docs-ca25fd841aa2213987887249055be498}"
+fi
 
 # Log directory
 LOG_DIR="./logs"
@@ -302,6 +345,7 @@ DISK_PRESSURE_CRITICAL_THRESHOLD="$DISK_PRESSURE_CRITICAL_THRESHOLD" \
 DISK_PRESSURE_EMERGENCY_THRESHOLD="$DISK_PRESSURE_EMERGENCY_THRESHOLD" \
 DISK_PRESSURE_PAUSE_INGESTION="$DISK_PRESSURE_PAUSE_INGESTION" \
 DEPLOYMENT_MODE="$DEPLOYMENT_MODE" \
+AIRGAP_MODE="$AIRGAP_MODE" \
 NANO_TIER="$NANO_TIER" \
 JOBS_PORT=3003 \
 LEADER_ELECTION_ENABLED=true \
@@ -344,6 +388,7 @@ DISK_PRESSURE_CRITICAL_THRESHOLD="$DISK_PRESSURE_CRITICAL_THRESHOLD" \
 DISK_PRESSURE_EMERGENCY_THRESHOLD="$DISK_PRESSURE_EMERGENCY_THRESHOLD" \
 DISK_PRESSURE_PAUSE_INGESTION="$DISK_PRESSURE_PAUSE_INGESTION" \
 DEPLOYMENT_MODE="$DEPLOYMENT_MODE" \
+AIRGAP_MODE="$AIRGAP_MODE" \
 NANO_TIER="$NANO_TIER" \
 SKIP_VECTOR_VALIDATION="${SKIP_VECTOR_VALIDATION:-false}" \
 VECTOR_INGEST_URL="${VECTOR_INGEST_URL:-http://localhost:8080/}" \

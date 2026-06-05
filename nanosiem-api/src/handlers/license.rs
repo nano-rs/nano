@@ -32,6 +32,13 @@ pub struct LicenseStatusResponse {
     pub expires_at: Option<String>,
     /// Whether license enforcement is configured
     pub enforcement_enabled: bool,
+    /// Whether this is an air-gapped deployment (AIRGAP_MODE on). Air-gap
+    /// installs enforce a signed *offline* license and have no phone-home path,
+    /// so `enforcement_enabled` (which tracks LICENSE_URL) is false even though
+    /// enforcement is active. The frontend treats `airgap || enforcement_enabled`
+    /// as "enforced" and routes a locked air-gap install to the offline-license
+    /// import surface instead of app.nano.rs (NAN-1222).
+    pub airgap: bool,
 }
 
 /// Get the current license status
@@ -45,7 +52,13 @@ pub struct LicenseStatusResponse {
     security(("api_key" = []))
 )]
 pub async fn get_license_status(State(state): State<AppState>) -> Json<LicenseStatusResponse> {
-    let status = state.license_status.read().await;
+    // Apply read-time `expires_at` enforcement so an expired (incl. offline
+    // air-gap) license reports Locked locally with no network (NAN-1206 / WS4).
+    let status = state
+        .license_status
+        .read()
+        .await
+        .effective(chrono::Utc::now());
     let enforcement_enabled = state.config.is_license_enabled();
 
     Json(LicenseStatusResponse {
@@ -56,6 +69,7 @@ pub async fn get_license_status(State(state): State<AppState>) -> Json<LicenseSt
         grace_ends_at: status.grace_ends_at.map(|dt| dt.to_rfc3339()),
         expires_at: status.expires_at.map(|dt| dt.to_rfc3339()),
         enforcement_enabled,
+        airgap: state.config.airgap,
     })
 }
 

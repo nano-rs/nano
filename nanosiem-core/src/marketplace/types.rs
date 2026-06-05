@@ -261,8 +261,36 @@ pub struct MarketplaceCatalogEntry {
     // Changelog (from manifest, shown on update notifications)
     pub changelog: Option<String>,
 
+    /// True when this entry's live install/sync path requires outbound internet
+    /// (so it can't operate in an air-gapped install without an imported bundle).
+    /// Computed in [`Self::compute_requires_network`] from the execution backend
+    /// + allowed_domains — NOT a stored column — and populated in the
+    /// repository's `hydrate`. The rule:
+    ///   - `identity` providers always sync from an external IdP → true
+    ///   - `deno` enrichments reach out only if they declare `allowed_domains`
+    ///     (a pure-transform deno enrichment with no domains stays offline) → true iff non-empty
+    ///   - `native` (IPinfo Lite) pulls a bulk feed over HTTP → true
+    /// Offline-capable entries (custom transforms, empty `allowed_domains`) → false.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub requires_network: bool,
+
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl MarketplaceCatalogEntry {
+    /// Derive [`Self::requires_network`] from the execution backend +
+    /// allowed_domains. See the field doc for the rule. Called from the
+    /// repository's `hydrate` so every returned entry carries the flag.
+    pub fn compute_requires_network(&self) -> bool {
+        match self.execution_backend.as_str() {
+            "identity" => true,
+            "native" => true,
+            "deno" => !self.allowed_domains.is_empty(),
+            _ => false,
+        }
+    }
 }
 
 // =============================================================================

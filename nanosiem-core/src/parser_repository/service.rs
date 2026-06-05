@@ -18,9 +18,10 @@ use crate::rule_repository::GitHubClient;
 
 use super::error::ParserRepositoryError;
 use super::models::{
-    ApplyUpstreamUpdateResult, BulkApplyUpstreamResult, NewParserRepository, ParserImport,
-    ParserImportPreview, ParserImportRequest, ParserImportType, ParserRepository, RepositoryParser,
-    RepositoryParserFilter, SyncResult, SyncStatus, UpdateParserRepository, UpstreamParserDiff,
+    ApplyUpstreamUpdateResult, BulkApplyUpstreamResult, BundleImportResult,
+    NewParserRepository, ParserImport, ParserImportPreview, ParserImportRequest, ParserImportType,
+    ParserRepository, RepositoryParser, RepositoryParserFilter, SyncResult, SyncStatus,
+    UpdateParserRepository, UpstreamParserDiff,
 };
 use super::repository::{
     ParserImportsRepository, ParserRepositoryRepository, RepositoryParsersRepository,
@@ -29,6 +30,12 @@ use super::yaml_parser::parse_parser_yaml;
 
 /// Allowed parser repository sources (owner/repo format, lowercase)
 const ALLOWED_REPOSITORIES: &[&str] = &["nano-rs/parsers"];
+
+/// Stable slug + display name for the synthetic repository that air-gapped
+/// parser bundles (NAN-1201/NAN-1204) are imported into. Lazily created on
+/// first bundle upload; never network-synced.
+const AIRGAP_REPOSITORY_SLUG: &str = "airgap-parsers";
+const AIRGAP_REPOSITORY_NAME: &str = "Air-gapped Parser Bundles";
 
 /// Configuration for the parser repository service
 #[derive(Debug, Clone)]
@@ -1235,6 +1242,143 @@ impl ParserRepositoryService {
             out.push("unknown".to_string());
         }
         out
+    }
+
+    // =========================================================================
+    // Air-gapped Bundle Sync (NAN-1226)
+    // =========================================================================
+
+    /// Sync parser definitions delivered via an offline (air-gapped) bundle
+    /// into the synthetic air-gap parser repository's catalog (NAN-1226).
+    ///
+    /// The caller (the API handler) is responsible for verifying the bundle
+    /// signature + checksums (`nanosiem_core::airgap::verify_bundle`) and
+    /// extracting the parser YAML payloads; this method takes the already-
+    /// verified `(file_path, raw_yaml)` pairs and upserts each into
+    /// `repository_parsers` — the *exact same* catalog upsert performed by
+    /// `run_sync` for GitHub-synced repos. This is the offline equivalent of a
+    /// repo *sync*: the parsers land as available-to-import (a
+    /// `repository_parsers` row with no `parser_imports` row / log source), and
+    /// the operator selectively imports + deploys them from the repositories
+    /// page afterward.
+    ///
+    /// Nothing is imported or deployed here — no log source is created and
+    /// Vector is never touched. The bundle's parsers are upserted into a
+    /// synthetic, always-present air-gap parser repository (created on first
+    /// use via the `AIRGAP_REPOSITORY_SLUG`). Returns the number of parsers
+    /// synced (successfully upserted) into the catalog.
+    pub async fn sync_parser_bundle(
+        &self,
+        content_version: &str,
+        parsers: &[(String, String)],
+        user_id: Option<Uuid>,
+    ) -> Result<BundleImportResult, ParserRepositoryError> {
+        let repo = self.find_or_create_airgap_repository(user_id).await?;
+
+        let mut synced = 0usize;
+
+        for (path, raw_content) in parsers {
+            // Parse + upsert the parser definition into repository_parsers so
+            // it shows up as available-to-import on the repositories page.
+            // Mirrors the GitHub sync upsert in `run_sync`.
+            let parsed = match parse_parser_yaml(raw_content) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(repo_id = %repo.id, path = %path, error = %e, "Invalid parser.yaml in air-gap bundle; skipping");
+                    continue;
+                }
+            };
+
+            // NAN-1149: honor an explicit `kind: enrichment`; air-gap bundles
+            // carry the kind in the YAML (no enrichments/ path convention).
+            let kind = parsed.kind.as_deref().unwrap_or("parser");
+
+            if let Err(e) = self
+                .parsers_repository
+                .upsert(
+                    repo.id,
+                    path,
+                    None,
+                    raw_content,
+                    Some(&parsed.name),
+                    parsed.display_name.as_deref(),
+                    parsed.description.as_deref(),
+                    parsed.version.as_deref(),
+                    parsed.category.as_deref(),
+                    parsed.vendor.as_deref(),
+                    parsed.product.as_deref(),
+                    parsed.parser_vrl.as_deref(),
+                    kind,
+                    parsed.enrich_kind.as_deref(),
+                    parsed.enrich_source.as_deref(),
+                    parsed.target_table.as_deref(),
+                    parsed.normalize_vrl.as_deref(),
+                )
+                .await
+            {
+                warn!(repo_id = %repo.id, path = %path, error = %e, "Failed to upsert air-gap parser into catalog");
+                continue;
+            }
+
+            synced += 1;
+        }
+
+        info!(
+            repo_id = %repo.id,
+            content_version = %content_version,
+            synced,
+            "Air-gapped parser bundle synced into catalog"
+        );
+
+        Ok(BundleImportResult {
+            repository_id: repo.id,
+            content_version: content_version.to_string(),
+            synced,
+        })
+    }
+
+    /// Find (or lazily create) the synthetic repository that air-gapped
+    /// parser bundles are imported into. It is a normal `parser_repositories`
+    /// row (so it shows up in the parser-repo browser) but with auto-sync
+    /// disabled and a non-GitHub sentinel URL — it's never synced over the
+    /// network. Bypasses `create_repository`'s GitHub URL allowlist on
+    /// purpose by going straight through the repository layer.
+    async fn find_or_create_airgap_repository(
+        &self,
+        user_id: Option<Uuid>,
+    ) -> Result<ParserRepository, ParserRepositoryError> {
+        if let Ok(existing) = self
+            .repo_repository
+            .find_by_slug(AIRGAP_REPOSITORY_SLUG)
+            .await
+        {
+            return Ok(existing);
+        }
+
+        let new_repo = NewParserRepository {
+            name: AIRGAP_REPOSITORY_NAME.to_string(),
+            slug: Some(AIRGAP_REPOSITORY_SLUG.to_string()),
+            description: Some(
+                "Parsers imported from offline air-gapped bundles (NAN-1201).".to_string(),
+            ),
+            // Sentinel, never-fetched URL — air-gap bundles are uploaded, not synced.
+            url: "airgap://parsers".to_string(),
+            branch: None,
+            parsers_path: None,
+            auto_sync_enabled: Some(false),
+            sync_interval_hours: None,
+        };
+
+        match self.repo_repository.create(&new_repo, user_id).await {
+            Ok(repo) => Ok(repo),
+            // Lost a create race with a concurrent bundle upload — re-fetch.
+            Err(super::repository::ParserRepositoryRepositoryError::AlreadyExists(_)) => self
+                .repo_repository
+                .find_by_slug(AIRGAP_REPOSITORY_SLUG)
+                .await
+                .map_err(|e| ParserRepositoryError::Internal(e.to_string())),
+            Err(e) => Err(ParserRepositoryError::Internal(e.to_string())),
+        }
     }
 
     fn validate_url(&self, url: &str) -> Result<(), ParserRepositoryError> {

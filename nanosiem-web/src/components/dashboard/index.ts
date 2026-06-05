@@ -43,7 +43,6 @@ export { QuickActions } from './QuickActions';
 export { MiniStats } from './MiniStats';
 export { TopFiringRules } from './TopFiringRules';
 // RiskLeaderboard lifted to @/enterprise/components/dashboard/RiskLeaderboard (NAN-745).
-export { CyberNewsFeed } from './CyberNewsFeed';
 // MyCases lifted to @/enterprise/components/dashboard/MyCases (NAN-745).
 export { AlertSummary } from './AlertSummary';
 // RecentCases lifted to @/enterprise/components/dashboard/RecentCases (NAN-745).

@@ -21,7 +21,7 @@ impl LicenseRepository {
     /// Load the cached license status. Returns default (active) if no row exists.
     pub async fn get_status(&self) -> Result<LicenseStatus, sqlx::Error> {
         let row = sqlx::query_as::<_, LicenseRow>(
-            "SELECT status, valid, tier, locked_reason, grace_ends_at, expires_at, last_checked_at, last_heartbeat_at
+            "SELECT status, valid, tier, locked_reason, grace_ends_at, expires_at, last_checked_at, last_heartbeat_at, COALESCE(offline, FALSE) AS offline
              FROM license_status WHERE id = TRUE"
         )
         .fetch_optional(&self.pool)
@@ -69,6 +69,7 @@ struct LicenseRow {
     expires_at: Option<DateTime<Utc>>,
     last_checked_at: Option<DateTime<Utc>>,
     last_heartbeat_at: Option<DateTime<Utc>>,
+    offline: bool,
 }
 
 impl LicenseRow {
@@ -82,6 +83,7 @@ impl LicenseRow {
             expires_at: self.expires_at,
             last_checked_at: self.last_checked_at,
             last_heartbeat_at: self.last_heartbeat_at,
+            offline: self.offline,
         }
     }
 }

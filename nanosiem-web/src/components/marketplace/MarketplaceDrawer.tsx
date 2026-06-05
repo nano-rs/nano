@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useEffect, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import {
   AlertTriangle, Check, CheckCircle, Code as CodeIcon, Copy, Download,
-  Eye, EyeOff, Info, KeyRound, Loader2, Lock, RefreshCw, Save,
+  Eye, EyeOff, FileDown, Info, KeyRound, Loader2, Lock, RefreshCw, Save,
   Settings as SettingsIcon, Trash2, Zap,
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
@@ -18,8 +19,9 @@ import type { CredentialFieldDef, MarketplaceCatalogEntry } from '@/lib/api/mark
 import { useToast } from '@/hooks/use-toast';
 import { formatNumber, formatUTCCompact } from '@/lib/date-utils';
 import { cn } from '@/lib/utils';
+import { isIpInfoEntry } from '@/lib/api/marketplace';
 import { MonoSwatch, getCategoryTone } from './MonoSwatch';
-import { StateBadge, getIntegrationState } from './IntegrationCard';
+import { StateBadge, getIntegrationState, IpInfoCredit } from './IntegrationCard';
 
 const TABS = [
   { id: 'about',  label: 'About',       icon: Info },
@@ -38,6 +40,18 @@ interface MarketplaceDrawerProps {
 
 export function MarketplaceDrawer({ slug, open, onOpenChange, onUpdated }: MarketplaceDrawerProps) {
   const { toast } = useToast();
+  // Air-gap mode — shared cache with the catalog page's query key. When the
+  // entry needs network, the egress "Sync now" action is replaced by an
+  // import-from-file route so the drawer stays honest offline (NAN-1212).
+  const airGapQuery = useQuery({
+    queryKey: ['system', 'config'],
+    queryFn: () => api.getSystemConfig(),
+    staleTime: Infinity,
+    gcTime: Infinity,
+    retry: 1,
+    refetchOnWindowFocus: false,
+  });
+  const airGap = airGapQuery.data?.air_gap ?? false;
   const [entry, setEntry] = useState<MarketplaceCatalogEntry | null>(null);
   const [loading, setLoading] = useState(false);
   const [tab, setTab] = useState<TabId>('config');
@@ -201,6 +215,7 @@ export function MarketplaceDrawer({ slug, open, onOpenChange, onUpdated }: Marke
           ) : (
             <DrawerInner
               entry={entry}
+              airGap={airGap}
               tab={tab}
               setTab={setTab}
               credentials={credentials}
@@ -237,6 +252,7 @@ export function MarketplaceDrawer({ slug, open, onOpenChange, onUpdated }: Marke
 
 interface DrawerInnerProps {
   entry: MarketplaceCatalogEntry;
+  airGap: boolean;
   tab: TabId;
   setTab: (t: TabId) => void;
   credentials: Record<string, string>;
@@ -261,7 +277,7 @@ interface DrawerInnerProps {
 
 function DrawerInner(props: DrawerInnerProps) {
   const {
-    entry, tab, setTab,
+    entry, airGap, tab, setTab,
     credentials, setCredentials, credsDirty, markCredsDirty,
     showSecrets, setShowSecrets, generateToken,
     handleToggleEnabled, handleSync, handleUninstall, handleUpdate, handleExport, handleSaveCredentials,
@@ -333,6 +349,7 @@ function DrawerInner(props: DrawerInnerProps) {
         {tab === 'config' && (
           <ConfigTab
             entry={entry}
+            airGap={airGap}
             credentials={credentials}
             setCredentials={setCredentials}
             credsDirty={credsDirty}
@@ -408,12 +425,19 @@ function AboutTab({ entry }: { entry: MarketplaceCatalogEntry }) {
         </code>{' '}
         on matching artifact types.
       </p>
+      {/* CC BY-SA 4.0 redistribution credit for the native IPinfo Lite feed. */}
+      {isIpInfoEntry(entry) && (
+        <div className="pt-1 border-t border-border/60">
+          <IpInfoCredit className="pt-3" />
+        </div>
+      )}
     </div>
   );
 }
 
 interface ConfigTabProps {
   entry: MarketplaceCatalogEntry;
+  airGap: boolean;
   credentials: Record<string, string>;
   setCredentials: React.Dispatch<React.SetStateAction<Record<string, string>>>;
   credsDirty: boolean;
@@ -434,7 +458,7 @@ interface ConfigTabProps {
 
 function ConfigTab(props: ConfigTabProps) {
   const {
-    entry, credentials, setCredentials, credsDirty, markCredsDirty,
+    entry, airGap, credentials, setCredentials, credsDirty, markCredsDirty,
     showSecrets, setShowSecrets, generateToken,
     handleToggleEnabled, handleSync, handleUninstall, handleSaveCredentials,
     syncing, savingCreds, hasUpdate, handleUpdate, updating,
@@ -443,6 +467,9 @@ function ConfigTab(props: ConfigTabProps) {
   const credentialFields: CredentialFieldDef[] = entry.credential_fields ?? [];
   const needsCreds = entry.requires_credential !== 'none' && credentialFields.length > 0;
   const isSystem = entry.source_type === 'system';
+  // Air-gap + connectivity-required: the live "Sync now" egress can't run.
+  // Swap it for an import-from-file route so the action stays honest.
+  const egressBlocked = airGap && (entry.requires_network ?? false);
 
   return (
     <div className="p-5 space-y-5">
@@ -635,10 +662,23 @@ function ConfigTab(props: ConfigTabProps) {
               {entry.enabled ? 'Apply changes' : 'Activate'}
             </Button>
             {entry.category === 'data' && (
-              <Button variant="outline" size="sm" className="h-8 rounded-md" onClick={handleSync} disabled={syncing}>
-                {syncing ? <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5 mr-1" />}
-                Sync now
-              </Button>
+              egressBlocked ? (
+                <Link to="/settings/airgap-import">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 rounded-md"
+                    title="Live sync needs outbound internet. Import a signed data bundle instead."
+                  >
+                    <FileDown className="w-3.5 h-3.5 mr-1" /> Import bundle
+                  </Button>
+                </Link>
+              ) : (
+                <Button variant="outline" size="sm" className="h-8 rounded-md" onClick={handleSync} disabled={syncing}>
+                  {syncing ? <Loader2 className="w-3.5 h-3.5 mr-1 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5 mr-1" />}
+                  Sync now
+                </Button>
+              )
             )}
             <div className="flex-1" />
             {!isSystem && (

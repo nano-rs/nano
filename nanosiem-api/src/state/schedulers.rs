@@ -60,17 +60,29 @@ impl AppState {
         tracing::info!("Distributed detection scheduler started");
 
         // --- Distributed scheduled jobs ---
-        let scheduler_service =
-            nanosiem_core::SchedulerService::with_node_id(self.pool.clone(), self.node_id.clone());
-        let poll_interval: u64 = std::env::var("SCHEDULER_POLL_INTERVAL_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(30);
-        handles.push(scheduler_service.start_scheduler(poll_interval));
-        tracing::info!(
-            "Distributed scheduled jobs loop started ({}s poll)",
-            poll_interval
-        );
+        // These are inputlookup ingestion jobs that fetch remote feed URLs over
+        // the network (see SchedulerService::fetch_and_process). That's an egress
+        // path, so the loop must NOT run in air-gap mode. The detection scheduler
+        // above is internal (ClickHouse/PG only) and keeps running regardless.
+        if !self.config.egress_jobs_enabled() {
+            tracing::info!(
+                "AIRGAP_MODE: skipping distributed scheduled jobs loop (remote inputlookup feed ingestion)"
+            );
+        } else {
+            let scheduler_service = nanosiem_core::SchedulerService::with_node_id(
+                self.pool.clone(),
+                self.node_id.clone(),
+            );
+            let poll_interval: u64 = std::env::var("SCHEDULER_POLL_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30);
+            handles.push(scheduler_service.start_scheduler(poll_interval));
+            tracing::info!(
+                "Distributed scheduled jobs loop started ({}s poll)",
+                poll_interval
+            );
+        }
 
         handles
     }

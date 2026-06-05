@@ -58,15 +58,31 @@ impl AppState {
     /// This spawns a background task that periodically checks AI provider
     /// health and feed staleness, creating notifications for issues.
     pub fn start_health_scheduler(&self) -> tokio::task::JoinHandle<()> {
-        use nanosiem_core::health::{HealthScheduler, HealthSchedulerConfig};
+        use nanosiem_core::health::{
+            AiProviderConnectivityChecker, HealthScheduler, HealthSchedulerConfig,
+        };
         use std::sync::Arc;
 
         let config = HealthSchedulerConfig::default();
+
+        // Inject the canonical, on-prem-`base_url`-aware provider connectivity
+        // test (NAN-1207) so AI-provider health checks honor an operator's
+        // on-prem endpoint instead of hardcoding public vendor hosts. The test
+        // lives in the enterprise AI-providers handler; open-core has no
+        // AI-provider surface, so the checker is `None` there and AI-provider
+        // health checks are skipped entirely. (NAN-1231)
+        #[cfg(feature = "enterprise")]
+        let ai_checker: Option<Arc<dyn AiProviderConnectivityChecker>> =
+            Some(Arc::new(crate::handlers::settings::ApiAiProviderChecker));
+        #[cfg(not(feature = "enterprise"))]
+        let ai_checker: Option<Arc<dyn AiProviderConnectivityChecker>> = None;
 
         let scheduler = Arc::new(HealthScheduler::with_dual_pool(
             self.pool.clone(),
             self.dual_pool.clone(),
             config,
+            ai_checker,
+            self.config.airgap,
         ));
 
         scheduler.start()
@@ -264,43 +280,57 @@ impl AppState {
             Err(e) => tracing::error!("Failed to start signal processor: {}", e),
         }
 
-        // Enrichment auto-sync scheduler (low-frequency singleton)
-        handles.push(self.start_enrichment_scheduler());
-        tracing::info!("Enrichment auto-sync scheduler started (leader-only)");
+        // === Egress schedulers — skipped in air-gap mode ===
+        // Air-gapped installs have no outbound internet, so any job that fetches
+        // from the internet (IPinfo enrichment, GitHub repo sync, model catalog)
+        // must NOT start — bundles arrive via the air-gap import surface instead.
+        // Internal jobs (signal processor above; tuning / disk-pressure /
+        // siem-health / cleanups below) are unaffected.
+        if !self.config.egress_jobs_enabled() {
+            tracing::info!(
+                "AIRGAP_MODE: skipping egress background jobs (enrichment, identity, repo auto-sync, marketplace, model-catalog, docs-rag)"
+            );
+        } else {
+            // Enrichment auto-sync scheduler (low-frequency singleton)
+            handles.push(self.start_enrichment_scheduler());
+            tracing::info!("Enrichment auto-sync scheduler started (leader-only)");
 
-        // Custom enrichment scheduler — runs Deno data enrichments on their
-        // cron schedules. Enterprise only after Phase 3.3 of NAN-744 (the
-        // sandbox runtime + scheduler live in nanosiem-enterprise).
-        #[cfg(feature = "enterprise")]
-        {
-            handles.push(self.start_custom_enrichment_scheduler());
-            tracing::info!("Custom enrichment scheduler started (leader-only)");
-        }
+            // Custom enrichment scheduler — runs Deno data enrichments on their
+            // cron schedules. Enterprise only after Phase 3.3 of NAN-744 (the
+            // sandbox runtime + scheduler live in nanosiem-enterprise).
+            #[cfg(feature = "enterprise")]
+            {
+                handles.push(self.start_custom_enrichment_scheduler());
+                tracing::info!("Custom enrichment scheduler started (leader-only)");
+            }
 
-        // Identity provider sync scheduler
-        handles.push(self.start_identity_sync_scheduler());
-        tracing::info!("Identity sync scheduler started (leader-only)");
+            // Identity provider sync scheduler
+            handles.push(self.start_identity_sync_scheduler());
+            tracing::info!("Identity sync scheduler started (leader-only)");
 
-        // Repository auto-sync schedulers — staggered to avoid concurrent GitHub clones:
-        //   Parsers: 10 min delay (needed first for rule evaluation)
-        //   Rules: 20 min delay
-        //   Marketplace: 30 min delay
-        handles.push(self.start_parser_repo_sync_scheduler());
-        tracing::info!("Parser repo auto-sync scheduler started (leader-only, 10m initial delay)");
+            // Repository auto-sync schedulers — staggered to avoid concurrent GitHub clones:
+            //   Parsers: 10 min delay (needed first for rule evaluation)
+            //   Rules: 20 min delay
+            //   Marketplace: 30 min delay
+            handles.push(self.start_parser_repo_sync_scheduler());
+            tracing::info!(
+                "Parser repo auto-sync scheduler started (leader-only, 10m initial delay)"
+            );
 
-        handles.push(self.start_rule_repo_sync_scheduler());
-        tracing::info!("Rule repo auto-sync scheduler started (leader-only, 20m initial delay)");
+            handles.push(self.start_rule_repo_sync_scheduler());
+            tracing::info!("Rule repo auto-sync scheduler started (leader-only, 20m initial delay)");
 
-        handles.push(self.start_marketplace_sync_scheduler());
-        tracing::info!(
-            "Marketplace repo auto-sync scheduler started (leader-only, 30m initial delay)"
-        );
+            handles.push(self.start_marketplace_sync_scheduler());
+            tracing::info!(
+                "Marketplace repo auto-sync scheduler started (leader-only, 30m initial delay)"
+            );
 
-        // Model catalog auto-sync (daily by default) — enterprise only.
-        #[cfg(feature = "enterprise")]
-        {
-            handles.push(self.start_model_catalog_sync_scheduler());
-            tracing::info!("Model catalog auto-sync scheduler started (leader-only)");
+            // Model catalog auto-sync (daily by default) — enterprise only.
+            #[cfg(feature = "enterprise")]
+            {
+                handles.push(self.start_model_catalog_sync_scheduler());
+                tracing::info!("Model catalog auto-sync scheduler started (leader-only)");
+            }
         }
 
         // Tuning scheduler (low-frequency singleton)

@@ -911,14 +911,6 @@ export function useSystemConfig() {
   );
 }
 
-// News feed hook
-export function useNews() {
-  return useQuery(
-    () => api.getNews(),
-    []
-  );
-}
-
 // Upload hooks
 export function useUploadHistory(filter?: import('@/lib/api').UploadHistoryFilter) {
   return useQuery(

@@ -167,6 +167,17 @@ pub(crate) fn field_to_sql_expr(field: &str, gen: &ClickHouseSqlGenerator) -> (S
         return (gen.generate_json_extract(field, "String"), true);
     }
 
+    // A field produced earlier in this pipeline (eval, stats alias, risk, …) is
+    // a real column in the current scope — reference it directly, even if its
+    // name collides with a "known metadata" field. Without this, `risk_factors`
+    // / `raw_risk_score` after a `| risk` command would be JSON-extracted from
+    // the `metadata` column, which is wrong (and errors outright once a `stats`
+    // upstream has dropped `metadata`). Stored-signal search, which has no such
+    // pipeline command, still falls through to JSON extraction below. (NAN-1236)
+    if gen.is_computed_field(field) {
+        return (escape_identifier(field), false);
+    }
+
     // Known metadata fields that need JSON extraction
     // These are fields stored in the metadata JSON column but commonly queried
     if is_known_metadata_field(field) {

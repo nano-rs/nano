@@ -42,6 +42,7 @@ import {
   Cpu,
   MessageSquare,
   Zap,
+  PackageOpen,
   type LucideIcon,
 } from 'lucide-react';
 
@@ -386,6 +387,16 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     desc: 'Data subject requests, retention overrides, legal hold.',
     href: '/settings/gdpr',
     permissions: 'gdpr:anonymize',
+    status: 'ok',
+  },
+  {
+    id: 'airgap-import',
+    label: 'Air-gapped Import',
+    group: 'admin',
+    icon: PackageOpen,
+    desc: 'Apply signed offline bundles (parsers, enrichment, license) without internet.',
+    href: '/settings/airgap-import',
+    permissions: 'settings:system',
     status: 'ok',
   },
 ];

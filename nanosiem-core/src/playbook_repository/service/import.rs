@@ -116,4 +116,155 @@ impl PlaybookRepositoryService {
             import_type: req.import_type.to_string(),
         })
     }
+
+    /// Sync a signed, air-gapped playbook bundle into the synthetic air-gap
+    /// playbook repository's catalog (NAN-1226).
+    ///
+    /// The bundle has already been verified upstream (Ed25519 signature +
+    /// per-file SHA-256 checksums via `nanosiem_core::airgap::verify_bundle`);
+    /// this method takes the already-verified `(file_path, raw_content)` pairs
+    /// and upserts each into `repository_playbooks` — the *exact same* catalog
+    /// upsert (frontmatter parse → upsert) performed by `run_sync` for
+    /// GitHub-synced repos. This is the offline equivalent of a repo *sync*:
+    /// the playbooks land as available-to-import (a `repository_playbooks` row
+    /// with no `playbook_imports` row), and the operator selectively imports
+    /// them from the repositories page afterward.
+    ///
+    /// Nothing is imported or activated here — no library playbook is created.
+    /// The bundle's playbooks are upserted into a synthetic, always-present
+    /// air-gap playbook repository (created on first use via
+    /// `AIRGAP_PLAYBOOK_REPOSITORY_SLUG`). Returns the number of playbooks
+    /// synced (successfully upserted) into the catalog.
+    pub async fn sync_playbook_bundle(
+        &self,
+        content_version: &str,
+        playbooks: &[(String, String)],
+        user_id: Option<Uuid>,
+    ) -> Result<super::super::models::PlaybookBundleImportResult, PlaybookRepositoryError> {
+        use crate::playbooks::{parse_playbook, split_frontmatter};
+        use super::super::models::PlaybookBundleImportResult;
+
+        let repo = self.find_or_create_airgap_playbook_repository(user_id).await?;
+
+        let mut synced = 0usize;
+
+        for (path, content) in playbooks {
+            // Split frontmatter + parse body for metadata. Mirrors `run_sync`.
+            // Unparseable files are still upserted with a `failed` parse status
+            // (exactly as `run_sync` does) so they remain visible in the
+            // catalog rather than silently dropped.
+            let (fm, parse_status, parse_error, step_count) = match split_frontmatter(content) {
+                Ok((fm, body)) => {
+                    let tree = parse_playbook(body);
+                    let steps: i32 = (tree.phases.iter().map(|p| p.steps.len()).sum::<usize>()
+                        + tree.steps.len()) as i32;
+                    (fm, "success", None, Some(steps))
+                }
+                Err(e) => (None, "failed", Some(e.to_string()), None),
+            };
+
+            let title = fm.as_ref().and_then(|f| f.title.clone());
+            let subtitle = fm.as_ref().and_then(|f| f.subtitle.clone());
+            let category = fm.as_ref().and_then(|f| f.category.clone());
+            let match_signals = fm.as_ref().map(|f| f.match_signals.clone());
+            let tags = fm.as_ref().map(|f| f.tags.clone());
+            let owner_team = fm.as_ref().and_then(|f| f.owner.clone());
+            let authored_date = fm.as_ref().and_then(|f| f.authored);
+            let danger_policy = fm
+                .as_ref()
+                .map(|f| serde_json::to_value(&f.danger_policy).unwrap_or(serde_json::Value::Null));
+            let review_cadence = fm.as_ref().and_then(|f| f.review_cadence.clone());
+            let scope = fm.as_ref().and_then(|f| f.scope.clone());
+
+            if let Err(e) = self
+                .playbooks_repository
+                .upsert(
+                    repo.id,
+                    path,
+                    None,
+                    content,
+                    title.as_deref(),
+                    subtitle.as_deref(),
+                    category.as_deref(),
+                    match_signals.as_deref(),
+                    tags.as_deref(),
+                    owner_team.as_deref(),
+                    authored_date,
+                    danger_policy.as_ref(),
+                    review_cadence.as_deref(),
+                    scope.as_deref(),
+                    parse_status,
+                    parse_error.as_deref(),
+                    step_count,
+                )
+                .await
+            {
+                info!(
+                    "Failed to upsert air-gap playbook {} into catalog: {}",
+                    path, e
+                );
+                continue;
+            }
+
+            synced += 1;
+        }
+
+        info!(
+            "Air-gapped playbook bundle synced into repo {} catalog (content_version={}): synced={}",
+            repo.id, content_version, synced
+        );
+
+        Ok(PlaybookBundleImportResult {
+            repository_id: repo.id,
+            content_version: content_version.to_string(),
+            synced,
+        })
+    }
+
+    /// Find (or lazily create) the synthetic repository that air-gapped
+    /// playbook bundles are imported into. A normal `playbook_repositories`
+    /// row (so it shows up in the playbook-repo browser) with auto-sync
+    /// disabled and a non-GitHub sentinel URL — never network-synced.
+    async fn find_or_create_airgap_playbook_repository(
+        &self,
+        user_id: Option<Uuid>,
+    ) -> Result<super::super::models::PlaybookRepository, PlaybookRepositoryError> {
+        use super::super::models::NewPlaybookRepository;
+
+        const AIRGAP_PLAYBOOK_REPOSITORY_SLUG: &str = "airgap-playbooks";
+        const AIRGAP_PLAYBOOK_REPOSITORY_NAME: &str = "Air-gapped Playbook Bundles";
+
+        if let Ok(existing) = self
+            .repo_repository
+            .find_by_slug(AIRGAP_PLAYBOOK_REPOSITORY_SLUG)
+            .await
+        {
+            return Ok(existing);
+        }
+
+        let new_repo = NewPlaybookRepository {
+            name: AIRGAP_PLAYBOOK_REPOSITORY_NAME.to_string(),
+            slug: Some(AIRGAP_PLAYBOOK_REPOSITORY_SLUG.to_string()),
+            description: Some(
+                "Playbooks imported from offline air-gapped bundles (NAN-1220).".to_string(),
+            ),
+            // Sentinel, never-fetched URL — air-gap bundles are uploaded, not synced.
+            url: "airgap://playbooks".to_string(),
+            branch: None,
+            playbooks_path: None,
+            auto_sync_enabled: Some(false),
+            sync_interval_hours: None,
+        };
+
+        match self.repo_repository.create(&new_repo, user_id).await {
+            Ok(repo) => Ok(repo),
+            // Lost a create race with a concurrent bundle upload — re-fetch.
+            Err(super::super::repository::PlaybookRepoRepositoryError::AlreadyExists(_)) => self
+                .repo_repository
+                .find_by_slug(AIRGAP_PLAYBOOK_REPOSITORY_SLUG)
+                .await
+                .map_err(|e| PlaybookRepositoryError::Internal(e.to_string())),
+            Err(e) => Err(PlaybookRepositoryError::Internal(e.to_string())),
+        }
+    }
 }

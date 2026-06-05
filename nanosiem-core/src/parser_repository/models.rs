@@ -202,6 +202,27 @@ pub struct ParserImportPreview {
 }
 
 // =============================================================================
+// Air-gapped Bundle Sync (NAN-1226)
+// =============================================================================
+
+/// Aggregate result of syncing an air-gapped parser bundle into the synthetic
+/// air-gap repository's catalog (NAN-1226). This is the offline equivalent of a
+/// GitHub repo *sync* — the parsers land as available-to-import; nothing is
+/// imported or deployed. The synthetic repository is returned so callers can
+/// browse/import via the normal parser-repository surface.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct BundleImportResult {
+    /// The synthetic air-gap repository the bundle parsers landed in.
+    #[serde(with = "typeid::parser_repo")]
+    #[schema(value_type = String)]
+    pub repository_id: Uuid,
+    /// Caller-defined content version from the bundle manifest.
+    pub content_version: String,
+    /// Number of parsers synced (upserted) into the repository catalog.
+    pub synced: usize,
+}
+
+// =============================================================================
 // Sync Types
 // =============================================================================
 

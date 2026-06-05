@@ -46,6 +46,13 @@ export interface MarketplaceCatalogEntry {
    *  per-query on the backend from custom_enrichment_runs. Drives the
    *  catalog card's footer-state badge (NAN-1108). */
   is_syncing?: boolean;
+  /** True when the live install/sync path requires outbound internet (identity
+   *  providers, native bulk feeds, or deno enrichments declaring allowed_domains).
+   *  Derived on the backend from execution_backend + allowed_domains. In air-gap
+   *  mode these badge "Requires connectivity" and route to import-from-file
+   *  instead of live sync; offline-capable entries (custom transforms with no
+   *  allowed_domains) are false. (NAN-1212) */
+  requires_network?: boolean;
   changelog?: string;
   created_at: string;
   updated_at: string;
@@ -202,6 +209,28 @@ export interface MarketplaceCoverage {
    */
   computed_at: string;
 }
+
+// =============================================================================
+// Attribution
+// =============================================================================
+
+/**
+ * The native IPinfo Lite IP geo/ASN enrichment is distributed under
+ * CC BY-SA 4.0, so any surface that exposes it must carry an attribution
+ * credit. This detects the IPinfo entry robustly (slug / name /
+ * native_source_id contains "ipinfo", case-insensitive) rather than
+ * pinning a generated UUID. (NAN-1216)
+ */
+export function isIpInfoEntry(entry: MarketplaceCatalogEntry): boolean {
+  const haystack = [entry.slug, entry.name, entry.native_source_id]
+    .filter((v): v is string => !!v)
+    .join(' ')
+    .toLowerCase();
+  return haystack.includes('ipinfo');
+}
+
+/** Stable URL for the CC BY-SA 4.0 license deed used by the credit link. */
+export const CC_BY_SA_4_URL = 'https://creativecommons.org/licenses/by-sa/4.0/';
 
 // =============================================================================
 // API Client

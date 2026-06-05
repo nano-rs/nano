@@ -49,9 +49,9 @@ function cspPlugin(): Plugin {
         const csp = [
           "default-src 'self'",
           `script-src ${scriptSrc}`,
-          "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+          "style-src 'self' 'unsafe-inline'",
           "img-src 'self' data: blob:",
-          "font-src 'self' data: https://fonts.gstatic.com",
+          "font-src 'self' data:",
           `connect-src ${connectSrc}`,
           "base-uri 'self'",
           "form-action 'self'",

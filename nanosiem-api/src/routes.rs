@@ -17,6 +17,13 @@ use tower_http::set_header::SetResponseHeaderLayer;
 /// Maximum upload file size: 100MB + overhead for multipart encoding
 const MAX_UPLOAD_SIZE: usize = 105 * 1024 * 1024;
 
+/// Max size for an air-gap import bundle. The IPinfo-Lite enrichment payload is
+/// ~400MB uncompressed; the compressed `.tar.gz` is buffered before the
+/// streaming verify/parse, so the cap must comfortably exceed the 105MB upload
+/// limit. Enterprise-only — the import surface ships only in the enterprise edition.
+#[cfg(feature = "enterprise")]
+const MAX_AIRGAP_BUNDLE_SIZE: usize = 1024 * 1024 * 1024;
+
 use crate::{
     config::ApiConfig,
     handlers,
@@ -126,6 +133,31 @@ pub fn create_router(state: AppState) -> Router {
             upload_rate_limit_middleware,
         ));
 
+    // Air-gapped bundle import routes (NAN-1201) — enterprise only. These accept
+    // large signed `.tar.gz` bundles (the IPinfo enrichment payload dwarfs the
+    // 105MB upload cap), so they live in their own sub-router with a much larger
+    // DefaultBodyLimit rather than inheriting axum's 2MB default. The license
+    // import route is registered separately (tiny payload, license-guard-exempt).
+    #[cfg(feature = "enterprise")]
+    let airgap_import_routes = Router::new()
+        .route(
+            "/api/airgap/parsers/import",
+            post(handlers::airgap::parsers::import_parser_bundle),
+        )
+        .route(
+            "/api/airgap/enrichment/import",
+            post(handlers::airgap::enrichment::import_enrichment_bundle),
+        )
+        .route(
+            "/api/airgap/rules/import",
+            post(handlers::airgap::rules::import_rule_bundle),
+        )
+        .route(
+            "/api/airgap/playbooks/import",
+            post(handlers::airgap::playbooks::import_playbook_bundle),
+        )
+        .layer(DefaultBodyLimit::max(MAX_AIRGAP_BUNDLE_SIZE));
+
     // NAN-474: dry-resolve is rate-limited per authenticated user because
     // templating cost scales with `{{...}}` token count. The middleware
     // runs inside the outer auth layer, so `AuthContext` is available.
@@ -179,14 +211,6 @@ pub fn create_router(state: AppState) -> Router {
         .layer(SetResponseHeaderLayer::overriding(
             header::CACHE_CONTROL,
             HeaderValue::from_static("private, max-age=3600, stale-while-revalidate=300"),
-        ));
-
-    // News feed - 15 minute browser cache (matches internal RSS cache)
-    let cached_news = Router::new()
-        .route("/api/news", get(handlers::news::get_news))
-        .layer(SetResponseHeaderLayer::overriding(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("private, max-age=900, stale-while-revalidate=60"),
         ));
 
     // Demo routes — only registered when DEPLOYMENT_MODE=demo.
@@ -483,6 +507,13 @@ pub fn create_router(state: AppState) -> Router {
     #[cfg(feature = "enterprise")]
     {
         app = app.route("/api/license", get(handlers::license::get_license_status));
+        // Air-gapped offline license import (NAN-1206). Kept license-guard-exempt
+        // so a fresh / locked install with no license yet can import one to recover.
+        // Payload is tiny (<256KB), so it stays under the default body limit.
+        app = app.route(
+            "/api/airgap/license/import",
+            post(handlers::airgap::license::import_offline_license),
+        );
     }
 
     // Cases + queues + queue-routing-rules + incidents — Phase 3.2 (NAN-744)
@@ -2414,12 +2445,18 @@ pub fn create_router(state: AppState) -> Router {
         // Cacheable routes (with Cache-Control headers)
         .merge(cached_metadata)
         .merge(cached_mitre)
-        .merge(cached_news)
         // OpenAPI / Swagger UI
         .merge(openapi::swagger_ui());
     // Demo routes (only on DEPLOYMENT_MODE=demo deployments)
     if let Some(demo) = demo_routes {
         app = app.merge(demo);
+    }
+    // Air-gapped large-bundle import sub-router (NAN-1201, enterprise). Merged
+    // before with_state so it shares AppState, and before the license guard
+    // layer below so parser/enrichment imports require a valid license.
+    #[cfg(feature = "enterprise")]
+    {
+        app = app.merge(airgap_import_routes);
     }
     #[cfg_attr(not(feature = "enterprise"), allow(unused_mut))]
     let mut app = app

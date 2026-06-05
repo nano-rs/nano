@@ -14,12 +14,12 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Bot, Check, CheckCircle, Cloud, Database, GitBranch, Loader2,
   Package, Plus, RefreshCw, Search as SearchIcon, Shield, Star,
-  Users, X as XIcon, Box,
+  Users, X as XIcon, Box, FileDown,
 } from 'lucide-react';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
@@ -86,13 +86,33 @@ const SECTIONS: SectionDef[] = [
 
 const SECTIONED_SLUGS = new Set(SECTIONS.flatMap(s => s.slugs));
 
+/** Where connectivity-required items + the hero CTA route to side-load bundles. */
+const AIRGAP_IMPORT_ROUTE = '/settings/airgap-import';
+
 export function Marketplace() {
   useDocumentTitle('Marketplace');
   useBreadcrumbTitle('Marketplace');
 
   const { capabilities } = useCapabilities();
   const { toast } = useToast();
+  const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
+
+  // Air-gap mode (no outbound internet). Drives the honest-marketplace reshape:
+  // connectivity badges on every card, egress actions disabled in favor of
+  // import-from-file, repo controls hidden, and a top-of-page import CTA.
+  // Static for the session, so cache it hard. Defaults to false until resolved
+  // (a transient failure just shows the normal online marketplace).
+  const airGapQuery = useQuery({
+    queryKey: ['system', 'config'],
+    queryFn: () => api.getSystemConfig(),
+    staleTime: Infinity,
+    gcTime: Infinity,
+    retry: 1,
+    refetchOnWindowFocus: false,
+  });
+  const airGap = airGapQuery.data?.air_gap ?? false;
+  const goImport = useCallback(() => navigate(AIRGAP_IMPORT_ROUTE), [navigate]);
   const [entries, setEntries] = useState<MarketplaceCatalogEntry[]>([]);
   const [stats, setStats] = useState<CatalogStats | null>(null);
   const [repos, setRepos] = useState<EnrichmentMarketplaceRepo[]>([]);
@@ -342,15 +362,28 @@ export function Marketplace() {
           </p>
         </div>
         <span className="flex-1" />
-        {capabilities.customEnrichment && (
-          <div className="flex items-center gap-2">
-            <Link to="/enrichments/custom/new">
+        <div className="flex items-center gap-2">
+          {/* Air-gap: threat-intel/data comes in via signed bundles, so make
+              import a first-class, prominent CTA. */}
+          {airGap && (
+            <Link to={AIRGAP_IMPORT_ROUTE}>
               <Button size="sm" className="h-8 rounded-md text-[12px]">
+                <FileDown className="w-3.5 h-3.5 mr-1" /> Import enrichment bundle
+              </Button>
+            </Link>
+          )}
+          {capabilities.customEnrichment && (
+            <Link to="/enrichments/custom/new">
+              <Button
+                size="sm"
+                variant={airGap ? 'outline' : 'default'}
+                className="h-8 rounded-md text-[12px]"
+              >
                 <Plus className="w-3.5 h-3.5 mr-1" /> Create custom
               </Button>
             </Link>
-          </div>
-        )}
+          )}
+        </div>
       </div>
 
       {/* Stats strip */}
@@ -380,11 +413,30 @@ export function Marketplace() {
         />
       </div>
 
-      {/* Repo sources */}
-      {repos.length > 0 && (
-        <div className="mt-4">
-          <RepoSources repos={repos} syncingId={syncingRepo} onSync={handleSyncRepo} />
+      {/* Repo sources — hidden in air-gap mode (GitHub-backed, egress-only).
+          A side-load banner takes its place so the surface stays honest. */}
+      {airGap ? (
+        <div className="mt-4 bg-card border border-border/60 rounded-lg px-4 py-3 flex items-center gap-3 shadow-none">
+          <FileDown className="w-[14px] h-[14px] text-primary shrink-0" />
+          <div className="min-w-0 flex-1">
+            <div className="text-[12.5px] text-foreground font-medium">Air-gapped install</div>
+            <div className="text-[11.5px] text-muted-foreground mt-0.5">
+              Repository sync is disabled. Bring in threat-intel and data feeds by importing
+              signed, offline bundles.
+            </div>
+          </div>
+          <Link to={AIRGAP_IMPORT_ROUTE} className="shrink-0">
+            <Button size="sm" className="h-7 rounded-md text-[11.5px]">
+              <FileDown className="w-3 h-3 mr-1" /> Import bundle
+            </Button>
+          </Link>
         </div>
+      ) : (
+        repos.length > 0 && (
+          <div className="mt-4">
+            <RepoSources repos={repos} syncingId={syncingRepo} onSync={handleSyncRepo} />
+          </div>
+        )
       )}
 
       {/* Filter bar */}
@@ -473,6 +525,8 @@ export function Marketplace() {
               entries={secEntries}
               onOpen={handleCardOpen}
               onInstall={handleInstallClick}
+              airGap={airGap}
+              onImportBundle={goImport}
             />
           ))}
           {grouped.other.length > 0 && (
@@ -483,6 +537,8 @@ export function Marketplace() {
               entries={grouped.other}
               onOpen={handleCardOpen}
               onInstall={handleInstallClick}
+              airGap={airGap}
+              onImportBundle={goImport}
             />
           )}
         </div>
@@ -494,6 +550,8 @@ export function Marketplace() {
               entry={entry}
               onOpen={handleCardOpen}
               onInstall={handleInstallClick}
+              airGap={airGap}
+              onImportBundle={goImport}
             />
           ))}
         </div>
@@ -637,9 +695,11 @@ interface SectionProps {
   entries: MarketplaceCatalogEntry[];
   onOpen: (slug: string) => void;
   onInstall: (slug: string) => void;
+  airGap: boolean;
+  onImportBundle: () => void;
 }
 
-function Section({ icon, title, count, entries, onOpen, onInstall }: SectionProps) {
+function Section({ icon, title, count, entries, onOpen, onInstall, airGap, onImportBundle }: SectionProps) {
   return (
     <section>
       <div className="flex items-center gap-2 mb-2.5">
@@ -656,6 +716,8 @@ function Section({ icon, title, count, entries, onOpen, onInstall }: SectionProp
             entry={entry}
             onOpen={onOpen}
             onInstall={onInstall}
+            airGap={airGap}
+            onImportBundle={onImportBundle}
           />
         ))}
       </div>

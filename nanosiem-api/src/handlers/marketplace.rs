@@ -410,6 +410,16 @@ pub async fn sync_enrichment(
         ));
     }
 
+    // Air-gap guard: refuse cleanly BEFORE any egress for connectivity-required
+    // entries (identity sync, native bulk feed, deno with allowed_domains). No
+    // fetch attempt, no timeout — the operator side-loads a signed bundle via
+    // the air-gap import surface instead.
+    if state.config.airgap && entry.requires_network {
+        return Err(ApiError::Conflict(
+            "Unavailable in air-gapped mode — import a signed data bundle instead.".to_string(),
+        ));
+    }
+
     match entry.execution_backend.as_str() {
         "native" => {
             // Only IPinfo Lite is native — everything else is Deno via the GitHub repo
@@ -663,6 +673,17 @@ pub async fn create_repo(
         ApiError::Forbidden("Missing permission: enrichments:configure".to_string())
     })?;
 
+    // Air-gap guard: a GitHub-backed repo only makes sense with outbound
+    // internet (the create path validates the URL with a live DNS/SSRF check
+    // and every later sync egresses). Refuse cleanly rather than create a repo
+    // that can never sync.
+    if state.config.airgap {
+        return Err(ApiError::Conflict(
+            "Unavailable in air-gapped mode — repositories sync from GitHub, which requires outbound internet."
+                .to_string(),
+        ));
+    }
+
     let repo = MarketplaceRepository::new(state.pool.clone());
     let created = repo.create_repo(&request, Some(auth.user_id())).await?;
 
@@ -770,6 +791,14 @@ pub async fn sync_repo(
     check_permission(&auth, permissions::ENRICHMENTS_CONFIGURE).map_err(|_| {
         ApiError::Forbidden("Missing permission: enrichments:configure".to_string())
     })?;
+
+    // Air-gap guard: a repo sync clones from GitHub — refuse before egress.
+    if state.config.airgap {
+        return Err(ApiError::Conflict(
+            "Unavailable in air-gapped mode — repository sync requires outbound internet."
+                .to_string(),
+        ));
+    }
 
     let sync_service = MarketplaceSyncService::new(state.pool.clone());
     sync_service.start_sync(*id).await?;

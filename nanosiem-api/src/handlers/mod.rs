@@ -21,6 +21,9 @@ pub use nanosiem_enterprise::handlers::agent_enrichment;
 pub mod alerts;
 pub mod api_keys;
 pub mod audit;
+// Air-gapped deployment import handlers (NAN-1201) — enterprise only.
+#[cfg(feature = "enterprise")]
+pub mod airgap;
 pub mod auth;
 pub mod capabilities;
 // Cases + queues + queue-routing-rules + case-grouping settings handlers —
@@ -71,7 +74,6 @@ pub mod marketplace;
 pub use nanosiem_enterprise::handlers::melod;
 pub mod mfa;
 pub mod mitre;
-pub mod news;
 // Notebooks handlers — lifted to nanosiem-enterprise in NAN-752 (Phase 2 of
 // the open-core split). Re-exported here so route registrations
 // (`handlers::notebooks::list_notebooks`, etc.) continue to resolve.
@@ -126,7 +128,6 @@ pub use health::*;
 pub use lookup::*;
 #[cfg(feature = "enterprise")]
 pub use melod::*;
-pub use news::*;
 #[cfg(feature = "enterprise")]
 pub use notebooks::*;
 pub use notifications::*;

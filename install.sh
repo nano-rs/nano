@@ -276,6 +276,12 @@ verify_image_digests
 log "Starting services"
 docker compose -f "$COMPOSE_FILE" up -d
 
+# On a re-run/upgrade, `up -d` recreates the app containers (new IPs) but leaves
+# nginx as-is — and it won't have loaded an updated nginx.conf either. Reload
+# nginx so it picks up any config change and re-resolves upstream IPs, otherwise
+# it proxies dead old IPs and 502s until restarted (NAN-1237). Best-effort.
+docker exec nano-nginx nginx -s reload >/dev/null 2>&1 || true
+
 # ----------------------------------------------------------------------------
 # 5. Wait for API health
 # ----------------------------------------------------------------------------

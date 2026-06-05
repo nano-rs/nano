@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { AlertTriangle, Download, RefreshCw, Settings } from 'lucide-react';
+import { AlertTriangle, Download, RefreshCw, Settings, WifiOff, FileDown, Wifi } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { MarketplaceCatalogEntry } from '@/lib/api/marketplace';
+import { isIpInfoEntry, CC_BY_SA_4_URL } from '@/lib/api/marketplace';
 import { MonoSwatch, getCategoryTone } from './MonoSwatch';
 
 export type IntegrationState =
@@ -58,17 +59,54 @@ export function StateBadge({ state }: StateBadgeProps) {
   );
 }
 
+/**
+ * Air-gap connectivity badge. In an air-gapped install every card must carry a
+ * clear offline signal: "Available offline" for transform/offline-capable
+ * entries, a muted "Requires connectivity" for egress-dependent ones (which
+ * route to import-from-file instead of a doomed live sync). NAN-1212.
+ */
+export function AirgapBadge({ requiresNetwork }: { requiresNetwork: boolean }) {
+  if (requiresNetwork) {
+    return (
+      <span
+        title="This integration's live sync needs outbound internet. In air-gapped mode, import a signed data bundle instead."
+        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-mono text-[9.5px] uppercase tracking-[0.1em] border whitespace-nowrap bg-muted/40 border-border text-muted-foreground"
+      >
+        <WifiOff className="w-[10px] h-[10px]" />
+        Requires connectivity
+      </span>
+    );
+  }
+  return (
+    <span
+      title="Runs without outbound internet — works in air-gapped mode."
+      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-mono text-[9.5px] uppercase tracking-[0.1em] border whitespace-nowrap bg-emerald-500/10 border-emerald-500/30 text-emerald-500"
+    >
+      <Wifi className="w-[10px] h-[10px]" />
+      Available offline
+    </span>
+  );
+}
+
 interface IntegrationCardProps {
   entry: MarketplaceCatalogEntry;
   onOpen: (slug: string) => void;
   onInstall: (slug: string) => void;
+  /** Air-gapped install — reshape badges + actions for offline honesty. */
+  airGap?: boolean;
+  /** Route a connectivity-required entry to the air-gap import flow. */
+  onImportBundle?: () => void;
 }
 
-export function IntegrationCard({ entry, onOpen, onInstall }: IntegrationCardProps) {
+export function IntegrationCard({ entry, onOpen, onInstall, airGap = false, onImportBundle }: IntegrationCardProps) {
   const state = getIntegrationState(entry);
   const tone = getCategoryTone(entry.category);
   const monogram = (entry.name?.trim()?.[0] || '?').toUpperCase();
   const artifacts = entry.tags?.slice(0, 4) ?? [];
+  const requiresNetwork = entry.requires_network ?? false;
+  // In air-gap mode, a connectivity-required entry can't egress — its live
+  // install/sync action is replaced by an import-from-file affordance.
+  const egressBlocked = airGap && requiresNetwork;
 
   return (
     <button
@@ -86,7 +124,10 @@ export function IntegrationCard({ entry, onOpen, onInstall }: IntegrationCardPro
             <span style={{ color: tone }}>{CATEGORY_LABEL[entry.category] || entry.category}</span>
           </div>
         </div>
-        <StateBadge state={state} />
+        {/* Air-gap mode: every card carries a connectivity signal instead of
+            (only) the lifecycle badge, so nothing renders without an air-gap
+            cue. Otherwise the usual lifecycle state badge. */}
+        {airGap ? <AirgapBadge requiresNetwork={requiresNetwork} /> : <StateBadge state={state} />}
       </div>
 
       <p className="text-[11.5px] text-muted-foreground mt-3 line-clamp-2 leading-[1.5]" style={{ textWrap: 'pretty' }}>
@@ -104,14 +145,75 @@ export function IntegrationCard({ entry, onOpen, onInstall }: IntegrationCardPro
       )}
 
       <div className="mt-3.5 pt-3 border-t border-border/60 flex items-center justify-between min-h-[24px]">
-        <FooterStatus state={state} entry={entry} />
-        <FooterAction
-          state={state}
-          slug={entry.slug}
-          onInstall={onInstall}
-        />
+        {/* In air-gap mode, installed connectivity-required items show
+            freshness ("updated N days ago") since the live sync footer states
+            don't apply offline; everything else keeps the normal status. */}
+        {egressBlocked && entry.installed
+          ? <FreshnessStatus entry={entry} />
+          : <FooterStatus state={state} entry={entry} />}
+        {egressBlocked
+          ? <ImportBundleAction onImportBundle={onImportBundle} />
+          : <FooterAction state={state} slug={entry.slug} onInstall={onInstall} />}
       </div>
+
+      {/* CC BY-SA 4.0 redistribution credit for the native IPinfo Lite feed. */}
+      {isIpInfoEntry(entry) && <IpInfoCredit className="mt-2" />}
     </button>
+  );
+}
+
+/**
+ * Discreet attribution required by IPinfo Lite's CC BY-SA 4.0 license, shown
+ * wherever the IPinfo IP-enrichment entry surfaces. (NAN-1216)
+ */
+export function IpInfoCredit({ className }: { className?: string }) {
+  return (
+    <div className={cn('text-[10.5px] text-muted-foreground leading-tight', className)}>
+      Data © IPinfo ·{' '}
+      <a
+        href={CC_BY_SA_4_URL}
+        target="_blank"
+        rel="noreferrer"
+        onClick={(e) => e.stopPropagation()}
+        className="underline hover:text-foreground"
+      >
+        CC BY-SA 4.0
+      </a>
+    </div>
+  );
+}
+
+/** Air-gap freshness line for installed connectivity-required items: how long
+ *  ago the data was last refreshed (from a bundle import or prior sync). */
+function FreshnessStatus({ entry }: { entry: MarketplaceCatalogEntry }) {
+  if (!entry.last_sync_at) {
+    return <span className="text-[11px] text-muted-foreground font-mono">no data yet</span>;
+  }
+  const ago = formatAgo(entry.last_sync_at);
+  const count = entry.record_count > 0 ? ` · ${entry.record_count.toLocaleString()}` : '';
+  return (
+    <span
+      className="text-[11px] text-muted-foreground font-mono inline-flex items-center gap-1"
+      title={`Last updated: ${new Date(entry.last_sync_at).toLocaleString()}`}
+    >
+      updated {ago}{count}
+    </span>
+  );
+}
+
+/** Replaces the egress install/sync action with an import-from-file affordance
+ *  in air-gap mode. Routes to the air-gap import surface. */
+function ImportBundleAction({ onImportBundle }: { onImportBundle?: () => void }) {
+  const stop = (e: React.MouseEvent) => e.stopPropagation();
+  return (
+    <span
+      role="button"
+      tabIndex={0}
+      onClick={(e) => { stop(e); onImportBundle?.(); }}
+      className="h-6 px-2 rounded inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-primary hover:bg-primary/10 font-mono cursor-pointer"
+    >
+      <FileDown className="w-[10px] h-[10px]" /> import bundle
+    </span>
   );
 }
 

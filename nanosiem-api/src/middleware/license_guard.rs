@@ -33,6 +33,17 @@ const LICENSE_EXEMPT_PREFIXES: &[&str] = &[
     "/swagger-ui",
     "/api-docs",
     "/metrics",
+    // Build edition + capability flags. The SPA hits this on boot to decide
+    // which surfaces to render (incl. whether to show the license lockout
+    // overlay at all); a Locked install that 403'd it would render blank with
+    // no recovery path (NAN-1222).
+    "/api/capabilities",
+    // Offline-license import is the ONLY recovery path for a fail-closed
+    // air-gapped install (NAN-1222). It must stay reachable while Locked, or
+    // the operator can never unlock. Scoped to the exact license-import route —
+    // the other /api/airgap/* bundle imports (parsers/enrichment/rules/
+    // playbooks) intentionally remain guarded and require a valid license.
+    "/api/airgap/license/import",
 ];
 
 /// Middleware that enforces license status on all API requests.
@@ -57,7 +68,11 @@ pub async fn license_guard(
         return Ok(next.run(request).await);
     }
 
-    let status = license_status.read().await;
+    // Compute the effective status: read-time `expires_at` enforcement degrades
+    // an expired (incl. offline air-gap) license to Locked with no network
+    // (NAN-1206 / WS4). Online installs never carry a past `expires_at` while
+    // Active, so this is a no-op for them.
+    let status = license_status.read().await.effective(chrono::Utc::now());
 
     match status.state {
         LicenseState::Active => Ok(next.run(request).await),

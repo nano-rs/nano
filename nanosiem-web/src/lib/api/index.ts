@@ -62,6 +62,12 @@ export interface LicenseStatusResponse {
   grace_ends_at?: string;
   expires_at?: string;
   enforcement_enabled: boolean;
+  /**
+   * Air-gapped deployment (AIRGAP_MODE on). Air-gap installs enforce a signed
+   * offline license but have no phone-home, so `enforcement_enabled` is false
+   * here; treat `airgap || enforcement_enabled` as "enforced" (NAN-1222).
+   */
+  airgap?: boolean;
 }
 export type {
   MarketplaceCatalogEntry, EnrichmentMarketplaceRepo, CatalogStats,
@@ -888,11 +894,6 @@ class ApiClient {
 
   async updateDeveloperSettings(request: import('./types').UpdateDeveloperSettingsRequest): Promise<import('./types').DeveloperSettings> {
     return this._core.updateDeveloperSettings(request);
-  }
-
-  // News Feed
-  async getNews(): Promise<import('./types').NewsResponse> {
-    return this.request<import('./types').NewsResponse>('/api/news');
   }
 
   // Tuning

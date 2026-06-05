@@ -674,6 +674,12 @@ pub struct ClickHouseSqlGenerator {
     max_mvexpand_rows: usize,
     /// Time range set during generation for subsearch IN subqueries
     generation_time_range: RwLock<Option<TimeRange>>,
+    /// Field names produced by earlier pipeline commands (eval, stats aliases,
+    /// risk, …), set at the start of generation. A name in this set is a real
+    /// column in the current scope, so it must be referenced directly even when
+    /// it collides with a "known metadata" field (e.g. `risk_factors` after a
+    /// `| risk` command). (NAN-1236)
+    computed_fields: RwLock<HashSet<String>>,
 }
 
 impl Clone for ClickHouseSqlGenerator {
@@ -683,6 +689,7 @@ impl Clone for ClickHouseSqlGenerator {
             max_group_array_size: self.max_group_array_size,
             max_mvexpand_rows: self.max_mvexpand_rows,
             generation_time_range: RwLock::new(None),
+            computed_fields: RwLock::new(HashSet::new()),
         }
     }
 }
@@ -701,6 +708,7 @@ impl ClickHouseSqlGenerator {
             max_group_array_size: DEFAULT_MAX_GROUP_ARRAY_SIZE,
             max_mvexpand_rows: DEFAULT_MAX_MVEXPAND_ROWS,
             generation_time_range: RwLock::new(None),
+            computed_fields: RwLock::new(HashSet::new()),
         }
     }
 
@@ -711,6 +719,18 @@ impl ClickHouseSqlGenerator {
             max_group_array_size: DEFAULT_MAX_GROUP_ARRAY_SIZE,
             max_mvexpand_rows: DEFAULT_MAX_MVEXPAND_ROWS,
             generation_time_range: RwLock::new(None),
+            computed_fields: RwLock::new(HashSet::new()),
+        }
+    }
+
+    /// Whether `field` is produced by an earlier pipeline command (eval, stats
+    /// alias, risk, …) and is therefore a real column in the current scope —
+    /// rather than a value to extract from the `metadata`/`ext` JSON. Populated
+    /// for the duration of [`generate_with_options`]. (NAN-1236)
+    pub(crate) fn is_computed_field(&self, field: &str) -> bool {
+        match self.computed_fields.read() {
+            Ok(guard) => guard.contains(field),
+            Err(poisoned) => poisoned.get_ref().contains(field),
         }
     }
 
@@ -745,6 +765,15 @@ impl ClickHouseSqlGenerator {
             Err(poisoned) => *poisoned.into_inner() = Some(time_range.clone()),
         }
 
+        // Record the fields computed by pipeline commands (risk, eval, stats
+        // aliases, …) so `field_to_sql_expr` references them as real columns
+        // instead of JSON-extracting from `metadata`/`ext` (NAN-1236).
+        let computed = field_analysis::collect_computed_field_names(query);
+        match self.computed_fields.write() {
+            Ok(mut guard) => *guard = computed,
+            Err(poisoned) => *poisoned.into_inner() = computed,
+        }
+
         let mut ctx = GeneratorContext::new(&self.table_name, time_range);
         ctx.use_cache = options.use_cache;
         if let Some(limit) = options.limit {
@@ -763,6 +792,10 @@ impl ClickHouseSqlGenerator {
         match self.generation_time_range.write() {
             Ok(mut guard) => *guard = None,
             Err(poisoned) => *poisoned.into_inner() = None,
+        }
+        match self.computed_fields.write() {
+            Ok(mut guard) => guard.clear(),
+            Err(poisoned) => poisoned.into_inner().clear(),
         }
         result
     }

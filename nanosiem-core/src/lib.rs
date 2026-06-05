@@ -20,6 +20,7 @@
 //! - AI-powered agent enrichment for alert triage
 //! - Unified audit logging to ClickHouse
 
+pub mod airgap;
 pub mod audit;
 pub mod auth;
 pub mod crypto;

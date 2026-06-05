@@ -180,15 +180,19 @@ services:
     # error at startup. Enterprise's Hetzner deploy pre-creates the host dirs
     # so it never hit this; OSS users on a clean Docker host would.
     entrypoint: ["/bin/sh", "-c"]
-    # NAN-813: `--config-dir` is recursive, so a single `--config-dir /etc/vector`
-    # already picks up every .toml under /etc/vector/{sources,sinks,dynamic}/...
-    # The previous compose listed the subdirs explicitly on top of the parent
-    # scan, which loaded every parser twice and tripped Vector with
-    # "duplicate transform id found" on first boot.
+    # NAN-1234: `--config-dir` is NOT recursive in Vector 0.52 — a single
+    # `--config-dir /etc/vector` loads only the top-level static TOMLs and SILENTLY
+    # DROPS every ingested event, because the api-delivered router + clickhouse_logs
+    # sink under dynamic/sources/parsers never load. List each dynamic dir explicitly
+    # (verified live: with one dir, 0/4 ingested events land; with all three, they do).
     command:
       - >
         mkdir -p /etc/vector/dynamic/sources/parsers /etc/vector/dynamic/sources/configs &&
-        exec /usr/bin/vector --config-dir /etc/vector --watch-config
+        exec /usr/bin/vector
+        --config-dir /etc/vector
+        --config-dir /etc/vector/dynamic/sources/parsers
+        --config-dir /etc/vector/dynamic/sources/configs
+        --watch-config
     environment:
       VECTOR_AUTH_TOKEN: ${VECTOR_AUTH_TOKEN}
       VECTOR_DATA_DIR: /var/lib/vector

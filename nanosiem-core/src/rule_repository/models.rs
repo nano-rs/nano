@@ -449,3 +449,24 @@ pub struct MissingFieldCount {
     pub count: i32,
     pub source_types_with_field: Vec<String>,
 }
+
+// =============================================================================
+// Air-gapped Bundle Import (NAN-1220)
+// =============================================================================
+
+/// Aggregate result of syncing an air-gapped rule bundle into the synthetic
+/// air-gap repository's catalog (NAN-1226). This is the offline equivalent of
+/// a GitHub repo *sync* — the rules land as available-to-import; nothing is
+/// imported or activated. The synthetic repository is returned so callers can
+/// browse/import via the normal rule-repository surface.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RuleBundleImportResult {
+    /// The synthetic air-gap repository the bundle rules landed in.
+    #[serde(with = "typeid::rule_repo")]
+    #[schema(value_type = String)]
+    pub repository_id: Uuid,
+    /// Caller-defined content version from the bundle manifest.
+    pub content_version: String,
+    /// Number of rules synced (upserted) into the repository catalog.
+    pub synced: usize,
+}

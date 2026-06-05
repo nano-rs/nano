@@ -202,3 +202,24 @@ pub struct PlaybookSyncResult {
     pub duration_ms: u64,
     pub error: Option<String>,
 }
+
+// =============================================================================
+// Air-gapped Bundle Sync (NAN-1226)
+// =============================================================================
+
+/// Aggregate result of syncing an air-gapped playbook bundle into the synthetic
+/// air-gap repository's catalog (NAN-1226). This is the offline equivalent of a
+/// GitHub repo *sync* — the playbooks land as available-to-import; nothing is
+/// imported or activated. The synthetic repository is returned so callers can
+/// browse/import via the normal playbook-repository surface.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PlaybookBundleImportResult {
+    /// The synthetic air-gap repository the bundle playbooks landed in.
+    #[serde(with = "typeid::playbook_repo")]
+    #[schema(value_type = String)]
+    pub repository_id: Uuid,
+    /// Caller-defined content version from the bundle manifest.
+    pub content_version: String,
+    /// Number of playbooks synced (upserted) into the repository catalog.
+    pub synced: usize,
+}

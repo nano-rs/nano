@@ -3,6 +3,7 @@
 // NAN-504 — header strip, toolbar, table, row, and per-row action.
 // Port of design-ref/shadcn/repos-view.jsx (header) and repos-table.jsx.
 
+import type { ReactNode } from 'react';
 import {
   Box,
   Clock,
@@ -27,9 +28,14 @@ interface HeaderProps {
   onSyncNow: () => void;
   onOpenHistory: () => void;
   syncing: boolean;
+  /**
+   * Air-gap mode (NAN-1226): when provided, replaces the egress "Sync now"
+   * control with an offline bundle-sync affordance.
+   */
+  airgapSlot?: ReactNode;
 }
 
-export function ReposHeader({ repo, onSyncNow, onOpenHistory, syncing }: HeaderProps) {
+export function ReposHeader({ repo, onSyncNow, onOpenHistory, syncing, airgapSlot }: HeaderProps) {
   return (
     <div className="shrink-0 border-b border-border bg-card/30 px-5 py-3.5 flex items-start gap-4">
       <div className="w-[38px] h-[38px] rounded-lg border border-border bg-card flex items-center justify-center shrink-0">
@@ -50,40 +56,44 @@ export function ReposHeader({ repo, onSyncNow, onOpenHistory, syncing }: HeaderP
         </div>
       </div>
 
-      {repo && (
-        <div className="hidden md:flex items-center gap-2.5 rounded-lg border border-border bg-card pl-3 pr-1 py-1 shrink-0">
-          <SiGithub className="w-[13px] h-[13px] text-foreground/70" />
-          <div className="flex flex-col">
-            <div className="font-mono text-[11px] text-foreground truncate">{repo.slug}</div>
-            <div className="text-[10px] text-muted-foreground font-mono flex items-center gap-1">
-              <GitBranch className="w-[9px] h-[9px]" strokeWidth={1.5} />
-              {repo.branch} · {repo.lastCommit.sha}
+      {airgapSlot ? (
+        <div className="flex items-center shrink-0">{airgapSlot}</div>
+      ) : (
+        repo && (
+          <div className="hidden md:flex items-center gap-2.5 rounded-lg border border-border bg-card pl-3 pr-1 py-1 shrink-0">
+            <SiGithub className="w-[13px] h-[13px] text-foreground/70" />
+            <div className="flex flex-col">
+              <div className="font-mono text-[11px] text-foreground truncate">{repo.slug}</div>
+              <div className="text-[10px] text-muted-foreground font-mono flex items-center gap-1">
+                <GitBranch className="w-[9px] h-[9px]" strokeWidth={1.5} />
+                {repo.branch} · {repo.lastCommit.sha}
+              </div>
             </div>
+            <div className="w-px h-7 bg-border mx-1" />
+            <button
+              type="button"
+              onClick={onOpenHistory}
+              className="h-[26px] px-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-foreground/5 text-[10.5px] font-mono flex items-center gap-1"
+            >
+              <Clock className="w-[11px] h-[11px]" strokeWidth={1.5} />
+              {repo.lastSync.relative}
+            </button>
+            <button
+              type="button"
+              onClick={onSyncNow}
+              disabled={syncing}
+              className={cn(
+                'h-[26px] px-2 rounded-md text-[10.5px] font-mono flex items-center gap-1 border',
+                syncing
+                  ? 'border-border bg-foreground/5 text-muted-foreground cursor-not-allowed'
+                  : 'border-border bg-card hover:bg-muted text-foreground/70 hover:text-foreground',
+              )}
+            >
+              <RefreshCw className={cn('w-[11px] h-[11px]', syncing && 'animate-spin')} strokeWidth={1.5} />
+              {syncing ? 'Syncing…' : 'Sync now'}
+            </button>
           </div>
-          <div className="w-px h-7 bg-border mx-1" />
-          <button
-            type="button"
-            onClick={onOpenHistory}
-            className="h-[26px] px-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-foreground/5 text-[10.5px] font-mono flex items-center gap-1"
-          >
-            <Clock className="w-[11px] h-[11px]" strokeWidth={1.5} />
-            {repo.lastSync.relative}
-          </button>
-          <button
-            type="button"
-            onClick={onSyncNow}
-            disabled={syncing}
-            className={cn(
-              'h-[26px] px-2 rounded-md text-[10.5px] font-mono flex items-center gap-1 border',
-              syncing
-                ? 'border-border bg-foreground/5 text-muted-foreground cursor-not-allowed'
-                : 'border-border bg-card hover:bg-muted text-foreground/70 hover:text-foreground',
-            )}
-          >
-            <RefreshCw className={cn('w-[11px] h-[11px]', syncing && 'animate-spin')} strokeWidth={1.5} />
-            {syncing ? 'Syncing…' : 'Sync now'}
-          </button>
-        </div>
+        )
       )}
     </div>
   );

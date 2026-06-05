@@ -12,6 +12,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel,
 import { DateTimeRangePicker } from '@/components/ui/date-time-range-picker';
 import { formatTimelineLabel, parseUTCTimestamp } from '@/lib/date-utils';
 import { cn, injectBeforeFirstPipe, isClickHouseDefault, stripComments } from '@/lib/utils';
+import { safeRandomUUID } from '@/lib/uuid';
 import {
   Search as SearchIcon,
   ChevronDown,
@@ -1499,8 +1500,9 @@ export function Search() {
     
     if (abortControllerRef.current) abortControllerRef.current.abort();
     abortControllerRef.current = new AbortController();
-    // Generate a unique request ID for query tracking and server-side cancellation
-    const requestId = crypto.randomUUID();
+    // Generate a unique request ID for query tracking and server-side cancellation.
+    // safeRandomUUID() works over plain HTTP, where crypto.randomUUID is undefined (NAN-1235).
+    const requestId = safeRandomUUID();
     currentRequestIdRef.current = requestId;
     setSearchError(null);
     setQueryReviewSuggestions([]);

@@ -65,6 +65,10 @@ tempfile = "3.25"
 vrl = "0.30"
 # Structured TOML emission for generated Vector source configs (NAN-689)
 toml = "0.9"
+# Air-gapped signed bundle verification (NAN-1202): detached Ed25519 signature
+# over a canonical manifest + streaming tar.gz payload checksum verification.
+ed25519-dalek = "2"
+tar = "0.4"
 
 [features]
 # Enterprise-only modules that are stripped from the open edition. Enabled

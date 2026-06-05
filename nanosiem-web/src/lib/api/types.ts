@@ -2026,6 +2026,10 @@ export interface SystemConfig {
   settings_editable: boolean;
   api_keys_editable: boolean;
   ai_providers_editable: boolean;
+  /** True when this install runs air-gapped (no outbound internet). The
+   *  marketplace uses this to badge connectivity-required items, hide egress
+   *  actions, and promote import-from-file. */
+  air_gap: boolean;
 }
 
 export interface SearchSummary {
@@ -3328,30 +3332,6 @@ export interface TuningProposalListParams {
   proposal_type?: ProposalType;
   limit?: number;
   offset?: number;
-}
-
-// Cybersecurity News Feed
-export interface NewsItem {
-  title: string;
-  link: string;
-  source: string;
-  source_id: string;
-  published: string | null;
-  summary: string | null;
-}
-
-export interface NewsSourceStatus {
-  name: string;
-  id: string;
-  status: string;
-  item_count: number;
-  error?: string;
-}
-
-export interface NewsResponse {
-  items: NewsItem[];
-  last_updated: string;
-  sources: NewsSourceStatus[];
 }
 
 // ============================================================================

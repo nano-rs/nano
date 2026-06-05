@@ -45,6 +45,10 @@ impl MarketplaceRepository {
     /// for whichever path skips it (NAN-1108).
     fn hydrate(mut entry: MarketplaceCatalogEntry) -> MarketplaceCatalogEntry {
         entry.has_credentials = entry.credentials_encrypted.is_some();
+        // requires_network is a derived field (execution backend + allowed_domains),
+        // not a stored column — compute it here so every entry-returning path carries
+        // it (the air-gap marketplace badges + egress-gating depend on it).
+        entry.requires_network = entry.compute_requires_network();
         entry
     }
 

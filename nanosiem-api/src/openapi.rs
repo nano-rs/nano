@@ -35,6 +35,7 @@ use crate::handlers;
         (name = "api_keys", description = "API key management"),
         (name = "sessions", description = "Session management"),
         (name = "audit", description = "Audit log viewing and export"),
+        (name = "airgap", description = "Air-gapped offline bundle import (signed parsers / IP & IOC enrichment / license)"),
         (name = "oidc", description = "OIDC provider configuration and authentication"),
         (name = "search", description = "Search queries, saved searches, field stats, and asset events (served by the search microservice on port 3002)"),
         (name = "search_history", description = "Per-user search history"),
@@ -69,7 +70,6 @@ use crate::handlers;
         (name = "playbooks", description = "SOC investigation playbook library (markdown + slash-command format)"),
         (name = "playbook_repositories", description = "External playbook repository syncing and import"),
         (name = "upload", description = "File upload and preview"),
-        (name = "news", description = "Security news feed"),
         (name = "marketplace", description = "Enrichment marketplace (unified catalog, repos, install/uninstall)"),
         (name = "gdpr", description = "GDPR data subject anonymization"),
         (name = "ip_allowlist", description = "IP allowlist management for access control"),
@@ -160,7 +160,6 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
         handlers::playbook_repositories::PlaybookRepositoriesApiDoc::openapi(),
         handlers::marketplace::MarketplaceApiDoc::openapi(),
         handlers::upload::UploadApiDoc::openapi(),
-        handlers::news::NewsApiDoc::openapi(),
         handlers::gdpr::GdprApiDoc::openapi(),
         handlers::ip_allowlist::IpAllowlistApiDoc::openapi(),
         handlers::onboarding::OnboardingApiDoc::openapi(),
@@ -194,6 +193,13 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
         // OIDC / SSO — open-core split (NAN-745). Gated alongside the
         // handler module; the open spec omits these paths entirely.
         sub_docs.push(handlers::oidc::OidcApiDoc::openapi());
+        // Air-gapped bundle import (NAN-1201) — enterprise only.
+        sub_docs.push(handlers::airgap::parsers::AirgapParsersApiDoc::openapi());
+        sub_docs.push(handlers::airgap::enrichment::AirgapEnrichmentApiDoc::openapi());
+        sub_docs.push(handlers::airgap::license::AirgapLicenseApiDoc::openapi());
+        // Air-gapped rule + playbook bundle import (NAN-1220) — enterprise only.
+        sub_docs.push(handlers::airgap::rules::AirgapRulesApiDoc::openapi());
+        sub_docs.push(handlers::airgap::playbooks::AirgapPlaybooksApiDoc::openapi());
     }
 
     for sub in sub_docs {
@@ -261,10 +267,13 @@ mod tests {
         //   incidents (~5) + case-grouping settings (~6) ≈ ~150.
         // Open clears ~366; enterprise ~470 (floors, current values higher).
         // NAN-1093 added 2 enterprise paths: /inbox-counts + /inbox-incidents.
+        // NAN-1201 added 3 enterprise paths: air-gap parsers/enrichment/license import.
+        // NAN-1220 added 2 enterprise paths: air-gap rules/playbooks import.
+        // NAN-1232 removed 1 shared path: /api/news (dead cybersecurity news feed).
         #[cfg(feature = "enterprise")]
-        let min_paths = 470;
+        let min_paths = 474;
         #[cfg(not(feature = "enterprise"))]
-        let min_paths = 366;
+        let min_paths = 365;
 
         assert!(
             path_count >= min_paths,

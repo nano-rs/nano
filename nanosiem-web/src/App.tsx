@@ -203,6 +203,7 @@ const UserSettings = lazyWithRetryNamed(() => import('@/pages/Settings/UserSetti
 const WebhookSettings = lazyWithRetryNamed(() => import('@/pages/Settings/WebhookSettings'), 'WebhookSettings');
 const SearchSettings = lazyWithRetryNamed(() => import('@/pages/Settings/SearchSettings'), 'SearchSettings');
 const GdprAnonymization = lazyWithRetryNamed(() => import('@/pages/Settings/GdprAnonymization'), 'GdprAnonymizationPage');
+const AirgapImportPage = lazyWithRetryNamed(() => import('@/enterprise/airgap/AirgapImportPage'), 'AirgapImportPage');
 
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? '';
 
@@ -885,6 +886,13 @@ function ProtectedAppRoutes() {
             <PermissionRoute permission="gdpr:anonymize" element={
               <Suspense fallback={<SettingsLoadingFallback />}>
                 <GdprAnonymization key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/settings/airgap-import" element={
+            <PermissionRoute permission="settings:system" element={
+              <Suspense fallback={<SettingsLoadingFallback />}>
+                <AirgapImportPage key={resetKey} />
               </Suspense>
             } />
           } />

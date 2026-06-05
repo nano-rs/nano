@@ -371,6 +371,7 @@ async fn run_sync(
             last_error: existing.as_ref().and_then(|e| e.last_error.clone()),
             record_count: existing.as_ref().map(|e| e.record_count).unwrap_or(0),
             is_syncing: false, // derived per-query in repository; not stored
+            requires_network: false, // derived in repository hydrate; not stored
             changelog: manifest.changelog.clone(),
             created_at: existing
                 .as_ref()

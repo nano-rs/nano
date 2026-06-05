@@ -12,6 +12,8 @@ import { useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, ArrowUpRight } from 'lucide-react';
 import { useSyncCompleteEffect } from '@/hooks/use-sync-complete';
+import { ImportBundleButton } from '@/components/airgap/ImportBundleButton';
+import { importRulesBundle } from '@/lib/api/airgap';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
@@ -50,6 +52,19 @@ export function RuleRepositories() {
   const { toast } = useToast();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+
+  // Air-gap mode: rule repositories sync from Git over the internet, which is
+  // unavailable offline. The page stays usable (browse + import); the egress
+  // controls (connect-repo / sync-from-Git) are swapped for an offline
+  // bundle-sync control that populates the catalog in place (NAN-1226).
+  const airGap =
+    useQuery({ queryKey: ['system', 'config'], queryFn: () => api.getSystemConfig() })
+      .data?.air_gap ?? false;
+
+  const refetchCatalog = () => {
+    queryClient.invalidateQueries({ queryKey: ['rule-repositories'] });
+    queryClient.invalidateQueries({ queryKey: ['rule-repository-rules', activeRepoId] });
+  };
 
   const [activeRepoId, setActiveRepoId] = useState<string | null>(null);
   const [activeCat, setActiveCat] = useState<CategoryCount['id']>('all');
@@ -396,52 +411,82 @@ export function RuleRepositories() {
               Rule repositories
             </div>
             <div className="text-[11.5px] text-muted-foreground mt-0.5 leading-relaxed max-w-[740px]">
-              Track detections from Git. Sync upstream rules, preview diffs, remap sources, and
-              import — bulk or one-by-one.
+              {airGap
+                ? 'Offline deployment. Upload a signed rule bundle to populate the catalog, then preview, remap sources, and import — bulk or one-by-one.'
+                : 'Track detections from Git. Sync upstream rules, preview diffs, remap sources, and import — bulk or one-by-one.'}
             </div>
           </div>
-          <button
-            type="button"
-            onClick={() => setAddOpen(true)}
-            className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium"
-          >
-            Connect a repo
-          </button>
+          {airGap ? (
+            <ImportBundleButton
+              noun="rules"
+              onUpload={importRulesBundle}
+              onSynced={refetchCatalog}
+            />
+          ) : (
+            <button
+              type="button"
+              onClick={() => setAddOpen(true)}
+              className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium"
+            >
+              Connect a repo
+            </button>
+          )}
         </div>
         <div className="flex-1 flex items-center justify-center p-8 text-center">
           <div className="max-w-md">
-            <div className="text-[14px] font-medium text-foreground mb-2">No repositories connected</div>
-            <div className="text-[12px] text-muted-foreground leading-relaxed mb-4">
-              Connect a Git repository to sync detection rules. Start with the official{' '}
-              <code className="font-mono text-foreground/80">nano-sh/rules</code> repo or bring your own.
+            <div className="text-[14px] font-medium text-foreground mb-2">
+              {airGap ? 'No rules synced yet' : 'No repositories connected'}
             </div>
-            <div className="flex items-center justify-center gap-2">
-              <button
-                type="button"
-                onClick={() =>
-                  createMutation.mutate({
-                    name: 'nano rules',
-                    url: 'https://github.com/nano-rs/rules',
-                    description: 'Official nano detection rules in native nPL format',
-                    branch: 'main',
-                    rules_path: '',
-                    rule_format: 'nanosiem',
-                    auto_sync_enabled: false,
-                  })
-                }
-                disabled={createMutation.isPending}
-                className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium"
-              >
-                {createMutation.isPending ? 'Adding…' : 'Add nano rules'}
-              </button>
-              <button
-                type="button"
-                onClick={() => setAddOpen(true)}
-                className="h-[28px] px-3 rounded-md border border-border bg-card hover:bg-muted text-[11.5px] font-medium text-foreground/80"
-              >
-                Connect custom repo
-              </button>
-            </div>
+            {airGap ? (
+              <>
+                <div className="text-[12px] text-muted-foreground leading-relaxed mb-4">
+                  This deployment is air-gapped. Upload a signed rule bundle
+                  (<code className="font-mono text-foreground/80">.tar.gz</code>) to populate the
+                  catalog — rules then appear here available to import.
+                </div>
+                <div className="flex items-center justify-center">
+                  <ImportBundleButton
+                    noun="rules"
+                    onUpload={importRulesBundle}
+                    onSynced={refetchCatalog}
+                  />
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="text-[12px] text-muted-foreground leading-relaxed mb-4">
+                  Connect a Git repository to sync detection rules. Start with the official{' '}
+                  <code className="font-mono text-foreground/80">nano-sh/rules</code> repo or bring your own.
+                </div>
+                <div className="flex items-center justify-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      createMutation.mutate({
+                        name: 'nano rules',
+                        url: 'https://github.com/nano-rs/rules',
+                        description: 'Official nano detection rules in native nPL format',
+                        branch: 'main',
+                        rules_path: '',
+                        rule_format: 'nanosiem',
+                        auto_sync_enabled: false,
+                      })
+                    }
+                    disabled={createMutation.isPending}
+                    className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium"
+                  >
+                    {createMutation.isPending ? 'Adding…' : 'Add nano rules'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setAddOpen(true)}
+                    className="h-[28px] px-3 rounded-md border border-border bg-card hover:bg-muted text-[11.5px] font-medium text-foreground/80"
+                  >
+                    Connect custom repo
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
 
@@ -474,6 +519,15 @@ export function RuleRepositories() {
         onSyncNow={() => syncMutation.mutate(activeRepo.id)}
         onOpenHistory={() => setHistoryOpen(true)}
         syncing={syncMutation.isPending && syncMutation.variables === activeRepo.id}
+        airgapSlot={
+          airGap ? (
+            <ImportBundleButton
+              noun="rules"
+              onUpload={importRulesBundle}
+              onSynced={refetchCatalog}
+            />
+          ) : undefined
+        }
       />
 
       <div

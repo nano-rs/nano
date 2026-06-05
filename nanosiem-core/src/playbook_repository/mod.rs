@@ -15,9 +15,10 @@ pub mod service;
 
 pub use error::PlaybookRepositoryError;
 pub use models::{
-    NewPlaybookRepository, PlaybookImport, PlaybookImportRequest, PlaybookImportResponse,
-    PlaybookImportType, PlaybookRepository, PlaybookSyncResult, PlaybookSyncStatus,
-    RepositoryPlaybook, RepositoryPlaybookFilter, UpdatePlaybookRepository,
+    NewPlaybookRepository, PlaybookBundleImportResult, PlaybookImport,
+    PlaybookImportRequest, PlaybookImportResponse, PlaybookImportType, PlaybookRepository,
+    PlaybookSyncResult, PlaybookSyncStatus, RepositoryPlaybook, RepositoryPlaybookFilter,
+    UpdatePlaybookRepository,
 };
 pub use repository::{
     PlaybookImportsRepository, PlaybookImportsRepositoryError, PlaybookRepoRepository,

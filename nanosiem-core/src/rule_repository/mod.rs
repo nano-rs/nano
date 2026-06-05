@@ -45,10 +45,10 @@ pub use coverage::{CoverageAnalyzer, CoverageAnalyzerError};
 pub use error::RuleRepositoryError;
 pub use github_client::{FileContent, GitHubClient, GitHubClientError, TreeEntry};
 pub use models::{
-    ConversionTriageHints, CoverageAnalysis, CoverageFilter, CoverageResult, FolderInfo,
-    ImportOutcome, ImportPreview, ImportRequest, ImportType, NewRuleRepository, RepositoryRule,
-    RepositoryRuleFilter, RuleImport, RuleRepository, SourceTypeSuggestion, SyncResult, SyncStatus,
-    UpdateRuleRepository, UpdatedRule, UpstreamDiff,
+    ConversionTriageHints, CoverageAnalysis, CoverageFilter, CoverageResult,
+    FolderInfo, ImportOutcome, ImportPreview, ImportRequest, ImportType, NewRuleRepository,
+    RepositoryRule, RepositoryRuleFilter, RuleBundleImportResult, RuleImport, RuleRepository,
+    SourceTypeSuggestion, SyncResult, SyncStatus, UpdateRuleRepository, UpdatedRule, UpstreamDiff,
 };
 pub use npl_parser::{
     extract_source_types, parse_npl, validate_source_types, AiTriageHints, NplParseError, NplRule,

@@ -15,7 +15,7 @@ use crate::db::repository::NotificationRepository;
 use crate::db::DualPool;
 use crate::models::notification::{NewNotification, NotificationType};
 
-use super::ai_monitor::AiMonitor;
+use super::ai_monitor::{AiMonitor, AiProviderConnectivityChecker};
 use super::feed_monitor::FeedMonitor;
 use super::repository::HealthRepository;
 use super::types::{HealthIssueType, HealthSchedulerConfig};
@@ -31,17 +31,24 @@ pub struct HealthScheduler {
 }
 
 impl HealthScheduler {
-    /// Create a new scheduler with DualPool support
+    /// Create a new scheduler with DualPool support.
+    ///
+    /// `ai_checker` is the injected, on-prem-`base_url`-aware provider
+    /// connectivity test (NAN-1231); `None` skips AI-provider health checks
+    /// (open-core / no AI surface). `airgap` skips probing any provider without
+    /// an on-prem `base_url` so the monitor never beacons to a public host.
     pub fn with_dual_pool(
         pool: PgPool,
         dual_pool: DualPool,
         config: HealthSchedulerConfig,
+        ai_checker: Option<Arc<dyn AiProviderConnectivityChecker>>,
+        airgap: bool,
     ) -> Self {
         Self {
             config,
             health_repo: HealthRepository::new(pool.clone()),
             notification_repo: NotificationRepository::new(pool.clone()),
-            ai_monitor: AiMonitor::new(pool.clone()),
+            ai_monitor: AiMonitor::new(pool.clone(), ai_checker, airgap),
             feed_monitor: FeedMonitor::with_clickhouse(pool, dual_pool.clickhouse().clone()),
             audit_emitter: AuditEmitter::new(dual_pool),
         }

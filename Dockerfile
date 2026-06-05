@@ -48,6 +48,14 @@ ARG EDITION=enterprise
 RUN test "$EDITION" = "enterprise" || test "$EDITION" = "open" \
     || (echo "Invalid EDITION='$EDITION' (expected 'enterprise' or 'open')" >&2 && exit 1)
 
+# Air-gap bundle signing public key (NAN-1210). nanosiem-core/build.rs embeds
+# this at compile time so verify_bundle trusts it; left empty -> the release
+# guard refuses the dev placeholder (no bundles verify). Non-secret (it's the
+# public half), passed as a build-arg from the build workflow. ENV so the
+# `cargo build` step below (where build.rs runs) sees it.
+ARG AIRGAP_BUNDLE_PUBLIC_KEY_HEX=""
+ENV AIRGAP_BUNDLE_PUBLIC_KEY_HEX=${AIRGAP_BUNDLE_PUBLIC_KEY_HEX}
+
 # Cook dependencies (cached unless Cargo.toml/Cargo.lock change). Cook with
 # the same feature set as the build below so the cached deps aren't a miss.
 COPY --from=planner /app/recipe.json recipe.json

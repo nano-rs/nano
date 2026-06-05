@@ -54,6 +54,13 @@ pub struct ApiConfig {
     pub license_token: Option<String>,
     /// Unique deployment identifier assigned by nano-main
     pub deployment_id: Option<String>,
+    /// Air-gapped install: no outbound internet. Orthogonal to `deployment_mode`
+    /// (an air-gap install is still self-hosted), so it's a separate flag rather
+    /// than a 4th `DeploymentMode` variant. Read from `AIRGAP_MODE` ("1"/"true").
+    /// When true, marketplace egress paths (deno/native/identity sync, GitHub
+    /// repo sync) refuse cleanly instead of attempting a doomed fetch — bundles
+    /// come in via the air-gap import surface instead.
+    pub airgap: bool,
 }
 
 impl ApiConfig {
@@ -98,6 +105,9 @@ impl ApiConfig {
                 .ok()
                 .or_else(|| env::var("HEARTBEAT_TOKEN").ok()),
             deployment_id: env::var("NANO_DEPLOYMENT_ID").ok(),
+            airgap: env::var("AIRGAP_MODE")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
         }
     }
 
@@ -111,6 +121,41 @@ impl ApiConfig {
     /// and NANO_DEPLOYMENT_ID.
     pub fn is_license_enabled(&self) -> bool {
         self.license_url.is_some() && self.license_token.is_some() && self.deployment_id.is_some()
+    }
+
+    /// Whether background jobs that make outbound network calls (IPinfo
+    /// enrichment, identity sync, GitHub repo auto-sync, marketplace, model
+    /// catalog, remote inputlookup ingestion) are allowed to start.
+    ///
+    /// Air-gapped installs have no outbound internet, so these egress jobs are
+    /// skipped at their spawn sites — content arrives via the air-gap import
+    /// surface instead. Internal jobs (detection, tuning, cleanups) are
+    /// unaffected by this predicate.
+    pub fn egress_jobs_enabled(&self) -> bool {
+        !self.airgap
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn egress_jobs_enabled_by_default() {
+        // Connected / non-air-gap self-hosted: egress jobs run.
+        let config = ApiConfig::default();
+        assert!(!config.airgap);
+        assert!(config.egress_jobs_enabled());
+    }
+
+    #[test]
+    fn egress_jobs_disabled_in_airgap() {
+        // Air-gap mode: egress jobs must be skipped at their spawn sites.
+        let config = ApiConfig {
+            airgap: true,
+            ..ApiConfig::default()
+        };
+        assert!(!config.egress_jobs_enabled());
     }
 }
 
@@ -129,6 +174,7 @@ impl Default for ApiConfig {
             license_url: None,
             license_token: None,
             deployment_id: None,
+            airgap: false,
         }
     }
 }

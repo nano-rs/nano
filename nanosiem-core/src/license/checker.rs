@@ -133,6 +133,13 @@ impl LicenseChecker {
         if status.state != LicenseState::Active {
             return;
         }
+        // Air-gap installs (offline = TRUE) have no license server to reach, so
+        // a stale `last_checked_at` must NOT age them out (NAN-1206 / WS4). Hard
+        // expiry (`expires_at`) is still enforced at read time in
+        // `LicenseStatus::effective`, independently of staleness.
+        if status.offline {
+            return;
+        }
         if let Some(last_checked) = status.last_checked_at {
             let stale_threshold = chrono::Utc::now() - chrono::Duration::days(STALE_LICENSE_DAYS);
             if last_checked < stale_threshold {
@@ -261,6 +268,8 @@ impl LicenseChecker {
             expires_at,
             last_checked_at: Some(now),
             last_heartbeat_at: None, // legacy field, no longer updated
+            // Online check-in result: never an air-gap import.
+            offline: false,
         }
     }
 }

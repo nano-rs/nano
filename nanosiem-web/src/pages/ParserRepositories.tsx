@@ -28,6 +28,8 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, ArrowUpRight, ChevronDown, Eye, Loader2, Rocket } from 'lucide-react';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { TooltipProvider } from '@/components/ui/tooltip';
+import { ImportBundleButton } from '@/components/airgap/ImportBundleButton';
+import { importParserBundle } from '@/lib/api/airgap';
 import { cn } from '@/lib/utils';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useToast } from '@/hooks/use-toast';
@@ -74,6 +76,19 @@ export function ParserRepositories() {
   const { toast } = useToast();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+
+  // Air-gap mode: parser repositories sync from Git over the internet, which is
+  // unavailable offline. The page stays usable (browse + import); the egress
+  // controls (connect-repo / sync-from-Git) are swapped for an offline
+  // bundle-sync control that populates the catalog in place (NAN-1226).
+  const airGap =
+    useQuery({ queryKey: ['system', 'config'], queryFn: () => api.getSystemConfig() })
+      .data?.air_gap ?? false;
+
+  const refetchCatalog = () => {
+    queryClient.invalidateQueries({ queryKey: ['parser-repositories'] });
+    queryClient.invalidateQueries({ queryKey: ['parser-repository-parsers', activeRepoId] });
+  };
 
   const [activeRepoId, setActiveRepoId] = useState<string | null>(null);
   const [activeCat, setActiveCat] = useState<CategoryCount['id']>('all');
@@ -537,38 +552,65 @@ export function ParserRepositories() {
                 Parser repositories
               </div>
               <div className="text-[11.5px] text-muted-foreground mt-0.5 leading-relaxed max-w-[740px]">
-                Sync VRL parsers from Git. Preview the source, inspect the normalized schema, and
-                import as draft log sources.
+                {airGap
+                  ? 'Offline deployment. Upload a signed parser bundle to populate the catalog, then preview the source, inspect the schema, and import as log sources.'
+                  : 'Sync VRL parsers from Git. Preview the source, inspect the normalized schema, and import as draft log sources.'}
               </div>
             </div>
+            {airGap && (
+              <ImportBundleButton
+                noun="parsers"
+                onUpload={importParserBundle}
+                onSynced={refetchCatalog}
+              />
+            )}
           </div>
           <div className="flex-1 flex items-center justify-center p-8 text-center">
             <div className="max-w-md">
               <div className="text-[14px] font-medium text-foreground mb-2">
-                No repositories connected
+                {airGap ? 'No parsers synced yet' : 'No repositories connected'}
               </div>
-              <div className="text-[12px] text-muted-foreground leading-relaxed mb-4">
-                Sync the official{' '}
-                <code className="font-mono text-foreground/80">nano-sh/parsers</code> library to
-                pull in pre-built parsers for common log sources.
-              </div>
-              <button
-                type="button"
-                onClick={() =>
-                  createMutation.mutate({
-                    name: 'nano parsers',
-                    url: 'https://github.com/nano-rs/parsers',
-                    description: 'Official nano parsers for common log sources',
-                    branch: 'main',
-                    parsers_path: 'parsers/',
-                    auto_sync_enabled: false,
-                  })
-                }
-                disabled={createMutation.isPending}
-                className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium"
-              >
-                {createMutation.isPending ? 'Adding…' : 'Add nano parsers'}
-              </button>
+              {airGap ? (
+                <>
+                  <div className="text-[12px] text-muted-foreground leading-relaxed mb-4">
+                    This deployment is air-gapped. Upload a signed parser bundle
+                    (<code className="font-mono text-foreground/80">.tar.gz</code>) to populate the
+                    catalog — parsers then appear here available to import.
+                  </div>
+                  <div className="flex items-center justify-center">
+                    <ImportBundleButton
+                      noun="parsers"
+                      onUpload={importParserBundle}
+                      onSynced={refetchCatalog}
+                    />
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="text-[12px] text-muted-foreground leading-relaxed mb-4">
+                    Sync the official{' '}
+                    <code className="font-mono text-foreground/80">nano-sh/parsers</code> library to
+                    pull in pre-built parsers for common log sources.
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      createMutation.mutate({
+                        name: 'nano parsers',
+                        url: 'https://github.com/nano-rs/parsers',
+                        description: 'Official nano parsers for common log sources',
+                        branch: 'main',
+                        parsers_path: 'parsers/',
+                        auto_sync_enabled: false,
+                      })
+                    }
+                    disabled={createMutation.isPending}
+                    className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium"
+                  >
+                    {createMutation.isPending ? 'Adding…' : 'Add nano parsers'}
+                  </button>
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -586,6 +628,15 @@ export function ParserRepositories() {
           syncing={
             (syncMutation.isPending && syncMutation.variables === activeRepo.id) ||
             activeRepo.raw.last_sync_status === 'syncing'
+          }
+          airgapSlot={
+            airGap ? (
+              <ImportBundleButton
+                noun="parsers"
+                onUpload={importParserBundle}
+                onSynced={refetchCatalog}
+              />
+            ) : undefined
           }
         />
 

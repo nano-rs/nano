@@ -495,3 +495,65 @@ fn realistic_resolve_then_stats() {
     assert!(sql.contains("ASOF LEFT JOIN"), "Should have identity join");
     assert!(sql.contains("GROUP BY"), "Should aggregate");
 }
+
+// ============================================================================
+// risk command — computed fields vs. metadata extraction (NAN-1236)
+//
+// `risk_factors` / `raw_risk_score` are in `is_known_metadata_field` (correct
+// for searching STORED signal events, where they live in the `metadata` JSON).
+// But after a live `| risk` command they are real computed columns. A `table`
+// projection must reference them directly, not `JSONExtract*(metadata, …)` —
+// otherwise the query errors (`Unknown identifier metadata`) once a `stats`
+// upstream has dropped the `metadata` column. This was breaking shipped
+// detection rules (ransomware, kerberoasting, port-scanning, …).
+// ============================================================================
+
+/// The exact failing shape: stats → risk → table risk_factors. The output must
+/// reference `risk_factors` as a real column and must NOT touch `metadata`.
+#[test]
+fn risk_factors_after_stats_and_risk_is_direct_column_not_metadata_extract() {
+    let sql = npl(
+        r#"source_type="windows_security" | where event_type="ticket_request" | stats count() as count, dc(dest_host) as unique_targets by user | risk score=75 entity=user factor="Multiple TGS requests" | where unique_targets>15 | risk score=90 factor="Likely Kerberoasting" | table user, count, unique_targets, risk_score, risk_factors"#,
+    );
+    // The risk command produces a real risk_factors array column...
+    assert!(
+        sql.contains("AS risk_factors"),
+        "risk command should project a real risk_factors column:\n{sql}"
+    );
+    // ...and the `table` projection must NOT JSON-extract it from `metadata`.
+    assert!(
+        !sql.contains("metadata, 'risk_factors'"),
+        "risk_factors must not be JSON-extracted from metadata after `| risk`:\n{sql}"
+    );
+    // `metadata` was dropped at the stats aggregation; nothing should reference
+    // it at all in this query.
+    assert!(
+        !sql.contains("metadata"),
+        "query must not reference the dropped `metadata` column:\n{sql}"
+    );
+}
+
+/// `raw_risk_score` (also in is_known_metadata_field) must likewise be direct
+/// after a `| risk` command.
+#[test]
+fn raw_risk_score_after_risk_is_direct_column() {
+    let sql = npl(
+        r#"* | stats count() as count by src_ip | risk score=50 entity=src_ip factor="x" | table src_ip, raw_risk_score"#,
+    );
+    assert!(
+        !sql.contains("metadata, 'raw_risk_score'"),
+        "raw_risk_score must not be JSON-extracted from metadata after `| risk`:\n{sql}"
+    );
+}
+
+/// Regression guard for the OTHER use case: searching stored signal events with
+/// NO `| risk` command. There, `risk_factors` legitimately lives in the
+/// `metadata` JSON and must still be extracted from it.
+#[test]
+fn risk_factors_without_risk_command_still_extracts_from_metadata() {
+    let sql = npl(r#"* | table risk_factors"#);
+    assert!(
+        sql.contains("metadata, 'risk_factors'"),
+        "stored-signal search (no `| risk`) must still extract risk_factors from metadata:\n{sql}"
+    );
+}

@@ -550,7 +550,7 @@ pub(crate) fn analyze_ext_fields(query: &Query) -> HashSet<String> {
 /// Collect field names that are created/computed by query pipeline commands.
 /// These are output column names from stats, sequence, transaction, eval, etc.
 /// that should NOT be treated as ext JSON fields.
-fn collect_computed_field_names(query: &Query) -> HashSet<String> {
+pub(crate) fn collect_computed_field_names(query: &Query) -> HashSet<String> {
     let mut computed = HashSet::new();
     collect_computed_from_query(query, &mut computed);
     computed
@@ -664,7 +664,13 @@ fn collect_computed_from_command(cmd: &Command, computed: &mut HashSet<String>) 
             }
         }
         Command::Risk { .. } => {
+            // All real columns the risk command projects. `risk_factors` and
+            // `raw_risk_score` also appear in `is_known_metadata_field`, so they
+            // must be recorded here to avoid being JSON-extracted from the
+            // (now-dropped) `metadata` column downstream (NAN-1236).
             computed.insert("risk_score".to_string());
+            computed.insert("raw_risk_score".to_string());
+            computed.insert("risk_entity".to_string());
             computed.insert("risk_factors".to_string());
         }
         Command::Prevalence { .. } => {

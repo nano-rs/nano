@@ -346,6 +346,10 @@ pub struct SystemConfig {
     pub settings_editable: bool,
     pub api_keys_editable: bool,
     pub ai_providers_editable: bool,
+    /// True when this install runs air-gapped (no outbound internet, `AIRGAP_MODE`).
+    /// The marketplace UI uses this to badge connectivity-required items, hide
+    /// egress actions (live sync / add-repository), and promote import-from-file.
+    pub air_gap: bool,
 }
 
 /// Get system configuration including deployment mode
@@ -389,6 +393,7 @@ pub async fn get_system_config(
         settings_editable: !is_managed,
         api_keys_editable,
         ai_providers_editable: !is_managed,
+        air_gap: state.config.airgap,
     }))
 }
 

@@ -99,6 +99,19 @@ impl PlaybookRepoRepository {
             .ok_or(PlaybookRepoRepositoryError::NotFound(id))
     }
 
+    pub async fn find_by_slug(
+        &self,
+        slug: &str,
+    ) -> Result<PlaybookRepository, PlaybookRepoRepositoryError> {
+        sqlx::query_as::<_, PlaybookRepository>(
+            "SELECT * FROM playbook_repositories WHERE slug = $1",
+        )
+        .bind(slug)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| PlaybookRepoRepositoryError::NotFound(Uuid::nil()))
+    }
+
     pub async fn list(&self) -> Result<Vec<PlaybookRepository>, PlaybookRepoRepositoryError> {
         // Clean up stuck syncing statuses first
         let _ = sqlx::query(

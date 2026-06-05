@@ -5,7 +5,7 @@
 //! Handles importing rules from external repositories into NanoSIEM's
 //! detection engine, including format conversion and metadata mapping.
 
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::models::{NewDetectionRule, RuleMode, Severity};
@@ -427,5 +427,160 @@ impl RuleRepositoryService {
         );
 
         Ok((detection_rule.id, ImportOutcome::Created))
+    }
+
+    /// Sync a signed, air-gapped rule bundle into the synthetic air-gap rule
+    /// repository's catalog (NAN-1226).
+    ///
+    /// The bundle has already been verified upstream (Ed25519 signature +
+    /// per-file SHA-256 checksums via `nanosiem_core::airgap::verify_bundle`);
+    /// this method takes the already-verified `(file_path, raw_content)` pairs
+    /// and upserts each into `repository_rules` — the *exact same* catalog
+    /// upsert performed by the nPL branch of `run_sync` for GitHub-synced
+    /// repos. This is the offline equivalent of a repo *sync*: the rules land
+    /// as available-to-import (a `repository_rules` row with no
+    /// `rule_imports` row), and the operator selectively imports them from the
+    /// repositories page afterward.
+    ///
+    /// Nothing is imported or activated here — no detection rule is created.
+    /// The bundle's rules are upserted into a synthetic, always-present air-gap
+    /// rule repository (created on first use via `AIRGAP_RULE_REPOSITORY_SLUG`,
+    /// `rule_format = "nanosiem"`). Returns the number of rules synced
+    /// (successfully upserted) into the catalog.
+    pub async fn sync_rule_bundle(
+        &self,
+        content_version: &str,
+        rules: &[(String, String)],
+        user_id: Option<Uuid>,
+    ) -> Result<crate::rule_repository::models::RuleBundleImportResult, RuleRepositoryError> {
+        use crate::rule_repository::npl_parser::parse_npl;
+
+        let repo = self.find_or_create_airgap_rule_repository(user_id).await?;
+
+        let mut synced = 0usize;
+
+        for (path, raw_content) in rules {
+            // Parse the nano-native nPL rule for metadata and upsert it into
+            // repository_rules so the rule shows up as available-to-import on
+            // the repositories page. Mirrors the nPL branch of `run_sync`.
+            let (
+                title,
+                description,
+                severity,
+                mitre_tactics,
+                mitre_techniques,
+                tags,
+                requires_fields,
+                requires_source_types,
+                conversion_status,
+            ) = match parse_npl(raw_content) {
+                Ok(npl) => (
+                    Some(npl.title),
+                    npl.description,
+                    npl.severity,
+                    (!npl.mitre_tactics.is_empty()).then_some(npl.mitre_tactics),
+                    (!npl.mitre_techniques.is_empty()).then_some(npl.mitre_techniques),
+                    (!npl.tags.is_empty()).then_some(npl.tags),
+                    (!npl.required_fields.is_empty()).then_some(npl.required_fields),
+                    (!npl.source_types.is_empty()).then_some(npl.source_types),
+                    Some("success"),
+                ),
+                // Store unparseable rules with minimal metadata + a failed
+                // conversion status, exactly as `run_sync` does, so they remain
+                // visible in the catalog rather than silently dropped.
+                Err(e) => {
+                    warn!(repo_id = %repo.id, path = %path, error = %e, "Failed to parse nPL rule in air-gap bundle");
+                    (None, None, None, None, None, None, None, None, Some("failed"))
+                }
+            };
+
+            if let Err(e) = self
+                .rules_repository
+                .upsert(
+                    repo.id,
+                    path,
+                    None,
+                    raw_content,
+                    title.as_deref(),
+                    description.as_deref(),
+                    severity.as_deref(),
+                    mitre_tactics.as_deref(),
+                    mitre_techniques.as_deref(),
+                    tags.as_deref(),
+                    requires_fields.as_deref(),
+                    requires_source_types.as_deref(),
+                    conversion_status,
+                )
+                .await
+            {
+                warn!(repo_id = %repo.id, path = %path, error = %e, "Failed to upsert air-gap rule into catalog");
+                continue;
+            }
+
+            synced += 1;
+        }
+
+        info!(
+            repo_id = %repo.id,
+            content_version = %content_version,
+            synced,
+            "Air-gapped rule bundle synced into catalog"
+        );
+
+        Ok(crate::rule_repository::models::RuleBundleImportResult {
+            repository_id: repo.id,
+            content_version: content_version.to_string(),
+            synced,
+        })
+    }
+
+    /// Find (or lazily create) the synthetic repository that air-gapped rule
+    /// bundles are imported into. A normal `rule_repositories` row (so it shows
+    /// up in the rule-repo browser) with auto-sync disabled, a non-GitHub
+    /// sentinel URL, and `rule_format = "nanosiem"` — air-gap rule bundles ship
+    /// the native nPL format.
+    async fn find_or_create_airgap_rule_repository(
+        &self,
+        user_id: Option<Uuid>,
+    ) -> Result<crate::rule_repository::models::RuleRepository, RuleRepositoryError> {
+        use crate::rule_repository::models::NewRuleRepository;
+
+        const AIRGAP_RULE_REPOSITORY_SLUG: &str = "airgap-rules";
+        const AIRGAP_RULE_REPOSITORY_NAME: &str = "Air-gapped Rule Bundles";
+
+        if let Ok(existing) = self
+            .repo_repository
+            .find_by_slug(AIRGAP_RULE_REPOSITORY_SLUG)
+            .await
+        {
+            return Ok(existing);
+        }
+
+        let new_repo = NewRuleRepository {
+            name: AIRGAP_RULE_REPOSITORY_NAME.to_string(),
+            slug: Some(AIRGAP_RULE_REPOSITORY_SLUG.to_string()),
+            description: Some(
+                "Rules imported from offline air-gapped bundles (NAN-1220).".to_string(),
+            ),
+            // Sentinel, never-fetched URL — air-gap bundles are uploaded, not synced.
+            url: "airgap://rules".to_string(),
+            branch: None,
+            rules_path: None,
+            rule_format: Some("nanosiem".to_string()),
+            auto_sync_enabled: Some(false),
+            sync_interval_hours: None,
+        };
+
+        match self.repo_repository.create(&new_repo, user_id).await {
+            Ok(repo) => Ok(repo),
+            // Lost a create race with a concurrent bundle upload — re-fetch.
+            Err(crate::rule_repository::repository::RuleRepositoryRepositoryError::AlreadyExists(_)) => {
+                self.repo_repository
+                    .find_by_slug(AIRGAP_RULE_REPOSITORY_SLUG)
+                    .await
+                    .map_err(|e| RuleRepositoryError::Internal(e.to_string()))
+            }
+            Err(e) => Err(RuleRepositoryError::Internal(e.to_string())),
+        }
     }
 }

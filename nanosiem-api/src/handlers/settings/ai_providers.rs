@@ -733,6 +733,30 @@ pub async fn validate_ai_provider(
     }
 }
 
+/// Adapter exposing the canonical, on-prem-`base_url`-aware provider
+/// connectivity test ([`test_provider_connection`]) to the `nanosiem-core`
+/// health monitor.
+///
+/// The health scheduler lives in `nanosiem-core` and cannot call this
+/// enterprise handler directly, so it goes through the
+/// [`AiProviderConnectivityChecker`](nanosiem_core::health::AiProviderConnectivityChecker)
+/// trait. This removes the old hardcoded-public-host duplicate in
+/// `ai_monitor.rs`, so health checks now honor an operator's on-prem endpoint
+/// exactly like the "Test connection" button. (NAN-1231)
+pub struct ApiAiProviderChecker;
+
+#[async_trait::async_trait]
+impl nanosiem_core::health::AiProviderConnectivityChecker for ApiAiProviderChecker {
+    async fn check(
+        &self,
+        provider: &str,
+        api_key: &str,
+        config: &serde_json::Value,
+    ) -> Result<(), String> {
+        test_provider_connection(provider, api_key, Some(config)).await
+    }
+}
+
 /// Test a provider connection by making a minimal API call
 async fn test_provider_connection(
     provider: &str,
@@ -740,6 +764,69 @@ async fn test_provider_connection(
     config: Option<&serde_json::Value>,
 ) -> Result<(), String> {
     let client = reqwest::Client::new();
+
+    // NAN-1207: air-gapped direct path. When the provider config carries a
+    // non-empty `base_url`, the operator is pointing nano at an on-prem
+    // OpenAI-compatible server (vLLM, Ollama, LocalAI, …). Test that endpoint
+    // directly with a minimal `/chat/completions` probe instead of the
+    // vendor's public API. The API key is optional — many on-prem servers run
+    // open behind a network boundary — so we only attach the bearer header
+    // when a key is configured.
+    let direct_base_url = config
+        .and_then(|c| c["base_url"].as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_end_matches('/').to_string());
+
+    if let Some(base_url) = direct_base_url {
+        let model = config
+            .and_then(|c| c["test_model"].as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let mut req = client
+            .post(format!("{}/chat/completions", base_url))
+            .header("content-type", "application/json");
+        if !api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", api_key));
+        }
+
+        // `model` is required by the OpenAI schema; on-prem servers ignore an
+        // unknown id but still answer, which is enough to prove reachability +
+        // auth. Default to a common placeholder when the operator hasn't
+        // pinned a test model in config.
+        let body = serde_json::json!({
+            "model": model.as_deref().unwrap_or("default"),
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "Hi"}]
+        });
+
+        let resp = req
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Request to on-prem endpoint failed: {}", e))?;
+
+        // 2xx is a clean success. A 4xx that is NOT an auth failure (e.g. 404
+        // unknown model, 422 bad model id) still proves the endpoint is
+        // reachable and any supplied key was accepted, so treat it as a pass —
+        // the operator can correct the model id separately. 401/403 are real
+        // auth failures.
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!("Authentication failed ({}): {}", status, body));
+        }
+        if status.is_client_error() {
+            // Reachable + authorized, just an upstream request-shape quibble.
+            return Ok(());
+        }
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("On-prem endpoint error ({}): {}", status, body));
+    }
 
     match provider {
         "anthropic" => {

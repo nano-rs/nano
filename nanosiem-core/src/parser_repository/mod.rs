@@ -20,10 +20,10 @@ mod yaml_parser;
 
 pub use error::ParserRepositoryError;
 pub use models::{
-    ApplyUpstreamUpdateResult, BulkApplyUpstreamResult, NewParserRepository, ParserImport,
-    ParserImportPreview, ParserImportRequest, ParserImportType, ParserRepository,
-    ParserUpstreamUpdate, RepositoryParser, RepositoryParserFilter, SyncResult, SyncStatus,
-    UpdateParserRepository, UpstreamParserDiff,
+    ApplyUpstreamUpdateResult, BulkApplyUpstreamResult, BundleImportResult,
+    NewParserRepository, ParserImport, ParserImportPreview, ParserImportRequest, ParserImportType,
+    ParserRepository, ParserUpstreamUpdate, RepositoryParser, RepositoryParserFilter, SyncResult,
+    SyncStatus, UpdateParserRepository, UpstreamParserDiff,
 };
 pub use repository::{
     ParserImportsRepository, ParserImportsRepositoryError, ParserRepositoryRepository,

@@ -145,6 +145,45 @@ async fn main() -> Result<()> {
         });
         state.add_task_handle(poll_handle).await;
         tracing::info!("License status poller started (5m interval, reads from PG)");
+    } else if state.config.airgap {
+        // === Air-gapped install (AIRGAP_MODE on, no LICENSE_URL) — FAIL CLOSED ===
+        // There is no phone-home path here (LICENSE_URL is unset, so we never
+        // start the poller above). Enforcement instead rides on a signed offline
+        // license bundle imported via POST /api/airgap/license/import, which
+        // persists a singleton `license_status` row with `offline = TRUE` and a
+        // hard `expires_at`. We load that persisted row so an imported license
+        // survives restarts, then decide the boot status:
+        //   - valid, non-expired offline license  -> that status (enforced by
+        //     license_guard + effective(now), incl. local self-expiry)
+        //   - anything else (no row / not offline / expired) -> Locked, so the
+        //     install is unusable until an operator imports a license.
+        let license_repo = nanosiem_core::LicenseRepository::new(state.pool.clone());
+        let persisted = match license_repo.get_status().await {
+            Ok(status) => status,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to load persisted air-gap license status: {} — failing closed",
+                    e
+                );
+                nanosiem_core::license::LicenseStatus::default()
+            }
+        };
+        let decided = airgap_boot_license_status(persisted, chrono::Utc::now());
+        if decided.state == nanosiem_core::license::LicenseState::Locked {
+            tracing::warn!(
+                reason = decided.locked_reason.as_deref().unwrap_or(""),
+                "Air-gapped deployment is LOCKED — import a signed offline license via /settings/airgap-import to unlock"
+            );
+        } else {
+            tracing::info!(
+                tier = decided.tier.as_deref().unwrap_or("unknown"),
+                expires_at = decided.expires_at.map(|e| e.to_rfc3339()).as_deref().unwrap_or(""),
+                "Air-gapped deployment unlocked by imported offline license"
+            );
+        }
+        *state.license_status.write().await = decided;
+        // No phone-home poller: air-gap has no LICENSE_URL to poll. Re-imports
+        // update the in-memory RwLock directly (see import_offline_license).
     } else {
         tracing::info!(
             "License enforcement not configured (LICENSE_URL not set) — running unrestricted"
@@ -212,4 +251,115 @@ async fn main() -> Result<()> {
         .await?;
 
     Ok(())
+}
+
+/// Decide the boot license status for an **air-gapped** deployment (NAN-1222).
+///
+/// Air-gap installs (`AIRGAP_MODE` on, no `LICENSE_URL`) must FAIL CLOSED: the
+/// only way they may run is with a valid, signed, non-expired *offline* license
+/// imported via `POST /api/airgap/license/import`. That import path persists a
+/// `license_status` row with `offline = TRUE` and a hard `expires_at`.
+///
+/// `LicenseRepository::get_status()` returns `LicenseStatus::default()`
+/// (`offline = false`, `expires_at = None`, `state = Active`) when **no row**
+/// exists — i.e. a fresh install is indistinguishable from a "real Active" by
+/// `state` alone. We therefore gate on the `offline` marker (only the import
+/// handler ever sets it) plus read-time expiry via `effective(now)`:
+///
+///   - `offline == true` AND `effective(now).state == Active` -> keep that
+///     status (the import is genuine and not yet expired).
+///   - anything else (no row / `offline == false` / expired) -> `Locked`.
+///
+/// Pure function (no I/O) so it is unit-testable; `main` feeds it the persisted
+/// row and `Utc::now()`.
+#[cfg(feature = "enterprise")]
+fn airgap_boot_license_status(
+    persisted: nanosiem_core::license::LicenseStatus,
+    now: chrono::DateTime<chrono::Utc>,
+) -> nanosiem_core::license::LicenseStatus {
+    use nanosiem_core::license::{LicenseState, LicenseStatus};
+
+    let effective = persisted.effective(now);
+    if persisted.offline && effective.state == LicenseState::Active {
+        // Genuine, non-expired operator-imported offline license.
+        effective
+    } else {
+        LicenseStatus {
+            state: LicenseState::Locked,
+            valid: false,
+            locked_reason: Some(
+                "No license imported — this air-gapped deployment requires a signed offline license."
+                    .to_string(),
+            ),
+            // Preserve any tier/expiry we managed to read for diagnostics, but the
+            // state above is what license_guard enforces.
+            ..persisted
+        }
+    }
+}
+
+#[cfg(all(test, feature = "enterprise"))]
+mod airgap_license_tests {
+    use super::airgap_boot_license_status;
+    use chrono::{Duration, Utc};
+    use nanosiem_core::license::{LicenseState, LicenseStatus};
+
+    /// Fresh air-gap install (no row) -> `get_status` returns the default
+    /// (`offline = false`, Active). Must FAIL CLOSED to Locked.
+    #[test]
+    fn fresh_install_no_license_is_locked() {
+        let decided = airgap_boot_license_status(LicenseStatus::default(), Utc::now());
+        assert_eq!(decided.state, LicenseState::Locked);
+        assert!(!decided.valid);
+        assert!(decided.locked_reason.is_some());
+    }
+
+    /// A non-offline Active row (defensive: should never exist in air-gap, but a
+    /// stray online-style row must not unlock an air-gap install).
+    #[test]
+    fn non_offline_active_row_is_locked() {
+        let status = LicenseStatus {
+            state: LicenseState::Active,
+            valid: true,
+            expires_at: Some(Utc::now() + Duration::days(30)),
+            offline: false,
+            ..Default::default()
+        };
+        let decided = airgap_boot_license_status(status, Utc::now());
+        assert_eq!(decided.state, LicenseState::Locked);
+    }
+
+    /// A valid, non-expired offline license unlocks the install.
+    #[test]
+    fn valid_offline_license_unlocks() {
+        let now = Utc::now();
+        let status = LicenseStatus {
+            state: LicenseState::Active,
+            valid: true,
+            tier: Some("enterprise".to_string()),
+            expires_at: Some(now + Duration::days(30)),
+            offline: true,
+            ..Default::default()
+        };
+        let decided = airgap_boot_license_status(status, now);
+        assert_eq!(decided.state, LicenseState::Active);
+        assert!(decided.valid);
+        assert_eq!(decided.tier.as_deref(), Some("enterprise"));
+    }
+
+    /// An expired offline license fails closed (read-time self-expiry).
+    #[test]
+    fn expired_offline_license_is_locked() {
+        let now = Utc::now();
+        let status = LicenseStatus {
+            state: LicenseState::Active,
+            valid: true,
+            expires_at: Some(now - Duration::hours(1)),
+            offline: true,
+            ..Default::default()
+        };
+        let decided = airgap_boot_license_status(status, now);
+        assert_eq!(decided.state, LicenseState::Locked);
+        assert!(!decided.valid);
+    }
 }

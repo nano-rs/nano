@@ -62,14 +62,38 @@ impl AppState {
         .map(|v| v as u32)
         .unwrap_or(60);
 
-        // Cloudflare AI Gateway URL (required for AI features)
+        // Cloudflare AI Gateway URL. Normally required, but NAN-1207 allows a
+        // fully air-gapped deployment where every enabled provider points at
+        // an on-prem OpenAI-compatible endpoint via its `config.base_url`. In
+        // that case there's no Cloudflare gateway to reach and the env var is
+        // legitimately unset — so we only disable AI when the gateway URL is
+        // missing AND no enabled provider has a direct base_url configured.
         let ai_gateway_url = match std::env::var("CLOUDFLARE_AI_GATEWAY_URL") {
             Ok(url) => url,
             Err(_) => {
-                tracing::warn!("CLOUDFLARE_AI_GATEWAY_URL not set - AI features disabled");
-                let mut guard = self.melod_service.write().await;
-                *guard = None;
-                return Ok(false);
+                let has_direct_provider: bool = sqlx::query_scalar(
+                    "SELECT COUNT(*) > 0 FROM provider_credentials \
+                     WHERE enabled = true \
+                       AND COALESCE(config->>'base_url', '') <> ''",
+                )
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(false);
+
+                if has_direct_provider {
+                    tracing::info!(
+                        "CLOUDFLARE_AI_GATEWAY_URL not set, but on-prem provider(s) configured \
+                         with a direct base_url - running AI in air-gapped mode"
+                    );
+                    // Empty gateway URL is fine: the direct path never reads it
+                    // (AiGatewayClient routes on config.base_url instead).
+                    String::new()
+                } else {
+                    tracing::warn!("CLOUDFLARE_AI_GATEWAY_URL not set - AI features disabled");
+                    let mut guard = self.melod_service.write().await;
+                    *guard = None;
+                    return Ok(false);
+                }
             }
         };
         let cf_auth_token = std::env::var("CF_AIG_AUTH_TOKEN").ok();

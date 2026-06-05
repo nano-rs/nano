@@ -4,6 +4,9 @@
 //!
 //! Checks the health of configured AI providers by testing their connectivity.
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use chrono::Utc;
 use sqlx::{PgPool, Row};
 use tracing::{debug, warn};
@@ -11,30 +14,64 @@ use tracing::{debug, warn};
 use super::types::AiProviderStatus;
 use crate::crypto::EncryptionService;
 
+/// Connectivity checker for AI providers.
+///
+/// The actual network probe lives behind this trait so the health monitor (in
+/// `nanosiem-core`) doesn't duplicate provider-connectivity logic or hardcode
+/// public vendor hostnames. The enterprise API layer injects the canonical,
+/// on-prem-`base_url`-aware tester (the same one the "Test connection" button
+/// uses, NAN-1207); open-core builds have no AI-provider surface and inject
+/// `None`, which skips AI-provider health checks entirely. (NAN-1231)
+#[async_trait]
+pub trait AiProviderConnectivityChecker: Send + Sync {
+    /// Probe a provider's reachability + auth. `config` is the provider's
+    /// JSONB config; a non-empty `base_url` means an on-prem endpoint and the
+    /// implementation MUST target it instead of the vendor's public host.
+    async fn check(
+        &self,
+        provider: &str,
+        api_key: &str,
+        config: &serde_json::Value,
+    ) -> Result<(), String>;
+}
+
 /// AI provider health monitor
 pub struct AiMonitor {
     pool: PgPool,
     encryption: EncryptionService,
-    http_client: reqwest::Client,
+    /// Injected connectivity checker. `None` (open-core / no AI surface) means
+    /// AI-provider health checks are skipped — we never report a provider as
+    /// down without having tested it.
+    checker: Option<Arc<dyn AiProviderConnectivityChecker>>,
+    /// In `AIRGAP_MODE`, providers without an on-prem `base_url` are skipped so
+    /// the monitor never beacons to a public vendor host. (NAN-1231)
+    airgap: bool,
 }
 
 impl AiMonitor {
-    pub fn new(pool: PgPool) -> Self {
-        let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("Failed to create HTTP client");
-
+    pub fn new(
+        pool: PgPool,
+        checker: Option<Arc<dyn AiProviderConnectivityChecker>>,
+        airgap: bool,
+    ) -> Self {
         Self {
             pool,
             encryption: EncryptionService::from_env(),
-            http_client,
+            checker,
+            airgap,
         }
     }
 
     /// Check health of all enabled AI providers
     pub async fn check_all_providers(&self) -> Vec<AiProviderStatus> {
         let mut statuses = Vec::new();
+
+        // No connectivity checker wired (open-core build, or no AI-provider
+        // surface). Nothing to probe — and we must not report providers as
+        // down when we never tested them. (NAN-1231)
+        let Some(checker) = self.checker.as_ref() else {
+            return statuses;
+        };
 
         // Get all enabled providers
         let providers = match self.get_enabled_providers().await {
@@ -46,8 +83,9 @@ impl AiMonitor {
         };
 
         for provider in providers {
-            let status = self.check_provider(&provider).await;
-            statuses.push(status);
+            if let Some(status) = self.check_provider(checker.as_ref(), &provider).await {
+                statuses.push(status);
+            }
         }
 
         statuses
@@ -93,51 +131,70 @@ impl AiMonitor {
             .collect())
     }
 
-    /// Check health of a single provider
-    async fn check_provider(&self, provider: &ProviderInfo) -> AiProviderStatus {
+    /// Check health of a single provider. Returns `None` when the provider is
+    /// skipped (AIRGAP_MODE with no on-prem `base_url`).
+    async fn check_provider(
+        &self,
+        checker: &dyn AiProviderConnectivityChecker,
+        provider: &ProviderInfo,
+    ) -> Option<AiProviderStatus> {
         let checked_at = Utc::now();
+
+        // Air-gap guard: a provider with no on-prem `base_url` would have its
+        // connectivity test fall through to the vendor's public host. In
+        // AIRGAP_MODE that's an outbound beacon, so skip it — only
+        // on-prem-configured providers are probed. (NAN-1231; mirrors the
+        // NAN-1228 egress gating.)
+        if self.airgap && !config_has_base_url(&provider.config) {
+            debug!(
+                provider = %provider.provider,
+                "Airgap mode: skipping AI provider health check (no on-prem base_url)"
+            );
+            return None;
+        }
 
         // Decrypt credentials
         let api_key = match self.decrypt_api_key(&provider.credentials_encrypted) {
             Ok(key) => key,
             Err(e) => {
-                return AiProviderStatus {
+                return Some(AiProviderStatus {
                     provider_id: uuid::Uuid::nil(),
                     provider_name: provider.display_name.clone(),
                     provider_type: provider.provider.clone(),
                     is_healthy: false,
                     error_message: Some(format!("Failed to decrypt credentials: {}", e)),
                     checked_at,
-                };
+                });
             }
         };
 
-        // Test the provider connection
-        match self
-            .test_provider_connection(&provider.provider, &api_key, &provider.config)
+        // Test the provider connection through the injected, on-prem-aware
+        // checker — NOT a hardcoded public endpoint. (NAN-1231)
+        match checker
+            .check(&provider.provider, &api_key, &provider.config)
             .await
         {
             Ok(()) => {
                 debug!(provider = %provider.provider, "Provider health check passed");
-                AiProviderStatus {
+                Some(AiProviderStatus {
                     provider_id: uuid::Uuid::nil(),
                     provider_name: provider.display_name.clone(),
                     provider_type: provider.provider.clone(),
                     is_healthy: true,
                     error_message: None,
                     checked_at,
-                }
+                })
             }
             Err(error_message) => {
                 warn!(provider = %provider.provider, error = %error_message, "Provider health check failed");
-                AiProviderStatus {
+                Some(AiProviderStatus {
                     provider_id: uuid::Uuid::nil(),
                     provider_name: provider.display_name.clone(),
                     provider_type: provider.provider.clone(),
                     is_healthy: false,
                     error_message: Some(error_message),
                     checked_at,
-                }
+                })
             }
         }
     }
@@ -175,132 +232,18 @@ impl AiMonitor {
             .map(|s| s.to_string())
             .ok_or_else(|| "No api_key in credentials".to_string())
     }
+}
 
-    /// Test a provider connection by making a minimal API call
-    async fn test_provider_connection(
-        &self,
-        provider: &str,
-        api_key: &str,
-        config: &serde_json::Value,
-    ) -> Result<(), String> {
-        match provider {
-            "anthropic" => {
-                // Test Anthropic API - just check auth by listing models
-                let resp = self
-                    .http_client
-                    .post("https://api.anthropic.com/v1/messages")
-                    .header("x-api-key", api_key)
-                    .header("anthropic-version", "2023-06-01")
-                    .header("content-type", "application/json")
-                    .json(&serde_json::json!({
-                        "model": "claude-haiku-4-5-20251001",
-                        "max_tokens": 1,
-                        "messages": [{"role": "user", "content": "test"}]
-                    }))
-                    .send()
-                    .await
-                    .map_err(|e| format!("Request failed: {}", e))?;
-
-                if resp.status().is_success() || resp.status().as_u16() == 400 {
-                    // 400 can happen due to content moderation, but auth succeeded
-                    Ok(())
-                } else if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 {
-                    Err("Authentication failed - invalid API key".to_string())
-                } else {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    Err(format!("API error ({}): {}", status, body))
-                }
-            }
-            "google" => {
-                let resp = self
-                    .http_client
-                    .post(format!(
-                        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={}",
-                        api_key
-                    ))
-                    .header("content-type", "application/json")
-                    .json(&serde_json::json!({
-                        "contents": [{"parts": [{"text": "test"}]}],
-                        "generationConfig": {"maxOutputTokens": 1}
-                    }))
-                    .send()
-                    .await
-                    .map_err(|e| format!("Request failed: {}", e))?;
-
-                if resp.status().is_success() || resp.status().as_u16() == 400 {
-                    Ok(())
-                } else if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 {
-                    Err("Authentication failed - invalid API key".to_string())
-                } else {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    Err(format!("API error ({}): {}", status, body))
-                }
-            }
-            "openai" => {
-                let resp = self
-                    .http_client
-                    .get("https://api.openai.com/v1/models")
-                    .header("Authorization", format!("Bearer {}", api_key))
-                    .send()
-                    .await
-                    .map_err(|e| format!("Request failed: {}", e))?;
-
-                if resp.status().is_success() {
-                    Ok(())
-                } else if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 {
-                    Err("Authentication failed - invalid API key".to_string())
-                } else {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    Err(format!("API error ({}): {}", status, body))
-                }
-            }
-            "azure" => {
-                let api_base = config
-                    .get("api_base")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| "Azure requires api_base in config".to_string())?;
-                let api_version = config
-                    .get("api_version")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("2024-10-21");
-
-                // List deployments to check auth
-                let resp = self
-                    .http_client
-                    .get(format!(
-                        "{}/openai/deployments?api-version={}",
-                        api_base, api_version
-                    ))
-                    .header("api-key", api_key)
-                    .send()
-                    .await
-                    .map_err(|e| format!("Request failed: {}", e))?;
-
-                if resp.status().is_success() {
-                    Ok(())
-                } else if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 {
-                    Err("Authentication failed - invalid API key".to_string())
-                } else {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    Err(format!("API error ({}): {}", status, body))
-                }
-            }
-            "bedrock" => {
-                // Bedrock uses AWS credentials - basic validation only
-                // Full validation would require AWS SDK
-                if api_key.is_empty() {
-                    Err("Empty credentials".to_string())
-                } else {
-                    Ok(())
-                }
-            }
-            _ => Err(format!("Unknown provider: {}", provider)),
-        }
-    }
+/// Whether a provider's JSONB config carries a non-empty `base_url` — i.e. the
+/// operator pointed it at an on-prem OpenAI-compatible endpoint (vLLM, Ollama,
+/// LocalAI, …). Used to decide whether a provider is safe to probe in
+/// AIRGAP_MODE. (NAN-1231)
+fn config_has_base_url(config: &serde_json::Value) -> bool {
+    config
+        .get("base_url")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
 }
 
 struct ProviderInfo {

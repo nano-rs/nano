@@ -8,7 +8,8 @@
  */
 
 import { useEffect, useState } from 'react';
-import { AlertTriangle, Lock, X } from 'lucide-react';
+import { Link, useLocation } from 'react-router-dom';
+import { AlertTriangle, Lock, X, KeyRound } from 'lucide-react';
 import { api } from '../lib/api';
 import type { LicenseStatusResponse } from '../lib/api';
 import { useCapabilities } from '@/hooks/use-capabilities';
@@ -22,6 +23,7 @@ export function LicenseBanner() {
 
   const [status, setStatus] = useState<LicenseStatusResponse | null>(null);
   const [dismissed, setDismissed] = useState(false);
+  const location = useLocation();
 
   useEffect(() => {
     if (!isEnterprise) return;
@@ -41,13 +43,28 @@ export function LicenseBanner() {
     return () => clearInterval(interval);
   }, [isEnterprise]);
 
+  // Air-gap installs enforce a signed offline license but have no phone-home,
+  // so `enforcement_enabled` (which tracks LICENSE_URL) is false; treat air-gap
+  // as enforced too (NAN-1222).
+  const enforced = !!status?.enforcement_enabled || !!status?.airgap;
+
   // Don't show anything if not enforced, active, or no status yet
-  if (!isEnterprise || !status || !status.enforcement_enabled || status.state === 'active') {
+  if (!isEnterprise || !status || !enforced || status.state === 'active') {
     return null;
   }
 
   // Full lockout page
   if (status.state === 'locked') {
+    // Air-gapped: the only recovery is importing a signed offline license, so
+    // point at the import surface (app.nano.rs is unreachable across the gap).
+    // Suppress the overlay while the operator is on the import page itself so
+    // the dropzone underneath stays usable.
+    if (status.airgap) {
+      if (location.pathname.startsWith('/settings/airgap-import')) {
+        return null;
+      }
+      return <AirgapLockoutOverlay reason={status.locked_reason} />;
+    }
     return <LicenseLockoutOverlay reason={status.locked_reason} />;
   }
 
@@ -123,6 +140,45 @@ function LicenseLockoutOverlay({ reason }: { reason?: string }) {
         </a>
         <p className="text-xs text-muted-foreground">
           Your data is safe. Full access will be restored within 5 minutes of resubscribing.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Air-gapped lockout (NAN-1222). An air-gapped deployment without a valid,
+ * non-expired signed offline license fails closed. There is no outbound network
+ * to resubscribe over, so the only recovery is importing a signed offline
+ * license bundle. The CTA routes to the in-app import surface (which is
+ * license-guard-exempt server-side and un-overlaid client-side).
+ */
+function AirgapLockoutOverlay({ reason }: { reason?: string }) {
+  return (
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-background/95 backdrop-blur-sm">
+      <div className="mx-auto max-w-md text-center space-y-6 p-8">
+        <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-red-100 dark:bg-red-500/10">
+          <Lock className="h-8 w-8 text-red-600 dark:text-red-400" />
+        </div>
+        <div className="space-y-2">
+          <h1 className="text-2xl font-semibold tracking-tight">
+            License Required
+          </h1>
+          <p className="text-muted-foreground">
+            {reason ||
+              'This air-gapped deployment requires a signed offline license. Import a license bundle to unlock access.'}
+          </p>
+        </div>
+        <Link
+          to="/settings/airgap-import"
+          className="inline-flex items-center justify-center gap-2 rounded-md bg-primary px-6 py-3 text-sm font-medium text-primary-foreground hover:bg-primary/90 transition-colors"
+        >
+          <KeyRound className="h-4 w-4" />
+          Import offline license
+        </Link>
+        <p className="text-xs text-muted-foreground">
+          Your data is safe. Access is restored as soon as a valid signed
+          license bundle is imported.
         </p>
       </div>
     </div>
