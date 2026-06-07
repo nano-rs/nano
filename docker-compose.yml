@@ -361,8 +361,12 @@ services:
       - no-new-privileges:true
     ports:
       - "6379:6379"
-    ulimits:
-      memlock: -1
+    # No `ulimits: memlock: -1` — unlimited memlock can't be set in an
+    # unprivileged LXC (Docker can't exceed the container's 8MB memlock hard
+    # cap → "error setting rlimit type 8: operation not permitted", container
+    # won't start). Dragonfly runs fine without it at this maxmemory cap; the
+    # ulimit was only relevant for io_uring on pre-5.12 kernels (no longer
+    # charged against RLIMIT_MEMLOCK since Linux 5.12).
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s

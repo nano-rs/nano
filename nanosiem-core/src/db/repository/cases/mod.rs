@@ -27,7 +27,7 @@ pub(crate) use crate::models::case::{
     CaseWallEntryWithCreator, CaseWithDetails, CaseWithDetailsRow, ChangeCaseStatus,
     EntityTypeSummary, NewCase, NewCaseEntity, NewCaseGroupingRule, NewCaseRelation,
     DuplicateCandidate, NewCaseWallEntry, RelatedCaseSummary, ShareCaseRequest, SharedGroup,
-    SlaTargets, UpdateCase, UpdateCaseGroupingRule,
+    SlaTargets, UpdateCase, UpdateCaseAiVerdict, UpdateCaseGroupingRule,
 };
 
 #[derive(Error, Debug)]

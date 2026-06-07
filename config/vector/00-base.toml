@@ -14,10 +14,13 @@ data_dir = "/var/lib/vector"
 # =============================================================================
 # Vector API (for config reload)
 # =============================================================================
+# NB: no `playground` key — vector removed `api.playground` in 0.55 (would fail
+# config validation → crashloop). The GraphQL API stays on for config reload /
+# `vector top`/`vector tap`; the browser playground IDE was a debug-only extra
+# and its port (8686) isn't even published in docker-compose.opensource.yml.
 [api]
 enabled = true
 address = "0.0.0.0:8686"
-playground = true
 
 # =============================================================================
 # Single HTTP Source - All formats on one port

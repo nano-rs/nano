@@ -190,6 +190,106 @@ pub trait AiClient: Send + Sync {
         prompt: &str,
         max_rows: usize,
     ) -> Result<Vec<Value>, ExtensionError>;
+
+    /// Structured completion: ask the model to return a single JSON object
+    /// matching `json_schema` and return it parsed (NAN-1251).
+    ///
+    /// The default impl appends a strict "respond with ONLY JSON" instruction
+    /// to the system prompt, calls `complete_for_agent`, and tolerantly
+    /// extracts the JSON object from the text (handling ```json fences and
+    /// leading/trailing prose). Enterprise implementations that support native
+    /// tool-calling override this to force a tool-call against the schema,
+    /// which is far more reliable than text parsing.
+    ///
+    /// `json_schema` is a JSON Schema object describing the expected shape.
+    /// Callers should still validate/clamp the returned values — neither path
+    /// guarantees the model honoured the schema.
+    async fn complete_structured(
+        &self,
+        agent_id: AiAgentId<'_>,
+        messages: Vec<AiMessage>,
+        system_prompt: &str,
+        json_schema: &Value,
+    ) -> Result<Value, ExtensionError> {
+        let augmented_system = format!(
+            "{system_prompt}\n\n## OUTPUT FORMAT\n\
+            Respond with ONLY a single JSON object matching this schema. \
+            No prose, no markdown, no code fences — just the raw JSON object.\n\
+            Schema:\n{}",
+            serde_json::to_string(json_schema).unwrap_or_default()
+        );
+        let raw = self
+            .complete_for_agent(agent_id, messages, &augmented_system)
+            .await?;
+        extract_json_object(&raw).ok_or_else(|| {
+            ExtensionError::AiProvider(format!(
+                "structured completion did not return parseable JSON (got {} chars)",
+                raw.len()
+            ))
+        })
+    }
+}
+
+/// Tolerantly pull a single JSON object out of an LLM text response. Handles
+/// the model wrapping the object in ```json fences or surrounding prose by
+/// scanning for the first balanced `{...}` span and parsing that. Returns
+/// `None` if no valid JSON object is found.
+pub fn extract_json_object(raw: &str) -> Option<Value> {
+    // Fast path: the whole thing is valid JSON.
+    if let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(raw.trim()) {
+        return Some(v);
+    }
+
+    // Strip a ```json ... ``` (or bare ``` ... ```) fence if present.
+    let unfenced = strip_code_fence(raw);
+    if let Ok(v @ Value::Object(_)) = serde_json::from_str::<Value>(unfenced.trim()) {
+        return Some(v);
+    }
+
+    // Scan for the first balanced top-level object, respecting strings/escapes.
+    let bytes = unfenced.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{')?;
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let candidate = &unfenced[start..=i];
+                    return serde_json::from_str::<Value>(candidate)
+                        .ok()
+                        .filter(|v| v.is_object());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Remove a surrounding ```json / ``` fence if the text is fenced.
+fn strip_code_fence(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        // Drop an optional language tag on the first line (e.g. "json").
+        let after_tag = rest.splitn(2, '\n').nth(1).unwrap_or("");
+        return after_tag.strip_suffix("```").unwrap_or(after_tag);
+    }
+    trimmed
 }
 
 /// No-op AI client used by open-core builds. AI-using code paths must check
@@ -272,6 +372,43 @@ mod tests {
         });
         let mut s = AiStream::from_channel(rx);
         assert_eq!(s.collect_all().await.unwrap(), "hello");
+    }
+
+    #[test]
+    fn extract_json_object_handles_bare_object() {
+        let v = extract_json_object(r#"{"disposition":"false_positive","confidence":0.9}"#).unwrap();
+        assert_eq!(v["disposition"], "false_positive");
+    }
+
+    #[test]
+    fn extract_json_object_strips_code_fence() {
+        let raw = "```json\n{\"disposition\":\"benign\",\"confidence\":0.8}\n```";
+        let v = extract_json_object(raw).unwrap();
+        assert_eq!(v["disposition"], "benign");
+    }
+
+    #[test]
+    fn extract_json_object_finds_object_amid_prose() {
+        let raw = "Here is my verdict:\n{\"disposition\":\"true_positive\",\
+            \"rationale\":\"found IEX cradle from evil.com\"} — hope that helps!";
+        let v = extract_json_object(raw).unwrap();
+        assert_eq!(v["disposition"], "true_positive");
+        assert_eq!(v["rationale"], "found IEX cradle from evil.com");
+    }
+
+    #[test]
+    fn extract_json_object_respects_braces_in_strings() {
+        // A `}` inside a string value must not prematurely close the object.
+        let raw = r#"{"note":"contains a } brace","ok":true}"#;
+        let v = extract_json_object(raw).unwrap();
+        assert_eq!(v["note"], "contains a } brace");
+        assert_eq!(v["ok"], true);
+    }
+
+    #[test]
+    fn extract_json_object_returns_none_on_garbage() {
+        assert!(extract_json_object("no json here at all").is_none());
+        assert!(extract_json_object("").is_none());
     }
 
     #[tokio::test]

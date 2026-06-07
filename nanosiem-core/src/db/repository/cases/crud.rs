@@ -8,7 +8,7 @@ use uuid::Uuid;
 use super::{
     AssignCase, Case, CaseDisposition, CaseFilter, CaseFullResponse, CaseRepository,
     CaseRepositoryError, CaseResponseStats, CaseSort, CaseStats, CaseSummary, CaseWithDetails,
-    CaseWithDetailsRow, ChangeCaseStatus, NewCase, SlaTargets, UpdateCase,
+    CaseWithDetailsRow, ChangeCaseStatus, NewCase, SlaTargets, UpdateCase, UpdateCaseAiVerdict,
 };
 
 /// NAN-1093: assemble the ORDER BY clause for `CaseRepository::list`. Kept
@@ -146,6 +146,17 @@ fn build_order_by(sort: CaseSort, sla_targets: Option<&SlaTargets>) -> String {
                 "ORDER BY LEAST({tta}, {ttr}, {tt_close}) ASC NULLS LAST, \
                  COALESCE(c.last_activity_at, c.created_at) DESC"
             )
+        }
+        CaseSort::AiPriority => {
+            // NAN-1251: AI-actionable cases first (TP / needs_investigation,
+            // not yet human-dispositioned), highest confidence first, then
+            // recency. Non-actionable / un-triaged cases fall to the bottom.
+            "ORDER BY \
+                CASE WHEN c.ai_disposition IN ('true_positive', 'needs_investigation') \
+                          AND c.disposition IS NULL THEN 0 ELSE 1 END, \
+                COALESCE(c.ai_confidence, 0) DESC, \
+                COALESCE(c.last_activity_at, c.created_at) DESC"
+                .to_string()
         }
     }
 }
@@ -396,7 +407,12 @@ impl CaseRepository {
                 c.id, c.case_number, c.title, c.description, c.severity, c.status,
                 c.disposition, c.priority, c.assigned_to, c.assigned_at,
                 c.assigned_group, c.assigned_group_at,
-                c.ai_summary, c.grouping_type, c.mitre_tactics, c.mitre_techniques,
+                c.ai_summary,
+                c.ai_disposition, c.ai_confidence, c.ai_recommended_action,
+                c.ai_key_evidence, c.ai_triaged_at,
+                c.needs_review, c.needs_review_reason, c.needs_review_at,
+                c.ai_closed,
+                c.grouping_type, c.mitre_tactics, c.mitre_techniques,
                 c.created_at, c.updated_at, c.first_activity_at, c.last_activity_at,
                 c.visibility, c.created_by,
                 c.first_response_at, c.triage_completed_at,
@@ -462,6 +478,11 @@ impl CaseRepository {
               AND ($14::bool IS NULL
                    OR ($14 = TRUE AND c.incident_id IS NULL)
                    OR ($14 = FALSE AND c.incident_id IS NOT NULL))
+              -- NAN-1251: "Must Investigate" bucket. When TRUE, restrict to
+              -- AI-actionable cases a human hasn't dispositioned yet.
+              AND ($15::bool IS NULL OR $15 = FALSE OR (
+                  c.ai_disposition IN ('true_positive', 'needs_investigation')
+                  AND c.disposition IS NULL))
               -- NAN-1074: Free-text mode. EXISTS subquery keeps the row set
               -- de-duplicated without DISTINCT (and avoids the join-induced
               -- row blowup for cases with many alerts). Cast matched_events
@@ -520,6 +541,7 @@ impl CaseRepository {
             .bind(&filter.free_text)
             .bind(&assigned_groups_filter)
             .bind(filter.incident_id_is_null)
+            .bind(filter.ai_escalated_only)
             .fetch_all(&self.pool)
             .await?;
 
@@ -544,6 +566,15 @@ impl CaseRepository {
                 assigned_group: row.assigned_group,
                 assigned_group_at: row.assigned_group_at,
                 ai_summary: row.ai_summary,
+                ai_disposition: row.ai_disposition,
+                ai_confidence: row.ai_confidence,
+                ai_recommended_action: row.ai_recommended_action,
+                ai_key_evidence: row.ai_key_evidence,
+                ai_triaged_at: row.ai_triaged_at,
+                needs_review: row.needs_review,
+                needs_review_reason: row.needs_review_reason,
+                needs_review_at: row.needs_review_at,
+                ai_closed: row.ai_closed,
                 grouping_type: row.grouping_type,
                 mitre_tactics: row.mitre_tactics,
                 mitre_techniques: row.mitre_techniques,
@@ -620,6 +651,10 @@ impl CaseRepository {
               AND ($12::bool IS NULL
                    OR ($12 = TRUE AND c.incident_id IS NULL)
                    OR ($12 = FALSE AND c.incident_id IS NOT NULL))
+              -- NAN-1251: "Must Investigate" bucket — same predicate as list().
+              AND ($13::bool IS NULL OR $13 = FALSE OR (
+                  c.ai_disposition IN ('true_positive', 'needs_investigation')
+                  AND c.disposition IS NULL))
               -- NAN-1074: free-text mode — same predicate as list().
               AND ($10::text IS NULL OR (
                   c.title ILIKE '%' || $10 || '%'
@@ -661,6 +696,7 @@ impl CaseRepository {
         .bind(&filter.free_text)
         .bind(&assigned_groups_filter)
         .bind(filter.incident_id_is_null)
+        .bind(filter.ai_escalated_only)
         .fetch_one(&self.pool)
         .await?;
 
@@ -758,6 +794,49 @@ impl CaseRepository {
         .bind(update.priority)
         .bind(&update.ai_summary)
         .bind(&update.ai_recommendations)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(CaseRepositoryError::NotFound(id))?;
+
+        Ok(result)
+    }
+
+    /// Write the shadow-investigator's structured verdict to a case (NAN-1251).
+    ///
+    /// Touches ONLY the `ai_*` recommendation columns + `ai_summary` — never the
+    /// human-owned `status` / `disposition`. In recommend-only mode this is the
+    /// full extent of the AI's write; auto-close (P4) goes through
+    /// `change_status` separately as a deliberate, audited transition.
+    ///
+    /// `ai_confidence` is clamped to [0.0, 1.0] defensively (the model can
+    /// occasionally return out-of-range values).
+    pub async fn update_ai_verdict(
+        &self,
+        id: Uuid,
+        verdict: &UpdateCaseAiVerdict,
+    ) -> Result<Case, CaseRepositoryError> {
+        let confidence = verdict.ai_confidence.clamp(0.0, 1.0);
+        let result = sqlx::query_as::<_, Case>(
+            r#"
+            UPDATE cases SET
+                ai_disposition = $2,
+                ai_confidence = $3,
+                ai_recommended_action = $4,
+                ai_key_evidence = $5,
+                ai_summary = COALESCE($6, ai_summary),
+                ai_summary_generated_at = CASE WHEN $6 IS NOT NULL THEN NOW() ELSE ai_summary_generated_at END,
+                ai_triaged_at = NOW(),
+                updated_at = NOW()
+            WHERE id = $1
+            RETURNING *
+            "#,
+        )
+        .bind(id)
+        .bind(verdict.ai_disposition.as_str())
+        .bind(confidence)
+        .bind(&verdict.ai_recommended_action)
+        .bind(&verdict.ai_key_evidence)
+        .bind(&verdict.ai_summary)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(CaseRepositoryError::NotFound(id))?;
@@ -865,7 +944,14 @@ impl CaseRepository {
             r#"
             UPDATE cases SET
                 status = $2,
-                disposition = COALESCE($3, disposition),
+                -- NAN-1251: reopening an AI-auto-closed case (→ open) clears the
+                -- AI-set disposition so it doesn't linger as a stale FP/benign.
+                -- Human-closed cases keep their disposition on reopen — no change
+                -- to the existing reopen behavior. Both reference the OLD ai_closed.
+                disposition = CASE WHEN $2 = 'open' AND ai_closed THEN NULL ELSE COALESCE($3, disposition) END,
+                -- Any move off 'closed' clears the AI-closed marker so a reopened
+                -- case is no longer badged as auto-closed.
+                ai_closed = CASE WHEN $2 = 'closed' THEN ai_closed ELSE FALSE END,
                 resolved_at = CASE WHEN $2 = 'resolved' THEN NOW() ELSE resolved_at END,
                 resolved_by = CASE WHEN $2 = 'resolved' THEN $4 ELSE resolved_by END,
                 closed_at = CASE WHEN $2 = 'closed' THEN NOW() ELSE closed_at END,

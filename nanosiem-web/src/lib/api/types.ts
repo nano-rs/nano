@@ -3340,6 +3340,14 @@ export interface TuningProposalListParams {
 
 export type CaseStatus = 'open' | 'in_progress' | 'pending' | 'resolved' | 'closed';
 export type CaseDisposition = 'true_positive' | 'false_positive' | 'benign' | 'inconclusive' | 'merged';
+// NAN-1251: AI Tier-1 triage verdict. Mirrors CaseDisposition plus
+// `needs_investigation` (no human-disposition equivalent).
+export type AiDisposition =
+  | 'true_positive'
+  | 'false_positive'
+  | 'benign'
+  | 'inconclusive'
+  | 'needs_investigation';
 export type CaseEntityType = 'user' | 'host' | 'ip' | 'domain' | 'hash' | 'url' | 'file' | 'process' | 'email';
 export type CaseWallEntryType = 'comment' | 'status_change' | 'assignment_change' | 'alert_added' | 'alert_removed' | 'ai_analysis' | 'action_taken';
 export type CaseRelationType = 'related' | 'parent' | 'child' | 'duplicate';
@@ -3370,6 +3378,20 @@ export interface Case {
   ai_summary?: string;
   ai_recommendations?: AiRecommendation[];
   ai_summary_generated_at?: string;
+  // NAN-1251: AI Tier-1 triage verdict, surfaced on list rows + the
+  // elevated-case verdict strip.
+  ai_disposition?: AiDisposition;
+  ai_confidence?: number; // 0.0–1.0
+  ai_recommended_action?: string;
+  ai_key_evidence?: string[];
+  ai_triaged_at?: string;
+  // NAN-1251 (P3): set when a later case escalated a shared entity this case
+  // had closed as FP/benign — suggests re-review.
+  needs_review?: boolean;
+  needs_review_reason?: string;
+  needs_review_at?: string;
+  // NAN-1251 (P4): true when the AI Tier-1 triage auto-closed this case.
+  ai_closed?: boolean;
   grouping_key?: string;
   grouping_type?: GroupingType;
   mitre_tactics: string[];
@@ -3871,12 +3893,16 @@ export interface CaseFilter {
   /** NAN-1093: result ordering. `mine_first` keys off the authenticated
    *  user; other variants are caller-controlled. Defaults to `newest`. */
   sort?: CaseSort;
+  /** NAN-1251: restrict to the "Must Investigate" bucket — cases the AI
+   *  flagged as actionable (true_positive / needs_investigation) that a
+   *  human hasn't dispositioned yet. */
+  ai_escalated_only?: boolean;
 }
 
 /** NAN-1093: Signal Inbox sort options. Matches the Rust `CaseSortParam`.
  *  NAN-1095 added `'sla'` — server resolves the per-severity SLA targets
  *  from `case_settings` and orders by least remaining time. */
-export type CaseSort = 'newest' | 'oldest' | 'severity' | 'mine_first' | 'sla';
+export type CaseSort = 'newest' | 'oldest' | 'severity' | 'mine_first' | 'sla' | 'ai_priority';
 
 /** NAN-1093: Per-tab counts for the Signal Inbox. `loose` are cases not
  *  attached to an incident (rendered in the tab list); `grouped` are
@@ -3893,6 +3919,8 @@ export interface InboxCountsResponse {
   escalations: InboxTabCount;
   all: InboxTabCount;
   mine: InboxTabCount;
+  // NAN-1251: "Must Investigate" — AI-actionable, not yet human-dispositioned.
+  must_investigate: InboxTabCount;
 }
 
 /** NAN-1093: Incident pill + its case children, returned by
@@ -4059,6 +4087,10 @@ export interface SlaSettings {
   informational: SlaTierSettings;
 }
 
+// NAN-1251: AI Tier-1 triage autonomy. `recommend_only` is the default and a
+// permanent first-class state; `auto_close` is explicit opt-in.
+export type AutonomyMode = 'off' | 'recommend_only' | 'auto_close';
+
 export interface CaseSettings {
   auto_grouping_enabled: boolean;
   auto_investigate_enabled: boolean;
@@ -4066,6 +4098,9 @@ export interface CaseSettings {
   default_time_window_minutes: number;
   default_assigned_group?: string;
   sla: SlaSettings;
+  autonomy_mode: AutonomyMode;
+  auto_close_min_confidence: number; // 0.0–1.0
+  auto_close_max_severity: string;
 }
 
 export interface UpdateCaseSettingsRequest {
@@ -4075,6 +4110,9 @@ export interface UpdateCaseSettingsRequest {
   default_time_window_minutes?: number;
   default_assigned_group?: string | null;
   sla?: SlaSettings;
+  autonomy_mode?: AutonomyMode;
+  auto_close_min_confidence?: number;
+  auto_close_max_severity?: string;
 }
 
 // ============================================================================

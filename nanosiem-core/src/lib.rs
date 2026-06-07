@@ -20,6 +20,11 @@
 //! - AI-powered agent enrichment for alert triage
 //! - Unified audit logging to ClickHouse
 
+// Air-gapped signed bundle format + Ed25519 verification (NAN-1201) — enterprise
+// only. Gated to match the api-side `#[cfg(feature = "enterprise")] pub mod airgap;`
+// so the open edition excludes the source, and the open-core mirror can strip the
+// `nanosiem-core/src/airgap` directory outright (tools/sync-to-nano-mirror.sh).
+#[cfg(feature = "enterprise")]
 pub mod airgap;
 pub mod audit;
 pub mod auth;

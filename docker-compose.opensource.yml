@@ -41,7 +41,11 @@ x-logging-verbose: &verbose-logging
 
 services:
   postgres:
-    image: postgres:17
+    # Pinned by digest (NAN-1258): a tag alone (`postgres:17`) can be silently
+    # re-pushed with different content; the @sha256 makes `docker pull` refuse
+    # anything but this exact manifest. Keep in sync with images.lock — bump the
+    # tag AND the digest together (resolve with `docker buildx imagetools inspect`).
+    image: postgres:17@sha256:0027bef26712baaee437a4ea48fdf3d2d2e2bc5f0d81615374408ca320f3c7e3
     container_name: nano-postgres
     restart: unless-stopped
     logging: *default-logging
@@ -65,7 +69,8 @@ services:
           memory: 512M
 
   clickhouse:
-    image: clickhouse/clickhouse-server:26.4
+    # Digest-pinned — see the note on the postgres service (NAN-1258).
+    image: clickhouse/clickhouse-server:26.5@sha256:07afc18d8a9706eb9d85c5c5d2752e5270f91bbc2894caeaecb73e4d0f603bf5
     container_name: nano-clickhouse
     restart: unless-stopped
     logging: *verbose-logging
@@ -109,15 +114,21 @@ services:
           memory: 2G
 
   dragonfly:
-    image: docker.dragonflydb.io/dragonflydb/dragonfly:latest
+    # Was `:latest` (NAN-1258): a floating tag on a security product is the
+    # easiest silent-mutation vector. Pinned to a concrete version + digest.
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:v1.38.1@sha256:baf70ba7ad182a992b988497cfa31a488978c8fab7712079784c2401f447e402
     container_name: nano-dragonfly
     restart: unless-stopped
     logging: *default-logging
     security_opt:
       - no-new-privileges:true
     command: ["--maxmemory", "512mb", "--proactor_threads", "2"]
-    ulimits:
-      memlock: -1
+    # No `ulimits: memlock: -1` — unlimited memlock can't be set in an
+    # unprivileged LXC (Docker can't exceed the container's 8MB memlock hard
+    # cap → "error setting rlimit type 8: operation not permitted", container
+    # won't start). Dragonfly runs fine without it at this maxmemory cap; the
+    # ulimit was only relevant for io_uring on pre-5.12 kernels (no longer
+    # charged against RLIMIT_MEMLOCK since Linux 5.12).
     healthcheck:
       test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 5s
@@ -165,7 +176,8 @@ services:
           memory: 128M
 
   vector:
-    image: timberio/vector:0.52.0-debian
+    # Digest-pinned — see the note on the postgres service (NAN-1258).
+    image: timberio/vector:0.56.0-debian@sha256:93b072b416fd29152f1bfe5bd2925a0b48999aeb069f3ae000691f82a135c200
     container_name: nano-vector
     restart: unless-stopped
     logging: *verbose-logging
@@ -180,7 +192,8 @@ services:
     # error at startup. Enterprise's Hetzner deploy pre-creates the host dirs
     # so it never hit this; OSS users on a clean Docker host would.
     entrypoint: ["/bin/sh", "-c"]
-    # NAN-1234: `--config-dir` is NOT recursive in Vector 0.52 — a single
+    # NAN-1234: `--config-dir` is NOT recursive in Vector (still true as of
+    # 0.56) — a single
     # `--config-dir /etc/vector` loads only the top-level static TOMLs and SILENTLY
     # DROPS every ingested event, because the api-delivered router + clickhouse_logs
     # sink under dynamic/sources/parsers never load. List each dynamic dir explicitly
@@ -425,7 +438,9 @@ services:
           memory: 128M
 
   nginx:
-    image: nginx:alpine
+    # Was `:alpine` (NAN-1258) — floating tag pinned to its digest. The tag is
+    # kept for human readability; the @sha256 is what `docker pull` enforces.
+    image: nginx:alpine@sha256:8b1e78743a03dbb2c95171cc58639fef29abc8816598e27fb910ed2e621e589a
     container_name: nano-nginx
     restart: unless-stopped
     logging: *default-logging

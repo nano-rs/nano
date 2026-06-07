@@ -85,12 +85,96 @@ json_escape() {
         || fail "Neither python3 nor node is available to JSON-escape the admin password. Install one and retry."
 }
 
-# Verify that the first-party images we just pulled match the sha256 manifest
-# digests recorded in images.lock (generated + committed by CI). Docker already
-# checksum-verifies layers on pull, but that only proves the bytes are internally
-# consistent — it does NOT prove the tag wasn't re-pushed with different content.
-# Pinning to the CI-vouched digest closes that supply-chain gap. Only the
-# ghcr.io/nano-rs/* images are listed; stock third-party images are out of scope.
+# Verify that the images we just pulled match the sha256 manifest digests
+# recorded in images.lock. Docker already checksum-verifies layers on pull, but
+# that only proves the bytes are internally consistent — it does NOT prove a
+# floating tag wasn't re-pushed with different content. Pinning to a vouched
+# digest closes that supply-chain gap (NAN-1258).
+#
+# images.lock has two kinds of lines, told apart by whether the image reference
+# carries a tag (a ':' in its last path segment):
+#   - First-party  "ghcr.io/nano-rs/nano-api sha256:…"  (no tag) — the tag is
+#     NANO_VERSION, and the digest is release-specific. CI regenerates these.
+#   - Third-party  "postgres:17 sha256:…"  (tagged, self-contained) — mirrors
+#     the @sha256 pins in docker-compose.opensource.yml. Version-independent.
+
+# Resolve owner/repo from NANO_REPO_URL when it points at GitHub, else empty.
+github_owner_repo() {
+    local s="$NANO_REPO_URL"
+    case "$s" in
+        *github.com*) ;;
+        *) return 1 ;;
+    esac
+    # Strip scheme/host and any trailing .git, normalize git@ and https forms.
+    s="${s#*github.com}"; s="${s#:}"; s="${s#/}"; s="${s%.git}"; s="${s%/}"
+    [[ "$s" == */* ]] || return 1
+    printf '%s' "$s"
+}
+
+# Echo (newest first) the commit SHAs that touched images.lock on the configured
+# GitHub repo, via the commits API. Needs python3 or node to parse JSON (same
+# soft dep as json_escape). Empty on any failure.
+github_lock_commit_shas() {
+    local owner_repo json
+    owner_repo=$(github_owner_repo) || return 1
+    json=$(curl -fsSL -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/${owner_repo}/commits?path=images.lock&per_page=100" 2>/dev/null) \
+        || return 1
+    printf '%s' "$json" | python3 -c '
+import json,sys
+for c in json.load(sys.stdin): print(c["sha"])
+' 2>/dev/null && return 0
+    printf '%s' "$json" | node -e '
+let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{for(const c of JSON.parse(s))console.log(c.sha);});
+' 2>/dev/null
+}
+
+# Fetch the images.lock whose "# Release:" header matches the pinned version into
+# a temp file and echo its path. The working-tree lock tracks the latest release,
+# so its first-party digests won't match an older pinned NANO_VERSION. We walk
+# the commits that touched images.lock (newest first) and return the first whose
+# header matches — this works whether the repo keeps a commit per release (the
+# dev repo) or snapshot-sync commits (the public mirror), since both carry the
+# "# Release:" header in the file itself. Empty on failure.
+fetch_release_lock() {
+    local want="${1#v}" want_re owner_repo sha tmp tried=0
+    owner_repo=$(github_owner_repo) || return 1
+    want_re="${want//./\\.}"   # dots are literal, not regex wildcards
+    while read -r sha; do
+        [[ -z "$sha" ]] && continue
+        tried=$((tried + 1)); [[ "$tried" -gt 40 ]] && break
+        tmp=$(mktemp) || return 1
+        if curl -fsSL "https://raw.githubusercontent.com/${owner_repo}/${sha}/images.lock" -o "$tmp" 2>/dev/null \
+           && grep -qE "^# Release: v?${want_re}([^0-9]|\$)" "$tmp"; then
+            printf '%s' "$tmp"; return 0
+        fi
+        rm -f "$tmp"
+    done < <(github_lock_commit_shas)
+    return 1
+}
+
+# Compare one lock line's expected digest against the pulled image. $1=image
+# reference (tag included for third-party, bare repo for first-party), $2=repo
+# without tag (for matching RepoDigests), $3=expected sha256. Echoes "ok",
+# "mismatch", or "missing".
+verify_one_digest() {
+    local inspect_ref="$1" repo_notag="$2" expected="$3" actual
+    # RepoDigests records the manifest(-list) digest the reference resolved to on
+    # pull — the same value recorded in images.lock. Pick this repo's entry.
+    actual=$(docker image inspect "$inspect_ref" \
+        --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
+        | grep -F "${repo_notag}@" | head -1)
+    actual="${actual##*@}"
+    if [[ -z "$actual" ]]; then echo "missing"; return; fi
+    if [[ "$actual" == "$expected" ]]; then echo "ok"; else
+        # To stderr — stdout is captured by the caller as the result token.
+        warn "DIGEST MISMATCH for $repo_notag" >&2
+        warn "  expected (images.lock): $expected" >&2
+        warn "  actual   (pulled):      $actual" >&2
+        echo "mismatch"
+    fi
+}
+
 verify_image_digests() {
     local lockfile="images.lock"
 
@@ -99,42 +183,59 @@ verify_image_digests() {
         return 0
     fi
 
-    # images.lock tracks the latest release on this branch, so a user-pinned
-    # NANO_VERSION won't match it. Only enforce on the default 'latest'; for a
-    # pinned release, check out the matching git tag (its images.lock matches).
+    # Third-party base images are version-independent and always verified against
+    # the local lock. First-party digests are release-specific: on 'latest' the
+    # local lock matches; on a pinned NANO_VERSION we fetch the matching release's
+    # lock so a careful (pinned) operator stays verified instead of skipped.
+    local fp_lockfile="$lockfile" fetched=""
     if [[ "$NANO_VERSION" != "latest" ]]; then
-        warn "NANO_VERSION is pinned to '$NANO_VERSION' — skipping images.lock verification (lockfile tracks 'latest')."
-        return 0
+        if fetched=$(fetch_release_lock "$NANO_VERSION") && [[ -n "$fetched" ]]; then
+            fp_lockfile="$fetched"
+            ok "Fetched images.lock for pinned release v${NANO_VERSION#v}"
+        else
+            fp_lockfile=""
+            warn "Could not fetch images.lock for pinned NANO_VERSION='$NANO_VERSION' — first-party digests not verified (base images still are)."
+        fi
     fi
 
     log "Verifying pulled image digests against images.lock"
-    local repo expected actual mismatch=0 verified=0
-    while read -r repo expected; do
-        [[ -z "$repo" || "$repo" == \#* ]] && continue
-        # RepoDigests records the manifest(-list) digest the tag resolved to on
-        # pull — the same value CI writes to images.lock. Pick the entry for this
-        # repo and strip everything up to the '@'.
-        actual=$(docker image inspect "${repo}:${NANO_VERSION}" \
-            --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
-            | grep -F "${repo}@" | head -1)
-        actual="${actual##*@}"
-        if [[ -z "$actual" ]]; then
-            fail "No registry digest found for ${repo}:${NANO_VERSION} — cannot verify it against images.lock. Refusing to start with unverifiable images."
-        fi
-        if [[ "$actual" != "$expected" ]]; then
-            warn "DIGEST MISMATCH for $repo"
-            warn "  expected (images.lock): $expected"
-            warn "  actual   (pulled):      $actual"
-            mismatch=1
-        else
-            verified=$((verified + 1))
-        fi
+    local ref expected basename repo_notag inspect_ref result
+    local mismatch=0 verified_fp=0 verified_tp=0
+
+    # First-party lines (no tag): inspect repo:NANO_VERSION, from fp_lockfile.
+    if [[ -n "$fp_lockfile" ]]; then
+        while read -r ref expected; do
+            [[ -z "$ref" || "$ref" == \#* ]] && continue
+            basename="${ref##*/}"; [[ "$basename" == *:* ]] && continue
+            inspect_ref="${ref}:${NANO_VERSION}"; repo_notag="$ref"
+            result=$(verify_one_digest "$inspect_ref" "$repo_notag" "$expected")
+            case "$result" in
+                ok) verified_fp=$((verified_fp + 1)) ;;
+                missing) fail "No registry digest found for ${inspect_ref} — cannot verify it against images.lock. Refusing to start with unverifiable images." ;;
+                *) mismatch=1 ;;
+            esac
+        done < "$fp_lockfile"
+    fi
+
+    # Third-party lines (tagged): self-contained, always from the local lock.
+    while read -r ref expected; do
+        [[ -z "$ref" || "$ref" == \#* ]] && continue
+        basename="${ref##*/}"; [[ "$basename" == *:* ]] || continue
+        inspect_ref="$ref"; repo_notag="${ref%:*}"
+        result=$(verify_one_digest "$inspect_ref" "$repo_notag" "$expected")
+        case "$result" in
+            ok) verified_tp=$((verified_tp + 1)) ;;
+            missing) fail "No registry digest found for ${inspect_ref} — cannot verify it against images.lock. Refusing to start with unverifiable images." ;;
+            *) mismatch=1 ;;
+        esac
     done < "$lockfile"
+
+    [[ -n "$fetched" ]] && rm -f "$fetched"
 
     if [[ "$mismatch" == "1" ]]; then
         fail "Image digest verification failed: pulled images do not match images.lock. Refusing to start. If you deliberately changed image versions this is expected — otherwise it may indicate a tampered or re-pushed tag."
     fi
-    ok "Verified $verified first-party image digest(s) against images.lock"
+    ok "Verified $verified_fp first-party + $verified_tp third-party image digest(s) against images.lock"
 }
 
 # ----------------------------------------------------------------------------

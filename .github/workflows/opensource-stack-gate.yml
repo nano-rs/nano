@@ -1,0 +1,44 @@
+name: opensource stack gate
+
+# NAN-1261 — cheap PR gate for the open-source quickstart stack DEFINITION.
+# Validates docker-compose.opensource.yml + images.lock + install.sh + the
+# config/vector bundle WITHOUT standing the stack up, so breakage like NAN-1260
+# (vector rejecting a removed config field after a version bump) is caught on the
+# PR, not after merge. The heavy full bring-up + ingestion smoke is a separate,
+# dispatch-only gate (see enrichment-lane-gate.yml for that pattern).
+
+on:
+  pull_request:
+    paths:
+      - docker-compose.opensource.yml
+      - images.lock
+      - install.sh
+      - config/vector/**
+      - scripts/check-opensource-pins.sh
+      - .github/workflows/opensource-stack-gate.yml
+  workflow_dispatch:
+
+concurrency:
+  group: opensource-stack-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    # Self-hosted only (repo rule — never ubuntu-latest). Needs docker +
+    # docker compose v2 on the runner (same as enrichment-lane-gate).
+    runs-on: [self-hosted, X64]
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: shellcheck install.sh + gate script (best-effort)
+        run: |
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck install.sh scripts/check-opensource-pins.sh
+          else
+            echo "shellcheck not installed on runner — skipping."
+          fi
+
+      - name: Validate open-source stack definition
+        run: bash scripts/check-opensource-pins.sh

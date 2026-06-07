@@ -62,6 +62,59 @@ pub enum CaseDisposition {
     Merged,
 }
 
+/// AI-recommended disposition from the shadow investigator (NAN-1251).
+///
+/// Mirrors `CaseDisposition` but adds `NeedsInvestigation` — the third verdict
+/// the LLM already emits, which has no human-disposition equivalent (an analyst
+/// who can't decide leaves the case open rather than dispositioning it). Kept a
+/// separate type so the AI's recommendation is never confused with the human's
+/// final `disposition`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema,
+)]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum AiDisposition {
+    TruePositive,
+    FalsePositive,
+    Benign,
+    Inconclusive,
+    NeedsInvestigation,
+}
+
+impl AiDisposition {
+    /// Wire/DB string form (`snake_case`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::TruePositive => "true_positive",
+            Self::FalsePositive => "false_positive",
+            Self::Benign => "benign",
+            Self::Inconclusive => "inconclusive",
+            Self::NeedsInvestigation => "needs_investigation",
+        }
+    }
+
+    /// Parse the verdict string the LLM returns. Tolerant of the common
+    /// phrasings the model emits ("needs further investigation", spaces, case).
+    pub fn parse_verdict(raw: &str) -> Option<Self> {
+        let n = raw.trim().to_lowercase().replace([' ', '-'], "_");
+        match n.as_str() {
+            "true_positive" | "tp" | "malicious" => Some(Self::TruePositive),
+            "false_positive" | "fp" => Some(Self::FalsePositive),
+            "benign" | "legitimate" => Some(Self::Benign),
+            "inconclusive" | "unknown" => Some(Self::Inconclusive),
+            s if s.starts_with("needs") => Some(Self::NeedsInvestigation),
+            _ => None,
+        }
+    }
+
+    /// True when this verdict warrants human attention (floats to the
+    /// "Must Investigate" inbox bucket). FP/benign/inconclusive do not.
+    pub fn is_actionable(&self) -> bool {
+        matches!(self, Self::TruePositive | Self::NeedsInvestigation)
+    }
+}
+
 /// Grouping type for auto-case creation
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema,
@@ -222,6 +275,33 @@ pub struct Case {
     pub ai_recommendations: Option<serde_json::Value>,
     pub ai_summary_generated_at: Option<DateTime<Utc>>,
 
+    // AI Tier-1 triage verdict (NAN-1251). Structured shadow-investigator
+    // recommendation, kept distinct from the human `disposition` above.
+    #[serde(default)]
+    pub ai_disposition: Option<String>,
+    #[serde(default)]
+    pub ai_confidence: Option<f64>,
+    #[serde(default)]
+    pub ai_recommended_action: Option<String>,
+    #[serde(default)]
+    pub ai_key_evidence: Option<serde_json::Value>,
+    #[serde(default)]
+    pub ai_triaged_at: Option<DateTime<Utc>>,
+
+    // Retroactive revision (NAN-1251 P3) — set when a later case escalated a
+    // shared entity this case had closed as FP/benign.
+    #[serde(default)]
+    pub needs_review: bool,
+    #[serde(default)]
+    pub needs_review_reason: Option<String>,
+    #[serde(default)]
+    pub needs_review_at: Option<DateTime<Utc>>,
+
+    // Auto-close marker (NAN-1251 P4) — true when the AI Tier-1 triage closed
+    // this case. Cleared on reopen.
+    #[serde(default)]
+    pub ai_closed: bool,
+
     // Grouping
     pub grouping_key: Option<String>,
     pub grouping_type: Option<String>,
@@ -287,6 +367,28 @@ pub struct CaseWithDetails {
     pub assigned_group: Option<Uuid>,
     pub assigned_group_at: Option<DateTime<Utc>>,
     pub ai_summary: Option<String>,
+    // AI Tier-1 triage verdict (NAN-1251) — surfaced on list rows + the
+    // elevated-case verdict strip.
+    #[serde(default)]
+    pub ai_disposition: Option<String>,
+    #[serde(default)]
+    pub ai_confidence: Option<f64>,
+    #[serde(default)]
+    pub ai_recommended_action: Option<String>,
+    #[serde(default)]
+    pub ai_key_evidence: Option<serde_json::Value>,
+    #[serde(default)]
+    pub ai_triaged_at: Option<DateTime<Utc>>,
+    // Retroactive revision flag (NAN-1251 P3).
+    #[serde(default)]
+    pub needs_review: bool,
+    #[serde(default)]
+    pub needs_review_reason: Option<String>,
+    #[serde(default)]
+    pub needs_review_at: Option<DateTime<Utc>>,
+    // Auto-close marker (NAN-1251 P4).
+    #[serde(default)]
+    pub ai_closed: bool,
     pub grouping_type: Option<String>,
     pub mitre_tactics: Vec<String>,
     pub mitre_techniques: Vec<String>,
@@ -360,6 +462,15 @@ pub struct CaseWithDetailsRow {
     pub assigned_group: Option<Uuid>,
     pub assigned_group_at: Option<DateTime<Utc>>,
     pub ai_summary: Option<String>,
+    pub ai_disposition: Option<String>,
+    pub ai_confidence: Option<f64>,
+    pub ai_recommended_action: Option<String>,
+    pub ai_key_evidence: Option<serde_json::Value>,
+    pub ai_triaged_at: Option<DateTime<Utc>>,
+    pub needs_review: bool,
+    pub needs_review_reason: Option<String>,
+    pub needs_review_at: Option<DateTime<Utc>>,
+    pub ai_closed: bool,
     pub grouping_type: Option<String>,
     pub mitre_tactics: Vec<String>,
     pub mitre_techniques: Vec<String>,
@@ -455,6 +566,22 @@ pub struct UpdateCase {
     pub priority: Option<i32>,
     pub ai_summary: Option<String>,
     pub ai_recommendations: Option<serde_json::Value>,
+}
+
+/// Input for writing the shadow-investigator's structured verdict back to a
+/// case (NAN-1251). Separate from `UpdateCase` so the AI write path is its own
+/// repository method — it never touches the human-owned columns (`disposition`,
+/// `status`), only the `ai_*` recommendation columns.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct UpdateCaseAiVerdict {
+    pub ai_disposition: AiDisposition,
+    /// 0.0–1.0. Clamped on write.
+    pub ai_confidence: f64,
+    pub ai_recommended_action: Option<String>,
+    /// JSON array of evidence strings the AI cited.
+    pub ai_key_evidence: Option<serde_json::Value>,
+    /// The narrative rationale, persisted to `ai_summary` alongside the verdict.
+    pub ai_summary: Option<String>,
 }
 
 /// Input for assigning a case
@@ -930,6 +1057,12 @@ pub struct CaseFilter {
     /// pre-1093 behaviour for callers that don't pass a sort.
     #[serde(default)]
     pub sort: CaseSort,
+    /// NAN-1251: "Must Investigate" bucket. When `Some(true)`, restrict to
+    /// cases the AI flagged as actionable (`ai_disposition` ∈ {true_positive,
+    /// needs_investigation}) that a human has not yet dispositioned. `None` /
+    /// `Some(false)` disables the filter.
+    #[serde(default)]
+    pub ai_escalated_only: Option<bool>,
     /// NAN-1095: per-severity SLA target minutes. Required when
     /// `sort = CaseSort::Sla`; ignored otherwise. Caller fetches from
     /// `CaseSettings::get_config()` and converts via
@@ -959,6 +1092,10 @@ pub enum CaseSort {
     /// first. Requires `CaseFilter::sla_targets` to be set or the
     /// repository falls back to `Newest`.
     Sla,
+    /// NAN-1251: AI-actionable first — cases the AI flagged as
+    /// true_positive / needs_investigation, highest confidence first,
+    /// then recency. Floats the "Must Investigate" work to the top.
+    AiPriority,
 }
 
 /// NAN-1095: per-severity SLA target minutes. Lifted out of the
@@ -1456,4 +1593,52 @@ pub struct CollabPresenceSummary {
     /// Zero when nobody else is on the case (or when presence tracking is
     /// disabled for this deployment).
     pub viewer_count: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the AI verdict string ↔ `AiDisposition` contract (NAN-1251). The
+    /// shadow investigator and the inbox both depend on these exact strings.
+    #[test]
+    fn ai_disposition_round_trips_wire_strings() {
+        let cases = [
+            (AiDisposition::TruePositive, "true_positive"),
+            (AiDisposition::FalsePositive, "false_positive"),
+            (AiDisposition::Benign, "benign"),
+            (AiDisposition::Inconclusive, "inconclusive"),
+            (AiDisposition::NeedsInvestigation, "needs_investigation"),
+        ];
+        for (variant, wire) in cases {
+            assert_eq!(variant.as_str(), wire);
+            assert_eq!(AiDisposition::parse_verdict(wire), Some(variant));
+        }
+    }
+
+    #[test]
+    fn ai_disposition_parses_model_phrasings() {
+        assert_eq!(
+            AiDisposition::parse_verdict("True Positive"),
+            Some(AiDisposition::TruePositive)
+        );
+        assert_eq!(
+            AiDisposition::parse_verdict("needs further investigation"),
+            Some(AiDisposition::NeedsInvestigation)
+        );
+        assert_eq!(
+            AiDisposition::parse_verdict("FP"),
+            Some(AiDisposition::FalsePositive)
+        );
+        assert_eq!(AiDisposition::parse_verdict("whatever"), None);
+    }
+
+    #[test]
+    fn only_tp_and_needs_investigation_are_actionable() {
+        assert!(AiDisposition::TruePositive.is_actionable());
+        assert!(AiDisposition::NeedsInvestigation.is_actionable());
+        assert!(!AiDisposition::FalsePositive.is_actionable());
+        assert!(!AiDisposition::Benign.is_actionable());
+        assert!(!AiDisposition::Inconclusive.is_actionable());
+    }
 }
