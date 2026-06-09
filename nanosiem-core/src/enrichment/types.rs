@@ -78,6 +78,12 @@ pub enum SyncStatus {
     Success,
     Failed,
     InProgress,
+    /// Queued for an immediate (re)sync. The scheduler's `needs_sync` honors
+    /// this unconditionally — no interval wait, no failure cooldown. Used to
+    /// recover a sync orphaned by a restart (NAN-1280): the prior process was
+    /// killed mid-sync, so we re-queue rather than mark it `Failed` (a restart
+    /// is not a feed failure, and the anti-hammer cooldown would be wrong).
+    Pending,
 }
 
 impl std::fmt::Display for SyncStatus {
@@ -86,6 +92,7 @@ impl std::fmt::Display for SyncStatus {
             SyncStatus::Success => write!(f, "success"),
             SyncStatus::Failed => write!(f, "failed"),
             SyncStatus::InProgress => write!(f, "in_progress"),
+            SyncStatus::Pending => write!(f, "pending"),
         }
     }
 }

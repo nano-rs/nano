@@ -1073,6 +1073,7 @@ fn build_coverage_service(state: &AppState) -> MarketplaceCoverageService {
         state.pool.clone(),
         state.dual_pool.clickhouse().clone(),
         (*state.marketplace_coverage_cache).clone(),
+        state.config.schema_profile(),
     )
 }
 

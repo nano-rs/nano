@@ -211,17 +211,21 @@ impl SearchService {
             _ => ("toStartOfDay(timestamp)".to_string(), 86400),
         };
 
+        let logs_table = self
+            .table_names
+            .read(Self::logs_table_key(self.active_profile.as_ref()));
         let histogram_sql = format!(
             r#"
-            SELECT 
+            SELECT
                 {} as time_bucket,
                 count(*) as count
-            FROM logs
+            FROM {}
             WHERE timestamp BETWEEN '{}' AND '{}'
             GROUP BY time_bucket
             ORDER BY time_bucket ASC
             "#,
             time_bucket_func,
+            logs_table,
             time_range.start.format("%Y-%m-%d %H:%M:%S%.6f"),
             time_range.end.format("%Y-%m-%d %H:%M:%S%.6f")
         );

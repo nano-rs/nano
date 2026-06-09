@@ -7,6 +7,8 @@ import {
   Zap,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
+import { buildSecondaryPrefs, SEQUENCE_SECONDARY_BASE } from '@/lib/secondary-identity-prefs';
 
 // ─────────────────────────── types ───────────────────────────
 
@@ -143,9 +145,12 @@ const META_KEYS = new Set([
   '_display_type',
 ]);
 
-const SECONDARY_PREFS = ['user', 'user_name', 'username', 'host', 'hostname', 'src_host', 'dest_host'];
-
-function adaptResult(r: SearchResult, byFields: string[], idx: number): Entity | null {
+function adaptResult(
+  r: SearchResult,
+  byFields: string[],
+  idx: number,
+  secondaryPrefs: readonly string[],
+): Entity | null {
   const f = r.fields ?? {};
   const group: Record<string, string> = {};
   const stepData: Record<number, { time?: string; eventId?: string; fields: Record<string, string> }> = {};
@@ -225,7 +230,7 @@ function adaptResult(r: SearchResult, byFields: string[], idx: number): Entity |
 
   const primaryField = byFields[0] ?? Object.keys(group)[0];
   const display = primaryField ? (group[primaryField] ?? '') : '';
-  const secondary = SECONDARY_PREFS
+  const secondary = secondaryPrefs
     .map((k) => group[k])
     .find((v) => v && v.length > 0) ?? '';
 
@@ -592,12 +597,20 @@ export function SequenceView({
   const parsed = useMemo(() => parseSequenceCmd(query), [query]);
   const byKey = parsed.byFields[0] ?? 'entity';
 
+  // Secondary identity line follows the active schema (NAN-1241): UDM base list,
+  // unioned with OCSF host/user/ip promoted columns when OCSF is active.
+  const { schemaFields } = useSchemaEntityMap();
+  const secondaryPrefs = useMemo(
+    () => buildSecondaryPrefs(SEQUENCE_SECONDARY_BASE, schemaFields),
+    [schemaFields],
+  );
+
   const entitiesRaw: Entity[] = useMemo(
     () =>
       results
-        .map((r, i) => adaptResult(r, parsed.byFields, i))
+        .map((r, i) => adaptResult(r, parsed.byFields, i, secondaryPrefs))
         .filter((e): e is Entity => e !== null),
-    [results, parsed.byFields],
+    [results, parsed.byFields, secondaryPrefs],
   );
 
   const [filter, setFilter] = useState('');

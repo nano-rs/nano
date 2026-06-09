@@ -404,7 +404,7 @@ export function RuleRepositories() {
   if (!activeRepo) {
     return (
       <TooltipProvider>
-        <div className="-m-3 flex h-[calc(100%+1.5rem)] overflow-hidden min-h-0 flex-col">
+        <div className="-m-3 flex h-[calc(100%+1.5rem)] overflow-hidden min-h-0 flex-col [contain:layout]">
         <div className="border-b border-border bg-card/30 px-5 py-3.5 flex items-start gap-4">
           <div className="flex-1 min-w-0">
             <div className="text-[16.5px] font-semibold tracking-[-0.01em] text-foreground">
@@ -513,7 +513,7 @@ export function RuleRepositories() {
 
   return (
     <TooltipProvider>
-      <div className="-m-3 flex h-[calc(100%+1.5rem)] overflow-hidden min-h-0 flex-col">
+      <div className="-m-3 flex h-[calc(100%+1.5rem)] overflow-hidden min-h-0 flex-col [contain:layout]">
         <ReposHeader
         repo={activeRepo}
         onSyncNow={() => syncMutation.mutate(activeRepo.id)}

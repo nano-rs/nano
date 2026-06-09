@@ -700,6 +700,31 @@ impl SignalProcessor {
         dual_pool: &DualPool,
         log_id: Uuid,
     ) -> anyhow::Result<Option<serde_json::Value>> {
+        // Resolve the active schema profile so column resolution + the FROM table
+        // follow UDM vs OCSF. UDM keeps the literal column names (byte-identical);
+        // OCSF maps the UDM-semantic entity fields to their promoted columns and
+        // falls back to an empty string for concepts it does not carry
+        // (`risk_entity`), so the strongly-typed row below still deserializes.
+        let profile = crate::schema::active_profile_from_env()
+            .map_err(|e| anyhow::anyhow!("invalid schema profile: {e}"))?;
+        // Same table-key derivation the search service uses: OCSF reads
+        // `ocsf_logs`, UDM reads `logs`, both through the tenant-aware registry.
+        let logs_table_key = match profile.id() {
+            crate::schema::SchemaId::Ocsf => "ocsf_logs",
+            crate::schema::SchemaId::Udm => "logs",
+        };
+        let logs_table = dual_pool.table_names().read(logs_table_key);
+
+        // Resolve a UDM-semantic entity field to a SELECT clause aliased back to
+        // the canonical name. When the active schema has no column for that
+        // concept, emit `'' AS <field>` so the typed row keeps its shape.
+        let entity_col = |udm_field: &str| -> String {
+            match profile.udm_column_sql(udm_field) {
+                Some(sql) => format!("{sql} AS {udm_field}"),
+                None => format!("'' AS {udm_field}"),
+            }
+        };
+
         // Only fetch key fields for alert context - metadata contains the full original log
         let query = format!(
             r#"
@@ -709,18 +734,25 @@ impl SignalProcessor {
                 message,
                 metadata,
                 source_type,
-                src_ip,
-                dest_ip,
-                src_host,
-                dest_host,
-                src_user,
-                dest_user,
-                risk_entity
-            FROM logs
+                {src_ip},
+                {dest_ip},
+                {src_host},
+                {dest_host},
+                {src_user},
+                {dest_user},
+                {risk_entity}
+            FROM {logs_table}
             WHERE id = '{}'
             LIMIT 1
             "#,
-            log_id
+            log_id,
+            src_ip = entity_col("src_ip"),
+            dest_ip = entity_col("dest_ip"),
+            src_host = entity_col("src_host"),
+            dest_host = entity_col("dest_host"),
+            src_user = entity_col("src_user"),
+            dest_user = entity_col("dest_user"),
+            risk_entity = entity_col("risk_entity"),
         );
 
         let ch_client = dual_pool.clickhouse();

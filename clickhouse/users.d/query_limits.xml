@@ -86,7 +86,16 @@
 
             <!-- Security -->
             <readonly>0</readonly>
-            <allow_ddl>0</allow_ddl>
+            <!-- allow_ddl=1 matches the managed-SaaS nanosiem profile
+                 (nano-main k8s-manifests/clickhouse.ts). The `nanosiem` user is
+                 BOTH the analyst-query user and the app/sync user; system
+                 operations like the IPinfo Lite sync's generational cleanup
+                 (`ALTER TABLE ip_enrichments DELETE …`, a mutation = DDL) require
+                 it. allow_ddl=0 here made open-edition/dev stricter than prod and
+                 broke the sync with Code 392 (NAN-1314). Analyst queries are
+                 still gated SELECT-only at the API layer; the nanosiem CH
+                 password is not exposed to analysts. -->
+            <allow_ddl>1</allow_ddl>
 
             <!-- Distributed Query Settings -->
             <distributed_product_mode>allow</distributed_product_mode>

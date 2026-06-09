@@ -33,6 +33,20 @@ fn safe_for_toml_comment(s: &str) -> String {
     out
 }
 
+/// NAN-1246: the OCSF-fork `_ocsf_prepare` VRL — shapes the `ocsf_logs` row
+/// `{event, timestamp, source_type}` from an OCSF event root. Kept as a const so
+/// it's directly VRL-compile-tested (Rust can't see inside the embedded `source`
+/// string literal — a syntax slip would only surface at Vector runtime; NAN-667).
+/// `%source_type` is the upstream-stashed routing key (the parser's
+/// `. = {OCSF object}` wiped the root); `time` is OCSF epoch-ms.
+const OCSF_PREPARE_VRL: &str = r#"ocsf_event = .
+time_ms = to_int(.time) ?? 0
+ts = now()
+if time_ms > 0 { ts = from_unix_timestamp!(time_ms, unit: "milliseconds") }
+src_type = downcase(to_string(%source_type) ?? "unknown")
+if src_type == "" { src_type = "unknown" }
+. = { "event": ocsf_event, "timestamp": format_timestamp!(ts, "%Y-%m-%d %H:%M:%S%.3f"), "source_type": src_type }"#;
+
 impl VectorConfigManager {
     /// Generate Vector TOML config for a single parser (returns string)
     pub fn generate_parser_config_string(&self, parser: &Parser) -> String {
@@ -97,6 +111,21 @@ impl VectorConfigManager {
             String::new()
         };
 
+        // NAN-1246: under the OCSF profile, fork OCSF events (the VRL emitted a
+        // root `.class_uid`) off to `ocsf_logs` and send everything else down the
+        // normal UDM `_output` → logs path. Generated per parser — mirrors how the
+        // UDM router/transforms are generated from onboarded sources — and gated on
+        // NANO_SCHEMA_PROFILE=ocsf so UDM deployments stay byte-identical (no lane).
+        // The shared `clickhouse_ocsf_logs` sink is emitted once by the deploy
+        // orchestration (inputs = every parser's `_ocsf_prepare`).
+        let (ocsf_lane_config, output_input) = if Self::ocsf_mode() {
+            let split_name = format!("{}_ocsf_split", safe_name);
+            let lane = self.generate_ocsf_lane(&safe_name, &output_input);
+            (lane, format!("{}._unmatched", split_name))
+        } else {
+            (String::new(), output_input)
+        };
+
         let output_config = self.generate_output_transform(parser, &output_input);
 
         config.push_str(&source_config);
@@ -109,6 +138,10 @@ impl VectorConfigManager {
             config.push_str(&extension_config);
             config.push_str("\n");
         }
+        if !ocsf_lane_config.is_empty() {
+            config.push_str(&ocsf_lane_config);
+            config.push_str("\n");
+        }
         config.push_str(&output_config);
 
         if let Some(sample_config) = self.generate_sample_transform(parser) {
@@ -117,6 +150,41 @@ impl VectorConfigManager {
         }
 
         config
+    }
+
+    /// NAN-1246: true only under `NANO_SCHEMA_PROFILE=ocsf` — the deployment-wide
+    /// gate for generating the native-OCSF ingestion lane. UDM (default) → false,
+    /// so no OCSF transforms/sink are emitted and the config is byte-identical.
+    pub(crate) fn ocsf_mode() -> bool {
+        crate::schema::active_profile_from_env()
+            .map(|p| p.id() == crate::schema::SchemaId::Ocsf)
+            .unwrap_or(false)
+    }
+
+    /// NAN-1246: per-parser OCSF fork. Routes events whose VRL emitted a root
+    /// `.class_uid` into `{name}_ocsf_prepare` (which shapes the `ocsf_logs` row:
+    /// `{event, timestamp, source_type}`) → the shared `clickhouse_ocsf_logs` sink;
+    /// non-OCSF events fall to `{name}_ocsf_split._unmatched` and continue down the
+    /// UDM `_output` → logs path. `source_type` is recovered from the event
+    /// metadata stashed upstream (the parser's `. = {OCSF object}` wipes the root).
+    fn generate_ocsf_lane(&self, safe_name: &str, input_name: &str) -> String {
+        let split = format!("{}_ocsf_split", safe_name);
+        let prepare = format!("{}_ocsf_prepare", safe_name);
+        format!(
+            "[transforms.{split}]\n\
+             type = \"route\"\n\
+             inputs = [\"{input_name}\"]\n\
+             [transforms.{split}.route]\n\
+             ocsf = 'exists(.class_uid)'\n\
+             \n\
+             [transforms.{prepare}]\n\
+             type = \"remap\"\n\
+             inputs = [\"{split}.ocsf\"]\n\
+             source = '''\n\
+             {vrl}\n\
+             '''\n",
+            vrl = OCSF_PREPARE_VRL
+        )
     }
 
     /// Generate the optional `{safe_name}_extension` remap transform (NAN-874).
@@ -643,5 +711,39 @@ mod tests {
                 "VRL block #{idx} failed to compile (metadata-escape regression?): {block}"
             );
         }
+    }
+
+    // NAN-1246: the generated OCSF-fork VRL must compile under Vector's stdlib —
+    // a syntax slip in the const would only surface at Vector runtime (NAN-667).
+    #[test]
+    fn ocsf_prepare_vrl_compiles() {
+        use vrl::compiler::compile;
+        assert!(
+            compile(super::OCSF_PREPARE_VRL, &vrl::stdlib::all()).is_ok(),
+            "OCSF_PREPARE_VRL failed to compile:\n{}",
+            super::OCSF_PREPARE_VRL
+        );
+    }
+
+    // NAN-1246: the per-parser OCSF lane forks `class_uid` events to `_ocsf_prepare`
+    // and its embedded VRL compiles. (Tests `generate_ocsf_lane` directly to avoid
+    // the env-racy `ocsf_mode` gate.)
+    #[test]
+    fn ocsf_lane_routes_class_uid_and_wires_prepare() {
+        use vrl::compiler::compile;
+        let m = manager();
+        let lane = m.generate_ocsf_lane("apache", "apache_parse");
+        assert!(lane.contains("[transforms.apache_ocsf_split]"), "{lane}");
+        assert!(lane.contains("inputs = [\"apache_parse\"]"), "{lane}");
+        assert!(lane.contains("ocsf = 'exists(.class_uid)'"), "{lane}");
+        assert!(lane.contains("[transforms.apache_ocsf_prepare]"), "{lane}");
+        assert!(lane.contains("inputs = [\"apache_ocsf_split.ocsf\"]"), "{lane}");
+        let opener = "source = '''";
+        let body = &lane[lane.find(opener).unwrap() + opener.len()..];
+        let vrl = &body[..body.find("'''").unwrap()];
+        assert!(
+            compile(vrl, &vrl::stdlib::all()).is_ok(),
+            "generated lane VRL failed to compile:\n{vrl}"
+        );
     }
 }

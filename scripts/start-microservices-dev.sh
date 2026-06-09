@@ -63,6 +63,18 @@ export NANO_TIER="${NANO_TIER:-unrestricted}"
 # Deployment mode (selfhosted, managed, demo)
 export DEPLOYMENT_MODE="${DEPLOYMENT_MODE:-selfhosted}"
 
+# Active schema profile (NAN-1241): `udm` (default, the native Unified Data Model)
+# or `ocsf` (query/detect natively over OCSF-shaped data in `nanosiem.ocsf_logs`).
+# Exported here so BOTH the API and the search microservice pick it up.
+#   ./scripts/start-microservices-dev.sh                            # UDM (default)
+#   NANO_SCHEMA_PROFILE=ocsf ./scripts/start-microservices-dev.sh   # OCSF
+# NOTE: OCSF mode requires the `nanosiem.ocsf_logs` table to exist (the API
+# fail-fasts at boot otherwise) — create it from clickhouse/ocsf/init.sql first.
+export NANO_SCHEMA_PROFILE="${NANO_SCHEMA_PROFILE:-udm}"
+if [ "$NANO_SCHEMA_PROFILE" != "udm" ]; then
+    echo -e "${YELLOW}🧬 Schema profile: ${NANO_SCHEMA_PROFILE} (requires nanosiem.${NANO_SCHEMA_PROFILE}_logs to exist)${NC}"
+fi
+
 # Air-gap mode (NAN-1201). AIRGAP_MODE=true runs the stack as a zero-egress
 # deployment: the marketplace hides cloud-install / repo-sync, badges providers
 # "available offline" vs "requires connectivity", surfaces import-from-file, and

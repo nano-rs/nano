@@ -9,6 +9,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+use crate::schema::{active_profile_from_env, EntityType, SchemaProfile, UdmProfile};
+
 /// An extracted entity from alert events
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ExtractedEntity {
@@ -57,15 +59,22 @@ impl EntityExtractor {
     pub fn extract_from_events(&self, events: &serde_json::Value) -> Vec<ExtractedEntity> {
         let mut entities = HashSet::new();
 
+        // NAN-1296: classify host/user/ip fields via the ACTIVE schema profile's
+        // entity_type (not a hardcoded name list), so any promoted entity field —
+        // OCSF device.hostname / src_endpoint.ip, UDM dvc / dvc_ip / user_name,
+        // and any future field — is recognized automatically.
+        let profile = active_profile_from_env()
+            .unwrap_or_else(|_| std::sync::Arc::new(UdmProfile::new()));
+
         // Process the events array or single event
         match events {
             serde_json::Value::Array(arr) => {
                 for event in arr {
-                    self.extract_from_value(event, &mut entities);
+                    self.extract_from_value(event, &mut entities, profile.as_ref());
                 }
             }
             serde_json::Value::Object(_) => {
-                self.extract_from_value(events, &mut entities);
+                self.extract_from_value(events, &mut entities, profile.as_ref());
             }
             _ => {}
         }
@@ -78,19 +87,20 @@ impl EntityExtractor {
         &self,
         value: &serde_json::Value,
         entities: &mut HashSet<ExtractedEntity>,
+        profile: &dyn SchemaProfile,
     ) {
         match value {
             serde_json::Value::Object(map) => {
                 for (key, val) in map {
                     // Check for known entity field names
-                    self.extract_by_field_name(&key.to_lowercase(), val, entities);
+                    self.extract_by_field_name(&key.to_lowercase(), val, entities, profile);
                     // Recursively process nested values
-                    self.extract_from_value(val, entities);
+                    self.extract_from_value(val, entities, profile);
                 }
             }
             serde_json::Value::Array(arr) => {
                 for item in arr {
-                    self.extract_from_value(item, entities);
+                    self.extract_from_value(item, entities, profile);
                 }
             }
             serde_json::Value::String(s) => {
@@ -107,6 +117,7 @@ impl EntityExtractor {
         field_name: &str,
         value: &serde_json::Value,
         entities: &mut HashSet<ExtractedEntity>,
+        profile: &dyn SchemaProfile,
     ) {
         let string_val = match value {
             serde_json::Value::String(s) => s.clone(),
@@ -118,44 +129,44 @@ impl EntityExtractor {
             return;
         }
 
-        // User-related fields — exact UDM column names only
-        // Avoids user_domain (domain names), user_id (SIDs), user_type, user_agent, etc.
-        if matches!(field_name, "user" | "src_user" | "dest_user" | "user_name") {
-            if !self.looks_like_ip(&string_val)
-                && !self.looks_like_hash(&string_val)
-                && self.looks_like_username(&string_val)
+        // Host / User / IP — classified by the ACTIVE schema profile's entity_type
+        // (NAN-1296) instead of a hardcoded name list, so every promoted entity
+        // field is recognized (device.hostname, src_endpoint.ip, dvc, dvc_ip,
+        // user_name, …). The value-shape checks (looks_like_*) still guard against
+        // mis-typed values (e.g. a user.* field whose value is a SID, not a name).
+        match profile.entity_type(field_name) {
+            Some(EntityType::User)
+                if !self.looks_like_ip(&string_val)
+                    && !self.looks_like_hash(&string_val)
+                    && self.looks_like_username(&string_val) =>
             {
                 entities.insert(ExtractedEntity {
                     entity_type: "user".to_string(),
                     value: string_val.clone(),
                 });
             }
-        }
-
-        // Host fields — exact UDM column names
-        if matches!(field_name, "src_host" | "dest_host") {
-            if !self.looks_like_ip(&string_val) && self.looks_like_hostname(&string_val) {
+            Some(EntityType::Host)
+                if !self.looks_like_ip(&string_val) && self.looks_like_hostname(&string_val) =>
+            {
                 entities.insert(ExtractedEntity {
                     entity_type: "host".to_string(),
                     value: string_val.clone(),
                 });
             }
-        }
-
-        // IP fields — exact UDM column names
-        if matches!(field_name, "src_ip" | "dest_ip") {
-            if self.looks_like_ip(&string_val) {
+            Some(EntityType::Ip) if self.looks_like_ip(&string_val) => {
                 entities.insert(ExtractedEntity {
                     entity_type: "ip".to_string(),
                     value: string_val.clone(),
                 });
             }
+            _ => {}
         }
 
         // Domain fields — UDM columns that contain actual domain values
         if matches!(
             field_name,
             "url_domain" | "sender_domain" | "recipient_domain"
+                | "http_request.url.hostname" | "url.hostname" | "query.hostname"
         ) {
             if !self.looks_like_ip(&string_val) && self.looks_like_domain(&string_val) {
                 entities.insert(ExtractedEntity {
@@ -165,8 +176,12 @@ impl EntityExtractor {
             }
         }
 
-        // Hash fields — exact UDM column names
-        if matches!(field_name, "file_hash" | "process_hash") {
+        // Hash fields — UDM column names + OCSF promoted SHA-256 columns (NAN-1291).
+        if matches!(
+            field_name,
+            "file_hash" | "process_hash"
+                | "file.hashes.sha256" | "process.file.hashes.sha256" | "actor.process.file.hashes.sha256"
+        ) {
             if self.looks_like_hash(&string_val) {
                 entities.insert(ExtractedEntity {
                     entity_type: "hash".to_string(),
@@ -175,8 +190,8 @@ impl EntityExtractor {
             }
         }
 
-        // URL fields — exact UDM column name
-        if matches!(field_name, "url") {
+        // URL fields — UDM column name + OCSF promoted URL strings (NAN-1291).
+        if matches!(field_name, "url" | "url.url_string" | "http_request.url.url_string") {
             if string_val.starts_with("http://") || string_val.starts_with("https://") {
                 entities.insert(ExtractedEntity {
                     entity_type: "url".to_string(),
@@ -191,6 +206,7 @@ impl EntityExtractor {
         if matches!(
             field_name,
             "command_line" | "process_name" | "parent_command_line" | "parent_process_name"
+                | "process.name" | "actor.process.name" | "process.cmd_line" | "actor.process.cmd_line"
         ) {
             if self.looks_like_process(&string_val) {
                 entities.insert(ExtractedEntity {
@@ -204,6 +220,7 @@ impl EntityExtractor {
         if matches!(
             field_name,
             "file_path" | "file_name" | "process_path" | "parent_process_path"
+                | "file.path" | "file.name" | "process.file.path" | "actor.process.file.path"
         ) {
             if !string_val.is_empty() && string_val.len() > 1 {
                 entities.insert(ExtractedEntity {

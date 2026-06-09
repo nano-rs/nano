@@ -3,11 +3,19 @@
 //! Database repository implementations
 
 pub mod alerts;
+// Cases & incidents are an enterprise feature (NAN-744): the API routes that
+// expose them live in nanosiem-enterprise, no open-core code calls these repos,
+// and the `ai_*` columns they SELECT only exist in the enterprise migration
+// overlay. Gate the repo layer out of the open edition entirely (NAN-1298),
+// matching the airgap/license precedent — so the open binary never compiles SQL
+// against columns its database doesn't have.
+#[cfg(feature = "enterprise")]
 pub mod cases;
 pub mod dashboards;
 pub mod detection_rules;
 pub mod feedback;
 pub mod folder_settings;
+#[cfg(feature = "enterprise")]
 pub mod incidents;
 pub mod notebooks;
 pub mod notifications;
@@ -19,6 +27,7 @@ pub mod search_history;
 pub mod shared_searches;
 
 pub use alerts::{compute_event_hash, AlertRepository, AlertRepositoryError};
+#[cfg(feature = "enterprise")]
 pub use cases::{CaseRepository, CaseRepositoryError, CaseWorkflowRepository};
 pub use dashboards::{DashboardRepository, DashboardRepositoryError};
 pub use detection_rules::{DailyStat, DetectionRuleRepository};
@@ -27,6 +36,7 @@ pub use feedback::{
     FeedbackWithUser, UpdateFeedbackRequest,
 };
 pub use folder_settings::{FolderSetting, FolderSettingsError, FolderSettingsRepository};
+#[cfg(feature = "enterprise")]
 pub use incidents::{IncidentRepository, IncidentRepositoryError};
 pub use notebooks::{NotebookRepository, NotebookRepositoryError};
 pub use notifications::{NotificationError, NotificationRepository};

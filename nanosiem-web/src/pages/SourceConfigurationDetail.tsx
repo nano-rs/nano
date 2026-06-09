@@ -533,9 +533,17 @@ export default function SourceConfigurationDetail() {
     });
   };
 
+  // NAN-1271: order routing rules with the `default` (catch-all) ALWAYS last
+  // (see sortRulesDefaultLast). Used for the drag-reorder order so it matches
+  // the displayed list in RulesList.
+  const orderedRoutingRules = useMemo(
+    () => sortRulesDefaultLast(config?.routing_rules ?? []),
+    [config?.routing_rules],
+  );
+
   const handleReorderDrop = (fromId: string, toId: string) => {
     if (!config || fromId === toId) return;
-    const order = config.routing_rules.map((r) => r.id);
+    const order = orderedRoutingRules.map((r) => r.id);
     const fromIdx = order.indexOf(fromId);
     const toIdx = order.indexOf(toId);
     if (fromIdx < 0 || toIdx < 0) return;
@@ -1550,6 +1558,19 @@ function EditConnectionSheet({
 // Rules list (left rail)
 // ============================================================================
 
+// NAN-1271: routing rules ordered with the `default` (catch-all) rule ALWAYS
+// last, regardless of stored priority. The backend pins defaults last on every
+// write, but this keeps the UI correct even for legacy rows (a fallback once
+// seeded at priority 0 would otherwise sort first and look like it matches
+// before every real rule).
+function sortRulesDefaultLast(rules: RoutingRule[]): RoutingRule[] {
+  return [...rules].sort(
+    (a, b) =>
+      Number(a.match_type === 'default') - Number(b.match_type === 'default') ||
+      a.priority - b.priority,
+  );
+}
+
 function RulesList({
   config,
   selectedRuleId,
@@ -1617,7 +1638,7 @@ function RulesList({
             No routing rules yet. Add one to start dispatching events to a parser.
           </div>
         ) : (
-          config.routing_rules.map((rule, i) => {
+          sortRulesDefaultLast(config.routing_rules).map((rule, i) => {
             const draft = ruleDrafts[rule.id];
             const display = draft ?? rule;
             const meta = matchTypeMeta(display.match_type);

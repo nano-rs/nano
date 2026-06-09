@@ -22,6 +22,7 @@ import { cn } from '@/lib/utils';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useAuth } from '@/contexts/AuthContext';
 import { useCapabilities } from '@/hooks/use-capabilities';
+import { useSystemConfig } from '@/hooks/use-api';
 import { useAuditLog } from '@/hooks/use-api';
 import {
   SETTINGS_GROUPS,
@@ -322,12 +323,15 @@ export function SettingsLanding() {
   useDocumentTitle('Settings');
   const { hasPermission, hasAnyPermission, isDemoUser } = useAuth();
   const { capabilities } = useCapabilities();
+  const { data: systemConfig } = useSystemConfig();
+  const isAirGap = systemConfig?.air_gap === true;
 
   const visibleSections = useMemo(() => {
     return SETTINGS_SECTIONS
       .map(s => {
         if (s.capability && !capabilities[s.capability]) return null;
         if (s.demoHidden && isDemoUser) return null;
+        if (s.airgapOnly && !isAirGap) return null;
         const ok = !s.permissions
           || (Array.isArray(s.permissions) ? hasAnyPermission(s.permissions) : hasPermission(s.permissions));
         if (!ok) return null;
@@ -335,7 +339,7 @@ export function SettingsLanding() {
       })
       .filter((s): s is SettingsSection => s !== null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasPermission, hasAnyPermission, isDemoUser, capabilities]);
+  }, [hasPermission, hasAnyPermission, isDemoUser, capabilities, isAirGap]);
 
   const attention = useAttentionItems(visibleSections);
 

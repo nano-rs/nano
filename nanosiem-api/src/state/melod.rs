@@ -299,6 +299,7 @@ impl AppState {
             self.pool.clone(),
             self.dual_pool.clickhouse().clone(),
             self.dual_pool.table_names(),
+            self.config.schema_profile(),
         )
     }
 

@@ -56,10 +56,22 @@ function nestedField(e: Record<string, unknown>, path: string): string | undefin
   return typeof cur === 'string' && cur.trim() ? cur : undefined;
 }
 
+// OCSF promoted columns are dotted (`src_endpoint.ip`). In stats-aggregate match
+// rows the group-by key lands as a FLAT dotted string key
+// (`{ "src_endpoint.ip": "10.1.2.100" }`), while some raw event shapes nest it
+// (`{ src_endpoint: { ip: "…" } }`). Try the flat key first, then nested — so
+// aggregate matches (the common case) resolve, without breaking nested shapes.
+function ocsfField(e: Record<string, unknown>, key: string): string | undefined {
+  return stringField(e, key) || nestedField(e, key);
+}
+
 // Entity extraction — a match fires against a grouping key (user, IP, host).
 // We don't know which one the rule grouped by without parsing the query, so we
 // prefer identity-ish fields first, then fall back to network identifiers.
-export function extractEntity(events: Record<string, unknown>[]): MatchEntity {
+export function extractEntity(
+  events: Record<string, unknown>[],
+  resolveEntityType?: (fieldName: string) => string | undefined,
+): MatchEntity {
   if (!events || events.length === 0) {
     return { id: 'unknown', label: 'unknown', type: 'other' };
   }
@@ -78,16 +90,81 @@ export function extractEntity(events: Record<string, unknown>[]): MatchEntity {
     };
   }
 
-  const user = stringField(e, 'user');
+  // NAN-1296: schema-aware classification. When the caller passes the active
+  // profile's resolver (useSchemaEntityMap), classify each event key by its
+  // entity_type so any promoted entity field (UDM or OCSF, current or future)
+  // resolves without a hardcoded list. Priority user > host > ip, matching the
+  // fallback below. Falls through to the hardcoded lists if nothing resolves.
+  if (resolveEntityType) {
+    let user: string | undefined;
+    let host: string | undefined;
+    let ip: string | undefined;
+    for (const [k, v] of Object.entries(e)) {
+      if (typeof v !== 'string' || !v.trim()) continue;
+      const t = resolveEntityType(k);
+      if (t === 'user' && !user) user = v;
+      else if (t === 'host' && !host) host = v;
+      else if (t === 'ip' && !ip) ip = v;
+    }
+    if (user) return { id: user, label: user, type: 'user', raw: user };
+    if (host) return { id: host, label: host, type: 'host', raw: host };
+    if (ip) return { id: ip, label: ip, type: 'ip', raw: ip };
+  }
+
+  // NAN-1241: fall back to the OCSF promoted (dotted) entity columns when the
+  // UDM names are absent (OCSF rows). UDM rows hit the UDM name first, so UDM
+  // extraction is byte-identical.
+  const user =
+    stringField(e, 'user') ||
+    ocsfField(e, 'actor.user.name') ||
+    ocsfField(e, 'user.name');
   if (user) return { id: user, label: user, type: 'user', raw: user };
 
-  const host = stringField(e, 'src_host') || stringField(e, 'hostname') || stringField(e, 'dest_host');
+  const host =
+    stringField(e, 'src_host') ||
+    stringField(e, 'hostname') ||
+    stringField(e, 'dest_host') ||
+    ocsfField(e, 'device.hostname') ||
+    ocsfField(e, 'src_endpoint.hostname') ||
+    ocsfField(e, 'dst_endpoint.hostname');
   if (host) return { id: host, label: host, type: 'host', raw: host };
 
-  const ip = stringField(e, 'src_ip') || stringField(e, 'dest_ip');
+  const ip =
+    stringField(e, 'src_ip') ||
+    stringField(e, 'dest_ip') ||
+    ocsfField(e, 'src_endpoint.ip') ||
+    ocsfField(e, 'dst_endpoint.ip');
   if (ip) return { id: ip, label: ip, type: 'ip', raw: ip };
 
   return { id: 'unknown', label: 'unknown', type: 'other' };
+}
+
+// Per-event entity label for the timeline lanes. Reuses `extractEntity`'s
+// field precedence on a single event so lanes track the rule's grouping entity
+// (host / user / ip) rather than assuming a source IP. Returns undefined when
+// nothing resolves (rendered as a `—` placeholder lane).
+export function eventEntityLabel(e: Record<string, unknown>): string | undefined {
+  const ent = extractEntity([e]);
+  return ent.id === 'unknown' && ent.type === 'other' ? undefined : ent.label;
+}
+
+// Human noun for an entity type — drives the timeline header ("N hosts") and
+// the leaderboard title ("Top users"). Append "s" at the call site to pluralize.
+export function entityNoun(type: EntityType): string {
+  switch (type) {
+    case 'ip':
+      return 'source IP';
+    case 'host':
+      return 'host';
+    case 'user':
+      return 'user';
+    case 'role':
+      return 'role';
+    case 'service':
+      return 'service';
+    default:
+      return 'entity';
+  }
 }
 
 // `YYYY-MM-DD[T| ]HH:MM` — gate the aggregate-row scan in `extractEventTime`
@@ -125,11 +202,14 @@ export function extractEventTime(e: Record<string, unknown>): Date | undefined {
 }
 
 // IP accessor — matches the UDM convention (src_ip) first, then CloudTrail's
-// sourceIPAddress so existing fixtures keep rendering.
+// sourceIPAddress, then the OCSF promoted endpoint IPs (flat-dotted keys in
+// aggregate rows) so OCSF matches count source IPs too (NAN-1287).
 export function extractIp(e: Record<string, unknown>): string | undefined {
   return stringField(e, 'src_ip')
     || stringField(e, 'sourceIPAddress')
-    || stringField(e, 'dest_ip');
+    || stringField(e, 'dest_ip')
+    || ocsfField(e, 'src_endpoint.ip')
+    || ocsfField(e, 'dst_endpoint.ip');
 }
 
 // Aggregate detection — NAN-830 moved this server-side via `_match_kind`.
@@ -182,13 +262,20 @@ export function extractAction(e: Record<string, unknown>): string | undefined {
     || stringField(e, 'event_type')
     || stringField(e, 'action')
     || stringField(e, 'event_id')
+    // OCSF raw events: `activity` (Launch/Logon/Get…) or the CloudTrail-style
+    // `api.operation` (DeleteBucket…) before the aggregate fallback (NAN-1287).
+    || stringField(e, 'activity')
+    || ocsfField(e, 'api.operation')
     || aggregateLabel(e);
 }
 
 export function extractRegion(e: Record<string, unknown>): string | undefined {
   return stringField(e, 'awsRegion')
     || stringField(e, 'region')
-    || stringField(e, 'enriched_src_country');
+    || stringField(e, 'enriched_src_country')
+    // OCSF: cloud region, then the geo-enriched source country (NAN-1287).
+    || ocsfField(e, 'cloud.region')
+    || ocsfField(e, 'src_endpoint.location.country');
 }
 
 // Event ingest time — when the detection engine fired (as opposed to when the
@@ -256,7 +343,10 @@ export function meanTimeToDetect(views: MatchView[]): Latency | null {
   return { ms: avg, level: classifyLatency(avg), formatted: formatLatency(avg) };
 }
 
-export function buildMatchView(m: DetectionMatch): MatchView {
+export function buildMatchView(
+  m: DetectionMatch,
+  resolveEntityType?: (fieldName: string) => string | undefined,
+): MatchView {
   const detectedAt = parseUTCTimestamp(m.detected_at);
   const events = m.events || [];
 
@@ -292,7 +382,7 @@ export function buildMatchView(m: DetectionMatch): MatchView {
     detectedAt,
     severity: m.severity,
     status: m.status,
-    entity: extractEntity(events),
+    entity: extractEntity(events, resolveEntityType),
     firstSeen,
     lastSeen,
     uniqueIps: ips.size,

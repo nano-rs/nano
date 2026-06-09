@@ -1,0 +1,107 @@
+{
+  "class_uid": 1001,
+  "class_name": "File System Activity",
+  "category_uid": 1,
+  "category_name": "System Activity",
+  "activity_id": 4,
+  "activity_name": "Delete",
+  "type_uid": 100104,
+  "type_name": "File System Activity: Delete",
+  "severity_id": 4,
+  "severity": "High",
+  "status_id": 1,
+  "status": "Success",
+  "time": 1749081788901,
+  "message": "ransom.exe deleted shadow copy script C:\\\\Users\\\\jsmith\\\\AppData\\\\Local\\\\Temp\\\\vss.bat on WS-JSMITH-01",
+  "metadata": {
+    "version": "1.8.0",
+    "product": {
+      "name": "Sysmon",
+      "vendor_name": "Microsoft",
+      "feature": {
+        "name": "FileDelete"
+      }
+    },
+    "uid": "c0d1e2f3-4a5b-4c6d-8e7f-90a1b2c3d4e5",
+    "log_name": "Microsoft-Windows-Sysmon/Operational",
+    "logged_time": 1749081789100
+  },
+  "device": {
+    "type_id": 6,
+    "type": "Server",
+    "hostname": "ws-jsmith-01.acme.local",
+    "os": {
+      "name": "Windows Server 2022",
+      "type_id": 100,
+      "type": "Windows"
+    }
+  },
+  "actor": {
+    "user": {
+      "name": "jsmith",
+      "domain": "ACME",
+      "uid": "S-1-5-21-1004336348-1177238915-682003330-1052"
+    },
+    "process": {
+      "name": "ransom.exe",
+      "pid": 9090,
+      "cmd_line": "C:\\\\Users\\\\jsmith\\\\AppData\\\\Local\\\\Temp\\\\ransom.exe --wipe",
+      "file": {
+        "name": "ransom.exe",
+        "path": "C:\\\\Users\\\\jsmith\\\\AppData\\\\Local\\\\Temp\\\\ransom.exe",
+        "hashes": [
+          {
+            "algorithm_id": 3,
+            "algorithm": "SHA-256",
+            "value": "DEADBEEFCAFEBABE0011223344556677889900AABBCCDDEEFF0011223344FFEE"
+          }
+        ]
+      }
+    }
+  },
+  "file": {
+    "name": "vss.bat",
+    "path": "C:\\\\Users\\\\jsmith\\\\AppData\\\\Local\\\\Temp\\\\vss.bat",
+    "type_id": 1,
+    "type": "Regular File",
+    "size": 412,
+    "hashes": [
+      {
+        "algorithm_id": 1,
+        "algorithm": "MD5",
+        "value": "0123456789abcdef0123456789abcdef"
+      },
+      {
+        "algorithm_id": 3,
+        "algorithm": "SHA-256",
+        "value": "5994471ABB01112AFCC18159F6CC74B4F511B99806DA59B3CAF5A9C173CACFC5"
+      }
+    ]
+  },
+  "observables": [
+    {
+      "name": "actor.user.name",
+      "type_id": 4,
+      "type": "User Name",
+      "value": "jsmith"
+    },
+    {
+      "name": "actor.process.name",
+      "type_id": 9,
+      "type": "Process Name",
+      "value": "ransom.exe"
+    },
+    {
+      "name": "file.hashes[].value",
+      "type_id": 10,
+      "type": "Hash",
+      "value": "5994471ABB01112AFCC18159F6CC74B4F511B99806DA59B3CAF5A9C173CACFC5"
+    },
+    {
+      "name": "file.path",
+      "type_id": 6,
+      "type": "File Name",
+      "value": "C:\\\\Users\\\\jsmith\\\\AppData\\\\Local\\\\Temp\\\\vss.bat"
+    }
+  ]
+}

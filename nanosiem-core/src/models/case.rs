@@ -283,6 +283,10 @@ pub struct Case {
     pub ai_confidence: Option<f64>,
     #[serde(default)]
     pub ai_recommended_action: Option<String>,
+    /// AI-recommended severity (NAN-1297). Drives symmetric re-triage:
+    /// escalate severity + priority on actionable verdicts.
+    #[serde(default)]
+    pub ai_recommended_severity: Option<String>,
     #[serde(default)]
     pub ai_key_evidence: Option<serde_json::Value>,
     #[serde(default)]
@@ -376,6 +380,8 @@ pub struct CaseWithDetails {
     #[serde(default)]
     pub ai_recommended_action: Option<String>,
     #[serde(default)]
+    pub ai_recommended_severity: Option<String>,
+    #[serde(default)]
     pub ai_key_evidence: Option<serde_json::Value>,
     #[serde(default)]
     pub ai_triaged_at: Option<DateTime<Utc>>,
@@ -465,6 +471,7 @@ pub struct CaseWithDetailsRow {
     pub ai_disposition: Option<String>,
     pub ai_confidence: Option<f64>,
     pub ai_recommended_action: Option<String>,
+    pub ai_recommended_severity: Option<String>,
     pub ai_key_evidence: Option<serde_json::Value>,
     pub ai_triaged_at: Option<DateTime<Utc>>,
     pub needs_review: bool,
@@ -578,6 +585,9 @@ pub struct UpdateCaseAiVerdict {
     /// 0.0–1.0. Clamped on write.
     pub ai_confidence: f64,
     pub ai_recommended_action: Option<String>,
+    /// AI-recommended severity (NAN-1297), e.g. "critical"/"high"/…. Drives
+    /// symmetric re-triage when more severe than the case's current severity.
+    pub ai_recommended_severity: Option<String>,
     /// JSON array of evidence strings the AI cited.
     pub ai_key_evidence: Option<serde_json::Value>,
     /// The narrative rationale, persisted to `ai_summary` alongside the verdict.

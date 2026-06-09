@@ -5,6 +5,12 @@
 //! - Baselines are being established
 //! - Threshold detection is functioning
 
+// NAN-1272: still gated. Activating this suite surfaced that it had silently
+// rotted while behind `#![cfg(any())]` — the `tuning::safety` module was
+// removed and `TuningProposal` / the threshold API were reshaped (17 compile
+// errors). Rewriting it against the current tuning API is its own task
+// (TODO NAN-1273); kept gated here so the rest of the suites can activate now.
+// The other de-gated suites use the `common::migrated_pool()` helper.
 #![cfg(any())]
 
 use chrono::{Duration, Utc};
@@ -13,14 +19,9 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// Helper function to create test database pool
+/// Helper function to create a test database pool (migrated once per binary).
 async fn create_test_pool() -> PgPool {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://nanosiem:nanosiem@localhost:5432/nanosiem".to_string());
-
-    PgPool::connect(&database_url)
-        .await
-        .expect("Failed to connect to test database")
+    common::migrated_pool().await
 }
 
 /// Helper function to create a test user

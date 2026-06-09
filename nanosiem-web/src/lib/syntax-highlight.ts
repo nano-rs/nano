@@ -34,6 +34,19 @@ export interface Token {
 // Combined set for syntax highlighting (UDM + enriched + IOC + computed + aliases)
 const UDM_FIELD_NAMES = new Set([...UDM_COLUMNS, ...ENRICHED_FIELDS_SET, ...IOC_FIELDS_SET, ...COMPUTED_FIELDS_SET, ...FIELD_ALIASES_SET]);
 
+/**
+ * Register additional field names for rendered code-block highlighting
+ * (NAN-1241) — e.g. the active schema's OCSF promoted columns from
+ * `getSchemaFields()`. `tokenize()` rebuilds its field pattern from this set on
+ * each call, so additions take effect on the next render. Under UDM this is
+ * never called with new names → highlighting stays byte-identical.
+ */
+export function registerHighlightDynamicFields(fields: string[]) {
+  for (const f of fields) {
+    UDM_FIELD_NAMES.add(f);
+  }
+}
+
 // Required YAML fields - show indicator when empty
 const REQUIRED_YAML_FIELDS = new Set(['title', 'description', 'author', 'severity', 'mitre_tactics', 'mitre_techniques']);
 
@@ -120,8 +133,17 @@ export function tokenizeQuery(code: string): Token[] {
   // Use static UDM field names for syntax highlighting
   const udmFieldNames = UDM_FIELD_NAMES;
 
-  // Create a regex pattern for all UDM fields
-  const udmFieldPattern = new RegExp(`^(${Array.from(udmFieldNames).join('|')})\\b`);
+  // Create a regex pattern for all UDM fields. Regex-escape each name so OCSF
+  // promoted columns (`src_endpoint.ip`) match literally — an unescaped `.` would
+  // match any char (e.g. highlight `src_endpointXip`). Longest-first so a dotted
+  // field isn't pre-empted by a prefix alternative (NAN-1241).
+  const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const udmFieldPattern = new RegExp(
+    `^(${Array.from(udmFieldNames)
+      .sort((a, b) => b.length - a.length)
+      .map(escapeRe)
+      .join('|')})\\b`,
+  );
 
   while (remaining.length > 0) {
     // Block comments /* */

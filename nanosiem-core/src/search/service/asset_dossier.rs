@@ -14,6 +14,7 @@
 
 use super::SearchService;
 use crate::query::TimeRange;
+use crate::schema::SchemaProfile;
 use crate::search::SearchError;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -228,9 +229,14 @@ impl SearchService {
         };
 
         let (ips, hostnames, users) =
-            Self::collect_asset_identifiers(identities, identifier_field, identifier_value);
+            Self::collect_asset_identifiers(identities, identifier_field, identifier_value, self.active_profile.as_ref());
         let (identity_clause, bind_values) =
-            match Self::build_log_identity_clause(&ips, &hostnames, &users) {
+            match Self::build_log_identity_clause_for(
+                self.active_profile.as_ref(),
+                &ips,
+                &hostnames,
+                &users,
+            ) {
                 Some(pair) => pair,
                 None => return Ok(AssetDossier::default()),
             };
@@ -240,11 +246,15 @@ impl SearchService {
         let bucket_seconds = bucket_seconds_for_range(time_range);
         let unix_start = time_range.start.timestamp() as u64;
 
-        let logs_table = self.table_names.read("logs");
+        let profile = self.active_profile.as_ref();
+        let logs_table = self
+            .table_names
+            .read(Self::logs_table_key(profile));
 
         // Kick off all 7 queries in parallel
         let identity_fut = query_identity(
             clickhouse,
+            profile,
             &logs_table,
             &identity_clause,
             &bind_values,
@@ -261,6 +271,7 @@ impl SearchService {
         );
         let timeline_fut = query_timeline(
             clickhouse,
+            profile,
             &logs_table,
             &identity_clause,
             &bind_values,
@@ -271,6 +282,7 @@ impl SearchService {
         );
         let processes_fut = query_processes(
             clickhouse,
+            profile,
             &logs_table,
             &identity_clause,
             &bind_values,
@@ -279,14 +291,17 @@ impl SearchService {
         );
         let network_fut = query_network(
             clickhouse,
+            profile,
             &logs_table,
             &identity_clause,
             &bind_values,
             &start_str,
             &end_str,
+            &hostnames,
         );
         let auth_fut = query_auth(
             clickhouse,
+            profile,
             &logs_table,
             &identity_clause,
             &bind_values,
@@ -295,6 +310,7 @@ impl SearchService {
         );
         let files_fut = query_files(
             clickhouse,
+            profile,
             &logs_table,
             &identity_clause,
             &bind_values,
@@ -303,6 +319,7 @@ impl SearchService {
         );
         let dns_fut = query_dns(
             clickhouse,
+            profile,
             &logs_table,
             &identity_clause,
             &bind_values,
@@ -403,6 +420,7 @@ async fn fetch_rows(
 
 async fn query_identity(
     ch: &clickhouse::Client,
+    profile: &dyn SchemaProfile,
     logs: &str,
     ident: &str,
     binds: &[String],
@@ -415,18 +433,33 @@ async fn query_identity(
     // rows without src_host/user), the whole column returns NULL even when older events
     // had a real value. argMaxIf skips rows where the column is blank so we always get
     // the latest-populated value when any event has it.
+    //
+    // Each identity column is resolved through the active schema profile; a field
+    // the schema does not map (`udm_column_sql` → None) is projected as an empty
+    // literal so the alias still exists and the row deserializes to "—".
+    let arg_max = |udm_field: &str, alias: &str| -> String {
+        match profile.udm_column_sql(udm_field) {
+            Some(col) => format!("argMaxIf({col}, timestamp, {col} != '') AS {alias}"),
+            None => format!("'' AS {alias}"),
+        }
+    };
     let sql = format!(
         r#"SELECT
-            argMaxIf(src_host,        timestamp, src_host != '')        AS hostname,
-            argMaxIf(src_ip,          timestamp, src_ip != '')          AS ip,
-            argMaxIf(src_mac,         timestamp, src_mac != '')         AS mac,
-            argMaxIf(user,            timestamp, user != '')            AS latest_user,
-            argMaxIf(vendor_product,  timestamp, vendor_product != '')  AS vendor_product,
+            {hostname},
+            {ip},
+            {mac},
+            {latest_user},
+            {vendor_product},
             formatDateTime(min(timestamp), '%Y-%m-%dT%H:%i:%S.%fZ') AS first_seen_in_range,
             formatDateTime(max(timestamp), '%Y-%m-%dT%H:%i:%S.%fZ') AS last_seen_in_range
         FROM {logs}
         PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})
-        "#
+        "#,
+        hostname = arg_max("src_host", "hostname"),
+        ip = arg_max("src_ip", "ip"),
+        mac = arg_max("src_mac", "mac"),
+        latest_user = arg_max("user", "latest_user"),
+        vendor_product = arg_max("vendor_product", "vendor_product"),
     );
     // argMaxIf on a String column returns "" (not null) when no row matches the filter —
     // treat empty strings as "not observed" so the frontend renders "—" instead of "".
@@ -483,12 +516,16 @@ async fn query_log_sources(
         .collect()
 }
 
-// Lane classification is shared with `service::asset`'s event-type classifier
-// — see `search::classification` for the single source of truth.
-use crate::search::classification::{AUTH_PREDICATE, FILE_PREDICATE, LANE_SQL};
+// Lane / auth / file classification is shared with `service::asset`'s
+// event-type classifier — see `search::classification` for the single source of
+// truth. The profile-aware `lane_sql`/`auth_predicate`/`file_predicate` helpers
+// return the UDM consts byte-identical for the UDM profile and the OCSF taxonomy
+// expressions under OCSF.
+use crate::search::classification::{auth_predicate, file_predicate, lane_sql};
 
 async fn query_timeline(
     ch: &clickhouse::Client,
+    profile: &dyn SchemaProfile,
     logs: &str,
     ident: &str,
     binds: &[String],
@@ -506,7 +543,7 @@ async fn query_timeline(
         PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})
         GROUP BY bucket, lane
         HAVING lane >= 0 AND bucket < {buckets}"#,
-        lane = LANE_SQL,
+        lane = lane_sql(profile),
         buckets = TIMELINE_BUCKETS,
     );
     let rows = fetch_rows(apply_binds(ch.query(&sql), binds), "timeline").await;
@@ -563,47 +600,102 @@ async fn query_timeline(
 
 async fn query_processes(
     ch: &clickhouse::Client,
+    profile: &dyn SchemaProfile,
     logs: &str,
     ident: &str,
     binds: &[String],
     start: &str,
     end: &str,
 ) -> AssetProcessesSummary {
+    // The processes card is built around `process_name`; if the schema does not
+    // expose a process-name column there is nothing to summarize.
+    let process_name = match profile.udm_column_sql("process_name") {
+        Some(c) => c,
+        None => return AssetProcessesSummary::default(),
+    };
+    let prev_hash = profile.udm_column_sql("prevalence_process_hash");
+    let parent = profile.udm_column_sql("parent_process_name");
+    let process_hash = profile.udm_column_sql("process_hash");
+    let command_line = profile.udm_column_sql("command_line");
+
+    // `rare` and per-process prevalence depend on the prevalence column; without
+    // it those become 0 / NULL rather than referencing a missing column.
+    let rare_expr = match &prev_hash {
+        Some(p) => format!(
+            "countIf({process_name} != '' AND {p} < 10000 AND toFloat32({p}) / {ASSUMED_FLEET_SIZE} * 100 < {rare_pct})",
+            rare_pct = RARE_PROCESS_THRESHOLD_PCT
+        ),
+        None => "toUInt64(0)".to_string(),
+    };
+    let from_office_expr = match &parent {
+        Some(p) => format!(
+            "countIf(lower({p}) IN ('winword.exe','excel.exe','powerpnt.exe','outlook.exe'))"
+        ),
+        None => "toUInt64(0)".to_string(),
+    };
     // Scalar counters
     let scalar_sql = format!(
         r#"SELECT
-            uniqExact(process_name) AS unique,
-            countIf(process_name != '' AND prevalence_process_hash < 10000 AND toFloat32(prevalence_process_hash) / {ASSUMED_FLEET_SIZE} * 100 < {rare_pct}) AS rare,
-            countIf(lower(parent_process_name) IN ('winword.exe','excel.exe','powerpnt.exe','outlook.exe')) AS from_office
+            uniqExact({process_name}) AS unique,
+            {rare_expr} AS rare,
+            {from_office_expr} AS from_office
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND process_name != ''"#,
-        rare_pct = RARE_PROCESS_THRESHOLD_PCT
+        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {process_name} != ''"#
     );
+    let top_prev_expr = match &prev_hash {
+        Some(p) => format!(
+            "avg(toFloat32(if({p} >= 10000, 100, {p})) / {ASSUMED_FLEET_SIZE} * 100)"
+        ),
+        None => "toFloat32(0)".to_string(),
+    };
     let top_sql = format!(
         r#"SELECT
-            process_name AS name,
+            {process_name} AS name,
             count() AS c,
-            avg(toFloat32(if(prevalence_process_hash >= 10000, 100, prevalence_process_hash)) / {ASSUMED_FLEET_SIZE} * 100) AS prev
+            {top_prev_expr} AS prev
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND process_name != ''
-        GROUP BY process_name
+        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {process_name} != ''
+        GROUP BY {process_name}
         ORDER BY c DESC
         LIMIT {TOP_LIMIT}"#
     );
-    let rare_sql = format!(
-        r#"SELECT
-            process_name AS name,
-            any(process_hash) AS hash,
-            avg(toFloat32(prevalence_process_hash) / {ASSUMED_FLEET_SIZE} * 100) AS prev,
-            any(command_line) AS cmd
+    let hash_select = match &process_hash {
+        Some(h) => format!("any({h})"),
+        None => "''".to_string(),
+    };
+    let cmd_select = match &command_line {
+        Some(c) => format!("any({c})"),
+        None => "''".to_string(),
+    };
+    // The "rare" list is prevalence-driven; with no prevalence column there is no
+    // basis to rank rarity, so it stays empty.
+    let rare_sql = match &prev_hash {
+        Some(p) => format!(
+            r#"SELECT
+            {process_name} AS name,
+            {hash_select} AS hash,
+            avg(toFloat32({p}) / {ASSUMED_FLEET_SIZE} * 100) AS prev,
+            {cmd_select} AS cmd
         FROM {logs}
         PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})
-            AND process_name != '' AND prevalence_process_hash < 10000
-            AND toFloat32(prevalence_process_hash) / {ASSUMED_FLEET_SIZE} * 100 < {RARE_PROCESS_THRESHOLD_PCT}
-        GROUP BY process_name
+            AND {process_name} != '' AND {p} < 10000
+            AND toFloat32({p}) / {ASSUMED_FLEET_SIZE} * 100 < {RARE_PROCESS_THRESHOLD_PCT}
+        GROUP BY {process_name}
         ORDER BY prev ASC
         LIMIT 5"#
-    );
+        ),
+        None => format!(
+            r#"SELECT
+            {process_name} AS name,
+            {hash_select} AS hash,
+            toFloat32(0) AS prev,
+            {cmd_select} AS cmd
+        FROM {logs}
+        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND 1 = 0
+        GROUP BY {process_name}
+        LIMIT 5"#
+        ),
+    };
 
     let (scalars, tops, rares) = tokio::join!(
         fetch_rows(apply_binds(ch.query(&scalar_sql), binds), "processes_scalar"),
@@ -670,48 +762,103 @@ async fn query_processes(
 
 async fn query_network(
     ch: &clickhouse::Client,
+    profile: &dyn SchemaProfile,
     logs: &str,
     ident: &str,
     binds: &[String],
     start: &str,
     end: &str,
+    self_hosts: &[String],
 ) -> AssetNetworkSummary {
+    // The network card needs at least a destination host/IP to have any content.
+    let dest_host = match profile.udm_column_sql("dest_host") {
+        Some(c) => c,
+        None => return AssetNetworkSummary::default(),
+    };
+    // NAN-1327: a real destination hostname is non-empty AND not the `"-"`
+    // placeholder Sysmon emits for an absent host (otherwise `dst_endpoint.hostname
+    // = "-"` groups into a bogus "AT -" destination). `dest_host` is the resolved
+    // column expression, so this is schema-agnostic; UDM never carries `"-"` here.
+    let dest_host_present = format!("{dest_host} NOT IN ('', '-')");
+    let dest_ip = profile.udm_column_sql("dest_ip");
+    let bytes_in = profile.udm_column_sql("bytes_in");
+    let bytes_out = profile.udm_column_sql("bytes_out");
+    let country = profile.udm_column_sql("enriched_dest_country_code");
+    let prev_domain = profile.udm_column_sql("prevalence_dest_domain");
+
+    let dest_ip_expr = dest_ip.clone().unwrap_or_else(|| "''".to_string());
+    let bytes_in_sum = bytes_in
+        .as_ref()
+        .map(|c| format!("sum({c})"))
+        .unwrap_or_else(|| "toUInt64(0)".to_string());
+    let bytes_out_sum = bytes_out
+        .as_ref()
+        .map(|c| format!("sum({c})"))
+        .unwrap_or_else(|| "toUInt64(0)".to_string());
+    let new_domains_expr = match &prev_domain {
+        Some(p) => format!(
+            "uniqExactIf({dest_host}, {dest_host_present} AND {p} < 5)"
+        ),
+        None => "toUInt64(0)".to_string(),
+    };
     let scalar_sql = format!(
         r#"SELECT
-            countIf(dest_ip != '' OR dest_host != '') AS total_conns,
-            sum(bytes_in) AS bytes_in,
-            sum(bytes_out) AS bytes_out,
-            uniqExact(dest_ip) AS unique_dsts,
-            uniqExactIf(dest_host, dest_host != '' AND prevalence_dest_domain < 5) AS new_domains
+            countIf({dest_ip_expr} != '' OR {dest_host} != '') AS total_conns,
+            {bytes_in_sum} AS bytes_in,
+            {bytes_out_sum} AS bytes_out,
+            uniqExact({dest_ip_expr}) AS unique_dsts,
+            {new_domains_expr} AS new_domains
         FROM {logs}
         PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})"#
     );
+    let top_ip_select = dest_ip
+        .as_ref()
+        .map(|c| format!("any({c})"))
+        .unwrap_or_else(|| "''".to_string());
+    let top_country_select = country
+        .as_ref()
+        .map(|c| format!("any({c})"))
+        .unwrap_or_else(|| "''".to_string());
+    let top_bytes_expr =
+        format!("({bytes_in_sum}) + ({bytes_out_sum})");
+    let top_prev_expr = prev_domain
+        .as_ref()
+        .map(|p| format!("min({p})"))
+        .unwrap_or_else(|| "toUInt64(9999)".to_string());
     let top_sql = format!(
         r#"SELECT
-            dest_host AS host,
-            any(dest_ip) AS ip,
-            any(enriched_dest_country_code) AS country,
-            sum(bytes_in) + sum(bytes_out) AS bytes,
+            {dest_host} AS host,
+            {top_ip_select} AS ip,
+            {top_country_select} AS country,
+            {top_bytes_expr} AS bytes,
             count() AS conns,
-            min(prevalence_dest_domain) AS prev
+            {top_prev_expr} AS prev
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND dest_host != ''
-        GROUP BY dest_host
+        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {dest_host_present}
+        GROUP BY {dest_host}
         ORDER BY bytes DESC
         LIMIT {TOP_LIMIT}"#
     );
-    let country_sql = format!(
-        r#"SELECT
-            enriched_dest_country_code AS country,
+    let country_sql = match &country {
+        Some(c) => format!(
+            r#"SELECT
+            {c} AS country,
             count() AS conns
         FROM {logs}
         PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})
-            AND enriched_dest_country_code != ''
-            AND enriched_dest_country_code NOT IN ('US','CA','GB','FR','DE','JP','AU','NL','IE','SG')
-        GROUP BY enriched_dest_country_code
+            AND {c} != ''
+            AND {c} NOT IN ('US','CA','GB','FR','DE','JP','AU','NL','IE','SG')
+        GROUP BY {c}
         ORDER BY conns DESC
         LIMIT 5"#
-    );
+        ),
+        None => format!(
+            r#"SELECT '' AS country, toUInt64(0) AS conns
+        FROM {logs}
+        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND 1 = 0
+        LIMIT 5"#
+        ),
+    };
 
     let (scalars, tops, countries) = tokio::join!(
         fetch_rows(apply_binds(ch.query(&scalar_sql), binds), "network_scalar"),
@@ -737,6 +884,13 @@ async fn query_network(
         .into_iter()
         .filter_map(|r| {
             let host = r.get("host")?.as_str()?.to_string();
+            // NAN-1327: the asset match clause unions src/device/dst (NAN-1318), so
+            // events where THIS host is the destination surface its own hostname as a
+            // "top destination". A host isn't a destination of itself — drop it.
+            // `self_hosts` and `dst_endpoint.hostname` are both lowercased.
+            if self_hosts.iter().any(|h| h.eq_ignore_ascii_case(&host)) {
+                return None;
+            }
             let prev = r.get("prev").and_then(|v| v.as_u64()).unwrap_or(9999);
             let rep = if prev < 5 {
                 "new-domain"
@@ -779,6 +933,7 @@ async fn query_network(
 
 async fn query_auth(
     ch: &clickhouse::Client,
+    profile: &dyn SchemaProfile,
     logs: &str,
     ident: &str,
     binds: &[String],
@@ -789,30 +944,116 @@ async fn query_auth(
     // and drilldown queries operate on the same row set (NAN-1049). Refining
     // sub-predicates (interactive / network logon type) stay local because
     // they're auth-internal and not part of the cross-module classifier.
-    let auth_predicate = AUTH_PREDICATE;
-    let interactive_predicate = "(lower(auth_type) = 'interactive' OR position(lower(action), 'interactive') > 0)";
-    let network_predicate = "(lower(auth_type) = 'network' OR position(lower(action), 'network') > 0)";
+    let auth_pred = auth_predicate(profile);
+
+    // Auth-result expression: VALUE-SEMANTICS divergence (NAN-1241).
+    //   UDM: `auth_result` is a STRING verb column; bare `result` is UDM-only, so
+    //   the coalesce tail only applies when the schema exposes it. We keep the
+    //   exact prior string ops (lower/coalesce/nullIf) → byte-identical for UDM.
+    //   OCSF: `udm_column_sql("auth_result")` resolves to the INT `status_id`
+    //   column (1=Success, 2=Failure, 0=Unknown, 99=Other). Applying lower()/
+    //   nullIf(.,'')/coalesce on an int is a CH type error (500 / empty card), so
+    //   instead we DECODE the int into the same lowercase verb tokens the IN()
+    //   clauses below already expect via transform(); unknown/other → '' (matches
+    //   neither the success nor failure IN-list, exactly like an unmapped value).
+    let is_ocsf = profile.id() == crate::schema::SchemaId::Ocsf;
+    let auth_result = profile.udm_column_sql("auth_result");
+    let result_col = profile.udm_column_sql("result");
+    let result_expr = if is_ocsf {
+        match &auth_result {
+            // status_id int → lowercase verb tokens consumed by the IN() clauses.
+            Some(a) => format!("transform({a}, [1, 2], ['success', 'failure'], '')"),
+            None => "''".to_string(),
+        }
+    } else {
+        match (&auth_result, &result_col) {
+            (Some(a), Some(r)) => format!("lower(coalesce(nullIf({a}, ''), {r}))"),
+            (Some(a), None) => format!("lower({a})"),
+            (None, Some(r)) => format!("lower({r})"),
+            (None, None) => "''".to_string(),
+        }
+    };
+
+    // Interactive / network refinement keys off `auth_type` + `action`.
+    //   UDM: `auth_type` + `action` are both STRING columns → string ops apply.
+    //   OCSF: `udm_column_sql("auth_type")` resolves to the INT `auth_protocol_id`
+    //   column (1=NTLM, 2=Kerberos, ...), which is the auth PROTOCOL, not a logon
+    //   type — it never carries 'interactive'/'network', and lower() on an int is
+    //   a CH type error. So under OCSF we DROP the auth_type leg entirely and key
+    //   the logon-type refinement off `action` only (which maps to the `activity`
+    //   String column). `action` is string in both schemas, so its leg is safe.
+    let auth_type = profile.udm_column_sql("auth_type");
+    let action = profile.udm_column_sql("action");
+    let logon_predicate = |kind: &str| -> String {
+        let mut legs: Vec<String> = Vec::new();
+        if let Some(at) = &auth_type {
+            if !is_ocsf {
+                legs.push(format!("lower({at}) = '{kind}'"));
+            }
+        }
+        if let Some(ac) = &action {
+            legs.push(format!("position(lower({ac}), '{kind}') > 0"));
+        }
+        if legs.is_empty() {
+            "0".to_string()
+        } else {
+            format!("({})", legs.join(" OR "))
+        }
+    };
+    let interactive_predicate = logon_predicate("interactive");
+    let network_predicate = logon_predicate("network");
 
     let scalar_sql = format!(
         r#"SELECT
-            countIf({auth_predicate} AND lower(coalesce(nullIf(auth_result, ''), result)) IN ('success','succeeded','allow')) AS success,
-            countIf({auth_predicate} AND lower(coalesce(nullIf(auth_result, ''), result)) IN ('failure','failed','denied','fail')) AS failure,
-            countIf({auth_predicate} AND {interactive_predicate}) AS interactive,
-            countIf({auth_predicate} AND {network_predicate}) AS network,
+            countIf({auth_pred} AND {result_expr} IN ('success','succeeded','allow')) AS success,
+            countIf({auth_pred} AND {result_expr} IN ('failure','failed','denied','fail')) AS failure,
+            countIf({auth_pred} AND {interactive_predicate}) AS interactive,
+            countIf({auth_pred} AND {network_predicate}) AS network,
             0 AS lateral
         FROM {logs}
         PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})"#
     );
+
+    let user_select = profile
+        .udm_column_sql("user")
+        .map(|c| format!("{c} AS user"))
+        .unwrap_or_else(|| "'' AS user".to_string());
+    let src_host = profile.udm_column_sql("src_host");
+    let src_ip = profile.udm_column_sql("src_ip");
+    let src_expr = match (&src_host, &src_ip) {
+        (Some(h), Some(i)) => format!("coalesce(nullIf({h}, ''), {i})"),
+        (Some(h), None) => h.clone(),
+        (None, Some(i)) => i.clone(),
+        (None, None) => "''".to_string(),
+    };
+    // Auth-type display column for the recent list.
+    //   UDM: `auth_type` is the STRING column → coalesce/nullIf string ops apply
+    //   (byte-identical to before).
+    //   OCSF: `auth_type` resolves to the INT `auth_protocol_id`; string ops would
+    //   500. The OCSF schema carries a sibling DISPLAY string `auth_protocol`
+    //   (LowCardinality(String), e.g. 'NTLM'/'Kerberos'), which is exactly the
+    //   human-readable label we want here — read it directly and apply the same
+    //   coalesce(nullIf(.,''),'other') string idiom on that string column.
+    let auth_type_display = if is_ocsf {
+        Some(crate::query::escape_identifier("auth_protocol"))
+    } else {
+        auth_type.clone()
+    };
+    let auth_type_select = auth_type_display
+        .as_ref()
+        .map(|c| format!("coalesce(nullIf({c}, ''), 'other')"))
+        .unwrap_or_else(|| "'other'".to_string());
+    let reason_select = action.clone().unwrap_or_else(|| "''".to_string());
     let recent_sql = format!(
         r#"SELECT
             formatDateTime(timestamp, '%H:%i:%S') AS ts,
-            coalesce(nullIf(auth_type, ''), 'other') AS auth_type,
-            user,
-            coalesce(nullIf(src_host, ''), src_ip) AS src,
-            lower(coalesce(nullIf(auth_result, ''), result)) AS result_raw,
-            action AS reason
+            {auth_type_select} AS auth_type,
+            {user_select},
+            {src_expr} AS src,
+            {result_expr} AS result_raw,
+            {reason_select} AS reason
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {auth_predicate}
+        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {auth_pred}
         ORDER BY timestamp DESC
         LIMIT {RECENT_LIMIT}"#
     );
@@ -875,6 +1116,7 @@ async fn query_auth(
 
 async fn query_files(
     ch: &clickhouse::Client,
+    profile: &dyn SchemaProfile,
     logs: &str,
     ident: &str,
     binds: &[String],
@@ -885,24 +1127,67 @@ async fn query_files(
     // counts and the "All file events" drilldown operate on the same row set
     // (NAN-1049). Recent-list still narrows on `file_path != ''` so empty
     // paths don't render blank rows.
-    let file_predicate = FILE_PREDICATE;
+    let file_pred = file_predicate(profile);
+
+    // The recent-list/"path" filter requires a file_path column; without it the
+    // files card has no events to render.
+    let file_path = match profile.udm_column_sql("file_path") {
+        Some(c) => c,
+        None => return AssetFilesSummary::default(),
+    };
+    let file_action = profile.udm_column_sql("file_action");
+    let file_name = profile.udm_column_sql("file_name");
+    let file_size = profile.udm_column_sql("file_size");
+    let process_name = profile.udm_column_sql("process_name");
+
+    // `file_action` is a string verb under UDM but a numeric `activity_id` under
+    // OCSF, so the string-verb count only applies when the schema exposes a
+    // text file-action column (string-typed). Otherwise writes are counted off
+    // the classifier-membership row set already constrained by `file_pred`.
+    let writes_expr = match (&file_action, profile.id()) {
+        (Some(fa), crate::schema::SchemaId::Udm) => {
+            format!("countIf(lower({fa}) IN ('create','write','modify','delete'))")
+        }
+        _ => "count()".to_string(),
+    };
+    let sensitive_expr = format!(
+        "countIf({file_path} LIKE '%\\\\Documents\\\\%' OR {file_path} LIKE '%\\\\Desktop\\\\%' OR {file_path} LIKE '%payroll%' OR {file_path} LIKE '%secret%')"
+    );
+    let exec_expr = match &file_name {
+        Some(fn_col) => format!(
+            "countIf({fn_col} LIKE '%.exe' OR {fn_col} LIKE '%.dll' OR {fn_col} LIKE '%.ps1' OR {fn_col} LIKE '%.bat')"
+        ),
+        None => "toUInt64(0)".to_string(),
+    };
     let scalar_sql = format!(
         r#"SELECT
-            countIf(lower(file_action) IN ('create','write','modify','delete')) AS writes,
-            countIf(file_path LIKE '%\\Documents\\%' OR file_path LIKE '%\\Desktop\\%' OR file_path LIKE '%payroll%' OR file_path LIKE '%secret%') AS sensitive,
-            countIf(file_name LIKE '%.exe' OR file_name LIKE '%.dll' OR file_name LIKE '%.ps1' OR file_name LIKE '%.bat') AS exec_count
+            {writes_expr} AS writes,
+            {sensitive_expr} AS sensitive,
+            {exec_expr} AS exec_count
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {file_predicate}"#
+        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {file_pred}"#
     );
+    let size_select = file_size
+        .as_ref()
+        .map(|c| c.clone())
+        .unwrap_or_else(|| "toUInt64(0)".to_string());
+    let action_select = file_action
+        .as_ref()
+        .map(|c| c.clone())
+        .unwrap_or_else(|| "''".to_string());
+    let proc_select = process_name
+        .as_ref()
+        .map(|c| c.clone())
+        .unwrap_or_else(|| "''".to_string());
     let recent_sql = format!(
         r#"SELECT
             formatDateTime(timestamp, '%H:%i:%S') AS ts,
-            file_path AS path,
-            file_size AS size_bytes,
-            file_action AS action,
-            process_name AS proc
+            {file_path} AS path,
+            {size_select} AS size_bytes,
+            {action_select} AS action,
+            {proc_select} AS proc
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {file_predicate} AND file_path != ''
+        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {file_pred} AND {file_path} != ''
         ORDER BY timestamp DESC
         LIMIT {RECENT_LIMIT}"#
     );
@@ -951,33 +1236,46 @@ async fn query_files(
 
 async fn query_dns(
     ch: &clickhouse::Client,
+    profile: &dyn SchemaProfile,
     logs: &str,
     ident: &str,
     binds: &[String],
     start: &str,
     end: &str,
 ) -> AssetDnsSummary {
+    // The DNS card is built entirely around the `query` column; without it there
+    // is nothing to aggregate.
+    let query = match profile.udm_column_sql("query") {
+        Some(c) => c,
+        None => return AssetDnsSummary::default(),
+    };
+    let answer = profile.udm_column_sql("answer");
+    // NX detection needs an `answer` column; without it nothing is NX.
+    let nx_expr = match &answer {
+        Some(a) => format!("({a} = '' OR lower({a}) = 'nxdomain')"),
+        None => "0".to_string(),
+    };
     let scalar_sql = format!(
         r#"SELECT
-            countIf(query != '') AS queries,
-            uniqExactIf(query, query != '') AS unique,
-            countIf(query != '' AND (answer = '' OR lower(answer) = 'nxdomain')) AS nx,
-            uniqExactIf(query,
-                query != ''
-                AND position(query, '.') > 0
-                AND arrayExists(x -> endsWith(lower(query), x),
+            countIf({query} != '') AS queries,
+            uniqExactIf({query}, {query} != '') AS unique,
+            countIf({query} != '' AND {nx_expr}) AS nx,
+            uniqExactIf({query},
+                {query} != ''
+                AND position({query}, '.') > 0
+                AND arrayExists(x -> endsWith(lower({query}), x),
                                 ['.ru','.cn','.tk','.top','.xyz','.ro'])) AS rare_tlds
         FROM {logs}
         PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})"#
     );
     let top_sql = format!(
         r#"SELECT
-            query AS domain,
+            {query} AS domain,
             count() AS c,
-            countIf(answer = '' OR lower(answer) = 'nxdomain') AS nx
+            countIf({nx_expr}) AS nx
         FROM {logs}
-        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND query != ''
-        GROUP BY query
+        PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident}) AND {query} != ''
+        GROUP BY {query}
         ORDER BY c DESC
         LIMIT {TOP_LIMIT}"#
     );

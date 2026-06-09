@@ -66,6 +66,22 @@ const PREVIEW_KEYS = [
   'process_name',
   'file_hash',
   'file_path',
+  // OCSF promoted (dotted) columns — NAN-1241; mirror of EventViewer.tsx. Under
+  // OCSF the row carries these instead of the UDM names; UDM rows never populate
+  // them, so the UDM preview is byte-identical.
+  'user.name',
+  'actor.user.name',
+  'src_endpoint.ip',
+  'dst_endpoint.ip',
+  'src_endpoint.hostname',
+  'dst_endpoint.hostname',
+  'http_request.http_method',
+  'http_response.code',
+  'url.url_string',
+  'actor.process.name',
+  'file.hashes.sha256',
+  'file.name',
+  'file.path',
   'eventName',
   'sourceIPAddress',
   'source_type',

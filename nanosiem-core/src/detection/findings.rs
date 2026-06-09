@@ -493,7 +493,29 @@ impl FindingLogger {
         realtime: bool,
         risk_result: RiskResult,
     ) -> Result<(), FindingLogError> {
-        let finding = FindingEvent::detection_match(rule, matched_events, realtime, risk_result);
+        self.log_detection_match_at(rule, matched_events, realtime, risk_result, None)
+            .await
+    }
+
+    /// Log a detection match, optionally overriding the finding timestamp.
+    ///
+    /// Grouped / aggregate live-mode rules pass the aggregated event window end
+    /// (`_last_seen`) so the live finding is stamped with the source-event time,
+    /// keeping `(rule, entity, time)` stable across re-evaluations (NAN-1305).
+    /// `None` preserves the legacy `now()` stamp.
+    pub async fn log_detection_match_at(
+        &self,
+        rule: &DetectionRule,
+        matched_events: &[serde_json::Value],
+        realtime: bool,
+        risk_result: RiskResult,
+        detected_at: Option<DateTime<Utc>>,
+    ) -> Result<(), FindingLogError> {
+        let mut finding =
+            FindingEvent::detection_match(rule, matched_events, realtime, risk_result);
+        if let Some(ts) = detected_at {
+            finding.detected_at = ts;
+        }
         info!(
             "Logging detection match finding: rule='{}', events={}, realtime={}",
             rule.name,
@@ -511,7 +533,30 @@ impl FindingLogger {
         realtime: bool,
         risk_result: RiskResult,
     ) -> Result<(), FindingLogError> {
-        let finding = FindingEvent::alert(rule, alert, realtime, risk_result);
+        self.log_alert_at(rule, alert, realtime, risk_result, None)
+            .await
+    }
+
+    /// Log an alert, optionally overriding the finding timestamp.
+    ///
+    /// Grouped / aggregate rules pass the aggregated event window end
+    /// (`_last_seen`) as `detected_at` so the finding is stamped with the
+    /// source-event time rather than the detection execution time (NAN-1305).
+    /// This keeps `(rule, entity, time)` stable across re-evaluations and sorts
+    /// the finding by when the activity happened. `None` preserves the legacy
+    /// `now()` stamp.
+    pub async fn log_alert_at(
+        &self,
+        rule: &DetectionRule,
+        alert: &Alert,
+        realtime: bool,
+        risk_result: RiskResult,
+        detected_at: Option<DateTime<Utc>>,
+    ) -> Result<(), FindingLogError> {
+        let mut finding = FindingEvent::alert(rule, alert, realtime, risk_result);
+        if let Some(ts) = detected_at {
+            finding.detected_at = ts;
+        }
         info!(
             "Logging alert finding: rule='{}', alert_id={}, realtime={}",
             rule.name, alert.id, realtime
@@ -556,6 +601,39 @@ impl FindingLogger {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
+        // NAN-1254: under the OCSF profile, emit a standards-compliant OCSF
+        // Detection Finding (class_uid 2004) into `ocsf_logs` instead of a
+        // UDM-shaped row into `logs`, so findings are searchable in the OCSF
+        // surface and the risk pipeline reads a single table. The UDM path
+        // below stays byte-identical (the branch only fires under OCSF).
+        let profile = crate::schema::active_profile_from_env()
+            .map_err(|e| FindingLogError::ClickHouseError(format!("schema profile: {e}")))?;
+        if profile.id() == crate::schema::SchemaId::Ocsf {
+            let event = Self::build_ocsf_finding_event(metadata, message, timestamp);
+            // event (JSON) + explicit timestamp (DateTime64(3) → millis) +
+            // source_type='findings' (operational column, so the read path's
+            // `WHERE source_type='findings'` is unchanged across modes). `id`
+            // and `_inserted_at` are server-defaulted; everything else
+            // materializes from `event`.
+            let ocsf_query = r#"
+                INSERT INTO ocsf_logs (event, timestamp, source_type)
+                VALUES (?, ?, 'findings')
+            "#;
+            client
+                .query(ocsf_query)
+                .bind(event.to_string())
+                .bind(timestamp.timestamp_millis())
+                .execute()
+                .await
+                .map_err(|e| FindingLogError::ClickHouseError(e.to_string()))?;
+
+            debug!(
+                "OCSF Detection Finding (2004) logged to ocsf_logs with risk_score={}, risk_entity={}",
+                risk_score, risk_entity
+            );
+            return Ok(());
+        }
+
         // Insert into ClickHouse logs table with UDM fields as direct columns
         let query = r#"
             INSERT INTO logs (
@@ -589,6 +667,91 @@ impl FindingLogger {
         Ok(())
     }
 
+    /// Build a standards-compliant OCSF Detection Finding (`class_uid` 2004)
+    /// `event` JSON from the nano finding metadata (NAN-1254).
+    ///
+    /// Native OCSF fields carry the parts OCSF models first-class: `risk_score`,
+    /// `severity[_id]`, `status_id`, `finding_info{title,uid,types,analytic}`.
+    /// The nano-specific risk attribution (`risk_entity` / `risk_entity_field`)
+    /// and the rest of the nano finding payload live under OCSF `unmapped` — the
+    /// sanctioned vendor-extension object — so the OCSF record stays valid while
+    /// the risk repository read path can pull `unmapped.risk_entity` etc. back.
+    pub fn build_ocsf_finding_event(
+        metadata: &serde_json::Value,
+        message: &str,
+        timestamp: DateTime<Utc>,
+    ) -> serde_json::Value {
+        let get_str = |k: &str| metadata.get(k).and_then(|v| v.as_str()).unwrap_or("");
+        let cloned = |k: &str, default: serde_json::Value| {
+            metadata.get(k).cloned().unwrap_or(default)
+        };
+
+        // nano Severity (lowercased) -> OCSF severity_id + Title-case sibling.
+        let (severity_id, severity_title) = match get_str("severity") {
+            "critical" => (5, "Critical"),
+            "high" => (4, "High"),
+            "medium" => (3, "Medium"),
+            "low" => (2, "Low"),
+            "info" | "informational" => (1, "Informational"),
+            _ => (0, "Unknown"),
+        };
+
+        const CLASS_UID: i64 = 2004; // Detection Finding
+        const ACTIVITY_ID: i64 = 1; // Create
+
+        let risk_score = metadata
+            .get("risk_score")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let signal_type = get_str("signal_type");
+        let rule_id = get_str("rule_id");
+        let rule_name = get_str("rule_name");
+
+        json!({
+            "class_uid": CLASS_UID,
+            "class_name": "Detection Finding",
+            "category_uid": 2,
+            "category_name": "Findings",
+            "activity_id": ACTIVITY_ID,
+            "activity_name": "Create",
+            "type_uid": CLASS_UID * 100 + ACTIVITY_ID, // 200401
+            // OCSF `time` is epoch milliseconds.
+            "time": timestamp.timestamp_millis(),
+            "severity_id": severity_id,
+            "severity": severity_title,
+            "status_id": 1, // New
+            "risk_score": risk_score,
+            "message": message,
+            "count": cloned("matched_event_count", json!(1)),
+            "metadata": {
+                "product": { "name": "nano", "vendor_name": "nano" },
+                "log_name": "findings",
+                "uid": cloned("alert_id", serde_json::Value::Null),
+            },
+            "finding_info": {
+                "title": rule_name,
+                "uid": rule_id,
+                "types": [signal_type],
+                "analytic": { "name": rule_name, "uid": rule_id, "type_id": 1 },
+            },
+            // nano vendor extension — read back by risk/repository.rs under OCSF.
+            "unmapped": {
+                "signal_type": signal_type,
+                "rule_id": rule_id,
+                "rule_name": rule_name,
+                "risk_score": risk_score,
+                "risk_entity": get_str("risk_entity"),
+                "risk_entity_field": cloned("risk_entity_field", serde_json::Value::Null),
+                "rule_mode": get_str("rule_mode"),
+                "realtime": cloned("realtime", json!(false)),
+                "raw_risk_score": cloned("raw_risk_score", json!(0)),
+                "mitre_tactics": cloned("mitre_tactics", json!([])),
+                "mitre_techniques": cloned("mitre_techniques", json!([])),
+                "risk_factors": cloned("risk_factors", json!([])),
+                "matched_events_sample": cloned("matched_events_sample", json!([])),
+            },
+        })
+    }
 }
 
 /// Errors that can occur during finding logging
@@ -599,6 +762,93 @@ pub enum FindingLogError {
 
     #[error("ClickHouse error: {0}")]
     ClickHouseError(String),
+}
+
+/// NAN-1254: the OCSF Detection Finding (class_uid 2004) write contract.
+/// Validates that `build_ocsf_finding_event` produces a spec-shaped 2004 event
+/// whose native fields + `unmapped` vendor extension match exactly what the risk
+/// repository read path extracts (`JSONExtract*(event, ...)`). Keeping these in
+/// lockstep is the whole point — write and read must agree.
+#[cfg(test)]
+mod ocsf_finding_tests {
+    use super::*;
+
+    fn sample_metadata() -> serde_json::Value {
+        json!({
+            "signal_type": "detection_match",
+            "rule_id": "rule-abc-123",
+            "rule_name": "Suspicious Login",
+            "rule_query": "user=admin failed",
+            "severity": "high",
+            "rule_mode": "live",
+            "mitre_tactics": ["TA0001"],
+            "mitre_techniques": ["T1078"],
+            "alert_id": null,
+            "matched_event_count": 3,
+            "matched_events_sample": [],
+            "realtime": false,
+            "raw_risk_score": 50,
+            "risk_score": 75,
+            "risk_entity": "10.0.0.5",
+            "risk_entity_field": "src_ip",
+            "risk_factors": ["off-hours"]
+        })
+    }
+
+    #[test]
+    fn builds_spec_shaped_detection_finding_2004() {
+        let ts = DateTime::parse_from_rfc3339("2026-06-06T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let event = FindingLogger::build_ocsf_finding_event(&sample_metadata(), "Suspicious Login - src_ip=10.0.0.5", ts);
+
+        // OCSF Detection Finding taxonomy
+        assert_eq!(event["class_uid"], 2004);
+        assert_eq!(event["category_uid"], 2);
+        assert_eq!(event["activity_id"], 1);
+        assert_eq!(event["type_uid"], 200401); // class_uid*100 + activity_id
+        assert_eq!(event["class_name"], "Detection Finding");
+        assert_eq!(event["time"], ts.timestamp_millis());
+
+        // severity mapping: nano "high" -> OCSF severity_id 4 + Title-case sibling
+        assert_eq!(event["severity_id"], 4);
+        assert_eq!(event["severity"], "High");
+
+        // native OCSF risk_score (Integer)
+        assert_eq!(event["risk_score"], 75);
+
+        // finding_info carries rule identity (read path: finding_info.title)
+        assert_eq!(event["finding_info"]["title"], "Suspicious Login");
+        assert_eq!(event["finding_info"]["uid"], "rule-abc-123");
+
+        // nano vendor extension under `unmapped` — read back by risk/repository.rs
+        assert_eq!(event["unmapped"]["risk_entity"], "10.0.0.5");
+        assert_eq!(event["unmapped"]["risk_entity_field"], "src_ip");
+        assert_eq!(event["unmapped"]["rule_id"], "rule-abc-123");
+        assert_eq!(event["unmapped"]["signal_type"], "detection_match");
+        assert_eq!(event["unmapped"]["risk_score"], 75);
+
+        // product provenance (so OCSF consumers attribute it to nano)
+        assert_eq!(event["metadata"]["product"]["name"], "nano");
+    }
+
+    #[test]
+    fn severity_id_mapping_covers_all_levels() {
+        let ts = Utc::now();
+        for (nano, expect_id, expect_title) in [
+            ("critical", 5, "Critical"),
+            ("high", 4, "High"),
+            ("medium", 3, "Medium"),
+            ("low", 2, "Low"),
+            ("info", 1, "Informational"),
+            ("bogus", 0, "Unknown"),
+        ] {
+            let md = json!({ "severity": nano, "risk_score": 1, "rule_id": "r", "rule_name": "n", "signal_type": "alert", "risk_entity": "e" });
+            let ev = FindingLogger::build_ocsf_finding_event(&md, "m", ts);
+            assert_eq!(ev["severity_id"], expect_id, "severity_id for {nano}");
+            assert_eq!(ev["severity"], expect_title, "severity title for {nano}");
+        }
+    }
 }
 
 #[cfg(any())]

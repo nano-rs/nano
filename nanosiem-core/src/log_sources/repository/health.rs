@@ -220,6 +220,16 @@ impl LogSourceRepository {
     ) -> Result<LogSourceHealth, LogSourceRepositoryError> {
         let where_clause = Self::build_log_source_where_clause(log_source);
 
+        // NAN-1241: read the active ingested-events table. Under OCSF the payload
+        // is the single `event` JSON column (there is no `message`/`metadata`
+        // column), so estimate row size from it; UDM keeps the original calc.
+        let logs_table = crate::schema::active_logs_table();
+        let size_expr = if logs_table == "ocsf_logs" {
+            "length(toString(event)) + length(source_type) + 100"
+        } else {
+            "length(message) + length(metadata) + length(source_type) + 100"
+        };
+
         // Query recent data with PREWHERE for partition pruning
         // Use 90-day window for total_events, dedicated counts for 24h/1h
         let sql = format!(
@@ -230,12 +240,11 @@ impl LogSourceRepository {
                 countIf(timestamp >= now() - INTERVAL 1 HOUR) as events_last_hour,
                 max(timestamp) as last_event_at,
                 min(timestamp) as first_event_at,
-                sum(length(message) + length(metadata) + length(source_type) + 100) as total_size_bytes
-            FROM logs
+                sum({size_expr}) as total_size_bytes
+            FROM {logs_table}
             PREWHERE timestamp >= now() - INTERVAL 90 DAY
-            WHERE {}
-            "#,
-            where_clause
+            WHERE {where_clause}
+            "#
         );
 
         // Execute query and parse results as JSON

@@ -5,7 +5,6 @@
 //! Generates ASOF JOIN SQL for the `resolve_identity` command,
 //! enriching events with resolved hostname/mac/user based on IP.
 
-use super::helpers::*;
 use super::ClickHouseSqlGenerator;
 use crate::query::sql_gen::SqlGenError;
 use std::collections::HashSet;
@@ -49,12 +48,35 @@ pub(crate) fn resolve_identity_entity_prefix(field: &str) -> &'static str {
 
 /// Map a resolve_identity field name to the identity_observations column to JOIN on,
 /// and whether this is a reverse lookup (user/hostname → IP).
-pub(crate) fn resolve_identity_join_col(field: &str) -> (&'static str, bool) {
+///
+/// Classification is driven by the active profile's entity type so OCSF host/user
+/// fields (e.g. `src_endpoint.hostname`, `actor.user.name`) route to the right
+/// join key. For UDM the entity-type lookup reproduces the prior literal matches
+/// exactly (`user`/`dest_user` → User, `src_host`/`dest_host` → Host), byte-identical.
+pub(crate) fn resolve_identity_join_col(
+    field: &str,
+    profile: &dyn crate::schema::SchemaProfile,
+) -> (&'static str, bool) {
     match field {
+        // UDM literal fast-path — byte-identical to the prior behavior, including
+        // the deliberate omission of `src_user` (forward-only) from the reverse set.
         "user" | "dest_user" => ("user", true),
         "src_host" | "dest_host" => ("hostname", true),
-        // All IP fields (src_ip, dest_ip, nat_ip, etc.) use the existing ip join
-        _ => ("ip", false),
+        _ => {
+            // For OCSF (non-UDM schemas), classify the dotted field via the
+            // profile's entity type so host/user reverse lookups route correctly.
+            // UDM keeps the prior `_ => ("ip", false)` default verbatim, so e.g.
+            // `src_user` / `user_name` stay forward-only exactly as before.
+            if profile.id() != crate::schema::SchemaId::Udm {
+                match profile.entity_type(field) {
+                    Some(crate::schema::EntityType::User) => return ("user", true),
+                    Some(crate::schema::EntityType::Host) => return ("hostname", true),
+                    _ => {}
+                }
+            }
+            // All IP fields (src_ip, dest_ip, nat_ip, etc.) use the existing ip join
+            ("ip", false)
+        }
     }
 }
 
@@ -100,18 +122,34 @@ impl ClickHouseSqlGenerator {
         available_columns: &Option<HashSet<String>>,
     ) -> Result<String, SqlGenError> {
         let max_age_secs = max_age.as_secs();
-        let field_escaped = escape_identifier(field);
+        // Resolve the lookup key through the active profile so OCSF reads its
+        // promoted column; for UDM `field_access_expr` returns the escaped column
+        // name verbatim (byte-identical to the prior `escape_identifier`).
+        let field_escaped = self.field_access_expr(field, "String");
 
         // Determine lookup type from field name
-        let (join_col, is_reverse) = resolve_identity_join_col(field);
+        let (join_col, is_reverse) = resolve_identity_join_col(field, self.profile.as_ref());
 
         // Check which fill-target columns exist in the source.
         // When a column-pruning command (table, fields keep) preceded us,
         // some columns may be absent — we can't reference or EXCEPT them.
+        //
+        // NAN-1323: when there is no explicit pruning set, a column is present iff
+        // the ACTIVE SCHEMA has a physical column literally named `col`. Under UDM
+        // that holds for every UDM column (`resolve()` is the identity), so this is
+        // byte-identical to the prior unconditional `true`. Under OCSF the
+        // fill-target UDM aliases (`src_mac`, `user`) and the `user_identity_*`
+        // columns are NOT physical columns (the physical ones are dotted /
+        // `user.name`), so `main.* EXCEPT (src_mac, user)` and `main.src_mac` would
+        // reference a column that does not exist in `ocsf_logs` → 500. Treating them
+        // as absent makes the fill fall back to the ASOF-join value instead.
         let has_col = |col: &str| -> bool {
             match available_columns {
-                None => true, // No pruning — all columns available
                 Some(set) => set.contains(col),
+                None => matches!(
+                    self.profile.resolve(col),
+                    crate::schema::FieldResolution::ExplicitColumn(ref c) if c == col
+                ),
             }
         };
 
@@ -182,17 +220,34 @@ impl ClickHouseSqlGenerator {
         // For reverse lookups (IP/hostname → user), the resolved user comes from the ASOF JOIN,
         // so we must use dictGetOrDefault.
         // Non-column fields (email, manager, etc.) always use dictGetOrDefault.
+        // NAN-1323: the COALESCE fallback to the event's own user must reference the
+        // active schema's physical user column. UDM resolves to `"user"` (byte-
+        // identical `main."user"`); OCSF resolves to `"user.name"` so the IP-lookup
+        // user key does not reference a nonexistent `user` column → 500.
+        let main_user_col = match self.profile.resolve("user") {
+            crate::schema::FieldResolution::ExplicitColumn(c) => crate::query::escape_identifier(&c),
+            _ => "\"user\"".to_string(),
+        };
         let user_expr = if is_reverse {
             // user/hostname fields: the lookup key is directly on the event row
             format!("lower(main.{})", field_escaped)
         } else {
             // IP fields: the resolved user comes from identity_observations JOIN
-            "lower(COALESCE(i.user, main.\"user\"))".to_string()
+            format!("lower(COALESCE(i.user, main.{}))", main_user_col)
         };
 
         let mut dict_lookup_parts: Vec<String> = Vec::new();
 
-        if is_forward_user {
+        // NAN-1323: the forward-user fast path reads the 8 dedicated `user_identity_*`
+        // columns straight off the row — but those are materialized only on the UDM
+        // `logs` table. Under OCSF (or a pruned UDM query that dropped them) they do
+        // not exist, so reading `main.user_identity_*` would 500. Gate on the columns
+        // actually being present; otherwise fall through to the dictGetOrDefault path,
+        // which resolves the same values via the registry dict.
+        let read_physical_identity = is_forward_user
+            && has_col(&format!("{}_{}", entity_prefix, IDENTITY_COLUMN_FIELDS[0].0));
+
+        if read_physical_identity {
             // Read dedicated columns directly from the row (already populated at ingestion)
             for (col_suffix, _dict_field, _default) in IDENTITY_COLUMN_FIELDS.iter() {
                 dict_lookup_parts.push(format!(

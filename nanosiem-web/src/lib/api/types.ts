@@ -221,6 +221,23 @@ export interface FieldInfo {
   cardinality?: number;  // Total unique values across ALL matching events (from server-side topK)
 }
 
+// Active schema profile's field universe (GET /api/schema/fields). Profile-aware
+// (OCSF Phase 7, NAN-1241) — the shape is identical for UDM and OCSF; only the
+// discriminator + field set differ.
+export interface SchemaFieldInfo {
+  name: string;
+  type: string;
+  category: string;
+  entity_type?: string;
+  prewhere: boolean;
+  search: boolean;
+}
+
+export interface SchemaFieldsResponse {
+  schema: string;            // active discriminator: "udm" | "ocsf"
+  fields: SchemaFieldInfo[];
+}
+
 // Async field stats request/response (loaded separately from main search)
 export interface FieldStatsRequest {
   query: string;
@@ -3383,6 +3400,10 @@ export interface Case {
   ai_disposition?: AiDisposition;
   ai_confidence?: number; // 0.0–1.0
   ai_recommended_action?: string;
+  // NAN-1297: AI-recommended severity. Drives symmetric re-triage — when more
+  // severe than `severity` it's a pending escalation (recommend-only); when it
+  // equals `severity` the escalation was already applied (auto mode).
+  ai_recommended_severity?: string;
   ai_key_evidence?: string[];
   ai_triaged_at?: string;
   // NAN-1251 (P3): set when a later case escalated a shared entity this case

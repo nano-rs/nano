@@ -11,14 +11,54 @@ use crate::search::query_processing::LateralCommandInfo;
 /// Maximum events to fetch per hop query to prevent runaway queries
 const MAX_EVENTS_PER_HOP: usize = 10_000;
 
-/// Columns to select for lateral movement events
-const LATERAL_COLUMNS: &str = "\
-    timestamp, source_type, user, \
-    src_ip, dest_ip, src_host, dest_host, src_port, dest_port, \
-    protocol, auth_type, auth_result, session_id, \
-    process_name, process_path, action, category";
+/// Canonical (UDM-semantic) field names selected for lateral-movement events,
+/// in projection order. The physical SELECT projection is built per the active
+/// schema profile by [`SearchService::lateral_columns`], which resolves each
+/// name to its physical column and aliases it back to the canonical name so
+/// `extract_edge` (which reads canonical JSON keys) works across UDM and OCSF.
+/// Fields the active schema does not map are skipped (NAN-1241).
+const LATERAL_FIELDS: &[&str] = &[
+    "timestamp",
+    "source_type",
+    "user",
+    "src_ip",
+    "dest_ip",
+    "src_host",
+    "dest_host",
+    "src_port",
+    "dest_port",
+    "protocol",
+    "auth_type",
+    "auth_result",
+    "session_id",
+    "process_name",
+    "process_path",
+    "action",
+    "category",
+];
 
 impl SearchService {
+    /// Build the lateral-movement SELECT projection for the active schema profile.
+    ///
+    /// Each canonical field in [`LATERAL_FIELDS`] is resolved via `udm_column_sql`
+    /// and aliased back to the canonical name (`col AS canonical`). For the UDM
+    /// profile every field resolves to its own column, so the projection is
+    /// byte-equivalent to the old const (modulo the seam's uniform reserved-word
+    /// quoting) and the rows are byte-identical. Fields the schema does not map
+    /// (`udm_column_sql` → `None`) are skipped so no unknown column is referenced.
+    fn lateral_columns(&self) -> String {
+        let profile = self.active_profile.as_ref();
+        LATERAL_FIELDS
+            .iter()
+            .filter_map(|field| {
+                profile
+                    .udm_column_sql(field)
+                    .map(|col| format!("{col} AS {field}"))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Build lateral movement view by tracing hop-by-hop movement paths.
     ///
     /// This method:
@@ -53,9 +93,21 @@ impl SearchService {
             lateral_info.methods
         );
 
-        let logs_table = self.table_names.read("logs");
+        let logs_table = self
+            .table_names
+            .read(Self::logs_table_key(self.active_profile.as_ref()));
+        let lateral_columns = self.lateral_columns();
         let start_str = time_range.start.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
         let end_str = time_range.end.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+
+        // Resolve the physical columns the hop predicates reference through the
+        // active schema profile (NAN-1241). Under UDM each resolves to its own name
+        // (byte-identical to the previous hardcodes modulo reserved-word quoting);
+        // under OCSF they resolve to the promoted columns. A field the schema does
+        // not map (`udm_column_sql` → None) yields `None`, and the predicate terms
+        // that depend on it are dropped so no unknown column is referenced.
+        let profile = self.active_profile.as_ref();
+        let cols = LateralPredicateColumns::resolve(profile);
 
         // Step 2: BFS hop expansion
         let mut all_edges: Vec<LateralEdge> = Vec::new();
@@ -87,11 +139,14 @@ impl SearchService {
             // that user's activity (not unrelated traffic on the same destinations).
             // For host-seeded queries, hops expand via the BFS frontier.
             let (entity_clause, entity_binds) = if let Some(ref user) = seed_user {
-                ("lower(user) = lower(?)".to_string(), vec![user.clone()])
+                (
+                    format!("lower({}) = lower(?)", cols.user),
+                    vec![user.clone()],
+                )
             } else if frontier_hosts.is_empty() {
                 break;
             } else {
-                build_host_clause(&frontier_hosts)
+                build_host_clause(&frontier_hosts, &cols)
             };
 
             // Build bind values: timestamp range + entity clause binds
@@ -100,15 +155,13 @@ impl SearchService {
 
             // Query each method type
             if lateral_info.methods.contains(&LateralMethod::Auth) {
+                let auth_where = cols.auth_where();
                 let auth_sql = format!(
-                    r#"SELECT {LATERAL_COLUMNS}
+                    r#"SELECT {lateral_columns}
                     FROM {logs_table}
                     PREWHERE timestamp BETWEEN ? AND ?
                         AND ({entity_clause})
-                    WHERE auth_type != '' OR auth_result != ''
-                        OR position(lower(action), 'login') > 0
-                        OR position(lower(action), 'logon') > 0
-                        OR lower(source_type) LIKE '%auth%'
+                    WHERE {auth_where}
                     ORDER BY timestamp ASC
                     LIMIT {MAX_EVENTS_PER_HOP}"#
                 );
@@ -140,7 +193,7 @@ impl SearchService {
                     if !discovered_ips.is_empty() {
                         let mut combined_hosts = frontier_hosts.clone();
                         combined_hosts.extend(discovered_ips);
-                        let (clause, binds) = build_host_clause(&combined_hosts);
+                        let (clause, binds) = build_host_clause(&combined_hosts, &cols);
                         // Use combined clause: original user clause OR host-based clause
                         network_clause = format!("({entity_clause}) OR ({clause})");
                         let mut nb = vec![start_str.clone(), end_str.clone()];
@@ -157,14 +210,13 @@ impl SearchService {
                 };
 
                 // Focus on lateral movement ports: RDP (3389), SSH (22), SMB (445), WinRM (5985/5986)
+                let network_where = cols.network_where();
                 let network_sql = format!(
-                    r#"SELECT {LATERAL_COLUMNS}
+                    r#"SELECT {lateral_columns}
                     FROM {logs_table}
                     PREWHERE timestamp BETWEEN ? AND ?
                         AND ({network_clause})
-                    WHERE dest_ip != '' AND dest_ip != src_ip
-                        AND (dest_port IN (22, 445, 3389, 5985, 5986, 135, 139)
-                             OR position(lower(action), 'connection') > 0)
+                    WHERE {network_where}
                     ORDER BY timestamp ASC
                     LIMIT {MAX_EVENTS_PER_HOP}"#
                 );
@@ -179,36 +231,31 @@ impl SearchService {
                 }
             }
 
+            // The schema has no `process_name` column under OCSF → no remote-exec
+            // edges are derivable, so skip the process method entirely for that
+            // schema (`process_where()` returns None). UDM always yields a clause.
             if lateral_info.methods.contains(&LateralMethod::Process) {
-                // Look for remote execution tools — require a destination to filter out
-                // local process executions (svchost, wermgr, etc.) that aren't lateral movement
-                let process_sql = format!(
-                    r#"SELECT {LATERAL_COLUMNS}
+                if let Some(process_where) = cols.process_where() {
+                    // Look for remote execution tools — require a destination to filter
+                    // out local process executions (svchost, wermgr, etc.) that aren't
+                    // lateral movement.
+                    let process_sql = format!(
+                        r#"SELECT {lateral_columns}
                     FROM {logs_table}
                     PREWHERE timestamp BETWEEN ? AND ?
                         AND ({entity_clause})
-                    WHERE process_name != ''
-                        AND (dest_ip != '' OR dest_host != '')
-                        AND (position(lower(process_name), 'psexe') > 0
-                             OR position(lower(process_name), 'wmic') > 0
-                             OR position(lower(process_name), 'winrs') > 0
-                             OR position(lower(process_name), 'powershell') > 0
-                             OR position(lower(process_name), 'pwsh') > 0
-                             OR position(lower(process_name), 'mstsc') > 0
-                             OR position(lower(process_name), 'ssh') > 0
-                             OR position(lower(process_name), 'schtasks') > 0
-                             OR position(lower(process_name), 'sc.exe') > 0
-                             OR position(lower(action), 'service') > 0)
+                    WHERE {process_where}
                     ORDER BY timestamp ASC
                     LIMIT {MAX_EVENTS_PER_HOP}"#
-                );
+                    );
 
-                let events = self
-                    .execute_lateral_query(clickhouse, &process_sql, &base_binds)
-                    .await;
-                for event in events {
-                    if let Some(edge) = extract_edge(&event, hop, "process") {
-                        hop_edges.push(edge);
+                    let events = self
+                        .execute_lateral_query(clickhouse, &process_sql, &base_binds)
+                        .await;
+                    for event in events {
+                        if let Some(edge) = extract_edge(&event, hop, "process") {
+                            hop_edges.push(edge);
+                        }
                     }
                 }
             }
@@ -360,9 +407,22 @@ impl SearchService {
             ));
         }
 
+        // Result rows are JSONEachRow with FLAT keys = the physical column names.
+        // Under OCSF those are the promoted dotted names (src_endpoint.ip, user.name),
+        // not the UDM tokens (src_ip, user) we auto-detect on, so resolve each UDM
+        // field to its physical result-key before the lookup. UDM byte-identical
+        // (resolve returns the same name). (NAN-1248)
+        let profile = self.active_profile.as_ref();
+        let result_key = |udm: &str| -> String {
+            match profile.resolve(udm) {
+                crate::schema::FieldResolution::ExplicitColumn(c) => c,
+                _ => udm.to_string(),
+            }
+        };
+
         // If entity_field is specified, use it directly
         if let Some(ref field) = lateral_info.entity_field {
-            if let Some(value) = extract_field_value(results, field) {
+            if let Some(value) = extract_field_value(results, &result_key(field)) {
                 return Ok((field.clone(), value));
             }
             return Err(SearchError::ParseError(format!(
@@ -384,8 +444,8 @@ impl SearchService {
             LateralSeedType::Auto => vec!["src_host", "dest_host", "src_ip", "dest_ip", "user"],
         };
 
-        for field in &fields_to_try {
-            if let Some(value) = extract_field_value(results, field) {
+        for &field in &fields_to_try {
+            if let Some(value) = extract_field_value(results, &result_key(field)) {
                 return Ok((field.to_string(), value));
             }
         }
@@ -668,10 +728,168 @@ fn dedup_edges(edges: Vec<LateralEdge>) -> Vec<LateralEdge> {
     result
 }
 
+/// Physical columns the hop predicates reference, resolved through the active
+/// schema profile (NAN-1241). Built once per `| lateral` invocation by
+/// [`LateralPredicateColumns::resolve`]. For the UDM profile each field resolves
+/// to its own name (e.g. `user` → `"user"`), so the predicate SQL is byte-equivalent
+/// to the previous hardcodes (modulo the seam's uniform reserved-word quoting);
+/// under OCSF they resolve to the promoted columns. Fields the schema does not map
+/// are `None`, and the predicate terms that depend on them are dropped.
+struct LateralPredicateColumns {
+    /// Active schema identity — gates value-semantics that differ between UDM and
+    /// OCSF (e.g. auth columns are STRINGs under UDM but INTs under OCSF, so the
+    /// `!= ''` predicate is a ClickHouse type error against OCSF). NAN-1241.
+    schema_id: crate::schema::SchemaId,
+    user: String,
+    src_host: String,
+    dest_host: String,
+    src_ip: String,
+    dest_ip: String,
+    dest_port: String,
+    auth_type: Option<String>,
+    auth_result: Option<String>,
+    action: Option<String>,
+    source_type: String,
+    process_name: Option<String>,
+}
+
+impl LateralPredicateColumns {
+    fn resolve(profile: &dyn crate::schema::SchemaProfile) -> Self {
+        // Entity/dedup columns always have a physical home in both schemas; fall
+        // back to the literal name if a schema unexpectedly omits one so the query
+        // still parses (rather than producing malformed SQL).
+        let req = |udm: &str| -> String {
+            profile.udm_column_sql(udm).unwrap_or_else(|| udm.to_string())
+        };
+        LateralPredicateColumns {
+            schema_id: profile.id(),
+            user: req("user"),
+            src_host: req("src_host"),
+            dest_host: req("dest_host"),
+            src_ip: req("src_ip"),
+            dest_ip: req("dest_ip"),
+            dest_port: req("dest_port"),
+            // Optional predicate axes — dropped from the WHERE when unmapped.
+            auth_type: profile.udm_column_sql("auth_type"),
+            auth_result: profile.udm_column_sql("auth_result"),
+            action: profile.udm_column_sql("action"),
+            source_type: req("source_type"),
+            process_name: profile.udm_column_sql("process_name"),
+        }
+    }
+
+    /// WHERE body identifying authentication-style events for a hop.
+    ///
+    /// VALUE-SEMANTICS SPLIT (NAN-1241): under UDM, `auth_type`/`auth_result`
+    /// resolve to STRING columns and "this is an auth event" is `col != ''`. Under
+    /// OCSF those same UDM-semantic names resolve to INT taxonomy columns
+    /// (`auth_protocol_id`, `status_id`, both `UInt32`), so `col != ''` is a
+    /// ClickHouse type error (500) and yields zero auth edges. OCSF instead
+    /// detects an auth event via the IAM category taxonomy (`category_uid = 3`,
+    /// the shared `auth_predicate`) ORed with non-zero auth ints — never an
+    /// `int != ''` comparison and never `lower()`/string ops on an int column.
+    ///
+    /// UDM output is byte-identical to the legacy predicate; terms whose column is
+    /// unmapped are dropped (always leaves at least the source_type term).
+    fn auth_where(&self) -> String {
+        match self.schema_id {
+            crate::schema::SchemaId::Ocsf => self.auth_where_ocsf(),
+            crate::schema::SchemaId::Udm => self.auth_where_udm(),
+        }
+    }
+
+    /// UDM auth predicate — STRING columns, byte-identical to the legacy hardcode.
+    fn auth_where_udm(&self) -> String {
+        let mut terms: Vec<String> = Vec::new();
+        if let Some(ref c) = self.auth_type {
+            terms.push(format!("{c} != ''"));
+        }
+        if let Some(ref c) = self.auth_result {
+            terms.push(format!("{c} != ''"));
+        }
+        if let Some(ref c) = self.action {
+            terms.push(format!("position(lower({c}), 'login') > 0"));
+            terms.push(format!("position(lower({c}), 'logon') > 0"));
+        }
+        terms.push(format!("lower({}) LIKE '%auth%'", self.source_type));
+        terms.join(" OR ")
+    }
+
+    /// OCSF auth predicate — INT taxonomy columns, no string ops on the ints.
+    fn auth_where_ocsf(&self) -> String {
+        let mut terms: Vec<String> = Vec::new();
+        // Primary signal: IAM category (`category_uid = 3`), the canonical OCSF
+        // "this is an auth/identity event" flag — reuse the classification
+        // module's existing `OCSF_AUTH_PREDICATE` so the two stay in lockstep.
+        terms.push(crate::search::classification::OCSF_AUTH_PREDICATE.to_string());
+        // Secondary: a populated auth protocol / outcome. These columns are INTs
+        // under OCSF (auth_protocol_id, status_id) — compare to the int 0 sentinel,
+        // never the empty string and never wrapped in lower().
+        if let Some(ref c) = self.auth_type {
+            terms.push(format!("{c} != 0"));
+        }
+        if let Some(ref c) = self.auth_result {
+            terms.push(format!("{c} != 0"));
+        }
+        // source_type is a String operational column under OCSF too, so the
+        // case-insensitive LIKE is valid here.
+        terms.push(format!("lower({}) LIKE '%auth%'", self.source_type));
+        terms.join(" OR ")
+    }
+
+    /// WHERE body identifying network/lateral-port events for a hop. Mirrors the
+    /// legacy UDM predicate; the `action` connection term is dropped when unmapped.
+    fn network_where(&self) -> String {
+        let mut port_or_action = format!(
+            "{dest_port} IN (22, 445, 3389, 5985, 5986, 135, 139)",
+            dest_port = self.dest_port
+        );
+        if let Some(ref c) = self.action {
+            port_or_action.push_str(&format!(" OR position(lower({c}), 'connection') > 0"));
+        }
+        format!(
+            "{dest_ip} != '' AND {dest_ip} != {src_ip} AND ({port_or_action})",
+            dest_ip = self.dest_ip,
+            src_ip = self.src_ip,
+        )
+    }
+
+    /// WHERE body identifying remote-execution process events for a hop. Returns
+    /// `None` when the schema has no `process_name` column (no edges derivable).
+    fn process_where(&self) -> Option<String> {
+        let process_name = self.process_name.as_ref()?;
+        let mut tool_terms = vec![
+            format!("position(lower({process_name}), 'psexe') > 0"),
+            format!("position(lower({process_name}), 'wmic') > 0"),
+            format!("position(lower({process_name}), 'winrs') > 0"),
+            format!("position(lower({process_name}), 'powershell') > 0"),
+            format!("position(lower({process_name}), 'pwsh') > 0"),
+            format!("position(lower({process_name}), 'mstsc') > 0"),
+            format!("position(lower({process_name}), 'ssh') > 0"),
+            format!("position(lower({process_name}), 'schtasks') > 0"),
+            format!("position(lower({process_name}), 'sc.exe') > 0"),
+        ];
+        if let Some(ref c) = self.action {
+            tool_terms.push(format!("position(lower({c}), 'service') > 0"));
+        }
+        Some(format!(
+            "{process_name} != '' \
+             AND ({dest_ip} != '' OR {dest_host} != '') \
+             AND ({tools})",
+            dest_ip = self.dest_ip,
+            dest_host = self.dest_host,
+            tools = tool_terms.join(" OR "),
+        ))
+    }
+}
+
 /// Build a parameterized ClickHouse WHERE clause matching any of the given hosts.
 /// Returns (sql_fragment with ? placeholders, bind values).
 /// Each IN clause gets its own set of placeholders since ClickHouse binds are positional.
-fn build_host_clause(hosts: &HashSet<String>) -> (String, Vec<String>) {
+fn build_host_clause(
+    hosts: &HashSet<String>,
+    cols: &LateralPredicateColumns,
+) -> (String, Vec<String>) {
     if hosts.is_empty() {
         return ("1=0".to_string(), vec![]);
     }
@@ -689,12 +907,17 @@ fn build_host_clause(hosts: &HashSet<String>) -> (String, Vec<String>) {
     let placeholders = vec!["?"; host_vec.len()].join(",");
 
     // 4 IN clauses, each needs its own copy of bind values. Host columns get
-    // FQDN-stripped at compare time; IP columns are compared as-is.
+    // FQDN-stripped at compare time; IP columns are compared as-is. Column names
+    // resolve through the active schema profile (UDM → byte-identical names).
     let sql = format!(
-        "(splitByChar('.', lower(src_host))[1] IN ({placeholders}) \
-         OR splitByChar('.', lower(dest_host))[1] IN ({placeholders}) \
-         OR lower(src_ip) IN ({placeholders}) \
-         OR lower(dest_ip) IN ({placeholders}))"
+        "(splitByChar('.', lower({src_host}))[1] IN ({placeholders}) \
+         OR splitByChar('.', lower({dest_host}))[1] IN ({placeholders}) \
+         OR lower({src_ip}) IN ({placeholders}) \
+         OR lower({dest_ip}) IN ({placeholders}))",
+        src_host = cols.src_host,
+        dest_host = cols.dest_host,
+        src_ip = cols.src_ip,
+        dest_ip = cols.dest_ip,
     );
 
     // Repeat values 4 times (once per IN clause)

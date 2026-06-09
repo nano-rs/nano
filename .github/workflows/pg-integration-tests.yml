@@ -1,0 +1,114 @@
+name: pg-integration-tests
+
+# NAN-1272 — runs the DB-backed Postgres integration suites that used to be
+# gated off behind `#![cfg(any())]` (so they never compiled or ran). Spins up a
+# throwaway Postgres, then `cargo test -- --ignored` runs the suites; each suite
+# applies the project migrations in-process via the canonical
+# `run_postgres_migrations` runner (see tests/common/mod.rs), so the schema
+# matches production. No app image build and no ClickHouse needed.
+#
+# These suites guard the class of bug NAN-1269 shipped: a column↔struct-field
+# drift in a runtime-checked `sqlx::query_as` that the compiler can't see and
+# only fails when executed against a real row.
+on:
+  pull_request:
+    paths:
+      - "**/*.rs"
+      - "migrations/**"
+      - ".github/workflows/pg-integration-tests.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: pg-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Self-hosted only (repo rule — never ubuntu-latest). A throwaway Postgres
+    # container with a unique name and a random host port keeps concurrent runs
+    # on the same host isolated (unlike the compose stack's fixed container_names).
+    #
+    # NAN-1282: the self-hosted runner host has neither `cargo` on the non-login
+    # shell PATH nor system OpenSSL/pkg-config (which `openssl-sys`, pulled in by
+    # clickhouse's `native-tls` feature, needs to build). Rather than manage host
+    # deps, we run cargo inside `rust:1-bookworm` (ships cargo + libssl-dev +
+    # pkg-config) — the same pattern as sync-mirror.yml / enrichment-lane-gate.yml.
+    # The cargo container joins the host network so it reaches the Postgres port
+    # published on 127.0.0.1, and writes its target dir to an in-container path
+    # so no root-owned build artifacts land in the workspace.
+    runs-on: [self-hosted, X64]
+    timeout-minutes: 45
+    env:
+      PG_CONTAINER: nan1272-pgit-${{ github.run_id }}
+      RUST_IMAGE: rust:1-bookworm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start throwaway Postgres
+        run: |
+          docker run -d --rm --name "$PG_CONTAINER" \
+            -e POSTGRES_USER=nanosiem \
+            -e POSTGRES_PASSWORD=nanosiem \
+            -e POSTGRES_DB=nanosiem \
+            -p 127.0.0.1::5432 \
+            postgres:18
+          # Resolve the randomly-assigned host port and export DATABASE_URL.
+          host_port="$(docker port "$PG_CONTAINER" 5432/tcp | head -1 | sed 's/.*://')"
+          echo "DATABASE_URL=postgres://nanosiem:nanosiem@localhost:${host_port}/nanosiem" >> "$GITHUB_ENV"
+          echo "Waiting for Postgres on :${host_port} ..."
+          for i in $(seq 1 60); do
+            if docker exec "$PG_CONTAINER" pg_isready -U nanosiem -d nanosiem >/dev/null 2>&1; then
+              echo "Postgres ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Postgres did not become ready in time"
+          docker logs "$PG_CONTAINER" --tail 50 || true
+          exit 1
+
+      - name: DB-backed suites (cargo in rust container)
+        run: |
+          # --network host: reach the Postgres published on 127.0.0.1:<host_port>
+          #   (DATABASE_URL above uses localhost).
+          # CARGO_TARGET_DIR=/tmp/target: ephemeral, in-container — keeps
+          #   root-owned build output out of the host workspace (NAN-773).
+          # Shared registry volume caches crate downloads across runs
+          #   (read-mostly; cargo's own file locks make concurrent access safe).
+          docker run --rm --network host \
+            -v "$PWD":/ws -w /ws \
+            -v nanosiem-pgit-cargo-registry:/usr/local/cargo/registry \
+            -e CARGO_TARGET_DIR=/tmp/target \
+            -e DATABASE_URL="$DATABASE_URL" \
+            "$RUST_IMAGE" \
+            bash -euo pipefail -c '
+              # Run each suite as its own sequential cargo invocation. The suites
+              # share one Postgres and each applies migrations via migrated_pool;
+              # the harness only guards concurrent migration within a binary
+              # (OnceCell), not across binaries, and the fresh-init CREATE TABLEs
+              # are not advisory-locked. Serial invocations keep the migrations
+              # from racing.
+              #
+              # Suites are grouped by which schema their migrated_pool applies:
+              #   - nanosiem-core: open migration path only (run_postgres_migrations).
+              #   - nanosiem-enterprise: open + enterprise overlay (postgres-enterprise).
+              # case_stats_visibility_integration tests the enterprise `cases`
+              # table, so it lives under -p nanosiem-enterprise (NAN-1283).
+              cargo test -p nanosiem-core --test api_key_rate_limit_integration -- --ignored
+              cargo test -p nanosiem-enterprise --test settings_integration -- --ignored
+              cargo test -p nanosiem-enterprise --test case_stats_visibility_integration -- --ignored
+            '
+
+      - name: Stop Postgres
+        if: always()
+        run: docker stop "$PG_CONTAINER" || true
+
+      - name: Reclaim workspace (NAN-773)
+        if: always()
+        # Defensive: if cargo wrote anything to /ws as root (e.g. Cargo.lock),
+        # chown it back via a throwaway container so the next host-side workflow's
+        # actions/checkout can clean the tree without EACCES.
+        run: |
+          docker run --rm -v "$PWD:/ws" -w /ws alpine \
+            chown -R "$(id -u):$(id -g)" . 2>/dev/null || true

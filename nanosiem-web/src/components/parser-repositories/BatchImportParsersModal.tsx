@@ -176,7 +176,7 @@ export function BatchImportParsersModal({
 
   return (
     <Dialog open={open} onOpenChange={(o) => { if (!importing) onOpenChange(o); }}>
-      <DialogContent className="flex max-h-[85vh] max-w-4xl flex-col rounded-xl border border-border/60 bg-card shadow-none">
+      <DialogContent className="flex max-h-[85vh] max-w-4xl flex-col">
         <DialogHeader className="border-b border-border/50 pb-4">
           <DialogTitle className="search-console-section-header"><Download />Batch Import Parsers</DialogTitle>
           <DialogDescription>
@@ -187,28 +187,28 @@ export function BatchImportParsersModal({
         {/* Bulk controls */}
         {!importing && (
           <div className="flex items-center gap-3 border-b border-border/50 px-1 py-2">
-            <Button variant="ghost" size="sm" className="rounded-lg" onClick={() => toggleAll(true)}>
+            <Button variant="ghost" className="h-7 text-[11.5px]" onClick={() => toggleAll(true)}>
               Select All
             </Button>
-            <Button variant="ghost" size="sm" className="rounded-lg" onClick={() => toggleAll(false)}>
+            <Button variant="ghost" className="h-7 text-[11.5px]" onClick={() => toggleAll(false)}>
               Deselect All
             </Button>
             <div className="h-4 w-px bg-border" />
             <span className="search-console-section-meta">Set selected to:</span>
             <Select onValueChange={(v) => setBulkImportType(v as 'linked' | 'forked')}>
-              <SelectTrigger className="h-7 w-28 rounded-lg border-border/70 bg-background/60 text-xs">
+              <SelectTrigger className="w-28">
                 <SelectValue placeholder="Import type..." />
               </SelectTrigger>
-              <SelectContent className="rounded-lg">
+              <SelectContent>
                 <SelectItem value="linked">Linked</SelectItem>
                 <SelectItem value="forked">Forked</SelectItem>
               </SelectContent>
             </Select>
             <Select onValueChange={setBulkIngestionMethod}>
-              <SelectTrigger className="h-7 w-32 rounded-lg border-border/70 bg-background/60 text-xs">
+              <SelectTrigger className="w-32">
                 <SelectValue placeholder="Ingestion..." />
               </SelectTrigger>
-              <SelectContent className="rounded-lg">
+              <SelectContent>
                 <SelectItem value="routed">HTTP (Routed)</SelectItem>
                 <SelectItem value="vector">Vector</SelectItem>
                 <SelectItem value="splunk_hec">Splunk HEC</SelectItem>
@@ -224,16 +224,16 @@ export function BatchImportParsersModal({
         {importing && (
           <div className="space-y-3 py-4">
             <Progress value={progressPercent} className="h-2" />
-            <div className="flex items-center gap-4 text-sm">
+            <div className="flex items-center gap-4 text-[11px]">
               <span className="flex items-center gap-1 text-green-600">
-                <CircleCheck className="w-4 h-4" /> {importProgress.imported} imported
+                <CircleCheck className="w-3.5 h-3.5" /> {importProgress.imported} imported
               </span>
               <span className="flex items-center gap-1 text-muted-foreground">
-                <CircleAlert className="w-4 h-4" /> {importProgress.skipped} skipped
+                <CircleAlert className="w-3.5 h-3.5" /> {importProgress.skipped} skipped
               </span>
               {importProgress.failed > 0 && (
                 <span className="flex items-center gap-1 text-red-500">
-                  <XCircle className="w-4 h-4" /> {importProgress.failed} failed
+                  <XCircle className="w-3.5 h-3.5" /> {importProgress.failed} failed
                 </span>
               )}
               <span className="text-muted-foreground ml-auto">
@@ -245,8 +245,8 @@ export function BatchImportParsersModal({
 
         {/* Parsers table */}
         {!importing && (
-          <div className="min-h-0 flex-1 overflow-auto rounded-lg border border-border/60">
-            <table className="w-full text-sm">
+          <div className="min-h-0 flex-1 overflow-auto rounded-md border border-border">
+            <table className="w-full text-[12px]">
               <thead className="sticky top-0 z-10 bg-muted/60 backdrop-blur-sm">
                 <tr className="border-b border-border/50">
                   <th className="w-10 p-2 text-left">
@@ -283,17 +283,17 @@ export function BatchImportParsersModal({
                         />
                       </td>
                       <td className="p-2">
-                        <div className="font-medium truncate max-w-[300px]" title={parser.display_name || parser.file_path}>
+                        <div className="font-medium text-[12.5px] leading-snug truncate max-w-[300px]" title={parser.display_name || parser.file_path}>
                           {parser.display_name || parser.name || parser.file_path.split('/').pop()}
                         </div>
                         {parser.description && (
-                          <div className="text-xs text-muted-foreground truncate max-w-[300px]">
+                          <div className="text-[11px] text-muted-foreground truncate max-w-[300px]">
                             {parser.description}
                           </div>
                         )}
                       </td>
                       <td className="p-2">
-                        <span className="text-xs text-muted-foreground truncate block max-w-[140px]" title={folder}>
+                        <span className="font-mono text-[11px] text-muted-foreground truncate block max-w-[140px]" title={folder}>
                           {folder}
                         </span>
                       </td>
@@ -303,10 +303,10 @@ export function BatchImportParsersModal({
                           onValueChange={(v) => updateConfig(parser.id, { importType: v as 'linked' | 'forked' })}
                           disabled={!config.selected}
                         >
-                          <SelectTrigger className="h-7 rounded-lg border-border/70 bg-background/60 text-xs">
+                          <SelectTrigger>
                             <SelectValue />
                           </SelectTrigger>
-                          <SelectContent className="rounded-lg">
+                          <SelectContent>
                             <SelectItem value="linked">Linked</SelectItem>
                             <SelectItem value="forked">Forked</SelectItem>
                           </SelectContent>
@@ -318,7 +318,7 @@ export function BatchImportParsersModal({
                           onValueChange={(v) => updateConfig(parser.id, { ingestionMethod: v })}
                           disabled={!config.selected}
                         >
-                          <SelectTrigger className="h-7 rounded-lg border-border/70 bg-background/60 text-xs">
+                          <SelectTrigger>
                             <SelectValue />
                           </SelectTrigger>
                           <SelectContent>
@@ -348,19 +348,19 @@ export function BatchImportParsersModal({
 
         <DialogFooter>
           {importDone ? (
-            <Button onClick={() => { onOpenChange(false); onSuccess(); }}>
+            <Button className="h-8 text-[11.5px]" onClick={() => { onOpenChange(false); onSuccess(); }}>
               Done
             </Button>
           ) : (
             <>
-              <Button variant="outline" onClick={() => onOpenChange(false)} disabled={importing}>
+              <Button variant="outline" className="h-8 text-[11.5px]" onClick={() => onOpenChange(false)} disabled={importing}>
                 Cancel
               </Button>
-              <Button onClick={handleImport} disabled={importing || selectedCount === 0}>
+              <Button className="h-8 text-[11.5px] gap-1.5" onClick={handleImport} disabled={importing || selectedCount === 0}>
                 {importing ? (
-                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                  <Loader2 className="h-[11px] w-[11px] animate-spin" />
                 ) : (
-                  <Download className="w-4 h-4 mr-2" />
+                  <Download className="h-[11px] w-[11px]" />
                 )}
                 Import {selectedCount} Parser{selectedCount !== 1 ? 's' : ''}
               </Button>

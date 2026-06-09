@@ -367,19 +367,10 @@ export function ParserRepositories() {
         dispatch_source_config_id: configId ?? null,
       });
 
-      // Routing-rule create-on-import — non-fatal if it fails.
-      if (configId && sourceType) {
-        try {
-          await api.createRoutingRule(configId, {
-            match_field: 'source_type',
-            match_type: 'exact',
-            match_value: sourceType,
-            target_source_type: sourceType,
-          });
-        } catch {
-          // Ignore — log source was created, routing can be configured manually.
-        }
-      }
+      // NAN-1270: the routing rule (source_type -> target) is now created
+      // server-side in import_parser, so single, batch, and raw-API imports all
+      // wire the source-config route identically. (Previously only this single-
+      // import path created it, so batch-imported parsers got no source config.)
 
       return result;
     },

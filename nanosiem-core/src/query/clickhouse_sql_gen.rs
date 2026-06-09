@@ -34,8 +34,10 @@ pub(crate) use helpers::*;
 
 use super::ast::*;
 use super::sql_gen::{SqlGenError, TimeRange};
+use crate::schema::{FieldResolution, SchemaProfile, UdmProfile};
 use once_cell::sync::Lazy;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::RwLock;
 use std::fmt::Write;
 
@@ -58,7 +60,11 @@ pub(crate) fn resolve_subsearch_limit(maxout: Option<usize>) -> usize {
 /// All other UDM fields are stored in the `ext` JSON column (extended fields)
 ///
 /// This list should match the columns defined in clickhouse/057_hybrid_json_schema.sql
-const EXPLICIT_COLUMNS: &[&str] = &[
+///
+/// `pub(crate)` so `UdmProfile` (`crate::schema::udm`) can reference the *same*
+/// slice for byte-for-byte parity rather than copying values (NAN-1244). Widening
+/// visibility is non-behavioral.
+pub(crate) const EXPLICIT_COLUMNS: &[&str] = &[
     // Core fields
     "id",
     "timestamp",
@@ -377,7 +383,14 @@ pub(crate) const MATERIALIZED_COLUMNS: &[&str] = &[
     "dest_user_identity_groups",
 ];
 
-/// Check if a field is an explicit column (direct column access) vs JSON field
+/// Check if a field is an explicit column (direct column access) vs JSON field.
+///
+/// Superseded by `SchemaProfile::resolve` (NAN-1241): callers now consult the
+/// active profile (`matches!(profile.resolve(f), FieldResolution::ExplicitColumn)`)
+/// so OCSF promoted columns classify correctly. Retained as the canonical
+/// UDM-parity reference (the schema anti-drift test asserts `resolve` reproduces
+/// this for every UDM field).
+#[allow(dead_code)]
 pub(crate) fn is_explicit_column(field: &str) -> bool {
     EXPLICIT_COLUMNS_SET.contains(field)
 }
@@ -460,7 +473,9 @@ pub struct QueryOptions {
 }
 
 /// Fields that benefit from being in PREWHERE (primary key or have set/bloom indexes)
-const PREWHERE_FIELDS: &[&str] = &[
+///
+/// `pub(crate)` for `UdmProfile` parity (NAN-1244).
+pub(crate) const PREWHERE_FIELDS: &[&str] = &[
     "source_type",
     "sourcetype",
     "src_host",
@@ -476,7 +491,9 @@ const PREWHERE_FIELDS: &[&str] = &[
 /// Fields that are normalized to lowercase at ingest time.
 /// For these fields, we can skip the lower() wrapper and do direct comparison,
 /// which allows efficient index usage.
-const LOWERCASE_NORMALIZED_FIELDS: &[&str] = &[
+///
+/// `pub(crate)` for `UdmProfile` parity (NAN-1244).
+pub(crate) const LOWERCASE_NORMALIZED_FIELDS: &[&str] = &[
     "source_type",
     "sourcetype",
     "event_type",
@@ -495,7 +512,9 @@ const LOWERCASE_NORMALIZED_FIELDS: &[&str] = &[
 /// Numeric UDM fields (UInt16, UInt32, Int64, Float64).
 /// For these fields, we should NOT apply lower() even when the value is passed as a string.
 /// We convert string values to numbers for comparison.
-const NUMERIC_UDM_FIELDS: &[&str] = &[
+///
+/// `pub(crate)` for `UdmProfile` parity (NAN-1244).
+pub(crate) const NUMERIC_UDM_FIELDS: &[&str] = &[
     // Ports (UInt16)
     "src_port",
     "dest_port",
@@ -549,20 +568,34 @@ const NUMERIC_UDM_FIELDS: &[&str] = &[
 /// UUID fields — ClickHouse UUID type doesn't support lower(), so we compare
 /// via toString() cast. UUIDs are case-insensitive by spec so no lower() needed.
 /// Add any new UUID-typed columns here.
-const UUID_FIELDS: &[&str] = &["id", "rule_id"];
+///
+/// `pub(crate)` for `UdmProfile` parity (NAN-1244).
+pub(crate) const UUID_FIELDS: &[&str] = &["id", "rule_id"];
 
 /// Extract PREWHERE-eligible equality conditions from a SearchExpr.
 /// Returns SQL conditions that can be added to PREWHERE for better index usage.
 /// These conditions will also remain in WHERE (duplicate is fine, ClickHouse optimizes).
-pub(super) fn extract_prewhere_conditions(expr: &SearchExpr) -> Vec<String> {
+pub(super) fn extract_prewhere_conditions(expr: &SearchExpr, profile: &dyn SchemaProfile) -> Vec<String> {
     let mut prewhere = Vec::new();
 
-    // Recursively collect equality conditions on indexed fields
-    fn collect_prewhere(expr: &SearchExpr, conditions: &mut Vec<String>) {
+    // Recursively collect equality conditions on PREWHERE-eligible *physical
+    // columns*, resolved through the active `SchemaProfile`. Resolving here
+    // (instead of emitting the raw UDM token) is what keeps PREWHERE in step with
+    // the profile-resolved WHERE clause: under OCSF a UDM alias like `src_ip` must
+    // become the promoted column `"src_endpoint.ip"`, never the literal `src_ip`
+    // (which is not a column → Code 47 / silent 0-rows, NAN-1299). Fields that do
+    // not resolve to a single physical column (JSON tail, class-split expression,
+    // unknown) are left to WHERE and never promoted to PREWHERE. For UDM the
+    // resolution is the identity column, so output is byte-for-byte unchanged.
+    fn collect_prewhere(
+        expr: &SearchExpr,
+        profile: &dyn SchemaProfile,
+        conditions: &mut Vec<String>,
+    ) {
         match expr {
             SearchExpr::And(left, right) => {
-                collect_prewhere(left, conditions);
-                collect_prewhere(right, conditions);
+                collect_prewhere(left, profile, conditions);
+                collect_prewhere(right, profile, conditions);
             }
             SearchExpr::FieldFilter {
                 field,
@@ -570,52 +603,72 @@ pub(super) fn extract_prewhere_conditions(expr: &SearchExpr) -> Vec<String> {
                 value,
             } => {
                 let normalized = normalize_field_name(field);
-                if PREWHERE_FIELDS.contains(&normalized) {
-                    let is_lowered = LOWERCASE_NORMALIZED_FIELDS.contains(&normalized);
-                    let condition = match value {
-                        Value::String(s) => {
-                            // Skip wildcards in PREWHERE — the WHERE clause handles them
-                            // correctly (pure "*" → 1, patterns → iLike). Adding a literal
-                            // '*' to PREWHERE would match nothing and break the query.
-                            if s.contains('*') || s.contains('?') {
-                                return;
-                            }
-                            let escaped = escape_string(&s.to_lowercase());
-                            // Hostname expansion: for src_host/dest_host without dots,
-                            // match both exact and FQDN variants in PREWHERE too
-                            let is_hostname_field =
-                                normalized == "src_host" || normalized == "dest_host";
-                            if is_hostname_field && !s.contains('.') {
-                                if is_lowered {
-                                    // Direct comparison — uses bloom/set indexes
-                                    format!(
-                                        "({} = '{}' OR startsWith({}, '{}.'))",
-                                        normalized, escaped, normalized, escaped
-                                    )
-                                } else {
-                                    format!(
-                                        "(lower({}) = '{}' OR startsWith(lower({}), '{}.'))",
-                                        normalized, escaped, normalized, escaped
-                                    )
-                                }
-                            } else if is_lowered {
-                                format!("{} = '{}'", normalized, escaped)
-                            } else {
-                                format!("lower({}) = '{}'", normalized, escaped)
-                            }
-                        }
-                        Value::Number(n) => format!("{} = {}", normalized, n),
-                        _ => return, // Skip complex values
-                    };
-                    conditions.push(condition);
+                // NAN-1321: a class-split concept (OCSF host/user/process/url) matches
+                // a value-pick `if(primary != '', primary, fallback)` in WHERE. Its
+                // `resolve()` returns only the PRIMARY column, so promoting THAT to
+                // PREWHERE would pre-filter to `primary = x` and drop every fallback
+                // row (the device.hostname endpoint events) before WHERE ever runs —
+                // a silent under-match. The `if(...)` is not a clean indexed equality,
+                // so leave class-split fields entirely to WHERE. UDM never class-splits
+                // → no-op, PREWHERE byte-identical.
+                if profile.class_split_value_sql(normalized).is_some() {
+                    return;
                 }
+                // Resolve to a real physical column (follow same-schema aliases).
+                // Anything else (JsonPath / ArrayElement / Unknown) is not
+                // PREWHERE-safe — leave it to the profile-resolved WHERE clause.
+                let col = match profile.resolve(normalized) {
+                    FieldResolution::ExplicitColumn(c) | FieldResolution::Alias(c) => c,
+                    _ => return,
+                };
+                // Only promote columns the active profile marks PREWHERE-worthy.
+                if !profile.prewhere_fields().contains(&col.as_str()) {
+                    return;
+                }
+                // Dotted OCSF columns are double-quoted; simple UDM names stay bare.
+                let col_sql = escape_identifier(&col);
+                let is_lowered = profile.is_lowercased_at_ingest(&col);
+                let condition = match value {
+                    Value::String(s) => {
+                        // Skip wildcards in PREWHERE — the WHERE clause handles them
+                        // correctly (pure "*" → 1, patterns → iLike). Adding a literal
+                        // '*' to PREWHERE would match nothing and break the query.
+                        if s.contains('*') || s.contains('?') {
+                            return;
+                        }
+                        let escaped = escape_string(&s.to_lowercase());
+                        // Hostname expansion: for src_host/dest_host without dots,
+                        // match both exact and FQDN variants in PREWHERE too.
+                        let is_hostname_field =
+                            normalized == "src_host" || normalized == "dest_host";
+                        if is_hostname_field && !s.contains('.') {
+                            if is_lowered {
+                                // Direct comparison — uses bloom/set indexes
+                                format!(
+                                    "({col_sql} = '{escaped}' OR startsWith({col_sql}, '{escaped}.'))"
+                                )
+                            } else {
+                                format!(
+                                    "(lower({col_sql}) = '{escaped}' OR startsWith(lower({col_sql}), '{escaped}.'))"
+                                )
+                            }
+                        } else if is_lowered {
+                            format!("{col_sql} = '{escaped}'")
+                        } else {
+                            format!("lower({col_sql}) = '{escaped}'")
+                        }
+                    }
+                    Value::Number(n) => format!("{col_sql} = {n}"),
+                    _ => return, // Skip complex values
+                };
+                conditions.push(condition);
             }
             // For OR and NOT, don't extract (too complex for PREWHERE optimization)
             _ => {}
         }
     }
 
-    collect_prewhere(expr, &mut prewhere);
+    collect_prewhere(expr, profile, &mut prewhere);
     prewhere
 }
 
@@ -623,21 +676,36 @@ pub(super) fn extract_prewhere_conditions(expr: &SearchExpr) -> Vec<String> {
 /// (anything beyond source_type/sourcetype). When true, `optimize_read_in_order`
 /// should be disabled to allow parallel granule scanning — sequential scanning
 /// through mostly-empty granules is much slower for sparse matches.
-pub(super) fn has_selective_prewhere(expr: &SearchExpr) -> bool {
-    fn check(expr: &SearchExpr) -> bool {
+pub(super) fn has_selective_prewhere(expr: &SearchExpr, profile: &dyn SchemaProfile) -> bool {
+    // Mirrors `extract_prewhere_conditions`' eligibility through the active
+    // profile so PREWHERE selectivity is judged on the resolved physical column,
+    // not the raw UDM token (NAN-1299). UDM resolves to the identity column, so
+    // behavior is unchanged there.
+    fn check(expr: &SearchExpr, profile: &dyn SchemaProfile) -> bool {
         match expr {
-            SearchExpr::And(left, right) => check(left) || check(right),
+            SearchExpr::And(left, right) => check(left, profile) || check(right, profile),
             SearchExpr::FieldFilter {
                 field,
                 op: Comparator::Eq,
                 value,
             } => {
                 let normalized = normalize_field_name(field);
-                // Only source_type/sourcetype are broad filters; everything else is selective
-                if normalized == "source_type" || normalized == "sourcetype" {
+                // NAN-1321: class-split fields are not promoted to PREWHERE (see
+                // `extract_prewhere_conditions`), so they cannot make PREWHERE
+                // selective — keep this in lockstep or `optimize_read_in_order` is
+                // toggled off for a PREWHERE condition that was never emitted.
+                if profile.class_split_value_sql(normalized).is_some() {
                     return false;
                 }
-                if PREWHERE_FIELDS.contains(&normalized) {
+                let col = match profile.resolve(normalized) {
+                    FieldResolution::ExplicitColumn(c) | FieldResolution::Alias(c) => c,
+                    _ => return false,
+                };
+                // Only source_type/sourcetype are broad filters; everything else is selective
+                if col == "source_type" || col == "sourcetype" {
+                    return false;
+                }
+                if profile.prewhere_fields().contains(&col.as_str()) {
                     // Skip wildcards — those aren't added to PREWHERE anyway
                     if let Value::String(s) = value {
                         if s.contains('*') || s.contains('?') {
@@ -651,7 +719,7 @@ pub(super) fn has_selective_prewhere(expr: &SearchExpr) -> bool {
             _ => false,
         }
     }
-    check(expr)
+    check(expr, profile)
 }
 
 /// Default max elements for groupArray/groupUniqArray to prevent OOM from unbounded array aggregation.
@@ -680,6 +748,12 @@ pub struct ClickHouseSqlGenerator {
     /// it collides with a "known metadata" field (e.g. `risk_factors` after a
     /// `| risk` command). (NAN-1236)
     computed_fields: RwLock<HashSet<String>>,
+    /// Active schema profile (OCSF Phase 2). Defaults to [`UdmProfile`] so the
+    /// ~79 `::new()` / `::with_table()` construction sites keep today's exact
+    /// behavior; OCSF deployments inject an `OcsfProfile` via [`with_profile`].
+    ///
+    /// [`with_profile`]: ClickHouseSqlGenerator::with_profile
+    profile: Arc<dyn SchemaProfile>,
 }
 
 impl Clone for ClickHouseSqlGenerator {
@@ -690,6 +764,7 @@ impl Clone for ClickHouseSqlGenerator {
             max_mvexpand_rows: self.max_mvexpand_rows,
             generation_time_range: RwLock::new(None),
             computed_fields: RwLock::new(HashSet::new()),
+            profile: Arc::clone(&self.profile),
         }
     }
 }
@@ -702,6 +777,7 @@ impl Default for ClickHouseSqlGenerator {
 
 impl ClickHouseSqlGenerator {
     /// Create a new ClickHouse SQL generator with default table name "logs"
+    /// and the UDM schema profile (today's behavior, unchanged).
     pub fn new() -> Self {
         Self {
             table_name: "logs".to_string(),
@@ -709,10 +785,12 @@ impl ClickHouseSqlGenerator {
             max_mvexpand_rows: DEFAULT_MAX_MVEXPAND_ROWS,
             generation_time_range: RwLock::new(None),
             computed_fields: RwLock::new(HashSet::new()),
+            profile: Arc::new(UdmProfile::new()),
         }
     }
 
     /// Create a new ClickHouse SQL generator with a custom table name
+    /// (UDM schema profile).
     pub fn with_table(table_name: impl Into<String>) -> Self {
         Self {
             table_name: table_name.into(),
@@ -720,7 +798,130 @@ impl ClickHouseSqlGenerator {
             max_mvexpand_rows: DEFAULT_MAX_MVEXPAND_ROWS,
             generation_time_range: RwLock::new(None),
             computed_fields: RwLock::new(HashSet::new()),
+            profile: Arc::new(UdmProfile::new()),
         }
+    }
+
+    /// Inject an explicit schema profile (OCSF Phase 2). Builder-style so it
+    /// composes with the existing `with_*` setters. UDM call sites that never
+    /// call this keep the default [`UdmProfile`], so behavior is unchanged.
+    pub fn with_profile(mut self, profile: Arc<dyn SchemaProfile>) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    // Phase 2b: route the storage binding (table name / timestamp expression)
+    // through `self.profile.table_name()` / `self.profile.timestamp_expr()`.
+    // Deliberately NOT wired here: the generator threads `self.table_name`
+    // (default "logs"/with_table) and the literal `timestamp` column through
+    // many sites, and consulting the profile risks diverging current UDM output.
+    // The existing `table_name` field must keep winning until OCSF wiring lands.
+
+    /// Whether `field` resolves to a direct ClickHouse column under the active
+    /// profile (`&self` wrapper over `profile.resolve()`). For UDM this is
+    /// byte-for-byte identical to the free `is_explicit_column()` — the profile's
+    /// `resolve()` returns `ExplicitColumn` for exactly the `EXPLICIT_COLUMNS`
+    /// set (proven by `schema::tests`).
+    pub(crate) fn resolves_to_column(&self, field: &str) -> bool {
+        matches!(self.profile.resolve(field), FieldResolution::ExplicitColumn(_))
+    }
+
+    /// Whether `field` resolves to a JSON-tail path under the active profile
+    /// (`&self` wrapper over `profile.resolve()`). **Always false for UDM** —
+    /// `UdmProfile::resolve` only ever returns `ExplicitColumn`/`Unknown`, never
+    /// `JsonPath` — so callers that branch on it stay UDM-byte-identical. True
+    /// only for OCSF unpromoted/unmapped names, which must be JSONExtracted from
+    /// `event` rather than referenced as a (nonexistent) bare column that 500s.
+    /// (NAN-1248)
+    pub(crate) fn resolves_to_json_path(&self, field: &str) -> bool {
+        matches!(self.profile.resolve(field), FieldResolution::JsonPath { .. })
+    }
+
+    /// The class-spanning value expression for a UDM-semantic concept the active
+    /// profile splits across columns by event class (`&self` wrapper over
+    /// `profile.class_split_value_sql()`, NAN-1319). `None` for UDM (no split →
+    /// byte-identical) and for non-split / native fields. Lets the value/group
+    /// seam (`field_to_sql_expr`) project the host/user/process value wherever
+    /// the OCSF class put it.
+    pub(crate) fn class_split_value_sql(&self, field: &str) -> Option<String> {
+        self.profile.class_split_value_sql(field)
+    }
+
+    /// Whether `field` belongs to the active profile's field universe (`&self`
+    /// wrapper over `profile.is_known_field()`, mirroring the `resolves_to_column`
+    /// pattern). Replaces the free `is_udm_field()` at generator-scoped call sites.
+    /// For UDM this is `EXPLICIT_COLUMNS ∪ valid UdmField` — i.e. the first two
+    /// branches of the free `is_udm_field()`; the computed-aggregation-name branch
+    /// (`count`/`sum`/…) of that free fn is handled separately by
+    /// [`is_computed_field`] in pipeline context, not the schema universe.
+    ///
+    /// [`is_computed_field`]: ClickHouseSqlGenerator::is_computed_field
+    // NAN-1248 re-pointed `field_to_sql_expr` (the last caller) at
+    // `resolves_to_column`, which catches OCSF UDM-semantic aliases that
+    // `is_known_field` does not. Kept (like the free `is_udm_field`) for the
+    // field universe semantics a future phase may route through.
+    #[allow(dead_code)]
+    pub(crate) fn is_known_profile_field(&self, field: &str) -> bool {
+        self.profile.is_known_field(field)
+    }
+
+    /// Profile-aware physical access expression for a field that is *not* a plain
+    /// computed/pipeline column — i.e. the "spill" access path the SQL generator
+    /// uses when a field is not a direct `ExplicitColumn`.
+    ///
+    /// This centralizes the historically-hardcoded `ext.{field}` access so OCSF's
+    /// nested layout works without changing UDM. It consults the active profile's
+    /// [`resolve`]:
+    /// - [`ExplicitColumn`] → `escape_identifier(col)` (a direct, possibly dotted,
+    ///   promoted column — backtick/quote-safe).
+    /// - [`JsonPath`] → an N-level `JSONExtract<T>(col, 'p1', 'p2', …)` against the
+    ///   JSON-typed column (OCSF's `event` tail). `json_type` is chosen by the
+    ///   caller from the comparison/value (`String`/`Float64`/`Bool`).
+    /// - [`Unknown`] (and the array/alias variants, which the tokenizer never
+    ///   produces on this path) → `ext.{field}` — UDM's existing behavior, kept
+    ///   **byte-for-byte identical** because `UdmProfile::resolve` only ever
+    ///   returns `ExplicitColumn`/`Unknown`.
+    ///
+    /// [`resolve`]: crate::schema::SchemaProfile::resolve
+    /// [`ExplicitColumn`]: FieldResolution::ExplicitColumn
+    /// [`JsonPath`]: FieldResolution::JsonPath
+    /// [`Unknown`]: FieldResolution::Unknown
+    pub(crate) fn field_access_expr(&self, field: &str, json_type: &str) -> String {
+        match self.profile.resolve(field) {
+            FieldResolution::ExplicitColumn(col) => escape_identifier(&col),
+            FieldResolution::JsonPath { col, path } => {
+                let path_args: Vec<String> = path
+                    .iter()
+                    .map(|p| format!("'{}'", escape_string(p)))
+                    .collect();
+                format!("JSONExtract{}({}, {})", json_type, col, path_args.join(", "))
+            }
+            // UDM Unknown (and OCSF array/alias variants the field tokenizer does
+            // not surface here): preserve UDM's `ext.{field}` spill access exactly.
+            FieldResolution::ArrayElement { .. }
+            | FieldResolution::Alias(_)
+            | FieldResolution::Unknown => format!("ext.{}", sanitize_json_path(field)),
+        }
+    }
+
+    /// Physical access expression for a field used on the LEFT of a `field=value`
+    /// search FILTER (NAN-1321). Identical to [`field_access_expr`] except that a
+    /// UDM-semantic concept OCSF splits across columns by event class (host / user
+    /// / process / url) resolves to its class-spanning value-pick
+    /// `if(primary != '', primary, fallback)` instead of the primary column alone —
+    /// so `src_host="ws-01"` matches the host wherever the OCSF class put it
+    /// (`device.hostname` on endpoint events), mirroring the `stats by src_host`
+    /// projection. Single expression, so negation (`!=`, `NOT iLike`) stays correct
+    /// with no De Morgan across columns. UDM has no class-split → falls through to
+    /// the bare column, byte-identical. PREWHERE deliberately does NOT use this (it
+    /// skips class-split fields entirely — see `extract_prewhere_conditions`), so it
+    /// never pre-filters to the primary column and drops the fallback's rows.
+    ///
+    /// [`field_access_expr`]: ClickHouseSqlGenerator::field_access_expr
+    pub(crate) fn filter_field_expr(&self, field: &str, json_type: &str) -> String {
+        self.profile
+            .class_split_value_sql(field)
+            .unwrap_or_else(|| self.field_access_expr(field, json_type))
     }
 
     /// Whether `field` is produced by an earlier pipeline command (eval, stats
@@ -782,11 +983,12 @@ impl ClickHouseSqlGenerator {
 
         // Analyze query to determine required fields for optimization
         // In table_view mode, always use minimal fields for fast initial load
-        ctx.required_fields = field_analysis::analyze_required_fields(query, options.table_view);
+        ctx.required_fields =
+            field_analysis::analyze_required_fields(query, options.table_view, self.profile.as_ref());
 
         // Identify ext JSON fields referenced by the query so they can be
         // materialized in stage_0 SELECT, making them visible to downstream CTEs
-        ctx.ext_fields = field_analysis::analyze_ext_fields(query);
+        ctx.ext_fields = field_analysis::analyze_ext_fields(query, self.profile.as_ref());
 
         let result = self.generate_query(query, &mut ctx);
         match self.generation_time_range.write() {
@@ -843,13 +1045,13 @@ impl ClickHouseSqlGenerator {
         let select_clause = self.build_select_clause(&ctx.required_fields, &ctx.ext_fields);
 
         // Extract equality conditions on indexed fields for PREWHERE optimization
-        let prewhere_conditions = extract_prewhere_conditions(expr);
+        let prewhere_conditions = extract_prewhere_conditions(expr, self.profile.as_ref());
         let extra_prewhere = if prewhere_conditions.is_empty() {
             String::new()
         } else {
             format!(" AND {}", prewhere_conditions.join(" AND "))
         };
-        let selective = has_selective_prewhere(expr);
+        let selective = has_selective_prewhere(expr, self.profile.as_ref());
 
         // Single query with ORDER BY and LIMIT together - much faster than CTE approach
         Ok(format!(
@@ -900,13 +1102,13 @@ impl ClickHouseSqlGenerator {
                 let select_clause = self.build_select_clause(&ctx.required_fields, &ctx.ext_fields);
 
                 // Extract equality conditions on indexed fields for PREWHERE optimization
-                let prewhere_conditions = extract_prewhere_conditions(expr);
+                let prewhere_conditions = extract_prewhere_conditions(expr, self.profile.as_ref());
                 let extra_prewhere = if prewhere_conditions.is_empty() {
                     String::new()
                 } else {
                     format!(" AND {}", prewhere_conditions.join(" AND "))
                 };
-                let selective = has_selective_prewhere(expr);
+                let selective = has_selective_prewhere(expr, self.profile.as_ref());
 
                 // Use PREWHERE for time filter + indexed field equality checks
                 // Apply limit to prevent unbounded queries
@@ -966,7 +1168,7 @@ impl ClickHouseSqlGenerator {
                 // list (e.g. process_guid/parent_process_guid) — adding them again would
                 // produce a duplicate column in `SELECT *, ...` (NAN-1147).
                 for f in [parent_field, child_field] {
-                    if !MATERIALIZED_COLUMNS.contains(&f.as_str()) {
+                    if !self.profile.materialized_columns().contains(&f.as_str()) {
                         materialized_cols.push(escape_identifier(f));
                     }
                 }
@@ -1001,7 +1203,7 @@ impl ClickHouseSqlGenerator {
                     };
 
                     // Extract equality conditions on indexed fields for PREWHERE optimization
-                    let prewhere_conditions = extract_prewhere_conditions(expr);
+                    let prewhere_conditions = extract_prewhere_conditions(expr, self.profile.as_ref());
                     let extra_prewhere = if prewhere_conditions.is_empty() {
                         String::new()
                     } else {
@@ -1108,7 +1310,10 @@ impl ClickHouseSqlGenerator {
         let select_list = if has_aggregate_or_projection {
             "*".to_string()
         } else {
-            "* EXCEPT (action)".to_string()
+            // Profile-aware terminal collapse: UDM → `* EXCEPT (action)`; OCSF
+            // (no default-view renames) → bare `*` so we never reference a
+            // nonexistent UDM `action` column.
+            self.outer_select_except_list()
         };
         if last_stage_has_ordering || has_aggregate_or_projection {
             write!(sql, "\nSELECT {} FROM {} {}", select_list, last_cte, settings).unwrap();
@@ -1251,7 +1456,7 @@ impl ClickHouseSqlGenerator {
         if stages.len() == 1 {
             if let QueryStage::Search(expr) = &stages[0] {
                 let where_clause = self.generate_search_expr(expr)?;
-                let prewhere_conditions = extract_prewhere_conditions(expr);
+                let prewhere_conditions = extract_prewhere_conditions(expr, self.profile.as_ref());
                 let extra_prewhere = if prewhere_conditions.is_empty() {
                     String::new()
                 } else {
@@ -1277,7 +1482,7 @@ impl ClickHouseSqlGenerator {
             match stage {
                 QueryStage::Search(expr) => {
                     let where_clause = self.generate_search_expr(expr)?;
-                    let prewhere_conditions = extract_prewhere_conditions(expr);
+                    let prewhere_conditions = extract_prewhere_conditions(expr, self.profile.as_ref());
                     let extra_prewhere = if prewhere_conditions.is_empty() {
                         String::new()
                     } else {
@@ -1345,6 +1550,68 @@ impl ClickHouseSqlGenerator {
         self.build_select_clause_with_options(required_fields, ext_fields, false)
     }
 
+    /// Build the default-view `SELECT *` base from the active profile's
+    /// [`default_view_renames`]. Each `(column, alias)` pair re-projects
+    /// `column AS alias`; in terminal projections the columns are also stripped
+    /// from the wildcard via `* EXCEPT (col, …)` so the result header carries the
+    /// canonical alias (and CH does not emit the column twice).
+    ///
+    /// - UDM (`[("action", "event_type")]`) reproduces today's
+    ///   `* EXCEPT (action), action AS event_type` /
+    ///   `*, action AS event_type` **byte-for-byte**.
+    /// - OCSF (`[]`) yields a bare `*`, so a default-view search on the OCSF
+    ///   table does not reference the nonexistent UDM `action` column.
+    ///
+    /// `preserve_legacy_columns = true` keeps the renamed columns inside `*` for
+    /// intermediate CTE stages (NAN-876); the terminal `EXCEPT` collapse, when
+    /// applicable, happens once at the outer SELECT in [`generate_cte_query`].
+    ///
+    /// [`default_view_renames`]: crate::schema::SchemaProfile::default_view_renames
+    fn build_default_view_base(&self, preserve_legacy_columns: bool) -> String {
+        let renames = self.profile.default_view_renames();
+        if renames.is_empty() {
+            return "*".to_string();
+        }
+        let alias_exprs = renames
+            .iter()
+            .map(|(col, alias)| {
+                format!("{} AS {}", escape_identifier(col), escape_identifier(alias))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        if preserve_legacy_columns {
+            format!("*, {}", alias_exprs)
+        } else {
+            let except_cols = renames
+                .iter()
+                .map(|(col, _)| escape_identifier(col))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("* EXCEPT ({}), {}", except_cols, alias_exprs)
+        }
+    }
+
+    /// The terminal-projection `SELECT` list used by [`generate_cte_query`]'s
+    /// outer SELECT when no aggregation/projection ran: `* EXCEPT (col, …)` over
+    /// the active profile's [`default_view_renames`] columns (the renamed
+    /// `event_type` alias was already added by stage_0's
+    /// `preserve_legacy_columns` base). UDM yields `* EXCEPT (action)`; OCSF
+    /// (no renames) yields a bare `*`.
+    ///
+    /// [`default_view_renames`]: crate::schema::SchemaProfile::default_view_renames
+    fn outer_select_except_list(&self) -> String {
+        let renames = self.profile.default_view_renames();
+        if renames.is_empty() {
+            return "*".to_string();
+        }
+        let except_cols = renames
+            .iter()
+            .map(|(col, _)| escape_identifier(col))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("* EXCEPT ({})", except_cols)
+    }
+
     /// Variant of [`build_select_clause`] that controls whether the
     /// physical `action` column is excluded from the wildcard expansion
     /// (NAN-671's terminal-projection behavior) or kept alongside its
@@ -1385,17 +1652,23 @@ impl ClickHouseSqlGenerator {
                 // downstream stages (and LLM-generated commands) can still reference
                 // it directly. The redundant column is dropped at the outer SELECT
                 // when the last stage didn't transform it away. See NAN-876.
-                let base = if preserve_legacy_columns {
-                    "*, action AS event_type"
-                } else {
-                    "* EXCEPT (action), action AS event_type"
-                };
+                let base = self.build_default_view_base(preserve_legacy_columns);
                 // Re-add every MATERIALIZED column (excluded from `SELECT *`) so any
                 // downstream CTE stage can reference it. Derived from the single
                 // MATERIALIZED_COLUMNS source of truth — the previous hand-maintained
                 // subset dropped enriched_*_continent / custom_* / *_identity_* and any
                 // downstream reference to those hit Code 47 (NAN-1147).
-                let materialized = MATERIALIZED_COLUMNS.join(", ");
+                // Escape each materialized column name. UDM columns are bare
+                // snake_case so `escape_identifier` is a no-op (byte-identical);
+                // OCSF promoted columns are dotted (`src_endpoint.ip`) and MUST be
+                // quoted or ClickHouse parses them as tuple/sub-column access.
+                let materialized = self
+                    .profile
+                    .materialized_columns()
+                    .iter()
+                    .map(|c| escape_identifier(c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
 
                 if ext_fields.is_empty() {
                     format!("{}, {}", base, materialized)
@@ -1408,8 +1681,8 @@ impl ClickHouseSqlGenerator {
                         .iter()
                         .map(|f| {
                             format!(
-                                "toString(ext.{}) AS {}",
-                                sanitize_json_path(f),
+                                "toString({}) AS {}",
+                                self.field_access_expr(f, "String"),
                                 escape_identifier(f)
                             )
                         })
@@ -1436,13 +1709,23 @@ impl ClickHouseSqlGenerator {
                 let mut field_exprs: Vec<String> = field_list
                     .iter()
                     .map(|field| {
-                        if is_explicit_column(field) {
-                            escape_identifier(field)
+                        if self.resolves_to_column(field) {
+                            // Resolve to the PHYSICAL column (NAN-1248): under OCSF a
+                            // UDM-semantic required field (`src_ip`) must project the
+                            // promoted column (`"src_endpoint.ip"`), not a bare `src_ip`
+                            // that ocsf_logs lacks — so a later stage that references the
+                            // resolved column (`stats`/`timechart`/`top` GROUP BY) finds
+                            // it in this stage's output. UDM byte-identical: for a UDM
+                            // explicit column `field_access_expr` == `escape_identifier`.
+                            self.field_access_expr(field, "String")
                         } else {
-                            // JSON field - cast to String to avoid Dynamic type in GROUP BY
+                            // Spill field — cast to String to avoid Dynamic type in
+                            // GROUP BY. Profile-aware: UDM Unknown → `ext.{field}`
+                            // (byte-identical); an OCSF tail path →
+                            // `JSONExtractString(event, …)`.
                             format!(
-                                "toString(ext.{}) AS {}",
-                                sanitize_json_path(field),
+                                "toString({}) AS {}",
+                                self.field_access_expr(field, "String"),
                                 escape_identifier(field)
                             )
                         }
@@ -1453,10 +1736,39 @@ impl ClickHouseSqlGenerator {
                 for f in ext_fields {
                     if !fields.contains(f) {
                         field_exprs.push(format!(
-                            "toString(ext.{}) AS {}",
-                            sanitize_json_path(f),
+                            "toString({}) AS {}",
+                            self.field_access_expr(f, "String"),
                             escape_identifier(f)
                         ));
+                    }
+                }
+
+                // OCSF tail-column passthrough (NAN-1248 follow-up). The slim
+                // projection above materializes each required field's *value*
+                // (e.g. `JSONExtractString(event, 'unmapped', 'foo') AS foo`) but
+                // drops the underlying `event` JSON column. A later CTE stage that
+                // re-extracts an unpromoted/tail OCSF field — a `timechart`/`top`/
+                // `stats` split-by on a `JsonPath` field — emits a fresh
+                // `JSONExtractString(event, …)` that references `event` against
+                // this stage's output, which no longer has it → CH
+                // "Unknown identifier: event" 500. When any required field
+                // resolves to a `JsonPath`, append its backing JSON column
+                // (OCSF's `event`) as a passthrough so downstream extracts
+                // resolve. UDM is untouched: `UdmProfile::resolve` never yields
+                // `JsonPath`, so `tail_col` stays `None` and the join below is
+                // byte-identical to before.
+                let tail_col: Option<String> = field_list.iter().find_map(|field| {
+                    match self.profile.resolve(field) {
+                        FieldResolution::JsonPath { col, .. } => Some(col),
+                        _ => None,
+                    }
+                });
+                if let Some(col) = tail_col {
+                    let escaped = escape_identifier(&col);
+                    // Guard against an accidental duplicate if the tail column
+                    // ever appears as its own bare required field.
+                    if !field_exprs.iter().any(|e| e == &escaped) {
+                        field_exprs.push(escaped);
                     }
                 }
 
@@ -1578,6 +1890,275 @@ mod tests {
             start: "2024-01-01T00:00:00Z".parse().unwrap(),
             end: "2024-01-02T00:00:00Z".parse().unwrap(),
         }
+    }
+
+    /// NAN-1311: under OCSF a `sequence` step-capture column whose field is dotted
+    /// (`[process.name=…]` → emitted alias `step1_process_name`) must be registered
+    /// as a computed column, so a downstream `| table step1_process_name` references
+    /// it bare. Previously it was JSON-tailed as `JSONExtractString(event,
+    /// 'step1_process_name')`, but the sequence output stage drops `event` →
+    /// `Code 47 UNKNOWN_IDENTIFIER: event`.
+    #[test]
+    fn ocsf_sequence_capture_column_not_json_tailed() {
+        use crate::schema::OcsfProfile;
+        use std::sync::Arc;
+        let gen = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()));
+        let query = parse_query(
+            "| sequence by user.name maxspan=2h [process.name=\"whoami.exe\"] \
+             [process.name=\"net.exe\"] | table step1_time, step2_time, user.name, step1_process_name",
+        )
+        .unwrap();
+        let sql = gen.generate(&query, &time_range()).unwrap();
+        // The fatal scope is the downstream `| table` stage (stage_2): its source
+        // is the sequence output, which drops `event`. Re-deriving the capture from
+        // `event` there is the Code 47. (stage_0 still pre-projects the computed
+        // columns from `event` as harmless, unused noise — it carries `event`.)
+        let downstream = &sql[sql
+            .find("stage_2 AS")
+            .expect("expected a stage_2 for the trailing table command")..];
+        assert!(
+            !downstream.contains("JSONExtractString(event"),
+            "downstream sequence stage must not JSON-tail capture columns from `event` (NAN-1311), got:\n{downstream}"
+        );
+        assert!(
+            downstream.contains("step1_process_name FROM stage_"),
+            "downstream stage should select step1_process_name as a bare computed column, got:\n{downstream}"
+        );
+    }
+
+    /// NAN-1323: `| resolve_identity` must not reference UDM column names that do
+    /// not exist under OCSF (`src_mac`, `user`, `user_identity_*`) — doing so 500s
+    /// with an unknown-identifier error. Across src_host / src_ip / user lookups the
+    /// OCSF SQL must (a) not `EXCEPT` or `main.`-reference those bare UDM names, and
+    /// (b) key the registry dict on the resolved physical user column (`user.name`).
+    /// Validated end-to-end on live OCSF CH.
+    #[test]
+    fn ocsf_resolve_identity_avoids_udm_only_columns() {
+        use crate::schema::OcsfProfile;
+        use std::sync::Arc;
+        let gen = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()));
+        for field in ["src_host", "src_ip", "user"] {
+            let q = parse_query(&format!("source_type=x | resolve_identity {field}")).unwrap();
+            let sql = gen.generate(&q, &time_range()).unwrap();
+            let stage = &sql[sql.find("ASOF LEFT JOIN").map(|i| sql[..i].rfind("SELECT").unwrap()).unwrap()..];
+            assert!(
+                !stage.contains("EXCEPT (") && !stage.contains("main.src_mac") && !stage.contains("main.\"user\""),
+                "OCSF resolve_identity {field} must not EXCEPT/reference bare UDM columns, got:\n{stage}"
+            );
+            assert!(
+                !stage.contains("main.user_identity_"),
+                "OCSF resolve_identity {field} must not read physical user_identity_* (absent in ocsf_logs), got:\n{stage}"
+            );
+            // The IP/user lookups key the registry dict on the resolved physical
+            // user column (`user.name`) — this is the `main."user"` → `main."user.name"`
+            // fix. (src_host is a HOST reverse lookup, keyed on the hostname instead.)
+            if field != "src_host" {
+                assert!(
+                    stage.contains("\"user.name\""),
+                    "OCSF resolve_identity {field} should key the user dict on user.name, got:\n{stage}"
+                );
+            }
+        }
+    }
+
+    /// NAN-1323 parity: UDM `resolve_identity` is byte-identical — it still EXCEPTs
+    /// the physical UDM columns and reads them via `main.<col>`.
+    #[test]
+    fn udm_resolve_identity_unchanged() {
+        let gen = ClickHouseSqlGenerator::new();
+        let sql = gen
+            .generate(&parse_query("source_type=x | resolve_identity src_host").unwrap(), &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("main.* EXCEPT (src_mac, user)")
+                && sql.contains("if(main.src_mac = '' OR main.src_mac IS NULL"),
+            "UDM resolve_identity must keep the EXCEPT + main.<col> fill form, got:\n{sql}"
+        );
+    }
+
+    /// NAN-1299: under OCSF, UDM-alias `field=value` search terms must resolve to
+    /// the promoted OCSF column in PREWHERE (matching the profile-resolved WHERE),
+    /// never the raw UDM token. Emitting the bare token (`src_ip = '…'`) references
+    /// a column that does not exist in `ocsf_logs` → Code 47 (500) / silent 0-rows.
+    #[test]
+    fn ocsf_udm_alias_prewhere_resolves_to_promoted_column() {
+        use crate::schema::OcsfProfile;
+        use std::sync::Arc;
+        let gen = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()));
+
+        // src_ip → src_endpoint.ip ; dest_ip → dst_endpoint.ip. (NAN-1321: the
+        // class-split `src_host` is intentionally NOT promoted to PREWHERE — its
+        // WHERE filter is a value-pick `if(...)` spanning device.hostname, which a
+        // single-column PREWHERE would pre-filter away. See
+        // `ocsf_filter_on_class_split_host_uses_value_pick_and_skips_prewhere`.)
+        for (query_str, expected_col) in [
+            ("src_ip=\"89.248.167.131\"", "src_endpoint.ip"),
+            ("dest_ip=\"10.0.0.1\"", "dst_endpoint.ip"),
+        ] {
+            let query = parse_query(query_str).unwrap();
+            let sql = gen.generate(&query, &time_range()).unwrap();
+            let prewhere = prewhere_slice(&sql);
+            assert!(
+                prewhere.contains(&format!("\"{expected_col}\"")),
+                "OCSF PREWHERE for `{query_str}` should reference the promoted column \
+                 \"{expected_col}\", got PREWHERE:\n{prewhere}"
+            );
+            // The raw UDM token must NOT appear as a bare PREWHERE identifier.
+            assert!(
+                !prewhere.contains(&format!("lower({}) =", query_str.split('=').next().unwrap()))
+                    && !prewhere.contains(&format!(
+                        "{} =",
+                        query_str.split('=').next().unwrap()
+                    )),
+                "OCSF PREWHERE for `{query_str}` must not emit the raw UDM token, got:\n{prewhere}"
+            );
+        }
+    }
+
+    /// NAN-1319: a UDM-semantic concept OCSF splits across columns by event class
+    /// (`src_host` → `src_endpoint.hostname` on network events, `device.hostname`
+    /// on endpoint/sysmon events) must GROUP BY / project the class-spanning value,
+    /// not just the primary column — otherwise `stats count by src_host` buckets
+    /// every endpoint event as empty (on local OCSF data the empty bucket held
+    /// 1.07M rows; the fix attributes them to their device host). The group key and
+    /// the SELECT projection must be the SAME `if(...)` expression.
+    #[test]
+    fn ocsf_stats_by_class_split_host_groups_on_the_union() {
+        use crate::schema::OcsfProfile;
+        use std::sync::Arc;
+        let gen = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()));
+        let query = parse_query("* | stats count by src_host").unwrap();
+        let sql = gen.generate(&query, &time_range()).unwrap();
+        let union = "if(\"src_endpoint.hostname\" != '', \"src_endpoint.hostname\", \"device.hostname\")";
+        assert!(
+            sql.contains(&format!("SELECT {union} AS src_host")),
+            "OCSF `stats by src_host` must PROJECT the class-spanning union, got:\n{sql}"
+        );
+        assert!(
+            sql.contains(&format!("GROUP BY {union}")),
+            "OCSF `stats by src_host` must GROUP BY the same union expression, got:\n{sql}"
+        );
+        // The other class-split concepts go through the same seam (consistency).
+        let q2 = parse_query("* | stats count by user").unwrap();
+        let sql2 = gen.generate(&q2, &time_range()).unwrap();
+        assert!(
+            sql2.contains("GROUP BY if(\"user.name\" != '', \"user.name\", \"actor.user.name\")"),
+            "OCSF `stats by user` must group on the class-spanning union, got:\n{sql2}"
+        );
+    }
+
+    /// NAN-1319 parity: under UDM a class-split concept does not exist — `src_host`
+    /// IS one column, so `class_split_value_sql` returns `None` and GROUP BY / the
+    /// projection stay the bare column, byte-for-byte unchanged.
+    #[test]
+    fn udm_stats_by_src_host_unchanged() {
+        let query = parse_query("* | stats count by src_host").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("SELECT src_host AS src_host") && sql.contains("GROUP BY src_host"),
+            "UDM `stats by src_host` must stay the bare column (no `if(...)`), got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("device.hostname"),
+            "UDM must never reference OCSF columns, got:\n{sql}"
+        );
+    }
+
+    /// NAN-1321: an OCSF search FILTER on a class-split concept (`src_host="x"`)
+    /// must match the value-pick `if(...)` (so it finds the host on `device.hostname`
+    /// endpoint events), and must NOT promote the primary column to PREWHERE — that
+    /// would pre-filter to `src_endpoint.hostname = x` and silently drop every
+    /// device-host row before WHERE. Validated end-to-end on live OCSF CH: 39 → 464.
+    #[test]
+    fn ocsf_filter_on_class_split_host_uses_value_pick_and_skips_prewhere() {
+        use crate::schema::OcsfProfile;
+        use std::sync::Arc;
+        let gen = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()));
+        let union = "if(\"src_endpoint.hostname\" != '', \"src_endpoint.hostname\", \"device.hostname\")";
+
+        // Equality: WHERE matches the value-pick; PREWHERE must not carry the host.
+        let sql = gen
+            .generate(&parse_query("src_host=\"ws-01\"").unwrap(), &time_range())
+            .unwrap();
+        assert!(
+            sql.contains(&format!("lower(toString({union})) = 'ws-01'")),
+            "OCSF src_host= must filter on the value-pick, got:\n{sql}"
+        );
+        let pw = prewhere_slice(&sql);
+        assert!(
+            !pw.contains("src_endpoint.hostname") && !pw.contains("device.hostname"),
+            "OCSF src_host= must NOT promote a host column to PREWHERE, got PREWHERE:\n{pw}"
+        );
+
+        // Negation stays correct with the single expression (no De Morgan).
+        let sql_ne = gen
+            .generate(&parse_query("src_host!=\"ws-01\"").unwrap(), &time_range())
+            .unwrap();
+        assert!(
+            sql_ne.contains(&format!("lower(toString({union})) != 'ws-01'")),
+            "OCSF src_host!= must negate the value-pick, got:\n{sql_ne}"
+        );
+
+        // IN-list (the UDM alias is not a promoted column, so it must be routed
+        // explicitly rather than falling to the empty metadata-JSON branch).
+        let sql_in = gen
+            .generate(&parse_query("src_host IN (\"a\",\"b\")").unwrap(), &time_range())
+            .unwrap();
+        assert!(
+            sql_in.contains(&format!("lower({union}) IN ('a', 'b')")),
+            "OCSF src_host IN must match the value-pick, got:\n{sql_in}"
+        );
+    }
+
+    /// NAN-1321 parity: UDM has no class-split, so a `src_host="x"` filter stays the
+    /// bare column in BOTH WHERE and PREWHERE — byte-for-byte unchanged.
+    #[test]
+    fn udm_filter_on_src_host_unchanged() {
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&parse_query("src_host=\"ws-01\"").unwrap(), &time_range())
+            .unwrap();
+        // PREWHERE still promotes the bare column (with the hostname FQDN expansion).
+        let pw = prewhere_slice(&sql);
+        assert!(
+            pw.contains("src_host = 'ws-01'"),
+            "UDM src_host= must still promote the bare column to PREWHERE, got:\n{pw}"
+        );
+        assert!(
+            !sql.contains("device.hostname") && !sql.contains("if("),
+            "UDM must never emit OCSF columns or the class-split `if(...)`, got:\n{sql}"
+        );
+    }
+
+    /// NAN-1299 parity: UDM PREWHERE output is byte-for-byte unchanged — the
+    /// field resolves to the identity column, so `lower(src_ip) = '…'` still holds.
+    #[test]
+    fn udm_prewhere_unchanged_for_alias_fields() {
+        let query = parse_query("src_ip=\"89.248.167.131\"").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        let prewhere = prewhere_slice(&sql);
+        assert!(
+            prewhere.contains("src_ip = '89.248.167.131'"),
+            "UDM PREWHERE must stay byte-identical (direct `src_ip = '…'`), got:\n{prewhere}"
+        );
+    }
+
+    /// Extract the PREWHERE clause text (up to the following WHERE/GROUP/ORDER/LIMIT).
+    fn prewhere_slice(sql: &str) -> String {
+        let start = match sql.find("PREWHERE") {
+            Some(i) => i,
+            None => return String::new(),
+        };
+        let rest = &sql[start..];
+        let end = ["\nWHERE", " WHERE", "GROUP BY", "ORDER BY", "LIMIT", "\n)"]
+            .iter()
+            .filter_map(|m| rest.find(m))
+            .min()
+            .unwrap_or(rest.len());
+        rest[..end].to_string()
     }
 
     /// NAN-671: the unfiltered SELECT * path must drop the physical `action`

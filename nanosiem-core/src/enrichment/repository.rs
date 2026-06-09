@@ -132,6 +132,48 @@ impl EnrichmentRepository {
         Ok(())
     }
 
+    /// Reset sources stuck in `in_progress` to `pending` for an immediate
+    /// re-sync. Called once at scheduler startup (NAN-1280).
+    ///
+    /// A freshly started process holds no in-flight sync task (the scheduler's
+    /// per-process `running` guard is empty at boot), so any source still marked
+    /// `in_progress` in Postgres is orphaned from a previous process killed
+    /// mid-sync — e.g. a deploy, since graceful shutdown aborts the
+    /// fire-and-forget sync task after 30s and it never writes a terminal
+    /// status. Without this, recovery waits out the 60-min stale-detection
+    /// window plus the 60-min failure cooldown (~2h).
+    ///
+    /// We re-queue (`pending`) rather than mark `failed`: a restart is not a
+    /// feed failure, so the anti-hammer failure cooldown is inappropriate.
+    /// `needs_sync` honors `pending` immediately, so the next scheduler tick
+    /// re-runs it. The interruption is recorded in `last_sync_error` for the
+    /// audit trail. Returns the ids that were reset.
+    ///
+    /// Safe against clobbering a live sibling sync: the enrichment scheduler is
+    /// leader-only (advisory-lock election in `jobs`), so at most one instance
+    /// runs it.
+    #[instrument(skip(self))]
+    pub async fn reset_interrupted_syncs(
+        &self,
+    ) -> Result<Vec<String>, EnrichmentRepositoryError> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            r#"
+            UPDATE enrichment_sources SET
+                last_sync_status = $1,
+                last_sync_error = $2,
+                updated_at = NOW()
+            WHERE last_sync_status = 'in_progress'
+            RETURNING id
+            "#,
+        )
+        .bind(SyncStatus::Pending.to_string())
+        .bind("Previous sync interrupted by service restart")
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(ids)
+    }
+
     /// Enable or disable an enrichment source
     #[instrument(skip(self))]
     pub async fn set_source_enabled(

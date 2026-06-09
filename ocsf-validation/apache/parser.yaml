@@ -1,0 +1,143 @@
+name: apache_ocsf
+display_name: Apache HTTP Server (OCSF)
+version: "1.0.0"
+description: >
+  Parses Apache combined/common log format into a complete OCSF 1.8.0
+  "HTTP Activity" (class_uid 4002) record. The whole OCSF object is emitted
+  on the root so it can be inserted into the ocsf_logs `event` column, from
+  which the promoted columns materialize. Mirrors the shape of the UDM
+  apache parser (../parsers/parsers/apache/parser.yaml) but targets OCSF
+  instead of `.udm.*`.
+match_values:
+  - apache
+  - apache_access
+category: application
+vendor: "Apache Software Foundation"
+product: "Apache HTTP Server"
+parser_vrl: |
+  # Apache Combined Log Format -> OCSF 1.8.0 HTTP Activity (class_uid 4002)
+  # Format: %h %l %u %t "%r" %>s %b "%{Referer}i" "%{User-Agent}i"
+  #
+  # Emits the COMPLETE standard OCSF record on the root. This object is what
+  # gets written to ocsf_logs.event; the MATERIALIZED columns derive from it.
+
+  raw_log = string!(.message)
+
+  parsed, err = parse_apache_log(raw_log, "combined")
+
+  if err == null {
+      # ---- method -> activity_id (OCSF HTTP Activity enum, 1.8.0) ----
+      # parse_apache_log returns method as a known String; no coalescing needed.
+      method = upcase(string!(parsed.method))
+      activity_id = 99
+      activity_name = "Other"
+      if method == "CONNECT" { activity_id = 1; activity_name = "Connect" }
+      if method == "DELETE"  { activity_id = 2; activity_name = "Delete" }
+      if method == "GET"     { activity_id = 3; activity_name = "Get" }
+      if method == "HEAD"    { activity_id = 4; activity_name = "Head" }
+      if method == "OPTIONS" { activity_id = 5; activity_name = "Options" }
+      if method == "POST"    { activity_id = 6; activity_name = "Post" }
+      if method == "PUT"     { activity_id = 7; activity_name = "Put" }
+      if method == "TRACE"   { activity_id = 8; activity_name = "Trace" }
+      if method == "PATCH"   { activity_id = 9; activity_name = "Patch" }
+
+      # ---- status -> status_id (2xx/3xx Success, else Failure) ----
+      # parse_apache_log returns status/size as ints already; to_int is infallible.
+      code = to_int(parsed.status)
+      status_id = 2
+      status_str = "Failure"
+      if code >= 200 && code < 400 { status_id = 1; status_str = "Success" }
+
+      # ---- time: parse_apache_log timestamp -> epoch milliseconds ----
+      time_ms = 0
+      tms, terr = to_unix_timestamp(parsed.timestamp, unit: "milliseconds")
+      if terr == null { time_ms = tms }
+
+      class_uid = 4002
+
+      # ---- build http_request ----
+      req_path = to_string(parsed.path)
+      http_request = {
+          "http_method": method,
+          "user_agent": to_string(parsed.agent),
+          "url": {
+              "path": req_path,
+              "url_string": req_path
+          }
+      }
+      # referrer: omit when "-"
+      ref = to_string(parsed.referrer)
+      if ref != "-" && ref != "" {
+          http_request.referrer = ref
+      }
+
+      # ---- build http_response (length + code) ----
+      size = to_int(parsed.size)
+      http_response = {
+          "code": code,
+          "length": size,
+          "status": status_str
+      }
+
+      # ---- assemble the OCSF record on the root ----
+      . = {
+          "class_uid": class_uid,
+          "class_name": "HTTP Activity",
+          "category_uid": 4,
+          "category_name": "Network Activity",
+          "activity_id": activity_id,
+          "activity_name": activity_name,
+          "type_uid": class_uid * 100 + activity_id,
+          "severity_id": 1,
+          "severity": "Informational",
+          "status_id": status_id,
+          "status": status_str,
+          "time": time_ms,
+          "message": raw_log,
+          "metadata": {
+              "version": "1.8.0",
+              "uid": uuid_v4(),
+              "product": {
+                  "name": "Apache HTTP Server",
+                  "vendor_name": "Apache Software Foundation"
+              }
+          },
+          "src_endpoint": {
+              "ip": to_string(parsed.host)
+          },
+          "http_request": http_request,
+          "http_response": http_response,
+          # traffic.bytes_out exercises our promoted `traffic.bytes_out` column.
+          "traffic": {
+              "bytes_out": size
+          }
+      }
+
+      # authenticated user (Apache %u) -> actor.user.name, omit "-"
+      auth_user = to_string(parsed.user)
+      if auth_user != "-" && auth_user != "" {
+          .actor = { "user": { "name": auth_user } }
+      }
+  } else {
+      # On parse failure, emit a minimal record carrying the raw + error so the
+      # row still lands and is debuggable rather than silently dropped.
+      . = {
+          "class_uid": 4002,
+          "category_uid": 4,
+          "activity_id": 99,
+          "type_uid": 400299,
+          "severity_id": 1,
+          "status_id": 0,
+          "time": 0,
+          "message": raw_log,
+          "metadata": {
+              "version": "1.8.0",
+              "uid": uuid_v4(),
+              "product": {
+                  "name": "Apache HTTP Server",
+                  "vendor_name": "Apache Software Foundation"
+              },
+              "log_level": "error"
+          }
+      }
+  }

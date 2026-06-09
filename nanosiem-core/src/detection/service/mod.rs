@@ -152,6 +152,14 @@ pub struct DetectionService {
     /// Shadow investigation hook for auto-triage on new case creation.
     /// Defaults to a no-op; the enterprise crate injects the real impl.
     pub(super) shadow_investigation: Arc<dyn ShadowInvestigationHook>,
+    /// Active schema profile (OCSF Phase 5, NAN-1241). Drives auto-detect entity
+    /// extraction so an OCSF deployment groups/scoring on OCSF physical fields
+    /// (`src_endpoint.ip`, `user.name`, …). Defaults to [`UdmProfile`] so existing
+    /// call sites stay byte-identical; the API injects the configured profile via
+    /// [`with_profile`](DetectionService::with_profile). The scheduled query SQL
+    /// is already schema-aware through `search_service` (Phase 3a); this field
+    /// covers the entity-extraction half of the scheduled path.
+    pub(super) active_profile: Arc<dyn crate::schema::SchemaProfile>,
 }
 
 impl DetectionService {
@@ -168,14 +176,45 @@ impl DetectionService {
         lookup_service: crate::lookup::LookupService,
         prevalence_service: PrevalenceService,
     ) -> Self {
+        Self::with_dual_pool_prevalence_and_profile(
+            dual_pool,
+            lookup_service,
+            prevalence_service,
+            Arc::new(crate::schema::UdmProfile::new()),
+        )
+    }
+
+    /// Profile-aware variant of [`with_dual_pool_and_prevalence`]
+    /// (OCSF Phase 5, NAN-1241).
+    ///
+    /// Threads the active schema profile through BOTH halves of the scheduled
+    /// detection path:
+    /// - the internal `SearchService` (so the scheduled rule query targets the
+    ///   profile's logs table — OCSF `ocsf_logs` — and resolves fields/default
+    ///   view under the active schema), and
+    /// - entity extraction (`ScoreCalculator` + `group_events_by_entity` via
+    ///   `active_profile`), so auto-detect entity grouping/scoring uses the
+    ///   profile's `entity_extraction_order()`.
+    ///
+    /// UDM is byte-identical to [`with_dual_pool_and_prevalence`].
+    ///
+    /// [`with_dual_pool_and_prevalence`]: DetectionService::with_dual_pool_and_prevalence
+    pub fn with_dual_pool_prevalence_and_profile(
+        dual_pool: &DualPool,
+        lookup_service: crate::lookup::LookupService,
+        prevalence_service: PrevalenceService,
+        profile: Arc<dyn crate::schema::SchemaProfile>,
+    ) -> Self {
         let finding_logger = FindingLogger::with_dual_pool(dual_pool);
         let pg_pool = dual_pool.postgres().clone();
 
-        // Create SearchService with both lookup and prevalence support
-        let search_service = SearchService::with_dual_pool_lookup_and_prevalence(
+        // Create SearchService with both lookup and prevalence support, under the
+        // active schema profile so the scheduled rule query is schema-aware.
+        let search_service = SearchService::with_dual_pool_lookup_and_prevalence_and_profile(
             dual_pool,
             lookup_service,
             prevalence_service.clone(),
+            profile.clone(),
         );
 
         Self {
@@ -184,7 +223,7 @@ impl DetectionService {
             search_service,
             finding_logger: Some(finding_logger),
             config: DetectionServiceConfig::default(),
-            score_calculator: ScoreCalculator::new(),
+            score_calculator: ScoreCalculator::new().with_profile(profile.clone()),
             pg_pool: pg_pool.clone(),
             prevalence_evaluator: Some(Arc::new(PrevalenceEvaluator::new(prevalence_service))),
             risk_weight_cache: Arc::new(RwLock::new(None)),
@@ -192,7 +231,28 @@ impl DetectionService {
             case_grouping: Arc::new(NoopCaseGroupingHook),
             webhook_service: None,
             shadow_investigation: Arc::new(NoopShadowInvestigationHook),
+            active_profile: profile,
         }
+    }
+
+    /// Set the active schema profile for the entity-extraction half of the
+    /// scheduled detection path (OCSF Phase 5, NAN-1241).
+    ///
+    /// Drives the auto-detect entity-extraction order used when a rule has no
+    /// explicit `risk_entity_field`, and propagates the profile into the
+    /// [`ScoreCalculator`]. NOTE: this does NOT rebuild the internal
+    /// `SearchService` (the pool/lookup/prevalence handles needed to do so are
+    /// not retained), so the scheduled query SQL keeps whatever profile the
+    /// service was constructed with. For a fully schema-aware scheduled path,
+    /// construct via [`with_dual_pool_prevalence_and_profile`] instead; use this
+    /// builder only to adjust entity extraction on an already-built service
+    /// (e.g. in tests). UDM is the default so existing call sites are unchanged.
+    ///
+    /// [`with_dual_pool_prevalence_and_profile`]: DetectionService::with_dual_pool_prevalence_and_profile
+    pub fn with_profile(mut self, profile: Arc<dyn crate::schema::SchemaProfile>) -> Self {
+        self.score_calculator = ScoreCalculator::new().with_profile(profile.clone());
+        self.active_profile = profile;
+        self
     }
 
     /// Set the prevalence evaluator for prevalence-based detection conditions

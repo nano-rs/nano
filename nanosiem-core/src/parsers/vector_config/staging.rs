@@ -338,7 +338,10 @@ impl VectorConfigManager {
         let staging_parsers_dir = self.staging_dir.join("sources").join("parsers");
         fs::create_dir_all(&staging_parsers_dir).await?;
         let pipeline_path = staging_parsers_dir.join("_pipeline.toml");
-        fs::write(&pipeline_path, Self::pipeline_config_content()).await?;
+        // NAN-1325: same active-schema content as the deploy writer, so the staged
+        // OCSF pipeline carries the generic Base Event lane and promote_staged copies
+        // it over verbatim (UDM byte-identical).
+        fs::write(&pipeline_path, Self::full_pipeline_config_content()).await?;
         Ok(())
     }
 

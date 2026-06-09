@@ -189,6 +189,7 @@ pub fn create_router(state: AppState) -> Router {
     // Static metadata - 5 minute browser cache
     let cached_metadata = Router::new()
         .route("/api/udm/fields", get(handlers::get_udm_fields))
+        .route("/api/schema/fields", get(handlers::get_schema_fields))
         .route("/api/source-types", get(handlers::get_source_types))
         .route("/api/permissions", get(handlers::roles::list_permissions))
         .route("/api/audit/actions", get(handlers::audit::get_action_types))

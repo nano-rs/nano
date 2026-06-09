@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use super::*;
+use crate::query::escape_identifier;
+// `MATERIALIZED_COLUMNS` is only referenced by the unit tests below (the UDM
+// materialized set passed to `build_fetch_log_sql`); production callers pass the
+// active profile's columns. Scoped to test builds to avoid an unused-import warning.
+#[cfg(test)]
 use crate::query::MATERIALIZED_COLUMNS;
 
 impl SearchService {
@@ -40,8 +45,16 @@ impl SearchService {
             .generate(&base_query, &tr)
             .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
 
+        // Enumerate the columns of the ACTIVE schema's logs table, not a
+        // hardcoded `logs`. `system.columns` reflects the underlying local
+        // MergeTree, so pass the bare local table key (UDM `logs` / OCSF
+        // `ocsf_logs`) — never the `_distributed` read alias (NAN-1241).
+        let logs_table = Self::logs_table_key(self.active_profile.as_ref());
         // Get column list dynamically
-        let columns = ch_executor.get_table_columns().await.unwrap_or_else(|e| {
+        let columns = ch_executor
+            .get_table_columns(logs_table)
+            .await
+            .unwrap_or_else(|e| {
             warn!(
                 "Failed to get table columns for field stats, using defaults: {}",
                 e
@@ -124,8 +137,15 @@ impl SearchService {
             .generate(&field_values_query, &tr)
             .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
 
+        // Resolve the field to its physical access expression via the ACTIVE
+        // schema profile (NAN-1241): OCSF promoted columns (`traffic.bytes_out`,
+        // `activity`) → the escaped dotted column / direct column, not the UDM
+        // `ext.{field}` spill. Byte-identical for UDM (ExplicitColumn → bare
+        // column; Unknown → `ext.{field}`).
+        let field_expr = self.ch_sql_generator.field_access_expr(field, "String");
+
         // Build simple GROUP BY query for this single field
-        let field_values_sql = ch_executor.build_field_values_sql(&base_sql, field, limit);
+        let field_values_sql = ch_executor.build_field_values_sql(&base_sql, &field_expr, limit);
         info!(field = %field, "Executing field values query");
         debug!(
             "Field values SQL: {}",
@@ -164,8 +184,20 @@ impl SearchService {
         source_type: Option<&str>,
         exclude_audit: bool,
     ) -> Result<Option<serde_json::Value>, SearchError> {
-        let table = self.table_names.read("logs");
-        let sql = build_fetch_log_sql(&table, id, time_range, source_type, exclude_audit);
+        // Profile-aware (NAN-1241): resolve the active schema's logs table
+        // (`ocsf_logs` under OCSF) and re-add that profile's materialized columns,
+        // not the UDM set. UDM behavior is unchanged (same key, same columns).
+        let table = self
+            .table_names
+            .read(Self::logs_table_key(self.active_profile.as_ref()));
+        let sql = build_fetch_log_sql(
+            &table,
+            id,
+            time_range,
+            source_type,
+            exclude_audit,
+            self.active_profile.materialized_columns(),
+        );
 
         debug!("Fetching log by ID: {}", sql);
 
@@ -256,8 +288,18 @@ impl SearchService {
             ))
         })?;
 
-        let table = self.table_names.read("logs");
-        ch_executor.get_ext_field_names(&table).await
+        // NAN-1241: enumerate the active ingested-events table's dynamic-JSON
+        // column — `ext` under UDM, `event` under OCSF.
+        let profile = self.active_profile.as_ref();
+        let table = self.table_names.read(Self::logs_table_key(profile));
+        // OCSF `event` is deeply nested, so the enumerator must return full leaf
+        // paths rather than collapsing to the top-level segment (which is correct
+        // for UDM's effectively-flat `ext`).
+        let is_ocsf = profile.id() == crate::schema::SchemaId::Ocsf;
+        let json_col = if is_ocsf { "event" } else { "ext" };
+        ch_executor
+            .get_ext_field_names(&table, json_col, is_ocsf)
+            .await
     }
 
     /// Get available UDM fields with their statistics
@@ -463,6 +505,7 @@ fn build_fetch_log_sql(
     time_range: Option<&TimeRangeInput>,
     source_type: Option<&str>,
     exclude_audit: bool,
+    materialized_cols: &[&str],
 ) -> String {
     let escaped_id = id.replace('\'', "''");
     let audit_filter = if exclude_audit {
@@ -474,12 +517,25 @@ fn build_fetch_log_sql(
         .map(|st| format!(" AND source_type = '{}'", st.replace('\'', "''")))
         .unwrap_or_default();
     // ClickHouse's `SELECT *` excludes MATERIALIZED columns (enrichment, IOC,
-    // prevalence, process-GUID, resolved-identity dict fills). The row-expand UI
-    // relies on this fetch as its full-fidelity source — table_view search results
-    // are field-pruned — so without re-adding them the inspector shows no
-    // enrichment even though it's stored. Mirrors build_select_clause's re-add
-    // off the same MATERIALIZED_COLUMNS source of truth (NAN-1147).
-    let select = format!("*, {}", MATERIALIZED_COLUMNS.join(", "));
+    // prevalence, process-GUID, resolved-identity dict fills for UDM; the promoted
+    // OCSF columns for OCSF). The row-expand UI relies on this fetch as its
+    // full-fidelity source — table_view search results are field-pruned — so
+    // without re-adding them the inspector shows no enrichment even though it's
+    // stored. Mirrors build_select_clause's re-add off the active profile's
+    // materialized-column source of truth (NAN-1147; OCSF profile-awareness
+    // NAN-1241). UDM names are bare snake_case (escape is a no-op → byte-identical);
+    // OCSF names are dotted (`src_endpoint.ip`) and MUST be quoted or ClickHouse
+    // parses them as tuple/sub-column access.
+    let select = if materialized_cols.is_empty() {
+        "*".to_string()
+    } else {
+        let cols = materialized_cols
+            .iter()
+            .map(|c| escape_identifier(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("*, {}", cols)
+    };
     if let Some(tr) = time_range {
         format!(
             "SELECT {} FROM {} WHERE id = '{}'{}{} AND timestamp BETWEEN '{}' AND '{}' LIMIT 1",
@@ -506,7 +562,7 @@ mod tests {
 
     #[test]
     fn fetch_log_sql_without_audit_exclusion_omits_source_type_filter() {
-        let sql = build_fetch_log_sql("logs", "abc-123", None, None, false);
+        let sql = build_fetch_log_sql("logs", "abc-123", None, None, false, MATERIALIZED_COLUMNS);
         assert!(sql.starts_with("SELECT *, "), "must re-add materialized cols: {sql}");
         assert!(
             sql.ends_with("FROM logs WHERE id = 'abc-123' LIMIT 1"),
@@ -518,7 +574,7 @@ mod tests {
     fn fetch_log_sql_reads_materialized_enrichment_columns() {
         // NAN-1147 regression: `SELECT *` excludes MATERIALIZED columns, so the
         // row-expand inspector showed no enrichment. The fetch must name them.
-        let sql = build_fetch_log_sql("logs", "abc-123", None, None, false);
+        let sql = build_fetch_log_sql("logs", "abc-123", None, None, false, MATERIALIZED_COLUMNS);
         for col in [
             "user_identity_department",
             "enriched_src_country",
@@ -531,7 +587,7 @@ mod tests {
 
     #[test]
     fn fetch_log_sql_with_audit_exclusion_filters_audit_rows() {
-        let sql = build_fetch_log_sql("logs", "abc-123", None, None, true);
+        let sql = build_fetch_log_sql("logs", "abc-123", None, None, true, MATERIALIZED_COLUMNS);
         assert!(sql.starts_with("SELECT *, "), "must re-add materialized cols: {sql}");
         assert!(
             sql.ends_with(
@@ -547,7 +603,7 @@ mod tests {
             start: Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap(),
             end: Utc.with_ymd_and_hms(2026, 1, 2, 4, 5, 6).unwrap(),
         };
-        let sql = build_fetch_log_sql("logs", "abc-123", Some(&tr), None, true);
+        let sql = build_fetch_log_sql("logs", "abc-123", Some(&tr), None, true, MATERIALIZED_COLUMNS);
         assert!(
             sql.contains("AND lower(source_type) != 'audit'"),
             "audit exclusion missing: {sql}"
@@ -560,10 +616,46 @@ mod tests {
 
     #[test]
     fn fetch_log_sql_escapes_single_quotes_in_id() {
-        let sql = build_fetch_log_sql("logs", "abc'; DROP--", None, None, true);
+        let sql = build_fetch_log_sql("logs", "abc'; DROP--", None, None, true, MATERIALIZED_COLUMNS);
         assert!(
             sql.contains("WHERE id = 'abc''; DROP--'"),
             "id quotes not escaped: {sql}"
+        );
+    }
+
+    #[test]
+    fn fetch_log_sql_quotes_dotted_ocsf_materialized_columns() {
+        // OCSF profile-awareness (NAN-1241): the fetch re-adds the active
+        // profile's materialized columns, which for OCSF are dotted promoted
+        // paths. They MUST be double-quoted or ClickHouse reads `src_endpoint.ip`
+        // as tuple sub-column access. `WHERE id =` is unchanged — OCSF now has a
+        // real `id` UUID column too.
+        let ocsf_cols: &[&str] = &["src_endpoint.ip", "http_response.code", "class_uid"];
+        let sql = build_fetch_log_sql("ocsf_logs", "abc-123", None, None, false, ocsf_cols);
+        assert!(
+            sql.contains("\"src_endpoint.ip\""),
+            "dotted col must be quoted: {sql}"
+        );
+        assert!(
+            sql.contains("\"http_response.code\""),
+            "dotted col must be quoted: {sql}"
+        );
+        // Bare names stay bare (no needless quoting).
+        assert!(sql.contains(", class_uid"), "bare col stays bare: {sql}");
+        assert!(
+            sql.ends_with("FROM ocsf_logs WHERE id = 'abc-123' LIMIT 1"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn fetch_log_sql_with_empty_materialized_cols_emits_bare_star() {
+        // Defensive: a profile with no materialized columns must not produce the
+        // dangling `SELECT *, ` (trailing comma → syntax error).
+        let sql = build_fetch_log_sql("logs", "abc-123", None, None, false, &[]);
+        assert!(
+            sql.starts_with("SELECT * FROM logs WHERE id = 'abc-123'"),
+            "{sql}"
         );
     }
 
@@ -579,6 +671,7 @@ mod tests {
             Some(&tr),
             Some("windows_sysmon"),
             false,
+            MATERIALIZED_COLUMNS,
         );
         // source_type goes immediately after the id predicate so the PK
         // (source_type, timestamp, ...) can do a tight range read on S3-backed
@@ -594,7 +687,8 @@ mod tests {
 
     #[test]
     fn fetch_log_sql_escapes_single_quotes_in_source_type() {
-        let sql = build_fetch_log_sql("logs", "abc-123", None, Some("evil'; DROP--"), false);
+        let sql =
+            build_fetch_log_sql("logs", "abc-123", None, Some("evil'; DROP--"), false, MATERIALIZED_COLUMNS);
         assert!(
             sql.contains("source_type = 'evil''; DROP--'"),
             "source_type quotes not escaped: {sql}"

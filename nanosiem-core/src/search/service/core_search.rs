@@ -701,7 +701,12 @@ impl SearchService {
                     })?;
 
                     // Get column list dynamically (run in parallel with data query)
-                    let columns = ch_executor.get_table_columns().await.unwrap_or_else(|e| {
+                    // for the ACTIVE schema's logs table (UDM `logs` / OCSF
+                    // `ocsf_logs`), so OCSF deployments enumerate OCSF columns
+                    // rather than a hardcoded `logs` (NAN-1241).
+                    let logs_table = Self::logs_table_key(self.active_profile.as_ref());
+                    let columns =
+                        ch_executor.get_table_columns(logs_table).await.unwrap_or_else(|e| {
                         warn!("Failed to get table columns, using defaults: {}", e);
                         vec![
                             "user",

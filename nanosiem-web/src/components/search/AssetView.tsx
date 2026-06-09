@@ -5,6 +5,8 @@ import { ChevronDown, ChevronRight, Server, Clock, Network, Shield, FileText, Gl
 import { api } from '@/lib/api';
 import type { AssetEventsRequest, AssetEventFilters, AssetPagination, TimeRange, EntityContextResponse, AssetTrueTimeRangeResponse, IdentityUser } from '@/lib/api/types';
 import { UDM_COLUMNS } from '@/lib/udm-fields';
+import { fieldVal } from '@/lib/ocsf-field-fallbacks';
+import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -427,9 +429,13 @@ function getEventType(fields: Record<string, unknown>): { type: string; color: s
 }
 
 // Get key inline fields to display based on event type
-// Returns array of [fieldName, value] pairs to show on the row
+// Returns array of [fieldName, value] pairs to show on the row.
+// NAN-1322/1324: `fieldVal` resolves each UDM concept through the shared
+// native-OCSF fallback map (UDM key first → byte-identical under UDM, then the
+// native OCSF column) so the inline preview populates under OCSF.
 function getInlineFields(fields: Record<string, unknown>, eventType: string): Array<[string, string]> {
   const result: Array<[string, string]> = [];
+  const fv = (concept: string) => fieldVal(fields, concept);
 
   const addField = (name: string, value: unknown) => {
     if (value !== null && value !== undefined && value !== '' && value !== 0 && value !== '0'
@@ -440,39 +446,39 @@ function getInlineFields(fields: Record<string, unknown>, eventType: string): Ar
 
   switch (eventType) {
     case 'PROCESS':
-      addField('process', fields.process_name);
-      addField('cmd', fields.command_line || fields.process);
-      addField('parent', fields.parent_command_line || fields.parent_process || fields.parent_process_name);
-      addField('user', fields.user);
+      addField('process', fv('process_name'));
+      addField('cmd', fv('command_line') || fields.process);
+      addField('parent', fv('parent_command_line') || fields.parent_process || fields.parent_process_name);
+      addField('user', fv('user'));
       break;
 
     case 'FILE':
-      addField('file', fields.file_name || fields.file_path);
+      addField('file', fv('file_name') || fv('file_path'));
       addField('action', fields.file_action || fields.action);
-      addField('process', fields.process_name);
-      addField('user', fields.user);
-      addField('hash', fields.file_hash);
+      addField('process', fv('process_name'));
+      addField('user', fv('user'));
+      addField('hash', fv('file_hash'));
       break;
 
     case 'NETWORK':
-      addField('dest', fields.dest_host || fields.dest_ip);
-      addField('port', fields.dest_port);
-      addField('url', fields.url);
-      addField('process', fields.process_name);
-      addField('bytes', fields.bytes_out || fields.bytes_in);
+      addField('dest', fv('dest_host') || fv('dest_ip'));
+      addField('port', fv('dest_port'));
+      addField('url', fv('url'));
+      addField('process', fv('process_name'));
+      addField('bytes', fv('bytes_out') || fv('bytes_in'));
       break;
 
     case 'DHCP':
-      addField('ip', fields.src_ip || fields.ip);
-      addField('mac', fields.src_mac || fields.mac);
-      addField('host', fields.src_host);
+      addField('ip', fv('src_ip') || fields.ip);
+      addField('mac', fv('src_mac') || fields.mac);
+      addField('host', fv('src_host'));
       break;
 
     case 'DNS':
-      addField('query', fields.query);
-      addField('answer', fields.answer);
+      addField('query', fv('query'));
+      addField('answer', fv('answer'));
       addField('type', fields.query_type);
-      addField('process', fields.process_name);
+      addField('process', fv('process_name'));
       break;
 
     case 'ALERT':
@@ -484,29 +490,29 @@ function getInlineFields(fields: Record<string, unknown>, eventType: string): Ar
 
     case 'AUTH_SUCCESS':
     case 'AUTH_FAILURE':
-      addField('user', fields.user);
-      addField('type', fields.auth_type);
-      addField('src', fields.src_ip || fields.src_host);
-      addField('target', fields.dest_host || fields.target_host);
+      addField('user', fv('user'));
+      addField('type', fv('auth_type'));
+      addField('src', fv('src_ip') || fv('src_host'));
+      addField('target', fv('dest_host') || fields.target_host);
       break;
 
     case 'IMAGE_LOAD':
-      addField('process', fields.process_name);
-      addField('hash', fields.process_hash);
+      addField('process', fv('process_name'));
+      addField('hash', fv('process_hash'));
       addField('signature', fields.signature);
-      addField('user', fields.user);
+      addField('user', fv('user'));
       break;
 
     case 'REGISTRY':
       addField('path', fields.registry_path);
       addField('value', fields.registry_value_data);
-      addField('process', fields.process_name);
-      addField('user', fields.user);
+      addField('process', fv('process_name'));
+      addField('user', fv('user'));
       break;
 
     case 'PIPE':
-      addField('process', fields.process_name);
-      addField('user', fields.user);
+      addField('process', fv('process_name'));
+      addField('user', fv('user'));
       break;
 
     default:
@@ -529,6 +535,11 @@ function EventTypeLabel({ type, color, icon }: { type: string; color: string; ic
 }
 
 // Default table columns by event type for drilldown table views
+// Per-event-type `| table` drilldown column lists (UDM names). Under OCSF these
+// names don't exist, so resolveTableColumns() (below) intersects the list with
+// the active schema's field set before emitting the `| table` command, dropping
+// columns that would 500. Under UDM every name resolves, so the output stays
+// byte-identical (NAN-1241).
 const TABLE_COLUMNS: Record<string, string> = {
   PROCESS: 'timestamp, source_type, action, user, src_host, process_name, process, process_path, parent_process, process_hash',
   FILE: 'timestamp, source_type, action, user, src_host, file_path, file_name, file_hash, file_action, process_name',
@@ -543,6 +554,24 @@ const TABLE_COLUMNS: Record<string, string> = {
   PIPE: 'timestamp, source_type, action, user, src_host, process_name',
   EVENT: 'timestamp, source_type, action, user, src_ip, src_host, dest_ip, dest_host, message',
 };
+
+// Always-safe columns kept even when intersection with the active schema would
+// otherwise empty the list (OCSF with none of the UDM names present).
+const ALWAYS_TABLE_COLUMNS = ['timestamp', 'source_type'];
+
+/**
+ * Resolve the `| table` column list for an event type against the active schema.
+ * `schemaFieldNames === null` (schema not yet loaded, or UDM where the const is
+ * already correct) → return the const verbatim (UDM byte-identical). Otherwise
+ * keep only columns present in the schema, preserving the always-safe ones.
+ */
+function resolveTableColumns(type: string, schemaFieldNames: Set<string> | null): string {
+  const base = TABLE_COLUMNS[type] || TABLE_COLUMNS.EVENT;
+  if (!schemaFieldNames) return base;
+  const cols = base.split(',').map(c => c.trim()).filter(Boolean);
+  const kept = cols.filter(c => ALWAYS_TABLE_COLUMNS.includes(c) || schemaFieldNames.has(c));
+  return (kept.length > 0 ? kept : ALWAYS_TABLE_COLUMNS).join(', ');
+}
 
 // Single timeline event row
 interface TimelineEventProps {
@@ -561,6 +590,28 @@ function TimelineEvent({ event, onDrilldown, onAddToQuery, onFetchLog, isHighlig
   const [isLoadingFullLog, setIsLoadingFullLog] = React.useState(false);
   const [expandedValueKeys, setExpandedValueKeys] = React.useState<Set<string>>(new Set());
   const hoverTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Schema-aware `| table` columns: under OCSF the UDM column names are dropped
+  // if absent from the active schema (would 500); under UDM we pass null so the
+  // const passes through byte-identical (NAN-1241).
+  const { schemaFields } = useSchemaEntityMap();
+  const schemaFieldNames = React.useMemo(
+    () =>
+      schemaFields && schemaFields.schema !== 'udm'
+        ? new Set(schemaFields.fields.map(f => f.name))
+        : null,
+    [schemaFields],
+  );
+  // Categorization "known field" oracle (NAN-1241): a field counts as a known
+  // core column if the active schema knows it OR it's a UDM column. Under UDM
+  // this is byte-identical to the old `UDM_COLUMNS.has()` check (the schema set is
+  // empty); under OCSF, promoted columns (`src_endpoint.ip`, `class_uid`, …)
+  // become "known" so they land in Core, not the Extended (ext spill) bucket.
+  // Mirrors EventInspectorPanel knownSchemaFields∪UDM_COLUMNS.
+  const isKnownField = React.useCallback(
+    (name: string): boolean =>
+      (schemaFieldNames?.has(name) ?? false) || UDM_COLUMNS.has(name),
+    [schemaFieldNames],
+  );
   const fields = event.fields;
   const { type, color, icon } = getEventType(fields);
   const inlineFields = getInlineFields(fields, type);
@@ -630,8 +681,8 @@ function TimelineEvent({ event, onDrilldown, onAddToQuery, onFetchLog, isHighlig
       if (name.startsWith('enriched_')) return 6;
       if (name.startsWith('custom_')) return 7;
       if (name.startsWith('metadata_')) return 8;
-      if (!UDM_COLUMNS.has(name)) return 9; // ext fields
-      return 0; // UDM core
+      if (!isKnownField(name)) return 9; // ext fields
+      return 0; // schema core (UDM, or OCSF promoted)
     };
 
     // Sort: priority fields first (in order), then by category, then alphabetically
@@ -651,7 +702,7 @@ function TimelineEvent({ event, onDrilldown, onAddToQuery, onFetchLog, isHighlig
     });
 
     return sorted;
-  }, [fields, fullLogData, type]);
+  }, [fields, fullLogData, type, isKnownField]);
 
   const timestamp = fields.timestamp as string || event.timestamp?.toString() || '';
 
@@ -659,7 +710,7 @@ function TimelineEvent({ event, onDrilldown, onAddToQuery, onFetchLog, isHighlig
   const fieldNameColor = (k: string) =>
     (k === 'risk_score' || k === 'risk_entity' || k === 'risk_factors' || k.startsWith('risk_')) ? "text-orange-400" :
     k.startsWith('ioc_') ? "text-red-400" :
-    UDM_COLUMNS.has(k) ? "text-sky-700 dark:text-sky-400/70" :
+    isKnownField(k) ? "text-sky-700 dark:text-sky-400/70" :
     "text-muted-foreground";
 
   // Prefetch full log on hover (400ms debounce to skip scroll drive-bys).
@@ -818,14 +869,14 @@ function TimelineEvent({ event, onDrilldown, onAddToQuery, onFetchLog, isHighlig
             )}
             {detailFields.map(([key, value]) => {
               const stringValue = typeof value === 'object' ? JSON.stringify(value) : String(value);
-              const tableColumns = TABLE_COLUMNS[type] || TABLE_COLUMNS.EVENT;
+              const tableColumns = resolveTableColumns(type, schemaFieldNames);
               const truncateAt = 200;
               const isLong = stringValue.length > truncateAt;
               const isValueExpanded = expandedValueKeys.has(key);
               const displayValue = (!isLong || isValueExpanded) ? stringValue : stringValue.substring(0, truncateAt);
               return (
                 <div key={key} className="flex gap-2 text-xs">
-                  <span className="text-muted-foreground font-medium min-w-[120px]" title={UDM_COLUMNS.has(key) ? "Indexed UDM column" : undefined}>{key}:</span>
+                  <span className="text-muted-foreground font-medium min-w-[120px]" title={isKnownField(key) ? "Indexed column" : undefined}>{key}:</span>
                   <div className="min-w-0 flex-1">
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
@@ -936,6 +987,12 @@ interface EventGroup {
 }
 
 export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter, timeRange, onFetchLog }: AssetViewProps) {
+  // Schema-aware entity resolution + identity field set (OCSF dotted columns).
+  // The const fallbacks below keep UDM byte-identical (NAN-1241).
+  const { resolveEntityType, schemaFields } = useSchemaEntityMap({
+    fallback: { src_ip: 'ip', dest_ip: 'ip', src_host: 'host', dest_host: 'host', user: 'user' },
+  });
+
   // Highlight state for prevalence click → scroll-to-event
   const [highlightedEventId, setHighlightedEventId] = React.useState<string | null>(null);
   const highlightTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -995,13 +1052,9 @@ export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter
     const field = assetProfile.primary_identifier.field;
     const value = assetProfile.primary_identifier.value;
 
-    // Map UDM field to entity type
-    const entityTypeMap: Record<string, string> = {
-      src_ip: 'ip', dest_ip: 'ip',
-      src_host: 'host', dest_host: 'host',
-      user: 'user',
-    };
-    const entityType = entityTypeMap[field] || field;
+    // Map the primary-identifier field to an entity type via the active schema
+    // (handles OCSF dotted columns); falls back to the UDM map / the raw field.
+    const entityType = resolveEntityType(field) || field;
 
     // Collect resolved identity values for broader matching
     const identityValues: string[] = [];
@@ -1014,7 +1067,7 @@ export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter
     api.getEntityContext(entityType, value, identityValues.length > 0 ? identityValues : undefined)
       .then(setEntityContext)
       .catch(() => { /* Entity context is supplementary — fail silently */ });
-  }, [assetProfile]);
+  }, [assetProfile, resolveEntityType]);
 
   // Fetch user profile from identity registry when primary identifier is a user field
   React.useEffect(() => {
@@ -1101,11 +1154,31 @@ export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter
     }
   }, [results]);
 
+  // Source identity field names stripped from drilldown filters before the
+  // resolved-identity OR clause is re-added. Seeded from the UDM set, then
+  // unioned with the active schema's ip/host/user fields so OCSF dotted identity
+  // columns (src_endpoint.ip, actor.user.name, …) are stripped too (NAN-1241).
+  const sourceIdentityFields = React.useMemo(() => {
+    const set = new Set(['src_ip', 'src_host', 'user', 'src_mac']);
+    // Under UDM the legacy 4-field set IS the existing behavior; the backend's
+    // entity-typed field universe is a superset (dest_ip/dest_host/dest_user/…)
+    // whose inclusion would change which drilldown filters get stripped. Only
+    // union the schema's identity fields under non-UDM schemas so UDM drilldown
+    // output stays byte-identical (NAN-1241).
+    if (schemaFields && schemaFields.schema !== 'udm') {
+      for (const f of schemaFields.fields) {
+        if (f.entity_type === 'ip' || f.entity_type === 'host' || f.entity_type === 'user') {
+          set.add(f.name);
+        }
+      }
+    }
+    return set;
+  }, [schemaFields]);
+
   // Identity-aware drilldown handler
   const handleAssetDrilldown = React.useCallback((filters: Record<string, unknown>) => {
     if (!onDrilldown) return;
 
-    const sourceIdentityFields = new Set(['src_ip', 'src_host', 'user', 'src_mac']);
 
     if (!assetProfile?.identities?.length) {
       onDrilldown(filters);
@@ -1142,7 +1215,7 @@ export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter
     }
 
     onDrilldown(modifiedFilters);
-  }, [onDrilldown, assetProfile]);
+  }, [onDrilldown, assetProfile, sourceIdentityFields]);
 
   // Load more events (infinite scroll)
   const loadMore = React.useCallback(async () => {

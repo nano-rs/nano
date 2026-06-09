@@ -715,6 +715,10 @@ class ApiClient {
     return this._core.getSourceTypes(timeRange);
   }
 
+  async getSchemaFields(): ReturnType<CoreApi['getSchemaFields']> {
+    return this._core.getSchemaFields();
+  }
+
   // Credentials
   async listCredentials(): Promise<import('./types').CredentialListResponse> {
     return this._credentials.listCredentials();

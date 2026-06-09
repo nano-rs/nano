@@ -451,9 +451,13 @@ impl TieringService {
     /// Disable tiering and revert to default storage
     async fn disable_tiering(&self) -> Result<(), TieringError> {
         // First, modify the TTL to remove any volume references
-        // This must happen BEFORE removing the storage config
+        // This must happen BEFORE removing the storage config.
+        // NAN-1241: target the active ingested-events table (ocsf_logs under OCSF).
+        let logs_table = crate::schema::active_logs_table();
         self.ch_client
-            .query("ALTER TABLE nanosiem.logs MODIFY TTL timestamp + INTERVAL 90 DAY DELETE")
+            .query(&format!(
+                "ALTER TABLE nanosiem.{logs_table} MODIFY TTL timestamp + INTERVAL 90 DAY DELETE"
+            ))
             .execute()
             .await
             .map_err(|e| TieringError::ClickHouse(e.to_string()))?;
@@ -655,9 +659,13 @@ impl TieringService {
     /// refuses to apply with `move_factor=0` so the storage policy is
     /// guaranteed to be doing the moves.
     async fn apply_ttl_rules(&self, config: &TieringConfig) -> Result<(), TieringError> {
+        // NAN-1241: target the active ingested-events table (ocsf_logs under OCSF).
+        let logs_table = crate::schema::active_logs_table();
         // First, update the storage policy
         self.ch_client
-            .query("ALTER TABLE logs MODIFY SETTING storage_policy = 'tiered'")
+            .query(&format!(
+                "ALTER TABLE {logs_table} MODIFY SETTING storage_policy = 'tiered'"
+            ))
             .execute()
             .await
             .map_err(|e| {
@@ -666,7 +674,7 @@ impl TieringService {
 
         // DELETE TTL only — moves are handled by move_factor on the policy.
         let ttl_query = format!(
-            "ALTER TABLE logs MODIFY TTL timestamp + INTERVAL {} DAY DELETE",
+            "ALTER TABLE {logs_table} MODIFY TTL timestamp + INTERVAL {} DAY DELETE",
             config.retention_days
         );
 
@@ -717,10 +725,12 @@ impl TieringService {
             total_rows: u64,
         }
 
-        // Get stats grouped by disk
+        // Get stats grouped by disk.
+        // NAN-1241: stats for the active ingested-events table (ocsf_logs under OCSF).
+        let logs_table = crate::schema::active_logs_table();
         let stats: Vec<VolumeStats> = self
             .ch_client
-            .query(
+            .query(&format!(
                 r#"
                 SELECT
                     disk_name,
@@ -728,11 +738,11 @@ impl TieringService {
                     sum(rows) as total_rows
                 FROM system.parts
                 WHERE database = currentDatabase()
-                  AND table = 'logs'
+                  AND table = '{logs_table}'
                   AND active = 1
                 GROUP BY disk_name
-                "#,
-            )
+                "#
+            ))
             .fetch_all()
             .await
             .map_err(|e| TieringError::ClickHouse(e.to_string()))?;

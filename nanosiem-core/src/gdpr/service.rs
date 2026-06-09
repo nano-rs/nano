@@ -16,8 +16,11 @@ use super::{
     AnonymizationError, AnonymizationPreview, AnonymizationRequest, AnonymizationStatus,
     IdentifierType,
 };
+use std::sync::Arc;
+
 use crate::db::dual_pool::TableNames;
 use crate::db::DualPool;
+use crate::schema::{SchemaId, SchemaProfile};
 
 /// Service for GDPR data subject anonymization
 #[derive(Clone)]
@@ -25,16 +28,56 @@ pub struct AnonymizationService {
     pool: PgPool,
     dual_pool: DualPool,
     table_names: TableNames,
+    /// Active schema profile (NAN-1259). Under OCSF, subject data lives in
+    /// `ocsf_logs` and PII is inside the `event` JSON (the promoted columns are
+    /// MATERIALIZED, hence not directly updatable) — so erasure rewrites `event`
+    /// and the promoted columns re-derive. UDM path is byte-identical.
+    profile: Arc<dyn SchemaProfile>,
 }
 
 impl AnonymizationService {
     pub fn new(pool: PgPool, dual_pool: DualPool) -> Self {
         let table_names = dual_pool.table_names();
+        let profile = crate::schema::active_profile_from_env()
+            .unwrap_or_else(|_| Arc::new(crate::schema::UdmProfile::new()));
         Self {
             pool,
             dual_pool,
             table_names,
+            profile,
         }
+    }
+
+    /// The active ingested-events table key ("ocsf_logs" under OCSF, else "logs").
+    fn logs_key(&self) -> &'static str {
+        crate::schema::active_logs_table()
+    }
+
+    /// Quote a column for the anonymization SQL: dotted OCSF columns
+    /// (`user.name`) get double-quoted (else CH reads them as `table.column`);
+    /// the UDM `user` reserved word keeps its backticks; everything else is bare
+    /// — so UDM output is byte-identical.
+    fn quote_anon_col(col: &str) -> String {
+        if col.contains('.') {
+            format!("\"{}\"", col.replace('"', "\"\""))
+        } else if col == "user" {
+            "`user`".to_string()
+        } else {
+            col.to_string()
+        }
+    }
+
+    /// Build the salted-hash WHERE match (`... = '<hash>' OR ...`) over a set of
+    /// identity columns. Mirrors the per-column check used in the UDM mutations.
+    fn build_hash_match_where(columns: &[&str], salt_escaped: &str, anon_hash: &str) -> String {
+        columns
+            .iter()
+            .map(|col| {
+                let q = Self::quote_anon_col(col);
+                format!("lower(hex(SHA256(concat('{salt_escaped}', lower({q}))))) = '{anon_hash}'")
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ")
     }
 
     /// Compute SHA256(salt || lower(value)) — matches ClickHouse and PostgreSQL
@@ -370,18 +413,33 @@ impl AnonymizationService {
         value: &str,
     ) -> Result<i64, AnonymizationError> {
         let escaped = Self::escape_ch_string(&value.to_lowercase());
-        let logs_table = self.table_names.read("logs");
-        let sql = match id_type {
-            IdentifierType::Username | IdentifierType::Email => format!(
-                "SELECT count() FROM {logs_table} WHERE \
-                 lower(user) = '{escaped}' OR lower(src_user) = '{escaped}' OR lower(dest_user) = '{escaped}' \
-                 OR lower(user_id) = '{escaped}' OR lower(user_name) = '{escaped}' \
-                 OR lower(sender) = '{escaped}' OR lower(recipient) = '{escaped}'"
-            ),
-            IdentifierType::Ip => format!(
-                "SELECT count() FROM {logs_table} WHERE \
-                 src_ip = '{escaped}' OR dest_ip = '{escaped}' OR dvc_ip = '{escaped}'"
-            ),
+        // NAN-1259: read the active ingested-events table; under OCSF match the
+        // subject on the OCSF identity columns (dotted, double-quoted).
+        let logs_table = self.table_names.read(self.logs_key());
+        let sql = if self.profile.id() == SchemaId::Ocsf {
+            match id_type {
+                IdentifierType::Username | IdentifierType::Email => format!(
+                    "SELECT count() FROM {logs_table} WHERE \
+                     lower(\"user.name\") = '{escaped}' OR lower(\"actor.user.name\") = '{escaped}'"
+                ),
+                IdentifierType::Ip => format!(
+                    "SELECT count() FROM {logs_table} WHERE \
+                     \"src_endpoint.ip\" = '{escaped}' OR \"dst_endpoint.ip\" = '{escaped}'"
+                ),
+            }
+        } else {
+            match id_type {
+                IdentifierType::Username | IdentifierType::Email => format!(
+                    "SELECT count() FROM {logs_table} WHERE \
+                     lower(user) = '{escaped}' OR lower(src_user) = '{escaped}' OR lower(dest_user) = '{escaped}' \
+                     OR lower(user_id) = '{escaped}' OR lower(user_name) = '{escaped}' \
+                     OR lower(sender) = '{escaped}' OR lower(recipient) = '{escaped}'"
+                ),
+                IdentifierType::Ip => format!(
+                    "SELECT count() FROM {logs_table} WHERE \
+                     src_ip = '{escaped}' OR dest_ip = '{escaped}' OR dvc_ip = '{escaped}'"
+                ),
+            }
         };
 
         self.ch_count(ch, &sql).await
@@ -478,9 +536,11 @@ impl AnonymizationService {
         salt_escaped: &str,
         anon_hash: &str,
     ) -> String {
-        // The read expression: toString(ext) for ext, plain field name otherwise
-        let read_expr = if target_field == "ext" {
-            "toString(ext)".to_string()
+        // The read expression: toString(...) for the JSON columns (`ext` under
+        // UDM, `event` under OCSF — CH casts the String result back to JSON on
+        // assignment), plain field name otherwise.
+        let read_expr = if target_field == "ext" || target_field == "event" {
+            format!("toString({target_field})")
         } else {
             format!("`{target_field}`")
         };
@@ -488,11 +548,7 @@ impl AnonymizationService {
         // Build the multiIf arms: each column checks if its hash matches, returns 1
         let mut match_arms = String::new();
         for col in columns {
-            let quoted = if *col == "user" {
-                "`user`".to_string()
-            } else {
-                col.to_string()
-            };
+            let quoted = Self::quote_anon_col(col);
             let arm = format!(
                 "{quoted} != '' AND lower(hex(SHA256(concat('{salt_escaped}', lower({quoted}))))) = '{anon_hash}', 1, "
             );
@@ -505,11 +561,7 @@ impl AnonymizationService {
         // multiIf that returns the original plaintext value from the matching column
         let mut value_arms = String::new();
         for col in columns {
-            let quoted = if *col == "user" {
-                "`user`".to_string()
-            } else {
-                col.to_string()
-            };
+            let quoted = Self::quote_anon_col(col);
             let arm = format!(
                 "{quoted} != '' AND lower(hex(SHA256(concat('{salt_escaped}', lower({quoted}))))) = '{anon_hash}', {quoted}, "
             );
@@ -557,12 +609,26 @@ impl AnonymizationService {
             "sender",
             "recipient",
         ];
-        let message_expr =
-            Self::build_freetext_replace("message", user_columns, &salt_escaped, anon_hash);
-        let ext_expr = Self::build_freetext_replace("ext", user_columns, &salt_escaped, anon_hash);
-        let logs_local = self.table_names.local("logs");
-
-        let sql = format!(
+        let sql = if self.profile.id() == SchemaId::Ocsf {
+            // OCSF: scrub PII by rewriting the `event` JSON; the promoted
+            // (MATERIALIZED) columns re-derive on the mutation (validated). Match
+            // the subject on the OCSF user identity columns.
+            let ocsf_user_cols: &[&str] = &["user.name", "actor.user.name"];
+            let event_expr =
+                Self::build_freetext_replace("event", ocsf_user_cols, &salt_escaped, anon_hash);
+            let where_match =
+                Self::build_hash_match_where(ocsf_user_cols, &salt_escaped, anon_hash);
+            let ocsf_local = self.table_names.local(self.logs_key());
+            format!(
+                "ALTER TABLE {ocsf_local} UPDATE {event_expr} WHERE {where_match} SETTINGS mutations_sync = 0"
+            )
+        } else {
+            let message_expr =
+                Self::build_freetext_replace("message", user_columns, &salt_escaped, anon_hash);
+            let ext_expr =
+                Self::build_freetext_replace("ext", user_columns, &salt_escaped, anon_hash);
+            let logs_local = self.table_names.local("logs");
+            format!(
             "ALTER TABLE {logs_local} \
              UPDATE \
                 `user` = if(`user` != '' AND lower(hex(SHA256(concat('{salt_escaped}', lower(`user`))))) = '{anon_hash}', '{anon_hash}', `user`), \
@@ -606,7 +672,8 @@ impl AnonymizationService {
                 OR lower(hex(SHA256(concat('{salt_escaped}', lower(sender))))) = '{anon_hash}' \
                 OR lower(hex(SHA256(concat('{salt_escaped}', lower(recipient))))) = '{anon_hash}' \
              SETTINGS mutations_sync = 0",
-        );
+            )
+        };
 
         ch.query(&sql)
             .execute()
@@ -657,12 +724,25 @@ impl AnonymizationService {
         let mutation_id = format!("gdpr_ip_{}", Uuid::now_v7().simple());
         let salt_escaped = salt.replace('\'', "\\'");
         let ip_columns: &[&str] = &["src_ip", "dest_ip", "dvc_ip"];
-        let message_expr =
-            Self::build_freetext_replace("message", ip_columns, &salt_escaped, anon_hash);
-        let ext_expr = Self::build_freetext_replace("ext", ip_columns, &salt_escaped, anon_hash);
-        let logs_local = self.table_names.local("logs");
-
-        let sql = format!(
+        let sql = if self.profile.id() == SchemaId::Ocsf {
+            // OCSF: scrub PII by rewriting the `event` JSON; promoted columns
+            // re-derive. Match the subject on the OCSF endpoint IP columns.
+            let ocsf_ip_cols: &[&str] = &["src_endpoint.ip", "dst_endpoint.ip"];
+            let event_expr =
+                Self::build_freetext_replace("event", ocsf_ip_cols, &salt_escaped, anon_hash);
+            let where_match =
+                Self::build_hash_match_where(ocsf_ip_cols, &salt_escaped, anon_hash);
+            let ocsf_local = self.table_names.local(self.logs_key());
+            format!(
+                "ALTER TABLE {ocsf_local} UPDATE {event_expr} WHERE {where_match} SETTINGS mutations_sync = 0"
+            )
+        } else {
+            let message_expr =
+                Self::build_freetext_replace("message", ip_columns, &salt_escaped, anon_hash);
+            let ext_expr =
+                Self::build_freetext_replace("ext", ip_columns, &salt_escaped, anon_hash);
+            let logs_local = self.table_names.local("logs");
+            format!(
             "ALTER TABLE {logs_local} \
              UPDATE \
                 src_ip = if(src_ip != '' AND lower(hex(SHA256(concat('{salt_escaped}', lower(src_ip))))) = '{anon_hash}', '{anon_hash}', src_ip), \
@@ -694,7 +774,8 @@ impl AnonymizationService {
                 OR lower(hex(SHA256(concat('{salt_escaped}', lower(dest_ip))))) = '{anon_hash}' \
                 OR lower(hex(SHA256(concat('{salt_escaped}', lower(dvc_ip))))) = '{anon_hash}' \
              SETTINGS mutations_sync = 0",
-        );
+            )
+        };
 
         ch.query(&sql)
             .execute()
@@ -843,5 +924,65 @@ impl From<AnonymizationRow> for AnonymizationRequest {
             started_at: row.started_at,
             completed_at: row.completed_at,
         }
+    }
+}
+
+/// NAN-1262: regression coverage for the OCSF erasure SQL generation (NAN-1259).
+/// The full mutation (event scrub + materialized-column recompute) is validated
+/// against live CH by hand; these lock the *generated SQL shape* so the OCSF
+/// branch can't silently regress, and assert the UDM branch stays byte-identical.
+#[cfg(test)]
+mod ocsf_anonymization_tests {
+    use super::AnonymizationService as A;
+
+    #[test]
+    fn quote_anon_col_dotted_vs_reserved_vs_bare() {
+        // dotted OCSF columns are double-quoted (else CH reads `a.b` as table.col)
+        assert_eq!(A::quote_anon_col("user.name"), "\"user.name\"");
+        assert_eq!(A::quote_anon_col("src_endpoint.ip"), "\"src_endpoint.ip\"");
+        // the UDM `user` reserved word keeps its backticks (byte-identical)
+        assert_eq!(A::quote_anon_col("user"), "`user`");
+        // plain UDM columns stay bare
+        assert_eq!(A::quote_anon_col("src_ip"), "src_ip");
+    }
+
+    #[test]
+    fn hash_match_where_joins_columns_with_salted_hash() {
+        let w = A::build_hash_match_where(&["user.name", "actor.user.name"], "SALT", "HASH");
+        assert!(w.contains("lower(hex(SHA256(concat('SALT', lower(\"user.name\"))))) = 'HASH'"));
+        assert!(w.contains("lower(hex(SHA256(concat('SALT', lower(\"actor.user.name\"))))) = 'HASH'"));
+        assert!(w.contains(" OR "));
+    }
+
+    #[test]
+    fn freetext_replace_ocsf_rewrites_event_json() {
+        // OCSF erasure rewrites the `event` JSON (promoted columns re-derive),
+        // matching on the dotted OCSF identity columns.
+        let e = A::build_freetext_replace("event", &["user.name", "actor.user.name"], "SALT", "HASH");
+        assert!(e.starts_with("event = if("), "got: {e}");
+        assert!(e.contains("toString(event)"), "must rewrite the event column: {e}");
+        assert!(e.contains("replaceRegexpAll("));
+        assert!(e.contains("\"user.name\"") && e.contains("\"actor.user.name\""));
+        // (?i) case-insensitive prefix is emitted via char codes 40,63,105,41
+        assert!(e.contains("char(40, 63, 105, 41)"));
+        assert!(e.contains("'HASH'"));
+        // never touches the UDM `ext`/`message` columns
+        assert!(!e.contains("toString(ext)"));
+    }
+
+    #[test]
+    fn freetext_replace_udm_unchanged() {
+        // UDM `ext` path: reads/writes `ext`, backticks the `user` column, never
+        // references `event` — byte-identical to pre-OCSF behavior.
+        let ext = A::build_freetext_replace("ext", &["user", "src_user"], "SALT", "HASH");
+        assert!(ext.starts_with("ext = if("));
+        assert!(ext.contains("toString(ext)"));
+        assert!(ext.contains("`user`"));
+        assert!(!ext.contains("event"));
+        // UDM `message` path reads the bare column.
+        let msg = A::build_freetext_replace("message", &["user"], "SALT", "HASH");
+        assert!(msg.starts_with("message = if("));
+        assert!(msg.contains("`message`"));
+        assert!(!msg.contains("toString(ext)") && !msg.contains("event"));
     }
 }

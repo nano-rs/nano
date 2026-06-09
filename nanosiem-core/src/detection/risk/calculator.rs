@@ -6,10 +6,13 @@
 //! - `RiskResult` - Result of a risk score calculation
 //! - `ScoreCalculator` - Stateless calculator for risk scores with entity extraction
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::models::Severity;
+use crate::schema::{SchemaProfile, UdmProfile};
 
 use super::defaults::default_score_for_severity;
 use super::types::{RiskError, RiskModifier};
@@ -67,10 +70,24 @@ impl RiskResult {
 ///
 /// The ScoreCalculator is designed to be fast (no I/O, pure computation)
 /// for use in realtime detection scenarios.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ScoreCalculator {
     /// Default entity value when extraction fails
     default_entity: String,
+    /// Active schema profile. Drives auto-detect entity extraction
+    /// (`entity_extraction_order()`) so an OCSF deployment extracts OCSF
+    /// physical fields (`src_endpoint.ip`, …) while UDM stays byte-identical.
+    /// Defaults to [`UdmProfile`] so existing call sites/tests are unchanged.
+    profile: Arc<dyn SchemaProfile>,
+}
+
+impl std::fmt::Debug for ScoreCalculator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScoreCalculator")
+            .field("default_entity", &self.default_entity)
+            .field("profile", &self.profile.id())
+            .finish()
+    }
 }
 
 impl Default for ScoreCalculator {
@@ -80,11 +97,19 @@ impl Default for ScoreCalculator {
 }
 
 impl ScoreCalculator {
-    /// Create a new score calculator
+    /// Create a new score calculator (UDM profile).
     pub fn new() -> Self {
         Self {
             default_entity: "unknown".to_string(),
+            profile: Arc::new(UdmProfile::new()),
         }
+    }
+
+    /// Set the active schema profile (OCSF Phase 5, NAN-1241). Drives the
+    /// auto-detect entity-extraction order. UDM is the default.
+    pub fn with_profile(mut self, profile: Arc<dyn SchemaProfile>) -> Self {
+        self.profile = profile;
+        self
     }
 
     /// Calculate risk score for a detection match
@@ -286,43 +311,12 @@ impl ScoreCalculator {
                 (self.default_entity.clone(), None)
             }
             None => {
-                // Try common UDM fields in order of preference
-                // Priority: IPs > Hostnames > Users > Hashes
-                let common_fields = [
-                    // IP addresses (highest priority for network-based threats)
-                    "src_ip",
-                    "dest_ip",
-                    "dvc_ip",
-                    "src_translated_ip",
-                    "dest_translated_ip",
-                    // Hostnames (host-based threats)
-                    "src_host",
-                    "dest_host",
-                    "host",
-                    "hostname",
-                    "dest_nt_host",
-                    "src_nt_host",
-                    "dvc",
-                    // Users (user-based threats)
-                    "src_user",
-                    "dest_user",
-                    "user",
-                    "src_user_name",
-                    "dest_user_name",
-                    "src_nt_domain",
-                    "dest_nt_domain",
-                    // File hashes (malware/file-based threats)
-                    "file_hash",
-                    "process_hash",
-                    "service_hash",
-                    "service_dll_hash",
-                    "ssl_hash",
-                    // Legacy/nested paths for backward compatibility
-                    "metadata.src_ip",
-                    "metadata.user",
-                    "metadata.hostname",
-                ];
-                for field in common_fields {
+                // Auto-detect: walk the active profile's entity-extraction order
+                // (semantic role → physical field, in priority order). For UDM this
+                // is the byte-identical superset list (IPs > Hostnames > Users >
+                // Hashes > legacy paths); for OCSF it yields `src_endpoint.ip`,
+                // `user.name`, etc. (NAN-1241 Phase 5).
+                for &(_role, field) in self.profile.entity_extraction_order() {
                     for event in events {
                         if let Some(value) = Self::get_string_field(event, field) {
                             return (value, Some(field.to_string()));
@@ -334,18 +328,45 @@ impl ScoreCalculator {
         }
     }
 
-    /// Get a string field value from an event
+    /// Get a string field value from an event.
+    ///
+    /// ClickHouse `JSONEachRow` rows have FLAT keys that ARE the (possibly
+    /// dotted) physical column names: `SELECT *` over `ocsf_logs` returns a key
+    /// literally named `src_endpoint.ip`, not a nested `{"src_endpoint": {"ip":
+    /// …}}` object. So we resolve `field` as a FLAT key first.
+    ///
+    /// Only when the flat key is absent do we fall back to walking `field` as a
+    /// nested JSON path. This preserves UDM byte-for-byte:
+    /// - UDM entity fields are single-segment (`src_ip`) → flat lookup returns
+    ///   them exactly as the old nested walk did.
+    /// - UDM legacy paths (`metadata.src_ip`, `metadata.user`,
+    ///   `metadata.hostname`) have no flat key, so the nested fall-back resolves
+    ///   them through the `metadata` object — identical to the prior behavior.
+    /// - OCSF promoted dotted columns (`src_endpoint.ip`, `user.name`, …) now
+    ///   resolve via the flat lookup instead of collapsing to `unknown`
+    ///   (NAN-1241).
     fn get_string_field(event: &Value, field: &str) -> Option<String> {
+        // 1. Flat key: the dotted column name as-is (OCSF + single-segment UDM).
+        if let Some(v) = event.get(field) {
+            return Self::value_to_string(v);
+        }
+
+        // 2. Fall back to nested-path walk (UDM `metadata.*` legacy paths, or
+        //    any genuinely nested ext/metadata access).
         let parts: Vec<&str> = field.split('.').collect();
         let mut current = event;
-
         for part in parts {
             match current.get(part) {
                 Some(v) => current = v,
                 None => return None,
             }
         }
+        Self::value_to_string(current)
+    }
 
+    /// Coerce a JSON leaf to a non-empty string, treating empty strings as
+    /// missing (shared by flat + nested resolution above).
+    fn value_to_string(current: &Value) -> Option<String> {
         match current {
             Value::String(s) => {
                 // Filter out empty strings - treat them as missing values

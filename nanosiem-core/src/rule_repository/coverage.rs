@@ -51,16 +51,21 @@ impl CoverageAnalyzer {
     pub async fn refresh_available_fields(&mut self) -> Result<(), CoverageAnalyzerError> {
         let ch_client = self.dual_pool.clickhouse();
 
-        // Query all distinct source types (no time filter)
-        let query = r#"
+        // Query all distinct source types (no time filter).
+        // NAN-1241: read the active ingested-events table (ocsf_logs under OCSF)
+        // so rule coverage sees the source types that actually exist. UDM-identical.
+        let logs_table = crate::schema::active_logs_table();
+        let query = format!(
+            r#"
             SELECT DISTINCT source_type
-            FROM logs
+            FROM {logs_table}
             WHERE source_type != ''
             ORDER BY source_type
-        "#;
+        "#
+        );
 
         let result = ch_client
-            .query(query)
+            .query(&query)
             .fetch_all::<SourceTypeRow>()
             .await
             .map_err(|e| CoverageAnalyzerError::Query(e.to_string()))?;

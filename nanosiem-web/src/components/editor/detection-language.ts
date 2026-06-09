@@ -21,6 +21,19 @@ import {
 // Combined UDM field names (includes enriched, IOC, computed, and aliases)
 const UDM_FIELD_NAMES = new Set([...UDM_COLUMNS, ...ENRICHED_FIELDS_SET, ...IOC_FIELDS_SET, ...COMPUTED_FIELDS_SET, ...FIELD_ALIASES_SET]);
 
+/**
+ * Register additional field names for detection-editor syntax highlighting
+ * (NAN-1241) — e.g. the active schema's OCSF promoted columns from
+ * `getSchemaFields()`. The tokenizer reads the same Set reference, so additions
+ * take effect on the next keystroke. Under UDM this is never called with new
+ * names, so highlighting stays byte-identical.
+ */
+export function registerDetectionDynamicFields(fields: string[]) {
+  for (const f of fields) {
+    UDM_FIELD_NAMES.add(f);
+  }
+}
+
 // YAML keywords for value highlighting (sorted by length descending so longer matches are tried first)
 const YAML_KEYWORDS = [
   'auto-detect', 'per_event', 'scheduled', 'alerting', 'realtime', 'critical', 'staging',
@@ -270,10 +283,12 @@ function tokenizeQuery(stream: StringStream, state: DetectionState): string | nu
     return 'special(propertyName)';
   }
 
-  // Identifiers (check against known sets)
+  // Identifiers (check against known sets). Dots are included so OCSF promoted
+  // columns (`src_endpoint.ip`, `actor.user.name`) tokenize as a single field
+  // and match the registered schema set (NAN-1241); bare UDM names are unaffected.
   // Save current position to get the matched string
   const startPos = stream.pos;
-  if (stream.match(/^[a-zA-Z_][a-zA-Z0-9_]*/)) {
+  if (stream.match(/^[a-zA-Z_][a-zA-Z0-9_.]*/)) {
     // Get the matched word by extracting from the string
     const word = stream.string.slice(startPos, stream.pos);
     const wordLower = word.toLowerCase();

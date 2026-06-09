@@ -8,7 +8,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { ArrowRight, Check, ListFilter, Search, FileText } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { absTime, extractAction, extractIp, extractEventTime, relTime, topActions, meanTimeToDetect, type MatchView } from './helpers';
+import { absTime, extractAction, extractEventTime, eventEntityLabel, entityNoun, relTime, topActions, meanTimeToDetect, type MatchView } from './helpers';
+import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from '@/components/ui/tooltip';
 import { LatencyPill } from './LatencyPill';
 import { EventViewer } from './EventViewer';
 import { useIdentityUserLookup, useRulePredicates } from '@/hooks/use-api';
@@ -24,19 +25,25 @@ function entitySearchQuery(entity: MatchEntity): string | null {
   if (!raw) return null;
   // Escape backslashes first, then double quotes — order matters.
   const escaped = raw.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  // OR the UDM column names together with their OCSF promoted (dotted)
+  // equivalents so the entity dossier + recent-activity searches resolve under
+  // either schema profile (NAN-1287). UDM names hit UDM columns / OCSF aliases;
+  // OCSF dotted names hit the promoted OCSF columns. On the inactive schema the
+  // extra clauses resolve to empty `ext`/JSON lookups (harmless, no error).
+  // OCSF Sysmon events in particular live under `device.hostname` and
+  // `actor.user.name`, which the UDM names never reach.
   switch (entity.type) {
     case 'user':
     case 'role':
     case 'service':
       // ARN-style identifiers (CloudTrail) round-trip through user_identity.arn
-      // when present. Otherwise fall back to user= which matches the canonical
-      // UDM column.
+      // when present. Otherwise match the username across UDM + OCSF columns.
       if (raw.startsWith('arn:')) return `user_identity.arn="${escaped}"`;
-      return `user="${escaped}"`;
+      return `user="${escaped}" OR user.name="${escaped}" OR actor.user.name="${escaped}"`;
     case 'host':
-      return `src_host="${escaped}" OR dest_host="${escaped}" OR hostname="${escaped}"`;
+      return `src_host="${escaped}" OR dest_host="${escaped}" OR hostname="${escaped}" OR device.hostname="${escaped}" OR src_endpoint.hostname="${escaped}" OR dst_endpoint.hostname="${escaped}"`;
     case 'ip':
-      return `src_ip="${escaped}" OR dest_ip="${escaped}"`;
+      return `src_ip="${escaped}" OR dest_ip="${escaped}" OR src_endpoint.ip="${escaped}" OR dst_endpoint.ip="${escaped}"`;
     default:
       // Fall back to a free-text search on the raw value.
       return `"${escaped}"`;
@@ -242,16 +249,21 @@ function EventTimeline({
   const last = view.lastSeen.getTime();
   const range = Math.max(last - first, 1000);
 
-  const ipCounts = useMemo(() => {
+  // Lanes track the rule's grouping entity (host / user / ip), not just a
+  // source IP — so OCSF host/user-grouped matches render a meaningful lane
+  // instead of a single `—`. UDM IP rules still resolve to the IP via the same
+  // entity precedence (NAN-1287).
+  const entityCounts = useMemo(() => {
     const counts = new Map<string, number>();
     for (const e of view.events) {
-      const ip = extractIp(e) || '—';
-      counts.set(ip, (counts.get(ip) || 0) + 1);
+      const label = eventEntityLabel(e) || '—';
+      counts.set(label, (counts.get(label) || 0) + 1);
     }
     return counts;
   }, [view.events]);
 
-  const useSwimLanes = ipCounts.size <= SWIMLANE_MAX_IPS;
+  const noun = entityNoun(view.entity.type);
+  const useSwimLanes = entityCounts.size <= SWIMLANE_MAX_IPS;
 
   return (
     <div
@@ -263,7 +275,7 @@ function EventTimeline({
           Event timeline
         </span>
         <span className="font-mono text-[10px] text-muted-foreground">
-          {view.events.length} events · {ipCounts.size} source IP{ipCounts.size !== 1 ? 's' : ''}
+          {view.events.length} events · {entityCounts.size} {noun}{entityCounts.size !== 1 ? 's' : ''}
         </span>
         <span className="ml-auto font-mono text-[10px] text-muted-foreground tabular-nums">
           {absTime(view.firstSeen)} → {absTime(view.lastSeen)}
@@ -274,12 +286,12 @@ function EventTimeline({
       {useSwimLanes ? (
         <EventTimelineSwimLanes
           view={view}
-          ips={Array.from(ipCounts.keys())}
+          entities={Array.from(entityCounts.keys())}
           onEventHover={onEventHover}
           hoveredEventId={hoveredEventId}
         />
       ) : (
-        <EventTimelineDensity view={view} ipCounts={ipCounts} />
+        <EventTimelineDensity view={view} entityCounts={entityCounts} noun={noun} />
       )}
     </div>
   );
@@ -287,37 +299,45 @@ function EventTimeline({
 
 function EventTimelineSwimLanes({
   view,
-  ips,
+  entities,
   onEventHover,
   hoveredEventId,
 }: {
   view: MatchView;
-  ips: string[];
+  entities: string[];
   onEventHover: (id: string | null) => void;
   hoveredEventId: string | null;
 }) {
   const first = view.firstSeen.getTime();
   const last = view.lastSeen.getTime();
   const range = Math.max(last - first, 1000);
-  const ipRow = (ip: string | undefined) => Math.max(0, ips.indexOf(ip || '—'));
+  const entityRow = (label: string | undefined) => Math.max(0, entities.indexOf(label || '—'));
   const rowH = 14;
-  const chartH = ips.length * rowH + 12;
+  const chartH = entities.length * rowH + 12;
 
   return (
     <div className="px-3 py-2">
       <div className="relative" style={{ height: chartH + 20 }}>
-        {/* Row labels */}
-        <div className="absolute left-3 top-2 flex flex-col" style={{ gap: '2px' }}>
-          {ips.map((ip) => (
-            <div
-              key={ip}
-              className="font-mono text-[9px] text-muted-foreground/70 tabular-nums"
-              style={{ height: rowH, lineHeight: `${rowH}px` }}
-            >
-              {ip}
-            </div>
-          ))}
-        </div>
+        {/* Row labels — truncated to the label gutter; full value on hover. */}
+        <TooltipProvider delayDuration={200}>
+          <div className="absolute left-3 top-2 flex flex-col" style={{ gap: '2px' }}>
+            {entities.map((label) => (
+              <Tooltip key={label}>
+                <TooltipTrigger asChild>
+                  <div
+                    className="font-mono text-[9px] text-muted-foreground/70 tabular-nums truncate cursor-default"
+                    style={{ height: rowH, lineHeight: `${rowH}px`, width: 84 }}
+                  >
+                    {label}
+                  </div>
+                </TooltipTrigger>
+                <TooltipContent side="right" className="font-mono text-[10px]">
+                  {label}
+                </TooltipContent>
+              </Tooltip>
+            ))}
+          </div>
+        </TooltipProvider>
         {/* Events */}
         <div className="absolute top-2 right-3" style={{ left: 100, height: chartH }}>
           <div
@@ -328,8 +348,8 @@ function EventTimelineSwimLanes({
             const t = extractEventTime(e);
             if (!t) return null;
             const x = ((t.getTime() - first) / range) * 100;
-            const ip = extractIp(e);
-            const y = ipRow(ip) * rowH + rowH / 2 - 3;
+            const label = eventEntityLabel(e);
+            const y = entityRow(label) * rowH + rowH / 2 - 3;
             const raw = e as Record<string, unknown>;
             const eventId = typeof raw.id === 'string' ? raw.id : `ev_${i}`;
             const hovered = hoveredEventId === eventId;
@@ -366,10 +386,12 @@ function EventTimelineSwimLanes({
 
 function EventTimelineDensity({
   view,
-  ipCounts,
+  entityCounts,
+  noun,
 }: {
   view: MatchView;
-  ipCounts: Map<string, number>;
+  entityCounts: Map<string, number>;
+  noun: string;
 }) {
   const first = view.firstSeen.getTime();
   const last = view.lastSeen.getTime();
@@ -395,12 +417,12 @@ function EventTimelineDensity({
 
   const topIps = useMemo(
     () =>
-      Array.from(ipCounts.entries())
+      Array.from(entityCounts.entries())
         .sort((a, b) => b[1] - a[1])
         .slice(0, TOP_N),
-    [ipCounts],
+    [entityCounts],
   );
-  const tailCount = ipCounts.size - topIps.length;
+  const tailCount = entityCounts.size - topIps.length;
   const topMax = topIps[0]?.[1] ?? 1;
 
   return (
@@ -437,7 +459,7 @@ function EventTimelineDensity({
 
       <div className="border-t border-border/60 pt-2.5">
         <div className="font-mono text-[9.5px] uppercase tracking-[0.12em] text-muted-foreground font-semibold mb-1.5">
-          Top source IPs
+          Top {noun}s
         </div>
         <div className="flex flex-col gap-1">
           {topIps.map(([ip, count]) => (

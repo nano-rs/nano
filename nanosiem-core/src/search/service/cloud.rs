@@ -10,18 +10,261 @@ impl SearchService {
     ///
     /// Pushes a `column IN (?, ?, ...)` condition into `conditions` and the
     /// corresponding values into `bind_values`.  No-ops when `vals` is None or empty.
+    ///
+    /// `udm_field` is the UDM-semantic field name (e.g. `cloud_provider`); it is
+    /// resolved through the active schema profile to the physical column. When the
+    /// active schema has no column for that concept the filter is skipped entirely
+    /// (no dead `ext.` reference) and its values are dropped — they have no column
+    /// to match against under this schema.
     fn build_cloud_in_filter(
-        column: &str,
+        profile: &dyn crate::schema::SchemaProfile,
+        udm_field: &str,
         vals: &Option<Vec<String>>,
         conditions: &mut Vec<String>,
         bind_values: &mut Vec<String>,
     ) {
+        let Some(column) = profile.udm_column_sql(udm_field) else {
+            return;
+        };
         if let Some(ref vs) = vals {
             if !vs.is_empty() {
                 let placeholders = vec!["?"; vs.len()].join(",");
                 conditions.push(format!("{} IN ({})", column, placeholders));
                 bind_values.extend(vs.iter().cloned());
             }
+        }
+    }
+
+    /// Resolve a UDM-semantic field to a `SELECT`-list projection term under the
+    /// active schema, aliasing back to the UDM name so result-set keys stay stable
+    /// across schemas. Returns `None` when the schema has no column for the concept
+    /// (caller drops the term). The alias is omitted when the physical column is
+    /// already the UDM name (UDM schema) so the emitted SQL stays byte-identical to
+    /// the pre-seam literal projection.
+    fn cloud_select_term(
+        profile: &dyn crate::schema::SchemaProfile,
+        udm_field: &str,
+    ) -> Option<String> {
+        profile.udm_column_sql(udm_field).map(|col| {
+            if col == udm_field {
+                col
+            } else {
+                format!("{col} AS {udm_field}")
+            }
+        })
+    }
+
+    /// Cloud-event column projection shared by the events SELECT lists. Resolves
+    /// each cloud UDM field through the active profile, drops unmapped ones, and
+    /// returns a trailing-comma-terminated fragment (empty string if nothing maps)
+    /// so it can be spliced after a fixed leading column. For UDM this is the exact
+    /// `cloud_provider, cloud_service, ... mfa_used,` literal used before the seam.
+    fn cloud_event_projection(profile: &dyn crate::schema::SchemaProfile) -> String {
+        const CLOUD_EVENT_FIELDS: [&str; 9] = [
+            "cloud_provider",
+            "cloud_service",
+            "cloud_region",
+            "cloud_account_id",
+            "resource_id",
+            "resource_name",
+            "resource_type",
+            "change_type",
+            "mfa_used",
+        ];
+        let terms: Vec<String> = CLOUD_EVENT_FIELDS
+            .iter()
+            .filter_map(|f| {
+                // change_type is profile-decoded to its display label: UDM emits the
+                // bare column (byte-identical), OCSF decodes activity_id -> the UDM
+                // label and aliases back to `change_type` so the result key is stable
+                // and the frontend shows create/read/update/delete, not 1/2/3/4.
+                if *f == "change_type" {
+                    return match Self::change_type_label_expr(profile).as_str() {
+                        // UDM bare column: keep the literal projection (no alias).
+                        "change_type" => Some("change_type".to_string()),
+                        "''" => None, // no column under this schema -> drop the term
+                        expr => Some(format!("{expr} AS change_type")),
+                    };
+                }
+                Self::cloud_select_term(profile, f)
+            })
+            .collect();
+        if terms.is_empty() {
+            String::new()
+        } else {
+            format!("{},", terms.join(", "))
+        }
+    }
+
+    /// Trailing cross-cutting projection appended to every cloud-event SELECT.
+    ///
+    /// `user`, `src_ip`, `http_user_agent`, `action`, and `http_status_code` are
+    /// UDM-semantic fields that do NOT exist as bare columns on `ocsf_logs` (OCSF
+    /// promotes them to dotted columns: `user.name`, `src_endpoint.ip`,
+    /// `http_request.user_agent`, `activity`, `http_response.code`). Each is
+    /// resolved through the profile and aliased back to the UDM result-key so the
+    /// JSONEachRow keys stay stable; unmapped fields are dropped (key simply absent
+    /// for that schema). `source_type` and `status` are real `ocsf_logs` columns
+    /// and stay bare. Under UDM every term resolves to the same name, so the SQL
+    /// stays byte-identical (modulo the seam's reserved-word quoting of `user`).
+    ///
+    /// Returns a fragment that begins on a fresh indented line, e.g.
+    /// `"\n                   user, src_ip, ... status, http_status_code"`.
+    fn cloud_event_crosscutting_projection(profile: &dyn crate::schema::SchemaProfile) -> String {
+        let mut terms: Vec<String> = Vec::new();
+        // user / src_ip / http_user_agent: alias back to the UDM key.
+        for udm_field in ["user", "src_ip", "http_user_agent"] {
+            if let Some(col) = profile.udm_column_sql(udm_field) {
+                if col == udm_field {
+                    terms.push(col);
+                } else {
+                    terms.push(format!("{col} AS {udm_field}"));
+                }
+            }
+        }
+        // source_type: real ocsf_logs column, always bare.
+        terms.push("source_type".to_string());
+        // action -> event_type result key. (Ordered between source_type and status
+        // to mirror the pre-seam literal projection.)
+        if let Some(col) = profile.udm_column_sql("action") {
+            terms.push(format!("{col} AS event_type"));
+        }
+        // status: real ocsf_logs column, always bare.
+        terms.push("status".to_string());
+        // http_status_code -> alias back to the UDM key.
+        if let Some(col) = profile.udm_column_sql("http_status_code") {
+            if col == "http_status_code" {
+                terms.push(col);
+            } else {
+                terms.push(format!("{col} AS http_status_code"));
+            }
+        }
+        format!("\n                   {}", terms.join(", "))
+    }
+
+    /// Enrichment/IOC tail appended to the user-timeline and entity-pivot event
+    /// SELECTs. These are UDM-physical MATERIALIZED columns absent from `ocsf_logs`,
+    /// so the tail is emitted only under the UDM schema; under OCSF it is empty
+    /// (the enrichment/IOC keys are simply absent from those event rows).
+    /// TODO(OCSF): emit profile-mapped enrichment/IOC columns once `ocsf_logs`
+    /// carries equivalents.
+    fn cloud_enrichment_tail(profile: &dyn crate::schema::SchemaProfile) -> &'static str {
+        if profile.id() == crate::schema::SchemaId::Udm {
+            ",\n                   enriched_src_country_code, enriched_src_asn, enriched_src_as_name,\n                   ioc_src_ip_threat_type, ioc_src_ip_malware, ioc_src_ip_confidence"
+        } else {
+            ""
+        }
+    }
+
+    /// Decode a UDM `change_type` literal → its OCSF `activity_id` enum code for
+    /// the cloud / API Activity (class_uid 6003) context: Create=1, Update=3,
+    /// Delete=4 (Read=2 is not a UDM change_type). `permission_change` has no
+    /// OCSF `activity_id` and is unrepresentable → `None` (NAN-1248).
+    pub(crate) fn change_type_activity_id(literal: &str) -> Option<u8> {
+        match literal {
+            "create" => Some(1),
+            "update" => Some(3),
+            "delete" => Some(4),
+            // permission_change (and anything unexpected): no OCSF activity_id code.
+            _ => None,
+        }
+    }
+
+    /// Build a `change_type = '<literal>'` predicate for `countIf`. UDM stores
+    /// `change_type` as a string, so the predicate is emitted verbatim
+    /// (byte-identical). OCSF maps `change_type` onto the numeric `activity_id`
+    /// enum (NAN-1248): decode the literal to its code and compare numerically;
+    /// literals with no OCSF code (`permission_change`) match nothing (`0`).
+    pub(crate) fn change_type_equals(profile: &dyn crate::schema::SchemaProfile, literal: &str) -> String {
+        match profile.udm_column_sql("change_type") {
+            Some(col) if col == "change_type" => format!("change_type = '{literal}'"),
+            Some(col) => match Self::change_type_activity_id(literal) {
+                Some(code) => format!("{col} = {code}"),
+                None => "0".to_string(),
+            },
+            None => "0".to_string(),
+        }
+    }
+
+    /// Build a `change_type IN (...)` predicate. UDM emits the string IN-list
+    /// verbatim; OCSF decodes each literal to its `activity_id` code, dropping
+    /// unrepresentable ones (`permission_change`), and emits a numeric IN-list.
+    /// `0` (match nothing) when no literal maps under OCSF (NAN-1248).
+    pub(crate) fn change_type_in(profile: &dyn crate::schema::SchemaProfile, literals: &[&str]) -> String {
+        match profile.udm_column_sql("change_type") {
+            Some(col) if col == "change_type" => {
+                let list = literals
+                    .iter()
+                    .map(|l| format!("'{l}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("change_type IN ({list})")
+            }
+            Some(col) => {
+                let codes: Vec<String> = literals
+                    .iter()
+                    .filter_map(|l| Self::change_type_activity_id(l).map(|c| c.to_string()))
+                    .collect();
+                if codes.is_empty() {
+                    "0".to_string()
+                } else {
+                    format!("{col} IN ({})", codes.join(", "))
+                }
+            }
+            None => "0".to_string(),
+        }
+    }
+
+    /// Build a SELECT-list expression that yields the *display* `change_type`
+    /// label under the active profile. UDM stores `change_type` as the literal
+    /// string, so the bare column is returned (byte-identical projection). OCSF
+    /// maps `change_type` onto the numeric `activity_id` enum, so the raw int
+    /// (1/2/3/4) would surface to the frontend; decode it back to the UDM label
+    /// (create/read/update/delete) via `transform`, falling back to the raw code
+    /// for any value outside the enum. `None` (no column) -> empty-string literal.
+    /// Use this for change_type PROJECTIONS only; predicates use
+    /// `change_type_equals`/`change_type_in` (NAN-1248, gaps #23/#24).
+    pub(crate) fn change_type_label_expr(profile: &dyn crate::schema::SchemaProfile) -> String {
+        match profile.udm_column_sql("change_type") {
+            Some(col) if col == "change_type" => "change_type".to_string(), // UDM bare (byte-identical)
+            Some(col) => format!(
+                "transform({col}, [1, 2, 3, 4], ['create', 'read', 'update', 'delete'], toString({col}))"
+            ),
+            None => "''".to_string(),
+        }
+    }
+
+    /// The cloud PRINCIPAL column (the IAM user / role / service account making
+    /// the API call). UDM stores it in `user`; OCSF API Activity (6003) puts the
+    /// caller in `actor.user.name` — the top-level `user.name` is the *target* and
+    /// is usually empty for cloud events — so under OCSF we prefer
+    /// `actor.user.name` and fall back to `user.name`. UDM byte-identical (returns
+    /// the bare `user` column). `None` only if the schema maps neither. (NAN-1248)
+    pub(crate) fn cloud_principal_col(profile: &dyn crate::schema::SchemaProfile) -> Option<String> {
+        match profile.id() {
+            crate::schema::SchemaId::Ocsf => {
+                let actor = crate::query::escape_identifier("actor.user.name");
+                let user = crate::query::escape_identifier("user.name");
+                Some(format!("if({actor} != '', {actor}, {user})"))
+            }
+            _ => profile.udm_column_sql("user"),
+        }
+    }
+
+    /// The `status` column wrapped for value comparison under the active profile.
+    /// UDM stores lowercase status values, so the raw column is returned
+    /// (byte-identical). OCSF stores the capitalized status caption
+    /// ('Success'/'Failure'/'Unknown'/'Other'), so it is wrapped in `lower(...)`
+    /// to match the lowercase UDM literals callers compare against. Values OCSF
+    /// does not carry ('error'/'denied') simply never match — callers OR an
+    /// `http_response.code` fallback for those. (NAN-1248)
+    pub(crate) fn status_cmp_col(profile: &dyn crate::schema::SchemaProfile) -> String {
+        let col = profile
+            .udm_column_sql("status")
+            .unwrap_or_else(|| "status".to_string());
+        match profile.id() {
+            crate::schema::SchemaId::Ocsf => format!("lower({col})"),
+            _ => col,
         }
     }
 
@@ -46,7 +289,9 @@ impl SearchService {
             },
             Err(_) => {
                 // Fallback: just use time range filter
-                let logs_table = self.table_names.read("logs");
+                let logs_table = self
+                    .table_names
+                    .read(Self::logs_table_key(self.active_profile.as_ref()));
                 format!(
                     "SELECT * FROM {logs_table} PREWHERE timestamp BETWEEN '{}' AND '{}' ORDER BY timestamp DESC",
                     time_range.start.format("%Y-%m-%d %H:%M:%S%.6f"),
@@ -58,18 +303,28 @@ impl SearchService {
         // MATERIALIZED columns are excluded from SELECT * in ClickHouse.
         // Cloud user-timeline and entity-pivot queries need enrichment/IOC columns,
         // so inject them into the base SELECT.
-        let materialized_cols = ", enriched_src_country, enriched_src_country_code, \
-            enriched_src_asn, enriched_src_as_name, enriched_src_as_domain, \
-            enriched_dest_country, enriched_dest_country_code, \
-            enriched_dest_asn, enriched_dest_as_name, enriched_dest_as_domain, \
-            ioc_src_ip_threat_type, ioc_src_ip_malware, ioc_src_ip_confidence, \
-            ioc_dest_ip_threat_type, ioc_dest_ip_malware, ioc_dest_ip_confidence, \
-            ioc_domain_threat_type, ioc_domain_malware, ioc_domain_confidence, \
-            ioc_hash_threat_type, ioc_hash_malware, ioc_hash_confidence, \
-            ioc_confidence, ioc_tags, ioc_source";
+        //
+        // These are UDM-physical enrichment/IOC column names. The OCSF schema
+        // (`ocsf_logs`) does not carry these MATERIALIZED columns, so injecting
+        // them there would 500 with an unknown-column error. Gate the injection on
+        // the active schema being UDM; under OCSF the enrichment/IOC columns are
+        // simply absent from the cloud event rows.
+        // TODO(OCSF): provide enrichment/IOC equivalents on ocsf_logs and inject the
+        // profile-mapped column names here once they exist.
         let mut sql = base_sql.trim_end_matches(';').to_string();
-        if !sql.contains("enriched_src_country_code") {
-            sql = sql.replacen("SELECT *", &format!("SELECT *{}", materialized_cols), 1);
+        if self.active_profile.id() == crate::schema::SchemaId::Udm {
+            let materialized_cols = ", enriched_src_country, enriched_src_country_code, \
+                enriched_src_asn, enriched_src_as_name, enriched_src_as_domain, \
+                enriched_dest_country, enriched_dest_country_code, \
+                enriched_dest_asn, enriched_dest_as_name, enriched_dest_as_domain, \
+                ioc_src_ip_threat_type, ioc_src_ip_malware, ioc_src_ip_confidence, \
+                ioc_dest_ip_threat_type, ioc_dest_ip_malware, ioc_dest_ip_confidence, \
+                ioc_domain_threat_type, ioc_domain_malware, ioc_domain_confidence, \
+                ioc_hash_threat_type, ioc_hash_malware, ioc_hash_confidence, \
+                ioc_confidence, ioc_tags, ioc_source";
+            if !sql.contains("enriched_src_country_code") {
+                sql = sql.replacen("SELECT *", &format!("SELECT *{}", materialized_cols), 1);
+            }
         }
 
         Ok(format!("cloud_base AS ({})", sql))
@@ -141,73 +396,122 @@ impl SearchService {
             }
         };
 
-        // 1. Facet summary query — UNION ALL for 6 dimensions
+        // Active schema profile — resolves UDM-semantic cloud field names to the
+        // physical column for this schema. `None` => the schema has no column for
+        // that concept, so the dimension/projection is skipped (never a dead ref).
+        let profile = self.active_profile.as_ref();
+
+        // 1. Facet summary query — UNION ALL over the cloud dimensions that exist
+        // under the active schema. The `dimension` label stays the UDM-semantic
+        // name (frontend keys off it); only the physical column is profile-mapped.
         let facet_dimensions = [
-            ("cloud_provider", "cloud_provider"),
-            ("cloud_service", "cloud_service"),
-            ("cloud_region", "cloud_region"),
-            ("cloud_account_id", "cloud_account_id"),
-            ("resource_type", "resource_type"),
-            ("change_type", "change_type"),
+            "cloud_provider",
+            "cloud_service",
+            "cloud_region",
+            "cloud_account_id",
+            "resource_type",
+            "change_type",
         ];
-        let facet_unions: Vec<String> = facet_dimensions.iter().map(|(dim_name, col)| {
-            format!(
-                "SELECT '{}' AS dimension, toString({}) AS value, count() AS cnt FROM cloud_base WHERE {} != '' GROUP BY {} ORDER BY cnt DESC LIMIT 20",
-                dim_name, col, col, col
-            )
-        }).collect();
+        let facet_unions: Vec<String> = facet_dimensions
+            .iter()
+            .filter_map(|dim_name| profile.udm_column_sql(dim_name).and_then(|col| {
+                // change_type maps to the numeric `activity_id` (UInt32) under OCSF.
+                // `WHERE activity_id != ''` is a Code 32 type error and the facet
+                // strings would be meaningless enum codes, so emit the change_type
+                // facet dimension ONLY when it resolves to the literal UDM column.
+                // (Same UDM-only discriminator as `change_type_equals`.)
+                if *dim_name == "change_type" && col != "change_type" {
+                    return None;
+                }
+                Some(format!(
+                    "SELECT '{}' AS dimension, toString({}) AS value, count() AS cnt FROM cloud_base WHERE {} != '' GROUP BY {} ORDER BY cnt DESC LIMIT 20",
+                    dim_name, col, col, col
+                ))
+            }))
+            .collect();
         let facet_sql = format!("WITH {} {}", base_cte, facet_unions.join(" UNION ALL "));
 
+        // Cloud-column projection for the events SELECT. Each UDM field is resolved
+        // to its physical column and aliased back to the UDM name so the JSONEachRow
+        // keys are stable across schemas; unmapped fields are dropped (the key is
+        // simply absent for that schema rather than emitting a dead reference).
+        let cloud_event_cols = Self::cloud_event_projection(profile);
+
         // 2. Paginated events query
+        let crosscutting_cols = Self::cloud_event_crosscutting_projection(profile);
         let events_sql = format!(
             r#"WITH {}
-            SELECT timestamp, cloud_provider, cloud_service, cloud_region, cloud_account_id,
-                   resource_id, resource_name, resource_type, change_type, mfa_used,
-                   user, src_ip, http_user_agent, source_type, action AS event_type,
-                   status, http_status_code
+            SELECT timestamp, {}{}
             FROM cloud_base
             ORDER BY timestamp DESC
             LIMIT {} OFFSET 0"#,
             base_cte,
+            cloud_event_cols,
+            crosscutting_cols,
             Self::CLOUD_EVENT_PAGE_SIZE
         );
 
         // 3. Total count query
         let count_sql = format!("WITH {} SELECT count() AS cnt FROM cloud_base", base_cte);
 
+        // Resolve the resource/cloud columns once. `resource_id/name/type` and
+        // `change_type` map in both schemas; fall back to the UDM name if a schema
+        // ever lacks one so the aggregate still builds (rows just come back empty).
+        let resource_id_col = profile
+            .udm_column_sql("resource_id")
+            .unwrap_or_else(|| "resource_id".to_string());
+        let resource_name_col = profile
+            .udm_column_sql("resource_name")
+            .unwrap_or_else(|| "resource_name".to_string());
+        let resource_type_col = profile
+            .udm_column_sql("resource_type")
+            .unwrap_or_else(|| "resource_type".to_string());
+        // Display-decode for the change_types[] rollup: UDM emits `change_type`
+        // bare (byte-identical), OCSF decodes activity_id -> the UDM label so the
+        // resource panel shows create/read/update/delete, not 1/2/3/4 (gap #24).
+        let change_type_label_expr = Self::change_type_label_expr(profile);
+        let cloud_service_col = profile
+            .udm_column_sql("cloud_service")
+            .unwrap_or_else(|| "cloud_service".to_string());
+        let mfa_used_col = profile
+            .udm_column_sql("mfa_used")
+            .unwrap_or_else(|| "mfa_used".to_string());
+
         // 4. Resource activity query
         let resources_sql = format!(
             r#"WITH {}
-            SELECT resource_id, any(resource_name) AS resource_name, any(resource_type) AS resource_type,
+            SELECT {resource_id_col} AS resource_id, any({resource_name_col}) AS resource_name, any({resource_type_col}) AS resource_type,
                    count() AS event_count,
                    toString(min(timestamp)) AS first_seen,
                    toString(max(timestamp)) AS last_seen,
-                   groupUniqArray(change_type) AS change_types
+                   groupUniqArray({change_type_label_expr}) AS change_types
             FROM cloud_base
-            WHERE resource_id != ''
-            GROUP BY resource_id
+            WHERE {resource_id_col} != ''
+            GROUP BY {resource_id_col}
             ORDER BY event_count DESC
             LIMIT 100"#,
             base_cte
         );
 
-        // 5. Optional MFA analysis query
-        let mfa_sql = if cloud_info.show_mfa {
-            Some(format!(
+        // 5. Optional MFA analysis query. `user` is profile-mapped (OCSF promotes
+        // it to `user.name`); aliased back to `user` so the deser struct key is
+        // stable. Skipped entirely when the schema has no user column.
+        let user_col = Self::cloud_principal_col(profile);
+        let mfa_sql = match (cloud_info.show_mfa, &user_col) {
+            (true, Some(user_col)) => Some(format!(
                 r#"WITH {}
-                SELECT user, groupUniqArray(cloud_service) AS services,
-                       countIf(mfa_used = 1) AS mfa_count,
-                       countIf(mfa_used = 0) AS no_mfa_count
+                SELECT {user_col} AS user, groupUniqArray({cloud_service_col}) AS services,
+                       countIf({mfa_used_col} = 1) AS mfa_count,
+                       countIf({mfa_used_col} = 0) AS no_mfa_count
                 FROM cloud_base
-                WHERE user != '' AND (mfa_used = 0 OR mfa_used = 1)
-                GROUP BY user
+                WHERE {user_col} != '' AND ({mfa_used_col} = 0 OR {mfa_used_col} = 1)
+                GROUP BY {user_col}
                 HAVING no_mfa_count > 0
                 ORDER BY no_mfa_count DESC
                 LIMIT 50"#,
                 base_cte
-            ))
-        } else {
-            None
+            )),
+            _ => None,
         };
 
         // Execute queries in parallel
@@ -327,8 +631,12 @@ impl SearchService {
             }
         };
 
-        // 6. User activity query (from pre-aggregated MV)
-        let user_activity_sql = format!(
+        // 6. User activity query (from pre-aggregated MV). The MV table `ua` keeps a
+        // real `user` column; only the `cloud_base` side of the join is profile-
+        // mapped (OCSF promotes `user` -> `user.name`). The inner subquery aliases
+        // the mapped column back to `user` so the join key + struct deser stay
+        // stable. Skipped entirely when the schema has no user column.
+        let user_activity_sql = user_col.as_ref().map(|user_col| format!(
             r#"WITH {}
             SELECT
                 cb.user AS user,
@@ -343,9 +651,9 @@ impl SearchService {
                 sum(ua.no_mfa_count) AS no_mfa_count
             FROM {cloud_user_activity_table} AS ua
             INNER JOIN (
-                SELECT DISTINCT user
+                SELECT DISTINCT {user_col} AS user
                 FROM cloud_base
-                WHERE user != ''
+                WHERE {user_col} != ''
             ) AS cb ON ua.user = cb.user
             WHERE ua.time_bucket >= toStartOfHour(toDateTime('{}'))
               AND ua.time_bucket <= '{}'
@@ -356,9 +664,12 @@ impl SearchService {
             time_range.start.format("%Y-%m-%d %H:%M:%S"),
             time_range.end.format("%Y-%m-%d %H:%M:%S"),
             cloud_user_activity_table = self.table_names.read("cloud_user_activity_agg"),
-        );
+        ));
 
         let user_activity_future = async {
+            let Some(ref sql) = user_activity_sql else {
+                return Vec::new();
+            };
             #[derive(Debug, clickhouse::Row, serde::Deserialize)]
             struct UserActivityRow {
                 user: String,
@@ -373,7 +684,7 @@ impl SearchService {
                 no_mfa_count: u64,
             }
             match clickhouse
-                .query(&user_activity_sql)
+                .query(sql)
                 .fetch_all::<UserActivityRow>()
                 .await
             {
@@ -530,65 +841,105 @@ impl SearchService {
             }
         };
 
+        // Active schema profile — resolves UDM-semantic cloud field names to the
+        // physical column for this schema (None => no column => filter skipped).
+        let profile = self.active_profile.as_ref();
+
         // Build filter conditions from CloudEventFilters
         let mut filter_conditions: Vec<String> = Vec::new();
         let mut filter_bind_values: Vec<String> = Vec::new();
         if let Some(f) = filters {
             Self::build_cloud_in_filter(
+                profile,
                 "cloud_provider",
                 &f.cloud_providers,
                 &mut filter_conditions,
                 &mut filter_bind_values,
             );
             Self::build_cloud_in_filter(
+                profile,
                 "cloud_service",
                 &f.cloud_services,
                 &mut filter_conditions,
                 &mut filter_bind_values,
             );
             Self::build_cloud_in_filter(
+                profile,
                 "cloud_region",
                 &f.cloud_regions,
                 &mut filter_conditions,
                 &mut filter_bind_values,
             );
             Self::build_cloud_in_filter(
+                profile,
                 "cloud_account_id",
                 &f.cloud_account_ids,
                 &mut filter_conditions,
                 &mut filter_bind_values,
             );
             Self::build_cloud_in_filter(
+                profile,
                 "resource_type",
                 &f.resource_types,
                 &mut filter_conditions,
                 &mut filter_bind_values,
             );
-            Self::build_cloud_in_filter(
-                "change_type",
-                &f.change_types,
-                &mut filter_conditions,
-                &mut filter_bind_values,
-            );
+            // change_type maps to the numeric `activity_id` (UInt32) under OCSF, so
+            // `activity_id IN ('permission_change', ...)` is a Code 53 type error.
+            // Apply the change_type IN-filter ONLY when it resolves to the literal
+            // UDM string column; under OCSF drop the filter (and its binds — they
+            // have no string column to match) so placeholder/bind counts stay aligned.
+            if profile.udm_column_sql("change_type").as_deref() == Some("change_type") {
+                Self::build_cloud_in_filter(
+                    profile,
+                    "change_type",
+                    &f.change_types,
+                    &mut filter_conditions,
+                    &mut filter_bind_values,
+                );
+            }
             if let Some(ref search_text) = f.search_text {
                 if !search_text.is_empty() {
                     let lowered = search_text.to_lowercase();
+                    // Free-text OR over message + a set of profile-mapped columns.
+                    // `message` is a real ocsf_logs materialized column (always
+                    // present). The cross-cutting fields (action/user/src_ip/
+                    // http_user_agent) do NOT exist bare on ocsf_logs — they promote
+                    // to dotted columns — so each term is emitted ONLY when its column
+                    // resolves under the active schema, pushing exactly one bind per
+                    // emitted term so placeholder/bind counts stay aligned.
+                    let resource_id_col = profile
+                        .udm_column_sql("resource_id")
+                        .unwrap_or_else(|| "resource_id".to_string());
+                    let resource_name_col = profile
+                        .udm_column_sql("resource_name")
+                        .unwrap_or_else(|| "resource_name".to_string());
                     // Use lower(message) with expression-based text index for the heaviest field.
                     // Other fields are short/sparse so position(lower(...)) is fine.
-                    // Each ? is a separate positional bind, so we push the value 7 times.
-                    filter_conditions.push(
-                        "( \
-                            position(lower(message), ?) > 0 \
-                            OR position(lower(action), ?) > 0 \
-                            OR position(lower(user), ?) > 0 \
-                            OR position(lower(src_ip), ?) > 0 \
-                            OR (resource_id != '' AND position(lower(resource_id), ?) > 0) \
-                            OR (resource_name != '' AND position(lower(resource_name), ?) > 0) \
-                            OR (http_user_agent != '' AND position(lower(http_user_agent), ?) > 0) \
-                        )"
-                        .to_string(),
-                    );
-                    for _ in 0..7 {
+                    let mut or_terms: Vec<String> =
+                        vec!["position(lower(message), ?) > 0".to_string()];
+                    if let Some(col) = profile.udm_column_sql("action") {
+                        or_terms.push(format!("position(lower({col}), ?) > 0"));
+                    }
+                    if let Some(col) = Self::cloud_principal_col(profile) {
+                        or_terms.push(format!("position(lower({col}), ?) > 0"));
+                    }
+                    if let Some(col) = profile.udm_column_sql("src_ip") {
+                        or_terms.push(format!("position(lower({col}), ?) > 0"));
+                    }
+                    or_terms.push(format!(
+                        "({resource_id_col} != '' AND position(lower({resource_id_col}), ?) > 0)"
+                    ));
+                    or_terms.push(format!(
+                        "({resource_name_col} != '' AND position(lower({resource_name_col}), ?) > 0)"
+                    ));
+                    if let Some(col) = profile.udm_column_sql("http_user_agent") {
+                        or_terms.push(format!("({col} != '' AND position(lower({col}), ?) > 0)"));
+                    }
+                    // One positional bind per emitted term.
+                    let term_count = or_terms.len();
+                    filter_conditions.push(format!("( {} )", or_terms.join(" OR ")));
+                    for _ in 0..term_count {
                         filter_bind_values.push(lowered.clone());
                     }
                 }
@@ -621,19 +972,28 @@ impl SearchService {
         // This avoids 6 redundant CTE evaluations (ClickHouse inlines CTEs into each UNION ALL branch).
         let facet_sql = if offset == 0 {
             let facet_dimensions = [
-                ("cloud_provider", "cloud_provider"),
-                ("cloud_service", "cloud_service"),
-                ("cloud_region", "cloud_region"),
-                ("cloud_account_id", "cloud_account_id"),
-                ("resource_type", "resource_type"),
-                ("change_type", "change_type"),
+                "cloud_provider",
+                "cloud_service",
+                "cloud_region",
+                "cloud_account_id",
+                "resource_type",
+                "change_type",
             ];
-            let facet_unions: Vec<String> = facet_dimensions.iter().map(|(dim_name, col)| {
-                format!(
-                    "SELECT '{}' AS dimension, toString({}) AS value, count() AS cnt FROM {} WHERE {} != '' GROUP BY {} ORDER BY cnt DESC LIMIT 20",
-                    dim_name, col, source_table, col, col
-                )
-            }).collect();
+            let facet_unions: Vec<String> = facet_dimensions
+                .iter()
+                .filter_map(|dim_name| profile.udm_column_sql(dim_name).and_then(|col| {
+                    // change_type -> numeric activity_id (UInt32) under OCSF; emit the
+                    // facet dimension ONLY when it resolves to the literal UDM column,
+                    // else `WHERE activity_id != ''` is a Code 32 type error.
+                    if *dim_name == "change_type" && col != "change_type" {
+                        return None;
+                    }
+                    Some(format!(
+                        "SELECT '{}' AS dimension, toString({}) AS value, count() AS cnt FROM {} WHERE {} != '' GROUP BY {} ORDER BY cnt DESC LIMIT 20",
+                        dim_name, col, source_table, col, col
+                    ))
+                }))
+                .collect();
             Some(format!(
                 "{} {}",
                 filtered_cte,
@@ -643,17 +1003,18 @@ impl SearchService {
             None
         };
 
+        // Cloud-event projection (profile-mapped, unmapped fields dropped).
+        let cloud_event_cols = Self::cloud_event_projection(profile);
+
         // 2. Paginated events query
+        let crosscutting_cols = Self::cloud_event_crosscutting_projection(profile);
         let events_sql = format!(
             r#"{}
-            SELECT timestamp, cloud_provider, cloud_service, cloud_region, cloud_account_id,
-                   resource_id, resource_name, resource_type, change_type, mfa_used,
-                   user, src_ip, http_user_agent, source_type, action AS event_type,
-                   status, http_status_code
+            SELECT timestamp, {}{}
             FROM {}
             ORDER BY timestamp DESC
             LIMIT {} OFFSET {}"#,
-            filtered_cte, source_table, limit, offset
+            filtered_cte, cloud_event_cols, crosscutting_cols, source_table, limit, offset
         );
 
         // 3. Total count query
@@ -668,17 +1029,31 @@ impl SearchService {
         // so offset==0 always means a filter change — including clearing all filters.
         let include_panels = offset == 0;
 
+        // Resolve resource/cloud columns once for the panel queries below.
+        let resource_id_col = profile
+            .udm_column_sql("resource_id")
+            .unwrap_or_else(|| "resource_id".to_string());
+        let resource_name_col = profile
+            .udm_column_sql("resource_name")
+            .unwrap_or_else(|| "resource_name".to_string());
+        let resource_type_col = profile
+            .udm_column_sql("resource_type")
+            .unwrap_or_else(|| "resource_type".to_string());
+        // Display-decode for the change_types[] rollup (gap #24): UDM bare =
+        // byte-identical; OCSF decodes activity_id -> create/read/update/delete.
+        let change_type_label_expr = Self::change_type_label_expr(profile);
+
         let resources_sql = if include_panels {
             Some(format!(
                 r#"{}
-                SELECT resource_id, any(resource_name) AS resource_name, any(resource_type) AS resource_type,
+                SELECT {resource_id_col} AS resource_id, any({resource_name_col}) AS resource_name, any({resource_type_col}) AS resource_type,
                        count() AS event_count,
                        toString(min(timestamp)) AS first_seen,
                        toString(max(timestamp)) AS last_seen,
-                       groupUniqArray(change_type) AS change_types
+                       groupUniqArray({change_type_label_expr}) AS change_types
                 FROM {}
-                WHERE resource_id != ''
-                GROUP BY resource_id
+                WHERE {resource_id_col} != ''
+                GROUP BY {resource_id_col}
                 ORDER BY event_count DESC
                 LIMIT 100"#,
                 filtered_cte, source_table
@@ -687,9 +1062,13 @@ impl SearchService {
             None
         };
 
+        // `user` is profile-mapped (OCSF -> `user.name`); the MV `ua` keeps a real
+        // `user` column so only the cloud_base side is mapped. Skip the panel when
+        // the schema has no user column.
+        let user_col = Self::cloud_principal_col(profile);
         let cloud_user_activity_table = self.table_names.read("cloud_user_activity_agg");
-        let user_activity_sql = if include_panels {
-            Some(format!(
+        let user_activity_sql = match (include_panels, &user_col) {
+            (true, Some(user_col)) => Some(format!(
                 r#"{}
                 SELECT
                     cb.user AS user,
@@ -704,9 +1083,9 @@ impl SearchService {
                     sum(ua.no_mfa_count) AS no_mfa_count
                 FROM {cloud_user_activity_table} AS ua
                 INNER JOIN (
-                    SELECT DISTINCT user
+                    SELECT DISTINCT {user_col} AS user
                     FROM {}
-                    WHERE user != ''
+                    WHERE {user_col} != ''
                 ) AS cb ON ua.user = cb.user
                 WHERE ua.time_bucket >= toStartOfHour(toDateTime('{}'))
                   AND ua.time_bucket <= '{}'
@@ -717,9 +1096,8 @@ impl SearchService {
                 source_table,
                 time_range.start.format("%Y-%m-%d %H:%M:%S"),
                 time_range.end.format("%Y-%m-%d %H:%M:%S"),
-            ))
-        } else {
-            None
+            )),
+            _ => None,
         };
 
         // Execute core queries in parallel — each query that includes the
@@ -954,47 +1332,84 @@ impl SearchService {
 
         let base_cte = self.build_cloud_base_cte(query_str, time_range)?;
         let user_bind = user.to_string();
+        let profile = self.active_profile.as_ref();
+
+        // Cloud-event projection (profile-mapped) + enrichment/IOC tail.
+        let cloud_event_cols = Self::cloud_event_projection(profile);
+        let crosscutting_cols = Self::cloud_event_crosscutting_projection(profile);
+        let enrichment_tail = Self::cloud_enrichment_tail(profile);
+
+        // `user` is the pivot entity (OCSF promotes it to `user.name`). The `? = ?`
+        // bind is positional, so when the schema has no user column we substitute a
+        // constant-false predicate AND drop the bind — keeping placeholder/bind
+        // counts aligned (both schemas map `user` today, so this never fires now).
+        let user_col = Self::cloud_principal_col(profile);
+        let user_pred = match &user_col {
+            Some(col) => format!("{col} = ?"),
+            None => "0".to_string(),
+        };
+        let user_bound = user_col.is_some();
 
         // 1. Events for this user (ASC order, limit 5000)
         let events_sql = format!(
             r#"WITH {}
-            SELECT timestamp, cloud_provider, cloud_service, cloud_region, cloud_account_id,
-                   resource_id, resource_name, resource_type, change_type, mfa_used,
-                   user, src_ip, http_user_agent, source_type, action AS event_type,
-                   status, http_status_code,
-                   enriched_src_country_code, enriched_src_asn, enriched_src_as_name,
-                   ioc_src_ip_threat_type, ioc_src_ip_malware, ioc_src_ip_confidence
+            SELECT timestamp, {}{}{}
             FROM cloud_base
-            WHERE user = ?
+            WHERE {}
             ORDER BY timestamp ASC
             LIMIT 5000"#,
-            base_cte
+            base_cte, cloud_event_cols, crosscutting_cols, enrichment_tail, user_pred
         );
+
+        // Profile-mapped cloud columns + value-literal predicates for the summary.
+        let cloud_service_col = profile
+            .udm_column_sql("cloud_service")
+            .unwrap_or_else(|| "cloud_service".to_string());
+        let cloud_region_col = profile
+            .udm_column_sql("cloud_region")
+            .unwrap_or_else(|| "cloud_region".to_string());
+        let mfa_used_col = profile
+            .udm_column_sql("mfa_used")
+            .unwrap_or_else(|| "mfa_used".to_string());
+        // src_ip / http_status_code are promoted to dotted columns under OCSF.
+        // Drop the term when unmapped (empty array / 0 count rather than dead ref).
+        let src_ip_col = profile.udm_column_sql("src_ip");
+        let http_status_col = profile.udm_column_sql("http_status_code");
+        let ips_expr = match &src_ip_col {
+            Some(col) => format!("groupUniqArray({col})"),
+            None => "[]".to_string(),
+        };
+        let fail_count_expr = match &http_status_col {
+            Some(col) => format!("countIf({col} >= 400)"),
+            None => "toUInt64(0)".to_string(),
+        };
+        let permission_change_pred = Self::change_type_equals(profile, "permission_change");
+        let delete_pred = Self::change_type_equals(profile, "delete");
 
         // 2. Session summary aggregates
         let summary_sql = format!(
             r#"WITH {}
             SELECT
-                groupUniqArray(cloud_service) AS services,
-                groupUniqArray(cloud_region) AS regions,
-                groupUniqArray(src_ip) AS ips,
+                groupUniqArray({cloud_service_col}) AS services,
+                groupUniqArray({cloud_region_col}) AS regions,
+                {ips_expr} AS ips,
                 count() AS event_count,
-                countIf(http_status_code >= 400) AS fail_count,
-                countIf(change_type = 'permission_change') AS permission_change_count,
-                countIf(change_type = 'delete') AS delete_count,
-                countIf(mfa_used = 0) AS no_mfa_count
+                {fail_count_expr} AS fail_count,
+                countIf({permission_change_pred}) AS permission_change_count,
+                countIf({delete_pred}) AS delete_count,
+                countIf({mfa_used_col} = 0) AS no_mfa_count
             FROM cloud_base
-            WHERE user = ?"#,
+            WHERE {user_pred}"#,
             base_cte
         );
 
         let events_future = async {
             let mut events: Vec<serde_json::Value> = Vec::new();
-            let mut cursor = match clickhouse
-                .query(&events_sql)
-                .bind(&user_bind)
-                .fetch_bytes("JSONEachRow")
-            {
+            let mut q = clickhouse.query(&events_sql);
+            if user_bound {
+                q = q.bind(&user_bind);
+            }
+            let mut cursor = match q.fetch_bytes("JSONEachRow") {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!("Cloud user timeline events query failed: {}", e);
@@ -1027,12 +1442,11 @@ impl SearchService {
                 delete_count: u64,
                 no_mfa_count: u64,
             }
-            match clickhouse
-                .query(&summary_sql)
-                .bind(&user_bind)
-                .fetch_optional::<SummaryRow>()
-                .await
-            {
+            let mut q = clickhouse.query(&summary_sql);
+            if user_bound {
+                q = q.bind(&user_bind);
+            }
+            match q.fetch_optional::<SummaryRow>().await {
                 Ok(Some(r)) => {
                     let total = r.event_count;
                     let mut risk_indicators = Vec::new();
@@ -1124,6 +1538,7 @@ impl SearchService {
 
         let base_cte = self.build_cloud_base_cte(query_str, time_range)?;
         let entity_val = entity_value.to_string();
+        let profile = self.active_profile.as_ref();
 
         tracing::info!(
             entity_type = entity_type,
@@ -1131,89 +1546,120 @@ impl SearchService {
             "Cloud entity pivot: searching for entity"
         );
 
-        // Build parameterized entity filter — returns (sql_fragment, bind_values)
+        // Cloud columns resolved through the active schema. `resource_id`/
+        // `resource_name` map in both schemas; fall back to the UDM name otherwise.
+        let resource_id_col = profile
+            .udm_column_sql("resource_id")
+            .unwrap_or_else(|| "resource_id".to_string());
+        let resource_name_col = profile
+            .udm_column_sql("resource_name")
+            .unwrap_or_else(|| "resource_name".to_string());
+        let cloud_service_col = profile
+            .udm_column_sql("cloud_service")
+            .unwrap_or_else(|| "cloud_service".to_string());
+        // Display-decode for the change_types[] rollup (gap #24): UDM bare =
+        // byte-identical; OCSF decodes activity_id -> create/read/update/delete.
+        let change_type_label_expr = Self::change_type_label_expr(profile);
+        // `user` / `src_ip` / `http_status_code` are promoted to dotted columns
+        // under OCSF (user.name / src_endpoint.ip / http_response.code), so they are
+        // resolved through the seam rather than referenced bare. Both schemas map
+        // user + src_ip today; the None branches keep the queries type-safe and
+        // bind-aligned for a future schema that drops a concept.
+        let user_col = Self::cloud_principal_col(profile);
+        let src_ip_col = profile.udm_column_sql("src_ip");
+        let http_status_col = profile.udm_column_sql("http_status_code");
+
+        // Build parameterized entity filter — returns (sql_fragment, bind_values).
+        // When the schema lacks the column the predicate becomes constant-false and
+        // carries NO binds, so entity_binds stays aligned with the placeholders.
         let (entity_filter, entity_binds) = match entity_type {
-            "user" => ("user = ?".to_string(), vec![entity_val.clone()]),
-            "ip" => ("src_ip = ?".to_string(), vec![entity_val.clone()]),
+            "user" => match &user_col {
+                Some(col) => (format!("{col} = ?"), vec![entity_val.clone()]),
+                None => ("0".to_string(), Vec::new()),
+            },
+            "ip" => match &src_ip_col {
+                Some(col) => (format!("{col} = ?"), vec![entity_val.clone()]),
+                None => ("0".to_string(), Vec::new()),
+            },
             "resource" => (
-                "(lower(resource_id) = lower(?) OR lower(resource_name) = lower(?))".to_string(),
+                format!(
+                    "(lower({resource_id_col}) = lower(?) OR lower({resource_name_col}) = lower(?))"
+                ),
                 vec![entity_val.clone(), entity_val.clone()],
             ),
             _ => unreachable!(),
         };
 
-        // Cross-ref queries use the entity filter twice (two UNION ALL branches),
-        // so we need the bind values repeated.
-        let xref_binds: Vec<String> = entity_binds
-            .iter()
-            .chain(entity_binds.iter())
-            .cloned()
-            .collect();
-
         // 1. Events for this entity (ASC, limit 5000)
+        let cloud_event_cols = Self::cloud_event_projection(profile);
+        let crosscutting_cols = Self::cloud_event_crosscutting_projection(profile);
+        let enrichment_tail = Self::cloud_enrichment_tail(profile);
         let events_sql = format!(
             r#"WITH {}
-            SELECT timestamp, cloud_provider, cloud_service, cloud_region, cloud_account_id,
-                   resource_id, resource_name, resource_type, change_type, mfa_used,
-                   user, src_ip, http_user_agent, source_type, action AS event_type,
-                   status, http_status_code,
-                   enriched_src_country_code, enriched_src_asn, enriched_src_as_name,
-                   ioc_src_ip_threat_type, ioc_src_ip_malware, ioc_src_ip_confidence
+            SELECT timestamp, {}{}{}
             FROM cloud_base
             WHERE {}
             ORDER BY timestamp ASC
             LIMIT 5000"#,
-            base_cte, entity_filter
+            base_cte, cloud_event_cols, crosscutting_cols, enrichment_tail, entity_filter
         );
 
-        // 2. Cross-references: find related entities
-        let xref_sql = match entity_type {
-            "user" => format!(
-                r#"WITH {}
-                SELECT 'ip' AS entity_type, src_ip AS entity_value, count() AS event_count
-                FROM cloud_base WHERE {} AND src_ip != ''
-                GROUP BY src_ip ORDER BY event_count DESC LIMIT 50
-                UNION ALL
-                SELECT 'resource' AS entity_type, resource_id AS entity_value, count() AS event_count
-                FROM cloud_base WHERE {} AND resource_id != ''
-                GROUP BY resource_id ORDER BY event_count DESC LIMIT 50"#,
-                base_cte, entity_filter, entity_filter
-            ),
-            "ip" => format!(
-                r#"WITH {}
-                SELECT 'user' AS entity_type, user AS entity_value, count() AS event_count
-                FROM cloud_base WHERE {} AND user != ''
-                GROUP BY user ORDER BY event_count DESC LIMIT 50
-                UNION ALL
-                SELECT 'resource' AS entity_type, resource_id AS entity_value, count() AS event_count
-                FROM cloud_base WHERE {} AND resource_id != ''
-                GROUP BY resource_id ORDER BY event_count DESC LIMIT 50"#,
-                base_cte, entity_filter, entity_filter
-            ),
-            "resource" => format!(
-                r#"WITH {}
-                SELECT 'user' AS entity_type, user AS entity_value, count() AS event_count
-                FROM cloud_base WHERE {} AND user != ''
-                GROUP BY user ORDER BY event_count DESC LIMIT 50
-                UNION ALL
-                SELECT 'ip' AS entity_type, src_ip AS entity_value, count() AS event_count
-                FROM cloud_base WHERE {} AND src_ip != ''
-                GROUP BY src_ip ORDER BY event_count DESC LIMIT 50"#,
-                base_cte, entity_filter, entity_filter
-            ),
+        // 2. Cross-references: find related entities. Each cross-ref dimension is a
+        // UNION ALL branch that uses `entity_filter` once. The `ip`/`user` target
+        // columns are profile-mapped (OCSF dotted) and emitted ONLY when they
+        // resolve; the `resource` branch always emits (resource_id falls back to the
+        // UDM name). We build branches as a Vec so the per-branch `entity_binds`
+        // copy is appended only for branches that are actually emitted — keeping
+        // placeholder/bind counts aligned regardless of which dimensions map.
+        let ip_xref_branch = src_ip_col.as_ref().map(|col| format!(
+            "SELECT 'ip' AS entity_type, {col} AS entity_value, count() AS event_count \
+             FROM cloud_base WHERE {entity_filter} AND {col} != '' \
+             GROUP BY {col} ORDER BY event_count DESC LIMIT 50"
+        ));
+        let user_xref_branch = user_col.as_ref().map(|col| format!(
+            "SELECT 'user' AS entity_type, {col} AS entity_value, count() AS event_count \
+             FROM cloud_base WHERE {entity_filter} AND {col} != '' \
+             GROUP BY {col} ORDER BY event_count DESC LIMIT 50"
+        ));
+        let resource_xref_branch = format!(
+            "SELECT 'resource' AS entity_type, {resource_id_col} AS entity_value, count() AS event_count \
+             FROM cloud_base WHERE {entity_filter} AND {resource_id_col} != '' \
+             GROUP BY {resource_id_col} ORDER BY event_count DESC LIMIT 50"
+        );
+        // Branch order per entity_type (mirrors the original cross-ref dimensions).
+        let branches: Vec<String> = match entity_type {
+            "user" => [ip_xref_branch, Some(resource_xref_branch)],
+            "ip" => [user_xref_branch, Some(resource_xref_branch)],
+            "resource" => [user_xref_branch, ip_xref_branch],
             _ => unreachable!(),
-        };
+        }
+        .into_iter()
+        .flatten()
+        .collect();
 
-        // 3. Entity summary
+        // One `entity_binds` copy per emitted branch (each branch uses the filter once).
+        let xref_binds: Vec<String> = branches
+            .iter()
+            .flat_map(|_| entity_binds.iter().cloned())
+            .collect();
+
+        let xref_sql = format!("WITH {} {}", base_cte, branches.join(" UNION ALL "));
+
+        // 3. Entity summary. `http_status_code` is promoted to `http_response.code`
+        // under OCSF, so resolve it through the seam; drop to a 0 count when unmapped.
+        let fail_count_expr = match &http_status_col {
+            Some(col) => format!("countIf({col} >= 400)"),
+            None => "toUInt64(0)".to_string(),
+        };
         let summary_sql = format!(
             r#"WITH {}
             SELECT
                 count() AS event_count,
-                countIf(http_status_code >= 400) AS fail_count,
+                {fail_count_expr} AS fail_count,
                 toString(min(timestamp)) AS first_seen,
                 toString(max(timestamp)) AS last_seen,
-                groupUniqArray(change_type) AS change_types,
-                groupUniqArray(cloud_service) AS services
+                groupUniqArray({change_type_label_expr}) AS change_types,
+                groupUniqArray({cloud_service_col}) AS services
             FROM cloud_base
             WHERE {}"#,
             base_cte, entity_filter

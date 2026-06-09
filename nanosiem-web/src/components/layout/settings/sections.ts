@@ -88,6 +88,8 @@ export interface SettingsSection {
    * settings (NAN-1198). Backend access stays governed by `demo_guard`.
    */
   demoHidden?: boolean;
+  /** Only show when the deployment runs in air-gapped mode (`system_config.air_gap`). */
+  airgapOnly?: boolean;
   children?: SettingsSectionChild[];
 }
 
@@ -397,6 +399,7 @@ export const SETTINGS_SECTIONS: SettingsSection[] = [
     desc: 'Apply signed offline bundles (parsers, enrichment, license) without internet.',
     href: '/settings/airgap-import',
     permissions: 'settings:system',
+    airgapOnly: true,
     status: 'ok',
   },
 ];

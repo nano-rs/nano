@@ -44,6 +44,10 @@ interface CloudSummary {
   change_type?: FacetValue[];
 }
 
+// Schema-agnostic cloud event (NAN-1241): the backend normalizes its cloud
+// SELECT back to these canonical UDM keys under both UDM and OCSF, so the named
+// fields stay strongly typed; the index signature admits extra schema-specific
+// keys without breaking the contract.
 interface CloudEvent {
   timestamp: string;
   cloud_provider: string;
@@ -60,6 +64,7 @@ interface CloudEvent {
   http_user_agent: string;
   source_type: string;
   event_type: string;
+  [key: string]: unknown;
 }
 
 interface CloudPagination {

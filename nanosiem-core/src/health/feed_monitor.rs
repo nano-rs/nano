@@ -130,13 +130,15 @@ impl FeedMonitor {
         source: &LogSourceInfo,
     ) -> Option<chrono::DateTime<Utc>> {
         let where_clause = source.build_where_clause();
+        // NAN-1241: read the active ingested-events table (ocsf_logs under OCSF)
+        // so feed staleness reflects where events actually land. UDM-identical.
+        let logs_table = crate::schema::active_logs_table();
         let sql = format!(
             r#"
             SELECT max(timestamp) as last_event_at
-            FROM logs
-            WHERE {}
+            FROM {logs_table}
+            WHERE {where_clause}
             "#,
-            where_clause
         );
 
         let result = ch_client.query(&sql).fetch_bytes("JSONEachRow").ok();

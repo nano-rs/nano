@@ -333,6 +333,10 @@ pub struct TableNames {
 /// Tables that have `_distributed` variants created by `ensure_distributed_tables()`.
 const DISTRIBUTED_TABLE_SET: &[&str] = &[
     "logs",
+    // OCSF canonical log table (NAN-1241). Listed so cluster-mode read routing
+    // (`ocsf_logs_distributed`) applies identically to the UDM `logs` table when
+    // the active schema profile is OCSF.
+    "ocsf_logs",
     "signals",
     "domain_prevalence_agg",
     "hash_prevalence_agg",

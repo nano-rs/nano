@@ -9,7 +9,6 @@ use tracing::{debug, info, warn};
 
 use super::sql_helpers::escape_question_marks_in_strings;
 use super::types::ClickHouseExecutor;
-use crate::query::is_explicit_column;
 use crate::search::{parse_clickhouse_error, FieldInfo, SearchError};
 
 /// Build the SQL that enumerates top-level ext (JSON) field names from recent data.
@@ -28,43 +27,106 @@ use crate::search::{parse_clickhouse_error, FieldInfo, SearchError};
 /// dotted (`a.b.c`); the query-bar tokenizer matches bare identifiers, so each is
 /// reduced to its top-level segment — the same key form the results-driven field list
 /// registers. The cap keeps this best-effort, fire-and-forget query from ever hanging.
-fn build_ext_field_names_sql(table: &str) -> String {
+fn build_ext_field_names_sql(table: &str, json_col: &str, nested: bool) -> String {
+    // NAN-1241: the dynamic-JSON column is `ext` under UDM, `event` under OCSF.
+    //
+    // UDM `ext` is effectively flat — keys are bare identifiers (`foo`) the
+    // query-bar tokenizer matches directly, so we collapse each dotted path to
+    // its top-level segment (`splitByChar('.', path)[1]`).
+    //
+    // OCSF `event` is deeply nested (`actor.process.file.path`,
+    // `http_request.url.path`, …). Collapsing to the first segment would throw
+    // away every useful leaf (`actor.process.file.path` → `actor`), so when
+    // `nested` is set we keep the FULL dotted path that `distinctJSONPaths`
+    // already returns.
+    let name_expr = if nested {
+        "path"
+    } else {
+        "splitByChar('.', path)[1]"
+    };
     format!(
-        "SELECT DISTINCT splitByChar('.', path)[1] AS name \
+        "SELECT DISTINCT {name_expr} AS name \
          FROM ( \
-             SELECT arrayJoin(distinctJSONPaths(ext)) AS path \
-             FROM {} \
+             SELECT arrayJoin(distinctJSONPaths({json_col})) AS path \
+             FROM {table} \
              WHERE timestamp >= now() - INTERVAL 3 HOUR \
          ) \
          WHERE name != '' \
          ORDER BY name \
          LIMIT 512 \
-         SETTINGS max_execution_time = 10",
-        table
+         SETTINGS max_execution_time = 10"
     )
 }
 
+/// Quote a column name for use as a *reference* inside `toString(...)` / `uniq(...)`.
+///
+/// OCSF columns are dotted (`src_endpoint.ip`); unquoted, ClickHouse parses them
+/// as `table.column` and fails with `Code: 47 Unknown identifier`. Double-quoting
+/// makes them resolve as a single identifier. Bare UDM snake_case columns contain
+/// no dot, so this is a no-op for them and the generated UDM SQL is unchanged.
+///
+/// Note: unlike `query::clickhouse_sql_gen::escape_identifier`, this deliberately
+/// does NOT quote reserved words (e.g. UDM's `user` column) — doing so would alter
+/// the byte-for-byte UDM field-stats SQL that has shipped for years and works as-is
+/// (`toString(user)`). Dotted-only quoting is the minimal change that fixes OCSF
+/// while keeping UDM identical (NAN-1241).
+fn field_stats_quote_ident(name: &str) -> String {
+    if name.contains('.') {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    } else {
+        name.to_string()
+    }
+}
+
+/// Sanitize a column name into a bare (dot-free) SQL alias.
+///
+/// A dotted alias such as `src_endpoint.ip_top` is a ClickHouse syntax error, so
+/// dots are collapsed to underscores. For bare UDM columns this is the identity,
+/// keeping the UDM field-stats SQL and its JSON result keys byte-identical.
+fn field_stats_alias(name: &str) -> String {
+    name.replace('.', "_")
+}
+
 impl ClickHouseExecutor {
-    /// Get list of queryable columns from the logs table schema
-    /// Excludes arrays, maps, and internal columns (starting with _)
-    pub async fn get_table_columns(&self) -> Result<Vec<String>, SearchError> {
-        let sql = r#"
+    /// Get list of queryable columns from the active schema's logs table.
+    /// Excludes arrays, maps, and internal columns (starting with _).
+    ///
+    /// `table` is the **bare local** table name (no `nanosiem.` prefix, no
+    /// `_distributed` suffix) — `system.columns` reflects the underlying local
+    /// MergeTree table. UDM passes `"logs"` (byte-identical to the previous
+    /// hardcoded query); an OCSF deployment passes `"ocsf_logs"` so the field
+    /// panel enumerates OCSF columns instead of UDM ones (NAN-1241).
+    ///
+    /// The `%.search` exclusion drops OCSF's dotted `_search` companion columns
+    /// (e.g. `src_endpoint.ip.search`); it sits alongside the existing `%_search`
+    /// exclusion that drops UDM's snake_case companions (`message_search`, …).
+    /// Both are harmless no-ops against the other schema.
+    pub async fn get_table_columns(&self, table: &str) -> Result<Vec<String>, SearchError> {
+        // Escape single quotes in the table name to avoid injection in the
+        // string literal (table names are internal/registry-derived, but keep
+        // it safe regardless).
+        let table_lit = table.replace('\'', "''");
+        let sql = format!(
+            r#"
             SELECT name
             FROM system.columns
             WHERE database = 'nanosiem'
-              AND table = 'logs'
+              AND table = '{table}'
               AND type NOT LIKE '%Array%'
               AND type NOT LIKE '%Map%'
               AND type NOT LIKE 'JSON%'
               AND name NOT LIKE '\_%'
               AND name NOT LIKE '%_search'
+              AND name NOT LIKE '%.search'
               AND name NOT LIKE 'prevalence_%'
               AND default_kind != 'ALIAS'
               AND name NOT IN ('ext', 'metadata', 'event_id', 'ingest_time', 'namespace')
             ORDER BY name
-        "#;
+        "#,
+            table = table_lit
+        );
 
-        let escaped_sql = escape_question_marks_in_strings(sql);
+        let escaped_sql = escape_question_marks_in_strings(&sql);
         let mut cursor = self
             .client
             .query(&escaped_sql)
@@ -112,22 +174,53 @@ impl ClickHouseExecutor {
         sample_rate: Option<f64>,
         fields: &[String],
     ) -> String {
-        // Extract the FROM and WHERE clauses from the base SQL
-        // We need to inject SAMPLE between FROM and WHERE
         let base_upper = base_sql.to_uppercase();
+        let settings_pos = base_upper.find(" SETTINGS ").unwrap_or(base_sql.len());
 
-        // Find FROM clause position
+        // Build SELECT with topK/uniq for each field (shared by both paths).
+        //
+        // The column REFERENCE inside toString()/uniq() is quoted via
+        // `field_stats_quote_ident` so OCSF's dotted columns (e.g.
+        // `src_endpoint.ip`) resolve instead of being parsed as `table.column`
+        // (Code 47). The quoting is a no-op for bare UDM snake_case columns, so
+        // the generated UDM SQL is byte-identical to before.
+        //
+        // The result ALIAS uses a sanitized (dot-free) name — a bare dotted
+        // alias like `src_endpoint.ip_top` is a ClickHouse syntax error. The
+        // same `field_stats_alias` mapping is applied in
+        // `execute_field_stats_query` when reading back the JSON keys. For bare
+        // UDM columns the sanitized name equals the original, so the SQL stays
+        // byte-identical.
+        let mut select_parts = Vec::new();
+        for field in fields {
+            let col = field_stats_quote_ident(field);
+            let alias = field_stats_alias(field);
+            // topK returns array of values, we also get approximate count via uniq
+            select_parts.push(format!("topK(100)(toString({col})) as {alias}_top"));
+            select_parts.push(format!("uniq({col}) as {alias}_cardinality"));
+        }
+        let select_clause = select_parts.join(",\n  ");
+
+        // Multi-CTE / piped queries (`WITH stage_0 AS (…) … SELECT … FROM stage_N`,
+        // e.g. sequence/funnel/stats) cannot be sliced by the first FROM/WHERE —
+        // that span lands inside `stage_0` and cuts the CTE chain mid-expression,
+        // yielding unbalanced parentheses (Code 62, NAN-1315). Wrap the whole
+        // query (minus any trailing SETTINGS) as a subquery and stat over its
+        // result. SAMPLE cannot sit on a derived subquery, so it only applies to
+        // the simple single-table path below.
+        if base_upper.trim_start().starts_with("WITH ") {
+            let inner = base_sql[..settings_pos].trim_end();
+            return format!("SELECT\n  {}\nFROM (\n{}\n)", select_clause, inner);
+        }
+
+        // Simple single-stage query: extract FROM..WHERE and re-apply the filter
+        // on the base table so SAMPLE can engage. Byte-identical to the legacy path.
         let from_pos = base_upper.find(" FROM ").unwrap_or(0);
-
-        // Find WHERE or PREWHERE clause position
         let where_pos = base_upper
             .find(" WHERE ")
             .or_else(|| base_upper.find(" PREWHERE "))
             .unwrap_or(base_sql.len());
-
-        // Find ORDER BY position to exclude it
         let order_pos = base_upper.find(" ORDER BY ").unwrap_or(base_sql.len());
-        let settings_pos = base_upper.find(" SETTINGS ").unwrap_or(base_sql.len());
         let end_pos = order_pos.min(settings_pos);
 
         // Extract table name (between FROM and WHERE/PREWHERE)
@@ -139,22 +232,6 @@ impl ClickHouseExecutor {
         } else {
             ""
         };
-
-        // Build SELECT with topK for each field
-        let mut select_parts = Vec::new();
-        for field in fields {
-            // topK returns array of values, we also get approximate count via uniq
-            select_parts.push(format!(
-                "topK(100)(toString({field})) as {field}_top",
-                field = field
-            ));
-            select_parts.push(format!(
-                "uniq({field}) as {field}_cardinality",
-                field = field
-            ));
-        }
-
-        let select_clause = select_parts.join(",\n  ");
 
         // Build the query, optionally with SAMPLE for large datasets
         // SAMPLE must come right after the table name
@@ -263,8 +340,12 @@ impl ClickHouseExecutor {
         let mut fields = Vec::new();
 
         for field_name in field_names {
-            let top_key = format!("{}_top", field_name);
-            let cardinality_key = format!("{}_cardinality", field_name);
+            // Result keys are aliased with the dot-free sanitized name (see
+            // `build_field_stats_sql`); the emitted `FieldInfo.name` keeps the
+            // original column name. For bare UDM columns the two are identical.
+            let alias = field_stats_alias(field_name);
+            let top_key = format!("{}_top", alias);
+            let cardinality_key = format!("{}_cardinality", alias);
 
             let cardinality = row
                 .get(&cardinality_key)
@@ -338,8 +419,13 @@ impl ClickHouseExecutor {
 
     /// Get distinct ext field names from recent data.
     /// Returns field names that exist in the ext JSON column (last 3h).
-    pub async fn get_ext_field_names(&self, table: &str) -> Result<Vec<String>, SearchError> {
-        let sql = build_ext_field_names_sql(table);
+    pub async fn get_ext_field_names(
+        &self,
+        table: &str,
+        json_col: &str,
+        nested: bool,
+    ) -> Result<Vec<String>, SearchError> {
+        let sql = build_ext_field_names_sql(table, json_col, nested);
 
         debug!("Querying ext field names: {}", sql);
 
@@ -390,21 +476,16 @@ impl ClickHouseExecutor {
         Ok(names)
     }
 
-    /// Build a simple SQL query to get top values for a SINGLE field
-    /// This is the on-demand approach - much faster than querying all fields at once
-    pub fn build_field_values_sql(&self, base_sql: &str, field: &str, limit: usize) -> String {
-        // Resolve field expression: direct column vs ext JSON field
-        let field_expr = if is_explicit_column(field) {
-            field.to_string()
-        } else {
-            // Sanitize the field name for safe JSON path access
-            let safe: String = field
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            format!("ext.{}", safe)
-        };
-
+    /// Build a simple SQL query to get top values for a SINGLE field.
+    /// This is the on-demand approach - much faster than querying all fields at once.
+    ///
+    /// `field_expr` is the ALREADY-RESOLVED physical access expression for the
+    /// field, computed by the caller via the active schema profile's
+    /// `field_access_expr` (UDM → escaped column or `ext.{field}`; OCSF → promoted
+    /// dotted column or `JSONExtract(event, …)`). Resolving here with a UDM-only
+    /// `is_explicit_column` check broke OCSF: `traffic.bytes_out` collapsed to
+    /// `ext.trafficbytes_out` and `activity` to `ext.activity` (NAN-1241).
+    pub fn build_field_values_sql(&self, base_sql: &str, field_expr: &str, limit: usize) -> String {
         // Strip trailing ORDER BY and SETTINGS from the base SQL
         let base_upper = base_sql.to_uppercase();
         let order_pos = base_upper.rfind(" ORDER BY ").unwrap_or(base_sql.len());
@@ -554,7 +635,8 @@ mod tests {
 
     #[test]
     fn ext_field_names_sql_is_bounded_and_native() {
-        let sql = build_ext_field_names_sql("nanosiem.logs");
+        // UDM `ext` is flat → nested=false.
+        let sql = build_ext_field_names_sql("nanosiem.logs", "ext", false);
 
         // Targets the resolved table.
         assert!(sql.contains("FROM nanosiem.logs"), "sql: {sql}");
@@ -564,18 +646,139 @@ mod tests {
         // (NAN-1172), and NOT arrayJoin(JSONAllPaths(ext)) over the raw window, which
         // exploded a row per path and timed out at scale (NAN-1177).
         assert!(sql.contains("distinctJSONPaths(ext)"), "sql: {sql}");
+
+        // NAN-1241: under OCSF the dynamic-JSON column is `event`, not `ext`, and the
+        // column is deeply nested → nested=true returns full leaf paths.
+        let ocsf_sql = build_ext_field_names_sql("nanosiem.ocsf_logs", "event", true);
+        assert!(ocsf_sql.contains("distinctJSONPaths(event)"), "sql: {ocsf_sql}");
+        assert!(ocsf_sql.contains("FROM nanosiem.ocsf_logs"), "sql: {ocsf_sql}");
+        // Bounded window + native aggregate still apply to the OCSF lane.
+        assert!(ocsf_sql.contains("INTERVAL 3 HOUR"), "sql: {ocsf_sql}");
         assert!(!sql.contains("toString(ext)"), "sql: {sql}");
         assert!(!sql.contains("JSONExtractKeys"), "sql: {sql}");
         assert!(!sql.contains("JSONAllPaths"), "sql: {sql}");
 
-        // Reduces dotted JSON paths to the bare top-level key the query-bar tokenizer
-        // matches (it looks up bare identifiers, not dotted paths).
+        // UDM (nested=false) reduces dotted JSON paths to the bare top-level key the
+        // query-bar tokenizer matches (it looks up bare identifiers, not dotted paths).
         assert!(sql.contains("splitByChar('.', path)[1]"), "sql: {sql}");
+
+        // OCSF (nested=true) keeps the FULL dotted leaf path
+        // (`actor.process.file.path`), so it must NOT collapse via splitByChar.
+        assert!(!ocsf_sql.contains("splitByChar"), "sql: {ocsf_sql}");
+        assert!(ocsf_sql.contains("SELECT DISTINCT path AS name"), "sql: {ocsf_sql}");
 
         // Bounded three ways: short recent window, result cap, and a hard server-side
         // execution cap so a slow ClickHouse can never hang the request.
         assert!(sql.contains("INTERVAL 3 HOUR"), "sql: {sql}");
         assert!(sql.contains("LIMIT 512"), "sql: {sql}");
         assert!(sql.contains("max_execution_time"), "sql: {sql}");
+    }
+
+    /// UDM byte-identical guard: for bare snake_case columns the field-stats SQL
+    /// must be *exactly* what shipped before the OCSF dotted-column fix — no
+    /// quotes, no alias rewriting. `field_stats_quote_ident` only quotes dotted
+    /// names and `field_stats_alias` only collapses dots, so both are no-ops
+    /// here. This pins the regression: if either helper starts quoting reserved
+    /// words (e.g. `user`) or otherwise altering bare identifiers, this fails.
+    #[test]
+    fn field_stats_sql_for_udm_columns_is_byte_identical() {
+        let base = "SELECT * FROM nanosiem.logs WHERE timestamp >= now()";
+        // Includes `user`, a ClickHouse reserved word, to prove we do NOT quote
+        // it (escape_identifier would → `"user"` and break byte-identical UDM).
+        let cols = vec![
+            "user".to_string(),
+            "src_ip".to_string(),
+            "action".to_string(),
+        ];
+        let sql = ClickHouseExecutor::build_field_stats_sql(base, None, &cols);
+
+        let expected = "SELECT\n  \
+            topK(100)(toString(user)) as user_top,\n  \
+            uniq(user) as user_cardinality,\n  \
+            topK(100)(toString(src_ip)) as src_ip_top,\n  \
+            uniq(src_ip) as src_ip_cardinality,\n  \
+            topK(100)(toString(action)) as action_top,\n  \
+            uniq(action) as action_cardinality\n \
+            FROM nanosiem.logs\n \
+            WHERE timestamp >= now()";
+        assert_eq!(sql, expected, "UDM field-stats SQL drifted:\n{sql}");
+    }
+
+    /// NAN-1315: a multi-CTE / piped base query (sequence/funnel/stats) must be
+    /// wrapped as a subquery, not sliced by the first FROM/WHERE (which cuts the
+    /// CTE chain mid-expression → unbalanced parens, Code 62). The result must be
+    /// balanced and stat over the query's result, not the base table.
+    #[test]
+    fn field_stats_sql_wraps_multi_cte_query() {
+        let base = "WITH stage_0 AS (\n  SELECT id, \"process.name\" FROM nanosiem.ocsf_logs \
+                    PREWHERE timestamp BETWEEN '2026-01-01' AND '2026-01-02' WHERE (1)\n),\n\
+                    stage_1 AS (\n  SELECT * FROM stage_0\n)\n\
+                    SELECT * FROM stage_1 SETTINGS max_threads=16";
+        let cols = vec!["process.name".to_string()];
+        let sql = ClickHouseExecutor::build_field_stats_sql(base, None, &cols);
+
+        // Wraps the whole query as a subquery and drops trailing SETTINGS.
+        assert!(sql.contains("FROM (\nWITH stage_0 AS"), "should wrap the CTE query: {sql}");
+        assert!(!sql.contains("SETTINGS max_threads"), "trailing SETTINGS must be stripped: {sql}");
+        // Balanced parentheses (the original bug was unmatched parens, Code 62).
+        let opens = sql.matches('(').count();
+        let closes = sql.matches(')').count();
+        assert_eq!(opens, closes, "unbalanced parentheses in field-stats SQL: {sql}");
+    }
+
+    /// OCSF dotted columns must be double-quoted as a single identifier inside
+    /// `toString(...)`/`uniq(...)` (else `Code: 47 Unknown identifier`), and the
+    /// alias must collapse dots to underscores (a bare dotted alias is a CH
+    /// syntax error).
+    #[test]
+    fn field_stats_sql_quotes_dotted_ocsf_columns() {
+        let base = "SELECT * FROM nanosiem.ocsf_logs WHERE timestamp >= now()";
+        let cols = vec!["src_endpoint.ip".to_string(), "class_uid".to_string()];
+        let sql = ClickHouseExecutor::build_field_stats_sql(base, None, &cols);
+
+        // Dotted column: quoted reference, dot-free alias.
+        assert!(
+            sql.contains("topK(100)(toString(\"src_endpoint.ip\")) as src_endpoint_ip_top"),
+            "dotted column not quoted/aliased: {sql}"
+        );
+        assert!(
+            sql.contains("uniq(\"src_endpoint.ip\") as src_endpoint_ip_cardinality"),
+            "dotted column not quoted/aliased: {sql}"
+        );
+        // No bare dotted alias (would be a syntax error).
+        assert!(
+            !sql.contains("src_endpoint.ip_top"),
+            "emitted a bare dotted alias: {sql}"
+        );
+        // Bare OCSF column stays unquoted.
+        assert!(
+            sql.contains("topK(100)(toString(class_uid)) as class_uid_top"),
+            "bare column should not be quoted: {sql}"
+        );
+    }
+
+    #[test]
+    fn field_stats_alias_collapses_dots_only() {
+        assert_eq!(field_stats_alias("user"), "user");
+        assert_eq!(field_stats_alias("src_ip"), "src_ip");
+        assert_eq!(field_stats_alias("src_endpoint.ip"), "src_endpoint_ip");
+        assert_eq!(
+            field_stats_alias("actor.process.cmd_line"),
+            "actor_process_cmd_line"
+        );
+    }
+
+    #[test]
+    fn field_stats_quote_ident_quotes_dotted_only() {
+        // Bare identifiers (incl. the reserved word `user`) are untouched so UDM
+        // SQL is byte-identical.
+        assert_eq!(field_stats_quote_ident("user"), "user");
+        assert_eq!(field_stats_quote_ident("src_ip"), "src_ip");
+        assert_eq!(field_stats_quote_ident("class_uid"), "class_uid");
+        // Dotted identifiers are double-quoted as one unit.
+        assert_eq!(
+            field_stats_quote_ident("src_endpoint.ip"),
+            "\"src_endpoint.ip\""
+        );
     }
 }

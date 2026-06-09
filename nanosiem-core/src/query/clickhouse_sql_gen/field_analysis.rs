@@ -2,7 +2,7 @@
 
 //! Field requirement analysis for query optimization
 
-use super::{is_explicit_column, is_known_metadata_field, normalize_field_name};
+use super::{extract_fields_from_search_expr, is_known_metadata_field, normalize_field_name};
 use crate::query::ast::*;
 use std::collections::HashSet;
 
@@ -11,7 +11,11 @@ use std::collections::HashSet;
 ///
 /// When `table_view` is true, always returns minimal fields for fast table display.
 /// Users can fetch full row data on demand when they expand a row.
-pub(crate) fn analyze_required_fields(query: &Query, table_view: bool) -> Option<HashSet<String>> {
+pub(crate) fn analyze_required_fields(
+    query: &Query,
+    table_view: bool,
+    profile: &dyn crate::schema::SchemaProfile,
+) -> Option<HashSet<String>> {
     let mut fields = HashSet::new();
     let mut needs_all_fields = false;
 
@@ -38,32 +42,77 @@ pub(crate) fn analyze_required_fields(query: &Query, table_view: bool) -> Option
         let has_explicit_fields = has_table_or_fields_command(query);
         let has_aggregation = has_aggregation_command(query);
         if !has_explicit_fields && !has_aggregation {
-            for f in &[
-                "src_host",
-                "src_ip",
-                "dest_host",
-                "dest_ip",
-                "user",
-                "action",
-                "status",
-                "severity",
-                "process_name",
-                "src_port",
-                "dest_port",
-                "protocol",
-                "prevalence_min",
-                // Enrichment columns are MATERIALIZED in ClickHouse, so they
-                // must be explicitly selected (SELECT * excludes them).
-                // Including them here ensures enrichment data appears in the
-                // initial search results and is visible in the field stats sidebar.
-                "enriched_src_country",
-                "enriched_src_asn",
-                "enriched_src_as_name",
-                "enriched_dest_country",
-                "enriched_dest_asn",
-                "enriched_dest_as_name",
-            ] {
-                fields.insert(f.to_string());
+            match profile.id() {
+                // OCSF (NAN-1241 / NAN-1277): the UDM summary columns below don't
+                // exist on `ocsf_logs`. The OCSF profile's `default_table_fields`
+                // is the NARROW FieldsPanel column list (class_uid/src/dst ip/
+                // user) — using it here left the per-row key chips (activity,
+                // status, severity, ports, process, enrichment) empty at display
+                // time, so they only filled on the hover full-row fetch. Mirror
+                // UDM's deliberately-BROADER table_view summary with the OCSF
+                // column equivalents so the slim projection loads them up front.
+                crate::schema::SchemaId::Ocsf => {
+                    for f in &[
+                        "class_uid",
+                        "activity",
+                        "status",
+                        "severity",
+                        "src_endpoint.ip",
+                        "src_endpoint.hostname",
+                        "dst_endpoint.ip",
+                        "dst_endpoint.hostname",
+                        "user.name",
+                        "actor.process.name",
+                        "process.name",
+                        "src_endpoint.port",
+                        "dst_endpoint.port",
+                        "connection_info.protocol_num",
+                        // Enrichment columns are MATERIALIZED — must be explicitly
+                        // selected (SELECT * excludes them) to show up front + in
+                        // the field-stats sidebar (parity with the UDM list).
+                        "src_endpoint.location.country",
+                        "src_endpoint.autonomous_system.number",
+                        "src_endpoint.autonomous_system.name",
+                        "dst_endpoint.location.country",
+                        "dst_endpoint.autonomous_system.number",
+                        "dst_endpoint.autonomous_system.name",
+                    ] {
+                        fields.insert(f.to_string());
+                    }
+                }
+                // UDM: unchanged, byte-for-byte (the epic's invariant). Do not
+                // route this through `default_table_fields()` — that set is the
+                // narrower FieldsPanel column list; the table_view summary is
+                // deliberately broader (ports, process, enrichment).
+                crate::schema::SchemaId::Udm => {
+                    for f in &[
+                        "src_host",
+                        "src_ip",
+                        "dest_host",
+                        "dest_ip",
+                        "user",
+                        "action",
+                        "status",
+                        "severity",
+                        "process_name",
+                        "src_port",
+                        "dest_port",
+                        "protocol",
+                        "prevalence_min",
+                        // Enrichment columns are MATERIALIZED in ClickHouse, so they
+                        // must be explicitly selected (SELECT * excludes them).
+                        // Including them here ensures enrichment data appears in the
+                        // initial search results and is visible in the field stats sidebar.
+                        "enriched_src_country",
+                        "enriched_src_asn",
+                        "enriched_src_as_name",
+                        "enriched_dest_country",
+                        "enriched_dest_asn",
+                        "enriched_dest_as_name",
+                    ] {
+                        fields.insert(f.to_string());
+                    }
+                }
             }
         }
         return Some(fields);
@@ -514,7 +563,10 @@ fn is_post_processing_field(field: &str) -> bool {
 /// NOT UDM fields, NOT metadata fields, and don't contain dots (which
 /// would be handled by JSON path syntax). Fields found here need to be
 /// materialized in the base SELECT so they're visible to downstream CTEs.
-pub(crate) fn analyze_ext_fields(query: &Query) -> HashSet<String> {
+pub(crate) fn analyze_ext_fields(
+    query: &Query,
+    profile: &dyn crate::schema::SchemaProfile,
+) -> HashSet<String> {
     let mut all_fields = HashSet::new();
     let mut needs_all = false;
     collect_required_fields_from_query(query, &mut all_fields, &mut needs_all);
@@ -527,7 +579,13 @@ pub(crate) fn analyze_ext_fields(query: &Query) -> HashSet<String> {
         .into_iter()
         .filter(|f| {
             let f = f.as_str();
-            !is_explicit_column(f)
+            // A field is an ext/overflow field only when the ACTIVE schema cannot
+            // resolve it to a real column/path (UDM: Unknown ≡ !is_explicit_column,
+            // byte-identical; OCSF: promoted columns now resolve and are excluded).
+            matches!(
+                profile.resolve(&profile.canonicalize(f)),
+                crate::schema::FieldResolution::Unknown
+            )
                 && !f.starts_with("metadata_")
                 && !f.starts_with("metadata.")
                 && !is_known_metadata_field(f)
@@ -633,15 +691,26 @@ fn collect_computed_from_command(cmd: &Command, computed: &mut HashSet<String>) 
         } => {
             // Sequence produces: step{N}_time, step{N}_event_id, step{N}_{field},
             // sequence_duration_seconds, sequence_count, timestamp
-            for (i, _) in conditions.iter().enumerate() {
+            for (i, cond) in conditions.iter().enumerate() {
                 let n = i + 1;
                 computed.insert(format!("step{}_time", n));
                 computed.insert(format!("step{}_event_id", n));
-            }
-            for (i, _) in conditions.iter().enumerate() {
-                let n = i + 1;
-                for field in capture_fields {
-                    computed.insert(format!("step{}_{}", n, field));
+                // Per-step captures mirror the SQL generator (commands_advanced):
+                // the auto-captured CONDITION fields plus user capture_fields,
+                // each normalized then dot-sanitized to match the emitted
+                // `step{n}_<ident>` alias (NAN-1294). Registering only the explicit
+                // capture_fields (and without sanitizing) missed OCSF dotted
+                // captures like `process.name` → emitted `step1_process_name` but
+                // unregistered → downstream `| table step1_process_name` JSON-tails
+                // it from `event`, which the sequence output stage doesn't carry →
+                // `Code 47 UNKNOWN_IDENTIFIER: event` (NAN-1311). UDM fields have no
+                // dots, so this is a no-op there.
+                let step_fields = extract_fields_from_search_expr(cond)
+                    .into_iter()
+                    .chain(capture_fields.iter().cloned());
+                for field in step_fields {
+                    let ident = normalize_field_name(&field).replace('.', "_");
+                    computed.insert(format!("step{}_{}", n, ident));
                 }
             }
             computed.insert("sequence_duration_seconds".to_string());
@@ -694,5 +763,84 @@ fn collect_computed_from_command(cmd: &Command, computed: &mut HashSet<String>) 
             computed.insert("ai_reasoning".to_string());
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod table_view_profile_tests {
+    use super::*;
+    use crate::query::parser::parse_query;
+    use crate::schema::{OcsfProfile, SchemaProfile, UdmProfile};
+
+    // Bare search, table_view: the slim projection's summary set must come from
+    // the active profile (NAN-1241 Phase 7). Before the fix, both profiles got
+    // the hardcoded UDM list, so OCSF rows rendered "unparsed" (the UDM columns
+    // don't exist on ocsf_logs).
+    fn required_for(profile: &dyn crate::schema::SchemaProfile) -> HashSet<String> {
+        let query = parse_query("source_type=apache").unwrap();
+        analyze_required_fields(&query, /* table_view */ true, profile)
+            .expect("table_view always returns an explicit field set")
+    }
+
+    #[test]
+    fn udm_table_view_summary_is_unchanged() {
+        let f = required_for(&UdmProfile::new());
+        // Core (always-on) + the historical UDM summary set, byte-for-byte.
+        for expected in [
+            "id",
+            "timestamp",
+            "message",
+            "source_type",
+            "src_ip",
+            "dest_ip",
+            "user",
+            "action",
+            "status",
+            "severity",
+            "enriched_src_country",
+        ] {
+            assert!(f.contains(expected), "UDM table_view missing {expected}");
+        }
+        // OCSF-only promoted columns must never leak into the UDM projection.
+        assert!(!f.contains("src_endpoint.ip"));
+        assert!(!f.contains("class_uid"));
+    }
+
+    #[test]
+    fn ocsf_table_view_summary_has_key_chip_fields() {
+        let profile = OcsfProfile::new();
+        let f = required_for(&profile);
+        // Core fields still present.
+        for core in ["id", "timestamp", "message", "source_type"] {
+            assert!(f.contains(core), "OCSF table_view missing core {core}");
+        }
+        // NAN-1277: the per-row key chips (activity/status/severity) + UDM-parity
+        // breadth (endpoints, ports, process, enrichment) must be in the slim
+        // projection so they load at display time, not on the hover full-row
+        // fetch. Includes the narrow default_table_fields as a subset.
+        for expected in [
+            "class_uid",
+            "activity",
+            "status",
+            "severity",
+            "src_endpoint.ip",
+            "src_endpoint.hostname",
+            "dst_endpoint.ip",
+            "user.name",
+            "actor.process.name",
+            "src_endpoint.port",
+            "connection_info.protocol_num",
+            "src_endpoint.autonomous_system.number",
+        ] {
+            assert!(f.contains(expected), "OCSF table_view missing {expected}");
+        }
+        for field in profile.default_table_fields() {
+            assert!(f.contains(*field), "OCSF table_view missing default field {field}");
+        }
+        // The UDM-only summary columns must not appear (they don't exist on
+        // ocsf_logs and selecting them would error / waste the projection).
+        assert!(!f.contains("src_ip"));
+        assert!(!f.contains("process_name"));
+        assert!(!f.contains("enriched_src_country"));
     }
 }

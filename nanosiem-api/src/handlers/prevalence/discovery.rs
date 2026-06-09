@@ -224,7 +224,9 @@ pub async fn get_artifact_explorer(
     let search = params.search.as_deref();
     let limit = params.limit.unwrap_or(50).min(200);
     let offset = params.offset.unwrap_or(0).max(0);
-    let logs_table = dual_pool.table_names().read("logs");
+    let logs_table = dual_pool
+        .table_names()
+        .read(nanosiem_core::schema::active_logs_table());
 
     match prevalence_service
         .get_artifact_explorer(
@@ -354,7 +356,9 @@ pub async fn get_artifact_detail(
 
     let time_window = parse_time_window(params.window.as_deref());
     let artifact_type = ArtifactType::detect(&params.artifact);
-    let logs_table = dual_pool.table_names().read("logs");
+    let logs_table = dual_pool
+        .table_names()
+        .read(nanosiem_core::schema::active_logs_table());
 
     match prevalence_service
         .get_artifact_detail(&params.artifact, &artifact_type, &logs_table, time_window)
@@ -626,7 +630,10 @@ pub async fn get_query_artifacts(
                 match extract_search_expr(&parsed_query) {
                     Some(search_expr) => {
                         // Generate WHERE clause directly from the search expression
-                        let logs_table = state.dual_pool().table_names().read("logs");
+                        let logs_table = state
+                            .dual_pool()
+                            .table_names()
+                            .read(nanosiem_core::schema::active_logs_table());
                         let sql_gen = ClickHouseSqlGenerator::with_table(&logs_table);
                         match sql_gen.generate_search_expr(search_expr) {
                             Ok(where_clause) => {
@@ -663,34 +670,45 @@ pub async fn get_query_artifacts(
     let combined_filter = format!("({}) AND ({})", time_filter, query_filter);
     tracing::debug!("Combined filter for prevalence query: {}", combined_filter);
 
-    // Get cluster-aware table name for logs
-    let logs_table = dual_pool.table_names().read("logs");
+    // Resolve the FROM table + the file-hash / dest-host columns through the
+    // active schema profile (OCSF Phase 6, NAN-1241) so the artifact extraction
+    // queries hit `ocsf_logs` and the promoted OCSF columns under the OCSF
+    // profile, and the exact UDM columns (`file_hash` / `dest_host`) under UDM.
+    // `udm_column_sql` returns `None` when the schema has no column for that UDM
+    // concept — we then skip that artifact class rather than emit an
+    // unknown-column 500.
+    let profile = state.config.schema_profile();
+    let logs_table = dual_pool
+        .table_names()
+        .read(profile.table_name().trim_start_matches("nanosiem."));
 
     // Query for unique file hashes (no limit - let prevalence filtering handle it)
-    let hash_query = format!(
-        "SELECT DISTINCT file_hash AS value FROM {} WHERE {} AND file_hash != ''",
-        logs_table, combined_filter
-    );
-
-    let hash_results: Vec<String> = ch
-        .query(&hash_query)
-        .fetch_all::<SingleStringRow>()
-        .await
-        .map(|rows| rows.into_iter().map(|r| r.value).collect())
-        .unwrap_or_default();
+    let hash_results: Vec<String> = if let Some(hash_col) = profile.udm_column_sql("file_hash") {
+        let hash_query = format!(
+            "SELECT DISTINCT {hash_col} AS value FROM {logs_table} WHERE {combined_filter} AND {hash_col} != ''"
+        );
+        ch.query(&hash_query)
+            .fetch_all::<SingleStringRow>()
+            .await
+            .map(|rows| rows.into_iter().map(|r| r.value).collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     // Query for unique domains (from dest_host)
-    let domain_query = format!(
-        "SELECT DISTINCT dest_host AS value FROM {} WHERE {} AND dest_host != '' AND dest_host NOT LIKE '%%.internal' AND dest_host NOT LIKE '%%.local'",
-        logs_table, combined_filter
-    );
-
-    let domain_results: Vec<String> = ch
-        .query(&domain_query)
-        .fetch_all::<SingleStringRow>()
-        .await
-        .map(|rows| rows.into_iter().map(|r| r.value).collect())
-        .unwrap_or_default();
+    let domain_results: Vec<String> = if let Some(host_col) = profile.udm_column_sql("dest_host") {
+        let domain_query = format!(
+            "SELECT DISTINCT {host_col} AS value FROM {logs_table} WHERE {combined_filter} AND {host_col} != '' AND {host_col} NOT LIKE '%%.internal' AND {host_col} NOT LIKE '%%.local'"
+        );
+        ch.query(&domain_query)
+            .fetch_all::<SingleStringRow>()
+            .await
+            .map(|rows| rows.into_iter().map(|r| r.value).collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     tracing::info!(
         "Query artifacts: found {} hashes, {} domains for query '{}' in time range",

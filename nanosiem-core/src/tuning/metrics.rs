@@ -23,6 +23,17 @@ use uuid::Uuid;
 use super::{AlertPattern, RuleMetrics};
 use crate::db::TableNames;
 
+/// True when the env-configured schema profile is OCSF. NAN-1254: drives the
+/// finding-column dispatch (rule id / metadata payload live in
+/// `event.unmapped.*` on `ocsf_logs`, vs explicit `rule_id`/`metadata` columns
+/// on the UDM `logs` table). Resolution mirrors `active_logs_table()`: any env
+/// error degrades to UDM (`false`), so a malformed env never breaks tuning.
+fn active_profile_is_ocsf() -> bool {
+    crate::schema::active_profile_from_env()
+        .map(|p| p.id() == crate::schema::SchemaId::Ocsf)
+        .unwrap_or(false)
+}
+
 /// Errors that can occur during metrics collection
 #[derive(Error, Debug)]
 pub enum MetricsCollectorError {
@@ -190,12 +201,22 @@ impl MetricsCollector {
         // table name returned by `TableNames::read`, which is a hard-coded
         // constant (`nanosiem.logs` / `nanosiem.logs_distributed`). All
         // caller-supplied values flow through `.bind(...)` placeholders.
-        let table = self.table_names.read("logs");
+        // NAN-1254: under OCSF the nano finding payload is an OCSF Detection
+        // Finding (class_uid 2004) in `ocsf_logs` — there is no `rule_id`
+        // column; the rule id lives in `event.unmapped.rule_id`. Branch the
+        // filter column accordingly; UDM stays byte-identical (`rule_id`).
+        let is_ocsf = active_profile_is_ocsf();
+        let table = self.table_names.read(crate::schema::active_logs_table());
+        let rule_id_col = if is_ocsf {
+            "JSONExtractString(event, 'unmapped', 'rule_id')"
+        } else {
+            "rule_id"
+        };
         let cutoff = now - window;
         let sql = format!(
             "SELECT count() FROM {table} \
              WHERE source_type = 'findings' \
-               AND rule_id = ? \
+               AND {rule_id_col} = ? \
                AND timestamp >= fromUnixTimestamp64Micro(?)"
         );
 
@@ -226,12 +247,28 @@ impl MetricsCollector {
         // table name returned by `TableNames::read`, which is a hard-coded
         // constant (`nanosiem.logs` / `nanosiem.logs_distributed`). All
         // caller-supplied values flow through `.bind(...)` placeholders.
-        let table = self.table_names.read("logs");
+        // NAN-1254: under OCSF the finding is a Detection Finding (class_uid
+        // 2004) on `ocsf_logs` with no `rule_id`/`metadata` columns — the nano
+        // payload (rule_id, signal_type, matched_events_sample, …) lives in
+        // `event.unmapped`. `JSONExtractRaw(event,'unmapped')` returns that
+        // object as a JSON string, which the parsing below reads
+        // `.matched_events_sample` from unchanged. `severity` is materialized on
+        // `ocsf_logs`. UDM stays byte-identical.
+        let is_ocsf = active_profile_is_ocsf();
+        let table = self.table_names.read(crate::schema::active_logs_table());
+        let (meta_col, rule_id_col) = if is_ocsf {
+            (
+                "JSONExtractRaw(event, 'unmapped')",
+                "JSONExtractString(event, 'unmapped', 'rule_id')",
+            )
+        } else {
+            ("metadata", "rule_id")
+        };
         let sql = format!(
-            "SELECT severity, metadata, toUnixTimestamp64Micro(timestamp) AS timestamp_us \
+            "SELECT severity, {meta_col} AS metadata, toUnixTimestamp64Micro(timestamp) AS timestamp_us \
              FROM {table} \
              WHERE source_type = 'findings' \
-               AND rule_id = ? \
+               AND {rule_id_col} = ? \
                AND timestamp >= fromUnixTimestamp64Micro(?) \
              ORDER BY timestamp DESC \
              LIMIT 1000"

@@ -14,6 +14,7 @@
 use super::SearchService;
 use crate::query::TimeRange;
 use crate::risk::{EntityRiskSummary, RiskTimeWindow};
+use crate::schema::{SchemaId, SchemaProfile};
 use crate::search::SearchError;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -46,15 +47,40 @@ impl CloudDossierFacetFilters {
 
 /// Build an `AND (...)` clause + bind values from the facet filters. Returns
 /// `("", vec![])` when every filter is empty so callers can inline it safely.
-fn build_facet_clause(filters: &CloudDossierFacetFilters) -> (String, Vec<String>) {
+///
+/// Each facet dimension is resolved to its physical column through the active
+/// schema profile (NAN-1241). A dimension whose column the schema does not map
+/// (`udm_column_sql` → None) is DROPPED — neither its clause nor its binds are
+/// emitted — so the placeholder/bind count the caller threads stays consistent.
+/// For the UDM profile every cloud column maps to its own name, so output is
+/// byte-identical to the pre-seam behavior.
+fn build_facet_clause(
+    filters: &CloudDossierFacetFilters,
+    profile: &dyn SchemaProfile,
+) -> (String, Vec<String>) {
     if filters.is_empty() {
         return (String::new(), Vec::new());
     }
     let mut clauses = Vec::new();
     let mut binds = Vec::new();
 
-    let mut push = |column: &str, values: &[String], lower: bool| {
+    let mut push = |udm: &str, values: &[String], lower: bool| {
         if values.is_empty() {
+            return;
+        }
+        // Skip-on-None: a schema without this cloud concept drops the dimension
+        // (and its binds) entirely rather than referencing a dead column.
+        let column = match profile.udm_column_sql(udm) {
+            Some(c) => c,
+            None => return,
+        };
+        // change_type is a string IN-filter — valid only when it resolves to
+        // the scalar UDM `change_type` column. Under OCSF it resolves to the
+        // numeric `activity_id` enum, where `activity_id IN ('permission_change'
+        // ,...)` 500s (Code 53 — int vs string). Drop the filter (and its binds)
+        // under any non-UDM mapping. TODO(OCSF/NAN-1248): filter by activity_id
+        // codes once a change_type→enum decode exists.
+        if udm == "change_type" && column != "change_type" {
             return;
         }
         let placeholders = vec!["?"; values.len()].join(",");
@@ -513,58 +539,211 @@ impl SearchService {
         let timeline_bucket_secs = (span_secs as u64 / TIMELINE_BUCKETS as u64).max(1);
         let timeline_unix_start = time_range.start.timestamp() as u64;
 
-        let logs_table = self.table_names.read("logs");
+        // Schema seam (NAN-1241): resolve the FROM table + every cloud UDM
+        // column through the active profile. For the UDM profile each cloud
+        // column maps to its own name, so the rendered SQL is byte-identical to
+        // the pre-seam version. For OCSF the columns resolve to the promoted
+        // physical columns and unmapped concepts are skipped per the patterns
+        // below.
+        let profile = self.active_profile.as_ref();
+        let logs_table = self.table_names.read(Self::logs_table_key(profile));
+
+        // Cloud columns resolved once and reused across the 12 subqueries.
+        // `cloud_col` is for columns that are SELECTed / GROUPed and therefore
+        // need an alias to survive even when unmapped: it falls back to a
+        // literal `''` so the JSONEachRow row still carries the expected key
+        // (mirrors asset_dossier's argMaxIf-or-`''` shape). The `_opt` variants
+        // are for WHERE / PREWHERE predicates, which we instead drop entirely
+        // when the column is absent.
+        let cloud_service_opt = profile.udm_column_sql("cloud_service");
+        let cloud_region_opt = profile.udm_column_sql("cloud_region");
+        let cloud_provider_opt = profile.udm_column_sql("cloud_provider");
+        let cloud_account_id_opt = profile.udm_column_sql("cloud_account_id");
+        let resource_type_opt = profile.udm_column_sql("resource_type");
+        let resource_id_opt = profile.udm_column_sql("resource_id");
+        let resource_name_opt = profile.udm_column_sql("resource_name");
+        let change_type_opt = profile.udm_column_sql("change_type");
+        let mfa_used_opt = profile.udm_column_sql("mfa_used");
+
+        // Cross-cutting UDM columns that are BARE literals on the legacy UDM
+        // table but live under promoted physical names on OCSF (NAN-1241):
+        //   user  -> "user" (UDM, reserved-word quoting) / user.name (OCSF)
+        //   src_ip-> src_ip / src_endpoint.ip
+        //   action-> action / activity
+        //   http_status_code -> http_status_code / http_response.code
+        //   http_user_agent  -> http_user_agent / http_request.user_agent
+        // Each resolves once and is substituted into the subqueries; a None
+        // result (a schema lacking the concept) drops the predicate/aggregate
+        // or projects a neutral fallback, exactly like cloud_overview.rs.
+        let user_opt = Self::cloud_principal_col(profile);
+        let src_ip_opt = profile.udm_column_sql("src_ip");
+        let action_opt = profile.udm_column_sql("action");
+        let http_status_opt = profile.udm_column_sql("http_status_code");
+        let http_ua_opt = profile.udm_column_sql("http_user_agent");
+
+        // AWS-verb allow-list column (NAN-1248, gap #22). The AssumeRole-chain /
+        // key-action / posture allow-lists compare against the literal AWS API
+        // verb ('AssumeRole', 'CreateAccessKey', …). Under UDM that verb lives in
+        // `action`; under OCSF `action` resolves to the GENERIC OCSF `activity`
+        // (Create/Read/Update/…) so the allow-lists silently never match — the
+        // schema phase instead promoted the native `api.operation` column (the
+        // raw AWS verb). Resolve the AWS-verb column per schema: OCSF → escaped
+        // "api.operation", UDM → the `action` column (byte-identical). `None`
+        // when neither maps so callers omit the term.
+        let aws_verb_opt: Option<String> = if profile.id() == SchemaId::Ocsf {
+            Some(crate::query::escape_identifier("api.operation"))
+        } else {
+            action_opt.clone()
+        };
+
+        // SELECT-projection fragments with a literal fallback so the JSONEachRow
+        // alias always exists (the builders downstream read these keys). String
+        // dims fall back to `''`, the change_type/mfa expressions to their
+        // neutral value. For UDM these are byte-identical to the old literals.
+        let str_or_empty = |opt: &Option<String>, alias: &str| -> String {
+            match opt {
+                Some(c) => format!("{c} AS {alias}"),
+                None => format!("'' AS {alias}"),
+            }
+        };
+
+        // `change_type` value semantics differ across schemas: UDM stores the
+        // scalar string ('permission_change'/'create'/…), OCSF reuses the
+        // numeric `activity_id` enum (no scalar change_type). This column is
+        // PROJECTED into the key-actions + stream SELECTs and then read by
+        // `classify_event_type`, which buckets on the LABEL ('create'/'update'/
+        // …) — so projecting OCSF's raw int (1/2/3/4) mis-buckets every event
+        // (NAN-1248, gap #25). Decode to the display label via the shared
+        // `change_type_label_expr`: UDM returns the bare `change_type` column
+        // (byte-identical projection), OCSF emits a transform() back to the UDM
+        // label. The value-literal predicates that COMPARE change_type are built
+        // separately below.
+        let change_type_select = format!(
+            "{} AS change_type",
+            Self::change_type_label_expr(profile)
+        );
+
+        // Value-literal predicate `change_type = 'permission_change'` is built
+        // inline in the key-actions and posture predicates below, gated to the
+        // UDM scalar `change_type` column. OCSF's change_type is the numeric
+        // `activity_id` enum with no equivalent 'permission_change' code, so the
+        // term is OMITTED there rather than emitting a never-matching (or
+        // type-mismatched) compare — the `action IN (...)` half still selects
+        // the sensitive writes. TODO(OCSF/NAN-1248): once an activity_id →
+        // permission-change mapping exists, add the numeric-code term.
 
         // `principal_clause` is always present (it's required) — we match on
         // the `user` UDM column, which all cloud parsers populate with the
         // IAM user or role session id. Some sources also set src_user; fall
         // back via an OR for robustness.
         let principal_bind = principal.to_string();
-        let provider_clause = provider_filter
-            .filter(|p| !p.is_empty())
-            .map(|_| " AND lower(cloud_provider) = lower(?)")
-            .unwrap_or("");
-        let account_clause = account_filter
-            .filter(|a| !a.is_empty())
-            .map(|_| " AND cloud_account_id = ?")
-            .unwrap_or("");
-        let (facet_clause, facet_binds) = build_facet_clause(facet_filters);
+        // Provider predicate only when both a filter is supplied AND the schema
+        // maps cloud_provider; otherwise the chip can't narrow and we skip it.
+        let provider_clause = match (
+            provider_filter.filter(|p| !p.is_empty()),
+            cloud_provider_opt.as_deref(),
+        ) {
+            (Some(_), Some(col)) => format!(" AND lower({col}) = lower(?)"),
+            _ => String::new(),
+        };
+        let provider_clause = provider_clause.as_str();
+        let account_clause = match (
+            account_filter.filter(|a| !a.is_empty()),
+            cloud_account_id_opt.as_deref(),
+        ) {
+            (Some(_), Some(col)) => format!(" AND {col} = ?"),
+            _ => String::new(),
+        };
+        let account_clause = account_clause.as_str();
+        let (facet_clause, facet_binds) = build_facet_clause(facet_filters, profile);
+
+        // Whether each optional clause actually rendered a `?` placeholder — a
+        // filter is only bound when its column maps under the active schema, so
+        // these mirror the clause-emission guards above and keep the bind count
+        // aligned with the placeholder count even when OCSF drops a dimension.
+        let bind_provider = !provider_clause.is_empty();
+        let bind_account = !account_clause.is_empty();
 
         // Bind order must match the rendered SQL placeholder order, which
         // comes out of `{provider_clause}{facet_clause}\n{account_clause}`:
         //   provider, facet_binds..., account.
         let extra_bind = |q: clickhouse::query::Query| -> clickhouse::query::Query {
             let mut q = q;
-            if let Some(p) = provider_filter.filter(|p| !p.is_empty()) {
+            if let (true, Some(p)) = (bind_provider, provider_filter.filter(|p| !p.is_empty())) {
                 q = q.bind(p.to_string());
             }
             for v in &facet_binds {
                 q = q.bind(v.clone());
             }
-            if let Some(a) = account_filter.filter(|a| !a.is_empty()) {
+            if let (true, Some(a)) = (bind_account, account_filter.filter(|a| !a.is_empty())) {
                 q = q.bind(a.to_string());
             }
             q
         };
 
+        // `user` is the principal-scoping column — required for every subquery.
+        // It maps under both shipped schemas (UDM `"user"`, OCSF `user.name`),
+        // but honour skip-on-None: if a schema lacks a user concept there is no
+        // way to scope to a principal, so return an empty dossier rather than
+        // emit a dead-column compare. Both placeholders in `identity_match` bind
+        // the same principal string, so the bind shape is unchanged.
+        let user_col = match &user_opt {
+            Some(c) => c.clone(),
+            None => return Ok(CloudDossier::default()),
+        };
+
         // Every query binds: start, end, principal, [provider], [account]
         // in that order. Identity clause matches either exact `user` or the
         // trailing component of a `role/session` compound user string.
-        let identity_match = "(user = ? OR splitByChar('/', user)[1] = ?)";
+        let identity_match =
+            format!("({user_col} = ? OR splitByChar('/', {user_col})[1] = ?)");
+        let identity_match = identity_match.as_str();
 
         // --- 1. Identity query ---------------------------------------------
+        // Cloud columns resolved with neutral fallbacks so every alias the
+        // build_identity reader expects (account/mfa_on/mfa_off/console_logins)
+        // stays present even when the active schema lacks that column.
+        let id_account = match &cloud_account_id_opt {
+            Some(c) => format!("argMaxIf({c}, timestamp, {c} != '') AS account"),
+            None => "'' AS account".to_string(),
+        };
+        let id_regions = match &cloud_region_opt {
+            Some(c) => format!("groupUniqArrayIf({c}, {c} != '') AS regions"),
+            None => "[] AS regions".to_string(),
+        };
+        // mfa_used keeps the 0/1 UDM value encoding; the OCSF column is
+        // `toUInt8(JSONExtractBool(...))`, matching the same 0/1 domain, so the
+        // `= 1` / `= 0` literal comparisons remain correct after substitution.
+        let id_mfa_on = match &mfa_used_opt {
+            Some(c) => format!("countIf({c} = 1) AS mfa_on"),
+            None => "toUInt64(0) AS mfa_on".to_string(),
+        };
+        let id_mfa_off = match &mfa_used_opt {
+            Some(c) => format!("countIf({c} = 0 AND {user_col} != '') AS mfa_off"),
+            None => "toUInt64(0) AS mfa_off".to_string(),
+        };
+        let id_console = match &cloud_service_opt {
+            Some(c) => format!("countIf(lower({c}) = 'signin') AS console_logins"),
+            None => "toUInt64(0) AS console_logins".to_string(),
+        };
+        // `src_ip` is the actor IP; promoted to src_endpoint.ip on OCSF. Project
+        // an empty array when the schema lacks it so the `ips` key still exists.
+        let id_ips = match &src_ip_opt {
+            Some(c) => format!("groupUniqArrayIf({c}, {c} != '') AS ips"),
+            None => "[] AS ips".to_string(),
+        };
         let identity_sql = format!(
             r#"SELECT
                 count() AS events_total,
-                argMaxIf(cloud_account_id, timestamp, cloud_account_id != '') AS account,
-                argMaxIf(user, timestamp, user != '') AS last_user,
+                {id_account},
+                argMaxIf({user_col}, timestamp, {user_col} != '') AS last_user,
                 toString(min(timestamp)) AS first_seen,
                 toString(max(timestamp)) AS last_seen,
-                groupUniqArrayIf(cloud_region, cloud_region != '') AS regions,
-                groupUniqArrayIf(src_ip, src_ip != '') AS ips,
-                countIf(mfa_used = 1) AS mfa_on,
-                countIf(mfa_used = 0 AND user != '') AS mfa_off,
-                countIf(lower(cloud_service) = 'signin') AS console_logins
+                {id_regions},
+                {id_ips},
+                {id_mfa_on},
+                {id_mfa_off},
+                {id_console}
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
               AND {identity_match}
@@ -573,13 +752,23 @@ impl SearchService {
         );
 
         // --- 2. User-agent breakdown ---------------------------------------
+        // http_user_agent promotes to http_request.user_agent on OCSF. When the
+        // schema lacks it, project '' (so the `ua` key survives) and drop the
+        // `!= ''` predicate. UDM output is byte-identical.
+        let ua_select = match &http_ua_opt {
+            Some(c) => format!("{c} AS ua"),
+            None => "'' AS ua".to_string(),
+        };
+        let ua_present_clause = match &http_ua_opt {
+            Some(c) => format!("AND {c} != ''\n              "),
+            None => String::new(),
+        };
         let ua_sql = format!(
-            r#"SELECT http_user_agent AS ua, count() AS cnt
+            r#"SELECT {ua_select}, count() AS cnt
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
               AND {identity_match}
-              AND http_user_agent != ''
-              {provider_clause}{facet_clause}
+              {ua_present_clause}{provider_clause}{facet_clause}
               {account_clause}
             GROUP BY ua
             ORDER BY cnt DESC
@@ -587,58 +776,109 @@ impl SearchService {
         );
 
         // --- 3. IP breakdown -----------------------------------------------
+        // Geo/ASN enrichment columns differ physically across schemas: UDM has
+        // the scalar `enriched_src_*` columns; OCSF promotes them to dotted
+        // `src_endpoint.*` columns (and has NO country-NAME column, only the
+        // ISO code), so we resolve through the profile and fall back to `''`
+        // when unmapped rather than referencing a nonexistent column (500 on
+        // OCSF). UDM output is byte-identical.
+        // Prefer the country-NAME column (UDM `enriched_src_country`); OCSF's
+        // location object has no name attribute, only the ISO 3166-1 code, so
+        // fall back to `enriched_src_country_code` (→ src_endpoint.location.country
+        // on OCSF) rather than blanking the panel (NAN-1248, gap #26). UDM maps
+        // the name column, so its output is byte-identical.
+        let ip_country = match profile
+            .udm_column_sql("enriched_src_country")
+            .or_else(|| profile.udm_column_sql("enriched_src_country_code"))
+        {
+            Some(c) => format!("anyIf({c}, {c} != '') AS country"),
+            None => "'' AS country".to_string(),
+        };
+        let ip_asn = match profile.udm_column_sql("enriched_src_as_name") {
+            Some(c) => format!("anyIf({c}, {c} != '') AS asn"),
+            None => "'' AS asn".to_string(),
+        };
+        // src_ip -> src_endpoint.ip on OCSF; project '' + drop the `!= ''`
+        // narrowing when the schema lacks an actor-IP column.
+        let ip_select = match &src_ip_opt {
+            Some(c) => format!("{c} AS ip"),
+            None => "'' AS ip".to_string(),
+        };
+        let ip_present_clause = match &src_ip_opt {
+            Some(c) => format!("AND {c} != ''\n              "),
+            None => String::new(),
+        };
         let ip_sql = format!(
             r#"SELECT
-                src_ip AS ip,
+                {ip_select},
                 count() AS cnt,
                 toString(min(timestamp)) AS first_at,
                 toString(max(timestamp)) AS last_at,
-                anyIf(enriched_src_country, enriched_src_country != '') AS country,
-                anyIf(enriched_src_as_name, enriched_src_as_name != '') AS asn
+                {ip_country},
+                {ip_asn}
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
               AND {identity_match}
-              AND src_ip != ''
-              {provider_clause}{facet_clause}
+              {ip_present_clause}{provider_clause}{facet_clause}
               {account_clause}
             GROUP BY ip
             ORDER BY cnt DESC
             LIMIT 8"#,
         );
 
-        // --- 4. Facets (6 dims UNION ALL) ----------------------------------
+        // --- 4. Facets (UNION ALL over the dims the schema maps) -----------
+        // Each dimension is only emitted when its cloud column resolves under
+        // the active schema. Dropped dims also drop their per-dim bind block —
+        // `facet_dim_count` (below) feeds the binder so placeholder/bind counts
+        // stay aligned. For UDM all 6 dims map with the same columns/limits/
+        // value-exprs, so this is semantically identical to the old fixed 6-dim
+        // UNION (only the UNION whitespace layout differs); no test snapshots
+        // this SQL.
+        // change_type is facetable ONLY when it resolves to the scalar UDM
+        // `change_type` column. Under OCSF it resolves to the numeric
+        // `activity_id` enum, where the dimension's `{col} != ''` / GROUP BY on
+        // a string-shaped value would 500 (Code 32 — int vs string). Gate the
+        // dimension to the literal UDM column; under OCSF it drops out (column =
+        // None), and the per-dim bind block drops with it via `facet_dim_count`,
+        // keeping placeholder/bind counts aligned. TODO(OCSF/NAN-1248): re-add a
+        // change_type facet over an activity_id enum-decode.
+        let change_type_facet_col = match change_type_opt.as_deref() {
+            Some("change_type") => Some("change_type"),
+            _ => None,
+        };
+        let facet_dim_specs: [(&str, Option<&str>, bool, usize); 6] = [
+            ("provider", cloud_provider_opt.as_deref(), true, 5),
+            ("service", cloud_service_opt.as_deref(), true, 12),
+            ("region", cloud_region_opt.as_deref(), false, 12),
+            ("account", cloud_account_id_opt.as_deref(), false, 6),
+            ("resource_type", resource_type_opt.as_deref(), false, 12),
+            ("change_type", change_type_facet_col, false, 8),
+        ];
+        let facet_dim_blocks: Vec<String> = facet_dim_specs
+            .iter()
+            .filter_map(|(dim, col, lower, limit)| {
+                let col = (*col)?;
+                // `value` keeps the same shape (lower() on provider/service) so
+                // the build_facets dispatch downstream is unchanged.
+                let value_expr = if *lower {
+                    format!("lower({col})")
+                } else {
+                    col.to_string()
+                };
+                Some(format!(
+                    r#"(
+                SELECT '{dim}' AS dim, {value_expr} AS value, count() AS cnt FROM {logs_table}
+                PREWHERE timestamp BETWEEN ? AND ? AND {identity_match} AND {col} != ''
+                  {provider_clause}{facet_clause} {account_clause}
+                GROUP BY value ORDER BY cnt DESC LIMIT {limit}
+            )"#
+                ))
+            })
+            .collect();
+        let facet_dim_count = facet_dim_blocks.len();
         let facets_sql = format!(
-            r#"SELECT * FROM (
-                SELECT 'provider' AS dim, lower(cloud_provider) AS value, count() AS cnt FROM {logs_table}
-                PREWHERE timestamp BETWEEN ? AND ? AND {identity_match} AND cloud_provider != ''
-                  {provider_clause}{facet_clause} {account_clause}
-                GROUP BY value ORDER BY cnt DESC LIMIT 5
-            ) UNION ALL (
-                SELECT 'service' AS dim, lower(cloud_service) AS value, count() AS cnt FROM {logs_table}
-                PREWHERE timestamp BETWEEN ? AND ? AND {identity_match} AND cloud_service != ''
-                  {provider_clause}{facet_clause} {account_clause}
-                GROUP BY value ORDER BY cnt DESC LIMIT 12
-            ) UNION ALL (
-                SELECT 'region' AS dim, cloud_region AS value, count() AS cnt FROM {logs_table}
-                PREWHERE timestamp BETWEEN ? AND ? AND {identity_match} AND cloud_region != ''
-                  {provider_clause}{facet_clause} {account_clause}
-                GROUP BY value ORDER BY cnt DESC LIMIT 12
-            ) UNION ALL (
-                SELECT 'account' AS dim, cloud_account_id AS value, count() AS cnt FROM {logs_table}
-                PREWHERE timestamp BETWEEN ? AND ? AND {identity_match} AND cloud_account_id != ''
-                  {provider_clause}{facet_clause} {account_clause}
-                GROUP BY value ORDER BY cnt DESC LIMIT 6
-            ) UNION ALL (
-                SELECT 'resource_type' AS dim, resource_type AS value, count() AS cnt FROM {logs_table}
-                PREWHERE timestamp BETWEEN ? AND ? AND {identity_match} AND resource_type != ''
-                  {provider_clause}{facet_clause} {account_clause}
-                GROUP BY value ORDER BY cnt DESC LIMIT 12
-            ) UNION ALL (
-                SELECT 'change_type' AS dim, change_type AS value, count() AS cnt FROM {logs_table}
-                PREWHERE timestamp BETWEEN ? AND ? AND {identity_match} AND change_type != ''
-                  {provider_clause}{facet_clause} {account_clause}
-                GROUP BY value ORDER BY cnt DESC LIMIT 8
-            )"#,
+            "SELECT * FROM {}",
+            facet_dim_blocks.join(" UNION ALL ")
         );
 
         // --- 5. AssumeRole chain --------------------------------------------
@@ -647,18 +887,40 @@ impl SearchService {
         // assemble the hop chain. The role that was ASSUMED next becomes a
         // row here itself (its `user` is "<role>/<session>" which our
         // `splitByChar('/', user)[1] = principal` pattern catches).
+        let chain_to_label = str_or_empty(&resource_name_opt, "to_label");
+        let chain_to_account = str_or_empty(&cloud_account_id_opt, "to_account");
+        // Drop the `lower(cloud_service) = 'sts'` narrowing when the schema has
+        // no cloud_service column (the `action = assumerole` filter still scopes
+        // the query). For UDM the predicate is byte-identical.
+        let chain_service_clause = match &cloud_service_opt {
+            Some(c) => format!("AND lower({c}) = 'sts'\n              "),
+            None => String::new(),
+        };
+        // src_ip -> src_endpoint.ip on OCSF; project '' when unmapped.
+        let chain_ip = match &src_ip_opt {
+            Some(c) => format!("anyIf({c}, {c} != '') AS ip"),
+            None => "'' AS ip".to_string(),
+        };
+        // The AssumeRole narrowing keys off the AWS API verb. Under UDM that is
+        // the `action` column; under OCSF the generic `activity` would
+        // under-match, so `aws_verb_opt` routes this to the native `api.operation`
+        // column (NAN-1248, gap #22). Drop the term when neither column maps —
+        // the cloud_service='sts' clause still scopes the chain. UDM is
+        // byte-identical (aws_verb_opt == action_opt there).
+        let chain_action_clause = match &aws_verb_opt {
+            Some(c) => format!("AND lower({c}) = 'assumerole'\n              "),
+            None => String::new(),
+        };
         let chain_sql = format!(
             r#"SELECT
                 toString(min(timestamp)) AS first_at,
-                resource_name AS to_label,
-                cloud_account_id AS to_account,
+                {chain_to_label},
+                {chain_to_account},
                 count() AS calls,
-                anyIf(src_ip, src_ip != '') AS ip
+                {chain_ip}
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
-              AND lower(cloud_service) = 'sts'
-              AND lower(action) = 'assumerole'
-              AND {identity_match}
+              {chain_service_clause}{chain_action_clause}AND {identity_match}
               {provider_clause}{facet_clause}
               {account_clause}
             GROUP BY to_label, to_account
@@ -671,24 +933,60 @@ impl SearchService {
         // Sensitive writes the principal performed (directly or via an
         // assumed role session). Severity is derived server-side from the
         // action name.
+        let ka_target = match &resource_name_opt {
+            Some(c) => format!("anyIf({c}, {c} != '') AS target"),
+            None => "'' AS target".to_string(),
+        };
+        let ka_service = match &cloud_service_opt {
+            Some(c) => format!("lower({c}) AS service"),
+            None => "'' AS service".to_string(),
+        };
+        // `action` projection (promoted to `activity` on OCSF). Project '' when
+        // the schema lacks it so the `action` key the builder reads still exists.
+        let ka_action_select = match &action_opt {
+            Some(c) => format!("{c} AS action"),
+            None => "'' AS action".to_string(),
+        };
+        // The sensitive-write allow-list filters on the AWS API verb; OMIT the
+        // IN-term when no verb column maps (the change_type='permission_change'
+        // half still selects permission changes under UDM). Under OCSF the verb
+        // resolves to the native `api.operation` column (NAN-1248, gap #22), so
+        // the AWS-API allow-list matches; UDM uses `action` (byte-identical).
+        // Assemble the OR-of-terms predicate from whatever terms the active
+        // schema supports, so it stays well-formed even if a term drops out.
+        let mut ka_pred_terms: Vec<String> = Vec::new();
+        if let Some(c) = &aws_verb_opt {
+            ka_pred_terms.push(format!(
+                "{c} IN ('CreateAccessKey','AttachUserPolicy','CreateUser','PutRolePolicy','UpdateAccessKey',
+                           'DeleteUser','PutBucketPolicy','DeleteBucket','AuthorizeSecurityGroupIngress',
+                           'GetSecretValue','PutSecretValue','ScheduleKeyDeletion','TerminateInstances',
+                           'UpdateStack','DeleteStack')"
+            ));
+        }
+        if let (SchemaId::Udm, Some(c)) = (profile.id(), &change_type_opt) {
+            ka_pred_terms.push(format!("{c} = 'permission_change'"));
+        }
+        // Fall back to `1=0` (selects nothing) if no term applies, keeping the
+        // `AND ( ... )` wrapper well-formed.
+        let ka_action_pred = if ka_pred_terms.is_empty() {
+            "1 = 0".to_string()
+        } else {
+            ka_pred_terms.join(" OR ")
+        };
         let key_actions_sql = format!(
             r#"SELECT
                 toString(min(timestamp)) AS at,
-                splitByChar('/', user)[1] AS role,
-                action AS action,
-                anyIf(resource_name, resource_name != '') AS target,
-                lower(cloud_service) AS service,
-                change_type AS change_type,
+                splitByChar('/', {user_col})[1] AS role,
+                {ka_action_select},
+                {ka_target},
+                {ka_service},
+                {change_type_select},
                 count() AS cnt
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
               AND {identity_match}
               AND (
-                action IN ('CreateAccessKey','AttachUserPolicy','CreateUser','PutRolePolicy','UpdateAccessKey',
-                           'DeleteUser','PutBucketPolicy','DeleteBucket','AuthorizeSecurityGroupIngress',
-                           'GetSecretValue','PutSecretValue','ScheduleKeyDeletion','TerminateInstances',
-                           'UpdateStack','DeleteStack')
-                OR change_type = 'permission_change'
+                {ka_action_pred}
               )
               {provider_clause}{facet_clause}
               {account_clause}
@@ -698,34 +996,61 @@ impl SearchService {
         );
 
         // --- 7. Timeline lanes ----------------------------------------------
+        let tl_service = match &cloud_service_opt {
+            Some(c) => format!("lower({c}) AS service"),
+            None => "'' AS service".to_string(),
+        };
+        let tl_service_clause = match &cloud_service_opt {
+            Some(c) => format!("AND {c} != ''\n              "),
+            None => String::new(),
+        };
         let timeline_sql = format!(
             r#"SELECT
-                lower(cloud_service) AS service,
+                {tl_service},
                 toUInt32(intDiv(toUnixTimestamp(timestamp) - {timeline_unix_start}, {timeline_bucket_secs})) AS bucket,
                 count() AS events
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
               AND {identity_match}
-              AND cloud_service != ''
-              {provider_clause}{facet_clause}
+              {tl_service_clause}{provider_clause}{facet_clause}
               {account_clause}
             GROUP BY service, bucket
             HAVING bucket < {TIMELINE_BUCKETS}"#,
         );
 
         // --- 8. Top actions -------------------------------------------------
+        // `action` (→ `activity` on OCSF) names the row; project '' + drop the
+        // `!= ''` narrowing when unmapped. http_status_code (→ http_response.code
+        // on OCSF, also numeric) feeds the error-count; drop that OR-term when
+        // the schema has no HTTP status. TODO(OCSF/NAN-1248): value-vocabulary —
+        // status='failure'/'error' string compares under-match on OCSF (caps
+        // Success/Failure/Unknown); needs a status_id decode.
+        let act_name = match &action_opt {
+            Some(c) => format!("{c} AS name"),
+            None => "'' AS name".to_string(),
+        };
+        let act_present_clause = match &action_opt {
+            Some(c) => format!("AND {c} != ''\n              "),
+            None => String::new(),
+        };
+        let act_http_err = match &http_status_opt {
+            Some(c) => format!(" OR {c} >= 400"),
+            None => String::new(),
+        };
+        // NAN-1248: status value-comparison form (raw under UDM, lower(status)
+        // under OCSF to match the capitalized caption).
+        let status_cmp = Self::status_cmp_col(profile);
         let actions_sql = format!(
             r#"SELECT
-                action AS name,
-                lower(cloud_service) AS service,
-                splitByChar('/', user)[1] AS principal_role,
+                {act_name},
+                {ka_service},
+                splitByChar('/', {user_col})[1] AS principal_role,
                 count() AS cnt,
-                countIf(status = 'failure' OR status = 'error' OR http_status_code >= 400) AS errs
+                countIf({status_cmp} = 'failure' OR {status_cmp} = 'error'{act_http_err}) AS errs
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
               AND {identity_match}
-              AND action != ''
-              {provider_clause}{facet_clause}
+              {act_present_clause}{provider_clause}{facet_clause}
               {account_clause}
             GROUP BY name, service, principal_role
             ORDER BY cnt DESC
@@ -733,19 +1058,48 @@ impl SearchService {
         );
 
         // --- 9. Top resources -----------------------------------------------
+        // `arn` (the grouping identity) is built from whichever resource id /
+        // name columns the schema maps; the existence predicate narrows on the
+        // same set. For UDM both map, so this is byte-identical to the original
+        // coalesce(nullIf(resource_id,''), resource_name).
+        let res_arn = match (&resource_id_opt, &resource_name_opt) {
+            (Some(id), Some(name)) => format!("coalesce(nullIf({id}, ''), {name})"),
+            (Some(id), None) => format!("nullIf({id}, '')"),
+            (None, Some(name)) => name.clone(),
+            (None, None) => "''".to_string(),
+        };
+        let res_type = match &resource_type_opt {
+            Some(c) => format!("any({c}) AS resource_type"),
+            None => "'' AS resource_type".to_string(),
+        };
+        let res_account = match &cloud_account_id_opt {
+            Some(c) => format!("any({c}) AS account"),
+            None => "'' AS account".to_string(),
+        };
+        let res_exists_clause = match (&resource_id_opt, &resource_name_opt) {
+            (Some(id), Some(name)) => format!("AND ({id} != '' OR {name} != '')\n              "),
+            (Some(id), None) => format!("AND {id} != ''\n              "),
+            (None, Some(name)) => format!("AND {name} != ''\n              "),
+            (None, None) => String::new(),
+        };
+        // `touched` collects distinct action names (→ `activity` on OCSF);
+        // project an empty array when the schema lacks an action column.
+        let res_touched = match &action_opt {
+            Some(c) => format!("arraySlice(groupUniqArrayIf({c}, {c} != ''), 1, 6) AS touched"),
+            None => "[] AS touched".to_string(),
+        };
         let resources_sql = format!(
             r#"SELECT
-                coalesce(nullIf(resource_id, ''), resource_name) AS arn,
-                any(resource_type) AS resource_type,
-                any(cloud_account_id) AS account,
+                {res_arn} AS arn,
+                {res_type},
+                {res_account},
                 count() AS changes,
                 toString(max(timestamp)) AS last_at,
-                arraySlice(groupUniqArrayIf(action, action != ''), 1, 6) AS touched
+                {res_touched}
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
               AND {identity_match}
-              AND (resource_id != '' OR resource_name != '')
-              {provider_clause}{facet_clause}
+              {res_exists_clause}{provider_clause}{facet_clause}
               {account_clause}
             GROUP BY arn
             ORDER BY changes DESC
@@ -753,11 +1107,20 @@ impl SearchService {
         );
 
         // --- 10. Error rate -------------------------------------------------
+        // http_status_code (→ http_response.code on OCSF, numeric) augments the
+        // denied count; drop the OR-term when the schema has no HTTP status.
+        // TODO(OCSF/NAN-1248): value-vocabulary — status='failure'/'error'/
+        // 'denied' string compares under-match on OCSF (caps Success/Failure/
+        // Unknown/Other); needs a status_id decode.
+        let er_http_denied = match &http_status_opt {
+            Some(c) => format!(" OR {c} = 403"),
+            None => String::new(),
+        };
         let error_rate_sql = format!(
             r#"SELECT
                 count() AS total,
-                countIf(status = 'failure' OR status = 'error') AS failed,
-                countIf(status = 'denied' OR http_status_code = 403) AS denied
+                countIf({status_cmp} = 'failure' OR {status_cmp} = 'error') AS failed,
+                countIf({status_cmp} = 'denied'{er_http_denied}) AS denied
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
               AND {identity_match}
@@ -770,7 +1133,7 @@ impl SearchService {
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
               AND {identity_match}
-              AND status != '' AND status != 'success'
+              AND {status_cmp} != '' AND {status_cmp} != 'success'
               {provider_clause}{facet_clause}
               {account_clause}
             GROUP BY code
@@ -780,19 +1143,47 @@ impl SearchService {
 
         // --- 11. Auth posture (account-scoped; lists all principals in the
         //     principal's primary account so the dossier shows fleet context)
+        // mfa_used keeps its 0/1 encoding across schemas (see identity above).
+        let po_has_mfa = match &mfa_used_opt {
+            Some(c) => format!("maxIf({c}, {user_col} != '') > 0 AS has_mfa"),
+            None => "0 AS has_mfa".to_string(),
+        };
+        let po_seen_without = match &mfa_used_opt {
+            Some(c) => format!("anyIf({c}, {c} = 0) AS seen_without_mfa"),
+            None => "toUInt8(0) AS seen_without_mfa".to_string(),
+        };
+        // Privileged-call predicate, assembled from the terms the active schema
+        // supports so it stays well-formed. The AWS-verb allow-list resolves
+        // `action` under UDM and the native `api.operation` column under OCSF
+        // (NAN-1248, gap #22); the change_type='permission_change' term only
+        // renders for UDM. Falls back to `1=0` if neither applies. UDM is
+        // byte-identical (aws_verb_opt == action_opt there).
+        let mut priv_terms: Vec<String> = Vec::new();
+        if let Some(c) = &aws_verb_opt {
+            priv_terms.push(format!(
+                "{c} IN ('CreateAccessKey','AttachUserPolicy','PutRolePolicy','PutBucketPolicy')"
+            ));
+        }
+        if let (SchemaId::Udm, Some(c)) = (profile.id(), &change_type_opt) {
+            priv_terms.push(format!("{c} = 'permission_change'"));
+        }
+        let priv_predicate = if priv_terms.is_empty() {
+            "1 = 0".to_string()
+        } else {
+            priv_terms.join(" OR ")
+        };
         let posture_sql = format!(
             r#"SELECT
-                user AS name,
-                maxIf(mfa_used, user != '') > 0 AS has_mfa,
-                anyIf(mfa_used, mfa_used = 0) AS seen_without_mfa,
+                {user_col} AS name,
+                {po_has_mfa},
+                {po_seen_without},
                 count() AS calls,
-                countIf(change_type = 'permission_change' OR action IN
-                    ('CreateAccessKey','AttachUserPolicy','PutRolePolicy','PutBucketPolicy')) AS priv_calls,
+                countIf({priv_predicate}) AS priv_calls,
                 toString(max(timestamp)) AS last_call,
-                startsWith(user, 'arn:aws:sts::') OR positionCaseInsensitive(user, 'Role') > 0 AS is_role
+                startsWith({user_col}, 'arn:aws:sts::') OR positionCaseInsensitive({user_col}, 'Role') > 0 AS is_role
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
-              AND user != ''
+              AND {user_col} != ''
               {provider_clause}{facet_clause}
               {account_clause}
             GROUP BY name
@@ -801,20 +1192,46 @@ impl SearchService {
         );
 
         // --- 12. Event stream ------------------------------------------------
+        let st_account = str_or_empty(&cloud_account_id_opt, "account");
+        let st_region = str_or_empty(&cloud_region_opt, "region");
+        // resource prefers resource_name then resource_id (reverse of the
+        // top-resources query). Byte-identical for UDM.
+        let st_resource = match (&resource_name_opt, &resource_id_opt) {
+            (Some(name), Some(id)) => format!("coalesce(nullIf({name}, ''), {id})"),
+            (Some(name), None) => format!("nullIf({name}, '')"),
+            (None, Some(id)) => id.clone(),
+            (None, None) => "''".to_string(),
+        };
+        // Cross-cutting projections with neutral fallbacks so the stream builder
+        // always finds its keys. action→activity, src_ip→src_endpoint.ip,
+        // http_status_code→http_response.code (numeric, toUInt64(0) fallback)
+        // on OCSF.
+        let st_event_name = match &action_opt {
+            Some(c) => format!("{c} AS event_name"),
+            None => "'' AS event_name".to_string(),
+        };
+        let st_source_ip = match &src_ip_opt {
+            Some(c) => format!("{c} AS source_ip"),
+            None => "'' AS source_ip".to_string(),
+        };
+        let st_http_status = match &http_status_opt {
+            Some(c) => format!("{c} AS http_status_code"),
+            None => "toUInt64(0) AS http_status_code".to_string(),
+        };
         let stream_sql = format!(
             r#"SELECT
                 toString(id) AS id,
                 toString(timestamp) AS ts,
-                action AS event_name,
-                lower(cloud_service) AS service,
-                user AS user,
-                cloud_account_id AS account,
-                cloud_region AS region,
-                src_ip AS source_ip,
-                coalesce(nullIf(resource_name, ''), resource_id) AS resource,
+                {st_event_name},
+                {ka_service},
+                {user_col} AS user,
+                {st_account},
+                {st_region},
+                {st_source_ip},
+                {st_resource} AS resource,
                 status AS status,
-                http_status_code AS http_status_code,
-                change_type AS change_type,
+                {st_http_status},
+                {change_type_select},
                 message AS message
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
@@ -842,16 +1259,16 @@ impl SearchService {
         // in facets_sql: {provider_clause}{facet_clause} then {account_clause}.
         let bind_facets_query = || -> clickhouse::query::Query {
             let mut q = clickhouse.query(&facets_sql);
-            for _ in 0..6 {
+            for _ in 0..facet_dim_count {
                 q = q.bind(start_str.clone()).bind(end_str.clone());
                 q = q.bind(principal_bind.clone()).bind(principal_bind.clone());
-                if let Some(p) = provider_filter.filter(|p| !p.is_empty()) {
+                if let (true, Some(p)) = (bind_provider, provider_filter.filter(|p| !p.is_empty())) {
                     q = q.bind(p.to_string());
                 }
                 for v in &facet_binds {
                     q = q.bind(v.clone());
                 }
-                if let Some(a) = account_filter.filter(|a| !a.is_empty()) {
+                if let (true, Some(a)) = (bind_account, account_filter.filter(|a| !a.is_empty())) {
                     q = q.bind(a.to_string());
                 }
             }

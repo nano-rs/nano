@@ -27,6 +27,10 @@ const ALLOWED_TABLES: &[&str] = &[
     // Core event tables
     "logs",
     "logs_distributed",
+    // OCSF profile ingested-events table (NAN-1241) — raw-SQL search/dashboard
+    // panels reference it directly under NANO_SCHEMA_PROFILE=ocsf.
+    "ocsf_logs",
+    "ocsf_logs_distributed",
     "signals",
     "signals_distributed",
     "ingestion_errors",

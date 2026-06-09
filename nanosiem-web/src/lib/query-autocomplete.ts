@@ -79,19 +79,58 @@ async function fetchSourceTypes(): Promise<string[]> {
   return sourceTypesFetchPromise;
 }
 
-async function fetchUdmFields(): Promise<UdmFieldInfo[]> {
-  if (udmFieldsCache) return udmFieldsCache;
-  if (udmFieldsFetchPromise) return udmFieldsFetchPromise;
-  
+/** Raw UDM field fetch (`/api/udm/fields`). UDM-only, but carries human-readable
+ *  `description`s that `/api/schema/fields` does not. Used directly under the UDM
+ *  profile (to keep suggestions byte-identical) and as the fallback when the
+ *  profile-aware schema endpoint is unavailable. */
+async function fetchLegacyUdmFields(): Promise<UdmFieldInfo[]> {
   const token = getAccessToken();
-  udmFieldsFetchPromise = fetch(`${import.meta.env.VITE_API_URL ?? ''}/api/udm/fields`, {
+  return fetch(`${import.meta.env.VITE_API_URL ?? ''}/api/udm/fields`, {
     headers: {
       'Authorization': token ? `Bearer ${token}` : '',
     },
   })
     .then(res => res.json())
-    .then(data => {
-      const fields: UdmFieldInfo[] = data.fields || [];
+    .then(data => (data.fields || []) as UdmFieldInfo[])
+    .catch(() => [] as UdmFieldInfo[]);
+}
+
+/**
+ * Field universe for nPL autocomplete, sourced from the profile-aware
+ * `/api/schema/fields` endpoint the rest of the app uses (NAN-1241). Previously
+ * this hit UDM-only `/api/udm/fields`, so under OCSF the promoted columns
+ * (`src_endpoint.ip`, `class_uid`, …) were never suggested.
+ *
+ * - Schema `udm`: defer to `/api/udm/fields` so suggestions (incl. descriptions)
+ *   stay byte-identical to the pre-OCSF behavior.
+ * - Schema `ocsf` (or any non-UDM): map the schema response into the
+ *   autocomplete shape (`name`/`column_name` = the schema column name; `type` →
+ *   `data_type`; no description in the schema response).
+ * - Schema endpoint unavailable / empty: fall back to `/api/udm/fields`.
+ */
+async function fetchUdmFields(): Promise<UdmFieldInfo[]> {
+  if (udmFieldsCache) return udmFieldsCache;
+  if (udmFieldsFetchPromise) return udmFieldsFetchPromise;
+
+  udmFieldsFetchPromise = api
+    .getSchemaFields()
+    .then(async (resp) => {
+      // UDM: keep the existing description-bearing source for byte-identical
+      // suggestions. Also covers an empty schema field set.
+      if (!resp || resp.schema === 'udm' || !resp.fields?.length) {
+        return fetchLegacyUdmFields();
+      }
+      const fields: UdmFieldInfo[] = resp.fields.map((f) => ({
+        name: f.name,
+        column_name: f.name,
+        data_type: f.type,
+        category: f.category,
+        description: '',
+      }));
+      return fields;
+    })
+    .catch(() => fetchLegacyUdmFields())
+    .then((fields) => {
       udmFieldsCache = fields;
       return fields;
     })
@@ -99,7 +138,7 @@ async function fetchUdmFields(): Promise<UdmFieldInfo[]> {
       udmFieldsFetchPromise = null;
       return [] as UdmFieldInfo[];
     });
-  
+
   return udmFieldsFetchPromise;
 }
 
@@ -165,7 +204,7 @@ export async function getQueryAutocompleteSuggestions(
 
   // Check for stats/timechart/eventstats/streamstats/chart aggregation function context
   const statsAggMatch = textBeforeCursor.match(/\|\s*(?:stats|timechart|eventstats|streamstats|chart)\s+(?:.*,\s*)?(\w*)$/i);
-  if (statsAggMatch && !/\bby\s+[\w,\s]*$/i.test(textBeforeCursor)) {
+  if (statsAggMatch && !/\bby\s+[\w.,\s]*$/i.test(textBeforeCursor)) {
     const partial = statsAggMatch[1].toLowerCase();
     const aggFunctions = [
       'count', 'dc', 'avg', 'sum', 'min', 'max', 'values', 'list',
@@ -182,7 +221,7 @@ export async function getQueryAutocompleteSuggestions(
   }
 
   // Check for parameter value context — suggest values for known params
-  const paramValueMatch = textBeforeCursor.match(/\b(\w+)=(\w*)$/);
+  const paramValueMatch = textBeforeCursor.match(/\b([\w.]+)=(\w*)$/);
   if (paramValueMatch) {
     const paramName = paramValueMatch[1].toLowerCase();
     const partial = paramValueMatch[2].toLowerCase();
@@ -278,25 +317,25 @@ export async function getQueryAutocompleteSuggestions(
 
   // Field context patterns — commands where the next token is a field name
   const fieldContextPatterns = [
-    /\|\s*table\s+[\w,\s]*$/i,
-    /\|\s*fields\s+[\w,\s]*$/i,
-    /\|\s*(?:stats|eventstats|streamstats|chart)\s+.*\bby\s+[\w,\s]*$/i,
-    /\bby\s+[\w,\s]*$/i,
+    /\|\s*table\s+[\w.,\s]*$/i,
+    /\|\s*fields\s+[\w.,\s]*$/i,
+    /\|\s*(?:stats|eventstats|streamstats|chart)\s+.*\bby\s+[\w.,\s]*$/i,
+    /\bby\s+[\w.,\s]*$/i,
     /\|\s*sort\s+[-+]?[\w.]*$/i,
     /\|\s*timechart\s+.*\bby\s+[\w.]*$/i,
     /\|\s*where\s+[\w.]*$/i,
     /\|\s*eval\s+\w+\s*=\s*[\w.]*$/i,
-    /\|\s*dedup\s+[\w,\s]*$/i,
-    /\|\s*top\s+[\w,\s]*$/i,
-    /\|\s*rare\s+[\w,\s]*$/i,
+    /\|\s*dedup\s+[\w.,\s]*$/i,
+    /\|\s*top\s+[\w.,\s]*$/i,
+    /\|\s*rare\s+[\w.,\s]*$/i,
     /\|\s*rename\s+[\w.]*$/i,
     /\|\s*mvexpand\s+[\w.]*$/i,
-    /\|\s*transaction\s+[\w,\s]*$/i,
-    /\|\s*join\s+(?:type=\w+\s+)?[\w,\s]*$/i,
-    /\|\s*return\s+[\w,\s]*$/i,
+    /\|\s*transaction\s+[\w.,\s]*$/i,
+    /\|\s*join\s+(?:type=\w+\s+)?[\w.,\s]*$/i,
+    /\|\s*return\s+[\w.,\s]*$/i,
     /\|\s*(?:anomaly|resolve_identity)\s+.*\bfield=[\w.]*$/i,
     /\|\s*prevalence\s+[\w.]*$/i,
-    /\|\s*fillnull\s+(?:value="[^"]*"\s+)?[\w,\s]*$/i,
+    /\|\s*fillnull\s+(?:value="[^"]*"\s+)?[\w.,\s]*$/i,
     /\bfield=[\w.]*$/i,
     /\|\s*rex\s+field=[\w.]*$/i,
   ];
@@ -316,7 +355,7 @@ export async function getQueryAutocompleteSuggestions(
   
   // Check for filter condition context - typing a field name for a new condition
   // Matches: start of query (after ---), start of line, after AND/OR, after quotes, after parentheses
-  const filterConditionMatch = textBeforeCursor.match(/(?:^|---\s*|\n\s*|AND\s+|OR\s+|"\s+|'\s+|\)\s+)(\w+)$/i);
+  const filterConditionMatch = textBeforeCursor.match(/(?:^|---\s*|\n\s*|AND\s+|OR\s+|"\s+|'\s+|\)\s+)([\w.]+)$/i);
   const isTypingFieldName = filterConditionMatch && filterConditionMatch[1].length >= 1;
   
   if (isTypingFieldName && !isInFieldContext) {

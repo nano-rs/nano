@@ -132,7 +132,10 @@ impl RuleRepositoryService {
         info!("Syncing repository {}/{} ({})", owner, repo_name, repo.name);
 
         // Get rule files - use git sparse-checkout for selected paths (avoids API rate limits entirely)
-        let rules_path = repo.rules_path.as_deref().unwrap_or("rules/");
+        // NAN-1266: under NANO_SCHEMA_PROFILE=ocsf the sync walks the sibling
+        // `rules-ocsf/` tree so imported rules target OCSF; UDM is unchanged.
+        let rules_path = crate::schema::active_repo_path(repo.rules_path.as_deref().unwrap_or("rules/"));
+        let rules_path = rules_path.as_str();
 
         let (rule_files, temp_dir, commit) = if let Some(ref selected) = repo.selected_paths {
             if !selected.is_empty() {

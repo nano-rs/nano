@@ -7,7 +7,46 @@
 //!
 //! Requirements: 3.1, 3.2, 3.3, 3.4, 3.5
 
+use crate::schema::{SchemaId, SchemaProfile};
 use crate::udm::fields::{UdmField, UdmFieldCategory};
+
+/// Build a field glossary from the ACTIVE schema profile's field universe
+/// (`profile.fields()`), grouped by category. Used for the non-UDM (OCSF)
+/// branch of the AI-context functions so the LLM is taught the schema's real
+/// field names (e.g. `src_endpoint.ip`, `api.operation`, `resources.type`)
+/// instead of the hardcoded UDM glossary. UDM-style aliases (`src_ip`, `user`,
+/// …) still resolve at query time via `OcsfProfile::resolve`, so they're noted
+/// as also-valid. (NAN-1252)
+fn schema_field_glossary(profile: &dyn SchemaProfile, names_only: bool, heading: &str) -> String {
+    use std::collections::BTreeMap;
+    let mut by_cat: BTreeMap<String, Vec<&crate::schema::FieldDef>> = BTreeMap::new();
+    for f in profile.fields() {
+        by_cat
+            .entry(format!("{:?}", f.category))
+            .or_default()
+            .push(f);
+    }
+    let mut out = format!("{heading}\n\n");
+    out.push_str(
+        "The deployment uses the OCSF schema. Use these field names directly. UDM-style \
+         aliases (e.g. `src_ip`, `user`, `dest_ip`, `file_hash`) also resolve to the \
+         corresponding OCSF column at query time.\n\n",
+    );
+    for (cat, fields) in by_cat {
+        out.push_str(&format!("### {cat}\n"));
+        if names_only {
+            let names: Vec<String> = fields.iter().map(|f| format!("`{}`", f.name)).collect();
+            out.push_str(&names.join(", "));
+            out.push_str("\n\n");
+        } else {
+            for f in fields {
+                out.push_str(&format!("- `{}` ({:?})\n", f.name, f.field_type));
+            }
+            out.push('\n');
+        }
+    }
+    out
+}
 
 /// Generate comprehensive UDM field context for AI agents
 ///
@@ -16,7 +55,10 @@ use crate::udm::fields::{UdmField, UdmFieldCategory};
 /// understand available fields when generating queries, detections, or parsers.
 ///
 /// Requirements: 3.4, 3.5
-pub fn get_udm_field_context() -> String {
+pub fn get_udm_field_context(profile: &dyn SchemaProfile) -> String {
+    if profile.id() != SchemaId::Udm {
+        return schema_field_glossary(profile, false, "## Available Fields");
+    }
     let mut context = String::from("## Available UDM Fields\n\n");
     context.push_str("The following fields are available in the Unified Data Model (UDM). ");
     context.push_str(
@@ -83,7 +125,15 @@ pub fn get_udm_field_context() -> String {
 /// Useful when you want to provide focused context for specific use cases.
 ///
 /// Requirements: 3.2, 3.3, 3.4
-pub fn get_udm_field_context_for_categories(categories: &[UdmFieldCategory]) -> String {
+pub fn get_udm_field_context_for_categories(
+    profile: &dyn SchemaProfile,
+    categories: &[UdmFieldCategory],
+) -> String {
+    if profile.id() != SchemaId::Udm {
+        // OCSF: the UdmFieldCategory filter doesn't map 1:1 to the OCSF field
+        // universe; emit the full OCSF glossary (≈90 promoted fields, token-cheap).
+        return schema_field_glossary(profile, false, "## Relevant Fields");
+    }
     let mut context = String::from("## Relevant UDM Fields\n\n");
 
     for category in categories {
@@ -118,7 +168,10 @@ pub fn get_udm_field_context_for_categories(categories: &[UdmFieldCategory]) -> 
 ///
 /// Returns a compact list of field names organized by category.
 /// Useful when you need a quick reference without full descriptions.
-pub fn get_udm_field_names_by_category() -> String {
+pub fn get_udm_field_names_by_category(profile: &dyn SchemaProfile) -> String {
+    if profile.id() != SchemaId::Udm {
+        return schema_field_glossary(profile, true, "## Field Names by Category");
+    }
     let mut context = String::from("## UDM Field Names by Category\n\n");
 
     let categories = vec![
@@ -164,12 +217,34 @@ pub fn get_udm_field_names_by_category() -> String {
     context
 }
 
+/// OCSF-profile field guidance (replaces the UDM-specific mistakes warning under
+/// `NANO_SCHEMA_PROFILE=ocsf`). The concrete field list is supplied dynamically by
+/// the glossary functions (`profile.fields()`); this is the static how-to. (NAN-1252)
+const OCSF_FIELD_NOTES: &str = r#"SCHEMA: OCSF is active. Field guidance:
+- Prefer the canonical OCSF field names from the field list above (dotted paths,
+  e.g. `src_endpoint.ip`, `actor.user.name`, `actor.process.cmd_line`,
+  `file.hashes.sha256`, `api.operation`, `cloud.provider`, `resources.type`).
+- UDM-style aliases also resolve at query time (e.g. `src_ip`→`src_endpoint.ip`,
+  `user`→`user.name`, `dest_ip`→`dst_endpoint.ip`, `process`→`actor.process.cmd_line`,
+  `file_hash`→`file.hashes.sha256`), so either name is valid in nPL.
+- VALUE encodings differ from UDM: `status_id`, `auth_protocol_id`, and
+  `activity_id` are INTEGER enums (e.g. status_id 1=Success, 2=Failure;
+  activity_id 1=Create/3=Update/4=Delete on API Activity). Filter them by the
+  integer code, not a string literal. The sibling `status` string is capitalized
+  ('Success'/'Failure').
+- OCSF-only fields (no UDM equivalent): `api.operation` (the AWS/cloud API verb),
+  `resources.type`/`resources.uid`/`resources.name`, `is_mfa`, `class_uid`,
+  `category_uid`, `activity_id`."#;
+
 /// Get the common field mistakes warning that should be included in AI prompts
 ///
 /// Returns a formatted string with critical warnings about fields that don't exist
 /// and their correct alternatives. This should be included in ALL AI prompts that
 /// generate queries to prevent the AI from using non-existent fields.
-pub fn get_field_mistakes_warning() -> &'static str {
+pub fn get_field_mistakes_warning(profile: &dyn SchemaProfile) -> &'static str {
+    if profile.id() != SchemaId::Udm {
+        return OCSF_FIELD_NOTES;
+    }
     r#"CRITICAL - ONLY use these UDM fields (others DO NOT exist):
 - Users: user, src_user, dest_user
 - Hosts: src_host, dest_host (NOT hostname, NOT host)

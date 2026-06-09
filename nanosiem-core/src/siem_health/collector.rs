@@ -40,7 +40,8 @@ async fn collect_ingestion_metrics(
     is_clustered: bool,
 ) -> IngestionMetrics {
     // Get per-source-type volumes for last 24h and prior 24h
-    let logs_table = TableNames::new(is_clustered).read("logs");
+    let logs_table =
+        TableNames::new(is_clustered).read(crate::schema::active_logs_table());
     let sql = format!(
         r#"
         SELECT
@@ -112,9 +113,16 @@ async fn collect_parsing_metrics(
     ch: &ClickHouseClient,
     is_clustered: bool,
 ) -> ParsingMetrics {
-    // Field coverage: percentage of events where key fields are populated
-    let logs_table = TableNames::new(is_clustered).read("logs");
-    let coverage_sql = build_field_coverage_sql(&logs_table);
+    // Field coverage: percentage of events where key fields are populated.
+    // Resolve the active profile once so the table name AND the column set used
+    // by the coverage / ext-usage builders agree (UDM columns on `logs`, OCSF
+    // promoted columns on `ocsf_logs`). NAN-1259.
+    let ocsf = crate::schema::active_profile_from_env()
+        .map(|p| p.id() == crate::schema::SchemaId::Ocsf)
+        .unwrap_or(false);
+    let logs_table =
+        TableNames::new(is_clustered).read(crate::schema::active_logs_table());
+    let coverage_sql = build_field_coverage_sql(&logs_table, ocsf);
 
     let mut field_coverage: Vec<FieldCoverageMetric> = Vec::new();
     match ch
@@ -141,7 +149,7 @@ async fn collect_parsing_metrics(
         }
     }
 
-    let ext_sql = build_ext_usage_sql(&logs_table);
+    let ext_sql = build_ext_usage_sql(&logs_table, ocsf);
 
     let mut high_ext_sources: Vec<ExtUsageMetric> = Vec::new();
     match ch.query(&ext_sql).fetch_all::<(String, u64, f64)>().await {
@@ -195,7 +203,8 @@ async fn collect_enrichment_metrics(
         providers: collect_enrichment_providers(pool).await,
     };
 
-    let logs_table = TableNames::new(is_clustered).read("logs");
+    let logs_table =
+        TableNames::new(is_clustered).read(crate::schema::active_logs_table());
 
     // Geo/ASN fill is meaningful only over *geo-eligible* rows — those with a
     // public, locatable IP on either end. The previous metric counted
@@ -203,21 +212,54 @@ async fn collect_enrichment_metrics(
     // enrichment entirely and (b) buried real coverage under host-based and
     // private-IP traffic that can never be geo-located. A proxy whose src_ip
     // is all 10.x but whose dest_ip is fully enriched scored 0% — see NAN-1178.
-    let src_pub = public_ipv4_expr("src_ip");
-    let dest_pub = public_ipv4_expr("dest_ip");
+    // NAN-1241: under OCSF, geo/ASN enrichment lands in the OCSF-native objects
+    // (src_endpoint.location.country / *.autonomous_system.number); ioc + identity
+    // have no promoted OCSF column yet, so they report 0 there rather than erroring
+    // on the UDM-only columns. UDM path byte-identical.
+    let ocsf = crate::schema::active_profile_from_env()
+        .map(|p| p.id() == crate::schema::SchemaId::Ocsf)
+        .unwrap_or(false);
+    let (src_pub, dest_pub) = if ocsf {
+        (
+            public_ipv4_expr("\"src_endpoint.ip\""),
+            public_ipv4_expr("\"dst_endpoint.ip\""),
+        )
+    } else {
+        (public_ipv4_expr("src_ip"), public_ipv4_expr("dest_ip"))
+    };
     let geo_eligible = format!("({src_pub} OR {dest_pub})");
+    let geoip_match = if ocsf {
+        "\"src_endpoint.location.country\" != '' OR \"dst_endpoint.location.country\" != ''"
+    } else {
+        "enriched_src_country != '' OR enriched_dest_country != ''"
+    };
+    let asn_match = if ocsf {
+        "\"src_endpoint.autonomous_system.number\" != 0 OR \"dst_endpoint.autonomous_system.number\" != 0"
+    } else {
+        "enriched_src_asn != '' OR enriched_dest_asn != ''"
+    };
+    let ioc_pct_expr = if ocsf {
+        "0.0"
+    } else {
+        "countIf(ioc_confidence > 0) * 100.0 / count()"
+    };
+    let identity_pct_expr = if ocsf {
+        "0.0"
+    } else {
+        "countIf(user_identity_department != '') * 100.0 / count()"
+    };
 
     // Fleet-wide rollup
     let rollup_sql = format!(
         r#"
         SELECT
             count() AS total_events,
-            ifNull(countIf({geo_eligible} AND (enriched_src_country != '' OR enriched_dest_country != '')) * 100.0
+            ifNull(countIf({geo_eligible} AND ({geoip_match})) * 100.0
                    / nullIf(countIf({geo_eligible}), 0), 0) AS geoip_pct,
-            ifNull(countIf({geo_eligible} AND (enriched_src_asn != '' OR enriched_dest_asn != '')) * 100.0
+            ifNull(countIf({geo_eligible} AND ({asn_match})) * 100.0
                    / nullIf(countIf({geo_eligible}), 0), 0) AS asn_pct,
-            countIf(ioc_confidence > 0) * 100.0 / count() AS ioc_pct,
-            countIf(user_identity_department != '') * 100.0 / count() AS identity_pct
+            {ioc_pct_expr} AS ioc_pct,
+            {identity_pct_expr} AS identity_pct
         FROM {logs_table}
         WHERE timestamp >= now() - INTERVAL 24 HOUR
           AND source_type != 'audit'
@@ -259,10 +301,10 @@ async fn collect_enrichment_metrics(
         SELECT
             source_type,
             count() AS total_events,
-            ifNull(countIf({geo_eligible} AND (enriched_src_country != '' OR enriched_dest_country != '')) * 100.0
+            ifNull(countIf({geo_eligible} AND ({geoip_match})) * 100.0
                    / nullIf(countIf({geo_eligible}), 0), 0) AS geoip_pct,
-            countIf(ioc_confidence > 0) * 100.0 / count() AS ioc_pct,
-            countIf(user_identity_department != '') * 100.0 / count() AS identity_pct
+            {ioc_pct_expr} AS ioc_pct,
+            {identity_pct_expr} AS identity_pct
         FROM {logs_table}
         WHERE timestamp >= now() - INTERVAL 24 HOUR
           AND source_type != 'audit'
@@ -301,8 +343,12 @@ async fn collect_enrichment_metrics(
     // the current window to tell "identity was never configured" (both 0 → not
     // a finding) from "identity enrichment stopped" (prior > 0, now 0 → a real
     // regression). NAN-1178.
-    let identity_prior_sql = format!(
-        r#"
+    // NAN-1241: identity enrichment has no promoted OCSF column, so the prior
+    // window is 0 under OCSF (matches the current-window identity_pct above) —
+    // skip the UDM-only query rather than error on it.
+    if !ocsf {
+        let identity_prior_sql = format!(
+            r#"
         SELECT ifNull(countIf(user_identity_department != '') * 100.0 / nullIf(count(), 0), 0)
         FROM {logs_table}
         WHERE timestamp >= now() - INTERVAL 48 HOUR
@@ -310,10 +356,11 @@ async fn collect_enrichment_metrics(
           AND source_type != 'audit'
           AND source_type != ''
         "#
-    );
-    match ch.query(&identity_prior_sql).fetch_one::<f64>().await {
-        Ok(prior) => rollup.identity_fill_prior_pct = prior,
-        Err(e) => warn!("Failed to collect prior-window identity fill: {}", e),
+        );
+        match ch.query(&identity_prior_sql).fetch_one::<f64>().await {
+            Ok(prior) => rollup.identity_fill_prior_pct = prior,
+            Err(e) => warn!("Failed to collect prior-window identity fill: {}", e),
+        }
     }
 
     info!(
@@ -626,9 +673,38 @@ async fn collect_alerting_metrics(pool: &PgPool) -> AlertingMetrics {
 /// Build the per-source field-coverage SQL. Extracted as a pure function so
 /// regression tests can pin its shape — the inline version previously had a
 /// JSON-vs-String comparison bug (NAN-614) that is hard to catch by reading.
-fn build_field_coverage_sql(logs_table: &str) -> String {
-    format!(
-        r#"
+fn build_field_coverage_sql(logs_table: &str, ocsf: bool) -> String {
+    // The result tuple `(source_type, total_events, src_ip_pct, user_pct,
+    // event_type_pct, message_pct)` is fixed by `FieldCoverageMetric`, so under
+    // OCSF we map the four semantic coverage slots onto the canonical OCSF
+    // PROMOTED columns rather than the UDM columns (which don't exist on
+    // `ocsf_logs`): src_ip → `src_endpoint.ip`, user → `user.name`, event_type
+    // → `class_uid` (the OCSF event-kind discriminator; UInt32 so `!= 0`),
+    // message → `message`. Dotted OCSF identifiers are double-quoted so
+    // ClickHouse reads them as a single column, not a nested-tuple access.
+    // UDM path is byte-identical. NAN-1259.
+    if ocsf {
+        format!(
+            r#"
+        SELECT
+            source_type,
+            count() AS total_events,
+            countIf("src_endpoint.ip" != '') * 100.0 / count() AS src_ip_pct,
+            countIf("user.name" != '') * 100.0 / count() AS user_pct,
+            countIf(class_uid != 0) * 100.0 / count() AS event_type_pct,
+            countIf(message != '') * 100.0 / count() AS message_pct
+        FROM {logs_table}
+        WHERE timestamp >= now() - INTERVAL 24 HOUR
+          AND source_type != 'audit'
+          AND source_type != ''
+        GROUP BY source_type
+        HAVING total_events >= 100
+        ORDER BY total_events DESC
+    "#
+        )
+    } else {
+        format!(
+            r#"
         SELECT
             source_type,
             count() AS total_events,
@@ -644,7 +720,8 @@ fn build_field_coverage_sql(logs_table: &str) -> String {
         HAVING total_events >= 100
         ORDER BY total_events DESC
     "#
-    )
+        )
+    }
 }
 
 /// SQL boolean expression: true when `col` holds a *globally routable*,
@@ -713,9 +790,34 @@ fn public_ipv4_expr(col: &str) -> String {
 /// paths (incl. nested) vs. only top-level keys, but any non-empty `ext` yields
 /// ≥1 of each. Verified identical per-source on the demo tenant (NAN-1180). This
 /// is per-row `length()`, NOT `arrayJoin(JSONAllPaths)` — no row explosion.
-fn build_ext_usage_sql(logs_table: &str) -> String {
-    format!(
-        r#"
+fn build_ext_usage_sql(logs_table: &str, ocsf: bool) -> String {
+    // UDM path is byte-identical (the `ext` JSON column, UDM guard fields). OCSF
+    // has no `ext`; its raw JSON payload lives in the `event` column, the
+    // event-type analog is `class_uid` (UInt32, so `!= 0` not `!= ''`), and the
+    // entity guard uses OCSF promoted columns (`src_endpoint.ip`, `user.name`,
+    // `dst_endpoint.ip`, double-quoted because they contain dots). NAN-1259.
+    if ocsf {
+        format!(
+            r#"
+        SELECT
+            source_type,
+            count() AS total_events,
+            countIf(length(JSONAllPaths(event)) > 0) * 100.0 / count() AS ext_pct
+        FROM {logs_table}
+        WHERE timestamp >= now() - INTERVAL 24 HOUR
+          AND source_type != 'audit'
+          AND source_type != ''
+        GROUP BY source_type
+        HAVING total_events >= 100
+           AND ext_pct > 50
+           AND countIf(class_uid != 0) * 100.0 / count() < 50
+           AND countIf("src_endpoint.ip" != '' OR "user.name" != '' OR "dst_endpoint.ip" != '') * 100.0 / count() < 50
+        ORDER BY ext_pct DESC
+    "#
+        )
+    } else {
+        format!(
+            r#"
         SELECT
             source_type,
             count() AS total_events,
@@ -731,7 +833,8 @@ fn build_ext_usage_sql(logs_table: &str) -> String {
            AND countIf(src_ip != '' OR user != '' OR dest_ip != '') * 100.0 / count() < 50
         ORDER BY ext_pct DESC
     "#
-    )
+        )
+    }
 }
 
 #[cfg(test)]
@@ -744,7 +847,7 @@ mod tests {
         // hits the JSON column's serialized schema rather than its payload and
         // reports ~100% ext usage for every source. The correct check counts
         // keys on the native JSON column via JSONAllPaths.
-        let sql = build_ext_usage_sql("logs");
+        let sql = build_ext_usage_sql("logs", false);
         assert!(
             sql.contains("length(JSONAllPaths(ext)) > 0"),
             "ext_pct must use JSONAllPaths-based emptiness check, got:\n{sql}"
@@ -762,12 +865,39 @@ mod tests {
     }
 
     #[test]
+    fn ext_usage_sql_ocsf_uses_event_column_and_promoted_guards() {
+        // NAN-1259: OCSF has no `ext` column — the raw JSON payload is `event`,
+        // and the normalization guard fields are the OCSF promoted columns
+        // (class_uid as the event-type analog + dotted entity columns).
+        let sql = build_ext_usage_sql("ocsf_logs", true);
+        assert!(
+            sql.contains("length(JSONAllPaths(event)) > 0"),
+            "OCSF ext_pct must read the `event` JSON column, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("JSONAllPaths(ext)") && !sql.contains("(ext)"),
+            "OCSF ext_pct must not reference the non-existent `ext` column, got:\n{sql}"
+        );
+        assert!(
+            sql.contains("countIf(class_uid != 0)"),
+            "OCSF normalization guard must use class_uid (event-type analog), got:\n{sql}"
+        );
+        // Dotted OCSF entity columns must be double-quoted.
+        assert!(
+            sql.contains("\"src_endpoint.ip\" != ''")
+                && sql.contains("\"user.name\" != ''")
+                && sql.contains("\"dst_endpoint.ip\" != ''"),
+            "OCSF entity guard must double-quote dotted promoted columns, got:\n{sql}"
+        );
+    }
+
+    #[test]
     fn ext_usage_sql_only_flags_genuine_passthrough() {
         // NAN-1178: "has ≥1 ext key" saturates to ~100% even for fully
         // normalized sources. The finding must additionally require the
         // canonical UDM fields to be mostly empty, or it false-alarms on
         // every structured parser.
-        let sql = build_ext_usage_sql("logs");
+        let sql = build_ext_usage_sql("logs", false);
         assert!(
             sql.contains("countIf(event_type != '') * 100.0 / count() < 50"),
             "high-ext finding must require event_type to be mostly empty, got:\n{sql}"
@@ -807,9 +937,48 @@ mod tests {
 
     #[test]
     fn field_coverage_sql_filters_audit_and_unknown_sources() {
-        let sql = build_field_coverage_sql("logs");
+        let sql = build_field_coverage_sql("logs", false);
         assert!(sql.contains("source_type != 'audit'"));
         assert!(sql.contains("source_type != ''"));
+        assert!(sql.contains("HAVING total_events >= 100"));
+        // UDM coverage must read the UDM columns, byte-identical to pre-NAN-1259.
+        assert!(sql.contains("countIf(src_ip != '')"));
+        assert!(sql.contains("countIf(user != '')"));
+        assert!(sql.contains("countIf(event_type != '')"));
+        assert!(sql.contains("countIf(message != '')"));
+    }
+
+    #[test]
+    fn field_coverage_sql_ocsf_uses_promoted_columns() {
+        // NAN-1259: under OCSF the UDM columns don't exist; the four coverage
+        // slots map onto the canonical OCSF promoted columns (dotted entity
+        // columns double-quoted, class_uid as the event-type analog).
+        let sql = build_field_coverage_sql("ocsf_logs", true);
+        assert!(sql.contains("FROM ocsf_logs"));
+        assert!(
+            sql.contains("countIf(\"src_endpoint.ip\" != '')"),
+            "OCSF src_ip slot must read src_endpoint.ip, got:\n{sql}"
+        );
+        assert!(
+            sql.contains("countIf(\"user.name\" != '')"),
+            "OCSF user slot must read user.name, got:\n{sql}"
+        );
+        assert!(
+            sql.contains("countIf(class_uid != 0)"),
+            "OCSF event_type slot must read class_uid, got:\n{sql}"
+        );
+        assert!(
+            sql.contains("countIf(message != '')"),
+            "OCSF message slot must read message, got:\n{sql}"
+        );
+        // Must not leak UDM-only columns that don't exist on ocsf_logs.
+        assert!(
+            !sql.contains("countIf(src_ip != '')")
+                && !sql.contains("countIf(event_type != '')"),
+            "OCSF coverage must not reference UDM columns, got:\n{sql}"
+        );
+        // Filtering/grouping is shared and must survive.
+        assert!(sql.contains("source_type != 'audit'"));
         assert!(sql.contains("HAVING total_events >= 100"));
     }
 }

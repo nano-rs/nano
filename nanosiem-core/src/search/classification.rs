@@ -130,6 +130,87 @@ macro_rules! p_network_fallback {
 // `pub const` form is enough and keeps the API smaller.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// OCSF classification (NAN-1241)
+//
+// OCSF rows carry none of the UDM columns the predicates above reference
+// (`action`, `auth_result`, `process_name`, `file_action`, `query`, …) — so the
+// UDM CASE expressions emit `Unknown identifier` 500s against `ocsf_logs`.
+// Instead, OCSF classifies off the promoted taxonomy columns:
+//   * `category_uid`  — 1 System, 2 Findings, 3 IAM, 4 Network, 5 Discovery, 6 App
+//   * `class_uid`     — 1001 File, 1005 Module(image-load), 1007 Process,
+//                       3002 Auth, 4001 Network, 4002 HTTP, 4003 DNS, 4004 DHCP
+//   * `status_id`     — 1 Success, 2 Failure (auth success/failure split)
+// Dotted promoted columns are backtick-quoted. The string labels + lane indices
+// match the UDM mapping exactly so both classifiers stay interchangeable.
+// ---------------------------------------------------------------------------
+
+/// OCSF analog of [`EVENT_TYPE_SQL`].
+pub const OCSF_EVENT_TYPE_SQL: &str = concat!(
+    "CASE",
+    " WHEN category_uid = 2 THEN 'ALERT'",
+    " WHEN class_uid = 4004 THEN 'DHCP'",
+    " WHEN class_uid = 4003 THEN 'DNS'",
+    " WHEN category_uid = 3 THEN CASE WHEN status_id = 2 THEN 'AUTH_FAILURE' ELSE 'AUTH_SUCCESS' END",
+    " WHEN class_uid = 1005 THEN 'IMAGE_LOAD'",
+    " WHEN class_uid = 1007 THEN 'PROCESS'",
+    " WHEN class_uid = 1001 THEN 'FILE'",
+    " WHEN category_uid = 4 THEN 'NETWORK'",
+    " WHEN `dst_endpoint.ip` != '' THEN 'NETWORK'",
+    " ELSE 'EVENT'",
+    " END",
+);
+
+/// OCSF analog of [`LANE_SQL`].
+pub const OCSF_LANE_SQL: &str = concat!(
+    "CASE",
+    " WHEN category_uid = 2 THEN 4",
+    " WHEN category_uid = 3 THEN 0",
+    " WHEN class_uid IN (1005, 1007) THEN 1",
+    " WHEN (category_uid = 4 OR `dst_endpoint.ip` != '') THEN 2",
+    " WHEN class_uid = 1001 THEN 3",
+    " ELSE -1",
+    " END",
+);
+
+/// OCSF analog of [`AUTH_PREDICATE`] — IAM category covers the auth family.
+pub const OCSF_AUTH_PREDICATE: &str = "(category_uid = 3)";
+/// OCSF analog of [`FILE_PREDICATE`] — File System Activity class.
+pub const OCSF_FILE_PREDICATE: &str = "(class_uid = 1001)";
+
+/// Event-type CASE expression for the active schema profile (NAN-1241). UDM
+/// returns [`EVENT_TYPE_SQL`] byte-identical; OCSF returns [`OCSF_EVENT_TYPE_SQL`].
+pub fn event_type_sql(profile: &dyn crate::schema::SchemaProfile) -> &'static str {
+    match profile.id() {
+        crate::schema::SchemaId::Ocsf => OCSF_EVENT_TYPE_SQL,
+        crate::schema::SchemaId::Udm => EVENT_TYPE_SQL,
+    }
+}
+
+/// Lane-index CASE expression for the active schema profile.
+pub fn lane_sql(profile: &dyn crate::schema::SchemaProfile) -> &'static str {
+    match profile.id() {
+        crate::schema::SchemaId::Ocsf => OCSF_LANE_SQL,
+        crate::schema::SchemaId::Udm => LANE_SQL,
+    }
+}
+
+/// Auth predicate for the active schema profile.
+pub fn auth_predicate(profile: &dyn crate::schema::SchemaProfile) -> &'static str {
+    match profile.id() {
+        crate::schema::SchemaId::Ocsf => OCSF_AUTH_PREDICATE,
+        crate::schema::SchemaId::Udm => AUTH_PREDICATE,
+    }
+}
+
+/// File predicate for the active schema profile.
+pub fn file_predicate(profile: &dyn crate::schema::SchemaProfile) -> &'static str {
+    match profile.id() {
+        crate::schema::SchemaId::Ocsf => OCSF_FILE_PREDICATE,
+        crate::schema::SchemaId::Udm => FILE_PREDICATE,
+    }
+}
+
 pub const ALERT_PREDICATE: &str = p_alert!();
 pub const DHCP_PREDICATE: &str = p_dhcp!();
 pub const DNS_PREDICATE: &str = p_dns!();
@@ -241,6 +322,30 @@ mod tests {
                 "LANE_SQL missing category '{cat}': {LANE_SQL}"
             );
         }
+    }
+
+    #[test]
+    fn profile_dispatch_is_udm_byte_identical_and_ocsf_distinct() {
+        use crate::schema::{OcsfProfile, UdmProfile};
+        let udm = UdmProfile::new();
+        let ocsf = OcsfProfile::new();
+        // UDM dispatch must return the existing consts byte-for-byte.
+        assert_eq!(event_type_sql(&udm), EVENT_TYPE_SQL);
+        assert_eq!(lane_sql(&udm), LANE_SQL);
+        assert_eq!(auth_predicate(&udm), AUTH_PREDICATE);
+        assert_eq!(file_predicate(&udm), FILE_PREDICATE);
+        // OCSF dispatch returns the OCSF taxonomy expressions (class_uid/category_uid).
+        assert_eq!(event_type_sql(&ocsf), OCSF_EVENT_TYPE_SQL);
+        assert_eq!(lane_sql(&ocsf), OCSF_LANE_SQL);
+        assert!(event_type_sql(&ocsf).contains("category_uid"));
+        assert!(lane_sql(&ocsf).contains("class_uid"));
+        // Both event-type classifiers are well-formed CASE expressions.
+        assert!(OCSF_EVENT_TYPE_SQL.starts_with("CASE") && OCSF_EVENT_TYPE_SQL.ends_with("END"));
+        assert_eq!(
+            OCSF_EVENT_TYPE_SQL.matches("CASE").count(),
+            OCSF_EVENT_TYPE_SQL.matches("END").count()
+        );
+        assert!(OCSF_LANE_SQL.starts_with("CASE") && OCSF_LANE_SQL.ends_with("END"));
     }
 
     #[test]

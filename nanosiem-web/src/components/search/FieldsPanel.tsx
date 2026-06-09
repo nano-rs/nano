@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useState, useEffect, useCallback } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import { api } from '@/lib/api';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -59,11 +61,13 @@ interface FieldsPanelProps {
 
 const INITIAL_VALUES_SHOWN = 10;
 
-// Common UDM fields pinned to a "Selected" section at the top of the field
-// index — the fields analysts land on for most searches. Any field in this
-// list that the current result set produced gets surfaced first; the rest
-// fall under "Available".
-const SELECTED_FIELDS = new Set([
+// Key fields pinned to a "Selected" section at the top of the field index — the
+// ones analysts land on for most searches. Any field in this list that the
+// current result set produced gets surfaced first; the rest fall under
+// "Available". The set is profile-aware (OCSF Phase 7, NAN-1241): under OCSF a
+// row carries `src_endpoint.ip`/`user.name`/`class_uid`/`activity`, so the UDM
+// set would leave only `source_type`+`timestamp` pinned.
+const SELECTED_FIELDS_UDM = new Set([
   'source_type',
   'sourcetype',
   'src_ip',
@@ -74,6 +78,18 @@ const SELECTED_FIELDS = new Set([
   'event_type',
   'timestamp',
   '_time',
+]);
+const SELECTED_FIELDS_OCSF = new Set([
+  'source_type',
+  'timestamp',
+  'time_dt',
+  'class_uid',
+  'activity',
+  'src_endpoint.ip',
+  'dst_endpoint.ip',
+  'user.name',
+  'actor.user.name',
+  'status',
 ]);
 
 function SectionHdr({ label, count }: { label: string; count: number }) {
@@ -105,6 +121,15 @@ export function FieldsPanel({
   const [searchTerm, setSearchTerm] = useState('');
   const [openMenuKey, setOpenMenuKey] = useState<string | null>(null);
   const [expandedValueFields, setExpandedValueFields] = useState<Set<string>>(new Set());
+  // Pin the active schema's key fields under "Selected" (NAN-1241). Cached app-wide.
+  const { data: schemaFields } = useQuery({
+    queryKey: ['schema-fields'],
+    queryFn: () => api.getSchemaFields(),
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  const selectedFieldSet =
+    schemaFields?.schema === 'ocsf' ? SELECTED_FIELDS_OCSF : SELECTED_FIELDS_UDM;
   // Server-side field values (fetched on-demand when field is expanded)
   const [serverFieldValues, setServerFieldValues] = useState<Map<string, ServerFieldValues>>(new Map());
 
@@ -238,8 +263,8 @@ export function FieldsPanel({
           ) : displayStats.length === 0 ? (
             <p className="text-muted-foreground text-[11.5px] font-mono py-4 text-center">Execute a query to build the field index</p>
           ) : (() => {
-            const selectedStats = displayStats.filter(s => SELECTED_FIELDS.has(s.field));
-            const availableStats = displayStats.filter(s => !SELECTED_FIELDS.has(s.field));
+            const selectedStats = displayStats.filter(s => selectedFieldSet.has(s.field));
+            const availableStats = displayStats.filter(s => !selectedFieldSet.has(s.field));
             const renderRow = (stat: FieldStat) => {
               const isOpen = expandedFields.has(stat.field);
               return (

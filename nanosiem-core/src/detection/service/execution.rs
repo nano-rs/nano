@@ -6,7 +6,7 @@
 
 use chrono::{DateTime, Duration, FixedOffset, Utc};
 use metrics::{counter, histogram};
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use crate::detection::query_enrichment::inject_timestamp_bounds;
 use crate::models::{Alert, AlertMode, DetectionRule, RuleMode};
@@ -213,89 +213,16 @@ impl DetectionService {
                         }
                     }
 
-                    // Group events by entity and create separate signals for each
-                    // This ensures each unique entity gets its own risk score update
-                    let events_by_entity =
-                        self.group_events_by_entity(rule.risk_entity_field.as_deref(), &results);
+                    // Log per-entity live findings, deduped per (rule, entity,
+                    // window) and stamped with the source event window so
+                    // overlapping re-evaluations don't re-emit / re-inflate risk
+                    // (NAN-1305).
+                    let emitted = self.log_live_findings(rule, &results, global_weight).await;
 
                     info!(
-                        "Rule {} (LIVE mode) matched {} events across {} unique entities",
-                        rule.name,
-                        match_count,
-                        events_by_entity.len()
+                        "Rule {} (LIVE mode) matched {} events, emitted {} new findings",
+                        rule.name, match_count, emitted
                     );
-
-                    // Log signal for each entity group
-                    if let Some(ref logger) = self.finding_logger {
-                        // Check if results have query-derived risk scores (from | risk command)
-                        let has_query_scores = results
-                            .first()
-                            .map(|e| super::super::risk::ScoreCalculator::has_query_risk_score(e))
-                            .unwrap_or(false);
-
-                        if has_query_scores {
-                            // Use query-derived scores - each event has its own score
-                            for event in &results {
-                                if let Some(risk_result) = self
-                                    .score_calculator
-                                    .calculate_from_query_result(event, global_weight)
-                                {
-                                    debug!(
-                                        "Query-derived risk score for entity {} (field: {:?}): raw={}, weighted={}",
-                                        risk_result.entity, risk_result.entity_field, risk_result.raw_score, risk_result.weighted_score
-                                    );
-
-                                    if let Err(e) = logger
-                                        .log_detection_match(
-                                            rule,
-                                            &[event.clone()],
-                                            false,
-                                            risk_result,
-                                        )
-                                        .await
-                                    {
-                                        error!("Failed to log detection match signal: {}", e);
-                                    }
-                                }
-                            }
-                        } else {
-                            // Use rule-derived scores - group by entity
-                            for ((entity, field_name), entity_events) in events_by_entity {
-                                let risk_result = self.score_calculator.calculate(
-                                    rule.risk_score,
-                                    rule.severity,
-                                    Some(&field_name), // Use the field name from grouping
-                                    &rule.risk_modifiers,
-                                    &entity_events,
-                                    global_weight,
-                                );
-
-                                // Override entity with the grouped entity value and field name
-                                let risk_result = super::super::risk::RiskResult::new(
-                                    risk_result.raw_score,
-                                    risk_result.weighted_score,
-                                    entity.clone(),
-                                    Some(field_name.clone()),
-                                    risk_result.factors,
-                                );
-
-                                debug!(
-                                    "Rule-derived risk score for entity {} (field: {}): raw={}, weighted={}",
-                                    entity, field_name, risk_result.raw_score, risk_result.weighted_score
-                                );
-
-                                if let Err(e) = logger
-                                    .log_detection_match(rule, &entity_events, false, risk_result)
-                                    .await
-                                {
-                                    error!(
-                                        "Failed to log detection match signal for entity {}: {}",
-                                        entity, e
-                                    );
-                                }
-                            }
-                        }
-                    }
                 }
 
                 // No alert in live mode

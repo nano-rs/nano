@@ -108,16 +108,27 @@ impl AppState {
         // Create tuning repository for proposal management
         let tuning_repository = Arc::new(TuningRepository::new(pg_pool.clone()));
 
-        // Create detection service with prevalence support (needed for materialized views)
-        let detection_service = DetectionService::with_dual_pool_and_prevalence(
+        // Create detection service with prevalence support (needed for materialized views).
+        // The active schema profile (UDM default | OCSF, from NANO_SCHEMA_PROFILE)
+        // is threaded through BOTH halves of the scheduled detection path: the
+        // internal SearchService (rule query targets the profile's logs table and
+        // resolves fields under the active schema) and entity extraction
+        // (auto-detect grouping/scoring uses the profile's entity-extraction
+        // order). NAN-1241 Phase 5.
+        let detection_service = DetectionService::with_dual_pool_prevalence_and_profile(
             &dual_pool,
             lookup_service.clone(),
             prevalence_service.clone(),
+            config.schema_profile(),
         );
 
-        // Create materialized view generator for real-time detection rules
-        // Uses admin client for DDL operations (CREATE/DROP MATERIALIZED VIEW)
-        let mv_generator = MaterializedViewGenerator::new(dual_pool.clickhouse_admin().clone());
+        // Create materialized view generator for real-time detection rules.
+        // Uses admin client for DDL operations (CREATE/DROP MATERIALIZED VIEW).
+        // The profile parameterizes DDL field-name validation + risk-entity
+        // auto-detection; the generated MV body itself stays UDM-shaped (real-time
+        // MV on OCSF is a Phase 5+ follow-up — see materialized_view.rs).
+        let mv_generator = MaterializedViewGenerator::new(dual_pool.clickhouse_admin().clone())
+            .with_profile(config.schema_profile());
 
         // Create audit emitter and query service for ClickHouse audit logging
         let audit_emitter = Arc::new(AuditEmitter::new(dual_pool.clone()));
@@ -126,11 +137,15 @@ impl AppState {
         // Create inputlookup service for URL-based enrichment
         let inputlookup_service = InputLookupService::new(InputLookupConfig::default());
 
-        // Create search service and add inputlookup
-        let mut search_service = SearchService::with_dual_pool_lookup_and_prevalence(
+        // Create search service and add inputlookup. The active schema profile
+        // (UDM default | OCSF, from NANO_SCHEMA_PROFILE) selects the FROM logs
+        // table and is injected into the SQL generator so default-view
+        // projection / field resolution follow the active schema (NAN-1241).
+        let mut search_service = SearchService::with_dual_pool_lookup_and_prevalence_and_profile(
             &dual_pool,
             lookup_service,
             prevalence_service,
+            config.schema_profile(),
         );
         search_service.set_inputlookup_service(inputlookup_service);
 
@@ -467,6 +482,76 @@ impl AppState {
             }
         }
         tracing::info!("ClickHouse schema version OK");
+
+        // OCSF Phase 3b (NAN-1241): fail-fast validation that the ACTIVE schema
+        // profile's logs table actually carries the columns the profile must
+        // query (its PREWHERE set + `timestamp`). This is the schema analog of
+        // the DualPool/schema-version fail-fast (NAN-800): an OCSF profile
+        // pointed at a UDM table (or vice versa) must error here rather than
+        // silently return empty results at query time.
+        //
+        // For UDM this is a no-op in practice — `nanosiem.logs` (already verified
+        // current above) carries every required column, so a healthy UDM deploy
+        // passes unconditionally and its boot behavior is unchanged.
+        //
+        // The probe is a plain `SELECT … FROM system.columns`; if it can't run
+        // (transient CH read error mid-boot) we log and continue rather than fail
+        // boot on transport flakiness — matching how other boot CH checks degrade.
+        // A genuine table/column mismatch IS a hard boot failure.
+        //
+        // Phase 3b TODO (persistence DEFERRED): the scoping (§2.4) also calls for
+        // persisting the active `SchemaId` in `system_settings` so a later boot
+        // with a *different* `NANO_SCHEMA_PROFILE` against the same data can fail
+        // fast on the mismatch. `system_settings` is a wide single-row
+        // (`id='default'`) table with sqlx COMPILE-TIME-checked queries, not a
+        // generic key/value store — recording the schema there needs a new
+        // migration adding (e.g.) an `active_schema_profile text` column plus a
+        // `query!`-checked read/write, which is out of scope to invent under this
+        // phase's time budget (repo scar: never edit applied migrations; pick the
+        // next number from the highest; verify columns exist). The boot DESCRIBE
+        // probe above already catches the dangerous case (an OCSF profile against
+        // a UDM table fails fast on missing columns), and `/api/schema/fields`
+        // reports the active schema for the frontend — so the persistence row is
+        // an introspection/audit nicety, deferred to a follow-up.
+        {
+            let profile = config.schema_profile();
+            // Resolve the LOCAL table (where columns physically live in cluster
+            // mode), through the same tenant-aware registry SearchService uses.
+            let key = match profile.id() {
+                nanosiem_core::schema::SchemaId::Ocsf => "ocsf_logs",
+                nanosiem_core::schema::SchemaId::Udm => "logs",
+            };
+            let local_table = dual_pool.table_names().local(key);
+            match nanosiem_core::schema::validate_active_schema_table(
+                dual_pool.clickhouse(),
+                profile.as_ref(),
+                &local_table,
+            )
+            .await
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        schema = ?profile.id(),
+                        table = %local_table,
+                        "Active schema profile table validated"
+                    );
+                }
+                Err(nanosiem_core::schema::SchemaValidationError::ProbeFailed {
+                    table,
+                    message,
+                }) => {
+                    tracing::warn!(
+                        table = %table,
+                        error = %message,
+                        "Schema profile table validation probe could not run; skipping (CH read error mid-boot)"
+                    );
+                }
+                Err(e) => {
+                    // TableMissing / MissingColumns — a real misconfiguration.
+                    return Err(DualPoolError::SchemaBehind(e.to_string()));
+                }
+            }
+        }
 
         // Re-detect cluster state. DualPool::new() runs before this check, so
         // is_clustered may reflect the pre-distributed-tables view; the

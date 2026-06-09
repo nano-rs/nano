@@ -31,6 +31,7 @@ import { MatchesList } from '@/components/matches/MatchesList';
 import { MatchesDetail } from '@/components/matches/MatchesDetail';
 import { LogicTab } from '@/components/matches/LogicTab';
 import { buildMatchView, buildActivity28, type MatchView } from '@/components/matches/helpers';
+import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
 
 type TabId = 'matches' | 'logic';
 
@@ -57,9 +58,12 @@ export function Matches() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [filter, setFilter] = useState<'all' | 'alerts'>('all');
 
+  // NAN-1296: schema-aware entity classification for match entities, so any
+  // promoted entity field (UDM or OCSF) resolves without a hardcoded list.
+  const { resolveEntityType } = useSchemaEntityMap();
   const views: MatchView[] = useMemo(() => {
-    return (matchesData?.matches || []).map(buildMatchView);
-  }, [matchesData]);
+    return (matchesData?.matches || []).map((m) => buildMatchView(m, resolveEntityType));
+  }, [matchesData, resolveEntityType]);
 
   // Set of match ids that generated alerts. The /api/alerts response doesn't
   // carry a `match_id` today, so we can't do an exact join — we correlate by

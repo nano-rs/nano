@@ -235,12 +235,20 @@ impl RetentionService {
             ));
         }
 
-        // Clean up old metadata (detection_matched_events, search_history, etc.)
+        // Clean up old metadata (detection_matched_events, finding emissions,
+        // search_history, etc.). NB: detection_matched_events is timestamped by
+        // `matched_at` (there is no `detected_at` column — that prior typo made
+        // this whole sweep error at runtime; fixed alongside NAN-1305).
         let deleted = sqlx::query_scalar::<_, i64>(
             r#"
             WITH deleted_events AS (
                 DELETE FROM detection_matched_events
-                WHERE detected_at < NOW() - ($1 || ' days')::interval
+                WHERE matched_at < NOW() - ($1 || ' days')::interval
+                RETURNING 1
+            ),
+            deleted_emissions AS (
+                DELETE FROM detection_finding_emissions
+                WHERE emitted_at < NOW() - ($1 || ' days')::interval
                 RETURNING 1
             ),
             deleted_history AS (
@@ -248,7 +256,9 @@ impl RetentionService {
                 WHERE created_at < NOW() - ($1 || ' days')::interval
                 RETURNING 1
             )
-            SELECT (SELECT COUNT(*) FROM deleted_events) + (SELECT COUNT(*) FROM deleted_history)
+            SELECT (SELECT COUNT(*) FROM deleted_events)
+                 + (SELECT COUNT(*) FROM deleted_emissions)
+                 + (SELECT COUNT(*) FROM deleted_history)
             "#,
         )
         .bind(config.retention_days as i32)
@@ -319,9 +329,11 @@ impl ClickHouseStorageService {
             partition_count: u64,
         }
 
+        // NAN-1241: storage stats for the active ingested-events table.
+        let stats_logs_table = crate::schema::active_logs_table();
         let stats: Option<TableStats> = match self
             .client
-            .query(
+            .query(&format!(
                 r#"
                 SELECT
                     COALESCE(sum(bytes_on_disk), 0) as total_bytes,
@@ -331,10 +343,10 @@ impl ClickHouseStorageService {
                     COALESCE(countDistinct(partition), 0) as partition_count
                 FROM system.parts
                 WHERE database = currentDatabase()
-                  AND table = 'logs'
+                  AND table = '{stats_logs_table}'
                   AND active = 1
-            "#,
-            )
+            "#
+            ))
             .fetch_one()
             .await
         {
@@ -355,9 +367,12 @@ impl ClickHouseStorageService {
             cnt: u64,
         }
 
+        // NAN-1241: storage stats reflect the active ingested-events table
+        // (ocsf_logs under OCSF — where the bulk of data lands). UDM-identical.
+        let logs_table = crate::schema::active_logs_table();
         let row_count: RowCount = self
             .client
-            .query("SELECT count() as cnt FROM logs")
+            .query(&format!("SELECT count() as cnt FROM {logs_table}"))
             .fetch_one()
             .await
             .map_err(|e| RetentionError::ClickHouse(format!("Failed to get row count: {}", e)))?;
@@ -372,14 +387,14 @@ impl ClickHouseStorageService {
 
             match self
                 .client
-                .query(
+                .query(&format!(
                     r#"
                     SELECT
                         formatDateTime(min(timestamp), '%Y-%m-%dT%H:%i:%sZ') as oldest,
                         formatDateTime(max(timestamp), '%Y-%m-%dT%H:%i:%sZ') as newest
-                    FROM logs
-                "#,
-                )
+                    FROM {logs_table}
+                "#
+                ))
                 .fetch_one::<TimeRange>()
                 .await
             {
@@ -444,8 +459,10 @@ impl ClickHouseStorageService {
 
     /// Update ClickHouse TTL retention period
     pub async fn update_retention(&self, days: u32) -> Result<(), RetentionError> {
+        // NAN-1241: target the active ingested-events table (ocsf_logs under OCSF).
+        let logs_table = crate::schema::active_logs_table();
         let query = format!(
-            "ALTER TABLE logs MODIFY TTL timestamp + INTERVAL {} DAY DELETE",
+            "ALTER TABLE {logs_table} MODIFY TTL timestamp + INTERVAL {} DAY DELETE",
             days
         );
 
@@ -466,23 +483,26 @@ impl ClickHouseStorageService {
             count: u64,
         }
 
+        // NAN-1241: force TTL on the active ingested-events table (ocsf_logs
+        // under OCSF — where the retention-relevant bulk data lives). UDM-identical.
+        let logs_table = crate::schema::active_logs_table();
         let before: RowCount = self
             .client
-            .query("SELECT count() as count FROM logs")
+            .query(&format!("SELECT count() as count FROM {logs_table}"))
             .fetch_one()
             .await
             .map_err(|e| RetentionError::ClickHouse(e.to_string()))?;
 
         // Force TTL materialization
         self.client
-            .query("ALTER TABLE logs MATERIALIZE TTL")
+            .query(&format!("ALTER TABLE {logs_table} MATERIALIZE TTL"))
             .execute()
             .await
             .map_err(|e| RetentionError::ClickHouse(e.to_string()))?;
 
         // Optimize to merge parts and actually delete data
         self.client
-            .query("OPTIMIZE TABLE logs FINAL")
+            .query(&format!("OPTIMIZE TABLE {logs_table} FINAL"))
             .execute()
             .await
             .map_err(|e| RetentionError::ClickHouse(e.to_string()))?;
@@ -490,7 +510,7 @@ impl ClickHouseStorageService {
         // Get row count after
         let after: RowCount = self
             .client
-            .query("SELECT count() as count FROM logs")
+            .query(&format!("SELECT count() as count FROM {logs_table}"))
             .fetch_one()
             .await
             .map_err(|e| RetentionError::ClickHouse(e.to_string()))?;

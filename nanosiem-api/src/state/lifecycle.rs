@@ -362,6 +362,7 @@ impl AppState {
         handles.push(self.start_audit_log_cleanup());
         handles.push(self.start_query_tracker_cleanup());
         handles.push(self.start_search_job_cleanup());
+        handles.push(self.start_finding_emission_cleanup());
         tracing::info!("Cleanup tasks started (leader-only)");
 
         handles

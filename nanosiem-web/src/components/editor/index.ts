@@ -36,6 +36,7 @@ export {
   isInYamlSection,
   getYamlFieldAtPosition,
   hasYamlAutocomplete,
+  registerDetectionDynamicFields,
 } from './detection-language';
 
 // Autocomplete

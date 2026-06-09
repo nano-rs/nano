@@ -65,6 +65,7 @@ pub mod query_library;
 pub mod risk;
 pub mod rule_repository;
 pub mod scheduler;
+pub mod schema;
 pub mod search;
 pub mod settings;
 pub mod siem_health;
@@ -170,9 +171,16 @@ pub use auth::{
 pub use entity_extraction::{EntityExtractor, ExtractedEntity};
 pub use crypto::{CryptoError, EncryptedData, EncryptionService};
 pub use db::{
-    CaseRepository, CaseRepositoryError, DashboardRepository, DashboardRepositoryError, Database,
-    DatabaseConfig, DualPool, DualPoolConfig, DualPoolError, HealthStatus, IncidentRepository,
-    IncidentRepositoryError, NotebookRepository, NotebookRepositoryError, TableNames,
+    DashboardRepository, DashboardRepositoryError, Database, DatabaseConfig, DualPool,
+    DualPoolConfig, DualPoolError, HealthStatus, NotebookRepository, NotebookRepositoryError,
+    TableNames,
+};
+// Cases & incidents repositories are enterprise-only (NAN-1298). Re-exported at
+// the crate root only when the `enterprise` feature is on; gated out of the open
+// edition alongside the modules themselves in db/repository.rs.
+#[cfg(feature = "enterprise")]
+pub use db::{
+    CaseRepository, CaseRepositoryError, IncidentRepository, IncidentRepositoryError,
 };
 pub use detection::{
     calculate_next_run_with_jitter, generate_node_id, DailyMatchCount, DetectionError,

@@ -1384,10 +1384,10 @@ function Step1Identify({
               value={feedId}
               onChange={(e) => setFeedId(sanitizeFeedId(e.target.value))}
               placeholder="aws_cloudtrail"
-              // NAN-936 F-17: left padding sits flush against the `source_type=`
-              // prefix so the placeholder reads `source_type=aws_cloudtrail`,
-              // matching the description text and the in-queries form below.
-              className="h-10 w-full rounded-md border border-input bg-background pl-[92px] pr-3 font-mono text-[13px] text-foreground placeholder:text-muted-foreground/60 focus:border-primary focus:outline-none"
+              // NAN-936 F-17: left padding clears the `source_type=` prefix so
+              // the placeholder/value reads `source_type=aws_cloudtrail` without
+              // overlapping it (the 12px-mono prefix is ~98px wide from left-3).
+              className="h-10 w-full rounded-md border border-input bg-background pl-[104px] pr-3 font-mono text-[13px] text-foreground placeholder:text-muted-foreground/60 focus:border-primary focus:outline-none"
             />
           </div>
           <FieldHint>

@@ -101,11 +101,20 @@ impl SearchState {
         let admission_controller = Arc::new(AdmissionController::new(admission_config));
         admission_controller.start_drain_loop();
 
-        // Create search service with lookup and prevalence support
-        let mut search_svc = SearchService::with_dual_pool_lookup_and_prevalence(
+        // Create search service with lookup and prevalence support.
+        // OCSF Phase 3a (NAN-1241): the search microservice (which actually
+        // executes queries) resolves the active schema profile from
+        // NANO_SCHEMA_PROFILE so queries run against the selected schema's table
+        // (`ocsf_logs` for OCSF) and resolve fields under it — mirroring
+        // nanosiem-api. Default `udm`; an unrecognized value fails fast (NAN-800).
+        let schema_profile = nanosiem_core::schema::active_profile_from_env()
+            .unwrap_or_else(|e| panic!("invalid NANO_SCHEMA_PROFILE: {e}"));
+        tracing::info!(schema = ?schema_profile.id(), "Search service schema profile");
+        let mut search_svc = SearchService::with_dual_pool_lookup_and_prevalence_and_profile(
             &dual_pool,
             (*lookup).clone(),
             (*prevalence).clone(),
+            schema_profile,
         );
 
         // Wire admission controller into search service

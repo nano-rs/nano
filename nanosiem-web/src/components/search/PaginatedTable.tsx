@@ -5,6 +5,7 @@ import { Table as UITable, TableHeader, TableBody, TableRow, TableHead, TableCel
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, BookOpen, ArrowUp, ArrowDown, ArrowUpDown, Info, Copy, Check, Table, Download } from 'lucide-react';
 import { IpIdentityPopover } from './IpIdentityPopover';
+import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
 import { cn, isClickHouseDefault } from '@/lib/utils';
 
 /** Try to coerce a value into a numeric array for sparkline rendering.
@@ -166,7 +167,9 @@ interface SearchResult {
   fields: Record<string, unknown>;
 }
 
-// Field to entity type mapping for notebook
+// Field to entity type mapping for notebook. UDM fallback for the schema-aware
+// resolver (useSchemaEntityMap); host normalized to this surface's `hostname`
+// vocabulary so UDM output stays byte-identical (NAN-1241).
 const FIELD_TO_ENTITY_TYPE: Record<string, string> = {
   src_ip: 'ip', dest_ip: 'ip', dst_ip: 'ip', source_ip: 'ip', client_ip: 'ip', server_ip: 'ip', dvc_ip: 'ip',
   dest_host: 'domain', dst_host: 'domain', url_domain: 'domain', domain: 'domain',
@@ -298,6 +301,12 @@ export function PaginatedTable({
   columnTooltips,
   onDownload,
 }: PaginatedTableProps) {
+  // Schema-aware entity resolution (OCSF dotted columns); falls back to the UDM
+  // map, normalizing the backend `host` type to this surface's `hostname`.
+  const { resolveEntityType } = useSchemaEntityMap({
+    fallback: FIELD_TO_ENTITY_TYPE,
+    normalize: { host: 'hostname' },
+  });
   const [expandedCells, setExpandedCells] = React.useState<Set<string>>(new Set());
   const [sortColumn, setSortColumn] = React.useState<string | null>(null);
   const [sortDirection, setSortDirection] = React.useState<SortDirection>(null);
@@ -699,29 +708,32 @@ export function PaginatedTable({
                               </button>
                             )}
                             {/* IP identity popover for IP fields */}
-                            {FIELD_TO_ENTITY_TYPE[key.toLowerCase()] === 'ip' && typeof value === 'string' && value.trim() && (
+                            {resolveEntityType(key) === 'ip' && typeof value === 'string' && value.trim() && (
                               <IpIdentityPopover ip={value} />
                             )}
                             {/* Add to notebook button for entity fields */}
-                            {notebookActive && onAddToNotebook && FIELD_TO_ENTITY_TYPE[key.toLowerCase()] && typeof value === 'string' && value.trim() && (
+                            {(() => {
+                              const cellEntityType = resolveEntityType(key);
+                              return notebookActive && onAddToNotebook && cellEntityType && typeof value === 'string' && value.trim() && (
                               <Tooltip>
                                 <TooltipTrigger asChild>
                                   <button
                                     onClick={(e) => {
                                       e.stopPropagation();
-                                      onAddToNotebook(FIELD_TO_ENTITY_TYPE[key.toLowerCase()], value);
+                                      onAddToNotebook(cellEntityType, value);
                                     }}
                                     className="ml-1 text-amber-500 hover:text-amber-400 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity"
-                                    title={`Add ${FIELD_TO_ENTITY_TYPE[key.toLowerCase()]} to notebook`}
+                                    title={`Add ${cellEntityType} to notebook`}
                                   >
                                     <BookOpen className="w-3.5 h-3.5" />
                                   </button>
                                 </TooltipTrigger>
                                 <TooltipContent side="top" className="bg-card border-border text-xs">
-                                  <p>Add {FIELD_TO_ENTITY_TYPE[key.toLowerCase()]} to notebook</p>
+                                  <p>Add {cellEntityType} to notebook</p>
                                 </TooltipContent>
                               </Tooltip>
-                            )}
+                              );
+                            })()}
                           </div>
                         )}
                       </TableCell>

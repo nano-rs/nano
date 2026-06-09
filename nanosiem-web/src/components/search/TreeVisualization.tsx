@@ -172,14 +172,24 @@ function derive(node: TreeNode, preset: Preset): DisplayNode {
   const r = node._data;
   const name = typeof node.label === 'string' ? node.label : JSON.stringify(node.label ?? node.id);
 
+  // Lookup key lists union the UDM names with their OCSF promoted-column
+  // equivalents (NAN-1241). UDM rows never carry the dotted OCSF keys, so the
+  // extra entries are inert under UDM (firstString skips absent keys → output
+  // byte-identical); under OCSF they let user/cmd/hash/signer nodes populate.
   const pid = preset === 'process'
-    ? firstString(r, ['pid', 'process_id', 'ProcessId'])
+    ? firstString(r, ['pid', 'process_id', 'ProcessId', 'actor.process.pid'])
     : undefined;
 
-  const user = firstString(r, ['user', 'user_name', 'username', 'target_user', 'process_user']);
+  const user = firstString(r, [
+    'user', 'user_name', 'username', 'target_user', 'process_user',
+    'actor.user.name', 'user.name',
+  ]);
 
   const cmd = node.detail
-    ?? firstString(r, ['command_line', 'CommandLine', 'cmdline', 'url', 'http_url']);
+    ?? firstString(r, [
+      'command_line', 'CommandLine', 'cmdline', 'url', 'http_url',
+      'actor.process.cmd_line', 'process.cmd_line', 'url.url_string',
+    ]);
 
   const hashRaw = firstString(r, [
     'process_hash',
@@ -190,6 +200,9 @@ function derive(node: TreeNode, preset: Preset): DisplayNode {
     'md5',
     'MD5',
     'sha1',
+    'actor.process.file.hashes',
+    'process.file.hashes',
+    'file.hashes',
   ]);
 
   const prevHostCount = node.prevalence?.host_count;
@@ -201,6 +214,8 @@ function derive(node: TreeNode, preset: Preset): DisplayNode {
     'image_signed',
     'signature_verified',
     'signed',
+    'actor.process.file.signature.state',
+    'file.signature.state',
   ]);
   const signer = firstString(r, [
     'process_signer',
@@ -208,6 +223,8 @@ function derive(node: TreeNode, preset: Preset): DisplayNode {
     'image_signer',
     'signature_subject',
     'signer',
+    'actor.process.file.signature.certificate.subject',
+    'file.signature.certificate.subject',
   ]);
 
   const ts = formatUtcTime(r?.timestamp ?? r?.event_time ?? r?.utc_time);

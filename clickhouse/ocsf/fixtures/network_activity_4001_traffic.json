@@ -1,0 +1,102 @@
+{
+  "class_uid": 4001,
+  "class_name": "Network Activity",
+  "category_uid": 4,
+  "category_name": "Network Activity",
+  "activity_id": 6,
+  "activity_name": "Traffic",
+  "type_uid": 400106,
+  "type_name": "Network Activity: Traffic",
+  "severity_id": 1,
+  "severity": "Informational",
+  "status_id": 1,
+  "status": "Success",
+  "time": 1749081661789,
+  "message": "Outbound HTTPS connection from 10.20.30.40:51820 to 93.184.216.34:443 (example.com)",
+  "metadata": {
+    "version": "1.8.0",
+    "product": {
+      "name": "Conduit Proxy",
+      "vendor_name": "nano"
+    },
+    "uid": "a1b2c3d4-5e6f-4708-9a0b-1c2d3e4f5061",
+    "logged_time": 1749081662000
+  },
+  "src_endpoint": {
+    "ip": "10.20.30.40",
+    "port": 51820,
+    "mac": "00:1A:2B:3C:4D:5E",
+    "hostname": "ws-jsmith-01.acme.local"
+  },
+  "dst_endpoint": {
+    "ip": "93.184.216.34",
+    "port": 443,
+    "mac": "AA:BB:CC:DD:EE:FF",
+    "hostname": "example.com",
+    "location": {
+      "country": "US",
+      "region": "Massachusetts",
+      "city": "Norwell",
+      "continent": "North America"
+    },
+    "autonomous_system": {
+      "number": 15133,
+      "name": "EDGECAST"
+    }
+  },
+  "connection_info": {
+    "direction_id": 2,
+    "direction": "Outbound",
+    "protocol_num": 6,
+    "protocol_name": "tcp"
+  },
+  "traffic": {
+    "bytes_in": 18452,
+    "bytes_out": 2371,
+    "packets_in": 27,
+    "packets_out": 19
+  },
+  "url": {
+    "hostname": "example.com",
+    "path": "/api/v2/telemetry",
+    "scheme": "https",
+    "port": 443,
+    "url_string": "https://example.com/api/v2/telemetry"
+  },
+  "enrichments": [
+    {
+      "name": "ioc_dest_ip_threat_type",
+      "type": "ioc",
+      "provider": "ThreatFox",
+      "value": "c2",
+      "data": { "malware": "CobaltStrike", "confidence_level": 80 }
+    },
+    {
+      "name": "custom_dest_ip_tags",
+      "type": "custom",
+      "provider": "nano",
+      "value": "known-cdn,monitored",
+      "data": { "risk_score": 10 }
+    }
+  ],
+  "observables": [
+    {
+      "name": "src_endpoint.ip",
+      "type_id": 2,
+      "type": "IP Address",
+      "value": "10.20.30.40"
+    },
+    {
+      "name": "dst_endpoint.ip",
+      "type_id": 2,
+      "type": "IP Address",
+      "value": "93.184.216.34"
+    },
+    {
+      "name": "url.hostname",
+      "type_id": 1,
+      "type": "Hostname",
+      "value": "example.com"
+    }
+  ]
+}

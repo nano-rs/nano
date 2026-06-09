@@ -344,9 +344,143 @@ impl SearchService {
             // 30d: use epoch-0 so the mask is a no-op (dict already windowed to 30d).
             PrevalenceTimeWindow::ThirtyDays => "toDateTime64(0, 6)",
         };
+        // Prevalence summary dicts are SCHEMA-AGNOSTIC (clickhouse/ocsf/init.sql:697-823):
+        // OCSF reuses the exact same `nanosiem.{hash,domain,ip}_prevalence_dict`, keyed by the
+        // canonical hash/domain/ip string. So the dict names are identical for UDM and OCSF —
+        // no profile branching needed here.
         let domain_dict = "nanosiem.domain_prevalence_dict".to_string();
         let ip_dict = "nanosiem.ip_prevalence_dict".to_string();
         let hash_dict = "nanosiem.hash_prevalence_dict".to_string();
+
+        // NAN-1241: resolve the UDM-semantic lookup columns to the active schema's physical
+        // columns. UDM returns the same bare literal (byte-identical output); OCSF returns the
+        // promoted dotted column (e.g. `"dst_endpoint.hostname"`). `None` => the schema has no
+        // column for that concept, so that lookup branch is dropped rather than referencing a
+        // missing column (which would 500 on OCSF).
+        let profile = self.active_profile.as_ref();
+        let dest_host_col = profile.udm_column_sql("dest_host");
+        let src_host_col = profile.udm_column_sql("src_host");
+        let query_col = profile.udm_column_sql("query");
+        let dest_ip_col = profile.udm_column_sql("dest_ip");
+        let src_ip_col = profile.udm_column_sql("src_ip");
+        let file_hash_col = profile.udm_column_sql("file_hash");
+        let process_hash_col = profile.udm_column_sql("process_hash");
+
+        // Domain lookup key: first non-empty non-IP domain field. Skip any branch whose column
+        // is unmapped; if no domain column maps at all, emit NULL (dictGet then falls through to
+        // the 9999 sentinel — i.e. "not tracked").
+        let domain_lookup_expr = {
+            let mut branches: Vec<String> = Vec::new();
+            if let Some(c) = &dest_host_col {
+                branches.push(format!("nullIf(CASE WHEN {c} != '' AND match({c}, '^[0-9]+\\\\.[0-9]+\\\\.[0-9]+\\\\.[0-9]+$') = 0 THEN lower({c}) ELSE '' END, '')"));
+            }
+            if let Some(c) = &src_host_col {
+                branches.push(format!("nullIf(CASE WHEN {c} != '' AND match({c}, '^[0-9]+\\\\.[0-9]+\\\\.[0-9]+\\\\.[0-9]+$') = 0 THEN lower({c}) ELSE '' END, '')"));
+            }
+            if let Some(c) = &query_col {
+                branches.push(format!("nullIf(lower({c}), '')"));
+            }
+            if branches.is_empty() {
+                "NULL".to_string()
+            } else {
+                format!("COALESCE(\n            {}\n        )", branches.join(",\n            "))
+            }
+        };
+
+        // IP lookup key: first non-empty IP field (or dest_host when it's an IP literal).
+        let ip_lookup_expr = {
+            let mut branches: Vec<String> = Vec::new();
+            if let Some(c) = &dest_ip_col {
+                branches.push(format!("nullIf({c}, '')"));
+            }
+            if let Some(c) = &src_ip_col {
+                branches.push(format!("nullIf({c}, '')"));
+            }
+            if let Some(c) = &dest_host_col {
+                branches.push(format!("nullIf(CASE WHEN match({c}, '^[0-9]+\\\\.[0-9]+\\\\.[0-9]+\\\\.[0-9]+$') THEN {c} ELSE '' END, '')"));
+            }
+            if branches.is_empty() {
+                "NULL".to_string()
+            } else {
+                format!("COALESCE(\n            {}\n        )", branches.join(",\n            "))
+            }
+        };
+
+        // Hash lookup key: first non-empty hash field, lowercased for case-insensitive match.
+        let hash_lookup_expr = {
+            let mut branches: Vec<String> = Vec::new();
+            if let Some(c) = &file_hash_col {
+                branches.push(format!("nullIf({c}, '')"));
+            }
+            if let Some(c) = &process_hash_col {
+                branches.push(format!("nullIf({c}, '')"));
+            }
+            if branches.is_empty() {
+                "NULL".to_string()
+            } else {
+                format!(
+                    "lower(COALESCE(\n            {}\n        ))",
+                    branches.join(",\n            ")
+                )
+            }
+        };
+
+        // `prevalence_artifact` CASE arms project the human-facing artifact value per winning
+        // entity type from whichever columns the schema maps.
+        //
+        // `udm_column_sql` returns a bare column for UDM, but for some OCSF fields
+        // (e.g. process_hash) a class-spanning EXPRESSION like
+        // `if(`process.file.hashes.sha256` != '', …, `actor.…`)`. A bare column is
+        // `l.`-qualified against `FROM base_logs l`; an expression must NOT be —
+        // `l.if(…)` is a bogus function call (CH: "Function `l.if` does not exist",
+        // NAN-1291). Its inner column refs resolve unqualified against the single
+        // source table. UDM (always a bare column) is byte-identical.
+        let artifact_col = |c: &str| -> String {
+            if c.contains('(') {
+                format!("nullIf({c}, '')")
+            } else {
+                format!("nullIf(l.{c}, '')")
+            }
+        };
+        let domain_artifact_expr = {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(c) = &dest_host_col {
+                parts.push(artifact_col(c));
+            }
+            if let Some(c) = &src_host_col {
+                parts.push(artifact_col(c));
+            }
+            if let Some(c) = &query_col {
+                parts.push(artifact_col(c));
+            }
+            parts.push("''".to_string());
+            format!("COALESCE({})", parts.join(", "))
+        };
+        let ip_artifact_expr = {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(c) = &dest_ip_col {
+                parts.push(artifact_col(c));
+            }
+            if let Some(c) = &src_ip_col {
+                parts.push(artifact_col(c));
+            }
+            if let Some(c) = &dest_host_col {
+                parts.push(artifact_col(c));
+            }
+            parts.push("''".to_string());
+            format!("COALESCE({})", parts.join(", "))
+        };
+        let hash_artifact_expr = {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(c) = &file_hash_col {
+                parts.push(artifact_col(c));
+            }
+            if let Some(c) = &process_hash_col {
+                parts.push(artifact_col(c));
+            }
+            parts.push("''".to_string());
+            format!("COALESCE({})", parts.join(", "))
+        };
 
         // Build the WHERE clause and EVAL expressions from post-prevalence commands
         // EVAL expressions must be processed first so WHERE can reference them
@@ -476,22 +610,11 @@ impl SearchService {
 logs_with_keys AS (
     SELECT *,
         -- Domain lookup: first non-empty domain field (exclude IPs)
-        COALESCE(
-            nullIf(CASE WHEN dest_host != '' AND match(dest_host, '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$') = 0 THEN lower(dest_host) ELSE '' END, ''),
-            nullIf(CASE WHEN src_host != '' AND match(src_host, '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$') = 0 THEN lower(src_host) ELSE '' END, ''),
-            nullIf(lower(query), '')
-        ) AS _domain_lookup,
+        {domain_lookup_expr} AS _domain_lookup,
         -- IP lookup: first non-empty IP field (or dest_host if it's an IP)
-        COALESCE(
-            nullIf(dest_ip, ''),
-            nullIf(src_ip, ''),
-            nullIf(CASE WHEN match(dest_host, '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$') THEN dest_host ELSE '' END, '')
-        ) AS _ip_lookup,
+        {ip_lookup_expr} AS _ip_lookup,
         -- Hash lookup: first non-empty hash field (lowercased for case-insensitive matching)
-        lower(COALESCE(
-            nullIf(file_hash, ''),
-            nullIf(process_hash, '')
-        )) AS _hash_lookup
+        {hash_lookup_expr} AS _hash_lookup
     FROM raw_logs
 ),
 base_logs AS (
@@ -555,11 +678,11 @@ SELECT
     END AS prevalence_type,
     CASE
         WHEN _dp_host_count < 9999 AND _dp_host_count <= _ip_host_count AND _dp_host_count <= _hp_host_count
-            THEN COALESCE(nullIf(l.dest_host, ''), nullIf(l.src_host, ''), nullIf(l.query, ''), '')
+            THEN {domain_artifact_expr}
         WHEN _ip_host_count < 9999 AND _ip_host_count <= _hp_host_count
-            THEN COALESCE(nullIf(l.dest_ip, ''), nullIf(l.src_ip, ''), nullIf(l.dest_host, ''), '')
+            THEN {ip_artifact_expr}
         WHEN _hp_host_count < 9999
-            THEN COALESCE(nullIf(l.file_hash, ''), nullIf(l.process_hash, ''), '')
+            THEN {hash_artifact_expr}
         ELSE NULL
     END AS prevalence_artifact{eval_columns}
 FROM base_logs l{extra_where}
@@ -571,6 +694,12 @@ ORDER BY l.timestamp DESC"#,
             window_cutoff_sql = window_cutoff_sql,
             is_rare_sql = is_rare_sql,
             prevalence_score_sql = prevalence_score_sql,
+            domain_lookup_expr = domain_lookup_expr,
+            ip_lookup_expr = ip_lookup_expr,
+            hash_lookup_expr = hash_lookup_expr,
+            domain_artifact_expr = domain_artifact_expr,
+            ip_artifact_expr = ip_artifact_expr,
+            hash_artifact_expr = hash_artifact_expr,
             eval_columns = eval_columns,
             extra_where = if where_conditions.is_empty() {
                 tracing::debug!("No WHERE conditions to add to prevalence SQL");

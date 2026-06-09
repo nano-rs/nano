@@ -252,7 +252,11 @@ impl ParserRepositoryService {
             },
         )?;
 
-        let parsers_path = repo.parsers_path.as_deref().unwrap_or("parsers/");
+        // NAN-1266: under NANO_SCHEMA_PROFILE=ocsf the sync walks the sibling
+        // `parsers-ocsf/` tree so imported parsers emit OCSF; UDM is unchanged.
+        let parsers_path =
+            crate::schema::active_repo_path(repo.parsers_path.as_deref().unwrap_or("parsers/"));
+        let parsers_path = parsers_path.as_str();
         let branch = &repo.branch;
 
         info!(repo_id = %id, owner = %owner, repo = %repo_name, "Starting parser repository sync");
@@ -590,6 +594,33 @@ impl ParserRepositoryService {
             .clone()
             .unwrap_or_else(|| "routed".to_string());
 
+        // NAN-1270: resolve the dispatch source-configuration. The single-import
+        // UI pins one (and creates the routing rule); batch import / raw API
+        // callers leave it None — which left the imported log source unwired to
+        // any source config (no association, no routing rule) while single
+        // import worked. Auto-resolve the deployed source-config whose
+        // config_type matches this parser's ingestion_method so every import
+        // path behaves identically. NULL only if none is deployed for that
+        // method (the "create/deploy a source config first" case).
+        let dispatch_source_config_id = match req.dispatch_source_config_id {
+            Some(id) => Some(id),
+            None => {
+                let config_type = Self::config_type_for_ingestion_method(&ingestion_method);
+                sqlx::query_scalar::<_, Uuid>(
+                    "SELECT id FROM source_configurations WHERE config_type = $1 \
+                     ORDER BY created_at ASC LIMIT 1",
+                )
+                .bind(config_type)
+                .fetch_optional(&self.pg_pool)
+                .await
+                .map_err(ParserRepositoryError::Database)?
+            }
+        };
+
+        // Primary source_type for the auto-created routing rule (below). Captured
+        // before `match_values` is moved into the NewLogSource.
+        let primary_source_type = match_values.first().cloned();
+
         // NAN-943: when the caller pairs a parser with a specific
         // source-configuration via `dispatch_source_config_id`, that
         // source-config's `config_type` must be compatible with the
@@ -601,7 +632,7 @@ impl ParserRepositoryService {
         // enforcement; a hand-rolled POST with mismatched
         // (ingestion_method=kafka, dispatch_source_config_id=<aws_s3 id>)
         // would be accepted.
-        if let Some(dispatch_id) = req.dispatch_source_config_id {
+        if let Some(dispatch_id) = dispatch_source_config_id {
             let row: Option<(String,)> = sqlx::query_as(
                 "SELECT config_type FROM source_configurations WHERE id = $1",
             )
@@ -632,7 +663,7 @@ impl ParserRepositoryService {
             parser_vrl,
             output_fields: None,
             credential_id: None,
-            dispatch_source_config_id: req.dispatch_source_config_id,
+            dispatch_source_config_id,
             category: parser.category.clone(),
             vendor: parser.vendor.clone(),
             product: parser.product.clone(),
@@ -770,6 +801,51 @@ impl ParserRepositoryService {
             .await
             .map_err(ParserRepositoryError::Database)?;
 
+        // NAN-1270: create the identity routing rule on the dispatch source
+        // config (source_type -> same source_type), mirroring what the
+        // single-import UI did out-of-band. Best-effort + deduped: a missing
+        // rule no longer silently differs between single and batch import.
+        // Enrichment imports route via the enrichment lane, not source_type.
+        if !is_enrichment {
+            if let (Some(cfg_id), Some(src_type)) =
+                (dispatch_source_config_id, primary_source_type.as_deref())
+            {
+                let exists: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM routing_rules \
+                     WHERE source_configuration_id = $1 AND match_field = 'source_type' AND match_value = $2",
+                )
+                .bind(cfg_id)
+                .bind(src_type)
+                .fetch_one(&self.pg_pool)
+                .await
+                .unwrap_or(0);
+                if exists == 0 {
+                    let next_priority: i32 = sqlx::query_scalar(
+                        "SELECT COALESCE(MAX(priority), 99) + 1 FROM routing_rules \
+                         WHERE source_configuration_id = $1",
+                    )
+                    .bind(cfg_id)
+                    .fetch_one(&self.pg_pool)
+                    .await
+                    .unwrap_or(100);
+                    if let Err(e) = sqlx::query(
+                        "INSERT INTO routing_rules \
+                         (source_configuration_id, priority, match_field, match_type, match_value, target_source_type) \
+                         VALUES ($1, $2, 'source_type', 'exact', $3, $3)",
+                    )
+                    .bind(cfg_id)
+                    .bind(next_priority)
+                    .bind(src_type)
+                    .execute(&self.pg_pool)
+                    .await
+                    {
+                        warn!(log_source_id = %log_source_id, source_type = %src_type, error = %e,
+                            "Imported parser: failed to auto-create routing rule (non-fatal)");
+                    }
+                }
+            }
+        }
+
         info!(
             repo_id = %repo_id,
             parser_path = %path,
@@ -779,6 +855,17 @@ impl ParserRepositoryService {
         );
 
         Ok(log_source_id)
+    }
+
+    /// Map a parser `ingestion_method` to the `source_configurations.config_type`
+    /// that carries it (inverse of [`Self::is_dispatch_compatible`]). Used to
+    /// auto-resolve the dispatch source-config when an importer doesn't pin one
+    /// (NAN-1270). Unknown methods fall through unchanged.
+    fn config_type_for_ingestion_method(ingestion_method: &str) -> &str {
+        match ingestion_method {
+            "routed" => "http",
+            other => other, // kafka/aws_s3/gcp_pubsub/splunk_hec/vector are identity
+        }
     }
 
     // =========================================================================

@@ -55,11 +55,21 @@ pub fn inject_timestamp_bounds(query: &Query) -> Query {
     }
 }
 
-/// Append min/max(timestamp) aggregations if not already present.
+/// Append the canonical `min(timestamp) as _first_seen` /
+/// `max(timestamp) as _last_seen` aggregations.
+///
+/// NAN-1308: this is **unconditional** — we always add the system-named
+/// `_first_seen`/`_last_seen`, even when the rule already aliases its own
+/// `min/max(timestamp)` (e.g. `... as first_seen`). The canonical pair is the
+/// stable, user-uncontrollable identity the cross-execution finding dedup keys
+/// on; backing off whenever a user supplied their own (arbitrarily-named) time
+/// aggregation left findings without a canonical window and re-hashed every
+/// cycle (flood). The only skip is idempotency: don't add a `_first_seen` /
+/// `_last_seen` that is already present (e.g. on a second enrichment pass).
 fn enrich_aggregations(aggregations: &[Aggregation]) -> Vec<Aggregation> {
     let mut new_aggs = aggregations.to_vec();
 
-    if !has_timestamp_agg(&new_aggs, AggFunc::Min, "_first_seen") {
+    if !alias_in_use(&new_aggs, "_first_seen") {
         new_aggs.push(Aggregation::with_alias(
             AggFunc::Min,
             Some("timestamp".to_string()),
@@ -67,7 +77,7 @@ fn enrich_aggregations(aggregations: &[Aggregation]) -> Vec<Aggregation> {
         ));
     }
 
-    if !has_timestamp_agg(&new_aggs, AggFunc::Max, "_last_seen") {
+    if !alias_in_use(&new_aggs, "_last_seen") {
         new_aggs.push(Aggregation::with_alias(
             AggFunc::Max,
             Some("timestamp".to_string()),
@@ -78,17 +88,13 @@ fn enrich_aggregations(aggregations: &[Aggregation]) -> Vec<Aggregation> {
     new_aggs
 }
 
-/// Check if aggregations already contain a min/max on timestamp,
-/// OR if the target alias is already taken by another aggregation.
-fn has_timestamp_agg(aggregations: &[Aggregation], func: AggFunc, alias: &str) -> bool {
-    aggregations.iter().any(|agg| {
-        // Already has this function on timestamp
-        (agg.func == func
-            && agg.field.as_deref().map(|f: &str| f.to_lowercase())
-                == Some("timestamp".to_string()))
-            // Or the alias is already in use
-            || agg.alias.as_deref() == Some(alias)
-    })
+/// Whether some aggregation already uses `alias` (only the canonical
+/// `_first_seen`/`_last_seen` system names matter here — user aliases like
+/// `first_seen` do NOT suppress injection, by design).
+fn alias_in_use(aggregations: &[Aggregation], alias: &str) -> bool {
+    aggregations
+        .iter()
+        .any(|agg| agg.alias.as_deref() == Some(alias))
 }
 
 #[cfg(test)]
@@ -120,22 +126,50 @@ mod tests {
     }
 
     #[test]
-    fn test_skips_injection_when_already_present() {
+    fn test_injects_canonical_even_when_user_aliases_own_window() {
+        // NAN-1308: a rule that aliases its OWN min/max(timestamp) to arbitrary
+        // names (here `first_seen`/`last_seen`) must STILL get the canonical
+        // `_first_seen`/`_last_seen` injected, so the finding dedup has a
+        // system-controlled window regardless of user naming.
         let query = parse_query(
             "error | stats count, min(timestamp) as first_seen, max(timestamp) as last_seen by src_ip",
         )
         .unwrap();
         let enriched = inject_timestamp_bounds(&query);
 
-        if let Query::Piped { command, .. } = &enriched {
-            if let Command::Stats { aggregations, .. } = command {
-                // Should not add duplicates
-                assert_eq!(aggregations.len(), 3);
-            } else {
-                panic!("Expected Stats command");
-            }
+        if let Query::Piped {
+            command: Command::Stats { aggregations, .. },
+            ..
+        } = &enriched
+        {
+            // count + user first_seen + user last_seen + _first_seen + _last_seen
+            assert_eq!(aggregations.len(), 5);
+            assert!(aggregations
+                .iter()
+                .any(|a| a.alias.as_deref() == Some("_first_seen")));
+            assert!(aggregations
+                .iter()
+                .any(|a| a.alias.as_deref() == Some("_last_seen")));
         } else {
-            panic!("Expected Piped query");
+            panic!("Expected Stats command");
+        }
+    }
+
+    #[test]
+    fn test_idempotent_when_canonical_alias_already_present() {
+        // Two enrichment passes must not duplicate the canonical pair.
+        let query = parse_query("error | stats count by src_ip").unwrap();
+        let once = inject_timestamp_bounds(&query);
+        let twice = inject_timestamp_bounds(&once);
+
+        if let Query::Piped {
+            command: Command::Stats { aggregations, .. },
+            ..
+        } = &twice
+        {
+            assert_eq!(aggregations.len(), 3); // count + _first_seen + _last_seen, no dupes
+        } else {
+            panic!("Expected Stats command");
         }
     }
 

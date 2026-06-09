@@ -97,7 +97,14 @@ SOURCE(CLICKHOUSE(
     QUERY 'SELECT network, argMax(country, updated_at) AS country, argMax(country_code, updated_at) AS country_code, argMax(continent, updated_at) AS continent, argMax(continent_code, updated_at) AS continent_code, argMax(asn, updated_at) AS asn, argMax(as_name, updated_at) AS as_name, argMax(as_domain, updated_at) AS as_domain FROM nanosiem.ip_enrichments GROUP BY network HAVING argMax(deleted, updated_at) = 0'
 ))
 LIFETIME(MIN 300 MAX 600)
-LAYOUT(IP_TRIE());
+LAYOUT(IP_TRIE())
+-- The dict load runs the source QUERY as the nanosiem user, which inherits the
+-- `default` profile's max_result_rows=1M / max_result_bytes=1G caps (result_overflow_mode=throw).
+-- IPinfo Lite is ~3.9M CIDR ranges (>1M), so without lifting these the load THROWs
+-- Code 396 -> dict FAILED -> dictGetOrDefault in the logs enriched_* columns THROWs
+-- on every INSERT -> total silent ingestion halt (same blast radius NAN-1117 warned of,
+-- new trigger). Lift the result caps for the load query ONLY; the analyst profile is untouched.
+SETTINGS(max_result_rows = 0, max_result_bytes = 0);
 
 -- IOC Enrichment Dictionary
 -- OOTB marketplace IOC feeds (e.g. ThreatFox) populate nanosiem.logs `ioc_*`

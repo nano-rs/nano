@@ -1114,8 +1114,20 @@ impl PrevalenceService {
         logs_table: &str,
         time_window: TimeWindow,
     ) -> Result<ArtifactDetailResponse, PrevalenceError> {
+        // Resolve the active schema profile so the repository's raw-SQL detail
+        // queries target the right physical columns (UDM byte-identical; OCSF
+        // promoted columns). The service struct holds no profile, so read the
+        // env-configured one here (NAN-1241).
+        let profile = crate::schema::active_profile_from_env()
+            .map_err(|e| PrevalenceError::Config(format!("schema profile: {e}")))?;
         self.repository
-            .get_artifact_detail(artifact, artifact_type, logs_table, time_window)
+            .get_artifact_detail(
+                artifact,
+                artifact_type,
+                logs_table,
+                profile.as_ref(),
+                time_window,
+            )
             .await
             .map_err(PrevalenceError::ClickHouse)
     }
@@ -1149,6 +1161,14 @@ impl PrevalenceService {
             }
         }
 
+        // Active schema profile for column resolution (NAN-1241). This is a
+        // best-effort enrichment path with no Result channel; a malformed
+        // profile env already fails fast at boot, so fall back to the UDM
+        // profile (byte-identical default) on the unreachable error case.
+        let profile = crate::schema::active_profile_from_env().unwrap_or_else(|_| {
+            crate::schema::profile_for_id(crate::schema::SchemaId::Udm)
+        });
+
         let ctx_map = self
             .repository
             .bulk_artifact_inline_context(
@@ -1156,6 +1176,7 @@ impl PrevalenceService {
                 &ip_artifacts,
                 &domain_artifacts,
                 logs_table,
+                profile.as_ref(),
                 time_window,
             )
             .await;
@@ -1326,6 +1347,9 @@ pub enum PrevalenceError {
 
     #[error("Invalid artifact: {0}")]
     InvalidArtifact(String),
+
+    #[error("Configuration error: {0}")]
+    Config(String),
 }
 
 #[cfg(test)]

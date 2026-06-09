@@ -1,0 +1,117 @@
+{
+  "class_uid": 1007,
+  "class_name": "Process Activity",
+  "category_uid": 1,
+  "category_name": "System Activity",
+  "activity_id": 1,
+  "activity_name": "Launch",
+  "type_uid": 100701,
+  "type_name": "Process Activity: Launch",
+  "severity_id": 3,
+  "severity": "Medium",
+  "status_id": 1,
+  "status": "Success",
+  "time": 1749081722345,
+  "message": "powershell.exe launched encoded command on WS-JSMITH-01",
+  "metadata": {
+    "version": "1.8.0",
+    "product": {
+      "name": "Sysmon",
+      "vendor_name": "Microsoft",
+      "feature": {
+        "name": "ProcessCreate"
+      }
+    },
+    "uid": "b7e2f9a0-3c4d-4e5f-8061-7a8b9c0d1e2f",
+    "log_name": "Microsoft-Windows-Sysmon/Operational",
+    "logged_time": 1749081722600
+  },
+  "device": {
+    "type_id": 6,
+    "type": "Server",
+    "hostname": "ws-jsmith-01.acme.local",
+    "os": {
+      "name": "Windows Server 2022",
+      "type_id": 100,
+      "type": "Windows"
+    }
+  },
+  "actor": {
+    "user": {
+      "name": "jsmith",
+      "domain": "ACME",
+      "uid": "S-1-5-21-1004336348-1177238915-682003330-1052"
+    },
+    "process": {
+      "name": "explorer.exe",
+      "pid": 4128,
+      "cmd_line": "C:\\\\Windows\\\\explorer.exe",
+      "file": {
+        "name": "explorer.exe",
+        "path": "C:\\\\Windows\\\\explorer.exe",
+        "type_id": 1,
+        "type": "Regular File",
+        "hashes": [
+          {
+            "algorithm_id": 1,
+            "algorithm": "MD5",
+            "value": "9bbe2c5d4e8f1a2b3c4d5e6f70819a2b"
+          },
+          {
+            "algorithm_id": 3,
+            "algorithm": "SHA-256",
+            "value": "A1F2E3D4C5B6079889AABBCCDDEEFF00112233445566778899AABBCCDDEEFF00"
+          }
+        ]
+      },
+      "parent_process": {
+        "name": "userinit.exe",
+        "pid": 980,
+        "cmd_line": "C:\\\\Windows\\\\system32\\\\userinit.exe"
+      }
+    }
+  },
+  "process": {
+    "name": "powershell.exe",
+    "pid": 7321,
+    "cmd_line": "powershell.exe -NoProfile -EncodedCommand SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQA",
+    "file": {
+      "name": "powershell.exe",
+      "path": "C:\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe",
+      "type_id": 1,
+      "type": "Regular File",
+      "hashes": [
+        {
+          "algorithm_id": 3,
+          "algorithm": "SHA-256",
+          "value": "9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08"
+        }
+      ]
+    },
+    "parent_process": {
+      "name": "explorer.exe",
+      "pid": 4128,
+      "cmd_line": "C:\\\\Windows\\\\explorer.exe"
+    }
+  },
+  "observables": [
+    {
+      "name": "actor.user.name",
+      "type_id": 4,
+      "type": "User Name",
+      "value": "jsmith"
+    },
+    {
+      "name": "process.file.hashes[].value",
+      "type_id": 10,
+      "type": "Hash",
+      "value": "9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08"
+    },
+    {
+      "name": "process.name",
+      "type_id": 9,
+      "type": "Process Name",
+      "value": "powershell.exe"
+    }
+  ]
+}

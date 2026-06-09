@@ -6,30 +6,150 @@ impl SearchService {
     /// Default page size for asset events
     const ASSET_EVENT_PAGE_SIZE: usize = 200;
 
-    /// Slim column list for asset timeline queries.
-    /// Covers everything detect_event_type, build_event_summary, and getInlineFields need,
-    /// avoiding the full 130+ column SELECT * to reduce payload size by ~80-90%.
-    const ASSET_TIMELINE_COLUMNS: &'static str = "\
-        id, timestamp, _inserted_at, ingest_time, source_type, vendor_product, namespace, \
-        message, category, \
-        src_ip, dest_ip, src_host, dest_host, src_port, dest_port, src_mac, \
-        protocol, bytes_in, bytes_out, duration, user, action, status, severity, \
-        auth_type, auth_result, \
-        process_name, command_line, process_id, parent_command_line, \
-        parent_process_name, parent_process_id, process_hash, process_path, \
-        file_name, file_path, file_hash, file_action, \
-        query, query_type, answer, url, url_domain, uri_path, \
-        http_method, http_status_code, http_user_agent, http_content_type, \
-        registry_path, registry_value_data, signature, signature_id, \
-        rule_name, mitre_technique_id, \
-        enriched_src_country, enriched_src_asn, enriched_dest_country, enriched_dest_asn, \
-        prevalence_min";
+    /// Canonical (UDM-semantic) timeline field names, in projection order.
+    ///
+    /// Slim column list for asset timeline queries — covers everything
+    /// `detect_event_type`, `build_event_summary`, and the frontend
+    /// `getInlineFields` need, avoiding the full 130+ column `SELECT *` to reduce
+    /// payload size by ~80-90%.
+    ///
+    /// These are UDM-semantic names. The actual SELECT projection is built per
+    /// the active schema profile by [`Self::asset_timeline_columns`], which
+    /// resolves each name to its physical column and aliases it back to the
+    /// canonical name so downstream JSON consumers (`detect_event_type`,
+    /// `build_event_summary`) see a stable key set regardless of schema (NAN-1241).
+    /// Fields the active schema does not map are skipped.
+    const ASSET_TIMELINE_FIELDS: &'static [&'static str] = &[
+        "id",
+        "timestamp",
+        "_inserted_at",
+        "ingest_time",
+        "source_type",
+        "vendor_product",
+        "namespace",
+        "message",
+        "category",
+        "src_ip",
+        "dest_ip",
+        "src_host",
+        "dest_host",
+        "src_port",
+        "dest_port",
+        "src_mac",
+        "protocol",
+        "bytes_in",
+        "bytes_out",
+        "duration",
+        "user",
+        "action",
+        "status",
+        "severity",
+        "auth_type",
+        "auth_result",
+        "process_name",
+        "command_line",
+        "process_id",
+        "parent_command_line",
+        "parent_process_name",
+        "parent_process_id",
+        "process_hash",
+        "process_path",
+        "file_name",
+        "file_path",
+        "file_hash",
+        "file_action",
+        "query",
+        "query_type",
+        "answer",
+        "url",
+        "url_domain",
+        "uri_path",
+        "http_method",
+        "http_status_code",
+        "http_user_agent",
+        "http_content_type",
+        "registry_path",
+        "registry_value_data",
+        "signature",
+        "signature_id",
+        "rule_name",
+        "mitre_technique_id",
+        "enriched_src_country",
+        "enriched_src_asn",
+        "enriched_dest_country",
+        "enriched_dest_asn",
+        "prevalence_min",
+    ];
 
-    /// CASE WHEN expression that classifies log events into broad categories.
-    /// Used by both the facet aggregation query and the event_type filter condition.
-    /// Definition is shared with the asset-dossier lane classifier — see
-    /// [`crate::search::classification`] for the single source of truth.
-    const EVENT_TYPE_CASE_WHEN: &'static str = crate::search::classification::EVENT_TYPE_SQL;
+    /// Build the asset-timeline SELECT projection for the active schema profile.
+    ///
+    /// Each canonical field in [`Self::ASSET_TIMELINE_FIELDS`] is resolved to its
+    /// physical column via `udm_column_sql` and aliased back to the canonical
+    /// name (`col AS canonical`). For the UDM profile every field resolves to the
+    /// same column name, so the emitted projection is byte-equivalent to the old
+    /// const (modulo the seam's uniform reserved-word quoting) and the result rows
+    /// are byte-identical. Fields the schema does not map (`udm_column_sql` →
+    /// `None`) are skipped entirely so no unknown-column reference is emitted.
+    fn asset_timeline_columns(&self) -> String {
+        let profile = self.active_profile.as_ref();
+        let is_ocsf = profile.id() == crate::schema::SchemaId::Ocsf;
+        Self::ASSET_TIMELINE_FIELDS
+            .iter()
+            .filter_map(|field| {
+                // Operational/physical columns present literally in BOTH schemas
+                // (`id`, `source_type`, `timestamp`) must be projected by their own
+                // name — NOT routed through `udm_column_sql`, whose OCSF manifest maps
+                // the UDM semantics elsewhere:
+                //   • `id` → `metadata.uid` (logical event uid, not the physical
+                //     row key) → row-expand refetch-by-id found nothing
+                //     ("Couldn't load full event", NAN-1316).
+                //   • `source_type` → `class_uid` (a UInt32, e.g. 4001) → the asset
+                //     stream emitted a NUMBER as source_type; the frontend then
+                //     POSTed `{source_type: 4001}` to /api/search/log (Option<String>)
+                //     → 422 "Invalid request body" (NAN-1317 row-expand).
+                //   • `timestamp` → `time_dt` (an ALIAS column) → the row was keyed
+                //     `time_dt`, so the per-event `event.get("timestamp")` read came
+                //     back empty and the stream rendered a blank time column with a
+                //     big left gutter (NAN-1324).
+                // All three exist verbatim in `logs` and `ocsf_logs`, and the OCSF
+                // profile's `resolve()` already special-cases them to the physical
+                // column — so projecting them literally is correct under both
+                // schemas (UDM's udm_column_sql already returned these names, so
+                // UDM output is byte-identical).
+                if matches!(*field, "id" | "source_type" | "timestamp") {
+                    return Some(format!("{field} AS {field}"));
+                }
+                profile.udm_column_sql(field).map(|col| {
+                    // Alias to the schema-NATIVE field name (NAN-1303): under OCSF
+                    // the row is keyed by the promoted OCSF column (src_endpoint.ip,
+                    // dst_endpoint.hostname, …) instead of UDM aliases, so the asset
+                    // stream renders OCSF fields for OCSF deployments — matching the
+                    // search results. `build_event_summary` reads the same
+                    // display_field_name keys, so summary stays in lockstep. UDM's
+                    // display_field_name is the identity, so UDM output is byte-identical.
+                    let key = profile
+                        .display_field_name(field)
+                        .unwrap_or_else(|| field.to_string());
+                    let key_sql = crate::query::escape_identifier(&key);
+                    // ASN under OCSF maps to the numeric `autonomous_system.number`
+                    // (UInt32) whereas UDM stores a String. Wrap the OCSF projection
+                    // in `toString()` so the column carries the type downstream
+                    // consumers expect. The UDM path is untouched (string column).
+                    if is_ocsf && matches!(*field, "enriched_src_asn" | "enriched_dest_asn") {
+                        format!("toString({col}) AS {key_sql}")
+                    } else {
+                        format!("{col} AS {key_sql}")
+                    }
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    // Event classification is profile-aware (NAN-1241): each call site uses
+    // `crate::search::classification::event_type_sql(self.active_profile.as_ref())`
+    // so UDM (`action`/`category`-based) and OCSF (`class_uid`/`category_uid`-based)
+    // each get their correct CASE expression. See [`crate::search::classification`].
 
     /// Build asset view from search results
     ///
@@ -215,6 +335,7 @@ impl SearchService {
         identities: &[serde_json::Value],
         identifier_field: &str,
         identifier_value: &str,
+        profile: &dyn crate::schema::SchemaProfile,
     ) -> (Vec<String>, Vec<String>, Vec<String>) {
         let mut ips: Vec<String> = Vec::new();
         let mut hostnames: Vec<String> = Vec::new();
@@ -250,18 +371,38 @@ impl SearchService {
             }
         }
 
-        match identifier_field {
-            "src_ip" | "dest_ip" => {
+        // Classify the seed identifier into ip/host/user. Two name spaces reach
+        // here: native fields the profile knows (`profile.entity_type` — under
+        // OCSF `device.hostname`, `src_endpoint.ip`, `user.name`, … which the old
+        // hardcoded UDM-name match dropped → empty dossier, NAN-1300) AND
+        // UDM-CANONICAL names (`src_host`/`src_ip`/`user`) that the asset command
+        // emits as the `primary_identifier` even under OCSF (resolved downstream
+        // via `udm_column_sql`). The OCSF registry does NOT know the UDM-canonical
+        // aliases, so `entity_type("src_host")` is None there — classifying by
+        // `entity_type` alone regressed that common path to 0 results. Resolve via
+        // the profile first, then fall back to the UDM-canonical names so BOTH
+        // spaces bucket correctly under either schema.
+        use crate::schema::EntityType;
+        let entity_type = profile
+            .entity_type(identifier_field)
+            .or_else(|| match identifier_field {
+                "src_ip" | "dest_ip" => Some(EntityType::Ip),
+                "src_host" | "dest_host" => Some(EntityType::Host),
+                "user" => Some(EntityType::User),
+                _ => None,
+            });
+        match entity_type {
+            Some(EntityType::Ip) => {
                 if !ips.contains(&identifier_value.to_string()) {
                     ips.push(identifier_value.to_string());
                 }
             }
-            "src_host" | "dest_host" => {
+            Some(EntityType::Host) => {
                 if !hostnames.contains(&identifier_value.to_lowercase()) {
                     hostnames.push(identifier_value.to_lowercase());
                 }
             }
-            "user" => {
+            Some(EntityType::User) => {
                 if !users.contains(&identifier_value.to_lowercase()) {
                     users.push(identifier_value.to_lowercase());
                 }
@@ -272,10 +413,15 @@ impl SearchService {
         (ips, hostnames, users)
     }
 
-    /// Build a SQL OR clause matching asset identifiers against log-table columns
-    /// (src_ip, src_host, user). Returns None if no identifiers are present.
-    /// Returns (sql_fragment_with_placeholders, bind_values).
-    pub(super) fn build_log_identity_clause(
+    /// Profile-aware identity-clause builder. Resolves the
+    /// `src_ip` / `src_host` / `user` UDM-semantic columns through the active
+    /// schema profile so the identity OR-clause targets the correct physical
+    /// columns under OCSF. A UDM profile resolves each to its own column, so the
+    /// emitted SQL is byte-identical to the legacy hardcoded form (modulo
+    /// reserved-word quoting that the seam applies uniformly). Fields the schema
+    /// does not map are skipped.
+    pub(super) fn build_log_identity_clause_for(
+        profile: &dyn crate::schema::SchemaProfile,
         ips: &[String],
         hostnames: &[String],
         users: &[String],
@@ -285,18 +431,44 @@ impl SearchService {
         }
         let mut conditions: Vec<String> = Vec::new();
         let mut binds: Vec<String> = Vec::new();
-        for ip in ips {
-            conditions.push("src_ip = ?".to_string());
-            binds.push(ip.clone());
+        if let Some(src_ip) = profile.udm_column_sql("src_ip") {
+            for ip in ips {
+                conditions.push(format!("{src_ip} = ?"));
+                binds.push(ip.clone());
+            }
         }
+        // Host columns to match a hostname against. UDM: the single `src_host`
+        // column (byte-identical). OCSF: a host shows up as the endpoint
+        // (`device.hostname` — where sysmon PROCESS/FILE/REGISTRY events carry it),
+        // the src endpoint, or the dst endpoint. Match ALL of them, or the asset
+        // view only captures the subset where the host happens to be
+        // `src_endpoint.hostname` (network events) and misses everything else
+        // (NAN-1318; same device.hostname family as NAN-1295/1302).
+        let host_cols: Vec<String> = if profile.id() == crate::schema::SchemaId::Ocsf {
+            ["src_endpoint.hostname", "device.hostname", "dst_endpoint.hostname"]
+                .iter()
+                .map(|c| crate::query::escape_identifier(c))
+                .collect()
+        } else {
+            profile.udm_column_sql("src_host").into_iter().collect()
+        };
         for hostname in hostnames {
-            conditions.push("(lower(src_host) = ? OR startsWith(lower(src_host), ?))".to_string());
-            binds.push(hostname.clone());
-            binds.push(format!("{}.", hostname));
+            for host_col in &host_cols {
+                conditions.push(format!(
+                    "(lower({host_col}) = ? OR startsWith(lower({host_col}), ?))"
+                ));
+                binds.push(hostname.clone());
+                binds.push(format!("{}.", hostname));
+            }
         }
-        for user in users {
-            conditions.push("lower(user) = ?".to_string());
-            binds.push(user.clone());
+        if let Some(user_col) = profile.udm_column_sql("user") {
+            for user in users {
+                conditions.push(format!("lower({user_col}) = ?"));
+                binds.push(user.clone());
+            }
+        }
+        if conditions.is_empty() {
+            return None;
         }
         Some((conditions.join(" OR "), binds))
     }
@@ -365,15 +537,29 @@ impl SearchService {
         };
 
         let (ips, hostnames, users) =
-            Self::collect_asset_identifiers(identities, identifier_field, identifier_value);
-        let (identity_clause, bind_values) =
-            match Self::build_log_identity_clause(&ips, &hostnames, &users) {
-                Some(pair) => pair,
-                None => return Ok((Vec::new(), 0, AssetFacets::default())),
-            };
+            Self::collect_asset_identifiers(identities, identifier_field, identifier_value, self.active_profile.as_ref());
+        let (identity_clause, bind_values) = match Self::build_log_identity_clause_for(
+            self.active_profile.as_ref(),
+            &ips,
+            &hostnames,
+            &users,
+        ) {
+            Some(pair) => pair,
+            None => return Ok((Vec::new(), 0, AssetFacets::default())),
+        };
 
         let start_str = time_range.start.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
         let end_str = time_range.end.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+
+        // Physical column carrying the `user` UDM concept under the active schema.
+        // UDM resolves to `"user"` (byte-identical to the prior hardcode modulo the
+        // seam's reserved-word quoting); OCSF resolves to its promoted user column.
+        // Falls back to the literal `user` when the schema doesn't map it so the
+        // query still parses (it just yields no user facets).
+        let user_col = self
+            .active_profile
+            .udm_column_sql("user")
+            .unwrap_or_else(|| "user".to_string());
 
         // Build filter conditions if provided
         let mut filter_conditions: Vec<String> = Vec::new();
@@ -397,7 +583,7 @@ impl SearchService {
                     let placeholders: Vec<&str> = event_types.iter().map(|_| "?").collect();
                     filter_conditions.push(format!(
                         "{} IN ({})",
-                        Self::EVENT_TYPE_CASE_WHEN,
+                        crate::search::classification::event_type_sql(self.active_profile.as_ref()),
                         placeholders.join(",")
                     ));
                     for s in event_types {
@@ -408,7 +594,8 @@ impl SearchService {
             if let Some(ref users) = f.users {
                 if !users.is_empty() {
                     let placeholders: Vec<&str> = users.iter().map(|_| "?").collect();
-                    filter_conditions.push(format!("user IN ({})", placeholders.join(",")));
+                    filter_conditions
+                        .push(format!("{user_col} IN ({})", placeholders.join(",")));
                     for s in users {
                         filter_binds.push(s.clone());
                     }
@@ -455,7 +642,10 @@ impl SearchService {
         // compute `event_type` server-side via the shared classifier so the
         // redesigned asset stream doesn't have to re-classify client-side —
         // same source of truth as the facet aggregation a few queries below.
-        let logs_table = self.table_names.read("logs");
+        let logs_table = self
+            .table_names
+            .read(Self::logs_table_key(self.active_profile.as_ref()));
+        let timeline_columns = self.asset_timeline_columns();
         let events_sql = format!(
             r#"SELECT {cols}, {event_type} AS event_type
             FROM {logs_table}
@@ -463,8 +653,8 @@ impl SearchService {
             {where_clause}
             ORDER BY timestamp DESC
             LIMIT {limit} OFFSET {offset}"#,
-            cols = Self::ASSET_TIMELINE_COLUMNS,
-            event_type = Self::EVENT_TYPE_CASE_WHEN,
+            cols = timeline_columns,
+            event_type = crate::search::classification::event_type_sql(self.active_profile.as_ref()),
             start = start_str,
             end = end_str,
             ident = identity_clause,
@@ -550,7 +740,7 @@ impl SearchService {
                  PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({}) \
                  GROUP BY source_type, event_type \
                  ORDER BY cnt DESC",
-                Self::EVENT_TYPE_CASE_WHEN,
+                crate::search::classification::event_type_sql(self.active_profile.as_ref()),
                 logs_table,
                 start_str,
                 end_str,
@@ -558,11 +748,11 @@ impl SearchService {
             );
 
             let user_facet_sql = format!(
-                r#"SELECT user, count() as cnt
+                r#"SELECT {user_col} AS user, count() as cnt
                 FROM {logs_table}
                 PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({})
-                WHERE user != ''
-                GROUP BY user
+                WHERE {user_col} != ''
+                GROUP BY {user_col}
                 ORDER BY cnt DESC
                 LIMIT 50"#,
                 start_str, end_str, identity_clause
@@ -694,14 +884,44 @@ impl SearchService {
             )));
         }
 
-        // Auto-detect: check common identifier fields in priority order
+        // Auto-detect: check common identifier fields in priority order. The
+        // priority list is UDM-semantic and fixed (preserving the legacy ordering
+        // exactly); under OCSF each canonical field is resolved to the physical
+        // column name the upstream result rows actually carry (e.g. `src_host` →
+        // `src_endpoint.hostname`) for the JSON lookup, while the canonical name is
+        // still returned as the identifier_field so identity resolution keeps
+        // operating on UDM semantics (NAN-1241). For UDM the resolved key equals
+        // the canonical name, so behavior is byte-identical.
+        let profile = self.active_profile.as_ref();
         let identifier_fields = ["src_host", "dest_host", "src_ip", "dest_ip", "user", "mac"];
+
+        // Map each canonical field to the raw result-row key(s) under the active
+        // schema. UDM (and any field the schema maps to a plain column) → the
+        // physical column name. Under OCSF a host can also be carried by
+        // `device.hostname` (the sysmon endpoint), which no UDM canonical resolves
+        // to — include it for the host concept so `device.hostname=… | asset`
+        // auto-detects (NAN-1318). We still return the canonical `src_host` so
+        // downstream identity resolution + the host clause (which now matches
+        // device.hostname too) operate on host semantics.
+        let is_ocsf = profile.id() == crate::schema::SchemaId::Ocsf;
+        let result_keys = |canonical: &str| -> Vec<String> {
+            let mut keys = match profile.resolve(canonical) {
+                crate::schema::FieldResolution::ExplicitColumn(c) => vec![c],
+                _ => vec![canonical.to_string()],
+            };
+            if is_ocsf && canonical == "src_host" {
+                keys.push("device.hostname".to_string());
+            }
+            keys
+        };
 
         for result in results.iter().take(10) {
             for field in &identifier_fields {
-                if let Some(value) = result.get(*field).and_then(|v| v.as_str()) {
-                    if !value.is_empty() {
-                        return Ok((field.to_string(), value.to_string()));
+                for key in result_keys(field) {
+                    if let Some(value) = result.get(&key).and_then(|v| v.as_str()) {
+                        if !value.is_empty() {
+                            return Ok((field.to_string(), value.to_string()));
+                        }
                     }
                 }
             }
@@ -870,7 +1090,7 @@ impl SearchService {
         };
 
         let (ips, hostnames, users) =
-            Self::collect_asset_identifiers(identities, identifier_field, identifier_value);
+            Self::collect_asset_identifiers(identities, identifier_field, identifier_value, self.active_profile.as_ref());
         let (identity_clause, identity_binds) =
             match Self::build_entity_identity_clause(&ips, &hostnames, &users) {
                 Some(pair) => pair,
@@ -930,10 +1150,11 @@ impl SearchService {
             None => return json!({ "hashes": [], "domains": [] }),
         };
 
+        let profile = self.active_profile.as_ref();
         let (ips, hostnames, users) =
-            Self::collect_asset_identifiers(identities, identifier_field, identifier_value);
+            Self::collect_asset_identifiers(identities, identifier_field, identifier_value, self.active_profile.as_ref());
         let (identity_clause, identity_binds) =
-            match Self::build_log_identity_clause(&ips, &hostnames, &users) {
+            match Self::build_log_identity_clause_for(profile, &ips, &hostnames, &users) {
                 Some(pair) => pair,
                 None => return json!({ "hashes": [], "domains": [] }),
             };
@@ -941,101 +1162,131 @@ impl SearchService {
         let start_str = time_range.start.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
         let end_str = time_range.end.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
 
-        // Hash query: file_hash + process_hash via UNION ALL
-        // Includes max pre-computed prevalence (host_count) from event enrichment
-        // The identity_clause appears twice (one per UNION ALL branch), so bind values are doubled
-        let logs_table = self.table_names.read("logs");
-        let hash_sql = format!(
-            "SELECT artifact, \
-                formatDateTime(min(first_ts), '%Y-%m-%dT%H:%i:%sZ') as first_ts, \
-                formatDateTime(max(last_ts), '%Y-%m-%dT%H:%i:%sZ') as last_ts, \
-                sum(cnt) as cnt, \
-                max(host_count) as host_count \
-             FROM ( \
-                SELECT lower(file_hash) as artifact, min(timestamp) as first_ts, max(timestamp) as last_ts, count() as cnt, \
-                    max(prevalence_file_hash) as host_count \
-                FROM {logs_table} \
-                PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({}) \
-                WHERE file_hash != '' AND length(file_hash) >= 32 AND match(file_hash, '^[a-fA-F0-9]+$') \
-                GROUP BY lower(file_hash) \
-                UNION ALL \
-                SELECT lower(process_hash) as artifact, min(timestamp) as first_ts, max(timestamp) as last_ts, count() as cnt, \
-                    max(prevalence_process_hash) as host_count \
-                FROM {logs_table} \
-                PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({}) \
-                WHERE process_hash != '' AND length(process_hash) >= 32 AND match(process_hash, '^[a-fA-F0-9]+$') \
-                GROUP BY lower(process_hash) \
-             ) GROUP BY artifact ORDER BY last_ts DESC LIMIT 50 \
-              SETTINGS max_execution_time=30",
-            start_str, end_str, identity_clause,
-            start_str, end_str, identity_clause,
-        );
+        // Resolve every artifact source column + its prevalence companion through the
+        // active schema profile (NAN-1241). Under UDM each resolves to its own name so
+        // the emitted SQL is byte-identical to the legacy hardcode (modulo the seam's
+        // reserved-word quoting); under OCSF they resolve to the promoted dotted
+        // columns (e.g. `file_hash` → "file.hashes.sha256"). A branch whose source
+        // column is unmapped is skipped entirely so no unknown-column reference is
+        // emitted. `prevalence_*` are operational columns present in both schemas; if
+        // a profile somehow doesn't map one we fall back to the literal `0` host_count.
+        let logs_table = self
+            .table_names
+            .read(Self::logs_table_key(profile));
+        let ip_exclude = r"^\d+\.\d+\.\d+\.\d+$";
 
-        // Domain query: dest_host + query + url_domain via UNION ALL, exclude IPs
+        // Build one UNION ALL branch for a hash artifact (file_hash / process_hash).
+        // Returns None when the source column is unmapped under the active schema.
+        let hash_branch = |udm_col: &str, prevalence_udm: &str| -> Option<String> {
+            let col = profile.udm_column_sql(udm_col)?;
+            let prev = profile
+                .udm_column_sql(prevalence_udm)
+                .unwrap_or_else(|| "0".to_string());
+            Some(format!(
+                "SELECT lower({col}) as artifact, min(timestamp) as first_ts, max(timestamp) as last_ts, count() as cnt, \
+                    max({prev}) as host_count \
+                FROM {logs_table} \
+                PREWHERE timestamp BETWEEN '{start_str}' AND '{end_str}' AND ({identity_clause}) \
+                WHERE {col} != '' AND length({col}) >= 32 AND match({col}, '^[a-fA-F0-9]+$') \
+                GROUP BY lower({col})"
+            ))
+        };
+
+        // Build one UNION ALL branch for a domain artifact (dest_host / query / url_domain).
         // NOTE: Use `match(...) = 0` instead of `NOT match(...)` — ClickHouse query
         // optimizer mishandles `NOT match()` when PREWHERE contains OR conditions,
         // silently returning 0 rows. The `= 0` form prevents the bad optimization.
-        // The identity_clause appears three times (one per UNION ALL branch), so bind values are tripled
-        let ip_exclude = r"^\d+\.\d+\.\d+\.\d+$";
-        let domain_sql = format!(
-            "SELECT artifact, \
-                formatDateTime(min(first_ts), '%Y-%m-%dT%H:%i:%sZ') as first_ts, \
-                formatDateTime(max(last_ts), '%Y-%m-%dT%H:%i:%sZ') as last_ts, \
-                sum(cnt) as cnt, \
-                max(host_count) as host_count \
-             FROM ( \
-                SELECT lower(dest_host) as artifact, min(timestamp) as first_ts, max(timestamp) as last_ts, count() as cnt, \
-                    max(prevalence_dest_domain) as host_count \
+        let domain_branch = |udm_col: &str| -> Option<String> {
+            let col = profile.udm_column_sql(udm_col)?;
+            let prev = profile
+                .udm_column_sql("prevalence_dest_domain")
+                .unwrap_or_else(|| "0".to_string());
+            Some(format!(
+                "SELECT lower({col}) as artifact, min(timestamp) as first_ts, max(timestamp) as last_ts, count() as cnt, \
+                    max({prev}) as host_count \
                 FROM {logs_table} \
-                PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({}) \
-                WHERE dest_host != '' AND position(dest_host, '.') > 0 AND match(dest_host, '{}') = 0 \
-                GROUP BY lower(dest_host) \
-                UNION ALL \
-                SELECT lower(query) as artifact, min(timestamp) as first_ts, max(timestamp) as last_ts, count() as cnt, \
-                    max(prevalence_dest_domain) as host_count \
-                FROM {logs_table} \
-                PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({}) \
-                WHERE query != '' AND position(query, '.') > 0 AND match(query, '{}') = 0 \
-                GROUP BY lower(query) \
-                UNION ALL \
-                SELECT lower(url_domain) as artifact, min(timestamp) as first_ts, max(timestamp) as last_ts, count() as cnt, \
-                    max(prevalence_dest_domain) as host_count \
-                FROM {logs_table} \
-                PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({}) \
-                WHERE url_domain != '' AND position(url_domain, '.') > 0 AND match(url_domain, '{}') = 0 \
-                GROUP BY lower(url_domain) \
-             ) GROUP BY artifact ORDER BY last_ts DESC LIMIT 50 \
-              SETTINGS max_execution_time=30",
-            start_str, end_str, identity_clause, ip_exclude,
-            start_str, end_str, identity_clause, ip_exclude,
-            start_str, end_str, identity_clause, ip_exclude,
-        );
+                PREWHERE timestamp BETWEEN '{start_str}' AND '{end_str}' AND ({identity_clause}) \
+                WHERE {col} != '' AND position({col}, '.') > 0 AND match({col}, '{ip_exclude}') = 0 \
+                GROUP BY lower({col})"
+            ))
+        };
 
-        // Hash SQL has identity_clause twice; domain SQL has it three times — repeat binds accordingly
-        let hash_binds: Vec<String> = identity_binds
+        let hash_branches: Vec<String> = ["file_hash", "process_hash"]
             .iter()
-            .chain(identity_binds.iter())
-            .cloned()
+            .zip(["prevalence_file_hash", "prevalence_process_hash"])
+            .filter_map(|(udm_col, prev)| hash_branch(udm_col, prev))
             .collect();
-        let domain_binds: Vec<String> = identity_binds
+        let domain_branches: Vec<String> = ["dest_host", "query", "url_domain"]
             .iter()
-            .chain(identity_binds.iter())
-            .chain(identity_binds.iter())
-            .cloned()
+            .filter_map(|udm_col| domain_branch(udm_col))
             .collect();
 
-        // Run both queries in parallel
-        let mut hash_query = clickhouse.query(&hash_sql);
-        for val in &hash_binds {
-            hash_query = hash_query.bind(val);
-        }
-        let hash_future = hash_query.fetch_all::<(String, String, String, u64, u16)>();
+        // identity_clause is bound once per branch — repeat the binds accordingly.
+        let repeat_binds = |n: usize| -> Vec<String> {
+            let mut v = Vec::with_capacity(identity_binds.len() * n);
+            for _ in 0..n {
+                v.extend(identity_binds.iter().cloned());
+            }
+            v
+        };
+        let hash_binds = repeat_binds(hash_branches.len());
+        let domain_binds = repeat_binds(domain_branches.len());
 
-        let mut domain_query = clickhouse.query(&domain_sql);
-        for val in &domain_binds {
-            domain_query = domain_query.bind(val);
-        }
-        let domain_future = domain_query.fetch_all::<(String, String, String, u64, u16)>();
+        let hash_sql = if hash_branches.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "SELECT artifact, \
+                    formatDateTime(min(first_ts), '%Y-%m-%dT%H:%i:%sZ') as first_ts, \
+                    formatDateTime(max(last_ts), '%Y-%m-%dT%H:%i:%sZ') as last_ts, \
+                    sum(cnt) as cnt, \
+                    max(host_count) as host_count \
+                 FROM ( {} ) GROUP BY artifact ORDER BY last_ts DESC LIMIT 50 \
+                  SETTINGS max_execution_time=30",
+                hash_branches.join(" UNION ALL ")
+            )
+        };
+        let domain_sql = if domain_branches.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "SELECT artifact, \
+                    formatDateTime(min(first_ts), '%Y-%m-%dT%H:%i:%sZ') as first_ts, \
+                    formatDateTime(max(last_ts), '%Y-%m-%dT%H:%i:%sZ') as last_ts, \
+                    sum(cnt) as cnt, \
+                    max(host_count) as host_count \
+                 FROM ( {} ) GROUP BY artifact ORDER BY last_ts DESC LIMIT 50 \
+                  SETTINGS max_execution_time=30",
+                domain_branches.join(" UNION ALL ")
+            )
+        };
+
+        // Run both queries in parallel (skip when a profile maps no source columns).
+        let hash_future = async {
+            if hash_sql.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut hash_query = clickhouse.query(&hash_sql);
+            for val in &hash_binds {
+                hash_query = hash_query.bind(val);
+            }
+            hash_query
+                .fetch_all::<(String, String, String, u64, u16)>()
+                .await
+        };
+
+        let domain_future = async {
+            if domain_sql.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut domain_query = clickhouse.query(&domain_sql);
+            for val in &domain_binds {
+                domain_query = domain_query.bind(val);
+            }
+            domain_query
+                .fetch_all::<(String, String, String, u64, u16)>()
+                .await
+        };
 
         let (hash_result, domain_result) = tokio::join!(hash_future, domain_future);
 
@@ -1082,159 +1333,115 @@ impl SearchService {
             None => return json!({ "hashes": [], "domains": [] }),
         };
 
+        let profile = self.active_profile.as_ref();
         let (ips, hostnames, users) =
-            Self::collect_asset_identifiers(identities, identifier_field, identifier_value);
+            Self::collect_asset_identifiers(identities, identifier_field, identifier_value, self.active_profile.as_ref());
         let (identity_clause, identity_binds) =
-            match Self::build_log_identity_clause(&ips, &hostnames, &users) {
+            match Self::build_log_identity_clause_for(profile, &ips, &hostnames, &users) {
                 Some(pair) => pair,
                 None => return json!({ "hashes": [], "domains": [] }),
             };
 
         let start_str = time_range.start.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
         let end_str = time_range.end.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
-        let logs_table = self.table_names.read("logs");
-
-        // Build artifact IN placeholders and collect bind values
-        let build_in_placeholders = |artifacts: &[String]| -> (String, Vec<String>) {
-            let placeholders: Vec<&str> = artifacts.iter().map(|_| "?").collect();
-            (placeholders.join(", "), artifacts.to_vec())
-        };
-
-        // Hash occurrences: individual (artifact, timestamp) rows
-        let (hash_sql, hash_binds) = if let Some(hashes) = hash_filter {
-            if hashes.is_empty() {
-                // No hashes passed the filter — skip query
-                (String::new(), Vec::new())
-            } else {
-                let (in_placeholders, artifact_binds) = build_in_placeholders(hashes);
-                // identity_clause appears twice, artifact IN appears twice
-                let binds: Vec<String> = identity_binds
-                    .iter()
-                    .chain(artifact_binds.iter())
-                    .chain(identity_binds.iter())
-                    .chain(artifact_binds.iter())
-                    .cloned()
-                    .collect();
-                let sql = format!(
-                    "SELECT artifact, formatDateTime(ts, '%Y-%m-%dT%H:%i:%sZ') as timestamp \
-                     FROM ( \
-                        SELECT lower(file_hash) as artifact, timestamp as ts \
-                        FROM {logs_table} \
-                        PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({}) \
-                        WHERE file_hash != '' AND length(file_hash) >= 32 AND lower(file_hash) IN ({}) \
-                        UNION ALL \
-                        SELECT lower(process_hash) as artifact, timestamp as ts \
-                        FROM {logs_table} \
-                        PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({}) \
-                        WHERE process_hash != '' AND length(process_hash) >= 32 AND lower(process_hash) IN ({}) \
-                     ) ORDER BY ts LIMIT 100 BY artifact \
-                      SETTINGS max_execution_time=30",
-                    start_str, end_str, identity_clause, in_placeholders,
-                    start_str, end_str, identity_clause, in_placeholders,
-                );
-                (sql, binds)
-            }
-        } else {
-            // No filter — return all hash occurrences (identity_clause appears twice)
-            let binds: Vec<String> = identity_binds
-                .iter()
-                .chain(identity_binds.iter())
-                .cloned()
-                .collect();
-            let sql = format!(
-                "SELECT artifact, formatDateTime(ts, '%Y-%m-%dT%H:%i:%sZ') as timestamp \
-                 FROM ( \
-                    SELECT lower(file_hash) as artifact, timestamp as ts \
-                    FROM {logs_table} \
-                    PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({}) \
-                    WHERE file_hash != '' AND length(file_hash) >= 32 AND match(file_hash, '^[a-fA-F0-9]+$') \
-                    UNION ALL \
-                    SELECT lower(process_hash) as artifact, timestamp as ts \
-                    FROM {logs_table} \
-                    PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({}) \
-                    WHERE process_hash != '' AND length(process_hash) >= 32 AND match(process_hash, '^[a-fA-F0-9]+$') \
-                 ) ORDER BY ts LIMIT 100 BY artifact \
-                  SETTINGS max_execution_time=30",
-                start_str, end_str, identity_clause,
-                start_str, end_str, identity_clause,
-            );
-            (sql, binds)
-        };
-
-        // Domain occurrences: individual (artifact, timestamp) rows
+        let logs_table = self
+            .table_names
+            .read(Self::logs_table_key(profile));
         let ip_exclude = r"^\d+\.\d+\.\d+\.\d+$";
-        let (domain_sql, domain_binds) = if let Some(domains) = domain_filter {
-            if domains.is_empty() {
-                (String::new(), Vec::new())
-            } else {
-                let (in_placeholders, artifact_binds) = build_in_placeholders(domains);
-                // identity_clause appears three times, artifact IN appears three times
-                let binds: Vec<String> = identity_binds
-                    .iter()
-                    .chain(artifact_binds.iter())
-                    .chain(identity_binds.iter())
-                    .chain(artifact_binds.iter())
-                    .chain(identity_binds.iter())
-                    .chain(artifact_binds.iter())
-                    .cloned()
-                    .collect();
-                let sql = format!(
-                    "SELECT artifact, formatDateTime(ts, '%Y-%m-%dT%H:%i:%sZ') as timestamp \
-                     FROM ( \
-                        SELECT lower(dest_host) as artifact, timestamp as ts \
-                        FROM {logs_table} \
-                        PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({}) \
-                        WHERE dest_host != '' AND position(dest_host, '.') > 0 AND lower(dest_host) IN ({}) \
-                        UNION ALL \
-                        SELECT lower(query) as artifact, timestamp as ts \
-                        FROM {logs_table} \
-                        PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({}) \
-                        WHERE query != '' AND position(query, '.') > 0 AND lower(query) IN ({}) \
-                        UNION ALL \
-                        SELECT lower(url_domain) as artifact, timestamp as ts \
-                        FROM {logs_table} \
-                        PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({}) \
-                        WHERE url_domain != '' AND position(url_domain, '.') > 0 AND lower(url_domain) IN ({}) \
-                     ) ORDER BY ts LIMIT 100 BY artifact \
-                      SETTINGS max_execution_time=30",
-                    start_str, end_str, identity_clause, in_placeholders,
-                    start_str, end_str, identity_clause, in_placeholders,
-                    start_str, end_str, identity_clause, in_placeholders,
-                );
-                (sql, binds)
+
+        // Build artifact IN placeholders
+        let in_placeholders = |artifacts: &[String]| -> String {
+            artifacts.iter().map(|_| "?").collect::<Vec<_>>().join(", ")
+        };
+
+        // Build one UNION ALL branch for an artifact source column, resolving the
+        // column through the active schema profile (NAN-1241). Returns the branch
+        // SQL plus the binds it consumes, in clause order (identity binds first,
+        // then artifact-IN binds when filtered). `None` when the column is unmapped
+        // under the active schema so the branch is skipped entirely. `is_hash`
+        // selects the hash length/hex predicate vs the domain dotted/IP-exclude one.
+        // For UDM every column resolves to itself → byte-identical SQL.
+        let branch = |udm_col: &str,
+                      is_hash: bool,
+                      filter: Option<&[String]>|
+         -> Option<(String, Vec<String>)> {
+            let col = profile.udm_column_sql(udm_col)?;
+            let mut binds: Vec<String> = identity_binds.clone();
+            let predicate = match filter {
+                Some(values) => {
+                    binds.extend(values.iter().cloned());
+                    let placeholders = in_placeholders(values);
+                    if is_hash {
+                        format!(
+                            "{col} != '' AND length({col}) >= 32 AND lower({col}) IN ({placeholders})"
+                        )
+                    } else {
+                        format!(
+                            "{col} != '' AND position({col}, '.') > 0 AND lower({col}) IN ({placeholders})"
+                        )
+                    }
+                }
+                None => {
+                    if is_hash {
+                        format!("{col} != '' AND length({col}) >= 32 AND match({col}, '^[a-fA-F0-9]+$')")
+                    } else {
+                        format!("{col} != '' AND position({col}, '.') > 0 AND match({col}, '{ip_exclude}') = 0")
+                    }
+                }
+            };
+            let sql = format!(
+                "SELECT lower({col}) as artifact, timestamp as ts \
+                 FROM {logs_table} \
+                 PREWHERE timestamp BETWEEN '{start_str}' AND '{end_str}' AND ({identity_clause}) \
+                 WHERE {predicate}"
+            );
+            Some((sql, binds))
+        };
+
+        // Wrap a set of UNION ALL branches into the final occurrences query.
+        let wrap = |branches: Vec<(String, Vec<String>)>| -> (String, Vec<String>) {
+            if branches.is_empty() {
+                return (String::new(), Vec::new());
             }
-        } else {
-            // No filter (identity_clause appears three times)
-            let binds: Vec<String> = identity_binds
-                .iter()
-                .chain(identity_binds.iter())
-                .chain(identity_binds.iter())
-                .cloned()
+            let mut binds: Vec<String> = Vec::new();
+            let frags: Vec<String> = branches
+                .into_iter()
+                .map(|(frag, b)| {
+                    binds.extend(b);
+                    frag
+                })
                 .collect();
             let sql = format!(
                 "SELECT artifact, formatDateTime(ts, '%Y-%m-%dT%H:%i:%sZ') as timestamp \
-                 FROM ( \
-                    SELECT lower(dest_host) as artifact, timestamp as ts \
-                    FROM {logs_table} \
-                    PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({}) \
-                    WHERE dest_host != '' AND position(dest_host, '.') > 0 AND match(dest_host, '{}') = 0 \
-                    UNION ALL \
-                    SELECT lower(query) as artifact, timestamp as ts \
-                    FROM {logs_table} \
-                    PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({}) \
-                    WHERE query != '' AND position(query, '.') > 0 AND match(query, '{}') = 0 \
-                    UNION ALL \
-                    SELECT lower(url_domain) as artifact, timestamp as ts \
-                    FROM {logs_table} \
-                    PREWHERE timestamp BETWEEN '{}' AND '{}' AND ({}) \
-                    WHERE url_domain != '' AND position(url_domain, '.') > 0 AND match(url_domain, '{}') = 0 \
-                 ) ORDER BY ts LIMIT 100 BY artifact \
+                 FROM ( {} ) ORDER BY ts LIMIT 100 BY artifact \
                   SETTINGS max_execution_time=30",
-                start_str, end_str, identity_clause, ip_exclude,
-                start_str, end_str, identity_clause, ip_exclude,
-                start_str, end_str, identity_clause, ip_exclude,
+                frags.join(" UNION ALL ")
             );
             (sql, binds)
+        };
+
+        // Hash occurrences. An explicit empty filter slice means "return nothing".
+        let (hash_sql, hash_binds) = match hash_filter {
+            Some(hashes) if hashes.is_empty() => (String::new(), Vec::new()),
+            _ => {
+                let branches: Vec<(String, Vec<String>)> = ["file_hash", "process_hash"]
+                    .iter()
+                    .filter_map(|c| branch(c, true, hash_filter))
+                    .collect();
+                wrap(branches)
+            }
+        };
+
+        // Domain occurrences. An explicit empty filter slice means "return nothing".
+        let (domain_sql, domain_binds) = match domain_filter {
+            Some(domains) if domains.is_empty() => (String::new(), Vec::new()),
+            _ => {
+                let branches: Vec<(String, Vec<String>)> = ["dest_host", "query", "url_domain"]
+                    .iter()
+                    .filter_map(|c| branch(c, false, domain_filter))
+                    .collect();
+                wrap(branches)
+            }
         };
 
         // Skip queries when SQL is empty (filter was empty slice = return nothing for that type)
@@ -1282,6 +1489,22 @@ impl SearchService {
     /// Ordering and logic mirrors the SQL CASE WHEN in the facet/filter queries
     /// and the frontend getEventType() to ensure consistent classification.
     fn detect_event_type(&self, event: &serde_json::Value) -> String {
+        // The paginated events query computes `event_type` server-side via the
+        // profile-aware classifier (`classification::event_type_sql`), so under
+        // OCSF — where the UDM key reads below would all be absent (those columns
+        // aren't projected) — we trust the SQL classification. Falls through to the
+        // UDM JSON-key heuristic only when the column is missing (e.g. callers that
+        // pass raw rows without the computed column). This keeps UDM byte-identical
+        // (the classifier and the heuristic agree on the UDM mapping) while making
+        // OCSF correct (NAN-1241).
+        if let Some(server_type) = event
+            .get("event_type")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            return server_type.to_string();
+        }
+
         let source_type = event
             .get("source_type")
             .and_then(|v| v.as_str())
@@ -1395,68 +1618,121 @@ impl SearchService {
         "EVENT".to_string()
     }
 
-    /// Build a human-readable summary for an event based on its type
+    /// Build a human-readable summary for an event based on its type.
+    ///
+    /// Profile-aware (NAN-1241/NAN-1303): the events fed here come from the
+    /// timeline query, whose projection ([`Self::asset_timeline_columns`]) keys
+    /// each column by its schema-NATIVE name via `display_field_name`. This reads
+    /// the same `display_field_name` keys, so it works whether the row carries UDM
+    /// canonical names (UDM — identity mapping, byte-identical) or native OCSF
+    /// columns (`dst_endpoint.hostname`, …). Empty values are skipped so the
+    /// fallback chain reaches a populated field (e.g. a NETWORK event with no
+    /// hostname falls through to the IP instead of rendering `:port`).
     fn build_event_summary(&self, event: &serde_json::Value, event_type: &str) -> String {
+        let profile = self.active_profile.as_ref();
+        // Resolve a UDM-semantic concept → the native key the row carries, then
+        // read it as a non-empty string / number.
+        let s = |concept: &str| -> Option<&str> {
+            let key = profile.display_field_name(concept)?;
+            event
+                .get(key.as_str())
+                .and_then(|v| v.as_str())
+                .filter(|x| !x.is_empty())
+        };
+        let n = |concept: &str| -> Option<u64> {
+            let key = profile.display_field_name(concept)?;
+            event.get(key.as_str()).and_then(|v| v.as_u64())
+        };
         match event_type {
             "PROCESS" => {
-                let proc_name = event
-                    .get("process_name")
-                    .or_else(|| event.get("command_line"))
-                    .and_then(|v| v.as_str())
+                let proc_name = s("process_name")
+                    .or_else(|| s("command_line"))
                     .unwrap_or("Unknown process");
-                let pid = event.get("process_id").and_then(|v| v.as_u64());
-                match pid {
+                match n("process_id") {
                     Some(p) => format!("{} ({})", proc_name, p),
                     None => proc_name.to_string(),
                 }
             }
-            "FILE" => event
-                .get("file_name")
-                .or_else(|| event.get("file_path"))
-                .and_then(|v| v.as_str())
+            "FILE" => s("file_name")
+                .or_else(|| s("file_path"))
                 .unwrap_or("Unknown file")
                 .to_string(),
             "NETWORK" => {
-                let dest = event
-                    .get("dest_host")
-                    .or_else(|| event.get("dest_ip"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown");
-                let port = event.get("dest_port").and_then(|v| v.as_u64());
-                match port {
+                let dest = s("dest_host").or_else(|| s("dest_ip")).unwrap_or("Unknown");
+                match n("dest_port") {
                     Some(p) => format!("{}:{}", dest, p),
                     None => dest.to_string(),
                 }
             }
-            "DNS" => event
-                .get("query")
-                .or_else(|| event.get("dest_host"))
-                .and_then(|v| v.as_str())
+            "DNS" => s("query")
+                .or_else(|| s("dest_host"))
+                .or_else(|| s("dest_ip"))
                 .unwrap_or("Unknown query")
                 .to_string(),
-            "ALERT" => event
-                .get("rule_name")
-                .or_else(|| event.get("message"))
-                .and_then(|v| v.as_str())
+            "ALERT" => s("rule_name")
+                .or_else(|| s("message"))
                 .unwrap_or("Alert triggered")
                 .to_string(),
             "AUTH_SUCCESS" | "AUTH_FAILURE" => {
-                let user = event
-                    .get("user")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown");
-                let auth_type = event.get("auth_type").and_then(|v| v.as_str());
-                match auth_type {
+                let user = s("user").unwrap_or("Unknown");
+                match s("auth_type") {
                     Some(t) => format!("{} via {}", user, t),
                     None => user.to_string(),
                 }
             }
-            _ => event
-                .get("message")
-                .or_else(|| event.get("action"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("Event")
-                .to_string(),
+            _ => s("message").or_else(|| s("action")).unwrap_or("Event").to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod nan1300_tests {
+    use crate::schema::{OcsfProfile, UdmProfile};
+    use crate::search::service::SearchService;
+
+    /// NAN-1300: native OCSF identifier fields must classify into the right
+    /// ip/host/user bucket via the profile's EntityType, not be dropped by a
+    /// hardcoded UDM-name match (which left asset dossier/view empty).
+    #[test]
+    fn ocsf_native_identifiers_classify_not_dropped() {
+        let p = OcsfProfile::new();
+        let cases = [
+            // Native OCSF fields (the original NAN-1300 gap).
+            ("device.hostname", "ws-eng-001.corp.local"),
+            ("src_endpoint.hostname", "ws-eng-001.corp.local"),
+            ("src_endpoint.ip", "89.248.167.131"),
+            ("user.name", "msanchez"),
+            ("actor.user.name", "msanchez"),
+            // UDM-canonical names the asset command emits as primary_identifier
+            // even under OCSF — the OCSF registry doesn't know them, so they must
+            // bucket via the UDM-canonical fallback (regression guard: classifying
+            // by entity_type alone dropped these → 0-result asset views).
+            ("src_host", "ws-eng-001.corp.local"),
+            ("src_ip", "89.248.167.131"),
+            ("user", "msanchez"),
+        ];
+        for (field, value) in cases {
+            let (ips, hosts, users) =
+                SearchService::collect_asset_identifiers(&[], field, value, &p);
+            assert!(
+                ips.len() + hosts.len() + users.len() == 1,
+                "OCSF native field {field} must classify into exactly one bucket (NAN-1300), \
+                 got ips={ips:?} hosts={hosts:?} users={users:?}"
+            );
+        }
+    }
+
+    /// NAN-1300 parity: UDM names still bucket exactly as before (host/user
+    /// lowercased, ip verbatim).
+    #[test]
+    fn udm_identifiers_unchanged() {
+        let p = UdmProfile::new();
+        let (ips, _, _) = SearchService::collect_asset_identifiers(&[], "src_ip", "10.0.0.1", &p);
+        assert_eq!(ips, vec!["10.0.0.1".to_string()]);
+        let (_, hosts, _) =
+            SearchService::collect_asset_identifiers(&[], "src_host", "WS-ENG-001", &p);
+        assert_eq!(hosts, vec!["ws-eng-001".to_string()]);
+        let (_, _, users) = SearchService::collect_asset_identifiers(&[], "user", "MSanchez", &p);
+        assert_eq!(users, vec!["msanchez".to_string()]);
     }
 }

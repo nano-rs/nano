@@ -72,6 +72,7 @@ const queryClient = new QueryClient({
 import { AuthProvider, useAuth } from '@/contexts/AuthContext';
 import { UserPreferencesProvider, useUserPreferences } from '@/contexts/UserPreferencesContext';
 import { useOnboardingProgress } from '@/hooks/use-api';
+import { useRegisterSchemaHighlightFields } from '@/hooks/useRegisterSchemaHighlightFields';
 import { NotebookProvider } from '@/enterprise/contexts/NotebookContext';
 import { LayoutProvider } from '@/contexts/LayoutContext';
 import { CapabilitiesProvider } from '@/contexts/CapabilitiesProvider';
@@ -432,6 +433,11 @@ function ProtectedAppRoutes() {
   const location = useLocation();
   const resetKey = (location.state as { resetKey?: number } | null)?.resetKey;
   const tierResult = useTier();
+
+  // Seed the editor tokenizers with the active schema's field names so OCSF
+  // promoted columns get syntax highlighting everywhere (NAN-1241). Runs only
+  // when authenticated (this subtree is inside ProtectedRoute); no-op under UDM.
+  useRegisterSchemaHighlightFields();
 
   return (
     <TierProvider value={tierResult}>

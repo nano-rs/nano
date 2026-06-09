@@ -201,6 +201,46 @@ export function filterUdmFields(prefix: string, limit = 12): string[] {
   }
   return out;
 }
+
+/**
+ * Prefix-filter the union of UDM field names and the active schema's field names
+ * (NAN-1241). Under UDM (\`extraFields\` empty/undefined) this is byte-identical to
+ * \`filterUdmFields\`; under OCSF the promoted columns (\`src_endpoint.ip\`, …) are
+ * offered too. The union is sorted, de-duplicated, and matched both on the full
+ * name and on the dotted leaf so a partial leaf still suggests dotted columns.
+ */
+export function filterFieldsWithSchema(
+  prefix: string,
+  extraFields: readonly string[] | undefined,
+  limit = 12,
+): string[] {
+  if (!extraFields || extraFields.length === 0) {
+    return filterUdmFields(prefix, limit);
+  }
+  const seen = new Set(UDM_FIELD_LIST);
+  const merged = [...UDM_FIELD_LIST];
+  for (const f of extraFields) {
+    if (!seen.has(f)) {
+      seen.add(f);
+      merged.push(f);
+    }
+  }
+  merged.sort((a, b) => a.localeCompare(b));
+
+  const needle = prefix.toLowerCase();
+  if (!needle) return merged.slice(0, limit);
+  const out: string[] = [];
+  for (const name of merged) {
+    const lower = name.toLowerCase();
+    const dot = lower.lastIndexOf('.');
+    const leaf = dot >= 0 ? lower.slice(dot + 1) : '';
+    if (lower.startsWith(needle) || (leaf && leaf.startsWith(needle))) {
+      out.push(name);
+      if (out.length >= limit) break;
+    }
+  }
+  return out;
+}
 `;
 
 writeFileSync(TS_OUTPUT, tsOutput);

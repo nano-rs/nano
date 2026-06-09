@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronRight, Filter, Layers, Star } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { fieldEntry } from '@/lib/ocsf-field-fallbacks';
 import { api } from '@/lib/api';
 import type {
   AssetEventsRequest,
@@ -460,6 +461,11 @@ function EventDetail({
     if (k.startsWith('prevalence_') && (v === 9999 || v === 65535)) return false;
     // Hide internal/marker fields the slim payload sometimes carries.
     if (k === 'event_type' || k === 'summary') return false;
+    // NAN-1324: the OCSF full log (SELECT *) carries the entire raw source as a
+    // single `event` JSON blob plus the `time_dt` timestamp alias — both OCSF-only
+    // and redundant with the promoted columns already shown (the blob dwarfs the
+    // row). UDM carries neither, so this is OCSF-only (UDM detail unchanged).
+    if (k === 'event' || k === 'time_dt') return false;
     return true;
   });
 
@@ -486,9 +492,15 @@ function EventDetail({
             ? 'text-orange-400'
             : 'text-str';
         return (
-          <div key={k} className="text-[11px] font-mono flex gap-2">
-            <span className="text-muted-foreground text-right w-[170px] shrink-0">{k}:</span>
-            <span className={`${valueClass} break-all`}>
+          // NAN-1324: left-align the label with a min-width (not fixed `w-[170px]
+          // text-right`). OCSF dotted names range from `id` to
+          // `actor.process.file.hashes.sha256` — right-aligning that spread left a
+          // ragged left gutter, and long names overran the fixed box into the value.
+          // Left-align + min-width keeps short labels' values aligned while letting
+          // long labels take the room they need before the value.
+          <div key={k} className="text-[11px] font-mono flex gap-3">
+            <span className="text-muted-foreground shrink-0 whitespace-nowrap min-w-[150px]">{k}:</span>
+            <span className={`${valueClass} break-all min-w-0`}>
               {typeof v === 'string' ? v : JSON.stringify(v)}
             </span>
           </div>
@@ -521,7 +533,14 @@ function normalizeEvent(raw: Record<string, unknown>): StreamEvent {
     source_type:
       (raw.source_type as string) ?? (details.source_type as string) ?? 'unknown',
     event_type: eventType,
-    user: (details.user as string) || undefined,
+    // The user that drives the USER facet/filter. UDM keys this `user`; OCSF
+    // keys the row by its native column (`user.name`, or `actor.user.name` on
+    // actor-class events), so check those too (NAN-1303 — asset stream is
+    // native-OCSF under OCSF).
+    user:
+      ((details.user ??
+        details['user.name'] ??
+        details['actor.user.name']) as string) || undefined,
     summary,
     details,
   };
@@ -611,7 +630,14 @@ function summarize(e: StreamEvent): string {
     if (parts.length >= 4) break;
   }
   if (parts.length) return parts.join(' ');
-  // Fallback to a few key details fields
+  // Fallback to a few key details fields. NAN-1324/1326: under OCSF the row is keyed
+  // by native columns (`process.name`, `dst_endpoint.hostname`, …). `fieldEntry`
+  // resolves each concept to the ACTUAL key it lives under + value, so the summary
+  // shows the schema-NATIVE name (`process.name=…` under OCSF, `process_name=…` under
+  // UDM — byte-identical) and stays consistent with the native-keyed detail. It also
+  // treats `"-"` as empty, so a Sysmon `dst_endpoint.hostname = "-"` falls through to
+  // the IP instead of rendering `dest_host=-`. The key list + order are unchanged.
+  // `event_type`/`message` are operational columns present verbatim in both schemas.
   const d = e.details;
   const keys = [
     'dest_host',
@@ -624,7 +650,17 @@ function summarize(e: StreamEvent): string {
     'message',
   ];
   for (const k of keys) {
-    if (d[k]) return `${k}=${String(d[k]).slice(0, 120)}`;
+    if (k === 'event_type' || k === 'message') {
+      const v = d[k];
+      if (v !== null && v !== undefined && v !== '') {
+        return `${k}=${String(v).slice(0, 120)}`;
+      }
+      continue;
+    }
+    const entry = fieldEntry(d, k);
+    if (entry) {
+      return `${entry.key}=${String(entry.value).slice(0, 120)}`;
+    }
   }
   return '';
 }

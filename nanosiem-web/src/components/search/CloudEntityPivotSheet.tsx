@@ -37,6 +37,10 @@ interface CloudEntityPivotSheetProps {
   onBack?: () => void;
 }
 
+// Schema-agnostic cloud timeline event (NAN-1241): the backend normalizes its
+// cloud SELECT back to these canonical UDM keys under both UDM and OCSF, so the
+// named fields stay strongly typed; the index signature admits extra
+// schema-specific keys without breaking the contract.
 interface TimelineEvent {
   timestamp: string;
   cloud_provider: string;
@@ -61,6 +65,7 @@ interface TimelineEvent {
   ioc_src_ip_threat_type: string;
   ioc_src_ip_malware: string;
   ioc_src_ip_confidence: number;
+  [key: string]: unknown;
 }
 
 // ============================================================================

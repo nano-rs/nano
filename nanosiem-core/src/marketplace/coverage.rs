@@ -16,6 +16,8 @@
 //! denominator + one numerator per artifact). Postgres is read for the
 //! installed-providers set.
 
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use clickhouse::Client as ChClient;
 use serde::{Deserialize, Serialize};
@@ -24,6 +26,7 @@ use tracing::{info, instrument, warn};
 
 use crate::marketplace::cache::MarketplaceCoverageCache;
 use crate::marketplace::error::MarketplaceError;
+use crate::schema::{SchemaId, SchemaProfile};
 
 // ============================================================================
 // Recommended-provider map
@@ -147,7 +150,13 @@ struct CoverageCounts {
     asn_enriched: u64,
 }
 
-const COVERAGE_SQL: &str = r#"
+/// The byte-for-byte UDM coverage aggregate. Kept verbatim (not synthesized
+/// from the profile) so the long-lived UDM behavior is provably unchanged by
+/// the profile-awareness work (NAN-1241): `udm_column_sql` would, for UDM,
+/// re-escape the reserved word `user` to `"user"` and otherwise round-trip the
+/// same column names — functionally identical, but this const removes any doubt.
+/// OCSF builds its own SQL in [`build_ocsf_coverage_sql`].
+const UDM_COVERAGE_SQL: &str = r#"
 SELECT
     countIf(src_ip != '' OR dest_ip != '')                                                        AS ip_total,
     countIf(
@@ -188,12 +197,234 @@ FROM logs
 PREWHERE timestamp >= now() - INTERVAL 24 HOUR
 "#;
 
-async fn fetch_counts(ch: &ChClient) -> CoverageCounts {
-    match ch
-        .query(COVERAGE_SQL)
-        .fetch_one::<CoverageCounts>()
-        .await
-    {
+/// SQL access expression for a UDM-semantic column under `profile`, or `None`
+/// when the active schema has no column for that concept (so the caller drops
+/// the predicate rather than referencing a nonexistent column and 500-ing the
+/// whole aggregate). UDM always returns the column itself; OCSF returns the
+/// promoted dotted column (e.g. `enriched_src_asn` →
+/// `` `src_endpoint.autonomous_system.number` ``) or `None` for unmapped
+/// concepts (`enriched_*_country`, `dest_user`, `*_identity_display_name`).
+fn col(profile: &dyn SchemaProfile, udm_field: &str) -> Option<String> {
+    profile.udm_column_sql(udm_field)
+}
+
+/// `present` predicate for a STRING-typed coverage column: `<col> != ''`.
+/// Resolves the column via [`col`]; returns `None` to drop the term when the
+/// schema doesn't carry it.
+fn str_present(profile: &dyn SchemaProfile, udm_field: &str) -> Option<String> {
+    col(profile, udm_field).map(|c| format!("{c} != ''"))
+}
+
+/// `present` predicate for an ASN column. UDM stores ASN as a String
+/// (`enriched_src_asn != ''`); OCSF promotes it to a numeric
+/// `autonomous_system.number` (UInt32), where presence is `!= 0`. The
+/// String-vs-numeric encoding difference is the OCSF value-encoding gate
+/// (NAN-1241) — comparing the OCSF UInt32 column to `''` would be a type error.
+fn asn_present(profile: &dyn SchemaProfile, udm_field: &str) -> Option<String> {
+    let c = col(profile, udm_field)?;
+    Some(match profile.id() {
+        SchemaId::Ocsf => format!("{c} != 0"),
+        SchemaId::Udm => format!("{c} != ''"),
+    })
+}
+
+/// `present` predicate for a prevalence column (UInt16; `< 65535` means "we
+/// have a host_count for this artifact"). Byte-identical semantics across UDM
+/// and OCSF — OCSF promotes real `prevalence_*` UInt16 columns (NAN-1248).
+fn prev_present(profile: &dyn SchemaProfile, udm_field: &str) -> Option<String> {
+    col(profile, udm_field).map(|c| format!("{c} < 65535"))
+}
+
+/// Join a set of OR-able sub-predicates, dropping any that resolved to `None`
+/// (unmapped in this schema). Returns `None` when nothing survives so the
+/// caller can fall back to a literal `0`.
+fn any_of(parts: Vec<Option<String>>) -> Option<String> {
+    let kept: Vec<String> = parts.into_iter().flatten().collect();
+    if kept.is_empty() {
+        None
+    } else {
+        Some(kept.join(" OR "))
+    }
+}
+
+/// `countIf(<pred>)`, or `countIf(0)` (always zero, but keeps the SELECT shape /
+/// column arity stable so the row decodes) when `pred` is `None`.
+fn count_if(pred: Option<String>) -> String {
+    match pred {
+        Some(p) => format!("countIf({p})"),
+        None => "countIf(0)".to_string(),
+    }
+}
+
+/// Build the coverage aggregate for an arbitrary (non-UDM) profile by resolving
+/// every UDM-semantic column through `udm_column_sql` and skipping/zeroing the
+/// ones the schema doesn't map. Mirrors [`UDM_COVERAGE_SQL`]'s 12-column shape
+/// exactly (denominator + numerator per artifact) so [`CoverageCounts`] decodes
+/// unchanged. Drives the marketplace coverage hero under OCSF instead of the old
+/// hardcoded `FROM logs` query (which would 500: `logs` doesn't exist under OCSF
+/// and the bare UDM `enriched_*`/`ioc_*` columns aren't promoted there).
+fn build_coverage_sql(profile: &dyn SchemaProfile) -> String {
+    // FROM the active schema's logs table (`nanosiem.ocsf_logs` for OCSF). The
+    // PREWHERE timestamp column is the same in both schemas (`timestamp`).
+    let table = profile.table_name();
+
+    // --- ip ---
+    let src_ip = col(profile, "src_ip");
+    let dest_ip = col(profile, "dest_ip");
+    let ip_total = any_of(vec![
+        src_ip.as_ref().map(|c| format!("{c} != ''")),
+        dest_ip.as_ref().map(|c| format!("{c} != ''")),
+    ]);
+    let src_enriched = any_of(vec![
+        str_present(profile, "enriched_src_country"),
+        asn_present(profile, "enriched_src_asn"),
+        str_present(profile, "ioc_src_ip_threat_type"),
+    ]);
+    let dest_enriched = any_of(vec![
+        str_present(profile, "enriched_dest_country"),
+        asn_present(profile, "enriched_dest_asn"),
+        str_present(profile, "ioc_dest_ip_threat_type"),
+        prev_present(profile, "prevalence_dest_ip"),
+    ]);
+    let ip_enriched = any_of(vec![
+        match (src_ip.as_ref(), src_enriched) {
+            (Some(c), Some(e)) => Some(format!("({c} != '' AND ({e}))")),
+            _ => None,
+        },
+        match (dest_ip.as_ref(), dest_enriched) {
+            (Some(c), Some(e)) => Some(format!("({c} != '' AND ({e}))")),
+            _ => None,
+        },
+    ]);
+
+    // --- domain ---
+    let url = col(profile, "url");
+    let dest_host = col(profile, "dest_host");
+    let domain_total = any_of(vec![
+        url.as_ref().map(|c| format!("{c} != ''")),
+        dest_host
+            .as_ref()
+            .map(|c| format!("({c} != '' AND NOT isIPv4String({c}))")),
+    ]);
+    let domain_enriched = match (dest_host.as_ref(), prev_present(profile, "prevalence_dest_domain")) {
+        (Some(c), Some(p)) => Some(format!("({c} != '' AND NOT isIPv4String({c}) AND {p})")),
+        _ => None,
+    };
+
+    // --- hash ---
+    let file_hash = col(profile, "file_hash");
+    let process_hash = col(profile, "process_hash");
+    let hash_total = any_of(vec![
+        file_hash.as_ref().map(|c| format!("{c} != ''")),
+        process_hash.as_ref().map(|c| format!("{c} != ''")),
+    ]);
+    let hash_enriched = any_of(vec![
+        match (file_hash.as_ref(), prev_present(profile, "prevalence_file_hash")) {
+            (Some(c), Some(p)) => Some(format!("({c} != '' AND {p})")),
+            _ => None,
+        },
+        match (
+            process_hash.as_ref(),
+            prev_present(profile, "prevalence_process_hash"),
+        ) {
+            (Some(c), Some(p)) => Some(format!("({c} != '' AND {p})")),
+            _ => None,
+        },
+    ]);
+
+    // --- user ---
+    let user = col(profile, "user");
+    let src_user = col(profile, "src_user");
+    let dest_user = col(profile, "dest_user");
+    let user_total = any_of(vec![
+        user.as_ref().map(|c| format!("{c} != ''")),
+        src_user.as_ref().map(|c| format!("{c} != ''")),
+        dest_user.as_ref().map(|c| format!("{c} != ''")),
+    ]);
+    // Identity-enrichment display names have no OCSF column today; both terms
+    // drop and `user_enriched` falls back to 0 (gap) until OCSF identity
+    // enrichment lands. TODO(OCSF): wire user-identity enrichment presence once
+    // the OCSF identity-enrichment columns exist (NAN-1148 lane).
+    let user_enriched = any_of(vec![
+        match (src_user.as_ref(), str_present(profile, "src_user_identity_display_name")) {
+            (Some(c), Some(p)) => Some(format!("({c} != '' AND {p})")),
+            _ => None,
+        },
+        match (
+            dest_user.as_ref(),
+            str_present(profile, "dest_user_identity_display_name"),
+        ) {
+            (Some(c), Some(p)) => Some(format!("({c} != '' AND {p})")),
+            _ => None,
+        },
+    ]);
+
+    // --- asset ---
+    let src_host = col(profile, "src_host");
+    let asset_total = any_of(vec![
+        src_host.as_ref().map(|c| format!("{c} != ''")),
+        dest_host.as_ref().map(|c| format!("{c} != ''")),
+    ]);
+    // Asset enrichment reuses the destination-domain prevalence signal (matches
+    // the UDM query's existing — admittedly approximate — heuristic).
+    let asset_enriched = any_of(vec![
+        match (src_host.as_ref(), prev_present(profile, "prevalence_dest_domain")) {
+            (Some(c), Some(p)) => Some(format!("({c} != '' AND {p})")),
+            _ => None,
+        },
+        match (dest_host.as_ref(), prev_present(profile, "prevalence_dest_domain")) {
+            (Some(c), Some(p)) => Some(format!("({c} != '' AND {p})")),
+            _ => None,
+        },
+    ]);
+
+    // --- asn ---
+    let asn_total = any_of(vec![
+        src_ip.as_ref().map(|c| format!("{c} != ''")),
+        dest_ip.as_ref().map(|c| format!("{c} != ''")),
+    ]);
+    let asn_enriched = any_of(vec![
+        match (src_ip.as_ref(), asn_present(profile, "enriched_src_asn")) {
+            (Some(c), Some(p)) => Some(format!("({c} != '' AND {p})")),
+            _ => None,
+        },
+        match (dest_ip.as_ref(), asn_present(profile, "enriched_dest_asn")) {
+            (Some(c), Some(p)) => Some(format!("({c} != '' AND {p})")),
+            _ => None,
+        },
+    ]);
+
+    format!(
+        "SELECT\n    {} AS ip_total,\n    {} AS ip_enriched,\n    {} AS domain_total,\n    {} AS domain_enriched,\n    {} AS hash_total,\n    {} AS hash_enriched,\n    {} AS user_total,\n    {} AS user_enriched,\n    {} AS asset_total,\n    {} AS asset_enriched,\n    {} AS asn_total,\n    {} AS asn_enriched\nFROM {}\nPREWHERE timestamp >= now() - INTERVAL 24 HOUR\n",
+        count_if(ip_total),
+        count_if(ip_enriched),
+        count_if(domain_total),
+        count_if(domain_enriched),
+        count_if(hash_total),
+        count_if(hash_enriched),
+        count_if(user_total),
+        count_if(user_enriched),
+        count_if(asset_total),
+        count_if(asset_enriched),
+        count_if(asn_total),
+        count_if(asn_enriched),
+        table,
+    )
+}
+
+/// Resolve the coverage SQL for the active profile. UDM uses the verbatim
+/// long-lived const (byte-identical, zero behavioral drift); every other schema
+/// synthesizes a profile-aware query.
+fn coverage_sql(profile: &dyn SchemaProfile) -> String {
+    match profile.id() {
+        SchemaId::Udm => UDM_COVERAGE_SQL.to_string(),
+        _ => build_coverage_sql(profile),
+    }
+}
+
+async fn fetch_counts(ch: &ChClient, profile: &dyn SchemaProfile) -> CoverageCounts {
+    let sql = coverage_sql(profile);
+    match ch.query(&sql).fetch_one::<CoverageCounts>().await {
         Ok(row) => row,
         Err(e) => {
             warn!(error = %e, "marketplace_coverage: ClickHouse aggregate failed; returning zeros");
@@ -211,6 +442,10 @@ pub struct MarketplaceCoverageService {
     pool: PgPool,
     ch_client: ChClient,
     cache: MarketplaceCoverageCache,
+    /// Active schema profile — the coverage aggregate is built against it so the
+    /// hero is correct under OCSF (`nanosiem.ocsf_logs` + promoted dotted
+    /// enrichment columns) as well as UDM (NAN-1241).
+    profile: Arc<dyn SchemaProfile>,
 }
 
 impl MarketplaceCoverageService {
@@ -219,15 +454,21 @@ impl MarketplaceCoverageService {
     /// [`MarketplaceCoverageCache::with_redis`]), so a slow recompute on
     /// one replica warms every user's hero on every replica for the next
     /// 6 hours.
+    ///
+    /// `profile` is the active schema profile (`state.config.schema_profile()`
+    /// at the API call site); it selects the logs table and resolves each
+    /// enrichment column per schema.
     pub fn new_with_cache(
         pool: PgPool,
         ch_client: ChClient,
         cache: MarketplaceCoverageCache,
+        profile: Arc<dyn SchemaProfile>,
     ) -> Self {
         Self {
             pool,
             ch_client,
             cache,
+            profile,
         }
     }
 
@@ -269,8 +510,8 @@ impl MarketplaceCoverageService {
         .fetch_all(&self.pool)
         .await?;
 
-        // 2. Fan one query at ClickHouse.
-        let counts = fetch_counts(&self.ch_client).await;
+        // 2. Fan one query at ClickHouse — built against the active schema.
+        let counts = fetch_counts(&self.ch_client, self.profile.as_ref()).await;
 
         // 3. Project each artifact row using the counts + installed set + the
         // recommended map.
@@ -376,5 +617,51 @@ mod tests {
     fn human_name_for_unknown_slug() {
         assert_eq!(human_name_for("foo-bar"), "Foo Bar");
         assert_eq!(human_name_for("solo"), "Solo");
+    }
+
+    #[test]
+    fn udm_coverage_sql_is_byte_identical_to_const() {
+        // The profile-aware resolver must reproduce the long-lived UDM query
+        // verbatim — zero behavioral drift for the dominant deployment.
+        let p = crate::schema::UdmProfile::new();
+        assert_eq!(coverage_sql(&p), UDM_COVERAGE_SQL);
+    }
+
+    #[test]
+    fn ocsf_coverage_sql_targets_ocsf_table_and_omits_unmapped_columns() {
+        let p = crate::schema::OcsfProfile::new();
+        let sql = coverage_sql(&p);
+
+        // FROM the OCSF table, not the nonexistent `logs`.
+        assert!(sql.contains("FROM nanosiem.ocsf_logs"), "sql:\n{sql}");
+        assert!(!sql.contains("FROM logs\n"), "must not read UDM logs:\n{sql}");
+
+        // Promoted dotted columns resolve (escaped) instead of bare UDM names.
+        assert!(sql.contains("\"src_endpoint.ip\""), "sql:\n{sql}");
+        assert!(
+            sql.contains("\"src_endpoint.autonomous_system.number\""),
+            "ASN should resolve to the promoted dotted column:\n{sql}"
+        );
+
+        // ASN presence is numeric (!= 0) under OCSF, never the String `!= ''`.
+        assert!(
+            sql.contains("\"src_endpoint.autonomous_system.number\" != 0"),
+            "OCSF ASN presence must be numeric:\n{sql}"
+        );
+
+        // Unmapped UDM concepts are dropped, never emitted as dead columns.
+        assert!(
+            !sql.contains("enriched_src_country"),
+            "enriched_src_country has no OCSF column:\n{sql}"
+        );
+        assert!(
+            !sql.contains("identity_display_name"),
+            "identity display-name has no OCSF column yet:\n{sql}"
+        );
+
+        // user_enriched has no OCSF signal today -> zeroed, but the SELECT shape
+        // (12 aliases) is preserved so CoverageCounts still decodes.
+        assert!(sql.contains("countIf(0) AS user_enriched"), "sql:\n{sql}");
+        assert_eq!(sql.matches(" AS ").count(), 12, "12 aliases:\n{sql}");
     }
 }

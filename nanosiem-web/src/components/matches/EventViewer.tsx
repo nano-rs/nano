@@ -30,6 +30,23 @@ const PREVIEW_KEYS = [
   'process_name',
   'file_hash',
   'file_path',
+  // OCSF promoted (dotted) columns — NAN-1241. Under OCSF the row carries these
+  // instead of the UDM names above; events are flattened to dotted keys, so the
+  // first-N-non-empty scan picks them up. UDM rows never populate these, so the
+  // UDM preview stays byte-identical.
+  'user.name',
+  'actor.user.name',
+  'src_endpoint.ip',
+  'dst_endpoint.ip',
+  'src_endpoint.hostname',
+  'dst_endpoint.hostname',
+  'http_request.http_method',
+  'http_response.code',
+  'url.url_string',
+  'actor.process.name',
+  'file.hashes.sha256',
+  'file.name',
+  'file.path',
   // AWS/CloudTrail legacy — only surface if UDM fields above didn't fill up.
   'eventName',
   'sourceIPAddress',

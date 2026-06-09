@@ -19,6 +19,23 @@ use crate::models::{
 use super::DetectionError;
 use super::DetectionService;
 
+/// A per-entity finding candidate with its stable cross-execution identity
+/// (NAN-1305). Built by `build_finding_candidates`, filtered to the new ones by
+/// `retain_unemitted`, then recorded by `record_finding_emissions`.
+pub(super) struct ClaimedFinding {
+    /// Entity value (e.g. the `src_ip`).
+    pub entity: String,
+    /// Field the entity was extracted from (e.g. `src_ip`).
+    pub field: String,
+    /// This entity's matched events (an aggregate row, or grouped raw events).
+    pub events: Vec<serde_json::Value>,
+    /// Source-event window end (`_last_seen` / latest `timestamp`) — stamped on
+    /// the finding.
+    pub window_end: chrono::DateTime<chrono::Utc>,
+    /// Stable dedup key for `(rule_id, finding_hash)`.
+    pub finding_hash: String,
+}
+
 impl DetectionService {
     // ========================================================================
     // Alert Generation Helpers
@@ -57,7 +74,14 @@ impl DetectionService {
         }
     }
 
-    /// Log risk signals for an alert's matched events, grouped by entity
+    /// Log risk signals for an alert's matched events, grouped by entity.
+    ///
+    /// Used by the per-event alert path. Grouped / aggregate rules do NOT use
+    /// this — they go through [`claim_new_grouped_findings`] +
+    /// [`emit_grouped_findings`] so emissions are deduped across executions and
+    /// stamped with the source-event window (NAN-1305). Per-event rules keep the
+    /// legacy `now()` stamp; their re-alerting is already gated upstream by the
+    /// single-event `event_hash`.
     pub(super) async fn log_alert_signals(
         &self,
         rule: &DetectionRule,
@@ -171,6 +195,15 @@ impl DetectionService {
     }
 
     /// Handle grouped alert mode: all matched events -> single alert (default behavior)
+    ///
+    /// NAN-1305: before creating the alert, claim a per-entity finding for each
+    /// entity in this result set keyed on the aggregated event window (not the
+    /// execution time). If *every* entity was already alerted by a prior
+    /// execution over the same window (the re-evaluation case: rule edit/enable,
+    /// jobs restart, scheduler gap), the whole alert is suppressed — no duplicate
+    /// alert row, no findings, no webhook, no case — which is what prevents the
+    /// re-alert storms and entity-risk inflation. Genuinely new entities (or a
+    /// later `_last_seen`) still produce an alert and findings as normal.
     pub(super) async fn handle_grouped_alert(
         &self,
         rule: &DetectionRule,
@@ -179,6 +212,33 @@ impl DetectionService {
         today: chrono::NaiveDate,
         global_weight: f64,
     ) -> Result<Option<Alert>, DetectionError> {
+        // Read-only dedup check first: which entities in this window are new?
+        // (No writes yet — we only record emissions after the alert is created,
+        // so a failed alert insert can't orphan a dedup row and silently
+        // suppress a future alert.)
+        let candidates = Self::build_finding_candidates(
+            "alert",
+            rule.id,
+            self.group_events_by_entity(rule.risk_entity_field.as_deref(), results)
+                .into_iter()
+                .map(|((entity, field), events)| (entity, field, events)),
+        );
+        let new_findings = self.retain_unemitted(rule.id, candidates).await;
+
+        if new_findings.is_empty() {
+            // Every entity over this window was already alerted — suppress the
+            // duplicate alert entirely (matches counted, no new alert/finding,
+            // no webhook, no case).
+            self.rule_repo
+                .record_daily_stats(rule.id, today, match_count, 0)
+                .await?;
+            debug!(
+                "Rule {} (ALERTING/grouped) matched {} events but all entities were already alerted for this window — suppressing duplicate alert",
+                rule.name, match_count
+            );
+            return Ok(None);
+        }
+
         self.rule_repo
             .record_daily_stats(rule.id, today, match_count, 1)
             .await?;
@@ -195,12 +255,19 @@ impl DetectionService {
 
         let alert = self.alert_repo.create(&new_alert).await?;
 
+        // Record the emissions only now that the alert exists, then emit a
+        // finding per new entity stamped with its source event window.
+        self.record_finding_emissions(rule.id, &new_findings).await;
+
         info!(
-            "Rule {} (ALERTING/grouped) matched {} events, generated alert {}",
-            rule.name, match_count, alert.id
+            "Rule {} (ALERTING/grouped) matched {} events ({} new entities), generated alert {}",
+            rule.name,
+            match_count,
+            new_findings.len(),
+            alert.id
         );
 
-        self.log_alert_signals(rule, &alert, results, global_weight)
+        self.emit_grouped_findings(rule, &alert, &new_findings, global_weight)
             .await;
 
         let case_permissions = self.get_case_permissions(rule).await;
@@ -208,6 +275,146 @@ impl DetectionService {
             .await;
 
         Ok(Some(alert))
+    }
+
+    /// Emit one risk-scored finding per already-recorded entity, stamped with the
+    /// entity's source event window rather than `now()` (NAN-1305).
+    pub(super) async fn emit_grouped_findings(
+        &self,
+        rule: &DetectionRule,
+        alert: &Alert,
+        new_findings: &[ClaimedFinding],
+        global_weight: f64,
+    ) {
+        let Some(ref logger) = self.finding_logger else {
+            return;
+        };
+        for nf in new_findings {
+            let risk_result = self.score_calculator.calculate(
+                rule.risk_score,
+                rule.severity,
+                Some(&nf.field),
+                &rule.risk_modifiers,
+                &nf.events,
+                global_weight,
+            );
+
+            let risk_result = super::super::risk::RiskResult::new(
+                risk_result.raw_score,
+                risk_result.weighted_score,
+                nf.entity.clone(),
+                Some(nf.field.clone()),
+                risk_result.factors,
+            );
+
+            debug!(
+                "Risk score for entity {} (field: {}): raw={}, weighted={}",
+                nf.entity, nf.field, risk_result.raw_score, risk_result.weighted_score
+            );
+
+            if let Err(e) = logger
+                .log_alert_at(rule, alert, false, risk_result, Some(nf.window_end))
+                .await
+            {
+                error!("Failed to log alert signal for entity {}: {}", nf.entity, e);
+            }
+        }
+    }
+
+    /// Log live-mode (bake-in) detection-match findings for a rule's results,
+    /// deduped per `(rule, entity, window)` and stamped with the source event
+    /// window so overlapping re-evaluations don't re-emit findings or re-inflate
+    /// entity risk (NAN-1305). Returns the number of findings emitted.
+    pub(super) async fn log_live_findings(
+        &self,
+        rule: &DetectionRule,
+        results: &[serde_json::Value],
+        global_weight: f64,
+    ) -> usize {
+        let Some(logger) = self.finding_logger.as_ref() else {
+            return 0;
+        };
+
+        // Query-derived scores (`| risk` command) score each event individually;
+        // otherwise group by entity and score per group.
+        let has_query_scores = results
+            .first()
+            .map(super::super::risk::ScoreCalculator::has_query_risk_score)
+            .unwrap_or(false);
+
+        let groups: Vec<(String, String, Vec<serde_json::Value>)> = if has_query_scores {
+            results
+                .iter()
+                .filter_map(|event| {
+                    let rr = self
+                        .score_calculator
+                        .calculate_from_query_result(event, global_weight)?;
+                    let field = rr.entity_field.clone().unwrap_or_default();
+                    Some((rr.entity, field, vec![event.clone()]))
+                })
+                .collect()
+        } else {
+            self.group_events_by_entity(rule.risk_entity_field.as_deref(), results)
+                .into_iter()
+                .map(|((entity, field), events)| (entity, field, events))
+                .collect()
+        };
+
+        let candidates = Self::build_finding_candidates("live", rule.id, groups);
+        let new_findings = self.retain_unemitted(rule.id, candidates).await;
+        if new_findings.is_empty() {
+            return 0;
+        }
+        self.record_finding_emissions(rule.id, &new_findings).await;
+
+        let mut emitted = 0;
+        for nf in &new_findings {
+            // Re-derive the risk result for this entity/event (query-derived
+            // score per event, else rule-derived score per group).
+            let risk_result = if has_query_scores {
+                match self
+                    .score_calculator
+                    .calculate_from_query_result(&nf.events[0], global_weight)
+                {
+                    Some(r) => r,
+                    None => continue,
+                }
+            } else {
+                let r = self.score_calculator.calculate(
+                    rule.risk_score,
+                    rule.severity,
+                    Some(&nf.field),
+                    &rule.risk_modifiers,
+                    &nf.events,
+                    global_weight,
+                );
+                super::super::risk::RiskResult::new(
+                    r.raw_score,
+                    r.weighted_score,
+                    nf.entity.clone(),
+                    Some(nf.field.clone()),
+                    r.factors,
+                )
+            };
+
+            debug!(
+                "Live finding for entity {} (field: {}): raw={}, weighted={}",
+                nf.entity, nf.field, risk_result.raw_score, risk_result.weighted_score
+            );
+
+            if let Err(e) = logger
+                .log_detection_match_at(rule, &nf.events, false, risk_result, Some(nf.window_end))
+                .await
+            {
+                error!(
+                    "Failed to log detection match signal for entity {}: {}",
+                    nf.entity, e
+                );
+            } else {
+                emitted += 1;
+            }
+        }
+        emitted
     }
 
     /// Handle per-event alert mode: each matched event -> its own alert

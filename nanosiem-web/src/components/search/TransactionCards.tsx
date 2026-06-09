@@ -10,6 +10,8 @@ import {
   Search as SearchIcon,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
+import { buildSecondaryPrefs, TRANSACTION_SECONDARY_BASE } from '@/lib/secondary-identity-prefs';
 
 interface SearchResult {
   id: string;
@@ -138,10 +140,12 @@ const RESERVED_KEYS = new Set([
   '_display_type',
 ]);
 
-/** Pick a secondary identity column (host, dest_ip, etc.) for the card subheader. */
-const SECONDARY_PREFS = ['host', 'hostname', 'src_host', 'dest_host', 'dest_ip', 'src_ip', 'dest_host_name'];
-
-function toTransaction(r: SearchResult, parsedFields: string[], idx: number): Transaction {
+function toTransaction(
+  r: SearchResult,
+  parsedFields: string[],
+  idx: number,
+  secondaryPrefs: readonly string[],
+): Transaction {
   const f = r.fields ?? {};
   const duration = Number(f.duration ?? 0);
   const eventCount = Number(f.eventcount ?? f.event_count ?? 0);
@@ -159,7 +163,7 @@ function toTransaction(r: SearchResult, parsedFields: string[], idx: number): Tr
   const groupValue = String(f[groupKey] ?? `#${idx + 1}`);
 
   let secondary: string | null = null;
-  for (const k of SECONDARY_PREFS) {
+  for (const k of secondaryPrefs) {
     if (k !== groupKey && f[k] != null && String(f[k]).trim() !== '') {
       secondary = String(f[k]);
       break;
@@ -494,9 +498,17 @@ export function TransactionCards({
 
   const maxSpanMs = parsed.maxspan ? parsed.maxspan.n * SPAN_MS[parsed.maxspan.unit] : null;
 
+  // Secondary identity column prefs follow the active schema (NAN-1241): UDM base
+  // list, unioned with OCSF host/user/ip promoted columns when OCSF is active.
+  const { schemaFields } = useSchemaEntityMap();
+  const secondaryPrefs = React.useMemo(
+    () => buildSecondaryPrefs(TRANSACTION_SECONDARY_BASE, schemaFields),
+    [schemaFields],
+  );
+
   const txns = React.useMemo(
-    () => results.map((r, i) => toTransaction(r, parsed.fields, i)),
-    [results, parsed.fields],
+    () => results.map((r, i) => toTransaction(r, parsed.fields, i, secondaryPrefs)),
+    [results, parsed.fields, secondaryPrefs],
   );
 
   // Mark transactions as notable (exceeds maxspan)

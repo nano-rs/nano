@@ -2,9 +2,12 @@
 
 import React, { useRef, useCallback, useEffect, useState, lazy, Suspense } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { useQuery } from '@tanstack/react-query';
 import { useVirtualizer } from '@tanstack/react-virtual';
+import { api } from '@/lib/api';
 import { useScrollContainer } from '@/contexts/ScrollContainerContext';
 import { useIsMobile } from '@/hooks/use-mobile';
+import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
@@ -62,6 +65,7 @@ const LateralView = lazy(() => import('./lateral').then(m => ({ default: m.Later
 const StatsView = lazy(() => import('./StatsView').then(m => ({ default: m.StatsView })));
 import { UDM_COLUMNS } from '@/lib/udm-fields';
 import { isClickHouseDefault } from '@/lib/utils';
+import { expandEventLeaves, getEventObject } from './event-flatten';
 
 // ============================================================================
 // Detail view mode — persisted to localStorage
@@ -83,10 +87,23 @@ function getDetailViewMode(): DetailViewMode {
 // Field utility functions (for inline expand view)
 // ============================================================================
 
-function flattenFieldsForExpand(fields: Record<string, unknown>, prefix = ''): [string, unknown][] {
+function flattenFieldsForExpand(fields: Record<string, unknown>, isOcsf = false, prefix = '', promotedNames?: Set<string>): [string, unknown][] {
   const result: [string, unknown][] = [];
+  // OCSF (NAN-1241): expand the raw nested `event` record into dotted leaf paths —
+  // the UDM `ext` analog — so nested OCSF fields are inspectable instead of one
+  // blob. Top level only; promoted top-level keys win on collision. See
+  // EventInspectorPanel.flattenFields for the matching inspector-side logic.
+  const topLevelKeys = prefix === '' ? new Set(Object.keys(fields)) : new Set<string>();
   for (const [key, value] of Object.entries(fields)) {
     const fullKey = prefix ? `${prefix}_${key}` : key;
+    if (prefix === '' && isOcsf && key === 'event') {
+      const eventObj = getEventObject(fields);
+      if (eventObj) {
+        topLevelKeys.delete('event');
+        result.push(...expandEventLeaves(eventObj, topLevelKeys, promotedNames));
+        continue;
+      }
+    }
     if (key.startsWith('prevalence_') && (value === 255 || value === 65535 || value === 9999)) continue;
     if (key === 'risk_score' && (value === 0 || value === '0')) continue;
     const isPrevalence = key === 'host_count' || key === 'is_rare' || key === 'prevalence_score' ||
@@ -103,13 +120,13 @@ function flattenFieldsForExpand(fields: Record<string, unknown>, prefix = ''): [
         } catch { /* not JSON */ }
       }
       if (metadataObj) {
-        result.push(...flattenFieldsForExpand(metadataObj, 'metadata'));
+        result.push(...flattenFieldsForExpand(metadataObj, isOcsf, 'metadata', promotedNames));
       } else if (value) {
         result.push([fullKey, value]);
       }
     } else if (key === '_prevalence') {
       if (typeof value === 'object' && !Array.isArray(value) && value !== null) {
-        result.push(...flattenFieldsForExpand(value as Record<string, unknown>, '_prevalence'));
+        result.push(...flattenFieldsForExpand(value as Record<string, unknown>, isOcsf, '_prevalence', promotedNames));
       } else if (value) {
         result.push([fullKey, value]);
       }
@@ -131,6 +148,7 @@ function flattenFieldsForExpand(fields: Record<string, unknown>, prefix = ''): [
     if (fieldName.startsWith('lookup_')) return 5;
     if (fieldName.startsWith('enriched_')) return 6;
     if (fieldName.startsWith('metadata_')) return 7;
+    if (isOcsf && fieldName.startsWith('unmapped.')) return 9; // OCSF unmapped spill last
     if (!UDM_COLUMNS.has(fieldName)) return 8;
     return 0;
   };
@@ -495,7 +513,9 @@ function exportToCSV(results: SearchResult[], isAggregate: boolean) {
   URL.revokeObjectURL(url);
 }
 
-// Field to entity type mapping for notebook
+// Field to entity type mapping for notebook. Schema-aware resolution (OCSF
+// dotted columns) is layered on top via useSchemaEntityMap; this const is the
+// UDM fallback that keeps UDM output byte-identical (NAN-1241).
 const FIELD_TO_ENTITY_TYPE: Record<string, string> = {
   src_ip: 'ip', dest_ip: 'ip', dst_ip: 'ip', source_ip: 'ip', client_ip: 'ip', server_ip: 'ip', dvc_ip: 'ip',
   dest_host: 'domain', dst_host: 'domain', url_domain: 'domain', domain: 'domain',
@@ -580,9 +600,10 @@ export function FieldValueMenu({
   onAddToNotebook,
 }: FieldValueMenuProps) {
   const navigate = useNavigate();
+  const { resolveEntityType, schemaFields } = useSchemaEntityMap({ fallback: FIELD_TO_ENTITY_TYPE });
   const stringValue = typeof value === 'object' ? JSON.stringify(value) : String(value);
   const fieldType = getFieldType(fieldName);
-  const entityType = FIELD_TO_ENTITY_TYPE[fieldName.toLowerCase()];
+  const entityType = resolveEntityType(fieldName);
   const canOpenEntityPage =
     !!entityType &&
     ENTITY_PAGE_TYPES.has(entityType) &&
@@ -620,10 +641,27 @@ export function FieldValueMenu({
     const base = getBaseSearch(q);
     if (!base || base === '*') return '*';
 
-    // Fields to keep for each tree type
+    // Fields to keep for each tree type. Under OCSF the UDM identity column names
+    // never appear in the query, so we also keep the active schema's host/user/ip
+    // promoted columns (NAN-1241). UDM rows never carry those names, so appending
+    // them leaves UDM scope extraction byte-identical.
     const processScope = ['src_host', 'hostname', 'dvc', 'source_type', 'sourcetype', 'earliest', 'latest'];
     const webScope = ['user', 'src_user', 'src_ip', 'src_host', 'source_type', 'sourcetype', 'earliest', 'latest'];
-    const keepFields = treeType === 'process' ? processScope : webScope;
+    const schemaHostFields: string[] = [];
+    const schemaSessionFields: string[] = [];
+    if (schemaFields && schemaFields.schema !== 'udm') {
+      for (const f of schemaFields.fields) {
+        const name = f.name.toLowerCase();
+        if (f.entity_type === 'host') schemaHostFields.push(name);
+        if (f.entity_type === 'host' || f.entity_type === 'user' || f.entity_type === 'ip') {
+          schemaSessionFields.push(name);
+        }
+      }
+    }
+    const keepFields =
+      treeType === 'process'
+        ? [...processScope, ...schemaHostFields]
+        : [...webScope, ...schemaSessionFields];
 
     // Extract field=value patterns from query
     // Match: field="value", field='value', field=value, field=/regex/
@@ -881,8 +919,13 @@ export function FieldValueMenu({
   );
 }
 
-// Extract entities from search results
-function extractEntitiesFromResults(results: SearchResult[]): Array<{ type: string; value: string }> {
+// Extract entities from search results. `resolveEntityType` is the schema-aware
+// resolver from useSchemaEntityMap (falls back to the UDM FIELD_TO_ENTITY_TYPE),
+// so OCSF dotted columns extract entities too (NAN-1241).
+function extractEntitiesFromResults(
+  results: SearchResult[],
+  resolveEntityType: (field: string) => string | undefined,
+): Array<{ type: string; value: string }> {
   const entities = new Map<string, { type: string; value: string }>();
 
   for (const result of results.slice(0, 100)) { // Limit to first 100 results
@@ -891,8 +934,7 @@ function extractEntitiesFromResults(results: SearchResult[]): Array<{ type: stri
     for (const [field, value] of Object.entries(result.fields)) {
       if (typeof value !== 'string' || !value.trim()) continue;
 
-      const fieldLower = field.toLowerCase();
-      const entityType = FIELD_TO_ENTITY_TYPE[fieldLower];
+      const entityType = resolveEntityType(field);
 
       if (entityType) {
         const key = `${entityType}:${value}`;
@@ -1088,11 +1130,12 @@ export function SearchResults({
 
   const [expandAllCells, setExpandAllCells] = React.useState(true);
 
-  // Extract entities for bulk add
+  // Extract entities for bulk add (schema-aware: OCSF dotted columns included)
+  const { resolveEntityType: resolveBulkEntityType } = useSchemaEntityMap({ fallback: FIELD_TO_ENTITY_TYPE });
   const extractedEntities = React.useMemo(() => {
     if (!notebookActive || !onAddAllEntitiesToNotebook) return [];
-    return extractEntitiesFromResults(results);
-  }, [results, notebookActive, onAddAllEntitiesToNotebook]);
+    return extractEntitiesFromResults(results, resolveBulkEntityType);
+  }, [results, notebookActive, onAddAllEntitiesToNotebook, resolveBulkEntityType]);
 
   // Check if aggregate results have any long values (for showing expand toggle)
   const hasExpandableCells = React.useMemo(() => {
@@ -1743,6 +1786,39 @@ function RawView({
   const [copiedInlineField, setCopiedInlineField] = React.useState<string | null>(null);
   const isInlineMode = detailViewMode === 'inline';
 
+  // Active schema profile drives the per-event "key fields" summary chips
+  // (OCSF Phase 7, NAN-1241). Under UDM the chips are src_ip/src_host/user/…;
+  // under OCSF the same row carries src_endpoint.ip/user.name/activity/… so the
+  // chip spec must follow the active schema or only `source_type` survives.
+  const { data: schemaFields } = useQuery({
+    queryKey: ['schema-fields'],
+    queryFn: () => api.getSchemaFields(),
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  // `label` is the chip's display tag; `field` is the real column key used both
+  // to read the value off the row and to filter on click (FieldValueMenu).
+  const keyChipSpecs: Array<{ label: string; field: string; accent?: boolean }> =
+    schemaFields?.schema === 'ocsf'
+      ? [
+          { label: 'sourcetype', field: 'source_type' },
+          { label: 'src_ip', field: 'src_endpoint.ip' },
+          { label: 'dest_ip', field: 'dst_endpoint.ip' },
+          { label: 'user', field: 'user.name' },
+          { label: 'status', field: 'status' },
+          { label: 'activity', field: 'activity', accent: true },
+        ]
+      : [
+          { label: 'sourcetype', field: 'source_type' },
+          { label: 'src_ip', field: 'src_ip' },
+          { label: 'src_host', field: 'src_host' },
+          { label: 'dest_ip', field: 'dest_ip' },
+          { label: 'dest_host', field: 'dest_host' },
+          { label: 'user', field: 'user' },
+          { label: 'dest_user', field: 'dest_user' },
+          { label: 'event_type', field: 'event_type', accent: true },
+        ];
+
   // Use shared data from parent, or fallback empty collections
   const fullLogDataMap = fullLogData ?? new Map<string, Record<string, unknown>>();
   const loadingLogsSet = loadingLogs ?? new Set<string>();
@@ -1904,18 +1980,21 @@ function RawView({
             const displayFields = fullData
               ? { ...result.fields, ...fullData }
               : result.fields;
-        // Extract key UDM fields for the summary row
-        const keyFields = {
-          source_type: displayFields?.source_type as string | undefined,
-          src_ip: displayFields?.src_ip as string | undefined,
-          src_host: displayFields?.src_host as string | undefined,
-          dest_ip: displayFields?.dest_ip as string | undefined,
-          dest_host: displayFields?.dest_host as string | undefined,
-          user: displayFields?.user as string | undefined,
-          dest_user: displayFields?.dest_user as string | undefined,
-          event_type: (displayFields?.event_type ?? displayFields?.action) as string | undefined,
-        };
-        const hasKeyFields = Object.values(keyFields).some(v => v !== undefined);
+        // Extract the active schema's key fields for the summary chip row.
+        // `event_type` falls back to the legacy `action` column (UDM only).
+        const keyChips = keyChipSpecs.map((spec) => {
+          const raw =
+            spec.field === 'event_type'
+              ? (displayFields?.event_type ?? displayFields?.action)
+              : displayFields?.[spec.field];
+          return {
+            label: spec.label,
+            apiField: spec.field,
+            value: raw as string | undefined,
+            accent: spec.accent,
+          };
+        });
+        const hasKeyFields = keyChips.some((c) => c.value !== undefined && c.value !== null && c.value !== '');
 
         return (
           <div
@@ -1973,23 +2052,12 @@ function RawView({
                     </div>
                   );
                 })()}
-                {/* Key UDM fields summary row - hidden when inline-expanded */}
+                {/* Key fields summary row (profile-aware) - hidden when inline-expanded */}
                 {hasKeyFields && !(isInlineMode && expandedFields.has(result.id)) && (() => {
-                  const chipFields: Array<{ field: string; value: string | null | undefined; accent?: boolean }> = [
-                    { field: 'sourcetype', value: keyFields.source_type },
-                    { field: 'src_ip', value: keyFields.src_ip },
-                    { field: 'src_host', value: keyFields.src_host },
-                    { field: 'dest_ip', value: keyFields.dest_ip },
-                    { field: 'dest_host', value: keyFields.dest_host },
-                    { field: 'user', value: keyFields.user },
-                    { field: 'dest_user', value: keyFields.dest_user },
-                    { field: 'event_type', value: keyFields.event_type, accent: true },
-                  ];
                   return (
                     <div className="flex flex-wrap gap-1 mt-3 font-mono text-[10.5px]">
-                      {chipFields.map(({ field, value, accent }) => {
+                      {keyChips.map(({ label: field, apiField, value, accent }) => {
                         if (!value) return null;
-                        const apiField = field === 'sourcetype' ? 'source_type' : field;
                         return (
                           <span
                             key={field}
@@ -2031,7 +2099,7 @@ function RawView({
                 {/* Inline expanded fields table */}
                 {isInlineMode && expandedFields.has(result.id) && (() => {
                   const isLoadingFullData = loadingLogsSet.has(result.id);
-                  let flattenedFields = displayFields ? flattenFieldsForExpand(displayFields) : [];
+                  let flattenedFields = displayFields ? flattenFieldsForExpand(displayFields, schemaFields?.schema === 'ocsf', '', new Set((schemaFields?.fields ?? []).map((f) => f.name))) : [];
                   if (_hiddenEnrichments.size > 0) {
                     flattenedFields = flattenedFields.filter(([k]) => !isFieldHiddenExpand(k, _hiddenEnrichments));
                   }

@@ -152,6 +152,44 @@ impl AppState {
         })
     }
 
+    /// Start the detection finding-emission dedup cleanup task (NAN-1305).
+    ///
+    /// Live-mode and aggregate rules write a `detection_finding_emissions` row
+    /// per entity per execution to dedup findings across overlapping
+    /// re-evaluations. Nothing else sweeps that table on a timer, so this purges
+    /// rows past the 7-day dedup retention (via `cleanup_old_finding_emissions()`)
+    /// every hour to keep it bounded.
+    pub fn start_finding_emission_cleanup(&self) -> tokio::task::JoinHandle<()> {
+        let pool = self.pool.clone();
+
+        tokio::spawn(async move {
+            // Cleanup every hour
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60 * 60));
+            interval.tick().await; // Skip initial tick
+
+            loop {
+                interval.tick().await;
+
+                match sqlx::query_scalar::<_, i64>("SELECT cleanup_old_finding_emissions()")
+                    .fetch_one(&pool)
+                    .await
+                {
+                    Ok(removed) => {
+                        if removed > 0 {
+                            tracing::info!(
+                                "Finding-emission cleanup removed {} expired dedup rows",
+                                removed
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Finding-emission cleanup failed: {}", e);
+                    }
+                }
+            }
+        })
+    }
+
     /// Start the rate limit bucket cleanup task
     ///
     /// Removes expired rate limit buckets from PostgreSQL every 15 minutes.

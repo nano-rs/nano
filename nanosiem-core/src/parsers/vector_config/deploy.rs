@@ -371,6 +371,11 @@ impl VectorConfigManager {
         // route for each (NAN-1151).
         self.write_router_config(&log_parsers, &enrichment_parsers).await?;
 
+        // NAN-1246: write the shared OCSF ingestion sink (only under
+        // NANO_SCHEMA_PROFILE=ocsf) wired to every parser's generated `_ocsf_prepare`
+        // fork, and drop the superseded hand-written `_ocsf.toml`. No-op under UDM.
+        self.write_ocsf_sink_config(&log_parsers).await?;
+
         // Write the static pipeline config (generic parser, mapping, sink)
         // In distributed deployments, these must be in parsers_dir to get S3-synced
         // to Vector pods alongside the dynamic router and parser configs.
@@ -390,6 +395,95 @@ impl VectorConfigManager {
             self.parsers_dir.display()
         );
 
+        Ok(())
+    }
+
+    /// NAN-1246: write the shared OCSF ingestion sink, and remove the superseded
+    /// hand-written `_ocsf.toml` (the apache-only Phase-6a stopgap). Under
+    /// NANO_SCHEMA_PROFILE=ocsf every enabled log parser's generated
+    /// `{name}_ocsf_prepare` fork feeds `nanosiem.ocsf_logs`; the sink config
+    /// mirrors the UDM `clickhouse_logs` sink. Under UDM (or with no parsers) it
+    /// writes nothing and clears any stale sink, so the config stays byte-identical.
+    pub(super) async fn write_ocsf_sink_config(
+        &self,
+        log_parsers: &[Parser],
+    ) -> Result<(), VectorConfigError> {
+        // The Phase-6a hand-written apache-only lane is superseded by generated config.
+        let legacy = self.parsers_dir.join("_ocsf.toml");
+        if legacy.exists() {
+            fs::remove_file(&legacy).await?;
+        }
+
+        let sink_path = self.parsers_dir.join("_ocsf_sink.toml");
+
+        let inputs: Vec<String> = if Self::ocsf_mode() {
+            let mut v: Vec<String> = log_parsers
+                .iter()
+                .filter(|p| p.enabled)
+                .map(|p| format!("\"{}_ocsf_prepare\"", Self::safe_name(&p.name)))
+                .collect();
+            // NAN-1325: the generic Base Event lane always feeds ocsf_logs under OCSF
+            // — even with zero deployed parsers — so unconfigured/unknown source types
+            // are searchable (parity with the UDM `logs` unknown bucket). The
+            // `generic_ocsf_prepare` transform is emitted by `full_pipeline_config_content`.
+            v.push("\"generic_ocsf_prepare\"".to_string());
+            v
+        } else {
+            Vec::new()
+        };
+
+        // No OCSF sink under UDM, or before any parser is deployed.
+        if inputs.is_empty() {
+            if sink_path.exists() {
+                fs::remove_file(&sink_path).await?;
+            }
+            return Ok(());
+        }
+
+        let content = format!(
+            "# Auto-generated OCSF ingestion sink (NAN-1246)\n\
+             # DO NOT EDIT - regenerated on every parser deploy.\n\
+             # Each parser's generated `_ocsf_prepare` fork feeds nanosiem.ocsf_logs.\n\
+             # Emitted only under NANO_SCHEMA_PROFILE=ocsf; mirrors clickhouse_logs.\n\
+             [sinks.clickhouse_ocsf_logs]\n\
+             type = \"clickhouse\"\n\
+             inputs = [{inputs}]\n\
+             endpoint = \"${{CLICKHOUSE_URL:-http://clickhouse:8123}}\"\n\
+             database = \"${{CLICKHOUSE_DATABASE:-nanosiem}}\"\n\
+             table = \"${{CLICKHOUSE_OCSF_LOGS_TABLE:-ocsf_logs}}\"\n\
+             auth.strategy = \"basic\"\n\
+             auth.user = \"${{CLICKHOUSE_USER:-nanosiem}}\"\n\
+             auth.password = \"${{CLICKHOUSE_PASSWORD:-nanosiem}}\"\n\
+             compression = \"gzip\"\n\
+             date_time_best_effort = true\n\
+             skip_unknown_fields = true\n\
+             \n\
+             [sinks.clickhouse_ocsf_logs.buffer]\n\
+             type = \"memory\"\n\
+             max_events = 100000\n\
+             when_full = \"drop_newest\"\n\
+             \n\
+             [sinks.clickhouse_ocsf_logs.acknowledgements]\n\
+             enabled = false\n\
+             \n\
+             [sinks.clickhouse_ocsf_logs.batch]\n\
+             max_bytes = ${{VECTOR_BATCH_MAX_BYTES:-52428800}}\n\
+             max_events = ${{VECTOR_BATCH_MAX_EVENTS:-50000}}\n\
+             timeout_secs = ${{VECTOR_BATCH_TIMEOUT_SECS:-10}}\n\
+             \n\
+             [sinks.clickhouse_ocsf_logs.request]\n\
+             concurrency = \"adaptive\"\n\
+             timeout_secs = 120\n\
+             retry_initial_backoff_secs = 1\n\
+             retry_max_duration_secs = 300\n",
+            inputs = inputs.join(", ")
+        );
+        fs::write(&sink_path, content).await?;
+        tracing::info!(
+            "Wrote OCSF ingestion sink ({} parser fork(s)) to {}",
+            inputs.len(),
+            sink_path.display()
+        );
         Ok(())
     }
 
@@ -820,6 +914,51 @@ retry_max_duration_secs = 300
 "#
     }
 
+    /// NAN-1325: generic OCSF **Base Event** lane. Under `NANO_SCHEMA_PROFILE=ocsf`,
+    /// events from source types with NO deployed parser fall through to
+    /// `generic_parser`, which sets `source_type`/metadata but never a `class_uid` —
+    /// so the per-parser `_ocsf_split` (`exists(.class_uid)`) never forks them, and
+    /// they reach the UDM `logs` table but never `ocsf_logs`. Since OCSF search reads
+    /// `ocsf_logs`, that unconfigured/early/unknown data was silently invisible
+    /// (UDM keeps it searchable in its `unknown` bucket). This transform forks off
+    /// `generic_parser` and shapes a minimal Base Event (`class_uid = 0`, the raw
+    /// record preserved in `event`, a `message`, `source_type`, `timestamp`) — the
+    /// row shape `clickhouse_ocsf_logs` expects (mirrors `OCSF_PREPARE_VRL`). The
+    /// sink wires `generic_ocsf_prepare` into its inputs. Appended only under OCSF
+    /// (UDM deployments get the static config verbatim — byte-identical).
+    const GENERIC_OCSF_PREPARE_BLOCK: &'static str = r#"
+# =============================================================================
+# Generic OCSF Base Event lane (NAN-1325) — unparsed/unknown source types still
+# land searchable in ocsf_logs as a class_uid=0 Base Event. OCSF deployments only.
+# =============================================================================
+[transforms.generic_ocsf_prepare]
+type = "remap"
+inputs = ["generic_parser"]
+drop_on_abort = false
+drop_on_error = false
+source = '''
+ocsf_event = .
+src_type = downcase(to_string(.metadata.original_source_type) ?? to_string(.source_type) ?? "unknown")
+if src_type == "" { src_type = "unknown" }
+msg = to_string(.message) ?? ""
+if msg == "" { msg = encode_json(ocsf_event) }
+ocsf_event.class_uid = 0
+ocsf_event.message = msg
+. = { "event": ocsf_event, "timestamp": format_timestamp!(now(), "%Y-%m-%d %H:%M:%S%.3f"), "source_type": src_type }
+'''
+"#;
+
+    /// The pipeline config for the ACTIVE schema: the static content plus, under
+    /// OCSF, the generic Base Event lane ([`Self::GENERIC_OCSF_PREPARE_BLOCK`]). UDM
+    /// returns the static content unchanged (byte-identical).
+    pub(super) fn full_pipeline_config_content() -> String {
+        let mut content = Self::pipeline_config_content().to_string();
+        if Self::ocsf_mode() {
+            content.push_str(Self::GENERIC_OCSF_PREPARE_BLOCK);
+        }
+        content
+    }
+
     /// Write the static pipeline config (generic parser, normalization, clickhouse mapping, sink)
     ///
     /// In distributed deployments (K8s), the base ConfigMap only has sources/auth/source_type_extract.
@@ -827,7 +966,7 @@ retry_max_duration_secs = 300
     /// so it arrives on Vector pods alongside the dynamic router and parser configs.
     pub(super) async fn write_pipeline_config(&self) -> Result<(), VectorConfigError> {
         let pipeline_path = self.parsers_dir.join("_pipeline.toml");
-        fs::write(&pipeline_path, Self::pipeline_config_content()).await?;
+        fs::write(&pipeline_path, Self::full_pipeline_config_content()).await?;
         tracing::info!(
             "Generated static pipeline config at {}",
             pipeline_path.display()
@@ -1333,6 +1472,46 @@ mod tests {
             failures.is_empty(),
             "pipeline VRL failed to compile:\n{}",
             failures.join("\n----\n")
+        );
+    }
+
+    /// NAN-1325: the generic OCSF Base Event lane's VRL must compile, or an OCSF
+    /// deploy would take ingestion down on the next Vector reload. Compiled here
+    /// independent of `NANO_SCHEMA_PROFILE` (the block is appended only under OCSF,
+    /// but the VRL itself must always be valid).
+    #[test]
+    fn generic_ocsf_prepare_vrl_compiles() {
+        use vrl::compiler::compile;
+        use vrl::diagnostic::Formatter;
+
+        let blocks = extract_vrl_blocks(VectorConfigManager::GENERIC_OCSF_PREPARE_BLOCK);
+        assert_eq!(
+            blocks.len(),
+            1,
+            "expected exactly one VRL block in the generic OCSF lane"
+        );
+        let fns = vrl::stdlib::all();
+        if let Err(diagnostics) = compile(blocks[0], &fns) {
+            panic!(
+                "generic OCSF prepare VRL failed to compile:\n{}",
+                Formatter::new(blocks[0], diagnostics)
+            );
+        }
+    }
+
+    /// NAN-1325: the generic Base Event row must carry `class_uid = 0` and preserve
+    /// the raw record in `event` so `ocsf_logs` materializes a searchable Base Event.
+    #[test]
+    fn generic_ocsf_prepare_emits_base_event() {
+        let block = VectorConfigManager::GENERIC_OCSF_PREPARE_BLOCK;
+        assert!(block.contains("ocsf_event.class_uid = 0"), "must set class_uid = 0");
+        assert!(
+            block.contains("\"event\": ocsf_event"),
+            "must preserve the raw record in `event`"
+        );
+        assert!(
+            block.contains("inputs = [\"generic_parser\"]"),
+            "must fork off the generic_parser fall-through"
         );
     }
 

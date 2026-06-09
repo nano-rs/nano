@@ -1,0 +1,70 @@
+{
+  "class_uid": 4003,
+  "class_name": "DNS Activity",
+  "category_uid": 4,
+  "category_name": "Network Activity",
+  "activity_id": 2,
+  "activity_name": "Response",
+  "type_uid": 400302,
+  "type_name": "DNS Activity: Response",
+  "severity_id": 1,
+  "severity": "Informational",
+  "status_id": 1,
+  "status": "Success",
+  "time": 1749081722345,
+  "message": "DNS A response for malware-c2.example.net resolved to 203.0.113.66",
+  "metadata": {
+    "version": "1.8.0",
+    "product": {
+      "name": "Conduit Proxy",
+      "vendor_name": "nano"
+    },
+    "uid": "b2c3d4e5-6f70-4819-ab1c-2d3e4f506172"
+  },
+  "src_endpoint": {
+    "ip": "10.20.30.40",
+    "port": 53124,
+    "hostname": "ws-jsmith-01.acme.local"
+  },
+  "dst_endpoint": {
+    "ip": "10.20.0.53",
+    "port": 53,
+    "hostname": "dns01.acme.local"
+  },
+  "query": {
+    "hostname": "malware-c2.example.net",
+    "type": "A",
+    "class": "IN"
+  },
+  "answers": [
+    {
+      "type": "A",
+      "class": "IN",
+      "ttl": 300,
+      "rdata": "203.0.113.66"
+    },
+    {
+      "type": "A",
+      "class": "IN",
+      "ttl": 300,
+      "rdata": "203.0.113.67"
+    }
+  ],
+  "enrichments": [
+    {
+      "name": "ioc_domain_threat_type",
+      "type": "ioc",
+      "provider": "ThreatFox",
+      "value": "c2_domain",
+      "data": { "malware": "Emotet", "confidence_level": 95 }
+    }
+  ],
+  "observables": [
+    {
+      "name": "query.hostname",
+      "type_id": 1,
+      "type": "Hostname",
+      "value": "malware-c2.example.net"
+    }
+  ]
+}

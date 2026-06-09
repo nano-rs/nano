@@ -18,8 +18,17 @@ mod sql_gen;
 pub mod validation;
 
 pub use ast::*;
-pub(crate) use clickhouse_sql_gen::is_explicit_column;
+pub(crate) use clickhouse_sql_gen::escape_identifier;
+pub(crate) use clickhouse_sql_gen::escape_string;
 pub(crate) use clickhouse_sql_gen::MATERIALIZED_COLUMNS;
+// Re-exported so `crate::schema::udm::UdmProfile::canonicalize` delegates to the
+// canonical alias map rather than duplicating it (OCSF Phase 2, NAN-1241).
+pub(crate) use clickhouse_sql_gen::normalize_field_name;
+// Re-exported for `crate::schema::udm::UdmProfile` so it references the canonical
+// const arrays for byte-for-byte parity rather than copying values (NAN-1244).
+pub(crate) use clickhouse_sql_gen::{
+    EXPLICIT_COLUMNS, LOWERCASE_NORMALIZED_FIELDS, NUMERIC_UDM_FIELDS, PREWHERE_FIELDS, UUID_FIELDS,
+};
 pub use clickhouse_sql_gen::{ClickHouseSqlGenerator, QueryOptions};
 pub use parser::{parse_query, ParseError};
 pub use pretty_print::PrettyPrint;

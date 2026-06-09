@@ -270,10 +270,12 @@ mod tests {
         // NAN-1201 added 3 enterprise paths: air-gap parsers/enrichment/license import.
         // NAN-1220 added 2 enterprise paths: air-gap rules/playbooks import.
         // NAN-1232 removed 1 shared path: /api/news (dead cybersecurity news feed).
+        // NAN-1241 (OCSF Phase 3b) added 1 shared path: /api/schema/fields
+        // (profile-aware field universe), counted in both editions.
         #[cfg(feature = "enterprise")]
-        let min_paths = 474;
+        let min_paths = 475;
         #[cfg(not(feature = "enterprise"))]
-        let min_paths = 365;
+        let min_paths = 366;
 
         assert!(
             path_count >= min_paths,

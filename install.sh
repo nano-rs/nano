@@ -23,6 +23,7 @@
 #   NANO_ADMIN_EMAIL, NANO_ADMIN_NAME, NANO_ADMIN_PASSWORD, NANO_BASE_URL
 #
 # Override defaults: NANO_INSTALL_DIR, NANO_REPO_URL, NANO_BRANCH, NANO_VERSION.
+# Set NANO_SKIP_IMAGE_VERIFY=1 to skip the image digest supply-chain check.
 
 set -euo pipefail
 
@@ -153,18 +154,36 @@ fetch_release_lock() {
     return 1
 }
 
+# Echo the manifest digest recorded in RepoDigests for the local image $1,
+# picking the entry for repo $2 — a bare sha256:… or empty. Purely local: no
+# network, no tag re-resolution.
+repo_digest_of() {
+    local line
+    line=$(docker image inspect "$1" \
+        --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
+        | grep -F "${2}@" | head -1)
+    printf '%s' "${line##*@}"
+}
+
 # Compare one lock line's expected digest against the pulled image. $1=image
 # reference (tag included for third-party, bare repo for first-party), $2=repo
 # without tag (for matching RepoDigests), $3=expected sha256. Echoes "ok",
 # "mismatch", or "missing".
 verify_one_digest() {
     local inspect_ref="$1" repo_notag="$2" expected="$3" actual
-    # RepoDigests records the manifest(-list) digest the reference resolved to on
-    # pull — the same value recorded in images.lock. Pick this repo's entry.
-    actual=$(docker image inspect "$inspect_ref" \
-        --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
-        | grep -F "${repo_notag}@" | head -1)
-    actual="${actual##*@}"
+    # RepoDigests records the manifest digest the reference resolved to on pull —
+    # the same value recorded in images.lock. Pick this repo's entry.
+    actual=$(repo_digest_of "$inspect_ref" "$repo_notag")
+    # Compose v5 (Docker 29+, what `curl get.docker.com | sh` installs today)
+    # pulls third-party images as repo:tag@sha256 and creates no local repo:tag,
+    # so the inspect above finds nothing even though the image is present
+    # (NAN-1328). It IS present under its pinned digest, so probe by
+    # repo@<expected>: that resolves iff the deployed digest equals the lock —
+    # exactly the check we want — without re-resolving the floating tag, so an
+    # upstream tag that later drifts past the pin can't cause a false mismatch.
+    if [[ -z "$actual" ]]; then
+        actual=$(repo_digest_of "${repo_notag}@${expected}" "$repo_notag")
+    fi
     if [[ -z "$actual" ]]; then echo "missing"; return; fi
     if [[ "$actual" == "$expected" ]]; then echo "ok"; else
         # To stderr — stdout is captured by the caller as the result token.
@@ -177,6 +196,14 @@ verify_one_digest() {
 
 verify_image_digests() {
     local lockfile="images.lock"
+
+    # Escape hatch (NAN-1328): let an operator opt out of the supply-chain check
+    # if they hit an environment the digest readback can't handle. Off by default
+    # — verification stays on for everyone who doesn't deliberately disable it.
+    if [[ "${NANO_SKIP_IMAGE_VERIFY:-0}" == "1" ]]; then
+        warn "NANO_SKIP_IMAGE_VERIFY=1 — skipping image digest verification (supply-chain check disabled)."
+        return 0
+    fi
 
     if [[ ! -f "$lockfile" ]]; then
         warn "images.lock not found — skipping image digest verification."

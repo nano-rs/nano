@@ -100,6 +100,22 @@ impl LogSourceRepository {
         Ok(())
     }
 
+    /// Mark every ENABLED source that isn't yet deployed as deployed. NAN-1275:
+    /// a Vector deploy regenerates the whole config from ALL enabled sources, so
+    /// they go live together — not just the one that triggered the deploy. Only
+    /// flips `deployed = false` rows (leaves already-deployed sources'
+    /// `deployed_at` untouched so the "edited since deploy" drift indicator is
+    /// preserved). Returns the number of sources flipped.
+    pub async fn mark_enabled_deployed(&self) -> Result<u64, LogSourceRepositoryError> {
+        let result = sqlx::query(
+            "UPDATE log_sources SET deployed = true, deployed_at = NOW() \
+             WHERE enabled = true AND deployed = false",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Mark as undeployed
     pub async fn mark_undeployed(&self, id: Uuid) -> Result<(), LogSourceRepositoryError> {
         let result = sqlx::query(

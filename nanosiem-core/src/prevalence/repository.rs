@@ -1069,31 +1069,84 @@ impl PrevalenceRepository {
         self.client.query(&query).fetch_all().await
     }
 
+    /// Empty artifact-detail response — returned when the active schema has no
+    /// column for the artifact's own pivot field (NAN-1241), so the detail
+    /// cannot be selected at all. UDM always has these columns, so this is only
+    /// reachable under a schema profile that drops the pivot concept.
+    fn empty_artifact_detail(
+        artifact: &str,
+        artifact_type: &ArtifactType,
+    ) -> ArtifactDetailResponse {
+        ArtifactDetailResponse {
+            artifact: artifact.to_string(),
+            artifact_type: *artifact_type,
+            top_hosts: Vec::new(),
+            top_users: Vec::new(),
+            source_types: Vec::new(),
+            processes: Vec::new(),
+            top_file_names: Vec::new(),
+            network: Vec::new(),
+            geo: Vec::new(),
+            threat_intel: Vec::new(),
+        }
+    }
+
     /// Get artifact detail from the logs table — top hosts, users, source types, and contextual data
-    #[instrument(skip(self))]
+    #[instrument(skip(self, profile))]
     pub async fn get_artifact_detail(
         &self,
         artifact: &str,
         artifact_type: &ArtifactType,
         logs_table: &str,
+        profile: &dyn crate::schema::SchemaProfile,
         time_window: TimeWindow,
     ) -> Result<ArtifactDetailResponse, clickhouse::error::Error> {
         let cutoff = Self::get_cutoff_time(time_window);
         let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
         let escaped = artifact.replace('\'', "''");
 
-        // Determine WHERE clause based on artifact type
-        let (where_field, where_clause) = if artifact_type.is_hash() {
+        // Resolve UDM-semantic column names to the active schema's physical
+        // columns (NAN-1241). Under UDM these return the same name (byte-identical
+        // SQL); under OCSF they return the promoted OCSF column expression. A
+        // `None` means the schema has no column for that concept — the dependent
+        // sub-query is skipped rather than emitting an unknown-column 500.
+        let col_file_hash = profile.udm_column_sql("file_hash");
+        let col_dest_ip = profile.udm_column_sql("dest_ip");
+        let col_dest_host = profile.udm_column_sql("dest_host");
+        let col_src_host = profile.udm_column_sql("src_host");
+        let col_user = profile.udm_column_sql("user");
+        let col_process_name = profile.udm_column_sql("process_name");
+        let col_command_line = profile.udm_column_sql("command_line");
+        let col_file_name = profile.udm_column_sql("file_name");
+        let col_dest_port = profile.udm_column_sql("dest_port");
+        let col_protocol = profile.udm_column_sql("protocol");
+
+        // Determine WHERE clause based on artifact type. If the schema lacks a
+        // column for the artifact's own pivot field, we cannot select this
+        // artifact at all — return an empty detail rather than a broken query.
+        let where_clause = if artifact_type.is_hash() {
             // Logs table stores mixed-case hashes; use lower() on column but not the
             // parameter (artifacts from the agg table are already lowercase).
-            (
-                "file_hash",
-                format!("lower(file_hash) = '{}'", escaped.to_lowercase()),
-            )
+            match &col_file_hash {
+                Some(c) => format!("lower({}) = '{}'", c, escaped.to_lowercase()),
+                None => {
+                    return Ok(Self::empty_artifact_detail(artifact, artifact_type));
+                }
+            }
         } else if artifact_type.is_ip() {
-            ("dest_ip", format!("dest_ip = '{}'", escaped))
+            match &col_dest_ip {
+                Some(c) => format!("{} = '{}'", c, escaped),
+                None => {
+                    return Ok(Self::empty_artifact_detail(artifact, artifact_type));
+                }
+            }
         } else {
-            ("dest_host", format!("dest_host = '{}'", escaped))
+            match &col_dest_host {
+                Some(c) => format!("{} = '{}'", c, escaped),
+                None => {
+                    return Ok(Self::empty_artifact_detail(artifact, artifact_type));
+                }
+            }
         };
 
         let prewhere_filter = format!("timestamp >= toDateTime('{}')", cutoff_str);
@@ -1102,6 +1155,9 @@ impl PrevalenceRepository {
         let (hosts_r, users_r, sources_r, processes_r, file_names_r, network_r, geo_r) = tokio::join!(
             // Top hosts
             async {
+                let Some(src_host) = &col_src_host else {
+                    return Ok(Vec::new());
+                };
                 #[derive(Debug, Row, Deserialize)]
                 struct R {
                     host: String,
@@ -1109,10 +1165,10 @@ impl PrevalenceRepository {
                     last_ts: i64,
                 }
                 let q = format!(
-                    "SELECT src_host AS host, count() AS cnt, reinterpretAsInt64(max(timestamp)) AS last_ts \
-                     FROM {} PREWHERE {} WHERE {} AND src_host != '' \
-                     GROUP BY src_host ORDER BY cnt DESC LIMIT 10",
-                    logs_table, prewhere_filter, where_clause
+                    "SELECT {sh} AS host, count() AS cnt, reinterpretAsInt64(max(timestamp)) AS last_ts \
+                     FROM {} PREWHERE {} WHERE {} AND {sh} != '' \
+                     GROUP BY {sh} ORDER BY cnt DESC LIMIT 10",
+                    logs_table, prewhere_filter, where_clause, sh = src_host
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -1126,16 +1182,19 @@ impl PrevalenceRepository {
             },
             // Top users
             async {
+                let Some(user) = &col_user else {
+                    return Ok(Vec::new());
+                };
                 #[derive(Debug, Row, Deserialize)]
                 struct R {
                     user: String,
                     cnt: u64,
                 }
                 let q = format!(
-                    "SELECT user, count() AS cnt \
-                     FROM {} PREWHERE {} WHERE {} AND user != '' \
-                     GROUP BY user ORDER BY cnt DESC LIMIT 10",
-                    logs_table, prewhere_filter, where_clause
+                    "SELECT {u} AS user, count() AS cnt \
+                     FROM {} PREWHERE {} WHERE {} AND {u} != '' \
+                     GROUP BY {u} ORDER BY cnt DESC LIMIT 10",
+                    logs_table, prewhere_filter, where_clause, u = user
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -1176,6 +1235,11 @@ impl PrevalenceRepository {
                 if !artifact_type.is_hash() {
                     return Ok(Vec::new());
                 }
+                let (Some(process_name), Some(command_line)) =
+                    (&col_process_name, &col_command_line)
+                else {
+                    return Ok(Vec::new());
+                };
                 #[derive(Debug, Row, Deserialize)]
                 struct R {
                     process_name: String,
@@ -1183,10 +1247,10 @@ impl PrevalenceRepository {
                     cnt: u64,
                 }
                 let q = format!(
-                    "SELECT process_name, command_line, count() AS cnt \
-                     FROM {} PREWHERE {} WHERE {} AND process_name != '' \
-                     GROUP BY process_name, command_line ORDER BY cnt DESC LIMIT 5",
-                    logs_table, prewhere_filter, where_clause
+                    "SELECT {pn} AS process_name, {cl} AS command_line, count() AS cnt \
+                     FROM {} PREWHERE {} WHERE {} AND {pn} != '' \
+                     GROUP BY {pn}, {cl} ORDER BY cnt DESC LIMIT 5",
+                    logs_table, prewhere_filter, where_clause, pn = process_name, cl = command_line
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -1211,16 +1275,19 @@ impl PrevalenceRepository {
                 if !artifact_type.is_hash() {
                     return Ok(Vec::new());
                 }
+                let Some(file_name) = &col_file_name else {
+                    return Ok(Vec::new());
+                };
                 #[derive(Debug, Row, Deserialize)]
                 struct R {
                     file_name: String,
                     cnt: u64,
                 }
                 let q = format!(
-                    "SELECT file_name, count() AS cnt \
-                     FROM {} PREWHERE {} WHERE {} AND file_name != '' \
-                     GROUP BY file_name ORDER BY cnt DESC LIMIT 5",
-                    logs_table, prewhere_filter, where_clause
+                    "SELECT {fn_} AS file_name, count() AS cnt \
+                     FROM {} PREWHERE {} WHERE {} AND {fn_} != '' \
+                     GROUP BY {fn_} ORDER BY cnt DESC LIMIT 5",
+                    logs_table, prewhere_filter, where_clause, fn_ = file_name
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -1236,17 +1303,26 @@ impl PrevalenceRepository {
                 if artifact_type.is_hash() {
                     return Ok(Vec::new());
                 }
+                let (Some(dest_port), Some(protocol)) = (&col_dest_port, &col_protocol) else {
+                    return Ok(Vec::new());
+                };
                 #[derive(Debug, Row, Deserialize)]
                 struct R {
                     dest_port: u16,
                     protocol: String,
                     cnt: u64,
                 }
+                // NOTE(OCSF/NAN-1241): under OCSF `protocol` resolves to
+                // `connection_info.protocol_num` (Int32), not a String. This
+                // query deserializes `protocol` as a String, so under OCSF the
+                // fetch will error and the network sub-context degrades to empty
+                // (caught by `unwrap_or_default` below). Acceptable best-effort
+                // degradation; a String protocol name has no promoted OCSF column.
                 let q = format!(
-                    "SELECT dest_port, protocol, count() AS cnt \
-                     FROM {} PREWHERE {} WHERE {} AND dest_port > 0 \
-                     GROUP BY dest_port, protocol ORDER BY cnt DESC LIMIT 10",
-                    logs_table, prewhere_filter, where_clause
+                    "SELECT {dp} AS dest_port, {proto} AS protocol, count() AS cnt \
+                     FROM {} PREWHERE {} WHERE {} AND {dp} > 0 \
+                     GROUP BY {dp}, {proto} ORDER BY cnt DESC LIMIT 10",
+                    logs_table, prewhere_filter, where_clause, dp = dest_port, proto = protocol
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -1263,6 +1339,18 @@ impl PrevalenceRepository {
                 if !artifact_type.is_ip() {
                     return Ok(Vec::new());
                 }
+                // NOTE(OCSF/NAN-1241): the UDM geo columns resolve via their UDM
+                // semantic names. `enriched_dest_country` has NO OCSF `udm_field`
+                // mapping (OCSF promotes `enriched_dest_country_code` →
+                // `dst_endpoint.location.country` instead), so under OCSF this
+                // returns None and the geo sub-context is skipped (empty). Under
+                // UDM both resolve to their own column names (byte-identical).
+                let (Some(country_col), Some(asn_col)) = (
+                    profile.udm_column_sql("enriched_dest_country"),
+                    profile.udm_column_sql("enriched_dest_asn"),
+                ) else {
+                    return Ok(Vec::new());
+                };
                 #[derive(Debug, Row, Deserialize)]
                 struct R {
                     country: String,
@@ -1270,10 +1358,10 @@ impl PrevalenceRepository {
                     cnt: u64,
                 }
                 let q = format!(
-                    "SELECT enriched_dest_country AS country, enriched_dest_asn AS asn, count() AS cnt \
-                     FROM {} PREWHERE {} WHERE {} AND enriched_dest_country != '' \
+                    "SELECT {cc} AS country, {asn} AS asn, count() AS cnt \
+                     FROM {} PREWHERE {} WHERE {} AND {cc} != '' \
                      GROUP BY country, asn ORDER BY cnt DESC LIMIT 5",
-                    logs_table, prewhere_filter, where_clause
+                    logs_table, prewhere_filter, where_clause, cc = country_col, asn = asn_col
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -1286,8 +1374,6 @@ impl PrevalenceRepository {
                 })
             },
         );
-
-        let _ = where_field; // used in where_clause construction
 
         Ok(ArtifactDetailResponse {
             artifact: artifact.to_string(),
@@ -1322,7 +1408,7 @@ impl PrevalenceRepository {
     /// — see the constant for the rationale. Today the handler caps `limit`
     /// at 200, so this is belt-and-suspenders for a future caller that
     /// raises or skips that cap.
-    #[instrument(skip(self, hash_artifacts, ip_artifacts, domain_artifacts))]
+    #[instrument(skip(self, profile, hash_artifacts, ip_artifacts, domain_artifacts))]
     #[allow(clippy::too_many_arguments)]
     pub async fn bulk_artifact_inline_context(
         &self,
@@ -1330,10 +1416,24 @@ impl PrevalenceRepository {
         ip_artifacts: &[String],
         domain_artifacts: &[String],
         logs_table: &str,
+        profile: &dyn crate::schema::SchemaProfile,
         time_window: TimeWindow,
     ) -> std::collections::HashMap<String, ArtifactInlineContext> {
         use std::collections::HashMap;
         let mut out: HashMap<String, ArtifactInlineContext> = HashMap::new();
+
+        // Resolve UDM-semantic columns to the active schema's physical columns
+        // (NAN-1241). Under UDM these return the same name (byte-identical SQL);
+        // under OCSF they return the promoted OCSF column. `source_type` is a real
+        // column on both tables and is left literal. A `None` resolution skips the
+        // dependent bucket rather than emitting an unknown-column query.
+        let col_file_hash = profile.udm_column_sql("file_hash");
+        let col_file_name = profile.udm_column_sql("file_name");
+        let col_user = profile.udm_column_sql("user");
+        let col_process_name = profile.udm_column_sql("process_name");
+        let col_command_line = profile.udm_column_sql("command_line");
+        let col_dest_ip = profile.udm_column_sql("dest_ip");
+        let col_dest_host = profile.udm_column_sql("dest_host");
 
         // Defensive cap on the inlined IN-list size. Each artifact value is
         // ~70 bytes worst case (SHA-256 hex + quoting + comma); 1000 entries
@@ -1363,7 +1463,16 @@ impl PrevalenceRepository {
         let prewhere_filter = format!("timestamp >= toDateTime('{}')", cutoff_str);
 
         // --- Hashes: top file_name, top process_name+command_line, user_count, top source_type ---
-        if !hash_artifacts.is_empty() {
+        // Requires file_hash + file_name + user columns; skip the whole bucket if
+        // the schema lacks any of them (NAN-1241).
+        if !hash_artifacts.is_empty()
+            && col_file_hash.is_some()
+            && col_file_name.is_some()
+            && col_user.is_some()
+        {
+            let file_hash = col_file_hash.as_deref().expect("checked is_some");
+            let file_name = col_file_name.as_deref().expect("checked is_some");
+            let user = col_user.as_deref().expect("checked is_some");
             let escaped: Vec<String> = hash_artifacts
                 .iter()
                 .map(|h| format!("'{}'", h.replace('\'', "''").to_lowercase()))
@@ -1379,22 +1488,25 @@ impl PrevalenceRepository {
                 top_source_type: String,
             }
             let q_files = format!(
-                "SELECT lower(file_hash) AS hash, \
-                        argMax(file_name, file_name_cnt) AS top_file_name, \
+                "SELECT lower({fh}) AS hash, \
+                        argMax({fn_}, file_name_cnt) AS top_file_name, \
                         any(distinct_users) AS user_count, \
                         argMax(source_type, src_cnt) AS top_source_type \
                  FROM ( \
-                    SELECT lower(file_hash) AS hash_lc, file_name, count() AS file_name_cnt, \
-                           uniqExact(user) AS distinct_users, source_type, count() AS src_cnt \
+                    SELECT lower({fh}) AS hash_lc, {fn_} AS file_name, count() AS file_name_cnt, \
+                           uniqExact({u}) AS distinct_users, source_type, count() AS src_cnt \
                     FROM {logs} \
                     PREWHERE {pre} \
-                    WHERE lower(file_hash) IN ({hashes}) \
+                    WHERE lower({fh}) IN ({hashes}) \
                     GROUP BY hash_lc, file_name, source_type \
                  ) \
-                 GROUP BY lower(file_hash)",
+                 GROUP BY lower({fh})",
                 logs = logs_table,
                 pre = prewhere_filter,
                 hashes = hash_list,
+                fh = file_hash,
+                fn_ = file_name,
+                u = user,
             );
             if let Ok(rows) = self.client.query(&q_files).fetch_all::<FRow>().await {
                 for r in rows {
@@ -1411,45 +1523,56 @@ impl PrevalenceRepository {
 
             // Top (process_name, command_line) per hash. Separate query so the
             // file_name aggregation above stays a single group-by per hash.
-            #[derive(Debug, Row, Deserialize)]
-            struct PRow {
-                hash: String,
-                top_process_name: String,
-                top_command_line: String,
-            }
-            let q_procs = format!(
-                "SELECT lower(file_hash) AS hash, \
-                        argMax(process_name, cnt) AS top_process_name, \
-                        argMax(command_line, cnt) AS top_command_line \
-                 FROM ( \
-                    SELECT lower(file_hash) AS hash_lc, process_name, command_line, count() AS cnt \
-                    FROM {logs} \
-                    PREWHERE {pre} \
-                    WHERE lower(file_hash) IN ({hashes}) AND process_name != '' \
-                    GROUP BY hash_lc, process_name, command_line \
-                 ) \
-                 GROUP BY lower(file_hash)",
-                logs = logs_table,
-                pre = prewhere_filter,
-                hashes = hash_list,
-            );
-            if let Ok(rows) = self.client.query(&q_procs).fetch_all::<PRow>().await {
-                for r in rows {
-                    let is_wrapper = is_wrapper_process(&r.top_process_name);
-                    let entry = out.entry(r.hash.clone()).or_default();
-                    if !r.top_process_name.is_empty() {
-                        entry.top_process_is_wrapper = is_wrapper;
-                        entry.top_process_name = Some(r.top_process_name);
-                    }
-                    if !r.top_command_line.is_empty() {
-                        entry.top_command_line = Some(r.top_command_line);
+            // Skipped if the schema lacks either process column (NAN-1241).
+            if let (Some(process_name), Some(command_line)) =
+                (col_process_name.as_deref(), col_command_line.as_deref())
+            {
+                #[derive(Debug, Row, Deserialize)]
+                struct PRow {
+                    hash: String,
+                    top_process_name: String,
+                    top_command_line: String,
+                }
+                let q_procs = format!(
+                    "SELECT lower({fh}) AS hash, \
+                            argMax({pn}, cnt) AS top_process_name, \
+                            argMax({cl}, cnt) AS top_command_line \
+                     FROM ( \
+                        SELECT lower({fh}) AS hash_lc, {pn} AS process_name, {cl} AS command_line, count() AS cnt \
+                        FROM {logs} \
+                        PREWHERE {pre} \
+                        WHERE lower({fh}) IN ({hashes}) AND {pn} != '' \
+                        GROUP BY hash_lc, process_name, command_line \
+                     ) \
+                     GROUP BY lower({fh})",
+                    logs = logs_table,
+                    pre = prewhere_filter,
+                    hashes = hash_list,
+                    fh = file_hash,
+                    pn = process_name,
+                    cl = command_line,
+                );
+                if let Ok(rows) = self.client.query(&q_procs).fetch_all::<PRow>().await {
+                    for r in rows {
+                        let is_wrapper = is_wrapper_process(&r.top_process_name);
+                        let entry = out.entry(r.hash.clone()).or_default();
+                        if !r.top_process_name.is_empty() {
+                            entry.top_process_is_wrapper = is_wrapper;
+                            entry.top_process_name = Some(r.top_process_name);
+                        }
+                        if !r.top_command_line.is_empty() {
+                            entry.top_command_line = Some(r.top_command_line);
+                        }
                     }
                 }
             }
         }
 
         // --- IPs: user_count + top source_type (geo/ASN comes from PG later) ---
-        if !ip_artifacts.is_empty() {
+        // Requires dest_ip + user columns; skip if the schema lacks either (NAN-1241).
+        if !ip_artifacts.is_empty() && col_dest_ip.is_some() && col_user.is_some() {
+            let dest_ip = col_dest_ip.as_deref().expect("checked is_some");
+            let user = col_user.as_deref().expect("checked is_some");
             let escaped: Vec<String> = ip_artifacts
                 .iter()
                 .map(|v| format!("'{}'", v.replace('\'', "''")))
@@ -1463,20 +1586,22 @@ impl PrevalenceRepository {
                 top_source_type: String,
             }
             let q = format!(
-                "SELECT dest_ip AS ip, \
-                        uniqExact(user) AS user_count, \
+                "SELECT {di} AS ip, \
+                        uniqExact({u}) AS user_count, \
                         argMax(source_type, src_cnt) AS top_source_type \
                  FROM ( \
-                    SELECT dest_ip, user, source_type, count() AS src_cnt \
+                    SELECT {di} AS dest_ip, {u} AS user, source_type, count() AS src_cnt \
                     FROM {logs} \
                     PREWHERE {pre} \
-                    WHERE dest_ip IN ({ips}) \
+                    WHERE {di} IN ({ips}) \
                     GROUP BY dest_ip, user, source_type \
                  ) \
-                 GROUP BY dest_ip",
+                 GROUP BY {di}",
                 logs = logs_table,
                 pre = prewhere_filter,
                 ips = ip_list,
+                di = dest_ip,
+                u = user,
             );
             if let Ok(rows) = self.client.query(&q).fetch_all::<IRow>().await {
                 for r in rows {
@@ -1490,7 +1615,10 @@ impl PrevalenceRepository {
         }
 
         // --- Domains: user_count + top source_type ---
-        if !domain_artifacts.is_empty() {
+        // Requires dest_host + user columns; skip if the schema lacks either (NAN-1241).
+        if !domain_artifacts.is_empty() && col_dest_host.is_some() && col_user.is_some() {
+            let dest_host = col_dest_host.as_deref().expect("checked is_some");
+            let user = col_user.as_deref().expect("checked is_some");
             let escaped: Vec<String> = domain_artifacts
                 .iter()
                 .map(|v| format!("'{}'", v.replace('\'', "''")))
@@ -1504,20 +1632,22 @@ impl PrevalenceRepository {
                 top_source_type: String,
             }
             let q = format!(
-                "SELECT dest_host AS domain, \
-                        uniqExact(user) AS user_count, \
+                "SELECT {dh} AS domain, \
+                        uniqExact({u}) AS user_count, \
                         argMax(source_type, src_cnt) AS top_source_type \
                  FROM ( \
-                    SELECT dest_host, user, source_type, count() AS src_cnt \
+                    SELECT {dh} AS dest_host, {u} AS user, source_type, count() AS src_cnt \
                     FROM {logs} \
                     PREWHERE {pre} \
-                    WHERE dest_host IN ({doms}) \
+                    WHERE {dh} IN ({doms}) \
                     GROUP BY dest_host, user, source_type \
                  ) \
-                 GROUP BY dest_host",
+                 GROUP BY {dh}",
                 logs = logs_table,
                 pre = prewhere_filter,
                 doms = dom_list,
+                dh = dest_host,
+                u = user,
             );
             if let Ok(rows) = self.client.query(&q).fetch_all::<DRow>().await {
                 for r in rows {

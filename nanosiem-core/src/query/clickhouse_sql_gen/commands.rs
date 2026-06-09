@@ -245,10 +245,11 @@ impl ClickHouseSqlGenerator {
                 fields,
                 keep_first: _,
             } => {
-                // Normalize and escape field names
+                // Normalize and resolve field names through the active profile
+                // (UDM-byte-identical; OCSF maps UDM aliases → promoted columns)
                 let partition_fields: Vec<String> = fields
                     .iter()
-                    .map(|f| escape_identifier(normalize_field_name(f)))
+                    .map(|f| by_field_sql(f, self))
                     .collect();
                 let partition_by = partition_fields.join(", ");
 

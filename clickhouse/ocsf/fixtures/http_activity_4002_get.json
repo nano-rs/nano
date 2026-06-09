@@ -1,0 +1,90 @@
+{
+  "class_uid": 4002,
+  "class_name": "HTTP Activity",
+  "category_uid": 4,
+  "category_name": "Network Activity",
+  "activity_id": 3,
+  "activity_name": "Get",
+  "type_uid": 400203,
+  "type_name": "HTTP Activity: Get",
+  "severity_id": 2,
+  "severity": "Low",
+  "status_id": 1,
+  "status": "Success",
+  "time": 1749081788901,
+  "message": "GET /admin/config.php returned 403 from 10.20.30.40",
+  "metadata": {
+    "version": "1.8.0",
+    "product": {
+      "name": "Conduit Proxy",
+      "vendor_name": "nano",
+      "feature": {
+        "name": "access_log"
+      }
+    },
+    "log_name": "/var/log/conduit/access.log",
+    "log_provider": "Vector",
+    "uid": "c3d4e5f6-7081-492a-bc2d-3e4f50617283",
+    "correlation_uid": "corr-7f3a91c2-0044-4e6b-9a1d-2c5e8b0f1234"
+  },
+  "src_endpoint": {
+    "ip": "10.20.30.40",
+    "port": 51999,
+    "hostname": "ws-jsmith-01.acme.local",
+    "location": {
+      "country": "US",
+      "region": "California",
+      "city": "San Francisco",
+      "continent": "North America"
+    },
+    "autonomous_system": {
+      "number": 13335,
+      "name": "CLOUDFLARENET"
+    }
+  },
+  "dst_endpoint": {
+    "ip": "198.51.100.23",
+    "port": 443,
+    "hostname": "intranet.acme.local"
+  },
+  "http_request": {
+    "http_method": "GET",
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "referrer": "https://intranet.acme.local/dashboard",
+    "url": {
+      "hostname": "intranet.acme.local",
+      "path": "/admin/config.php",
+      "scheme": "https",
+      "url_string": "https://intranet.acme.local/admin/config.php"
+    }
+  },
+  "http_response": {
+    "code": 403,
+    "status": "Forbidden",
+    "content_type": "text/html"
+  },
+  "enrichments": [
+    {
+      "name": "ioc_src_ip_threat_type",
+      "type": "ioc",
+      "provider": "AbuseIPDB",
+      "value": "scanner",
+      "data": { "malware": "", "confidence_level": 60 }
+    },
+    {
+      "name": "custom_src_ip_tags",
+      "type": "custom",
+      "provider": "nano",
+      "value": "internal,workstation",
+      "data": { "risk_score": 5 }
+    }
+  ],
+  "observables": [
+    {
+      "name": "src_endpoint.ip",
+      "type_id": 2,
+      "type": "IP Address",
+      "value": "10.20.30.40"
+    }
+  ]
+}

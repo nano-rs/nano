@@ -8,10 +8,7 @@
 
 use super::eval_functions::eval_expression_to_sql;
 use super::helpers::*;
-use super::{
-    ClickHouseSqlGenerator, LOWERCASE_NORMALIZED_FIELDS, NUMERIC_UDM_FIELDS, SUBSEARCH_RESULT_LIMIT,
-    UUID_FIELDS,
-};
+use super::{ClickHouseSqlGenerator, SUBSEARCH_RESULT_LIMIT};
 use crate::query::ast::*;
 use crate::query::sql_gen::SqlGenError;
 
@@ -26,12 +23,17 @@ use crate::query::sql_gen::SqlGenError;
 /// 6. Fallback: plain match(field, pattern)
 ///
 /// `field_expr`: the SQL expression for the field (e.g., `"command_line"`, `toString(ext.foo)`)
-/// `is_message`: true if field is `message` (uses `lower(message)` for hasToken)
+/// `skip_tostring`: true when `field_expr` is a plain String column, so the
+///   case-insensitive substring guard uses `lower(field_expr)` — which matches
+///   the `lower(<col>)` text skip index (NAN-1247). false keeps
+///   `lower(toString(field_expr))` for ext/JSON/numeric fields (NULL-safety /
+///   coercion). Computed by the caller via `search_lowered`/
+///   `is_plain_string_search_column`.
 /// `negated`: true for NotRegex (inverts the result)
 fn build_optimized_regex_sql(
     field_expr: &str,
     pattern: &str,
-    is_message: bool,
+    skip_tostring: bool,
     negated: bool,
 ) -> String {
     let escaped = escape_regex_pattern(pattern);
@@ -72,8 +74,8 @@ fn build_optimized_regex_sql(
                     .map(|lit| {
                         let escaped_lit = escape_string(&lit.to_lowercase());
                         let pattern = escape_like_pattern(&escaped_lit);
-                        if is_message {
-                            format!("lower(message) iLike '%{}%'", pattern)
+                        if skip_tostring {
+                            format!("lower({}) iLike '%{}%'", field_expr, pattern)
                         } else {
                             format!(
                                 "lower(toString({})) iLike '%{}%'",
@@ -98,8 +100,8 @@ fn build_optimized_regex_sql(
                 // verifies the full regex on survivors.
                 let escaped_token = escape_string(&token.to_lowercase());
                 let pattern = escape_like_pattern(&escaped_token);
-                let guard = if is_message {
-                    format!("lower(message) iLike '%{}%'", pattern)
+                let guard = if skip_tostring {
+                    format!("lower({}) iLike '%{}%'", field_expr, pattern)
                 } else {
                     format!(
                         "lower(toString({})) iLike '%{}%'",
@@ -124,6 +126,35 @@ fn build_optimized_regex_sql(
 }
 
 impl ClickHouseSqlGenerator {
+    /// True when `field` resolves to a plain String column — a UDM/OCSF promoted
+    /// `ExplicitColumn` that is neither numeric nor UUID. For these, full-text
+    /// substring search must use `lower(<col>)`, NOT `lower(toString(<col>))`:
+    /// ClickHouse matches a text skip index by EXPRESSION, and the `toString`
+    /// wrapper orphans the `lower(<col>)` index → full scan (NAN-1247). For a real
+    /// String column `toString(col)` is a semantic no-op, so dropping it changes
+    /// only the SQL form (and turns the index back on), never the result.
+    fn is_plain_string_search_column(&self, field: &str) -> bool {
+        matches!(
+            self.profile.resolve(field),
+            crate::schema::FieldResolution::ExplicitColumn(_)
+        ) && !self.profile.is_numeric_field(field)
+            && !self.profile.is_uuid_field(field)
+    }
+
+    /// Lowercased, index-matchable expression for case-insensitive substring /
+    /// full-text search on `field` (whose access SQL is `field_expr`). Plain
+    /// String columns → `lower(field_expr)` (matches the `lower(col)` text index);
+    /// ext/JSON/numeric/uuid → `lower(toString(field_expr))` (NULL-safety /
+    /// coercion). `message` flows through the String-column branch, so it stays
+    /// byte-identical (`lower(message)`).
+    fn search_lowered(&self, field: &str, field_expr: &str) -> String {
+        if self.is_plain_string_search_column(field) {
+            format!("lower({})", field_expr)
+        } else {
+            format!("lower(toString({}))", field_expr)
+        }
+    }
+
     /// Generate SQL for a search expression (WHERE clause content)
     pub fn generate_search_expr(&self, expr: &SearchExpr) -> Result<String, SqlGenError> {
         match expr {
@@ -252,27 +283,35 @@ impl ClickHouseSqlGenerator {
         // Check if all values are strings (for case-insensitive handling)
         let all_strings = values.iter().all(|v| matches!(v, Value::String(_)));
 
-        if is_udm_field(field) {
-            // Determine if this is an explicit column or a JSON field
-            let field_expr = if super::is_explicit_column(field) {
-                escape_identifier(field)
-            } else {
-                // Access via ext JSON column (extended fields)
-                format!("ext.{}", field)
-            };
+        // NAN-1321: OCSF class-split UDM aliases (`src_host`, `user`, …) are not
+        // promoted columns, so `is_known_field` is false and they would fall to the
+        // metadata-JSON branch below (`JSONExtractString(metadata, 'src_host')`) —
+        // empty under OCSF. Route them through the column branch so the IN-list
+        // matches the value-pick `if(...)` like the `=` filter does. UDM never
+        // class-splits → gate unchanged → byte-identical.
+        let is_class_split = self.profile.class_split_value_sql(field).is_some();
+        if self.profile.is_known_field(field) || is_class_split {
+            // Determine the physical access expression via the active profile:
+            // ExplicitColumn → escaped column, JsonPath → JSONExtract, Unknown →
+            // `ext.{field}` (UDM's spill). For OCSF a known field is always a
+            // promoted ExplicitColumn, so this is byte-identical for UDM.
+            // NAN-1321: class-split concepts resolve to the value-pick `if(...)` so
+            // an IN-list filter matches the host/user/process wherever the class put
+            // it (UDM unaffected → bare column).
+            let field_expr = self.filter_field_expr(field, "String");
 
-            if UUID_FIELDS.contains(&field) {
+            if self.profile.is_uuid_field(field) {
                 // UUID fields: use toString() instead of lower()
                 let values_sql: Vec<String> = values
                     .iter()
                     .map(|v| match v {
                         Value::String(s) => format!("'{}'", escape_string(&s.to_lowercase())),
-                        _ => value_to_sql_for_field(field, v),
+                        _ => value_to_sql_for_field(field, v, self.profile.as_ref()),
                     })
                     .collect();
                 let values_list = values_sql.join(", ");
                 Ok(format!("toString({}) {} ({})", field_expr, op, values_list))
-            } else if NUMERIC_UDM_FIELDS.contains(&field) {
+            } else if self.profile.is_numeric_field(field) {
                 // Numeric fields: never apply lower() — convert string values to numbers
                 let values_sql: Vec<String> = values
                     .iter()
@@ -285,7 +324,7 @@ impl ClickHouseSqlGenerator {
                                 "0".to_string()
                             }
                         }
-                        _ => value_to_sql_for_field(field, v),
+                        _ => value_to_sql_for_field(field, v, self.profile.as_ref()),
                     })
                     .collect();
                 let values_list = values_sql.join(", ");
@@ -296,7 +335,7 @@ impl ClickHouseSqlGenerator {
                     .iter()
                     .map(|v| match v {
                         Value::String(s) => format!("'{}'", escape_string(&s.to_lowercase())),
-                        _ => value_to_sql_for_field(field, v),
+                        _ => value_to_sql_for_field(field, v, self.profile.as_ref()),
                     })
                     .collect();
                 let values_list = values_sql.join(", ");
@@ -304,7 +343,7 @@ impl ClickHouseSqlGenerator {
             } else {
                 let values_sql: Vec<String> = values
                     .iter()
-                    .map(|v| value_to_sql_for_field(field, v))
+                    .map(|v| value_to_sql_for_field(field, v, self.profile.as_ref()))
                     .collect();
                 let values_list = values_sql.join(", ");
                 Ok(format!("{} {} ({})", field_expr, op, values_list))
@@ -353,7 +392,7 @@ impl ClickHouseSqlGenerator {
         let field = normalize_field_name(field);
 
         // Check if it's a UDM field (direct column) or metadata field (JSON)
-        if is_udm_field(field) {
+        if self.profile.is_known_field(field) {
             self.generate_udm_field_filter(field, op, value)
         } else {
             self.generate_json_field_filter(field, op, value)
@@ -371,14 +410,11 @@ impl ClickHouseSqlGenerator {
         op: &Comparator,
         value: &Value,
     ) -> Result<String, SqlGenError> {
-        // Determine if this is an explicit column or a JSON field
-        let field_expr = if super::is_explicit_column(field) {
-            escape_identifier(field)
-        } else {
-            // Native JSON dot-notation: ext.field returns Dynamic, which works
-            // for comparisons. Returns NULL for missing paths.
-            format!("ext.{}", sanitize_json_path(field))
-        };
+        // Profile-aware physical access: ExplicitColumn → escaped column (direct,
+        // possibly dotted/promoted), JsonPath → JSONExtract (OCSF tail), Unknown →
+        // `ext.{field}` (UDM's existing ext-JSON dot-notation, byte-identical).
+        // NAN-1321: a class-split concept resolves to the value-pick `if(...)`.
+        let field_expr = self.filter_field_expr(field, "String");
 
         // Check if the value contains wildcards (* or ?) and we're using Eq/Ne
         if let Value::String(s) = value {
@@ -405,7 +441,7 @@ impl ClickHouseSqlGenerator {
 
         let value_sql = match value {
             Value::Regex(pattern) => format!("'{}'", escape_regex_pattern(pattern)),
-            _ => value_to_sql_for_field(field, value),
+            _ => value_to_sql_for_field(field, value, self.profile.as_ref()),
         };
 
         match op {
@@ -416,19 +452,17 @@ impl ClickHouseSqlGenerator {
                     if let Some(token) = extract_simple_regex_token(pattern) {
                         let escaped = escape_string(&token.to_lowercase());
                         let like = escape_like_pattern(&escaped);
-                        if field == "message" {
-                            return Ok(format!("lower(message) iLike '%{}%'", like));
-                        }
                         return Ok(format!(
-                            "lower(toString({})) iLike '%{}%'",
-                            field_expr, like
+                            "{} iLike '%{}%'",
+                            self.search_lowered(field, &field_expr),
+                            like
                         ));
                     }
                     // Complex regex — try bloom-guard pre-filtering and pattern rewrites
                     return Ok(build_optimized_regex_sql(
                         &field_expr,
                         pattern,
-                        field == "message",
+                        self.is_plain_string_search_column(field),
                         false,
                     ));
                 }
@@ -440,22 +474,17 @@ impl ClickHouseSqlGenerator {
                     if let Some(token) = extract_simple_regex_token(pattern) {
                         let escaped = escape_string(&token.to_lowercase());
                         let like = escape_like_pattern(&escaped);
-                        if field == "message" {
-                            return Ok(format!(
-                                "lower(message) NOT iLike '%{}%'",
-                                like
-                            ));
-                        }
                         return Ok(format!(
-                            "lower(toString({})) NOT iLike '%{}%'",
-                            field_expr, like
+                            "{} NOT iLike '%{}%'",
+                            self.search_lowered(field, &field_expr),
+                            like
                         ));
                     }
                     // Complex regex — try pattern rewrites (bloom guard not useful for negation)
                     return Ok(build_optimized_regex_sql(
                         &field_expr,
                         pattern,
-                        field == "message",
+                        self.is_plain_string_search_column(field),
                         true,
                     ));
                 }
@@ -478,14 +507,11 @@ impl ClickHouseSqlGenerator {
                 // `src_host CONTAINS "dc"` matches "srv-dc01"; etc.).
                 if let Value::String(s) = value {
                     let escaped = escape_like_pattern(&escape_string(&s.to_lowercase()));
-                    if field == "message" {
-                        Ok(format!("lower(message) iLike '%{}%'", escaped))
-                    } else {
-                        Ok(format!(
-                            "lower(toString({})) iLike '%{}%'",
-                            field_expr, escaped
-                        ))
-                    }
+                    Ok(format!(
+                        "{} iLike '%{}%'",
+                        self.search_lowered(field, &field_expr),
+                        escaped
+                    ))
                 } else {
                     Ok(format!(
                         "{} iLike concat('%', {}, '%')",
@@ -499,14 +525,11 @@ impl ClickHouseSqlGenerator {
                 // filters when host tokens were `dc01`, not `dc`.
                 if let Value::String(s) = value {
                     let escaped = escape_like_pattern(&escape_string(&s.to_lowercase()));
-                    if field == "message" {
-                        Ok(format!("lower(message) NOT iLike '%{}%'", escaped))
-                    } else {
-                        Ok(format!(
-                            "lower(toString({})) NOT iLike '%{}%'",
-                            field_expr, escaped
-                        ))
-                    }
+                    Ok(format!(
+                        "{} NOT iLike '%{}%'",
+                        self.search_lowered(field, &field_expr),
+                        escaped
+                    ))
                 } else {
                     Ok(format!(
                         "{} NOT iLike concat('%', {}, '%')",
@@ -562,7 +585,7 @@ impl ClickHouseSqlGenerator {
                 let sql_op = comparator_to_sql(op);
 
                 // For numeric UDM fields, never apply lower() - compare as numbers
-                if NUMERIC_UDM_FIELDS.contains(&field) {
+                if self.profile.is_numeric_field(field) {
                     match value {
                         Value::String(s) => {
                             // Convert string to number for comparison (handles drilldown from UI)
@@ -583,7 +606,7 @@ impl ClickHouseSqlGenerator {
                         }
                         _ => Ok(format!("{} {} {}", field_expr, sql_op, value_sql)),
                     }
-                } else if UUID_FIELDS.contains(&field) {
+                } else if self.profile.is_uuid_field(field) {
                     // UUID fields: compare via toString() — lower() doesn't work on UUID type
                     match value {
                         Value::String(s) => Ok(format!(
@@ -600,9 +623,14 @@ impl ClickHouseSqlGenerator {
                         Value::String(s) => {
                             let escaped_lower = escape_string(&s.to_lowercase());
 
-                            // Hostname expansion: for src_host/dest_host without dots,
-                            // match both exact and FQDN variants (e.g., "workstation" matches "workstation.corp.local")
-                            let is_hostname_field = field == "src_host" || field == "dest_host";
+                            // Hostname expansion: for host-entity fields without dots,
+                            // match both exact and FQDN variants (e.g., "workstation"
+                            // matches "workstation.corp.local"). Driven by the active
+                            // profile's entity classification so OCSF promoted host
+                            // columns (e.g. `src_endpoint.hostname`) expand too — for
+                            // UDM these are exactly the host-entity columns.
+                            let is_hostname_field =
+                                self.profile.entity_type(field) == Some(crate::schema::EntityType::Host);
                             let has_no_dot = !s.contains('.');
 
                             if is_hostname_field && has_no_dot && *op == Comparator::Eq {
@@ -617,7 +645,7 @@ impl ClickHouseSqlGenerator {
                                     "(lower({}) != '{}' AND NOT startsWith(lower({}), '{}.'))",
                                     field_expr, escaped_lower, field_expr, escaped_lower
                                 ))
-                            } else if LOWERCASE_NORMALIZED_FIELDS.contains(&field) {
+                            } else if self.profile.is_lowercased_at_ingest(field) {
                                 // For fields normalized to lowercase at ingest, skip lower() wrapper
                                 // This allows efficient index usage (set indexes, bloom filters)
                                 Ok(format!("{} {} '{}'", field_expr, sql_op, escaped_lower))
@@ -660,17 +688,23 @@ impl ClickHouseSqlGenerator {
         };
 
         // Generate field expression: ext.field or JSONExtract for metadata
+        let json_type = match value {
+            Value::Number(_) => "Float64",
+            Value::Bool(_) => "Bool",
+            _ => "String",
+        };
         let field_expr = if use_metadata {
             // Use JSONExtract for metadata column access
-            let json_type = match value {
-                Value::Number(_) => "Float64",
-                Value::Bool(_) => "Bool",
-                _ => "String",
-            };
             self.generate_json_extract(&field_path, json_type)
         } else {
-            // Native JSON dot-notation for ext field access
-            format!("ext.{}", sanitize_json_path(&field_path))
+            // Profile-aware spill access. For UDM the profile returns Unknown →
+            // `ext.{field}` (byte-identical to the prior native-dot-notation). For
+            // OCSF an unpromoted tail field resolves to JsonPath →
+            // `JSONExtract<T>(event, 'p1', 'p2', …)`. NAN-1321: OCSF UDM-semantic
+            // aliases (`src_host`, `user`, …) are not promoted columns so they reach
+            // THIS path; `filter_field_expr` resolves the class-split ones to the
+            // value-pick `if(...)` so `src_host="ws-01"` matches device.hostname too.
+            self.filter_field_expr(&field_path, json_type)
         };
 
         // String/pattern comparisons compare against toString(field) so a missing ext key
@@ -858,7 +892,29 @@ impl ClickHouseSqlGenerator {
     /// - Simple fields: metadata_field -> JSONExtractString(metadata, 'field')
     /// - Nested fields: a.b.c -> JSONExtractString(metadata, 'a', 'b', 'c')
     /// - Type-specific extraction: JSONExtractString, JSONExtractInt, JSONExtractFloat, JSONExtractBool
+    ///
+    /// OCSF Phase 2: when the active profile resolves `field` to a
+    /// [`FieldResolution::JsonPath`] (a nested path in an arbitrary JSON column,
+    /// e.g. OCSF's `event` column), emit an N-level
+    /// `JSONExtract<T>(col, 'p1', 'p2', …)` against that column. For UDM the
+    /// profile only ever returns `ExplicitColumn` or `Unknown` — neither hits the
+    /// JsonPath branch — so the legacy `metadata`-prefixed behavior below is
+    /// preserved byte-for-byte.
     pub fn generate_json_extract(&self, field: &str, json_type: &str) -> String {
+        // OCSF nested-path resolution (additive; never exercised by UDM).
+        if let crate::schema::FieldResolution::JsonPath { col, path } = self.profile.resolve(field) {
+            let path_args: Vec<String> = path
+                .iter()
+                .map(|p| format!("'{}'", escape_string(p)))
+                .collect();
+            return format!(
+                "JSONExtract{}({}, {})",
+                json_type,
+                col,
+                path_args.join(", ")
+            );
+        }
+
         // Handle metadata_ prefix: metadata_endpoint -> JSONExtract(metadata, 'endpoint')
         let field_path = if let Some(stripped) = field.strip_prefix("metadata_") {
             stripped.to_string()
@@ -1348,30 +1404,24 @@ impl ClickHouseSqlGenerator {
             time_range.end.format("%Y-%m-%d %H:%M:%S%.6f"),
         );
         if let Some(expr) = search_expr {
-            let extra = super::extract_prewhere_conditions(expr);
+            let extra = super::extract_prewhere_conditions(expr, self.profile.as_ref());
             if !extra.is_empty() {
                 prewhere = format!("{} AND {}", prewhere, extra.join(" AND "));
             }
         }
 
-        // Build the SELECT expression for the return field
-        let return_field_expr = if super::is_explicit_column(return_field) {
-            escape_identifier(return_field)
-        } else {
-            format!("ext.{}", return_field)
-        };
+        // Build the SELECT expression for the return field (profile-aware: direct
+        // column for promoted/UDM columns, JSONExtract for an OCSF tail path,
+        // `ext.{field}` for a UDM Unknown — byte-identical for UDM).
+        let return_field_expr = self.field_access_expr(return_field, "String");
 
-        // Build the outer field expression
-        let outer_field_expr = if super::is_explicit_column(field) {
-            escape_identifier(field)
-        } else {
-            format!("ext.{}", field)
-        };
+        // Build the outer field expression (same profile-aware resolution).
+        let outer_field_expr = self.field_access_expr(field, "String");
 
         let op = if negated { "NOT IN" } else { "IN" };
 
         // Use case-insensitive matching for string fields, direct for numeric
-        let is_numeric = NUMERIC_UDM_FIELDS.contains(&field);
+        let is_numeric = self.profile.is_numeric_field(field);
         if is_numeric {
             Ok(format!(
                 "{} {} (SELECT DISTINCT {} FROM {} PREWHERE {}{} LIMIT {})",

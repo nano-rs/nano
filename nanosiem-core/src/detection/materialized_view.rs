@@ -11,22 +11,37 @@
 use crate::detection::risk::default_score_for_severity;
 use crate::models::detection_rule::DetectionRule;
 use crate::query::{parse_query, ClickHouseSqlGenerator, Query, SearchExpr};
-use crate::udm::fields::UdmField;
 use thiserror::Error;
 use tracing::{debug, error, info};
 
 /// Validate that a field name is safe for interpolation into DDL statements.
 ///
 /// This prevents SQL injection via crafted `risk_entity_field` values (e.g.,
-/// `concat(currentDatabase(), ':', version())`). The function checks:
-/// 1. The field is a known UDM column name, OR
-/// 2. The field is a valid `ext.*` extension field
+/// `concat(currentDatabase(), ':', version())`). The function applies, in order:
+/// 1. A strict identifier pattern (defense-in-depth) — `^[a-z][a-z0-9_.]*$`,
+///    which blocks parentheses, semicolons, quotes, spaces, and SQL keywords
+///    used as function calls. This is the actual injection guard and is applied
+///    REGARDLESS of profile, so it can never be loosened by widening the
+///    allowlist.
+/// 2. An allowlist of *known* field names from the **active schema profile**
+///    ([`SchemaProfile::is_known_field`]) — UDM's `src_ip`/`process_name`, OR
+///    OCSF's dotted promoted columns (`src_endpoint.ip`, `actor.process.cmd_line`).
+/// 3. The overflow escape hatch (`ext.*` for UDM-style overflow).
 ///
-/// As defense-in-depth, all fields must also match `^[a-z][a-z0-9_.]*$`.
-fn validate_ddl_field_name(field: &str) -> Result<(), MaterializedViewError> {
+/// NAN-1241 Phase 5: the allowlist is profile-derived so OCSF dotted fields
+/// validate, but the strict identifier pattern (step 1) is unchanged — the
+/// dotted OCSF names already match `[a-z][a-z0-9_.]*`, so widening the allowlist
+/// does not widen what *characters* are accepted, and the guard stays
+/// injection-safe.
+fn validate_ddl_field_name(
+    field: &str,
+    profile: &dyn crate::schema::SchemaProfile,
+) -> Result<(), MaterializedViewError> {
     // Defense-in-depth: reject anything that doesn't match a strict identifier pattern.
     // This blocks parentheses, semicolons, quotes, spaces, SQL keywords used as
-    // function calls, and any other unexpected characters.
+    // function calls, and any other unexpected characters. Applied before (and
+    // independently of) the profile allowlist so the injection guard is never
+    // relaxed by a broader field universe.
     let is_safe_identifier = !field.is_empty()
         && field.len() <= 128
         && field
@@ -45,8 +60,11 @@ fn validate_ddl_field_name(field: &str) -> Result<(), MaterializedViewError> {
         )));
     }
 
-    // Check if it's a known UDM field
-    if field.parse::<UdmField>().is_ok() {
+    // Check if it's a known field in the active schema's universe. For UDM this
+    // is the explicit columns + the generated `UdmField` enum (byte-identical to
+    // the previous `field.parse::<UdmField>()` allowlist, since `is_known_field`
+    // covers it); for OCSF this is the promoted dotted columns + known paths.
+    if profile.is_known_field(field) {
         return Ok(());
     }
 
@@ -57,7 +75,7 @@ fn validate_ddl_field_name(field: &str) -> Result<(), MaterializedViewError> {
 
     Err(MaterializedViewError::InvalidRule(format!(
         "Unknown field '{}' cannot be used in DDL. \
-         Must be a valid UDM field name or an ext.* extension field.",
+         Must be a known field in the active schema or an ext.* extension field.",
         field
     )))
 }
@@ -126,17 +144,46 @@ pub enum MaterializedViewError {
 pub struct MaterializedViewGenerator {
     /// ClickHouse client for DDL operations
     clickhouse_client: clickhouse::Client,
+    /// Active schema profile (OCSF, NAN-1241). Drives the entire MV DDL:
+    /// - field-name validation ([`validate_ddl_field_name`]),
+    /// - risk-entity auto-detection over the profile's entity-extraction order,
+    /// - the `FROM` table ([`Self::logs_table_name`]: UDM `logs` / OCSF
+    ///   `ocsf_logs`) and the `<table>.id` matched-log key,
+    /// - the WHERE clause (profile is injected into the canonical generator in
+    ///   [`Self::extract_where_clause`] so UDM field names resolve to the active
+    ///   schema's physical columns).
+    ///
+    /// Defaults to [`UdmProfile`]; the UDM path is byte-identical to the
+    /// pre-OCSF DDL (`escape_identifier` is a no-op on single-segment names and
+    /// `logs_table_name` returns `logs`).
+    profile: std::sync::Arc<dyn crate::schema::SchemaProfile>,
 }
 
 impl MaterializedViewGenerator {
-    /// Create a new materialized view generator
+    /// Create a new materialized view generator (UDM profile).
     ///
     /// # Arguments
     /// * `clickhouse_client` - ClickHouse client for executing DDL statements
     ///
     /// Requirements: 4.1
     pub fn new(clickhouse_client: clickhouse::Client) -> Self {
-        Self { clickhouse_client }
+        Self {
+            clickhouse_client,
+            profile: std::sync::Arc::new(crate::schema::UdmProfile::new()),
+        }
+    }
+
+    /// Set the active schema profile (OCSF, NAN-1241). Makes the generated MV
+    /// DDL schema-aware end to end: FROM table, `<table>.id` matched-log key,
+    /// WHERE-clause column resolution, risk-entity auto-detection, and DDL
+    /// field-name validation all follow the injected profile. UDM is the default
+    /// and stays byte-identical to the pre-OCSF DDL.
+    pub fn with_profile(
+        mut self,
+        profile: std::sync::Arc<dyn crate::schema::SchemaProfile>,
+    ) -> Self {
+        self.profile = profile;
+        self
     }
 
     /// Generate materialized view name from rule ID
@@ -146,6 +193,22 @@ impl MaterializedViewGenerator {
     /// Example: mv_rt_detection_550e8400e29b41d4a716446655440000
     fn generate_view_name(rule: &DetectionRule) -> String {
         format!("mv_rt_detection_{}", rule.id.to_string().replace('-', ""))
+    }
+
+    /// Bare logs-table name the MV reads `FROM` for the active profile.
+    ///
+    /// UDM → `logs` (byte-identical to the previous hardcode); OCSF → `ocsf_logs`
+    /// (`clickhouse/ocsf/init.sql`). Mirrors `SearchService::logs_table_key`'s
+    /// profile→key mapping. The MV body runs in the deployment's default CH
+    /// database, so the bare (un-prefixed) name is what the MV needs — the
+    /// tenant-aware `table_names` registry (which the search service uses) is not
+    /// available on this generator, and the prior code already used the bare
+    /// `logs` here.
+    fn logs_table_name(profile: &dyn crate::schema::SchemaProfile) -> &'static str {
+        match profile.id() {
+            crate::schema::SchemaId::Ocsf => "ocsf_logs",
+            crate::schema::SchemaId::Udm => "logs",
+        }
     }
 
     /// Create a materialized view for a real-time detection rule
@@ -308,7 +371,20 @@ impl MaterializedViewGenerator {
         // Validate risk_entity_field before interpolating into DDL to prevent SQL injection.
         // An attacker could set risk_entity_field to a SQL expression like
         // `concat(currentDatabase(), ':', version())` to exfiltrate data.
-        validate_ddl_field_name(&risk_entity_field)?;
+        // Validation runs on the UNESCAPED physical name (`src_ip` /
+        // `src_endpoint.ip`) against the active profile's field universe; the
+        // identity escape below is applied only after the guard passes.
+        validate_ddl_field_name(&risk_entity_field, self.profile.as_ref())?;
+
+        // Resolve `risk_entity_field` to the physical column expression the SELECT
+        // references via `... AS risk_entity`. Mirrors the canonical scheduled path
+        // (`risk::ScoreCalculator::extract_entity`): the stored/auto-detected field
+        // is ALREADY a physical column name in the active schema (UDM `src_ip`,
+        // OCSF `src_endpoint.ip`) — it is NOT a UDM-semantic alias to translate.
+        // We only escape it so dotted OCSF columns are quoted for ClickHouse.
+        // `escape_identifier` is a no-op on UDM single-segment names, so UDM DDL
+        // is byte-identical; OCSF dotted names become `"src_endpoint.ip"`.
+        let risk_entity_sql = crate::query::escape_identifier(&risk_entity_field);
 
         // Calculate risk score (use rule's risk_score or default based on severity).
         // Severity defaults are sourced from `crate::detection::risk` so the MV path
@@ -319,6 +395,13 @@ impl MaterializedViewGenerator {
 
         // Generate view name
         let view_name = Self::generate_view_name(rule);
+
+        // Resolve the FROM table for the active profile (UDM → `logs`, OCSF →
+        // `ocsf_logs`). The MV body runs inside the deployment's default CH
+        // database (`nanosiem`), so the bare table name is correct for both and
+        // keeps UDM byte-identical (`logs`). `<table>.id` qualifies the row key
+        // against the same table (both schemas expose an `id` column).
+        let logs_table = Self::logs_table_name(self.profile.as_ref());
 
         // Generate DDL
         let ddl = format!(
@@ -331,10 +414,10 @@ SELECT
     '{}' AS severity,
     {} AS risk_score,
     {} AS risk_entity,
-    logs.id AS matched_log_id,
+    {}.id AS matched_log_id,
     toJSONString(map()) AS metadata,
     now64(6) AS _inserted_at
-FROM logs
+FROM {}
 WHERE {}
   AND timestamp >= now() - INTERVAL 1 HOUR"#,
             view_name,
@@ -342,7 +425,9 @@ WHERE {}
             rule.name.replace('\'', "''"), // Escape single quotes
             format!("{:?}", rule.severity).to_lowercase(),
             risk_score,
-            risk_entity_field,
+            risk_entity_sql,
+            logs_table,
+            logs_table,
             where_clause
         );
 
@@ -364,38 +449,15 @@ WHERE {}
     /// # Returns
     /// * The detected field name, or "src_ip" as default
     fn auto_detect_risk_entity(&self, where_clause: &str) -> String {
-        // Priority order for risk entity fields (matching risk.rs)
-        let priority_fields = [
-            // IP addresses (highest priority)
-            "src_ip",
-            "dest_ip",
-            "dvc_ip",
-            "src_translated_ip",
-            "dest_translated_ip",
-            // Hostnames
-            "src_host",
-            "dest_host",
-            "host",
-            "hostname",
-            "dest_nt_host",
-            "src_nt_host",
-            "dvc",
-            // Users
-            "src_user",
-            "dest_user",
-            "user",
-            "src_user_name",
-            "dest_user_name",
-            // File hashes
-            "file_hash",
-            "process_hash",
-            "service_hash",
-            "service_dll_hash",
-            "ssl_hash",
-        ];
-
-        // Check which fields are referenced in the query
-        for field in &priority_fields {
+        // Priority order for risk entity fields, from the active profile's
+        // entity-extraction order (NAN-1241). For UDM this reproduces the
+        // previous hard-coded list (the superset list is a superset of it; the
+        // first match in priority order wins, so a UDM WHERE clause resolves to
+        // the same field). For OCSF the WHERE clause is OCSF-shaped, so the scan
+        // matches OCSF physical columns (`src_endpoint.ip`, `user.name`, …) which
+        // the order yields directly; the returned name is escaped at the DDL
+        // interpolation site (`generate_view_ddl`).
+        for &(_role, field) in self.profile.entity_extraction_order() {
             if where_clause.contains(field) {
                 tracing::debug!(
                     "Auto-detected risk entity field: {} (found in query)",
@@ -405,9 +467,16 @@ WHERE {}
             }
         }
 
-        // Default to src_ip if no fields found
-        tracing::debug!("Auto-detected risk entity field: src_ip (default)");
-        "src_ip".to_string()
+        // Default to the profile's risk-entity default (UDM `src_ip` via the
+        // first entity-extraction entry) if no fields found.
+        let default = self
+            .profile
+            .entity_extraction_order()
+            .first()
+            .map(|(_role, f)| *f)
+            .unwrap_or("src_ip");
+        tracing::debug!("Auto-detected risk entity field: {} (default)", default);
+        default.to_string()
     }
 
     /// Check if a query string contains piped commands
@@ -461,7 +530,17 @@ WHERE {}
         // normalization, no wildcard->iLike, case-sensitive regex, no hostname
         // FQDN expansion), so a rule could match in scheduled mode yet silently
         // never match in real-time mode (NAN-1142).
+        //
+        // OCSF (NAN-1241): the generator is built `.with_profile(self.profile)`
+        // so UDM field names in the rule query resolve to the active schema's
+        // physical columns — UDM `dest_ip="…"` → `lower(dest_ip) = …` (default
+        // `UdmProfile`, byte-identical to the previous `new()`), OCSF →
+        // `dst_endpoint.ip` etc. `generate_search_expr` emits only the WHERE
+        // predicate (no FROM), so the generator's table name is irrelevant here;
+        // the FROM table is resolved separately in `generate_view_ddl` via
+        // `logs_table_name`.
         ClickHouseSqlGenerator::new()
+            .with_profile(self.profile.clone())
             .generate_search_expr(search_expr)
             .map_err(|e| {
                 MaterializedViewError::DdlGenerationError(format!(
@@ -669,20 +748,77 @@ mod tests {
 
     #[test]
     fn test_validate_ddl_field_name_accepts_udm_and_ext() {
-        assert!(validate_ddl_field_name("src_ip").is_ok());
-        assert!(validate_ddl_field_name("process_name").is_ok());
-        assert!(validate_ddl_field_name("ext.custom_field").is_ok());
+        let udm = crate::schema::UdmProfile::new();
+        assert!(validate_ddl_field_name("src_ip", &udm).is_ok());
+        assert!(validate_ddl_field_name("process_name", &udm).is_ok());
+        assert!(validate_ddl_field_name("ext.custom_field", &udm).is_ok());
     }
 
     #[test]
     fn test_validate_ddl_field_name_rejects_injection_and_unknown() {
-        assert!(validate_ddl_field_name("concat(currentDatabase(), ':', version())").is_err());
-        assert!(validate_ddl_field_name("1; DROP TABLE logs--").is_err());
-        assert!(validate_ddl_field_name("src_ip' OR '1'='1").is_err());
-        assert!(validate_ddl_field_name("").is_err());
-        assert!(validate_ddl_field_name("SRC_IP").is_err());
-        assert!(validate_ddl_field_name("not_a_real_field").is_err());
-        assert!(validate_ddl_field_name("ext.").is_err());
+        let udm = crate::schema::UdmProfile::new();
+        assert!(validate_ddl_field_name("concat(currentDatabase(), ':', version())", &udm).is_err());
+        assert!(validate_ddl_field_name("1; DROP TABLE logs--", &udm).is_err());
+        assert!(validate_ddl_field_name("src_ip' OR '1'='1", &udm).is_err());
+        assert!(validate_ddl_field_name("", &udm).is_err());
+        assert!(validate_ddl_field_name("SRC_IP", &udm).is_err());
+        assert!(validate_ddl_field_name("not_a_real_field", &udm).is_err());
+        assert!(validate_ddl_field_name("ext.", &udm).is_err());
+    }
+
+    // --- OCSF Phase 5: profile-aware DDL validation + entity extraction ---
+
+    #[test]
+    fn test_validate_ddl_field_name_ocsf_accepts_dotted_rejects_injection() {
+        let ocsf = crate::schema::OcsfProfile::new();
+        // OCSF promoted dotted columns validate under the OCSF profile...
+        assert!(
+            validate_ddl_field_name("src_endpoint.ip", &ocsf).is_ok(),
+            "OCSF dotted promoted column must validate"
+        );
+        assert!(validate_ddl_field_name("actor.process.cmd_line", &ocsf).is_ok());
+        // ...but the strict identifier guard still rejects injection regardless
+        // of the (now broader) field universe.
+        assert!(
+            validate_ddl_field_name("concat(currentDatabase(), ':', version())", &ocsf).is_err()
+        );
+        assert!(validate_ddl_field_name("src_endpoint.ip; DROP TABLE x--", &ocsf).is_err());
+        assert!(validate_ddl_field_name("src_endpoint.ip' OR '1'='1", &ocsf).is_err());
+        // And a dotted name that is NOT a known OCSF field is still rejected
+        // (the allowlist did not become "any dotted identifier").
+        assert!(validate_ddl_field_name("not.a.real.ocsf.field", &ocsf).is_err());
+        // The dotted OCSF column is NOT a UDM field — it would have been rejected
+        // by the old `UdmField`-only allowlist; the profile-derived universe is
+        // what makes it valid in OCSF mode.
+        let udm = crate::schema::UdmProfile::new();
+        assert!(validate_ddl_field_name("src_endpoint.ip", &udm).is_err());
+    }
+
+    #[test]
+    fn test_auto_detect_risk_entity_is_profile_driven() {
+        use crate::schema::SchemaProfile;
+        // UDM: a WHERE clause referencing src_user resolves to src_user.
+        let udm_gen = MaterializedViewGenerator::new(clickhouse::Client::default());
+        assert_eq!(
+            udm_gen.auto_detect_risk_entity("lower(src_user) = lower('alice')"),
+            "src_user"
+        );
+        // UDM default (no recognized field) is src_ip.
+        assert_eq!(udm_gen.auto_detect_risk_entity("1 = 1"), "src_ip");
+
+        // OCSF: the first entity-extraction entry (src_endpoint.ip) is the
+        // default, and a clause referencing user.name resolves to it.
+        let ocsf = std::sync::Arc::new(crate::schema::OcsfProfile::new());
+        let ocsf_default = ocsf
+            .entity_extraction_order()
+            .first()
+            .map(|(_r, f)| f.to_string());
+        let ocsf_gen = MaterializedViewGenerator::new(clickhouse::Client::default())
+            .with_profile(ocsf.clone());
+        assert_eq!(
+            ocsf_gen.auto_detect_risk_entity("1 = 1"),
+            ocsf_default.unwrap()
+        );
     }
 
     #[test]

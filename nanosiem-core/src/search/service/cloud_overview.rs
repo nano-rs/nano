@@ -277,24 +277,66 @@ impl SearchService {
         let timeline_unix_start = time_range.start.timestamp() as u64;
         let trend_bucket_secs = (span_secs as u64 / SERVICE_TREND_BUCKETS as u64).max(1);
 
-        let logs_table = self.table_names.read("logs");
+        // Active schema profile (NAN-1241). Every physical column referenced in
+        // the raw SQL below is resolved through the profile so the queries run
+        // against the right table + columns under both UDM (byte-equivalent to
+        // the previous hardcodes, modulo the seam's uniform reserved-word
+        // quoting) and OCSF (promoted dotted columns). Fields the active schema
+        // does not map (`udm_column_sql` → None) are SKIPPED — we never emit a
+        // dead `ext.` reference (that 500s on OCSF) nor the bare literal name.
+        let profile = self.active_profile.as_ref();
+        let logs_table = self
+            .table_names
+            .read(Self::logs_table_key(profile));
         let signals_table = self.table_names.read("signals");
 
-        let provider_clause = provider_filter
+        // Resolve the cloud-context columns once. `cloud_provider` /
+        // `cloud_account_id` gate both the filter clauses and the scope
+        // predicates; the rest feed individual sub-queries. All map under both
+        // shipped schemas today, but we honour skip-on-None throughout so a
+        // future schema that drops a concept degrades gracefully instead of
+        // referencing an unknown column.
+        let cloud_provider_col = profile.udm_column_sql("cloud_provider");
+        let cloud_service_col = profile.udm_column_sql("cloud_service");
+        let cloud_account_id_col = profile.udm_column_sql("cloud_account_id");
+        let cloud_region_col = profile.udm_column_sql("cloud_region");
+        let user_col = Self::cloud_principal_col(profile);
+        let status_col = profile.udm_column_sql("status");
+        let http_status_col = profile.udm_column_sql("http_status_code");
+        let action_col = profile.udm_column_sql("action");
+        let change_type_col = profile.udm_column_sql("change_type");
+        let resource_name_col = profile.udm_column_sql("resource_name");
+        let resource_type_col = profile.udm_column_sql("resource_type");
+
+        // The provider/account filters can only apply when the schema actually
+        // has the gating column; otherwise drop the clause (and its bind).
+        let provider_filter_active = provider_filter
             .filter(|p| !p.is_empty())
-            .map(|_| " AND lower(cloud_provider) = lower(?)".to_string())
-            .unwrap_or_default();
-        let account_clause = account_filter
+            .is_some()
+            && cloud_provider_col.is_some();
+        let account_filter_active = account_filter
             .filter(|a| !a.is_empty())
-            .map(|_| " AND cloud_account_id = ?".to_string())
-            .unwrap_or_default();
+            .is_some()
+            && cloud_account_id_col.is_some();
+        let provider_clause = match (&cloud_provider_col, provider_filter_active) {
+            (Some(col), true) => format!(" AND lower({col}) = lower(?)"),
+            _ => String::new(),
+        };
+        let account_clause = match (&cloud_account_id_col, account_filter_active) {
+            (Some(col), true) => format!(" AND {col} = ?"),
+            _ => String::new(),
+        };
         let extra_bind = |q: clickhouse::query::Query| -> clickhouse::query::Query {
             let mut q = q;
-            if let Some(p) = provider_filter.filter(|p| !p.is_empty()) {
-                q = q.bind(p.to_string());
+            if provider_filter_active {
+                if let Some(p) = provider_filter.filter(|p| !p.is_empty()) {
+                    q = q.bind(p.to_string());
+                }
             }
-            if let Some(a) = account_filter.filter(|a| !a.is_empty()) {
-                q = q.bind(a.to_string());
+            if account_filter_active {
+                if let Some(a) = account_filter.filter(|a| !a.is_empty()) {
+                    q = q.bind(a.to_string());
+                }
             }
             q
         };
@@ -306,155 +348,480 @@ impl SearchService {
         // cloud_account_id, so we OR across all three. Errors are split into
         // action-level (status) and transport-level (http_status_code) —
         // everything else is a 200/success.
+        // Cloud-scope predicate: "any row with cloud context populated". OR
+        // across whichever of provider/service/account the schema maps; if none
+        // map there is no cloud context to scope on and we omit the predicate.
+        let cloud_scope_predicate = {
+            let terms: Vec<String> = [&cloud_provider_col, &cloud_service_col, &cloud_account_id_col]
+                .into_iter()
+                .filter_map(|c| c.as_ref().map(|col| format!("{col} != ''")))
+                .collect();
+            if terms.is_empty() {
+                String::new()
+            } else {
+                format!("AND ({})", terms.join(" OR "))
+            }
+        };
+
+        // Header aggregate fragments — each axis is skipped when its column is
+        // unmapped so we never reference an unknown column. NAN-1248: `status_cmp`
+        // is the raw column under UDM (byte-identical) and `lower(status)` under
+        // OCSF (matches the capitalized OCSF caption 'Failure'/'Success'). OCSF
+        // has no 'error'/'denied' status caption, so those terms never match —
+        // the http_response.code fallback below covers the denied axis.
+        let events_failed_expr = match &status_col {
+            Some(_) => {
+                let s = Self::status_cmp_col(self.active_profile.as_ref());
+                format!("countIf({s} = 'failure' OR {s} = 'error' OR {s} = 'denied')")
+            }
+            None => "toUInt64(0)".to_string(),
+        };
+        let events_denied_expr = {
+            let mut terms: Vec<String> = Vec::new();
+            if status_col.is_some() {
+                let s = Self::status_cmp_col(self.active_profile.as_ref());
+                terms.push(format!("{s} = 'denied'"));
+            }
+            if let Some(col) = &http_status_col {
+                terms.push(format!("{col} = 403"));
+            }
+            if terms.is_empty() {
+                "toUInt64(0)".to_string()
+            } else {
+                format!("countIf({})", terms.join(" OR "))
+            }
+        };
+        let accounts_expr = match &cloud_account_id_col {
+            Some(col) => format!("uniqIf({col}, {col} != '')"),
+            None => "toUInt64(0)".to_string(),
+        };
+        let principals_expr = match &user_col {
+            Some(col) => format!("uniqIf({col}, {col} != '')"),
+            None => "toUInt64(0)".to_string(),
+        };
+        let regions_expr = match &cloud_region_col {
+            Some(col) => format!("uniqIf({col}, {col} != '')"),
+            None => "toUInt64(0)".to_string(),
+        };
         let header_sql = format!(
             r#"SELECT
                 count() AS events_total,
-                countIf(status = 'failure' OR status = 'error' OR status = 'denied') AS events_failed,
-                countIf(status = 'denied' OR http_status_code = 403) AS events_denied,
-                uniqIf(cloud_account_id, cloud_account_id != '') AS accounts,
-                uniqIf(user, user != '') AS principals,
-                uniqIf(cloud_region, cloud_region != '') AS regions
+                {events_failed_expr} AS events_failed,
+                {events_denied_expr} AS events_denied,
+                {accounts_expr} AS accounts,
+                {principals_expr} AS principals,
+                {regions_expr} AS regions
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
-              AND (cloud_provider != '' OR cloud_service != '' OR cloud_account_id != '')
+              {cloud_scope_predicate}
               {provider_clause}
               {account_clause}"#,
         );
-        let provider_sql = format!(
-            r#"SELECT lower(cloud_provider) AS provider, count() AS cnt
+        // Provider breakdown — only meaningful when the schema maps
+        // `cloud_provider`. When unmapped we hand the executor a no-result query
+        // shape (empty string column) so downstream parsing yields zero rows.
+        let provider_sql = match &cloud_provider_col {
+            Some(col) => format!(
+                r#"SELECT lower({col}) AS provider, count() AS cnt
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
-              AND cloud_provider != ''
+              AND {col} != ''
               {provider_clause}
               {account_clause}
             GROUP BY provider
             ORDER BY cnt DESC
             LIMIT 5"#,
-        );
+            ),
+            None => format!(
+                r#"SELECT '' AS provider, count() AS cnt
+            FROM {logs_table}
+            PREWHERE timestamp BETWEEN ? AND ?
+              {provider_clause}
+              {account_clause}
+            GROUP BY provider
+            LIMIT 0"#,
+            ),
+        };
 
         // --- 2. Accounts grid -----------------------------------------------
         // Two-stage aggregate: the inner query collapses (account, provider,
         // region, user) quadruples so we can (a) count principals/regions
         // exactly, and (b) pick the highest-volume principal via argMaxIf.
-        let accounts_sql = format!(
-            r#"SELECT
-                cloud_account_id AS account_id,
-                lower(cloud_provider) AS provider,
+        // Accounts grid is keyed on `cloud_account_id`; without it there is no
+        // account dimension to aggregate, so emit a zero-row query shape.
+        // Provider / region / principal axes degrade to '' / 0 when unmapped
+        // (build_accounts supplies the same defaults those JSON keys imply).
+        let accounts_sql = match &cloud_account_id_col {
+            Some(acct) => {
+                // Inner: collapse to (account, provider, region, principal)
+                // quadruples under STABLE ALIASES, then the outer aggregates over
+                // those aliases. Re-referencing the raw expressions in the outer
+                // scope is the NAN-1306 bug: under OCSF the principal is a
+                // class-split `if("actor.user.name" != '', …, "user.name")`
+                // expression and provider/region are dotted columns — none of
+                // which the subquery exposes by their underlying names, so the
+                // outer `uniqIf(<expr>, …)` threw `Code 47 UNKNOWN_IDENTIFIER`
+                // (swallowed → empty accounts facet). Aliasing keeps both UDM
+                // (bare columns) and OCSF (expressions) correct. Unmapped axes
+                // degrade to '' (build_accounts implies the same defaults).
+                let provider_inner = cloud_provider_col.as_deref().unwrap_or("''");
+                let region_inner = cloud_region_col.as_deref().unwrap_or("''");
+                let principal_inner = user_col.as_deref().unwrap_or("''");
+                format!(
+                    r#"SELECT
+                account_id,
+                lower(provider_raw) AS provider,
                 sum(cnt) AS events,
-                uniqIf(user, user != '') AS principals,
-                uniqIf(cloud_region, cloud_region != '') AS regions,
-                argMaxIf(user, cnt, user != '') AS top_principal
+                uniqIf(principal_v, principal_v != '') AS principals,
+                uniqIf(region_v, region_v != '') AS regions,
+                argMaxIf(principal_v, cnt, principal_v != '') AS top_principal
             FROM (
-                SELECT cloud_account_id, cloud_provider, cloud_region, user, count() AS cnt
+                SELECT {acct} AS account_id,
+                       {provider_inner} AS provider_raw,
+                       {region_inner} AS region_v,
+                       {principal_inner} AS principal_v,
+                       count() AS cnt
                 FROM {logs_table}
                 PREWHERE timestamp BETWEEN ? AND ?
-                  AND cloud_account_id != ''
+                  AND {acct} != ''
                   {provider_clause}
                   {account_clause}
-                GROUP BY cloud_account_id, cloud_provider, cloud_region, user
+                GROUP BY account_id, provider_raw, region_v, principal_v
             )
             GROUP BY account_id, provider
             ORDER BY events DESC
             LIMIT {TOP_ACCOUNTS_LIMIT}"#,
-        );
+                )
+            }
+            None => format!(
+                r#"SELECT '' AS account_id, '' AS provider, count() AS events,
+                toUInt64(0) AS principals, toUInt64(0) AS regions, '' AS top_principal
+            FROM {logs_table}
+            PREWHERE timestamp BETWEEN ? AND ?
+              {provider_clause}
+              {account_clause}
+            GROUP BY account_id, provider
+            LIMIT 0"#,
+            ),
+        };
 
         // --- 3. Top principals by event volume ------------------------------
-        let principals_sql = format!(
-            r#"SELECT
-                user AS principal,
-                cloud_account_id AS account_id,
+        // Top principals are keyed on `user`; without it there is no principal
+        // axis, so emit a zero-row shape. The cloud-context gate stays on
+        // `cloud_provider` (UDM-byte-identical); if that column is unmapped the
+        // gate is simply dropped rather than substituting a different axis.
+        let principal_provider_gate = cloud_provider_col
+            .as_ref()
+            .map(|col| format!("AND {col} != ''"))
+            .unwrap_or_default();
+        let principals_sql = match &user_col {
+            Some(user) => {
+                let account_outer = match &cloud_account_id_col {
+                    Some(col) => format!("{col} AS account_id"),
+                    None => "'' AS account_id".to_string(),
+                };
+                let group_account = cloud_account_id_col
+                    .as_ref()
+                    .map(|col| format!(", {col}"))
+                    .unwrap_or_default();
+                format!(
+                    r#"SELECT
+                {user} AS principal,
+                {account_outer},
                 count() AS events,
                 toString(max(timestamp)) AS last_seen
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
-              AND user != ''
-              AND cloud_provider != ''
+              AND {user} != ''
+              {principal_provider_gate}
+              {provider_clause}
+              {account_clause}
+            GROUP BY principal{group_account}
+            ORDER BY events DESC
+            LIMIT {TOP_PRINCIPALS_LIMIT}"#,
+                )
+            }
+            None => format!(
+                r#"SELECT '' AS principal, '' AS account_id, count() AS events,
+                '' AS last_seen
+            FROM {logs_table}
+            PREWHERE timestamp BETWEEN ? AND ?
               {provider_clause}
               {account_clause}
             GROUP BY principal, account_id
-            ORDER BY events DESC
-            LIMIT {TOP_PRINCIPALS_LIMIT}"#,
-        );
+            LIMIT 0"#,
+            ),
+        };
 
         // --- 4. Cross-account timeline --------------------------------------
         // `toUnixTimestamp` always returns seconds regardless of DateTime64
         // precision — `toUInt64(DateTime64(6))` returns microseconds, which
         // silently blows up bucket math when precision differs.
-        let timeline_sql = format!(
-            r#"SELECT
-                cloud_account_id AS account_id,
+        // Cross-account timeline is keyed on `cloud_account_id`; without it there
+        // are no lanes to plot, so emit a zero-row shape.
+        let timeline_sql = match &cloud_account_id_col {
+            Some(acct) => format!(
+                r#"SELECT
+                {acct} AS account_id,
                 toUInt32(intDiv(toUnixTimestamp(timestamp) - {timeline_unix_start}, {timeline_bucket_secs})) AS bucket,
                 count() AS events
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
-              AND cloud_account_id != ''
+              AND {acct} != ''
               {provider_clause}
               {account_clause}
             GROUP BY account_id, bucket
             HAVING bucket < {TIMELINE_BUCKETS}
             ORDER BY events DESC"#,
-        );
+            ),
+            None => format!(
+                r#"SELECT '' AS account_id, toUInt32(0) AS bucket, count() AS events
+            FROM {logs_table}
+            PREWHERE timestamp BETWEEN ? AND ?
+              {provider_clause}
+              {account_clause}
+            GROUP BY account_id, bucket
+            LIMIT 0"#,
+            ),
+        };
 
         // --- 5. Service health ----------------------------------------------
         // Error rows are anything that looks like a failure at the action or
         // transport layer: non-success `status` or any HTTP 4xx/5xx.
-        let service_health_sql = format!(
-            r#"SELECT
-                lower(cloud_service) AS service,
+        // Service health/trend are keyed on `cloud_service`; without it there are
+        // no services to report, so emit zero-row shapes. The error count ORs
+        // whichever of http_status_code / status the schema maps; `top_error`
+        // needs `status`. Value literals stay UDM-exact.
+        // TODO(OCSF): `status` value codes ('failure'/'denied'/'success') differ
+        // from OCSF status_id enum strings; column mapped, values best-effort.
+        let errors_expr = {
+            let mut terms: Vec<String> = Vec::new();
+            if let Some(col) = &http_status_col {
+                terms.push(format!("{col} >= 400"));
+            }
+            if status_col.is_some() {
+                // NAN-1248: status_cmp = raw col under UDM (byte-identical),
+                // lower(status) under OCSF (matches 'Failure'); 'denied' has no
+                // OCSF caption so the http >= 400 term above carries it.
+                let s = Self::status_cmp_col(self.active_profile.as_ref());
+                terms.push(format!("{s} = 'failure'"));
+                terms.push(format!("{s} = 'denied'"));
+            }
+            if terms.is_empty() {
+                "toUInt64(0)".to_string()
+            } else {
+                format!("countIf({})", terms.join(" OR "))
+            }
+        };
+        let top_error_expr = match &status_col {
+            // `col` is the raw display value (keep the OCSF caption verbatim);
+            // `s` is the value-comparison form (lower() under OCSF). (NAN-1248)
+            Some(col) => {
+                let s = Self::status_cmp_col(self.active_profile.as_ref());
+                format!("argMaxIf({col}, 1, {s} != '' AND {s} != 'success')")
+            }
+            None => "''".to_string(),
+        };
+        let service_health_sql = match &cloud_service_col {
+            Some(svc) => format!(
+                r#"SELECT
+                lower({svc}) AS service,
                 count() AS events,
-                countIf(http_status_code >= 400 OR status = 'failure' OR status = 'denied') AS errors,
-                argMaxIf(status, 1, status != '' AND status != 'success') AS top_error
+                {errors_expr} AS errors,
+                {top_error_expr} AS top_error
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
-              AND cloud_service != ''
+              AND {svc} != ''
               {provider_clause}
               {account_clause}
             GROUP BY service
             ORDER BY events DESC
             LIMIT {TOP_SERVICES_LIMIT}"#,
-        );
+            ),
+            None => format!(
+                r#"SELECT '' AS service, count() AS events, toUInt64(0) AS errors, '' AS top_error
+            FROM {logs_table}
+            PREWHERE timestamp BETWEEN ? AND ?
+              {provider_clause}
+              {account_clause}
+            GROUP BY service
+            LIMIT 0"#,
+            ),
+        };
 
-        let service_trend_sql = format!(
-            r#"SELECT
-                lower(cloud_service) AS service,
+        let service_trend_sql = match &cloud_service_col {
+            Some(svc) => format!(
+                r#"SELECT
+                lower({svc}) AS service,
                 toUInt32(intDiv(toUnixTimestamp(timestamp) - {timeline_unix_start}, {trend_bucket_secs})) AS bucket,
                 count() AS events
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
-              AND cloud_service != ''
+              AND {svc} != ''
               {provider_clause}
               {account_clause}
             GROUP BY service, bucket
             HAVING bucket < {SERVICE_TREND_BUCKETS}"#,
-        );
-
-        // --- 6. Top sensitive changes ---------------------------------------
-        let changes_sql = format!(
-            r#"SELECT
-                toString(timestamp) AS ts,
-                lower(cloud_service) AS service,
-                change_type AS kind,
-                cloud_account_id AS account_id,
-                user AS actor,
-                action AS action,
-                resource_name AS target,
-                resource_type AS target_type
+            ),
+            None => format!(
+                r#"SELECT '' AS service, toUInt32(0) AS bucket, count() AS events
             FROM {logs_table}
             PREWHERE timestamp BETWEEN ? AND ?
-              AND change_type IN ('permission_change', 'create', 'delete', 'update')
-              AND cloud_service != ''
               {provider_clause}
               {account_clause}
-            WHERE resource_type != '' OR resource_name != ''
+            GROUP BY service, bucket
+            LIMIT 0"#,
+            ),
+        };
+
+        // --- 6. Top sensitive changes ---------------------------------------
+        // Top sensitive changes need both `change_type` (the `kind` axis, which
+        // build_changes treats as required) and `cloud_service` (scope). Without
+        // either there is nothing to surface, so emit a zero-row shape. The
+        // remaining axes (account/actor/action/target/target_type) degrade to ''
+        // when unmapped — build_changes already tolerates missing JSON keys.
+        // OCSF: `change_type` resolves to `activity_id` (UInt32 enum), NOT None,
+        // so skip-on-None does not catch it. Comparing that int column to the
+        // string IN-list ('permission_change'/'create'/'delete'/'update') is a
+        // CH Code 53 that `fetch_rows` swallows into an empty panel — not a
+        // silent under-match. The branch below therefore gates the IN-filter on
+        // the UDM discriminator (`change_type == "change_type"`) and drops it
+        // under OCSF; see the inline note there. The `kind` axis projection is
+        // safe under both schemas (it's a value column, not a predicate).
+        let changes_sql = match (&change_type_col, &cloud_service_col) {
+            (Some(_change_type), Some(svc)) => {
+                // Cluster B (NAN-1241): `change_type` is the literal UDM string
+                // column under UDM but resolves to `activity_id` (UInt32 enum)
+                // under OCSF. The string IN-filter below is only valid against
+                // the UDM column — comparing the OCSF int column to string
+                // literals is a CH Code 53 that `fetch_rows` swallows into an
+                // empty panel. Gate the predicate on the UDM discriminator
+                // (same one `change_type_equals` uses in cloud.rs): emit it ONLY
+                // when the column resolves to the literal `change_type`,
+                // otherwise drop the term entirely (no bind values are attached
+                // to this fragment, so placeholder counts stay aligned). The
+                // `{change_type} AS kind` projection stays either way — UNION-ALL
+                // coerces the OCSF int value column to String fine.
+                // TODO(OCSF/NAN-1248): value-vocabulary — under OCSF this filter
+                // is dropped, so the panel is unfiltered by change kind until an
+                // activity_id decode layer maps the OCSF generic activity enum.
+                // NAN-1248: decode UDM change_type literals → OCSF activity_id
+                // codes (create=1/update=3/delete=4; permission_change has no OCSF
+                // code and is dropped under OCSF). UDM emits the verbatim string
+                // IN-list (byte-identical); OCSF emits `activity_id IN (1, 3, 4)`.
+                let change_kind_filter = format!(
+                    "\n              AND {}",
+                    Self::change_type_in(
+                        self.active_profile.as_ref(),
+                        &["permission_change", "create", "delete", "update"],
+                    )
+                );
+                let account_outer = match &cloud_account_id_col {
+                    Some(col) => format!("{col} AS account_id"),
+                    None => "'' AS account_id".to_string(),
+                };
+                let actor_outer = match &user_col {
+                    Some(col) => format!("{col} AS actor"),
+                    None => "'' AS actor".to_string(),
+                };
+                let action_outer = match &action_col {
+                    Some(col) => format!("{col} AS action"),
+                    None => "'' AS action".to_string(),
+                };
+                let target_outer = match &resource_name_col {
+                    Some(col) => format!("{col} AS target"),
+                    None => "'' AS target".to_string(),
+                };
+                let target_type_outer = match &resource_type_col {
+                    Some(col) => format!("{col} AS target_type"),
+                    None => "'' AS target_type".to_string(),
+                };
+                // The post-aggregate filter requires at least one resource axis
+                // to be present; drop it entirely when neither maps.
+                let resource_filter = {
+                    let mut terms: Vec<String> = Vec::new();
+                    if let Some(col) = &resource_type_col {
+                        terms.push(format!("{col} != ''"));
+                    }
+                    if let Some(col) = &resource_name_col {
+                        terms.push(format!("{col} != ''"));
+                    }
+                    if terms.is_empty() {
+                        String::new()
+                    } else {
+                        format!("WHERE {}", terms.join(" OR "))
+                    }
+                };
+                // Project the DECODED change_type label (string) — under OCSF the
+                // raw `activity_id` is a JSON *number*, which build_changes' as_str()
+                // reads as empty and drops the row. change_type_label_expr yields
+                // 'create'/'update'/'delete' (OCSF) / bare `change_type` (UDM,
+                // byte-identical). (NAN-1248)
+                let change_kind_label = Self::change_type_label_expr(self.active_profile.as_ref());
+                format!(
+                    r#"SELECT
+                toString(timestamp) AS ts,
+                lower({svc}) AS service,
+                {change_kind_label} AS kind,
+                {account_outer},
+                {actor_outer},
+                {action_outer},
+                {target_outer},
+                {target_type_outer}
+            FROM {logs_table}
+            PREWHERE timestamp BETWEEN ? AND ?{change_kind_filter}
+              AND {svc} != ''
+              {provider_clause}
+              {account_clause}
+            {resource_filter}
             ORDER BY timestamp DESC
             LIMIT {TOP_CHANGES_LIMIT}"#,
-        );
+                )
+            }
+            _ => format!(
+                r#"SELECT toString(timestamp) AS ts, '' AS service, '' AS kind,
+                '' AS account_id, '' AS actor, '' AS action, '' AS target, '' AS target_type
+            FROM {logs_table}
+            PREWHERE timestamp BETWEEN ? AND ?
+              {provider_clause}
+              {account_clause}
+            ORDER BY timestamp DESC
+            LIMIT 0"#,
+            ),
+        };
 
         // --- 7. Anomaly feed (from signals) ---------------------------------
         // Inner-join to logs so we only surface signals whose matched event has
         // cloud context — otherwise every proxy / endpoint signal leaks into
         // the cloud view (caught during NAN-394 preview: squid_proxy signals
         // were polluting the feed).
+        // Anomaly feed joins signals → logs and only keeps signals whose matched
+        // event has cloud context. The cloud columns are read off the `l` alias,
+        // so prefix the profile-resolved column with `l.`. account_id/service
+        // degrade to '' when unmapped (build_anomalies tolerates empty keys);
+        // the cloud-context WHERE ORs whichever of service/provider/account map.
+        let anomaly_account_outer = match &cloud_account_id_col {
+            Some(col) => format!("l.{col} AS account_id"),
+            None => "'' AS account_id".to_string(),
+        };
+        let anomaly_service_outer = match &cloud_service_col {
+            Some(col) => format!("lower(l.{col}) AS service"),
+            None => "'' AS service".to_string(),
+        };
+        let anomaly_cloud_filter = {
+            let terms: Vec<String> =
+                [&cloud_service_col, &cloud_provider_col, &cloud_account_id_col]
+                    .into_iter()
+                    .filter_map(|c| c.as_ref().map(|col| format!("l.{col} != ''")))
+                    .collect();
+            if terms.is_empty() {
+                // No cloud context to gate on — keep the feed empty rather than
+                // surfacing every (non-cloud) signal.
+                "WHERE 0".to_string()
+            } else {
+                format!("WHERE {}", terms.join(" OR "))
+            }
+        };
         let anomalies_sql = format!(
             r#"SELECT
                 toString(s.id) AS id,
@@ -462,13 +829,13 @@ impl SearchService {
                 s.severity AS severity,
                 s.rule_name AS rule_name,
                 s.risk_entity AS principal,
-                l.cloud_account_id AS account_id,
-                lower(l.cloud_service) AS service,
+                {anomaly_account_outer},
+                {anomaly_service_outer},
                 s.metadata AS metadata
             FROM {signals_table} AS s
             INNER JOIN {logs_table} AS l ON l.id = s.matched_log_id
             PREWHERE s.timestamp BETWEEN ? AND ?
-            WHERE l.cloud_service != '' OR l.cloud_provider != '' OR l.cloud_account_id != ''
+            {anomaly_cloud_filter}
             ORDER BY s.timestamp DESC
             LIMIT {ANOMALIES_LIMIT}"#,
         );

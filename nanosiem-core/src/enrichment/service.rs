@@ -9,13 +9,11 @@
 //! - IP enrichment lookups for ingestion
 
 use async_compression::tokio::bufread::GzipDecoder;
-use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::RwLock;
-use tokio_util::io::StreamReader;
 use tracing::{info, instrument, warn};
 
 use super::repository::{EnrichmentRepository, EnrichmentRepositoryError};
@@ -107,6 +105,24 @@ impl DownloadConfig {
                 .unwrap_or(30),
         }
     }
+}
+
+/// Row written to `nanosiem.ip_enrichments` by the IPinfo bulk loader
+/// (NAN-1286). Only the 8 feed columns are listed, so the native RowBinary
+/// insert (validation disabled) emits exactly these and the remaining columns
+/// — `source_id` (LowCardinality), `updated_at` (DateTime64), `deleted` (UInt8)
+/// — fall back to their table DEFAULTs (`'ipinfo_lite'`, `now64(3)`, `0`).
+/// Owned `String`s so rows can be moved straight out of the parsed CSV record.
+#[derive(clickhouse::Row, serde::Serialize)]
+struct IpEnrichRow {
+    network: String,
+    country: String,
+    country_code: String,
+    continent: String,
+    continent_code: String,
+    asn: String,
+    as_name: String,
+    as_domain: String,
 }
 
 /// Enrichment service for managing and applying IP enrichments
@@ -501,119 +517,150 @@ impl EnrichmentService {
         }
     }
 
-    /// Stream HTTP → gzip decode → CSV parse → batched DB insert
+    /// Download the IPinfo Lite gzip fully, then bulk-load it into ClickHouse.
     ///
-    /// Memory stays bounded: only one batch of records (~10k) is in memory at a time.
-    /// The HTTP response, gzip decompression, and CSV parsing all happen as a single
-    /// streaming pipeline — nothing is buffered to completion.
+    /// NAN-1286: the previous version streamed download → gzip → CSV →
+    /// per-5k-row `INSERT … VALUES` (~800 round-trips). Backpressure from the
+    /// insert loop held the HTTP download connection open for the whole
+    /// ~59-minute load, so the CDN dropped it near the tail (`error decoding
+    /// response body`) and the run raced the 60-minute stale timeout. We now
+    /// (1) drain the ~24 MB gzip to memory so the connection lives only for the
+    /// transfer, then (2) bulk-insert via native RowBinary in a single request.
+    ///
+    /// This function is IPinfo-specific: rows are inserted with only the 8 feed
+    /// columns, so `source_id` (LowCardinality), `updated_at` (DateTime64), and
+    /// `deleted` take their table DEFAULTs (`'ipinfo_lite'`, `now64(3)`, `0`).
+    /// The caller always passes `source_id = "ipinfo_lite"`, matching the
+    /// default; the trailing purge is scoped to that same `source_id`.
     async fn stream_and_insert_ipinfo(
         &self,
         url: &str,
         config: &DownloadConfig,
         source_id: &str,
     ) -> Result<u64, EnrichmentError> {
-        const BATCH_SIZE: usize = 10_000;
+        debug_assert_eq!(
+            source_id, "ipinfo_lite",
+            "loader relies on the ip_enrichments source_id DEFAULT 'ipinfo_lite'"
+        );
 
         let ch = self.ch()?;
 
-        // One run timestamp stamps every row inserted by this sync as a single
-        // ReplacingMergeTree generation. After the stream completes we
-        // lightweight-DELETE any CIDR for this source whose `updated_at` is
-        // older than `run_ms` — i.e. CIDRs the new feed dropped. The dict's
-        // argMax(updated_at) resolves a CIDR present in both generations to the
-        // newest row, so correctness holds even before the async DELETE mutation
-        // lands. Scoping the DELETE by source_id avoids clobbering other sources.
+        // One run timestamp marks this ReplacingMergeTree generation. Rows get
+        // `updated_at = now64(3)` (the DEFAULT), all > `run_ms` since it's
+        // captured before the insert; after a successful, non-empty load we
+        // lightweight-DELETE this source's rows older than `run_ms` — the prior
+        // generation. The dict's argMax(updated_at) resolves a CIDR present in
+        // both generations to the newest row.
         let run_ms = chrono::Utc::now().timestamp_millis() as u64;
 
         // SSRF defense-in-depth: every hop (initial + each redirect) is
-        // re-validated with DNS resolution and dialed against a freshly
-        // pinned client. See `fetch_with_validated_redirects` for the
-        // rebinding-bypass we're closing.
+        // re-validated with DNS resolution and dialed against a freshly pinned
+        // client. See `fetch_with_validated_redirects`.
         let response = self.fetch_with_validated_redirects(url, config).await?;
-
         let content_length = response.content_length();
-        info!(content_length = ?content_length, "Response received, starting streaming pipeline");
 
-        // Build the streaming pipeline:
-        // reqwest byte stream → StreamReader (AsyncRead) → GzipDecoder → BufReader → lines
-        let byte_stream = response
-            .bytes_stream()
-            .map(|result| result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
-        let stream_reader = StreamReader::new(byte_stream);
-        let gzip_decoder = GzipDecoder::new(BufReader::new(stream_reader));
-        let mut lines = BufReader::new(gzip_decoder).lines();
+        // Drain the whole compressed payload first so the download connection is
+        // held open only for the (seconds-long) ~24 MB transfer, not the load.
+        let compressed = response.bytes().await.map_err(|e| {
+            EnrichmentError::DownloadError(format!("reading response body: {}", e))
+        })?;
+        info!(
+            content_length = ?content_length,
+            compressed_bytes = compressed.len(),
+            "Downloaded IPinfo Lite payload; connection closed, starting bulk load"
+        );
+
+        // Bulk insert via native RowBinary in a single request. Validation off so
+        // the client emits just our column list (omitted columns use the table
+        // DEFAULTs); async_insert off + wait_end_of_query so the rows are durable
+        // and queryable by the time we return (the caller reloads the dict on
+        // success).
+        let writer = ch
+            .clone()
+            .with_validation(false)
+            .with_option("async_insert", "0")
+            .with_option("wait_end_of_query", "1");
+        let mut insert = writer
+            .insert::<IpEnrichRow>("nanosiem.ip_enrichments")
+            .await?;
+
+        // Decompress + CSV-parse from the in-memory buffer (bounded: the native
+        // insert streams its body out as we write, so we don't hold all rows).
+        let decoder = GzipDecoder::new(BufReader::new(std::io::Cursor::new(compressed)));
+        let mut lines = BufReader::new(decoder).lines();
 
         let mut total_inserted = 0u64;
-        let mut batch = Vec::with_capacity(BATCH_SIZE);
+        let mut skipped = 0u64;
         let mut header_skipped = false;
         let mut line_count = 0u64;
 
-        while let Some(line_result) = lines
+        while let Some(line) = lines
             .next_line()
             .await
-            .map_err(|e| EnrichmentError::ParseError(format!("Stream read error: {}", e)))?
+            .map_err(|e| EnrichmentError::ParseError(format!("gzip/CSV read error: {}", e)))?
         {
             // Skip CSV header row
             if !header_skipped {
                 header_skipped = true;
                 continue;
             }
-
             line_count += 1;
 
-            // Parse CSV line using the csv crate to handle quoted fields correctly
-            // (as_name can contain commas, e.g. "Amazon.com, Inc.")
+            // The csv crate handles quoted fields (as_name can contain commas,
+            // e.g. "Amazon.com, Inc.").
             let mut reader = csv::ReaderBuilder::new()
                 .has_headers(false)
-                .from_reader(line_result.as_bytes());
-
-            if let Some(result) = reader.deserialize::<IpInfoLiteRecord>().next() {
-                let record = result.map_err(|e| {
-                    EnrichmentError::ParseError(format!(
-                        "CSV parse error at line {}: {}",
-                        line_count, e
-                    ))
-                })?;
-                batch.push(record);
-            }
-
-            // Flush batch when full
-            if batch.len() >= BATCH_SIZE {
-                let inserted =
-                    Self::insert_ch_batch(ch, source_id, run_ms, &batch).await?;
-                total_inserted += inserted;
-                batch.clear();
-
-                if total_inserted % 100_000 == 0 {
-                    info!(total_inserted, "Streaming insert progress");
+                .from_reader(line.as_bytes());
+            match reader.deserialize::<IpInfoLiteRecord>().next() {
+                Some(Ok(rec)) => {
+                    // Move the parsed Strings into the row — no extra allocation.
+                    insert
+                        .write(&IpEnrichRow {
+                            network: rec.network,
+                            country: rec.country,
+                            country_code: rec.country_code,
+                            continent: rec.continent,
+                            continent_code: rec.continent_code,
+                            asn: rec.asn,
+                            as_name: rec.as_name,
+                            as_domain: rec.as_domain,
+                        })
+                        .await?;
+                    total_inserted += 1;
+                    if total_inserted.is_multiple_of(500_000) {
+                        info!(total_inserted, "Bulk insert progress");
+                    }
                 }
+                // A single malformed line shouldn't sink a multi-million-row feed.
+                Some(Err(e)) => {
+                    skipped += 1;
+                    if skipped <= 20 {
+                        warn!(line = line_count, error = %e, "Skipping malformed IPinfo row");
+                    }
+                }
+                None => {}
             }
         }
 
-        // Flush remaining records
-        if !batch.is_empty() {
-            let inserted = Self::insert_ch_batch(ch, source_id, run_ms, &batch).await?;
-            total_inserted += inserted;
-        }
+        // Finalize the single insert request.
+        insert.end().await?;
 
-        info!(
-            total_inserted,
-            "Streaming insert into ClickHouse complete"
-        );
+        if skipped > 0 {
+            warn!(skipped, "Skipped malformed IPinfo rows during bulk load");
+        }
+        info!(total_inserted, "Bulk insert into ClickHouse complete");
 
         // Empty-feed footgun: a sync that yields zero rows must NOT delete the
         // prior generation, or the dict reloads empty and all enrichment goes
         // blank. This mirrors the old PG behavior, where swap_enrichment_staging
         // only ran after a successful, non-empty stream.
         if total_inserted > 0 {
-            // Lightweight delete of CIDRs the new feed dropped. Async mutation;
-            // the dict's argMax keeps correctness during the brief window where
-            // both generations coexist.
-            // NAN-1123: `updated_at` is DateTime64(3); a raw integer in a
+            // Lightweight delete of the prior generation (CIDRs older than this
+            // run). NAN-1123: `updated_at` is DateTime64(3); a raw integer in a
             // `updated_at < ?` comparison is coerced by ClickHouse as SECONDS
-            // (far-future), so `< run_ms` matched every row just inserted and
-            // the purge wiped the whole generation. fromUnixTimestamp64Milli
-            // makes the ms scale explicit (matches the INSERT below).
+            // (far-future), so `< run_ms` matched every row just inserted and the
+            // purge wiped the whole generation. fromUnixTimestamp64Milli makes the
+            // ms scale explicit (matches the inserted DEFAULT now64(3) > run_ms).
             ch.query(
                 "ALTER TABLE nanosiem.ip_enrichments \
                  DELETE WHERE source_id = ? AND updated_at < fromUnixTimestamp64Milli(toInt64(?))",
@@ -631,98 +678,6 @@ impl EnrichmentService {
         }
 
         Ok(total_inserted)
-    }
-
-    /// Insert one batch of IPinfo records into the CH payload table.
-    ///
-    /// Mirrors the batched multi-row INSERT pattern in
-    /// `nanosiem-enterprise/src/custom_enrichment/results_store.rs`: build one
-    /// `INSERT ... VALUES (?),(?),...` per chunk, falling back to per-row
-    /// inserts if a chunk fails so one malformed CIDR can't sink the whole
-    /// batch. `network` is inserted verbatim as a CIDR String (IP_TRIE keys on
-    /// the CIDR text — do NOT convert to a CH IP type).
-    async fn insert_ch_batch(
-        ch: &clickhouse::Client,
-        source_id: &str,
-        run_ms: u64,
-        records: &[IpInfoLiteRecord],
-    ) -> Result<u64, EnrichmentError> {
-        const CHUNK_SIZE: usize = 5000;
-        // (network, source_id, country, country_code, continent, continent_code,
-        //  asn, as_name, as_domain, updated_at, deleted)
-        const COLUMNS: &str = "(network, source_id, country, country_code, continent, \
-             continent_code, asn, as_name, as_domain, updated_at, deleted)";
-        // updated_at (10th col) is DateTime64(3); wrap the bound ms value in
-        // fromUnixTimestamp64Milli so storage uses the explicit ms scale that
-        // the purge DELETE compares against (NAN-1123).
-        const VALUE_TUPLE: &str =
-            "(?, ?, ?, ?, ?, ?, ?, ?, ?, fromUnixTimestamp64Milli(toInt64(?)), ?)";
-
-        if records.is_empty() {
-            return Ok(0);
-        }
-
-        let mut inserted = 0u64;
-        for chunk in records.chunks(CHUNK_SIZE) {
-            match Self::insert_ch_rows(ch, source_id, run_ms, COLUMNS, VALUE_TUPLE, chunk).await {
-                Ok(()) => inserted += chunk.len() as u64,
-                Err(e) => {
-                    warn!(
-                        chunk_size = chunk.len(),
-                        error = %e,
-                        "CH IP enrichment batch insert failed; retrying records individually"
-                    );
-                    for record in chunk {
-                        match Self::insert_ch_rows(
-                            ch,
-                            source_id,
-                            run_ms,
-                            COLUMNS,
-                            VALUE_TUPLE,
-                            std::slice::from_ref(record),
-                        )
-                        .await
-                        {
-                            Ok(()) => inserted += 1,
-                            Err(e) => {
-                                warn!(network = %record.network, error = %e, "Failed to store IP enrichment record");
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(inserted)
-    }
-
-    /// Build + execute a single multi-row INSERT for `rows` (length >= 1).
-    async fn insert_ch_rows(
-        ch: &clickhouse::Client,
-        source_id: &str,
-        run_ms: u64,
-        columns: &str,
-        value_tuple: &str,
-        rows: &[IpInfoLiteRecord],
-    ) -> Result<(), clickhouse::error::Error> {
-        let tuples = vec![value_tuple; rows.len()].join(", ");
-        let sql = format!("INSERT INTO nanosiem.ip_enrichments {columns} VALUES {tuples}");
-
-        let mut q = ch.query(&sql);
-        for record in rows {
-            q = q
-                .bind(&record.network)
-                .bind(source_id)
-                .bind(&record.country)
-                .bind(&record.country_code)
-                .bind(&record.continent)
-                .bind(&record.continent_code)
-                .bind(&record.asn)
-                .bind(&record.as_name)
-                .bind(&record.as_domain)
-                .bind(run_ms)
-                .bind(0u8);
-        }
-        q.execute().await
     }
 
     /// Purge a source's CH IP enrichment rows by writing tombstones (deleted=1)

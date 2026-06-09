@@ -1,0 +1,86 @@
+{
+  "class_uid": 3002,
+  "class_name": "Authentication",
+  "category_uid": 3,
+  "category_name": "Identity & Access Management",
+  "activity_id": 1,
+  "activity_name": "Logon",
+  "type_uid": 300201,
+  "type_name": "Authentication: Logon",
+  "severity_id": 1,
+  "severity": "Informational",
+  "status_id": 1,
+  "status": "Success",
+  "status_detail": "LOGON_SUCCESS",
+  "time": 1749081600123,
+  "message": "Successful interactive Kerberos logon for ACME\\\\jsmith on DC01 from 10.20.30.40",
+  "metadata": {
+    "version": "1.8.0",
+    "product": {
+      "name": "Windows Security",
+      "vendor_name": "Microsoft",
+      "feature": {
+        "name": "Security Auditing"
+      }
+    },
+    "uid": "f4c6a8d2-1b3e-4f5a-9c7d-2e1a8b9c0d3e",
+    "log_name": "Security",
+    "logged_time": 1749081600456,
+    "original_time": "2026-06-05T00:00:00.123Z"
+  },
+  "auth_protocol_id": 2,
+  "auth_protocol": "Kerberos",
+  "logon_type_id": 2,
+  "logon_type": "Interactive",
+  "is_mfa": true,
+  "is_remote": false,
+  "user": {
+    "name": "jsmith",
+    "domain": "ACME",
+    "uid": "S-1-5-21-1004336348-1177238915-682003330-1052",
+    "type_id": 1,
+    "type": "User"
+  },
+  "actor": {
+    "user": {
+      "name": "jsmith",
+      "domain": "ACME",
+      "uid": "S-1-5-21-1004336348-1177238915-682003330-1052"
+    }
+  },
+  "src_endpoint": {
+    "ip": "10.20.30.40",
+    "port": 49213,
+    "hostname": "ws-jsmith-01.acme.local"
+  },
+  "dst_endpoint": {
+    "ip": "10.20.0.5",
+    "port": 88,
+    "hostname": "dc01.acme.local"
+  },
+  "session": {
+    "uid": "0x3e7a91c4",
+    "is_remote": false,
+    "created_time": 1749081600123
+  },
+  "observables": [
+    {
+      "name": "src_endpoint.ip",
+      "type_id": 2,
+      "type": "IP Address",
+      "value": "10.20.30.40"
+    },
+    {
+      "name": "user.name",
+      "type_id": 4,
+      "type": "User Name",
+      "value": "jsmith"
+    },
+    {
+      "name": "dst_endpoint.hostname",
+      "type_id": 1,
+      "type": "Hostname",
+      "value": "dc01.acme.local"
+    }
+  ]
+}

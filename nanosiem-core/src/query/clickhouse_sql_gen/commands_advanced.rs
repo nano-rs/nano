@@ -153,7 +153,7 @@ impl ClickHouseSqlGenerator {
             Some(fields) => {
                 let partition_fields: Vec<String> = fields
                     .iter()
-                    .map(|f| escape_identifier(normalize_field_name(f)))
+                    .map(|f| by_field_sql(f, self))
                     .collect();
                 partition_fields.join(", ")
             }
@@ -166,7 +166,7 @@ impl ClickHouseSqlGenerator {
                 let field_expr = agg
                     .field
                     .as_ref()
-                    .map(|f| escape_identifier(normalize_field_name(f)))
+                    .map(|f| by_field_sql(f, self))
                     .unwrap_or_else(|| "*".to_string());
 
                 // Whole-partition window (no ORDER BY): eventstats annotates every row with the
@@ -301,7 +301,7 @@ impl ClickHouseSqlGenerator {
         // Group by fields
         let group_fields: Vec<String> = group_by
             .iter()
-            .map(|f| escape_identifier(normalize_field_name(f)))
+            .map(|f| by_field_sql(f, self))
             .collect();
 
         // Build the sequence function for HAVING clause. HAVING filters *groups*
@@ -410,11 +410,15 @@ impl ClickHouseSqlGenerator {
             cond1
         ));
         for f in &per_step_captures[0] {
+            // Alias suffix must be a bare identifier — OCSF dotted fields
+            // (`process.name`) would produce an invalid `step1_process.name`
+            // alias, so sanitize dots to underscores (NAN-1294). The value
+            // expression still references the real (escaped) column.
             layer0_cols.push(format!(
                 "argMinIf({}, timestamp, {}) AS step1_{}",
                 escape_identifier(f),
                 cond1,
-                f
+                f.replace('.', "_")
             ));
         }
         // Sorted event tuple array — only if there's at least one step beyond 1.
@@ -472,7 +476,7 @@ impl ClickHouseSqlGenerator {
         outer_cols.push("step1_time".to_string());
         outer_cols.push("step1_event_id".to_string());
         for f in &per_step_captures[0] {
-            outer_cols.push(format!("step1_{}", f));
+            outer_cols.push(format!("step1_{}", f.replace('.', "_")));
         }
         for k_idx in 1..n_conds {
             let step_num = k_idx + 1;
@@ -489,7 +493,7 @@ impl ClickHouseSqlGenerator {
                     tup = tup,
                     pos = field_pos(f),
                     n = step_num,
-                    f = f
+                    f = f.replace('.', "_")
                 ));
             }
         }
@@ -544,7 +548,7 @@ impl ClickHouseSqlGenerator {
         // Group by fields
         let group_fields: Vec<String> = group_by
             .iter()
-            .map(|f| escape_identifier(normalize_field_name(f)))
+            .map(|f| by_field_sql(f, self))
             .collect();
 
         let seconds = window.as_secs();
@@ -581,19 +585,30 @@ impl ClickHouseSqlGenerator {
         //
         // For string fields, argMax returns '' for sources that don't populate
         // the column, and the post-processor filters '' before top-K.
-        fn argmax_expr(field: &str) -> String {
-            match field {
-                "dest_port" => {
-                    "argMaxIf(toString(dest_port), timestamp, dest_port != 0) AS _last_dest_port"
-                        .to_string()
-                }
-                other => format!("argMax({other}, timestamp) AS _last_{other}"),
+        // Resolve each dropper field through the active profile so OCSF reads its
+        // promoted column instead of a literal UDM name; the `_last_<name>` /
+        // `_droppers_<name>` aliases stay keyed by the canonical UDM name so the
+        // post-processor reads the same set. Fields the active schema has no
+        // column for are SKIPPED (None) rather than emitting an unknown-column
+        // reference. For UDM `udm_column_sql` returns the escaped column itself,
+        // so this is byte-identical (`dest_port` keeps its zero-filtered argMaxIf).
+        let argmax_expr = |name: &str| -> Option<String> {
+            let col = self.profile.udm_column_sql(name)?;
+            // Port fields default to 0 for portless events; argMaxIf skips that
+            // noise so it never surfaces as a top dropper attribute.
+            let is_port = name.ends_with("_port") || name == "port";
+            if is_port {
+                Some(format!(
+                    "argMaxIf(toString({col}), timestamp, {col} != 0) AS _last_{name}"
+                ))
+            } else {
+                Some(format!("argMax({col}, timestamp) AS _last_{name}"))
             }
-        }
+        };
 
         let entity_argmax: Vec<String> = crate::search::query_processing::FUNNEL_DROPPER_FIELDS
             .iter()
-            .map(|name| argmax_expr(name))
+            .filter_map(|name| argmax_expr(name))
             .collect();
 
         // Outer aggregation: one groupArraySampleIf per curated field, capped
@@ -602,6 +617,9 @@ impl ClickHouseSqlGenerator {
         // FILTER clause for older ClickHouse compatibility.
         let dropper_samples: Vec<String> = crate::search::query_processing::FUNNEL_DROPPER_FIELDS
             .iter()
+            // Mirror `entity_argmax`: only emit a sampler for fields the active
+            // schema actually produced a `_last_<name>` column for.
+            .filter(|name| self.profile.udm_column_sql(name).is_some())
             .map(|name| {
                 format!(
                     "groupArraySampleIf(1000)(_last_{name}, _fl == funnel_level) AS _droppers_{name}"
@@ -659,7 +677,7 @@ impl ClickHouseSqlGenerator {
     ) -> Result<String, SqlGenError> {
         let by_exprs: Vec<String> = by_fields
             .iter()
-            .map(|b| escape_identifier(normalize_field_name(b)))
+            .map(|b| by_field_sql(b, self))
             .collect();
 
         // Aggregation-first syntax: field contains "(" like "count()" or "sum(bytes_out)"
@@ -670,39 +688,27 @@ impl ClickHouseSqlGenerator {
                 .generate_anomaly_aggregation_sql(source, field, &by_exprs, threshold, method);
         }
 
-        let field_expr = escape_identifier(normalize_field_name(field));
+        let field_expr = by_field_sql(field, self);
         let partition_clause = if !by_exprs.is_empty() {
             format!("PARTITION BY {}", by_exprs.join(", "))
         } else {
             String::new()
         };
 
-        // Known numeric UDM columns where direct statistical anomaly makes sense.
-        // Everything else (process_name, user, action, src_ip, etc.) is categorical
-        // and needs count-based anomaly detection.
-        const NUMERIC_FIELDS: &[&str] = &[
-            "bytes_in",
-            "bytes_out",
-            "packets_in",
-            "packets_out",
-            "src_port",
-            "dest_port",
+        // Non-column numeric fields: aggregation/alias names that are not part of
+        // any schema's column universe but are still numeric when statistical
+        // anomaly runs on a computed result (stats aliases) or on common
+        // non-canonical aliases. The schema columns themselves are classified via
+        // the active profile below, so OCSF promoted numeric columns
+        // (`dst_endpoint.port`, byte counts, …) also get direct statistical
+        // anomaly instead of count-based. For UDM the union reproduces the prior
+        // hardcoded list exactly (every real UDM numeric column already resolves
+        // through `profile.is_numeric_field`).
+        const NUMERIC_COMPUTED_FIELDS: &[&str] = &[
+            // Non-canonical numeric aliases not carried in the profile field set
             "dst_port",
-            "duration",
-            "file_size",
-            "process_id",
-            "parent_process_id",
             "http_status",
-            "status_code",
             "severity_level",
-            "risk_score",
-            "prevalence_file_hash",
-            "prevalence_process_hash",
-            "prevalence_dest_domain",
-            "prevalence_dest_ip",
-            "prevalence_min",
-            "ioc_confidence",
-            "ioc_matched",
             // Common computed fields from stats commands
             "count",
             "sum",
@@ -723,7 +729,8 @@ impl ClickHouseSqlGenerator {
         ];
 
         let normalized = normalize_field_name(field);
-        let is_numeric = NUMERIC_FIELDS.contains(&normalized.as_ref());
+        let is_numeric = self.profile.is_numeric_field(normalized.as_ref())
+            || NUMERIC_COMPUTED_FIELDS.contains(&normalized.as_ref());
 
         if is_numeric {
             // Direct anomaly on numeric values

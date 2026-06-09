@@ -122,11 +122,35 @@ impl SearchService {
             return Ok(results);
         }
 
-        // Determine which field to extract artifacts from based on PrevalenceField
-        let artifact_field = match field {
+        // Determine which result-row key to extract artifacts from based on PrevalenceField.
+        //
+        // NAN-1241: these are the RESULT-ROW output field names (the keys serde produced from
+        // the SELECT aliases), not raw SQL columns — so they follow the active schema's output
+        // naming. Resolve the UDM-semantic concept through the profile: UDM yields the same
+        // `file_hash`/`dest_host` literal (byte-identical), OCSF yields its promoted output
+        // column name. If the active schema has no column for the concept, the filter cannot
+        // apply — short-circuit gracefully rather than scanning a field that never exists.
+        let profile = self.active_profile.as_ref();
+        let udm_concept = match field {
             PrevalenceField::HashPrevalence | PrevalenceField::HashFirstSeen => "file_hash",
             PrevalenceField::DomainPrevalence | PrevalenceField::DomainFirstSeen => "dest_host",
         };
+        let artifact_field: String = match profile.udm_column_sql(udm_concept) {
+            // udm_column_sql returns the SQL-escaped column; strip the OCSF double-quotes so we
+            // index the JSON result map by the bare output key. UDM is unquoted → unchanged
+            // (byte-identical). TODO(OCSF): the result-row KEY equals the promoted column's
+            // serde name; if OCSF serialization ever renames it (vs the bare dotted column),
+            // this lookup key must follow that renaming.
+            Some(col) => col.trim_matches('"').to_string(),
+            None => {
+                debug!(
+                    "Prevalence filtering: active schema has no column for '{}'; skipping filter",
+                    udm_concept
+                );
+                return Ok(results);
+            }
+        };
+        let artifact_field: &str = artifact_field.as_str();
 
         // For timestamp-based fields, we need different handling
         if field.is_timestamp_field() {
@@ -258,45 +282,92 @@ impl SearchService {
         );
 
         // Extract all unique hashes, domains, and IPs from results
-        // Support multiple field names for hashes, domains, and IPs based on UDM fields
-        let hash_fields = [
-            "file_hash",        // Generic file hash (any algorithm)
-            "process_hash",     // Process/executable hash (Sysmon, EDR)
-            "service_hash",     // Windows service executable hash
-            "service_dll_hash", // Windows service DLL hash
-            // Legacy/common aliases (not in UDM but may exist in raw logs)
-            "hash",
-            "md5",
-            "sha256",
-            "sha1",
-        ];
-        let domain_fields = [
-            "dest_host",            // Destination hostname (most common)
-            "src_host",             // Source hostname
-            "dest_nt_domain",       // Windows NT domain (destination)
-            "src_nt_domain",        // Windows NT domain (source)
-            "http_referrer_domain", // HTTP referrer domain
-            "recipient_domain",     // Email recipient domain
-            "src_user_domain",      // Source user's domain
-            "url_domain",           // Domain extracted from URL
-            // Legacy/common aliases (not in UDM but may exist in raw logs)
-            "domain",
-            "query_name",
-            "dns_query",
-            "hostname",
-        ];
-        let ip_fields = [
-            "dest_ip",     // Destination IP address (most common)
-            "src_ip",      // Source IP address
-            "client_ip",   // Client IP (web logs)
-            "server_ip",   // Server IP
-            "nat_dest_ip", // NAT destination IP
-            "nat_src_ip",  // NAT source IP
-            // Legacy/common aliases
-            "ip",
-            "remote_ip",
-            "target_ip",
-        ];
+        // Support multiple field names for hashes, domains, and IPs based on UDM fields.
+        //
+        // NAN-1241: these are RESULT-ROW output keys (the keys serde produced from the SELECT
+        // aliases), not raw SQL columns — so they follow the active schema's output naming. Under
+        // the OCSF profile the promoted columns serialize under their dotted names (e.g.
+        // `dst_endpoint.hostname`, `file.hashes.sha256`), so the hardcoded UDM keys never match
+        // and enrichment silently no-ops.
+        //
+        // The fix is SCHEMA-GATED, not blanket profile-resolution. Many of the UDM artifact field
+        // names below are NOT in EXPLICIT_COLUMNS (service_hash, service_dll_hash, dest_nt_domain,
+        // src_nt_domain, http_referrer_domain, src_user_domain, client_ip, server_ip, nat_dest_ip,
+        // nat_src_ip) — for those the *default UDM profile's* `udm_column_sql` would resolve to
+        // `ext.<name>`, which is the WRONG result-row key and would silently break UDM. So:
+        //   - UDM (default): use the exact previous literal arrays, byte-for-byte unchanged. No
+        //     profile resolution is applied — UDM result-row keys ARE these bare names.
+        //   - OCSF: resolve the UDM-semantic concepts through `udm_column_sql` (quotes stripped to
+        //     get the bare dotted result-row key); concepts OCSF doesn't map return `None` and are
+        //     dropped. Legacy/common aliases (md5, domain, ip, …) are not UDM-semantic and have no
+        //     OCSF mapping; they are kept verbatim (UDM-only — they may also coincidentally appear
+        //     as raw `ext` keys on OCSF rows, where matching them is harmless).
+        let profile = self.active_profile.as_ref();
+        let is_ocsf = profile.id() == crate::schema::SchemaId::Ocsf;
+
+        // OCSF only: resolve a UDM-semantic field to its dotted result-row key (quotes stripped),
+        // mirroring `apply_prevalence_filtering` above. None → schema has no column → drop.
+        let resolve_ocsf = |udm_field: &str| -> Option<String> {
+            profile
+                .udm_column_sql(udm_field)
+                .map(|col| col.trim_matches('"').to_string())
+        };
+
+        // Build a field list. UDM: literal `udm_concepts` + `legacy` verbatim (byte-identical to
+        // the prior hardcoded arrays). OCSF: profile-resolved `udm_concepts` (None dropped) +
+        // `legacy` verbatim.
+        let build = |udm_concepts: &[&str], legacy: &[&str]| -> Vec<String> {
+            let mut out: Vec<String> = Vec::new();
+            for f in udm_concepts {
+                if is_ocsf {
+                    if let Some(key) = resolve_ocsf(f) {
+                        out.push(key);
+                    }
+                } else {
+                    out.push((*f).to_string());
+                }
+            }
+            for f in legacy {
+                out.push((*f).to_string());
+            }
+            out
+        };
+
+        // UDM-semantic concepts (per-profile) + legacy aliases (UDM-only literals).
+        // Under UDM these reduce to the exact previous arrays, byte-identical.
+        let hash_fields = build(
+            &[
+                "file_hash",        // Generic file hash (any algorithm)
+                "process_hash",     // Process/executable hash (Sysmon, EDR)
+                "service_hash",     // Windows service executable hash
+                "service_dll_hash", // Windows service DLL hash
+            ],
+            &["hash", "md5", "sha256", "sha1"],
+        );
+        let domain_fields = build(
+            &[
+                "dest_host",            // Destination hostname (most common)
+                "src_host",             // Source hostname
+                "dest_nt_domain",       // Windows NT domain (destination)
+                "src_nt_domain",        // Windows NT domain (source)
+                "http_referrer_domain", // HTTP referrer domain
+                "recipient_domain",     // Email recipient domain
+                "src_user_domain",      // Source user's domain
+                "url_domain",           // Domain extracted from URL
+            ],
+            &["domain", "query_name", "dns_query", "hostname"],
+        );
+        let ip_fields = build(
+            &[
+                "dest_ip",     // Destination IP address (most common)
+                "src_ip",      // Source IP address
+                "client_ip",   // Client IP (web logs)
+                "server_ip",   // Server IP
+                "nat_dest_ip", // NAT destination IP
+                "nat_src_ip",  // NAT source IP
+            ],
+            &["ip", "remote_ip", "target_ip"],
+        );
 
         let mut hashes: Vec<String> = Vec::new();
         let mut domains: Vec<String> = Vec::new();
@@ -306,7 +377,7 @@ impl SearchService {
             // Try multiple hash field names
             for field in &hash_fields {
                 if let Some(hash) = row
-                    .get(*field)
+                    .get(field.as_str())
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                 {
@@ -320,7 +391,7 @@ impl SearchService {
             let mut found_ip_in_domain_field = false;
             for field in &domain_fields {
                 if let Some(value) = row
-                    .get(*field)
+                    .get(field.as_str())
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                 {
@@ -341,7 +412,7 @@ impl SearchService {
             if !found_ip_in_domain_field {
                 for field in &ip_fields {
                     if let Some(ip) = row
-                        .get(*field)
+                        .get(field.as_str())
                         .and_then(|v| v.as_str())
                         .filter(|s| !s.is_empty())
                     {
@@ -445,7 +516,7 @@ impl SearchService {
                 // Try to find hash in multiple possible fields
                 for field in &hash_fields {
                     if let Some(hash) = obj
-                        .get(*field)
+                        .get(field.as_str())
                         .and_then(|v| v.as_str())
                         .filter(|s| !s.is_empty())
                     {
@@ -474,7 +545,7 @@ impl SearchService {
                 // If the field contains an IP address instead of a domain, fall back to IP prevalence
                 for field in &domain_fields {
                     if let Some(value) = obj
-                        .get(*field)
+                        .get(field.as_str())
                         .and_then(|v| v.as_str())
                         .filter(|s| !s.is_empty())
                     {
@@ -526,7 +597,7 @@ impl SearchService {
                 if found_ip.is_none() {
                     for field in &ip_fields {
                         if let Some(ip) = obj
-                            .get(*field)
+                            .get(field.as_str())
                             .and_then(|v| v.as_str())
                             .filter(|s| !s.is_empty())
                         {
@@ -818,62 +889,142 @@ impl SearchService {
         // Query to extract ALL distinct artifacts from matching logs
         // No limit on artifacts - batching handles any count
         // This ensures targeted searches (e.g., src_host="danslaptop") find all rare artifacts
-        let logs_table = self.table_names.read("logs");
+        // NAN-1241: profile-aware table + column resolution. UDM resolves each UDM-semantic
+        // field to the same bare literal (byte-identical SQL); OCSF resolves to the promoted
+        // dotted column. Any concept the active schema doesn't map is skipped (its UNION-ALL
+        // branch is dropped) rather than referencing a missing column (which 500s on OCSF).
+        let profile = self.active_profile.as_ref();
+        let logs_table = self.table_names.read(Self::logs_table_key(profile));
+
+        let dest_host_col = profile.udm_column_sql("dest_host");
+        let src_host_col = profile.udm_column_sql("src_host");
+        let query_col = profile.udm_column_sql("query");
+        let dest_ip_col = profile.udm_column_sql("dest_ip");
+        let src_ip_col = profile.udm_column_sql("src_ip");
+        let file_hash_col = profile.udm_column_sql("file_hash");
+        let process_hash_col = profile.udm_column_sql("process_hash");
+
+        // The matching_logs CTE projects each resolved artifact column under a
+        // STABLE ALIAS (`_dest_host`, `_process_hash`, …); every DISTINCT branch
+        // references that alias, never the raw resolved expression. Under OCSF the
+        // resolved columns are class-split `if("a" != '', "a", "b")` expressions
+        // over dotted columns the CTE does not otherwise expose, so re-referencing
+        // them outside matching_logs threw `Code 47 UNKNOWN_IDENTIFIER`
+        // (NAN-1301, same scope class as NAN-1306). UDM columns are bare, so the
+        // alias is a harmless rename. `domain`/`hash`/`ip` stay the final
+        // sub-select alias names the row reader expects.
+        let dest_host_a = dest_host_col.as_ref().map(|_| "_dest_host");
+        let src_host_a = src_host_col.as_ref().map(|_| "_src_host");
+        let query_a = query_col.as_ref().map(|_| "_query");
+        let dest_ip_a = dest_ip_col.as_ref().map(|_| "_dest_ip");
+        let src_ip_a = src_ip_col.as_ref().map(|_| "_src_ip");
+        let file_hash_a = file_hash_col.as_ref().map(|_| "_file_hash");
+        let process_hash_a = process_hash_col.as_ref().map(|_| "_process_hash");
+
+        let mut select_cols: Vec<String> = Vec::new();
+        for (col, alias) in [
+            (&dest_host_col, "_dest_host"),
+            (&src_host_col, "_src_host"),
+            (&query_col, "_query"),
+            (&dest_ip_col, "_dest_ip"),
+            (&src_ip_col, "_src_ip"),
+            (&file_hash_col, "_file_hash"),
+            (&process_hash_col, "_process_hash"),
+        ] {
+            if let Some(c) = col {
+                select_cols.push(format!("{c} AS {alias}"));
+            }
+        }
+        // Guard: nothing to extract under this schema → empty scatter data, no SQL.
+        if select_cols.is_empty() {
+            return Ok(PrevalenceScatterData {
+                hash_points: Vec::new(),
+                domain_points: Vec::new(),
+                ip_points: Vec::new(),
+                rarity_threshold: 3,
+            });
+        }
+
+        // Domain UNION-ALL branches (alias `domain`): dest_host / src_host (non-IP) + query (dotted).
+        let mut domain_branches: Vec<String> = Vec::new();
+        if let Some(c) = &dest_host_a {
+            domain_branches.push(format!(
+                "SELECT DISTINCT {c} as domain FROM matching_logs\n                WHERE {c} != '' AND {c} NOT LIKE '%%.%%.%%.%%'"
+            ));
+        }
+        if let Some(c) = &src_host_a {
+            domain_branches.push(format!(
+                "SELECT DISTINCT {c} as domain FROM matching_logs\n                WHERE {c} != '' AND {c} NOT LIKE '%%.%%.%%.%%'"
+            ));
+        }
+        if let Some(c) = &query_a {
+            domain_branches.push(format!(
+                "SELECT DISTINCT {c} as domain FROM matching_logs\n                WHERE {c} != '' AND {c} LIKE '%%.%%'"
+            ));
+        }
+
+        // Hash UNION-ALL branches (alias `hash`): file_hash + process_hash.
+        let mut hash_branches: Vec<String> = Vec::new();
+        if let Some(c) = &file_hash_a {
+            hash_branches.push(format!(
+                "SELECT DISTINCT {c} as hash FROM matching_logs WHERE {c} != '' AND length({c}) >= 32"
+            ));
+        }
+        if let Some(c) = &process_hash_a {
+            hash_branches.push(format!(
+                "SELECT DISTINCT {c} as hash FROM matching_logs WHERE {c} != '' AND length({c}) >= 32"
+            ));
+        }
+
+        // IP UNION-ALL branches (alias `ip`): dest_ip + src_ip.
+        let mut ip_branches: Vec<String> = Vec::new();
+        if let Some(c) = &dest_ip_a {
+            ip_branches.push(format!(
+                "SELECT DISTINCT {c} as ip FROM matching_logs WHERE {c} != '' AND {c} LIKE '%%.%%.%%.%%'"
+            ));
+        }
+        if let Some(c) = &src_ip_a {
+            ip_branches.push(format!(
+                "SELECT DISTINCT {c} as ip FROM matching_logs WHERE {c} != '' AND {c} LIKE '%%.%%.%%.%%'"
+            ));
+        }
+
+        // Assemble the per-type SELECT, skipping a whole artifact type when it has no branches.
+        let mut union_sections: Vec<String> = Vec::new();
+        if !domain_branches.is_empty() {
+            union_sections.push(format!(
+                "SELECT\n                'domain' as artifact_type,\n                lower(domain) as artifact\n            FROM (\n                {}\n            )\n            WHERE domain != ''",
+                domain_branches.join("\n                UNION ALL\n                ")
+            ));
+        }
+        if !hash_branches.is_empty() {
+            union_sections.push(format!(
+                "SELECT\n                'hash' as artifact_type,\n                hash as artifact\n            FROM (\n                {}\n            )\n            WHERE hash != ''",
+                hash_branches.join("\n                UNION ALL\n                ")
+            ));
+        }
+        if !ip_branches.is_empty() {
+            union_sections.push(format!(
+                "SELECT\n                'ip' as artifact_type,\n                ip as artifact\n            FROM (\n                {}\n            )\n            WHERE ip != ''",
+                ip_branches.join("\n                UNION ALL\n                ")
+            ));
+        }
+
         let artifacts_sql = format!(
             r#"
             WITH matching_logs AS (
                 SELECT
-                    dest_host,
-                    src_host,
-                    query,
-                    dest_ip,
-                    src_ip,
-                    file_hash,
-                    process_hash
+                    {select_cols}
                 FROM {logs_table}
                 WHERE {where_clause}
                 LIMIT 100000
             )
-            SELECT
-                'domain' as artifact_type,
-                lower(domain) as artifact
-            FROM (
-                SELECT DISTINCT dest_host as domain FROM matching_logs
-                WHERE dest_host != '' AND dest_host NOT LIKE '%%.%%.%%.%%'
-                UNION ALL
-                SELECT DISTINCT src_host as domain FROM matching_logs
-                WHERE src_host != '' AND src_host NOT LIKE '%%.%%.%%.%%'
-                UNION ALL
-                SELECT DISTINCT query as domain FROM matching_logs
-                WHERE query != '' AND query LIKE '%%.%%'
-            )
-            WHERE domain != ''
-
-            UNION ALL
-
-            SELECT
-                'hash' as artifact_type,
-                hash as artifact
-            FROM (
-                SELECT DISTINCT file_hash as hash FROM matching_logs WHERE file_hash != '' AND length(file_hash) >= 32
-                UNION ALL
-                SELECT DISTINCT process_hash as hash FROM matching_logs WHERE process_hash != '' AND length(process_hash) >= 32
-            )
-            WHERE hash != ''
-
-            UNION ALL
-
-            SELECT
-                'ip' as artifact_type,
-                ip as artifact
-            FROM (
-                SELECT DISTINCT dest_ip as ip FROM matching_logs WHERE dest_ip != '' AND dest_ip LIKE '%%.%%.%%.%%'
-                UNION ALL
-                SELECT DISTINCT src_ip as ip FROM matching_logs WHERE src_ip != '' AND src_ip LIKE '%%.%%.%%.%%'
-            )
-            WHERE ip != ''
+            {union_body}
             "#,
+            select_cols = select_cols.join(",\n                    "),
+            logs_table = logs_table,
             where_clause = where_clause,
+            union_body = union_sections.join("\n\n            UNION ALL\n\n            "),
         );
 
         tracing::debug!("Prevalence artifacts SQL: {}", artifacts_sql);

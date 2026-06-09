@@ -292,8 +292,17 @@ impl LogSourceService {
             });
         }
 
-        // Success!
+        // Success! The deploy regenerated the whole Vector config from EVERY
+        // enabled source, so they're all live now — mark the explicit target
+        // (refreshing its deployed_at) and flip any other enabled-but-never-
+        // deployed source to deployed too. Without this, sources included in the
+        // config but never individually published (e.g. batch-imported parsers)
+        // keep showing "ready" though they're live (NAN-1275). Best-effort: a
+        // bookkeeping miss must not fail an otherwise-successful deploy.
         self.repository().mark_deployed(id).await?;
+        if let Err(e) = self.repository().mark_enabled_deployed().await {
+            tracing::warn!(error = %e, "deploy succeeded but failed to mark sibling enabled sources deployed");
+        }
 
         let deployment_id = self
             .repository()

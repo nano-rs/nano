@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import React, { useState, useCallback, useEffect, useRef } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { X, Copy, Check, ChevronLeft, ChevronRight, GripVertical, ScanEye } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -8,6 +9,8 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { formatUTCShort } from '@/lib/date-utils';
 import { UDM_COLUMNS } from '@/lib/udm-fields';
 import { isClickHouseDefault } from '@/lib/utils';
+import { api } from '@/lib/api';
+import { expandEventLeaves, getEventObject } from './event-flatten';
 
 // ============================================================================
 // Types
@@ -57,11 +60,26 @@ export interface EventInspectorPanelProps {
 // Field utilities (mirrors SearchResults.tsx logic)
 // ============================================================================
 
-function flattenFields(fields: Record<string, unknown>, prefix = ''): [string, unknown][] {
+function flattenFields(fields: Record<string, unknown>, isOcsf = false, prefix = '', promotedNames?: Set<string>): [string, unknown][] {
   const result: [string, unknown][] = [];
+
+  // OCSF (NAN-1241): the raw `event` column is the full nested OCSF record. Expand
+  // it into dotted leaf paths (the UDM `ext` analog — backend already flattens ext)
+  // so each nested OCSF field is individually inspectable instead of one blob. Done
+  // only at the top level under OCSF; promoted top-level keys win on collision.
+  const topLevelKeys = prefix === '' ? new Set(Object.keys(fields)) : new Set<string>();
 
   for (const [key, value] of Object.entries(fields)) {
     const fullKey = prefix ? `${prefix}_${key}` : key;
+
+    if (prefix === '' && isOcsf && key === 'event') {
+      const eventObj = getEventObject(fields);
+      if (eventObj) {
+        topLevelKeys.delete('event');
+        result.push(...expandEventLeaves(eventObj, topLevelKeys, promotedNames));
+        continue;
+      }
+    }
 
     if (key.startsWith('prevalence_') && (value === 255 || value === 65535 || value === 9999)) continue;
     if (key === 'risk_score' && (value === 0 || value === '0')) continue;
@@ -82,13 +100,13 @@ function flattenFields(fields: Record<string, unknown>, prefix = ''): [string, u
         } catch { /* not JSON */ }
       }
       if (metadataObj) {
-        result.push(...flattenFields(metadataObj, 'metadata'));
+        result.push(...flattenFields(metadataObj, isOcsf, 'metadata', promotedNames));
       } else if (value) {
         result.push([fullKey, value]);
       }
     } else if (key === '_prevalence') {
       if (typeof value === 'object' && !Array.isArray(value) && value !== null) {
-        result.push(...flattenFields(value as Record<string, unknown>, '_prevalence'));
+        result.push(...flattenFields(value as Record<string, unknown>, isOcsf, '_prevalence', promotedNames));
       } else if (value) {
         result.push([fullKey, value]);
       }
@@ -113,6 +131,7 @@ function flattenFields(fields: Record<string, unknown>, prefix = ''): [string, u
     if (fieldName.startsWith('lookup_')) return 5;
     if (fieldName.startsWith('enriched_')) return 6;
     if (fieldName.startsWith('metadata_')) return 7;
+    if (isOcsf && fieldName.startsWith('unmapped.')) return 9; // OCSF unmapped spill last
     if (!UDM_COLUMNS.has(fieldName)) return 8;
     return 0;
   };
@@ -162,13 +181,11 @@ function isIdentityField(fieldName: string): boolean {
          fieldName === 'is_nat_candidate';
 }
 
-function isExtField(fieldName: string): boolean {
-  return !UDM_COLUMNS.has(fieldName) && !fieldName.startsWith('enriched_') &&
-         !fieldName.startsWith('ioc_') && !fieldName.startsWith('lookup_') &&
-         !fieldName.startsWith('metadata_') && !fieldName.includes('_identity_') && !fieldName.startsWith('identity_') &&
-         !fieldName.startsWith('prevalence_') && !fieldName.startsWith('_prevalence') &&
-         !fieldName.startsWith('risk_') && fieldName !== 'is_nat_candidate';
-}
+// (NAN-1241 Phase 7) Field categorization is now profile-aware and computed
+// inside the component against the active schema's field universe — see the
+// `fieldCategories` memo. The old `isExtField(fieldName)` helper assumed UDM
+// (`!UDM_COLUMNS.has`), so every OCSF promoted field fell into "Extended"; it
+// was removed.
 
 // Enrichment category check (mirrors SearchResults)
 const ENRICHMENT_CATEGORIES: Record<string, (k: string) => boolean> = {
@@ -235,6 +252,54 @@ export function EventInspectorPanel({
   const [expandedValues, setExpandedValues] = useState<Set<string>>(new Set());
   const [copiedField, setCopiedField] = useState<string | null>(null);
   const [width, setWidth] = useState(getStoredWidth);
+
+  // Active schema profile's field universe (OCSF Phase 7, NAN-1241). Used to
+  // categorize fields for the active deployment instead of assuming UDM: under
+  // OCSF, promoted fields (`src_endpoint.ip`, `class_uid`, …) are "known" and
+  // must land in Core, not the "Extended" (ext spill) bucket. Cached app-wide.
+  const { data: schemaFields } = useQuery({
+    queryKey: ['schema-fields'],
+    queryFn: () => api.getSchemaFields(),
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  // Only consult the schema field universe under a NON-UDM profile. Under UDM the
+  // backend field universe is a superset of the hand-maintained frontend
+  // `UDM_COLUMNS` list (drift is expected — see NAN-1155), so OR-ing it into the
+  // Core/Extended decision would silently move some fields from "Extended" to
+  // "Core" versus the old `!UDM_COLUMNS.has()` behavior. Gate to non-UDM so UDM
+  // categorization stays byte-identical (mirrors AssetView's schemaFieldNames).
+  const knownSchemaFields = React.useMemo(
+    () =>
+      schemaFields && schemaFields.schema !== 'udm'
+        ? new Set(schemaFields.fields.map((f) => f.name))
+        : new Set<string>(),
+    [schemaFields],
+  );
+  // Per-event key-field summary chips follow the active schema (NAN-1241): under
+  // OCSF the same row carries src_endpoint.ip/user.name/activity rather than the
+  // UDM src_ip/src_host/user/event_type, so the spec must switch on the profile
+  // or only `source_type` survives. Mirrors SearchResults RawView keyChipSpecs.
+  const keyChipSpecs: Array<{ label: string; field: string; accent?: boolean }> =
+    schemaFields?.schema === 'ocsf'
+      ? [
+          { label: 'sourcetype', field: 'source_type' },
+          { label: 'src_ip', field: 'src_endpoint.ip' },
+          { label: 'dest_ip', field: 'dst_endpoint.ip' },
+          { label: 'user', field: 'user.name' },
+          { label: 'status', field: 'status' },
+          { label: 'activity', field: 'activity', accent: true },
+        ]
+      : [
+          { label: 'sourcetype', field: 'source_type' },
+          { label: 'src_ip', field: 'src_ip' },
+          { label: 'src_host', field: 'src_host' },
+          { label: 'dest_ip', field: 'dest_ip' },
+          { label: 'dest_host', field: 'dest_host' },
+          { label: 'user', field: 'user' },
+          { label: 'dest_user', field: 'dest_user' },
+          { label: 'event_type', field: 'event_type', accent: true },
+        ];
   const widthRef = useRef(width);
   widthRef.current = width;
   const panelRef = useRef<HTMLDivElement>(null);
@@ -259,7 +324,8 @@ export function EventInspectorPanel({
     ? { ...event.fields, ...fullLogData }
     : event.fields;
 
-  let flattenedFields = displayFields ? flattenFields(displayFields) : [];
+  const isOcsf = schemaFields?.schema === 'ocsf';
+  let flattenedFields = displayFields ? flattenFields(displayFields, isOcsf, '', knownSchemaFields) : [];
   if (hiddenEnrichments.size > 0) {
     flattenedFields = flattenedFields.filter(([k]) => !isFieldHidden(k, hiddenEnrichments));
   }
@@ -351,7 +417,7 @@ export function EventInspectorPanel({
     const NEUTRAL = 'text-muted-foreground';
     const ACCENT = 'text-primary/80';
     const categories: { label: string; color: string; tooltip: string; fields: [string, unknown][] }[] = [
-      { label: 'Core', color: NEUTRAL, tooltip: 'Indexed UDM columns with bloom filters for fast search', fields: [] },
+      { label: 'Core', color: NEUTRAL, tooltip: 'Promoted, indexed schema columns for fast search (UDM or OCSF)', fields: [] },
       { label: 'Risk', color: ACCENT, tooltip: 'Risk scores and factors from detection rules', fields: [] },
       { label: 'IOC', color: ACCENT, tooltip: 'Indicators of compromise from threat intelligence feeds', fields: [] },
       { label: 'Identity', color: ACCENT, tooltip: 'Resolved identity from the user registry (department, title, groups, account status)', fields: [] },
@@ -359,7 +425,15 @@ export function EventInspectorPanel({
       { label: 'Lookup', color: ACCENT, tooltip: 'Enrichments from lookup tables', fields: [] },
       { label: 'Enrichment', color: ACCENT, tooltip: 'Auto-enriched fields (geo, ASN, reputation)', fields: [] },
       { label: 'Metadata', color: ACCENT, tooltip: 'Parser metadata and processing info', fields: [] },
-      { label: 'Extended', color: ACCENT, tooltip: 'Additional fields from the ext JSON column', fields: [] },
+      // Non-promoted fields: UDM `ext` spill, or OCSF schema fields that simply
+      // aren't promoted to a Core column (class_name, *.file.name, …). These are
+      // still MAPPED to the schema — distinct from `unmapped` below.
+      { label: 'Extended', color: ACCENT, tooltip: 'Non-promoted fields (UDM ext spill; OCSF schema fields without a promoted column)', fields: [] },
+      // NAN-1278: OCSF's `unmapped` object (base_event.unmapped) is the TRUE
+      // source spill — fields with no OCSF attribute (e.g. unmapped.granted_access).
+      // Its own bucket so it isn't conflated with non-promoted-but-mapped OCSF
+      // fields. OCSF only; empty (and filtered out) under UDM.
+      { label: 'Unmapped', color: ACCENT, tooltip: 'Source fields with no OCSF attribute (the unmapped.* spill)', fields: [] },
     ];
 
     for (const field of flattenedFields) {
@@ -372,12 +446,19 @@ export function EventInspectorPanel({
       else if (isLookupField(k)) categories[5].fields.push(field);
       else if (k.startsWith('enriched_')) categories[6].fields.push(field);
       else if (k.startsWith('metadata_')) categories[7].fields.push(field);
-      else if (isExtField(k)) categories[8].fields.push(field);
-      else categories[0].fields.push(field);
+      // Core = a field known to the ACTIVE schema profile (OCSF promoted fields
+      // like `src_endpoint.ip`/`class_uid`) OR a base UDM column (covers the
+      // shared operational fields — message/severity/status/source_type/id/
+      // timestamp — that aren't in the OCSF field universe). NAN-1241 Phase 7.
+      else if (knownSchemaFields.has(k) || UDM_COLUMNS.has(k)) categories[0].fields.push(field);
+      // OCSF `unmapped.*` = the true source spill (no OCSF attribute) → own bucket.
+      else if (isOcsf && (k === 'unmapped' || k.startsWith('unmapped.'))) categories[9].fields.push(field);
+      // Non-promoted but schema-mapped (or UDM ext spill).
+      else categories[8].fields.push(field);
     }
 
     return categories.filter(c => c.fields.length > 0);
-  }, [flattenedFields]);
+  }, [flattenedFields, knownSchemaFields, isOcsf]);
 
   const tabs: { id: InspectorTab; label: string; count?: number }[] = [
     { id: 'fields', label: 'Fields', count: flattenedFields.length },
@@ -460,11 +541,9 @@ export function EventInspectorPanel({
       {/* Key fields summary */}
       <div className="px-3 py-2 sticky top-[45px] z-10" style={{ background: 'var(--card)' }}>
         <div className="flex flex-wrap gap-1 font-mono text-[10.5px]">
-          {(['source_type', 'src_ip', 'src_host', 'dest_ip', 'dest_host', 'user', 'event_type'] as const).map(field => {
+          {keyChipSpecs.map(({ label: displayField, field, accent }) => {
             const value = displayFields?.[field];
             if (!value || isClickHouseDefault(value, field)) return null;
-            const accent = field === 'event_type';
-            const displayField = field === 'source_type' ? 'sourcetype' : field;
             return (
               <span
                 key={field}

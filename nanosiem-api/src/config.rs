@@ -61,11 +61,24 @@ pub struct ApiConfig {
     /// repo sync) refuse cleanly instead of attempting a doomed fetch — bundles
     /// come in via the air-gap import surface instead.
     pub airgap: bool,
+    /// Active schema profile selected for this deployment (scoping §2.4).
+    /// Resolved from `NANO_SCHEMA_PROFILE` at boot (`udm` default | `ocsf`).
+    /// Boot fails fast on an unrecognized value (DualPool philosophy, NAN-800).
+    /// The resolved `Arc<dyn SchemaProfile>` is threaded into the search path
+    /// from `AppState`; this field records the choice for reporting.
+    pub schema_id: nanosiem_core::schema::SchemaId,
 }
 
 impl ApiConfig {
     /// Load configuration from environment variables
     pub fn from_env() -> Self {
+        // Resolve the active schema profile early; an unrecognized
+        // NANO_SCHEMA_PROFILE is a hard boot failure (fail-fast, NAN-800) rather
+        // than a silent UDM fallback against a possibly-OCSF table.
+        let schema_raw = env::var(nanosiem_core::schema::SCHEMA_PROFILE_ENV).unwrap_or_default();
+        let schema_id = nanosiem_core::schema::SchemaId::from_env_str(&schema_raw)
+            .unwrap_or_else(|e| panic!("{e}"));
+
         let cors_origins = env::var("CORS_ORIGINS")
             .unwrap_or_else(|_| "*".to_string())
             .split(',')
@@ -108,7 +121,16 @@ impl ApiConfig {
             airgap: env::var("AIRGAP_MODE")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
+            schema_id,
         }
+    }
+
+    /// Resolve the active schema profile for this deployment. Built from
+    /// [`schema_id`](ApiConfig::schema_id) (already validated at
+    /// [`from_env`](ApiConfig::from_env)) so AppState can inject it into the
+    /// search path without re-reading the environment.
+    pub fn schema_profile(&self) -> std::sync::Arc<dyn nanosiem_core::schema::SchemaProfile> {
+        nanosiem_core::schema::profile_for_id(self.schema_id)
     }
 
     /// Get the bind address
@@ -175,6 +197,7 @@ impl Default for ApiConfig {
             license_token: None,
             deployment_id: None,
             airgap: false,
+            schema_id: nanosiem_core::schema::SchemaId::Udm,
         }
     }
 }

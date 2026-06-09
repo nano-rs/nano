@@ -161,16 +161,32 @@ pub async fn get_source_types(
     {
         let ch_client = state.dual_pool.clickhouse();
 
+        // Resolve the FROM table from the active schema profile (OCSF Phase 7,
+        // NAN-1241) so the source picker queries `ocsf_logs` under the OCSF
+        // profile and `logs` under UDM. The profile's fully-qualified
+        // `table_name()` (`nanosiem.ocsf_logs` / `nanosiem.logs`) is reduced to
+        // its bare key and re-resolved through the tenant/cluster-aware
+        // `table_names` registry, so `_distributed` read routing applies
+        // identically to both — same mechanism `SearchService` uses.
+        let profile = state.config.schema_profile();
+        let table = state
+            .dual_pool
+            .table_names()
+            .read(profile.table_name().trim_start_matches("nanosiem."));
+
+        // Both profiles expose `source_type` and a `timestamp` column, so only
+        // the FROM target varies between schemas here.
         let sql = format!(
             r#"
             SELECT source_type, count(*) as count
-            FROM logs
+            FROM {}
             WHERE timestamp >= '{}'
               AND timestamp < '{}'
               AND source_type != ''
             GROUP BY source_type
             ORDER BY count DESC
             "#,
+            table,
             time_range.start.format("%Y-%m-%d %H:%M:%S"),
             time_range.end.format("%Y-%m-%d %H:%M:%S")
         );
@@ -240,6 +256,113 @@ pub async fn get_ext_fields(State(state): State<AppState>) -> Result<Json<Vec<St
     Ok(Json(names))
 }
 
+/// A single field in the active schema profile's queryable universe.
+///
+/// Profile-agnostic (OCSF Phase 3b, NAN-1241): the shape is the same whether the
+/// deployment runs UDM or OCSF — only the discriminator + the field set differ.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SchemaFieldInfo {
+    /// Canonical field name as typed in nPL (e.g. `src_ip`, `src_endpoint.ip`).
+    pub name: String,
+    /// Value type (`string`, `ip_address`, `integer`, `uuid`, ...).
+    pub r#type: String,
+    /// Coarse category for grouping/UX (`network`, `authentication`, ...).
+    pub category: String,
+    /// Security entity the field denotes, if any (`ip`, `host`, `user`, ...).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_type: Option<String>,
+    /// Whether the field is PREWHERE/index-eligible for the active profile.
+    pub prewhere: bool,
+    /// Whether the profile exposes a `_search`/`.search` full-text companion for
+    /// this field (UDM today exposes none in the field universe; reserved for
+    /// OCSF's declared search companions).
+    pub search: bool,
+}
+
+/// Response for the profile-aware `GET /api/schema/fields` endpoint.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SchemaFieldsResponse {
+    /// The active schema discriminator (`udm` | `ocsf`) — lets the frontend
+    /// hydrate its field universe and report the deployment's schema.
+    pub schema: String,
+    /// The active profile's full field universe.
+    pub fields: Vec<SchemaFieldInfo>,
+}
+
+/// Get the active schema profile's field universe.
+///
+/// Profile-aware replacement for `/api/udm/fields` (OCSF Phase 3b, NAN-1241):
+/// returns the field set of whatever schema the deployment booted with
+/// (`NANO_SCHEMA_PROFILE`), so the frontend can discover fields and report the
+/// active schema without assuming UDM. Additive — `/api/udm/fields` is retained
+/// (Phase 7 retires it).
+#[utoipa::path(
+    get,
+    path = "/api/schema/fields",
+    tag = "fields",
+    responses(
+        (status = 200, description = "Active schema profile field universe", body = SchemaFieldsResponse),
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
+pub async fn get_schema_fields(
+    State(state): State<AppState>,
+) -> Result<Json<SchemaFieldsResponse>, ApiError> {
+    Ok(Json(build_schema_fields_response(
+        state.config.schema_profile().as_ref(),
+    )))
+}
+
+/// Build the `/api/schema/fields` response from a schema profile.
+///
+/// Pure (no I/O) so it is unit-testable against any profile without a live
+/// AppState/DualPool. The handler is a thin wrapper that resolves the active
+/// profile from config and delegates here.
+fn build_schema_fields_response(
+    profile: &dyn nanosiem_core::schema::SchemaProfile,
+) -> SchemaFieldsResponse {
+    // PREWHERE-eligible set, looked up O(1) per field.
+    let prewhere: std::collections::HashSet<&str> =
+        profile.prewhere_fields().iter().copied().collect();
+    // Field-universe set, so a `{name}_search` companion can be detected without
+    // a dedicated trait method (the profile declares its own search companions as
+    // fields; UDM declares none, OCSF may declare `.search` siblings).
+    let universe: std::collections::HashSet<&str> =
+        profile.fields().iter().map(|f| f.name).collect();
+
+    let fields = profile
+        .fields()
+        .iter()
+        .map(|f| {
+            let search_companion = format!("{}_search", f.name);
+            SchemaFieldInfo {
+                name: f.name.to_string(),
+                r#type: serde_field_value(&f.field_type),
+                category: serde_field_value(&f.category),
+                entity_type: f.entity_type.as_ref().map(serde_field_value),
+                prewhere: prewhere.contains(f.name),
+                search: universe.contains(search_companion.as_str()),
+            }
+        })
+        .collect();
+
+    SchemaFieldsResponse {
+        schema: serde_field_value(&profile.id()),
+        fields,
+    }
+}
+
+/// Render a `#[serde(rename_all = "snake_case")]` enum to its wire string
+/// (e.g. `FieldType::IpAddress` → `"ip_address"`) by reusing its `Serialize`
+/// impl, so the API surface matches the schema-core vocabulary exactly and never
+/// drifts from a hand-maintained `match`.
+fn serde_field_value<T: Serialize>(v: &T) -> String {
+    serde_json::to_value(v)
+        .ok()
+        .and_then(|j| j.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
 /// Get all UDM fields with their metadata
 ///
 /// Returns JSON with all fields and their metadata including:
@@ -289,6 +412,7 @@ pub async fn get_udm_fields() -> Result<Json<UdmFieldsResponse>, ApiError> {
         get_source_types,
         get_ext_fields,
         get_udm_fields,
+        get_schema_fields,
     ),
     components(
         schemas(
@@ -296,6 +420,8 @@ pub async fn get_udm_fields() -> Result<Json<UdmFieldsResponse>, ApiError> {
             FieldValue,
             UdmFieldsResponse,
             UdmFieldInfo,
+            SchemaFieldsResponse,
+            SchemaFieldInfo,
         )
     ),
     tags(
@@ -303,3 +429,51 @@ pub async fn get_udm_fields() -> Result<Json<UdmFieldsResponse>, ApiError> {
     )
 )]
 pub struct FieldsApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nanosiem_core::schema::{OcsfProfile, SchemaProfile, UdmProfile};
+
+    #[test]
+    fn schema_fields_returns_udm_universe_and_discriminator() {
+        let profile = UdmProfile::new();
+        let resp = build_schema_fields_response(&profile);
+
+        assert_eq!(resp.schema, "udm");
+        // Reports the full active-profile field universe.
+        assert_eq!(resp.fields.len(), profile.fields().len());
+        assert!(!resp.fields.is_empty());
+
+        // A known UDM field is present with its entity type + a sane type string.
+        let src_ip = resp
+            .fields
+            .iter()
+            .find(|f| f.name == "src_ip")
+            .expect("src_ip should be in the UDM universe");
+        assert_eq!(src_ip.r#type, "ip_address");
+        assert_eq!(src_ip.entity_type.as_deref(), Some("ip"));
+        // src_ip is PREWHERE-eligible for UDM.
+        assert!(src_ip.prewhere, "src_ip should be PREWHERE-eligible");
+
+        // The `prewhere` flag tracks the profile's prewhere set exactly.
+        let prewhere: std::collections::HashSet<&str> =
+            profile.prewhere_fields().iter().copied().collect();
+        for f in &resp.fields {
+            assert_eq!(
+                f.prewhere,
+                prewhere.contains(f.name.as_str()),
+                "prewhere flag disagreed with profile for {}",
+                f.name
+            );
+        }
+    }
+
+    #[test]
+    fn schema_fields_reports_ocsf_discriminator() {
+        // The discriminator follows the active profile, not a hardcoded "udm".
+        let resp = build_schema_fields_response(&OcsfProfile::new());
+        assert_eq!(resp.schema, "ocsf");
+        assert!(!resp.fields.is_empty());
+    }
+}

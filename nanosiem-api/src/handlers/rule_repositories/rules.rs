@@ -279,7 +279,10 @@ pub async fn import_rule(
             };
 
             let ai_client = melod_service.ai_client_arc();
-            let converter = nanosiem_enterprise::melod::SigmaConverterAgent::new(ai_client);
+            let converter = nanosiem_enterprise::melod::SigmaConverterAgent::new(
+                ai_client,
+                state.config.schema_profile(),
+            );
             let context = nanosiem_enterprise::melod::ConversionContext {
                 available_source_types,
                 ..Default::default()

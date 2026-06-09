@@ -619,8 +619,38 @@ impl SourceConfigRepository {
     pub async fn update_rule(
         &self,
         rule_id: Uuid,
-        request: UpdateRoutingRule,
+        mut request: UpdateRoutingRule,
     ) -> Result<RoutingRule, SourceConfigRepositoryError> {
+        // NAN-1271: fallback-last invariant. A `default` (catch-all) rule must
+        // always sort AFTER every non-default rule — it is the route's `else`,
+        // and the UI orders by priority. create_rule and reorder_rules already
+        // pin defaults last; update_rule is the one write path that applied a
+        // caller-supplied priority unguarded (how a fallback ended up at
+        // priority 0, showing first in the UI). Clamp a default's priority to
+        // sit above all non-defaults here so it can never be written ahead of a
+        // real rule.
+        if let Some(req_priority) = request.priority {
+            let current = self.get_rule(rule_id).await?;
+            let effective_type = request
+                .match_type
+                .as_deref()
+                .unwrap_or(&current.match_type);
+            if effective_type == "default" {
+                let max_non_default: Option<i32> = sqlx::query_scalar(
+                    "SELECT MAX(priority) FROM routing_rules \
+                     WHERE source_configuration_id = $1 AND match_type != 'default' AND id != $2",
+                )
+                .bind(current.source_configuration_id)
+                .bind(rule_id)
+                .fetch_one(&self.pool)
+                .await?;
+                let pinned = max_non_default.map_or(1000, |m| (m + 10).max(1000));
+                if req_priority != pinned {
+                    request.priority = Some(pinned);
+                }
+            }
+        }
+
         let mut updates = Vec::new();
         let mut param_idx = 1;
 

@@ -56,6 +56,9 @@ pub(crate) fn is_boolean_field(field: &str) -> bool {
     field == "ioc_matched"
 }
 
+// Phase 4: the 50+ `normalize_field_name` call sites route through
+// `profile.canonicalize()` then (dotted OCSF paths pass through UDM aliasing
+// unchanged today, so leaving them is behavior-neutral for UDM).
 pub(crate) fn normalize_field_name(field: &str) -> &str {
     match field {
         // Time field alias (PPL convention)
@@ -157,9 +160,28 @@ pub(crate) fn field_to_sql_expr(field: &str, gen: &ClickHouseSqlGenerator) -> (S
         return (gen.generate_json_extract(field, "String"), true);
     }
 
-    // Known UDM fields are direct column references
-    if is_udm_field(field) {
-        return (escape_identifier(field), false);
+    // A field the active schema resolves to a real physical column: a UDM
+    // explicit column, an OCSF promoted column, or (NAN-1248) a UDM-semantic
+    // alias like `src_ip` → `src_endpoint.ip`. `field_access_expr` emits the
+    // resolved column. UDM byte-identical: `resolve()` returns the same name for
+    // UDM explicit columns, so `field_access_expr` == `escape_identifier(field)`
+    // exactly as before. Gating on `resolves_to_column` (not `is_known_field`,
+    // which under OCSF only knows native dotted names) is what lets a UDM-named
+    // `stats by src_ip` GROUP BY the promoted OCSF column instead of a bare
+    // reference (500) or an `ext`/JSONExtract miss.
+    if gen.resolves_to_column(field) {
+        // NAN-1319: a UDM-semantic concept OCSF splits across columns by event
+        // class (the source host is `src_endpoint.hostname` on network events but
+        // `device.hostname` on endpoint/sysmon events; user/process span actor.*
+        // too) must PROJECT / GROUP BY / SORT on the class-spanning value, or
+        // `stats count by src_host` sees only network hosts and drops every
+        // endpoint event. Mirror the raw-SQL builders (`udm_column_sql`). UDM has
+        // no class-split → `None`, so this is byte-identical there; native OCSF
+        // dotted names aren't UDM concepts → `None`, so they keep `field_access_expr`.
+        if let Some(split_expr) = gen.class_split_value_sql(field) {
+            return (split_expr, false);
+        }
+        return (gen.field_access_expr(field, "String"), false);
     }
 
     // Dot notation means nested metadata access
@@ -185,10 +207,55 @@ pub(crate) fn field_to_sql_expr(field: &str, gen: &ClickHouseSqlGenerator) -> (S
         return (gen.generate_json_extract(field, json_type), true);
     }
 
+    // Unknown bare field. Under OCSF an unmapped/unpromoted name is part of the
+    // `event` tail → JSONExtract (returns '' when absent) rather than a bare column
+    // reference that 500s with "Unknown identifier". Under UDM `resolve` never
+    // yields JsonPath, so this is skipped and the bare reference (a computed /
+    // renamed / previous-stage column) is preserved byte-identically. Computed
+    // pipeline fields were already returned above (is_computed_field). (NAN-1248)
+    if gen.resolves_to_json_path(field) {
+        return (gen.field_access_expr(field, "String"), true);
+    }
     // For unknown fields without metadata_ prefix and no dots:
     // Treat as a direct column reference (could be a computed column from eval,
     // a renamed column, or a column from a previous stage)
     (escape_identifier(field), false)
+}
+
+/// Resolve a by-field / GROUP BY / PARTITION BY / dedup-key reference for the
+/// multi-stage window commands (eventstats / streamstats / anomaly / funnel /
+/// sequence / dedup) in a SchemaProfile-aware way.
+///
+/// These commands historically emitted `escape_identifier(normalize_field_name(f))`
+/// directly, which under OCSF produces a bare reference to a UDM name that is not
+/// an OCSF column (`src_ip` → 500 in a GROUP BY, or a silent miss). This routes a
+/// field the active profile resolves to a real column (UDM explicit column, OCSF
+/// promoted column, or — NAN-1248 — a UDM-semantic alias like `src_ip` →
+/// `src_endpoint.ip`) through [`field_access_expr`]; everything else keeps the
+/// exact legacy `escape_identifier(normalize_field_name(f))` form. UDM is therefore
+/// byte-identical (under UDM `resolves_to_column` ⇔ the field is an explicit column,
+/// and `field_access_expr` returns the same escaped name).
+///
+/// [`field_access_expr`]: ClickHouseSqlGenerator::field_access_expr
+pub(crate) fn by_field_sql(field: &str, gen: &ClickHouseSqlGenerator) -> String {
+    let field = normalize_field_name(field);
+    if gen.resolves_to_column(field) {
+        // NAN-1319: class-split UDM concepts (OCSF host/user/process/url) PARTITION
+        // / GROUP / dedup on the class-spanning value, same as `field_to_sql_expr`.
+        // `None` for UDM and native fields → byte-identical legacy behavior.
+        if let Some(split_expr) = gen.class_split_value_sql(field) {
+            return split_expr;
+        }
+        gen.field_access_expr(field, "String")
+    } else if !gen.is_computed_field(field) && gen.resolves_to_json_path(field) {
+        // OCSF unmapped/tail field → JSONExtract from `event` (empty if absent),
+        // not a bare reference that 500s in GROUP BY / PARTITION BY. Computed
+        // pipeline fields are excluded — they are real in-scope columns and stay
+        // bare. UDM never hits this (resolve never yields JsonPath). (NAN-1248)
+        gen.field_access_expr(field, "String")
+    } else {
+        escape_identifier(field)
+    }
 }
 
 /// Check if a field is a known metadata field that should be extracted from JSON
@@ -232,6 +299,13 @@ pub(crate) fn get_metadata_field_type(field: &str) -> &'static str {
 /// - Explicit columns are stored as direct columns with bloom filters
 /// - Other UDM fields are stored in the `ext` JSON column (extended fields)
 /// - Non-UDM fields are stored in the `metadata` JSON column
+///
+/// Phase 2b re-pointed the generator-scoped callers at
+/// `ClickHouseSqlGenerator::is_known_profile_field` (→ `profile.is_known_field`),
+/// so the only remaining references are the free-fn classification semantics this
+/// keeps as the canonical helper. `#[allow(dead_code)]` while no in-tree caller
+/// remains; Phase 4 may route the free-fn analysis helpers through it.
+#[allow(dead_code)]
 pub(crate) fn is_udm_field(field: &str) -> bool {
     use crate::udm::fields::UdmField;
     use std::str::FromStr;
@@ -321,8 +395,16 @@ pub(crate) fn value_to_sql(value: &crate::query::ast::Value) -> String {
 }
 
 /// Convert a Value to SQL literal, respecting the target field's column type
-pub(crate) fn value_to_sql_for_field(field: &str, value: &crate::query::ast::Value) -> String {
-    if is_text_column(field) {
+/// per the ACTIVE schema profile (NAN-1241). A numeric literal compared against a
+/// String column is quoted to avoid CH type-mismatch; numeric columns keep the
+/// bare literal. The profile drives the String-vs-numeric decision so OCSF
+/// promoted columns are typed correctly instead of falling through the UDM list.
+pub(crate) fn value_to_sql_for_field(
+    field: &str,
+    value: &crate::query::ast::Value,
+    profile: &dyn crate::schema::SchemaProfile,
+) -> String {
+    if is_text_column(field, profile) {
         match value {
             crate::query::ast::Value::Number(n) => {
                 if n.fract() == 0.0 {
@@ -338,39 +420,21 @@ pub(crate) fn value_to_sql_for_field(field: &str, value: &crate::query::ast::Val
     }
 }
 
-/// Check if a UDM field is stored as String/LowCardinality(String) in ClickHouse.
-/// Used by value_to_sql_for_field to auto-quote numeric literals for String columns,
-/// preventing type mismatch errors (e.g. `signature_id = 4672` → `signature_id = '4672'`).
+/// Check if a field is stored as String/LowCardinality(String) in ClickHouse for
+/// the active schema. Used by `value_to_sql_for_field` to auto-quote numeric
+/// literals for String columns, preventing type mismatch errors (e.g.
+/// `signature_id = 4672` → `signature_id = '4672'`).
 ///
-/// Inverted logic: if it's an explicit column and NOT in the numeric list, it's text.
-/// This is safer than maintaining a whitelist — new String columns work automatically.
-pub(crate) fn is_text_column(field: &str) -> bool {
-    const NUMERIC_COLUMNS: &[&str] = &[
-        "src_port",
-        "dest_port",
-        "bytes_in",
-        "bytes_out",
-        "packets_in",
-        "packets_out",
-        "duration",
-        "severity",
-        "pid",
-        "ppid",
-        "http_status_code",
-        "risk_score",
-        "ioc_src_ip_confidence",
-        "ioc_dest_ip_confidence",
-        "ioc_domain_confidence",
-        "ioc_hash_confidence",
-        "prevalence_file_hash",
-        "prevalence_process_hash",
-        "prevalence_dest_domain",
-        "prevalence_dest_ip",
-        "prevalence_min",
-    ];
-
-    // Only applies to explicit UDM columns — ext JSON fields are handled separately
-    EXPLICIT_COLUMNS_SET.contains(field) && !NUMERIC_COLUMNS.contains(&field)
+/// A field is "text" when it is a known column of the active schema and the
+/// profile does not classify it as numeric. For UDM this is byte-identical to the
+/// previous `EXPLICIT_COLUMNS_SET.contains && !NUMERIC_COLUMNS.contains` check —
+/// `UdmProfile::is_numeric_field` is backed by exactly that numeric list and
+/// `is_known_field`/`resolve` by `EXPLICIT_COLUMNS_SET`.
+pub(crate) fn is_text_column(field: &str, profile: &dyn crate::schema::SchemaProfile) -> bool {
+    matches!(
+        profile.resolve(field),
+        crate::schema::FieldResolution::ExplicitColumn(_)
+    ) && !profile.is_numeric_field(field)
 }
 
 /// Escape a string for SQL (single quotes)

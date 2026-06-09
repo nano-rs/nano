@@ -510,22 +510,68 @@ pub struct SearchService {
     table_names: TableNames,
     /// Hot-reloadable query safety limits (read at query time, updated by config polling)
     query_limits: std::sync::Arc<tokio::sync::RwLock<crate::settings::SearchQueryLimitsConfig>>,
+    /// Active schema profile (OCSF Phase 3a, NAN-1241). Defaults to
+    /// [`UdmProfile`](crate::schema::UdmProfile); an OCSF deployment injects an
+    /// `OcsfProfile` via [`with_profile`](SearchService::with_profile). It is
+    /// passed to the SQL generator at construction so default-view projection,
+    /// field resolution, and the FROM table follow the active schema.
+    active_profile: std::sync::Arc<dyn crate::schema::SchemaProfile>,
 }
 
 impl SearchService {
-    /// Build a ClickHouse SQL generator using the appropriate table from DualPool.
-    fn ch_generator_for_pool(dual_pool: &DualPool) -> ClickHouseSqlGenerator {
-        ClickHouseSqlGenerator::with_table(dual_pool.table_names().read_bare("logs"))
+    /// The tenant-aware `table_names` registry key for the active profile's logs
+    /// table. UDM → `"logs"` (byte-identical to today); OCSF → `"ocsf_logs"`.
+    ///
+    /// Derived from the profile's fully-qualified `table_name()` by stripping the
+    /// `nanosiem.` database prefix, so cluster/tenant prefixing still flows
+    /// through the same registry (`ocsf_logs` is registered in
+    /// `DISTRIBUTED_TABLE_SET`) rather than being hardcoded here.
+    fn logs_table_key(profile: &dyn crate::schema::SchemaProfile) -> &'static str {
+        match profile.id() {
+            crate::schema::SchemaId::Ocsf => "ocsf_logs",
+            crate::schema::SchemaId::Udm => "logs",
+        }
     }
 
-    /// Create a new search service with DualPool (ClickHouse for logs, PostgreSQL for lookups)
+    /// Build a ClickHouse SQL generator using the appropriate table from DualPool
+    /// and the active schema profile. The generator's FROM table is resolved
+    /// through the tenant-aware `table_names` registry for the profile's logs
+    /// table key, and the profile is injected so resolution/typing/default-view
+    /// projection follow the active schema.
+    fn ch_generator_for_pool(
+        dual_pool: &DualPool,
+        profile: std::sync::Arc<dyn crate::schema::SchemaProfile>,
+    ) -> ClickHouseSqlGenerator {
+        let table = dual_pool
+            .table_names()
+            .read_bare(Self::logs_table_key(profile.as_ref()));
+        ClickHouseSqlGenerator::with_table(table).with_profile(profile)
+    }
+
+    /// Create a new search service with DualPool (ClickHouse for logs, PostgreSQL
+    /// for lookups). Uses the default [`UdmProfile`](crate::schema::UdmProfile),
+    /// so behavior is unchanged for existing call sites.
     pub fn with_dual_pool(dual_pool: &DualPool) -> Self {
+        Self::with_dual_pool_and_profile(
+            dual_pool,
+            std::sync::Arc::new(crate::schema::UdmProfile::new()),
+        )
+    }
+
+    /// Create a new search service with DualPool and an explicit active schema
+    /// profile. The profile selects the FROM logs table (UDM `logs` vs OCSF
+    /// `ocsf_logs`, both through the tenant-aware registry) and is injected into
+    /// the SQL generator so resolution / default-view projection follow it.
+    pub fn with_dual_pool_and_profile(
+        dual_pool: &DualPool,
+        profile: std::sync::Arc<dyn crate::schema::SchemaProfile>,
+    ) -> Self {
         let ch_executor = Some(ClickHouseExecutor::new(dual_pool.clickhouse().clone()));
         Self {
             pg_pool: dual_pool.postgres().clone(),
             ch_client: Some(dual_pool.clickhouse().clone()),
             config: SearchConfig::default(),
-            ch_sql_generator: Self::ch_generator_for_pool(dual_pool),
+            ch_sql_generator: Self::ch_generator_for_pool(dual_pool, profile.clone()),
             lookup_service: None,
             prevalence_service: None,
             inputlookup_service: None,
@@ -541,20 +587,44 @@ impl SearchService {
             query_limits: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::settings::SearchQueryLimitsConfig::default(),
             )),
+            active_profile: profile,
         }
     }
-    /// Create a new search service with DualPool, lookup, and prevalence support
+    /// Create a new search service with DualPool, lookup, and prevalence support.
+    /// Uses the default [`UdmProfile`](crate::schema::UdmProfile) — existing call
+    /// sites keep today's behavior unchanged.
     pub fn with_dual_pool_lookup_and_prevalence(
         dual_pool: &DualPool,
         lookup_service: LookupService,
         prevalence_service: PrevalenceService,
+    ) -> Self {
+        Self::with_dual_pool_lookup_and_prevalence_and_profile(
+            dual_pool,
+            lookup_service,
+            prevalence_service,
+            std::sync::Arc::new(crate::schema::UdmProfile::new()),
+        )
+    }
+
+    /// Profile-aware variant of [`with_dual_pool_lookup_and_prevalence`]. The
+    /// active schema profile selects the FROM logs table (UDM `logs` vs OCSF
+    /// `ocsf_logs`, both through the tenant-aware registry) and is injected into
+    /// the SQL generator so resolution / default-view projection follow it. App
+    /// boot passes the profile resolved from `NANO_SCHEMA_PROFILE`.
+    ///
+    /// [`with_dual_pool_lookup_and_prevalence`]: SearchService::with_dual_pool_lookup_and_prevalence
+    pub fn with_dual_pool_lookup_and_prevalence_and_profile(
+        dual_pool: &DualPool,
+        lookup_service: LookupService,
+        prevalence_service: PrevalenceService,
+        profile: std::sync::Arc<dyn crate::schema::SchemaProfile>,
     ) -> Self {
         let ch_executor = Some(ClickHouseExecutor::new(dual_pool.clickhouse().clone()));
         Self {
             pg_pool: dual_pool.postgres().clone(),
             ch_client: Some(dual_pool.clickhouse().clone()),
             config: SearchConfig::default(),
-            ch_sql_generator: Self::ch_generator_for_pool(dual_pool),
+            ch_sql_generator: Self::ch_generator_for_pool(dual_pool, profile.clone()),
             lookup_service: Some(lookup_service),
             prevalence_service: Some(prevalence_service),
             inputlookup_service: None,
@@ -570,7 +640,13 @@ impl SearchService {
             query_limits: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::settings::SearchQueryLimitsConfig::default(),
             )),
+            active_profile: profile,
         }
+    }
+
+    /// The active schema profile this service queries under.
+    pub fn active_profile(&self) -> &std::sync::Arc<dyn crate::schema::SchemaProfile> {
+        &self.active_profile
     }
     /// Get the current backend type
     pub fn backend(&self) -> SearchBackend {

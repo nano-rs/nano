@@ -7,6 +7,7 @@
 
 import type {
   FieldInfo,
+  SchemaFieldsResponse,
   SystemOverview,
   SystemConfig,
   DeveloperSettings,
@@ -44,6 +45,17 @@ export class CoreApi {
   async getSourceTypes(timeRange?: { start: string; end: string }): Promise<[string, number][]> {
     const params = timeRange ? `?start=${encodeURIComponent(timeRange.start)}&end=${encodeURIComponent(timeRange.end)}` : '';
     return this.request(`/api/source-types${params}`);
+  }
+
+  /**
+   * Active schema profile's field universe (UDM or OCSF), from the profile-aware
+   * `/api/schema/fields` endpoint. The frontend uses this to categorize fields
+   * for the active deployment instead of assuming UDM (OCSF Phase 7, NAN-1241):
+   * under OCSF, promoted fields like `src_endpoint.ip` / `class_uid` are "known"
+   * and must not fall into the "Extended" (ext spill) bucket.
+   */
+  async getSchemaFields(): Promise<SchemaFieldsResponse> {
+    return this.request('/api/schema/fields');
   }
 
   // Ingestion

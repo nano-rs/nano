@@ -131,7 +131,8 @@ pub async fn convert_sigma(
     let ai_client = melod_service.ai_client_arc();
 
     // Create the converter agent
-    let converter = nanosiem_enterprise::melod::SigmaConverterAgent::new(ai_client);
+    let converter =
+        nanosiem_enterprise::melod::SigmaConverterAgent::new(ai_client, state.config.schema_profile());
 
     // Convert
     let context = nanosiem_enterprise::melod::ConversionContext::default();

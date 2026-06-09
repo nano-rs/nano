@@ -261,7 +261,7 @@ pub async fn format_query(
     security(("bearer_auth" = []), ("api_key" = []))
 )]
 pub async fn validate_detection(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<ValidateDetectionRequest>,
 ) -> Result<Json<ValidateDetectionResponse>, ApiError> {
@@ -337,7 +337,13 @@ pub async fn validate_detection(
     // Validate field names against:
     // 1. Direct ClickHouse columns (fast, indexed queries)
     // 2. Valid UDM fields (can be accessed via ext.* JSON column)
+    // 3. The active schema profile's field universe — so OCSF dotted fields
+    //    (e.g. `src_endpoint.ip`, `actor.process.cmd_line`) are accepted when the
+    //    deployment runs the OCSF profile (NAN-1241). Under UDM this is a superset
+    //    of branches 1+2, so UDM validation stays byte-identical.
     use nanosiem_core::udm::UdmField;
+
+    let profile = state.config.schema_profile();
 
     static CLICKHOUSE_COLUMNS: &[&str] = &[
         "_inserted_at",
@@ -539,6 +545,12 @@ pub async fn validate_detection(
         }
         // 4. Check if it's a valid UDM field (accessible via ext.*)
         if field_name.parse::<UdmField>().is_ok() {
+            continue;
+        }
+        // 5. Check if it's a known field in the active schema profile. For OCSF
+        //    this accepts the promoted dotted columns; for UDM it's a superset of
+        //    the checks above (no UDM field that passed before can fail here).
+        if profile.is_known_field(field_name) || profile.is_known_field(&lower) {
             continue;
         }
         // Not valid - suggest common fields

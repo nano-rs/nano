@@ -219,20 +219,24 @@ async fn get_event_count_clickhouse(
     // Calculate partition boundaries (daily partitions as YYYYMMDD)
     let start_partition = start.format("%Y%m%d").to_string();
 
-    // Query system.parts for fast row count - nearly instant regardless of volume
-    let sql = r#"
+    // Query system.parts for fast row count - nearly instant regardless of volume.
+    // NAN-1241: count the active ingested-events table (ocsf_logs under OCSF).
+    let logs_table = nanosiem_core::schema::active_logs_table();
+    let sql = format!(
+        r#"
         SELECT sum(rows) as count
         FROM system.parts
         WHERE database = 'nanosiem'
-          AND table = 'logs'
+          AND table = '{logs_table}'
           AND active
           AND partition >= ?
-    "#;
+    "#
+    );
 
     // Wrap with timeout to prevent hanging on ClickHouse issues
     let count: u64 = timeout(
         TokioDuration::from_secs(DASHBOARD_QUERY_TIMEOUT_SECS),
-        client.query(sql).bind(start_partition).fetch_one::<u64>(),
+        client.query(&sql).bind(start_partition).fetch_one::<u64>(),
     )
     .await
     .map_err(|_| ApiError::Timeout("Dashboard log count query timed out".to_string()))?

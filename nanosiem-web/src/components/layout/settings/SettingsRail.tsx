@@ -14,6 +14,7 @@ import { ChevronDown, ChevronLeft, Search as SearchIcon, Settings as SettingsIco
 import { cn } from '@/lib/utils';
 import { useAuth } from '@/contexts/AuthContext';
 import { useCapabilities } from '@/hooks/use-capabilities';
+import { useSystemConfig } from '@/hooks/use-api';
 import {
   SETTINGS_GROUPS,
   SETTINGS_SECTIONS,
@@ -119,6 +120,8 @@ export function SettingsRail({ onBackToApp }: SettingsRailProps) {
   const location = useLocation();
   const { hasPermission, hasAnyPermission, isDemoUser, user } = useAuth();
   const { capabilities } = useCapabilities();
+  const { data: systemConfig } = useSystemConfig();
+  const isAirGap = systemConfig?.air_gap === true;
   const [query, setQuery] = useState('');
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({ access: true });
   const inputRef = useRef<HTMLInputElement>(null);
@@ -144,6 +147,7 @@ export function SettingsRail({ onBackToApp }: SettingsRailProps) {
       .map((s): SettingsSection | null => {
         if (s.capability && !capabilities[s.capability]) return null;
         if (s.demoHidden && isDemoUser) return null;
+        if (s.airgapOnly && !isAirGap) return null;
         const sectionVisible = !s.permissions
           || (Array.isArray(s.permissions) ? hasAnyPermission(s.permissions) : hasPermission(s.permissions));
         if (!sectionVisible) return null;
@@ -155,7 +159,7 @@ export function SettingsRail({ onBackToApp }: SettingsRailProps) {
       })
       .filter((s): s is SettingsSection => s !== null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasPermission, hasAnyPermission, isDemoUser, capabilities]);
+  }, [hasPermission, hasAnyPermission, isDemoUser, capabilities, isAirGap]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();

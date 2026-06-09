@@ -358,6 +358,7 @@ impl AppState {
                     notification_service_arc,
                     Arc::new(dual_pool),
                     Some(ai_client),
+                    self.config.schema_profile(),
                 );
 
                 scheduler = scheduler.with_orchestrator(Arc::new(orchestrator));
