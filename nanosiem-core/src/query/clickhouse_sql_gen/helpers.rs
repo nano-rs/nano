@@ -178,6 +178,13 @@ pub(crate) fn field_to_sql_expr(field: &str, gen: &ClickHouseSqlGenerator) -> (S
         // endpoint event. Mirror the raw-SQL builders (`udm_column_sql`). UDM has
         // no class-split → `None`, so this is byte-identical there; native OCSF
         // dotted names aren't UDM concepts → `None`, so they keep `field_access_expr`.
+        // NAN-1333: project / GROUP BY / SORT on the INDEXED unified column when
+        // the split concept has one (materializes the same union, prunes via its
+        // words index); else the inline value-pick `if(...)`. UDM → both `None` →
+        // byte-identical.
+        if let Some(col) = gen.class_split_column(field) {
+            return (escape_identifier(&col), false);
+        }
         if let Some(split_expr) = gen.class_split_value_sql(field) {
             return (split_expr, false);
         }
@@ -198,6 +205,15 @@ pub(crate) fn field_to_sql_expr(field: &str, gen: &ClickHouseSqlGenerator) -> (S
     // pipeline command, still falls through to JSON extraction below. (NAN-1236)
     if gen.is_computed_field(field) {
         return (escape_identifier(field), false);
+    }
+
+    // `{func}_{field}` reference to an UN-aliased aggregation earlier in the
+    // pipeline (NAN-1339): `… | chart avg(bytes_in) over X | sort -avg_bytes_in`
+    // — the output column is literally `avg`, but the `values_`/`list_` naming
+    // convention makes `avg_bytes_in` the intuitive reference. Resolve it to
+    // the actual output column (aliased back for projections).
+    if let Some(target) = gen.agg_reference_alias(field) {
+        return (escape_identifier(&target), true);
     }
 
     // Known metadata fields that need JSON extraction
@@ -243,6 +259,11 @@ pub(crate) fn by_field_sql(field: &str, gen: &ClickHouseSqlGenerator) -> String 
         // NAN-1319: class-split UDM concepts (OCSF host/user/process/url) PARTITION
         // / GROUP / dedup on the class-spanning value, same as `field_to_sql_expr`.
         // `None` for UDM and native fields → byte-identical legacy behavior.
+        // NAN-1333: prefer the indexed unified column (same union, words-index
+        // prunable) over the inline value-pick. UDM → `None` → byte-identical.
+        if let Some(col) = gen.class_split_column(field) {
+            return escape_identifier(&col);
+        }
         if let Some(split_expr) = gen.class_split_value_sql(field) {
             return split_expr;
         }
@@ -817,19 +838,23 @@ fn unescape_regex_literal(s: &str) -> String {
 }
 
 /// Extract named capture group names from a regex pattern
-/// Returns a list of group names in order of appearance
-/// Example: "(?<user>\w+)@(?<domain>\w+)" -> ["user", "domain"]
+/// Returns a list of group names in order of appearance.
+/// Accepts both PCRE/Splunk forms — `(?<name>…)` and `(?P<name>…)` — since
+/// migrating users write either (NAN-1340); the optional `P` is what re2 / Python
+/// syntax uses and what the corpus leans on.
+/// Example: "(?<user>\w+)@(?P<domain>\w+)" -> ["user", "domain"]
 pub(crate) fn extract_named_groups(pattern: &str) -> Vec<String> {
-    let re = regex::Regex::new(r"\(\?<([^>]+)>").unwrap();
+    let re = regex::Regex::new(r"\(\?P?<([^>]+)>").unwrap();
     re.captures_iter(pattern)
         .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
         .collect()
 }
 
-/// Convert named capture groups to numbered groups for ClickHouse
-/// Example: "(?<user>\w+)" -> "(\w+)"
+/// Convert named capture groups to numbered groups for ClickHouse.
+/// Handles both `(?<name>…)` and `(?P<name>…)` (NAN-1340).
+/// Example: "(?P<user>\w+)" -> "(\w+)"
 pub(crate) fn convert_named_groups_to_numbered(pattern: &str) -> String {
-    let re = regex::Regex::new(r"\(\?<[^>]+>").unwrap();
+    let re = regex::Regex::new(r"\(\?P?<[^>]+>").unwrap();
     re.replace_all(pattern, "(").to_string()
 }
 
@@ -904,6 +929,31 @@ pub(crate) fn is_reserved_word(word: &str) -> bool {
 #[cfg(test)]
 mod inline_tests {
     use super::*;
+
+    #[test]
+    fn extract_named_groups_handles_both_pcre_forms() {
+        // NAN-1340: `(?P<name>…)` (re2/Python/Splunk-PCRE) must be recognized, not
+        // just `(?<name>…)` — else the corpus's `(?P<method>…)` captures are never
+        // created and the rex command silently no-ops.
+        assert_eq!(
+            extract_named_groups(r"(?<user>\w+)@(?P<domain>\w+)"),
+            vec!["user".to_string(), "domain".to_string()]
+        );
+        assert_eq!(
+            extract_named_groups(r"(?P<method>GET|POST)\s+(?P<path>/\S+)"),
+            vec!["method".to_string(), "path".to_string()]
+        );
+    }
+
+    #[test]
+    fn convert_named_groups_to_numbered_strips_both_pcre_forms() {
+        // NAN-1340: both `(?<…>)` and `(?P<…>)` collapse to a bare `(` for the
+        // numbered-group pattern ClickHouse `extractGroups` consumes.
+        assert_eq!(
+            convert_named_groups_to_numbered(r"(?P<method>GET|POST)\s+(?<path>/\S+)"),
+            r"(GET|POST)\s+(/\S+)"
+        );
+    }
 
     #[test]
     fn test_escape_regex_pattern_question_mark() {

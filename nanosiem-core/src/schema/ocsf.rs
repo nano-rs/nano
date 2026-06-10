@@ -59,6 +59,17 @@ const OCSF_EVENT_COLUMN: &str = "event";
 /// `timestamp`/`_inserted_at` bookkeeping columns — see [`OcsfProfile::resolve`].
 const OCSF_SOURCE_TYPE_COLUMN: &str = "source_type";
 
+/// Promoted columns the DDL declares `DEFAULT` (NOT `MATERIALIZED`) because they
+/// sit in the sort key, which ClickHouse forbids MATERIALIZED columns from
+/// joining — the same carve-out that already applies to `timestamp` (NAN-1334).
+/// Unlike MATERIALIZED columns, `DEFAULT` columns ARE included in `SELECT *`, so
+/// they MUST be EXCLUDED from the [`OcsfRegistry::materialized`] re-add list:
+/// re-adding them alongside `SELECT *` would emit a duplicate column (CH Code 352).
+/// They still derive from `event` on insert exactly as before. `timestamp` is not
+/// listed here because it is bookkeeping (never in the manifest promotion set, so
+/// never on the re-add list to begin with).
+const OCSF_DEFAULT_SORTKEY_COLUMNS: &[&str] = &["class_uid", "src_endpoint.ip"];
+
 /// The vendored promotion manifest — the single source of truth for the OCSF
 /// field universe (and the DDL's mechanical basis).
 const MANIFEST: &str = include_str!(concat!(
@@ -170,9 +181,12 @@ struct OcsfRegistry {
     promoted: HashSet<String>,
     /// PREWHERE-eligible promoted columns (manifest `prewhere == true`).
     prewhere: Vec<String>,
-    /// All promoted columns are MATERIALIZED (except the `time_dt` ALIAS) and so
-    /// must be re-added in multi-stage CTE SELECTs, same as UDM's
-    /// `MATERIALIZED_COLUMNS`.
+    /// Promoted columns that are MATERIALIZED in the DDL (so excluded from
+    /// `SELECT *`) and must be re-added in multi-stage CTE SELECTs, same as UDM's
+    /// `MATERIALIZED_COLUMNS`. EXCLUDES the `time_dt` ALIAS and the
+    /// `OCSF_DEFAULT_SORTKEY_COLUMNS` (`class_uid`, `src_endpoint.ip`) — those are
+    /// DEFAULT-derived (sort-key carve-out, NAN-1334) and therefore already in
+    /// `SELECT *`; re-adding them would duplicate-project (CH Code 352).
     materialized: Vec<String>,
     /// `<col>` for every manifest entry with `is_search_col == true` (the
     /// `<col>.search` companion realized in the DDL). Retained for the field
@@ -233,7 +247,21 @@ fn registry() -> &'static OcsfRegistry {
         // `time_dt` is an ALIAS column in the DDL (not MATERIALIZED) — keep it in
         // the field universe / promoted set but drop it from the re-add list so a
         // CTE SELECT does not try to project an alias.
-        materialized.retain(|c| c != "time_dt");
+        //
+        // `class_uid` / `src_endpoint.ip` are DEFAULT (not MATERIALIZED) because
+        // they sit in the sort key (NAN-1334). DEFAULT columns ARE in `SELECT *`,
+        // so re-adding them would duplicate-project (CH Code 352). Drop them too.
+        materialized
+            .retain(|c| c != "time_dt" && !OCSF_DEFAULT_SORTKEY_COLUMNS.contains(&c.as_str()));
+
+        // NAN-1337: the NAN-1333 unified columns are MATERIALIZED real columns but
+        // NOT manifest entries, so the loop above never added them. They're absent
+        // from `SELECT *`, so a multi-stage CTE that references one in a later stage
+        // (`SELECT src_host_unified … FROM stage_0`) fails with "Unknown identifier"
+        // unless stage_0 projects it. Append them to the re-add list.
+        for u in OCSF_UNIFIED_COLUMNS {
+            materialized.push((*u).to_string());
+        }
 
         let lowercased = OCSF_LOWERCASED_AT_INGEST
             .iter()
@@ -295,6 +323,55 @@ fn class_split_udm_field(udm_field: &str) -> Option<(&'static str, &'static str,
         _ => return None,
     };
     Some(m)
+}
+
+/// NAN-1337: the 10 NAN-1333 `<udm_field>_unified` columns. They are MATERIALIZED
+/// real columns (so absent from `SELECT *`) but are NOT manifest entries, so the
+/// manifest-built re-add list (`OcsfRegistry.materialized`) omits them. They MUST be
+/// appended to that list so every multi-stage CTE stage projects them — otherwise a
+/// query whose later stage references one (`SELECT src_host_unified … FROM stage_0`),
+/// e.g. `* | stats count by src_host`, fails with CH Code 47 "Unknown identifier".
+/// Kept in lockstep with [`class_split_column`] (asserted in tests).
+const OCSF_UNIFIED_COLUMNS: &[&str] = &[
+    "process_name_unified",
+    "process_path_unified",
+    "command_line_unified",
+    "process_id_unified",
+    "process_guid_unified",
+    "process_hash_unified",
+    "user_unified",
+    "url_domain_unified",
+    "url_unified",
+    "src_host_unified",
+];
+
+/// NAN-1333: the INDEXED unified physical column that materializes the exact
+/// `class_split_value_sql` union for a class-split UDM concept. The inline
+/// `if(primary != <sentinel>, primary, fallback)` value-pick is opaque to every
+/// skip index (a function of two columns), so a filter on it FULL-SCANS even
+/// though both source columns are individually indexed. `clickhouse/ocsf/init.sql`
+/// materializes the same union into one plain column per concept and attaches a
+/// words text index; routing WHERE / GROUP BY / raw-SQL to this column makes the
+/// index actually prune (prototype: src_host 640/640 → 294/640 granules, identical
+/// match counts). The mapping is 1:1 with [`class_split_udm_field`] — keep them in
+/// lockstep — and the column name is always `<udm_field>_unified`. Returns `None`
+/// for every non-split concept (the caller then keeps its single-column /
+/// value-pick resolution unchanged).
+fn class_split_column(udm_field: &str) -> Option<&'static str> {
+    let col = match udm_field {
+        "process_name" => "process_name_unified",
+        "process_path" => "process_path_unified",
+        "command_line" => "command_line_unified",
+        "process_id" => "process_id_unified",
+        "process_guid" => "process_guid_unified",
+        "process_hash" => "process_hash_unified",
+        "user" => "user_unified",
+        "url_domain" => "url_domain_unified",
+        "url" => "url_unified",
+        "src_host" => "src_host_unified",
+        _ => return None,
+    };
+    Some(col)
 }
 
 /// Intern a manifest column name into a `&'static str` so it can live in a
@@ -406,6 +483,11 @@ impl OcsfProfile {
 impl SchemaProfile for OcsfProfile {
     fn id(&self) -> SchemaId {
         SchemaId::Ocsf
+    }
+
+    /// OCSF's JSON tail is the `event` column (UDM uses `ext`) — NAN-1343.
+    fn json_tail_column(&self) -> &'static str {
+        OCSF_EVENT_COLUMN
     }
 
     fn fields(&self) -> &[FieldDef] {
@@ -585,6 +667,16 @@ impl SchemaProfile for OcsfProfile {
         // it landed. NOTE: OCSF promoted columns default to ''/0 (NOT NULL), so
         // this is `if(primary != <sentinel>, primary, fallback)`, not COALESCE
         // (which only skips NULL).
+        // NAN-1333: route class-split concepts to the INDEXED unified column
+        // (which materializes the identical `if(...)` union) instead of the inline
+        // value-pick, so raw-SQL builders' WHERE/GROUP BY can prune via the words
+        // index. `class_split_value_sql` (the `if(...)`) remains the source-of-truth
+        // value expr + the materialization definition; this just swaps the emitted
+        // reference. Falls through to the inline `if(...)` only if the column lookup
+        // ever diverges (it cannot — both keyed off the same field set).
+        if let Some(col) = class_split_column(udm_field) {
+            return Some(crate::query::escape_identifier(col));
+        }
         if let Some(expr) = self.class_split_value_sql(udm_field) {
             return Some(expr);
         }
@@ -613,6 +705,15 @@ impl SchemaProfile for OcsfProfile {
             let sentinel = if numeric { "0" } else { "''" };
             format!("if({p} != {sentinel}, {p}, {f})")
         })
+    }
+
+    fn class_split_column(&self, udm_field: &str) -> Option<String> {
+        // NAN-1333: the indexed unified column that materializes the
+        // `class_split_value_sql` union, so WHERE / GROUP BY / SORT / raw-SQL on a
+        // split concept reference a plain indexed column (words-index prunable)
+        // rather than the skip-index-opaque inline `if(...)`. `None` for non-split
+        // concepts (caller keeps single-column / value-pick resolution).
+        class_split_column(udm_field).map(|c| c.to_string())
     }
 
     fn display_field_name(&self, udm_field: &str) -> Option<String> {
@@ -825,9 +926,43 @@ mod tests {
         let p = OcsfProfile::new();
         // The `time_dt` ALIAS must not be in the CTE re-add list.
         assert!(!p.materialized_columns().contains(&"time_dt"));
-        for c in p.materialized_columns() {
+        // The DEFAULT sort-key columns (NAN-1334) ARE in `SELECT *`, so they must
+        // NOT be re-added — doing so would duplicate-project (CH Code 352).
+        for c in OCSF_DEFAULT_SORTKEY_COLUMNS {
+            assert!(
+                !p.materialized_columns().contains(c),
+                "DEFAULT sort-key column {c} must be excluded from the CTE re-add list",
+            );
+            // Still a real, known, promoted field — just DEFAULT not MATERIALIZED.
             assert!(p.is_known_field(c));
         }
+        // NAN-1337: the unified columns ARE re-added (so multi-stage CTEs project
+        // them, fixing `* | stats count by src_host` → Code 47). They are derived
+        // accelerators, not manifest fields, so they're exempt from is_known_field.
+        for u in OCSF_UNIFIED_COLUMNS {
+            assert!(
+                p.materialized_columns().contains(u),
+                "unified column {u} must be in the CTE re-add list (NAN-1337)",
+            );
+        }
+        for c in p.materialized_columns() {
+            if OCSF_UNIFIED_COLUMNS.contains(&c) {
+                continue;
+            }
+            assert!(p.is_known_field(c));
+        }
+        // Lockstep: every class-split concept's unified column is in the const list.
+        for udm in [
+            "process_name", "process_path", "command_line", "process_id",
+            "process_guid", "process_hash", "user", "url_domain", "url", "src_host",
+        ] {
+            let col = class_split_column(udm).expect("class-split concept");
+            assert!(
+                OCSF_UNIFIED_COLUMNS.contains(&col),
+                "{col} (class_split_column({udm})) must be in OCSF_UNIFIED_COLUMNS",
+            );
+        }
+        assert_eq!(OCSF_UNIFIED_COLUMNS.len(), 10);
     }
 
     #[test]
@@ -874,36 +1009,24 @@ mod tests {
         let p = OcsfProfile::new();
         // UDM-semantic field name → escaped OCSF promoted column (NAN-1241).
         // NAN-1319: `src_host` is class-split — network events carry the source in
-        // `src_endpoint.hostname`, endpoint/sysmon events in `device.hostname`. The
-        // value/group seam prefers the explicit source endpoint, falls back to the
-        // observing device (712K device-only rows on local OCSF data otherwise lost).
-        assert_eq!(
-            p.udm_column_sql("src_host").as_deref(),
-            Some("if(\"src_endpoint.hostname\" != '', \"src_endpoint.hostname\", \"device.hostname\")")
-        );
+        // `src_endpoint.hostname`, endpoint/sysmon events in `device.hostname`.
+        // NAN-1333: raw-SQL now references the INDEXED unified column that
+        // materializes that union (`src_host_unified`), not the inline `if(...)`,
+        // so WHERE/GROUP BY prunes via the words index. The `if(...)` survives as
+        // `class_split_value_sql` (the column's materialization def + source of
+        // truth) — see `udm_column_sql_emits_unified_column_for_class_split`.
+        assert_eq!(p.udm_column_sql("src_host").as_deref(), Some("src_host_unified"));
         assert_eq!(p.udm_column_sql("src_ip").as_deref(), Some("\"src_endpoint.ip\""));
         // NAN-1276 class-split resolution: OCSF puts the primary process in the
         // top-level `process.*` (Process Activity 1007) but in `actor.process.*`
-        // on Module/Network/File/DNS/Registry; UDM process_name/path/cmd/etc.
-        // must see it wherever it landed -> `if(primary != '', primary, fallback)`.
-        // (OCSF columns default to ''/0, not NULL, so this is `if`, not COALESCE.)
-        assert_eq!(
-            p.udm_column_sql("process_name").as_deref(),
-            Some("if(\"process.name\" != '', \"process.name\", \"actor.process.name\")")
-        );
-        assert_eq!(
-            p.udm_column_sql("command_line").as_deref(),
-            Some("if(\"process.cmd_line\" != '', \"process.cmd_line\", \"actor.process.cmd_line\")")
-        );
-        assert_eq!(
-            p.udm_column_sql("process_id").as_deref(),
-            Some("if(\"process.pid\" != 0, \"process.pid\", \"actor.process.pid\")")
-        );
-        // `user` spans Authentication subject (`user.name`) vs initiator (`actor.user.name`).
-        assert_eq!(
-            p.udm_column_sql("user").as_deref(),
-            Some("if(\"user.name\" != '', \"user.name\", \"actor.user.name\")")
-        );
+        // on Module/Network/File/DNS/Registry. NAN-1333 routes these to their
+        // indexed unified columns (same union, words-index prunable).
+        assert_eq!(p.udm_column_sql("process_name").as_deref(), Some("process_name_unified"));
+        assert_eq!(p.udm_column_sql("command_line").as_deref(), Some("command_line_unified"));
+        assert_eq!(p.udm_column_sql("process_id").as_deref(), Some("process_id_unified"));
+        // `user` spans Authentication subject (`user.name`) vs initiator
+        // (`actor.user.name`); NAN-1333 → indexed unified column.
+        assert_eq!(p.udm_column_sql("user").as_deref(), Some("user_unified"));
         // parent_command_line stays the parent column (not class-split).
         assert_eq!(p.udm_column_sql("parent_command_line").as_deref(), Some("\"actor.process.cmd_line\""));
         assert_eq!(p.udm_column_sql("dest_ip").as_deref(), Some("\"dst_endpoint.ip\""));
@@ -964,6 +1087,63 @@ mod tests {
         let udm = UdmProfile::new();
         assert_eq!(udm.class_split_value_sql("src_host"), None);
         assert_eq!(udm.class_split_value_sql("user"), None);
+    }
+
+    /// NAN-1333: the class-split unified COLUMN seam — the indexed column that
+    /// materializes the same union. OCSF returns `<udm_field>_unified` for the 10
+    /// split concepts; UDM and OCSF non-split/native fields return None. The codegen
+    /// routes WHERE/GROUP BY/raw-SQL to this column so the words index prunes.
+    #[test]
+    fn class_split_column_maps_split_concepts_to_unified_column() {
+        use crate::schema::{SchemaProfile, UdmProfile};
+        let ocsf = OcsfProfile::new();
+        // All 10 split concepts → `<udm_field>_unified`.
+        for (udm, col) in [
+            ("process_name", "process_name_unified"),
+            ("process_path", "process_path_unified"),
+            ("command_line", "command_line_unified"),
+            ("process_id", "process_id_unified"),
+            ("process_guid", "process_guid_unified"),
+            ("process_hash", "process_hash_unified"),
+            ("user", "user_unified"),
+            ("url_domain", "url_domain_unified"),
+            ("url", "url_unified"),
+            ("src_host", "src_host_unified"),
+        ] {
+            assert_eq!(
+                ocsf.class_split_column(udm).as_deref(),
+                Some(col),
+                "OCSF class_split_column({udm})"
+            );
+            // The unified-column set must be 1:1 with the value-pick set.
+            assert!(ocsf.class_split_value_sql(udm).is_some());
+        }
+        // Non-split UDM concept + native OCSF column → None.
+        assert_eq!(ocsf.class_split_column("src_ip"), None);
+        assert_eq!(ocsf.class_split_column("dest_host"), None);
+        assert_eq!(ocsf.class_split_column("src_endpoint.hostname"), None);
+        // UDM never class-splits → always None (byte-identical codegen).
+        let udm = UdmProfile::new();
+        assert_eq!(udm.class_split_column("src_host"), None);
+        assert_eq!(udm.class_split_column("user"), None);
+    }
+
+    /// NAN-1333: `udm_column_sql` (raw-SQL builders) now emits the indexed unified
+    /// column for a class-split concept, NOT the inline value-pick `if(...)`. The
+    /// `if(...)` survives as `class_split_value_sql` (source of truth + the column's
+    /// materialization def), but raw-SQL/projection should reference the column.
+    #[test]
+    fn udm_column_sql_emits_unified_column_for_class_split() {
+        use crate::schema::SchemaProfile;
+        let ocsf = OcsfProfile::new();
+        assert_eq!(ocsf.udm_column_sql("src_host").as_deref(), Some("src_host_unified"));
+        assert_eq!(ocsf.udm_column_sql("user").as_deref(), Some("user_unified"));
+        assert_eq!(
+            ocsf.udm_column_sql("process_name").as_deref(),
+            Some("process_name_unified")
+        );
+        // No inline `if(` in the emitted raw-SQL reference for a split concept.
+        assert!(!ocsf.udm_column_sql("src_host").unwrap().contains("if("));
     }
 
     #[test]

@@ -234,6 +234,19 @@
     "notes": "CLASS-DEPENDENT principal. For Authentication 3002 and IAM classes, the SUBJECT being authenticated is top-level `user.name` (required). For System Activity classes (Process 1007 / File 1001), the acting principal is `actor.user.name`. DDL should promote BOTH and the profile resolves UDM `user` to COALESCE(`user.name`, `actor.user.name`) or pick per-class. UDM user is bloom + text index + PREWHERE + lowercase-normalized. `user.name.search` companion."
   },
   {
+    "udm_field": "dest_user",
+    "ocsf_path": "user.name",
+    "ch_column_name": "user.name",
+    "ch_type": "String",
+    "index": "bloom_filter",
+    "prewhere": false,
+    "is_search_col": true,
+    "array_key": null,
+    "entity_type": "user",
+    "category": "Identity",
+    "notes": "Duplicate-column entry (activity_id precedent): maps UDM dest_user to the same promoted `user.name` column. Per OCSF Authentication 3002, `user` is the TARGET/subject account being acted upon and `actor.user` the initiator — exactly UDM dest_user/src_user (src_user already maps to actor.user.name). Without this, dest_user fell through to JSONExtract(event, dest_user) — a key OCSF never carries — so searches/stats/resolve_identity on it silently matched nothing (NAN-1339 follow-up from NAN-1346 #5)."
+  },
+  {
     "udm_field": "src_user",
     "ocsf_path": "actor.user.name",
     "ch_column_name": "actor.user.name",
@@ -364,7 +377,7 @@
     "notes": "PRIMARY subject process uid — OCSF-native process identifier (process_t.uid, string_t). Per OCSF Process Activity 1007 the SUBJECT is top-level `process`, so process.uid IS the UDM process_guid analog (client-provided GUID, NOT recomputed). bloom for process-tree pivots. The parent uid is `actor.process.uid`."
   },
   {
-    "udm_field": null,
+    "udm_field": "parent_process_guid",
     "ocsf_path": "actor.process.uid",
     "ch_column_name": "actor.process.uid",
     "ch_type": "String",
@@ -374,7 +387,7 @@
     "array_key": null,
     "entity_type": null,
     "category": "Process",
-    "notes": "PARENT process uid (process_t.uid, string_t). Per OCSF Process Activity 1007 `actor.process` is the parent/initiator; secondary, no UDM alias (udm_field=null — UDM process_guid now resolves to the subject `process.uid`). bloom for process-tree pivots."
+    "notes": "PARENT process uid (process_t.uid, string_t). Per OCSF Process Activity 1007 `actor.process` is the parent/initiator, so its uid maps to UDM parent_process_guid (NAN-1346 tree lineage; mirrors parent_command_line → actor.process.cmd_line). UDM process_guid resolves to the subject `process.uid`. bloom for process-tree pivots."
   },
   {
     "udm_field": "process_hash",

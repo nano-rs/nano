@@ -46,8 +46,11 @@ pub struct EnrichmentLaneClient {
     http: reqwest::Client,
     ingest_url: String,
     /// Bearer token for the Vector ingest source. `None` posts unauthenticated,
-    /// which only succeeds against a Vector whose `VECTOR_AUTH_TOKEN` is also
-    /// unset (its `auth_check` then reports `auth_status = "skipped"`).
+    /// which only succeeds against a Vector that is *also* tokenless **and** has
+    /// explicitly opted into unauthenticated ingest
+    /// (`VECTOR_ALLOW_UNAUTHENTICATED_INGEST=true`); otherwise `auth_check` fails
+    /// closed and aborts the push (NAN-1351). A token-protected Vector validates
+    /// the bearer normally.
     auth_token: Option<String>,
 }
 

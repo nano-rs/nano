@@ -298,6 +298,15 @@ pub async fn explain(
 
     let sql = result.map_err(|e| {
         tracing::error!(error = %e, "Query explain failed");
+        // Surface user-actionable generation guardrails (see the SqlGenError
+        // mapping in error.rs); mask internal failures.
+        if let nanosiem_core::SearchError::SqlGenError(ref msg) = e {
+            if msg.starts_with("Invalid query:")
+                || msg.starts_with("Unsupported operation:")
+            {
+                return SearchError::QueryError(msg.clone());
+            }
+        }
         SearchError::QueryError("Query processing failed".to_string())
     })?;
     Ok(Json(ExplainResponse {

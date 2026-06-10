@@ -104,6 +104,14 @@ pub trait SchemaProfile: Send + Sync {
         &[]
     }
 
+    /// The JSON "tail"/overflow column holding the un-promoted record body —
+    /// `ext` for UDM, `event` for OCSF. JSON extraction with no explicit,
+    /// schema-mapped source column (e.g. `spath`) targets this (NAN-1343). The
+    /// default reproduces UDM's `ext`; OCSF overrides it.
+    fn json_tail_column(&self) -> &'static str {
+        "ext"
+    }
+
     // --- Detection semantics ---
 
     /// Semantic-role → physical field, in priority order. Replaces the three
@@ -187,6 +195,22 @@ pub trait SchemaProfile: Send + Sync {
     /// raw-SQL builders; this exposes it to the `field_to_sql_expr` value/group
     /// seam so `stats count by src_host` sees the host wherever the class put it.
     fn class_split_value_sql(&self, _udm_field: &str) -> Option<String> {
+        None
+    }
+
+    /// The INDEXED unified physical column that materializes the
+    /// [`class_split_value_sql`](Self::class_split_value_sql) union for a class-
+    /// split concept (NAN-1333). The inline `if(primary != s, primary, fallback)`
+    /// value-pick is opaque to every skip index, so a filter on it full-scans;
+    /// the active profile may materialize the same union into one plain column
+    /// (with a words text index) and return its name here so the codegen emits the
+    /// indexed column instead — restoring granule pruning while preserving the
+    /// exact union semantics. Returns `Some(col)` only for split concepts that
+    /// HAVE such a column.
+    ///
+    /// Default: `None` — UDM has no class-split, so all UDM codegen paths keep
+    /// their single-column resolution byte-identical. OCSF overrides this.
+    fn class_split_column(&self, _udm_field: &str) -> Option<String> {
         None
     }
 

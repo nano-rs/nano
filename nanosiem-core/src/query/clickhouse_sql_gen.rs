@@ -611,6 +611,9 @@ pub(super) fn extract_prewhere_conditions(expr: &SearchExpr, profile: &dyn Schem
                 // a silent under-match. The `if(...)` is not a clean indexed equality,
                 // so leave class-split fields entirely to WHERE. UDM never class-splits
                 // → no-op, PREWHERE byte-identical.
+                // NAN-1333 FOLLOW-UP: the unified `<col>_unified` column IS a clean
+                // indexed equality and could be promoted to PREWHERE here; deferred —
+                // the words-index-in-WHERE already delivers the granule-pruning win.
                 if profile.class_split_value_sql(normalized).is_some() {
                     return;
                 }
@@ -748,6 +751,14 @@ pub struct ClickHouseSqlGenerator {
     /// it collides with a "known metadata" field (e.g. `risk_factors` after a
     /// `| risk` command). (NAN-1236)
     computed_fields: RwLock<HashSet<String>>,
+    /// Reference-side aliases for UN-aliased aggregations (NAN-1339): an
+    /// un-aliased `avg(bytes_in)` outputs a column literally named `avg`
+    /// (`Aggregation::output_alias` fallback), but users following the
+    /// `values_`/`list_` convention reference it as `avg_bytes_in` — which
+    /// previously emitted a bare unknown identifier (Code 47). Maps
+    /// `{func}_{field}` → the actual output column. Renaming the output
+    /// itself would break saved content referencing the bare func name.
+    agg_reference_aliases: RwLock<std::collections::HashMap<String, String>>,
     /// Active schema profile (OCSF Phase 2). Defaults to [`UdmProfile`] so the
     /// ~79 `::new()` / `::with_table()` construction sites keep today's exact
     /// behavior; OCSF deployments inject an `OcsfProfile` via [`with_profile`].
@@ -764,6 +775,7 @@ impl Clone for ClickHouseSqlGenerator {
             max_mvexpand_rows: self.max_mvexpand_rows,
             generation_time_range: RwLock::new(None),
             computed_fields: RwLock::new(HashSet::new()),
+            agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
             profile: Arc::clone(&self.profile),
         }
     }
@@ -785,6 +797,7 @@ impl ClickHouseSqlGenerator {
             max_mvexpand_rows: DEFAULT_MAX_MVEXPAND_ROWS,
             generation_time_range: RwLock::new(None),
             computed_fields: RwLock::new(HashSet::new()),
+            agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
             profile: Arc::new(UdmProfile::new()),
         }
     }
@@ -798,6 +811,7 @@ impl ClickHouseSqlGenerator {
             max_mvexpand_rows: DEFAULT_MAX_MVEXPAND_ROWS,
             generation_time_range: RwLock::new(None),
             computed_fields: RwLock::new(HashSet::new()),
+            agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
             profile: Arc::new(UdmProfile::new()),
         }
     }
@@ -845,6 +859,16 @@ impl ClickHouseSqlGenerator {
     /// the OCSF class put it.
     pub(crate) fn class_split_value_sql(&self, field: &str) -> Option<String> {
         self.profile.class_split_value_sql(field)
+    }
+
+    /// The INDEXED unified column that materializes the `class_split_value_sql`
+    /// union for a class-split concept (`&self` wrapper over
+    /// `profile.class_split_column()`, NAN-1333). When `Some`, the value/group/sort
+    /// and filter seams emit `escape_identifier(col)` — a plain words-index-prunable
+    /// column reference — instead of the skip-index-opaque inline `if(...)`. `None`
+    /// for UDM (no split → byte-identical) and for non-split / native fields.
+    pub(crate) fn class_split_column(&self, field: &str) -> Option<String> {
+        self.profile.class_split_column(field)
     }
 
     /// Whether `field` belongs to the active profile's field universe (`&self`
@@ -919,6 +943,15 @@ impl ClickHouseSqlGenerator {
     ///
     /// [`field_access_expr`]: ClickHouseSqlGenerator::field_access_expr
     pub(crate) fn filter_field_expr(&self, field: &str, json_type: &str) -> String {
+        // NAN-1333: prefer the INDEXED unified column (which materializes the exact
+        // same union) so the WHERE predicate prunes via the words index instead of
+        // full-scanning the opaque inline `if(...)`. Falls back to the value-pick
+        // `if(...)` if a split concept has no materialized column, then to the plain
+        // field access for non-split fields. UDM never class-splits → both lookups
+        // are `None` → byte-identical bare column.
+        if let Some(col) = self.profile.class_split_column(field) {
+            return escape_identifier(&col);
+        }
         self.profile
             .class_split_value_sql(field)
             .unwrap_or_else(|| self.field_access_expr(field, json_type))
@@ -928,10 +961,53 @@ impl ClickHouseSqlGenerator {
     /// alias, risk, …) and is therefore a real column in the current scope —
     /// rather than a value to extract from the `metadata`/`ext` JSON. Populated
     /// for the duration of [`generate_with_options`]. (NAN-1236)
+    /// Expand a `table`/`fields` wildcard pattern against the schema's
+    /// explicit columns AND the pipeline's computed fields (rex captures,
+    /// spath outputs, eval/stats aliases) — the static-only expansion made
+    /// `table ext_*` after a spath silently expand to NOTHING, emitting an
+    /// empty SELECT list (CH Code 62 syntax error, NAN-1339).
+    pub(crate) fn expand_wildcard(&self, pattern: &str) -> Vec<String> {
+        let mut cols = expand_wildcard_pattern(pattern);
+        if !is_wildcard_pattern(pattern) {
+            return cols;
+        }
+        let regex_pattern = format!("^{}$", regex::escape(pattern).replace("\\*", ".*"));
+        if let Ok(re) = regex::Regex::new(&regex_pattern) {
+            let computed: Vec<String> = match self.computed_fields.read() {
+                Ok(guard) => guard.iter().filter(|f| re.is_match(f)).cloned().collect(),
+                Err(poisoned) => poisoned
+                    .get_ref()
+                    .iter()
+                    .filter(|f| re.is_match(f))
+                    .cloned()
+                    .collect(),
+            };
+            let mut computed = computed;
+            computed.sort();
+            for c in computed {
+                if !cols.contains(&c) {
+                    cols.push(c);
+                }
+            }
+        }
+        cols
+    }
+
     pub(crate) fn is_computed_field(&self, field: &str) -> bool {
         match self.computed_fields.read() {
             Ok(guard) => guard.contains(field),
             Err(poisoned) => poisoned.get_ref().contains(field),
+        }
+    }
+
+    /// Resolve a `{func}_{field}` reference to the actual output column of an
+    /// UN-aliased aggregation earlier in this pipeline (NAN-1339). Returns
+    /// `None` for everything else — including names an explicit alias already
+    /// owns (real columns win at population time).
+    pub(crate) fn agg_reference_alias(&self, field: &str) -> Option<String> {
+        match self.agg_reference_aliases.read() {
+            Ok(guard) => guard.get(field).cloned(),
+            Err(poisoned) => poisoned.get_ref().get(field).cloned(),
         }
     }
 
@@ -970,13 +1046,28 @@ impl ClickHouseSqlGenerator {
         // aliases, …) so `field_to_sql_expr` references them as real columns
         // instead of JSON-extracting from `metadata`/`ext` (NAN-1236).
         let computed = field_analysis::collect_computed_field_names(query);
+        let agg_aliases = field_analysis::collect_agg_reference_aliases(query, &computed);
         match self.computed_fields.write() {
             Ok(mut guard) => *guard = computed,
             Err(poisoned) => *poisoned.into_inner() = computed,
         }
+        match self.agg_reference_aliases.write() {
+            Ok(mut guard) => *guard = agg_aliases,
+            Err(poisoned) => *poisoned.into_inner() = agg_aliases,
+        }
 
         let mut ctx = GeneratorContext::new(&self.table_name, time_range);
         ctx.use_cache = options.use_cache;
+        // With exactly ONE resolve_identity in the pipeline, the bare
+        // `identity_*` names are unambiguous — the stage emits them as extra
+        // aliases of the prefixed columns (NAN-1346 #5). Two resolved entities
+        // keep requiring the prefix.
+        ctx.single_resolve_identity = self
+            .collect_stages(query)
+            .iter()
+            .filter(|st| matches!(st, QueryStage::Command(Command::ResolveIdentity { .. })))
+            .count()
+            == 1;
         if let Some(limit) = options.limit {
             ctx.limit = limit;
         }
@@ -1136,6 +1227,25 @@ impl ClickHouseSqlGenerator {
         stages: &[QueryStage],
         ctx: &mut GeneratorContext,
     ) -> Result<String, SqlGenError> {
+        // `asset` renders a terminal dossier view (DisplayType::Asset, built in
+        // post-processing) — it is not a columnar transform, and its rendered
+        // attributes (asset_criticality, …) are not pipeline fields. A command
+        // piped after it (`| asset X | where asset_criticality …`) previously
+        // fell through to ext JSON extraction and failed at execution or
+        // silently matched nothing (NAN-1346 #5). Refuse with guidance.
+        if let Some(pos) = stages
+            .iter()
+            .position(|st| matches!(st, QueryStage::Command(Command::Asset { .. })))
+        {
+            if pos != stages.len() - 1 {
+                return Err(SqlGenError::InvalidQuery(
+                    "asset renders an asset dossier and must be the last command in the \
+                     query. Filter and shape results before it (e.g. `src_host=server-01 \
+                     | where ... | asset`)"
+                        .to_string(),
+                ));
+            }
+        }
         let mut sql = String::from("WITH ");
         let mut cte_parts = Vec::new();
         let mut last_stage_has_ordering = false;
@@ -1168,7 +1278,26 @@ impl ClickHouseSqlGenerator {
                 // list (e.g. process_guid/parent_process_guid) — adding them again would
                 // produce a duplicate column in `SELECT *, ...` (NAN-1147).
                 for f in [parent_field, child_field] {
-                    if !self.profile.materialized_columns().contains(&f.as_str()) {
+                    // A parent-less positional `tree <field>` carries an empty
+                    // parent_field — generation refuses it later (commands.rs),
+                    // but never emit an empty identifier into the select list.
+                    // A field the profile maps to a DIFFERENT column (an OCSF
+                    // class-split concept or a UDM alias like
+                    // parent_process_guid → "actor.process.uid") must not be
+                    // injected raw either — the resolved column is already in
+                    // the wide base clause, and the raw name does not exist on
+                    // the table (NAN-1346 #5). UDM resolves every known field
+                    // to itself, so this is byte-identical there.
+                    let maps_elsewhere = self.class_split_column(f).is_some()
+                        || matches!(
+                            self.profile.resolve(f),
+                            FieldResolution::ExplicitColumn(ref c) if c != f
+                        )
+                        || matches!(self.profile.resolve(f), FieldResolution::JsonPath { .. });
+                    if !f.is_empty()
+                        && !maps_elsewhere
+                        && !self.profile.materialized_columns().contains(&f.as_str())
+                    {
                         materialized_cols.push(escape_identifier(f));
                     }
                 }
@@ -1283,7 +1412,7 @@ impl ClickHouseSqlGenerator {
                         }
                         _ => {}
                     }
-                    self.generate_command_cte(&cte_name, &prev_cte, cmd, ctx)?
+                    self.generate_command_cte(&cte_name, &prev_cte, cmd, ctx, &stages[..i])?
                 }
             };
             cte_parts.push(cte_sql);
@@ -1296,7 +1425,20 @@ impl ClickHouseSqlGenerator {
         // CTE final SELECT operates on already-filtered/aggregated data,
         // so optimize_read_in_order is irrelevant here (pass false).
         let last_cte = format!("stage_{}", stages.len() - 1);
-        let settings = generate_settings(ctx.use_cache, false, has_non_timechart_aggregation);
+        let mut settings = generate_settings(ctx.use_cache, false, has_non_timechart_aggregation);
+        // An append UNION can produce Variant-typed columns when the arms carry
+        // different types under the same name (e.g. a numeric group-by column
+        // unioned with an eval'd string literal). ClickHouse rejects ORDER
+        // BY/GROUP BY on Variant/Dynamic by default — opt in for append
+        // queries only, matching append's type-loose union semantics.
+        if stages
+            .iter()
+            .any(|s| matches!(s, QueryStage::Command(Command::Append { .. })))
+        {
+            settings.push_str(
+                ", allow_suspicious_types_in_order_by=1, allow_suspicious_types_in_group_by=1",
+            );
+        }
 
         // NAN-876: stage_0 preserves the physical `action` column for
         // downstream stages, so the last CTE may still carry it alongside
@@ -1330,12 +1472,17 @@ impl ClickHouseSqlGenerator {
     }
 
     /// Generate a CTE for a command stage
+    ///
+    /// `prior_stages` is the pipeline prefix feeding this stage (everything
+    /// before the current command) — `append` uses it to compute the main
+    /// side's output shape so the UNION arms can be column-aligned.
     fn generate_command_cte(
         &self,
         cte_name: &str,
         source_cte: &str,
         cmd: &Command,
         ctx: &mut GeneratorContext,
+        prior_stages: &[QueryStage],
     ) -> Result<String, SqlGenError> {
         // Handle join specially since it needs to generate subsearch SQL
         if let Command::Join {
@@ -1356,7 +1503,8 @@ impl ClickHouseSqlGenerator {
         // Handle append specially - UNION ALL with subsearch
         if let Command::Append { subsearch, maxout } = cmd {
             let limit = resolve_subsearch_limit(*maxout);
-            let inner_sql = self.generate_append_sql(source_cte, subsearch, limit, ctx)?;
+            let inner_sql =
+                self.generate_append_sql(source_cte, subsearch, limit, ctx, prior_stages)?;
             return Ok(format!("{} AS (\n{}\n)", cte_name, inner_sql));
         }
 
@@ -1365,21 +1513,248 @@ impl ClickHouseSqlGenerator {
     }
 
     /// Generate SQL for an APPEND command (UNION ALL)
+    ///
+    /// ClickHouse `UNION ALL` is positional: both arms must produce the same
+    /// number of columns, in the same order. nPL's `append` instead aligns
+    /// by name and pads missing columns with null. To match that, when both
+    /// sides have a statically known projection (`stats`/`chart`/`table`/…)
+    /// the arms are re-projected onto the name-union of their columns with
+    /// `NULL AS <col>` padding (NAN-1346 #3). When both sides are unprojected
+    /// passthroughs they share the identical base select clause (see
+    /// [`generate_subsearch_sql`]) so the positional union is already aligned.
+    /// Any other mix (raw events + aggregate, or a command whose output shape
+    /// isn't modeled) can't be aligned — return an actionable error instead of
+    /// letting ClickHouse fail with a bare Code 53 TYPE_MISMATCH.
     fn generate_append_sql(
         &self,
         source_cte: &str,
         subsearch: &Query,
         limit: usize,
         ctx: &GeneratorContext,
+        prior_stages: &[QueryStage],
     ) -> Result<String, SqlGenError> {
         // Generate the subsearch SQL
         let subsearch_sql = self.generate_subsearch_sql(subsearch, ctx, limit)?;
 
-        // UNION ALL combines results from main query and subsearch
-        Ok(format!(
-            "  SELECT * FROM {}\n  UNION ALL\n{}",
-            source_cte, subsearch_sql
-        ))
+        let main_shape = self.pipeline_output_shape(prior_stages);
+        let sub_shape = self.pipeline_output_shape(&self.collect_stages(subsearch));
+
+        match (main_shape, sub_shape) {
+            (OutputShape::Columns(main_cols), OutputShape::Columns(sub_cols)) => {
+                // Name-union, main side's order first, then subsearch-only columns
+                let mut union_cols = main_cols.clone();
+                for c in &sub_cols {
+                    if !union_cols.contains(c) {
+                        union_cols.push(c.clone());
+                    }
+                }
+                let project = |side: &[String]| -> String {
+                    union_cols
+                        .iter()
+                        .map(|c| {
+                            if side.contains(c) {
+                                escape_identifier(c)
+                            } else {
+                                format!("NULL AS {}", escape_identifier(c))
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                // The subsearch SQL is either a bare SELECT (single-stage) or
+                // already parenthesized (multi-stage) — normalize to a
+                // parenthesized table expression.
+                let trimmed = subsearch_sql.trim();
+                let sub_expr = if trimmed.starts_with('(') {
+                    trimmed.to_string()
+                } else {
+                    format!("({})", trimmed)
+                };
+                Ok(format!(
+                    "  SELECT {} FROM {}\n  UNION ALL\n  SELECT {} FROM {} AS _append_sub",
+                    project(&main_cols),
+                    source_cte,
+                    project(&sub_cols),
+                    sub_expr
+                ))
+            }
+            (OutputShape::Wide(main_extra), OutputShape::Wide(sub_extra))
+                if main_extra == sub_extra =>
+            {
+                // Both sides are passthroughs over the same base select clause
+                // (plus identical eval/rename extras) — positionally aligned.
+                Ok(format!(
+                    "  SELECT * FROM {}\n  UNION ALL\n{}",
+                    source_cte, subsearch_sql
+                ))
+            }
+            _ => Err(SqlGenError::UnsupportedOperation(
+                "append: the main search and the appended subsearch produce different result \
+                 shapes that cannot be combined. Aggregate or project explicit fields on both \
+                 sides (e.g. end each with `stats ...` or `table ...`) so append can align \
+                 their columns"
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// Compute the statically known output shape of a pipeline stage prefix.
+    ///
+    /// Used by `append` to align UNION arms (see [`generate_append_sql`]).
+    /// Conservative by design: commands whose output projection isn't modeled
+    /// here yield [`OutputShape::Unknown`], which makes `append` refuse with an
+    /// actionable error rather than emit a misaligned UNION. Column names must
+    /// match what the corresponding SQL generators alias their outputs to:
+    /// `stats`/`chart` alias group-bys to `normalize_field_name(f)` and
+    /// aggregations to `Aggregation::output_alias()` (aggregation.rs);
+    /// `table`/`fields` alias to the requested name (commands.rs).
+    fn pipeline_output_shape(&self, stages: &[QueryStage]) -> OutputShape {
+        let mut shape = OutputShape::Unknown;
+        for stage in stages {
+            match stage {
+                QueryStage::Search(_) => shape = OutputShape::Wide(Vec::new()),
+                QueryStage::Command(cmd) => {
+                    shape = match cmd {
+                        // Row filters / reorderings — projection unchanged
+                        Command::Where { .. }
+                        | Command::Sort { .. }
+                        | Command::Head { .. }
+                        | Command::Tail { .. }
+                        | Command::Reverse
+                        | Command::Dedup { .. } => shape,
+                        Command::Stats {
+                            aggregations,
+                            group_by,
+                        }
+                        | Command::Chart {
+                            aggregations,
+                            group_by,
+                        } => {
+                            let mut cols: Vec<String> = group_by
+                                .as_deref()
+                                .unwrap_or(&[])
+                                .iter()
+                                .map(|f| normalize_field_name(f).to_string())
+                                .collect();
+                            cols.extend(aggregations.iter().map(|a| a.output_alias()));
+                            OutputShape::Columns(cols)
+                        }
+                        // eval/rename emit `SELECT *, expr AS name` — appended columns
+                        Command::Eval { assignments } => {
+                            let mut cur = shape;
+                            for a in assignments {
+                                match &mut cur {
+                                    OutputShape::Wide(extra) => {
+                                        if !extra.contains(&a.field) {
+                                            extra.push(a.field.clone());
+                                        }
+                                    }
+                                    OutputShape::Columns(cols) => {
+                                        if !cols.contains(&a.field) {
+                                            cols.push(a.field.clone());
+                                        }
+                                    }
+                                    OutputShape::Unknown => {}
+                                }
+                            }
+                            cur
+                        }
+                        Command::Rename { mappings } => {
+                            let mut cur = shape;
+                            for m in mappings {
+                                match &mut cur {
+                                    OutputShape::Wide(extra) => {
+                                        if !extra.contains(&m.to) {
+                                            extra.push(m.to.clone());
+                                        }
+                                    }
+                                    OutputShape::Columns(cols) => {
+                                        if !cols.contains(&m.to) {
+                                            cols.push(m.to.clone());
+                                        }
+                                    }
+                                    OutputShape::Unknown => {}
+                                }
+                            }
+                            cur
+                        }
+                        Command::Table { fields } => {
+                            // Wildcard patterns expand against live columns —
+                            // not statically known here
+                            if fields.iter().any(|f| f.name.contains('*')) {
+                                OutputShape::Unknown
+                            } else {
+                                OutputShape::Columns(
+                                    fields
+                                        .iter()
+                                        .map(|f| f.alias.clone().unwrap_or_else(|| f.name.clone()))
+                                        .collect(),
+                                )
+                            }
+                        }
+                        Command::Fields { keep: true, fields } => {
+                            if fields.iter().any(|f| f.contains('*')) {
+                                OutputShape::Unknown
+                            } else {
+                                OutputShape::Columns(fields.clone())
+                            }
+                        }
+                        // A join with a known sub shape projects `main.*` plus
+                        // the sub's non-key columns under bare names (see
+                        // generate_join_sql) — model it like eval-added columns.
+                        Command::Join {
+                            subsearch, fields, ..
+                        } => {
+                            let sub = self.pipeline_output_shape(&self.collect_stages(subsearch));
+                            let key_names: Vec<String> = fields
+                                .iter()
+                                .map(|f| normalize_field_name(f).to_string())
+                                .collect();
+                            match (shape, sub) {
+                                (OutputShape::Wide(mut e), OutputShape::Columns(s)) => {
+                                    for c in s {
+                                        if !key_names.contains(&c) && !e.contains(&c) {
+                                            e.push(c);
+                                        }
+                                    }
+                                    OutputShape::Wide(e)
+                                }
+                                (OutputShape::Columns(mut m), OutputShape::Columns(s)) => {
+                                    for c in s {
+                                        if !key_names.contains(&c) && !m.contains(&c) {
+                                            m.push(c);
+                                        }
+                                    }
+                                    OutputShape::Columns(m)
+                                }
+                                _ => OutputShape::Unknown,
+                            }
+                        }
+                        // A nested append: combine shapes the same way the
+                        // generated UNION does
+                        Command::Append { subsearch, .. } => {
+                            let sub = self.pipeline_output_shape(&self.collect_stages(subsearch));
+                            match (shape, sub) {
+                                (OutputShape::Columns(mut m), OutputShape::Columns(s)) => {
+                                    for c in s {
+                                        if !m.contains(&c) {
+                                            m.push(c);
+                                        }
+                                    }
+                                    OutputShape::Columns(m)
+                                }
+                                (OutputShape::Wide(m), OutputShape::Wide(s)) if m == s => {
+                                    OutputShape::Wide(m)
+                                }
+                                _ => OutputShape::Unknown,
+                            }
+                        }
+                        _ => OutputShape::Unknown,
+                    };
+                }
+            }
+        }
+        shape
     }
 
     /// Generate SQL for a JOIN command
@@ -1413,28 +1788,86 @@ impl ClickHouseSqlGenerator {
             JoinType::Outer => "FULL OUTER JOIN",
         };
 
-        // For max > 1, use ROW_NUMBER to limit matches per key
-        if max > 1 {
-            let partition_fields: Vec<String> = fields
-                .iter()
-                .map(|f| escape_identifier(normalize_field_name(f)))
-                .collect();
-            Ok(format!(
-                "  SELECT * FROM {} AS main\n  {} (\n    SELECT *, ROW_NUMBER() OVER (PARTITION BY {} ORDER BY timestamp) AS _join_rn\n    FROM ({})\n  ) AS sub ON {} AND sub._join_rn <= {}",
-                source_cte,
-                join_keyword,
-                partition_fields.join(", "),
-                subsearch_sql,
-                join_condition,
-                max
-            ))
-        } else {
-            // Standard join with max=1 (default behavior)
-            Ok(format!(
-                "  SELECT * FROM {} AS main\n  {} (\n{}\n  ) AS sub ON {}",
-                source_cte, join_keyword, subsearch_sql, join_condition
-            ))
-        }
+        // Join semantics: events without the join field never match. An
+        // empty/NULL key on the subsearch side would otherwise equi-join every
+        // empty-keyed main row against every empty-keyed sub row — a hash-join
+        // row explosion that OOMs on real data (NAN-1346 #4). Evict them from
+        // the sub side; LEFT-join main rows with empty keys simply get no match.
+        // (toString of a NULL key yields NULL, which is falsy in WHERE.)
+        let sub_key_filter = fields
+            .iter()
+            .map(|f| {
+                format!(
+                    "toString({}) != ''",
+                    escape_identifier(normalize_field_name(f))
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
+
+        // `join` matches at most `max` subsearch results per join key (default 1).
+        // The old SQL only enforced this for max > 1, via a
+        // `ROW_NUMBER() OVER (… ORDER BY timestamp)` window — which broke on
+        // aggregated subsearches (no `timestamp` column → the ClickHouse
+        // analyzer resolved it from the OUTER query and rejected the join as a
+        // correlated subquery, Code 48), and for the default max=1 the join was
+        // unbounded many-to-many, exploding memory when sub keys repeat
+        // (NAN-1346 #4). Use ClickHouse-native `LIMIT {max} BY {keys}` on the
+        // sub side instead: no window, no `_join_rn` leaking into `SELECT *`
+        // output, and first-in-time selection when the subsearch still carries
+        // `timestamp` (an aggregated subsearch has one row per key anyway).
+        let key_list = fields
+            .iter()
+            .map(|f| escape_identifier(normalize_field_name(f)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sub_shape = self.pipeline_output_shape(&self.collect_stages(subsearch));
+        let sub_order = match &sub_shape {
+            OutputShape::Wide(_) => "\n    ORDER BY timestamp",
+            OutputShape::Columns(cols) if cols.iter().any(|c| c == "timestamp") => {
+                "\n    ORDER BY timestamp"
+            }
+            _ => "",
+        };
+        // When the subsearch's output columns are known, project `main.*` plus
+        // the sub's non-key columns under their bare names. A bare `SELECT *`
+        // over the join emits the sub's columns as literal `sub.<col>`
+        // duplicates — a later CHAINED join's `ON main.k = sub.k` then binds
+        // `sub.k` to the prior stage's "sub.k" column instead of the new sub
+        // table (Code 403 INVALID_JOIN_ON_EXPRESSION), and downstream stages
+        // can't reference the bare name. Join keys are already in `main.*`.
+        let select_clause = match &sub_shape {
+            OutputShape::Columns(cols) => {
+                let key_names: Vec<&str> =
+                    fields.iter().map(|f| normalize_field_name(f)).collect();
+                let sub_cols: Vec<String> = cols
+                    .iter()
+                    .filter(|c| !key_names.contains(&c.as_str()))
+                    .map(|c| {
+                        let escaped = escape_identifier(c);
+                        format!("sub.{} AS {}", escaped, escaped)
+                    })
+                    .collect();
+                if sub_cols.is_empty() {
+                    "main.*".to_string()
+                } else {
+                    format!("main.*, {}", sub_cols.join(", "))
+                }
+            }
+            _ => "*".to_string(),
+        };
+        Ok(format!(
+            "  SELECT {} FROM {} AS main\n  {} (\n    SELECT * FROM (\n{}\n    ) WHERE {}{}\n    LIMIT {} BY {}\n  ) AS sub ON {}",
+            select_clause,
+            source_cte,
+            join_keyword,
+            subsearch_sql,
+            sub_key_filter,
+            sub_order,
+            max,
+            key_list,
+            join_condition
+        ))
     }
 
     /// Generate SQL for a subsearch (used by join/append)
@@ -1452,6 +1885,16 @@ impl ClickHouseSqlGenerator {
             return Err(SqlGenError::EmptyQuery);
         }
 
+        // Base select clause for the subsearch's table scan. MUST be the same
+        // clause the main pipeline's stage_0 uses (generate_cte_query): a bare
+        // `SELECT *` omits MATERIALIZED columns (ClickHouse excludes them from
+        // `*`), so a subsearch `stats by <materialized col>` hits Code 47, and
+        // an append of two passthroughs ends up with mismatched UNION arms
+        // (NAN-1346 #3). With append/join present, field analysis sets
+        // needs_all, so this is the full wide clause on both sides.
+        let base_select =
+            self.build_select_clause_with_options(&ctx.required_fields, &ctx.ext_fields, true);
+
         // For single-stage subsearch (just a search), generate inline with LIMIT
         if stages.len() == 1 {
             if let QueryStage::Search(expr) = &stages[0] {
@@ -1464,7 +1907,8 @@ impl ClickHouseSqlGenerator {
                 };
                 // Use PREWHERE for time filter + indexed field equality checks
                 return Ok(format!(
-                    "    SELECT * FROM {}\n    PREWHERE timestamp BETWEEN '{}' AND '{}'{}\n    WHERE ({})\n    LIMIT {}",
+                    "    SELECT {} FROM {}\n    PREWHERE timestamp BETWEEN '{}' AND '{}'{}\n    WHERE ({})\n    LIMIT {}",
+                    base_select,
                     ctx.table_name,
                     ctx.time_range.start.format("%Y-%m-%d %H:%M:%S%.6f"),
                     ctx.time_range.end.format("%Y-%m-%d %H:%M:%S%.6f"),
@@ -1490,7 +1934,8 @@ impl ClickHouseSqlGenerator {
                     };
                     // Use PREWHERE for time filter + indexed field equality checks
                     current_sql = format!(
-                        "SELECT * FROM {} PREWHERE timestamp BETWEEN '{}' AND '{}'{} WHERE ({})",
+                        "SELECT {} FROM {} PREWHERE timestamp BETWEEN '{}' AND '{}'{} WHERE ({})",
+                        base_select,
                         ctx.table_name,
                         ctx.time_range.start.format("%Y-%m-%d %H:%M:%S%.6f"),
                         ctx.time_range.end.format("%Y-%m-%d %H:%M:%S%.6f"),
@@ -1508,15 +1953,33 @@ impl ClickHouseSqlGenerator {
                         ..
                     } = cmd
                     {
-                        let extra_cols = format!(
-                            ", {}, {}",
-                            escape_identifier(parent_field),
-                            escape_identifier(child_field)
-                        );
-                        if !current_sql.contains(&escape_identifier(parent_field)) {
+                        // Only inject fields that resolve to themselves on the
+                        // active profile — a class-split concept or mapped UDM
+                        // alias (parent_process_guid → "actor.process.uid") is
+                        // already carried by the wide base clause, and the raw
+                        // name does not exist on the table (NAN-1346 #5).
+                        let inject: Vec<String> = [parent_field, child_field]
+                            .into_iter()
+                            .filter(|f| {
+                                // Exclude only fields the profile maps ELSEWHERE;
+                                // Unknown (UDM ext) fields keep the old raw injection.
+                                !f.is_empty()
+                                    && self.class_split_column(f).is_none()
+                                    && !matches!(
+                                        self.profile.resolve(f),
+                                        FieldResolution::ExplicitColumn(ref c) if c != *f
+                                    )
+                                    && !matches!(
+                                        self.profile.resolve(f),
+                                        FieldResolution::JsonPath { .. }
+                                    )
+                            })
+                            .map(|f| escape_identifier(f).to_string())
+                            .collect();
+                        if !inject.is_empty() && !current_sql.contains(&inject[0]) {
                             current_sql = current_sql.replacen(
                                 "SELECT *",
-                                &format!("SELECT *{}", extra_cols),
+                                &format!("SELECT *, {}", inject.join(", ")),
                                 1,
                             );
                         }
@@ -1530,10 +1993,14 @@ impl ClickHouseSqlGenerator {
             }
         }
 
-        // Apply subsearch limit to the final multi-stage subsearch output
-        // LIMIT must be inside the parens so it's valid when used as a JOIN/subquery source
+        // Apply subsearch limit to the final multi-stage subsearch output.
+        // LIMIT must be inside the parens so it's valid when used as a
+        // JOIN/subquery source, and the stage SQL is wrapped in its own
+        // subquery first — the last stage may already end in a LIMIT
+        // (`head`/`sort`), and `... LIMIT 5 LIMIT 10000` is a syntax error
+        // (NAN-1346 #3).
         Ok(format!(
-            "    ({} LIMIT {})",
+            "    (SELECT * FROM ({}) LIMIT {})",
             current_sql.replace('\n', "\n    "),
             limit
         ))
@@ -1709,7 +2176,17 @@ impl ClickHouseSqlGenerator {
                 let mut field_exprs: Vec<String> = field_list
                     .iter()
                     .map(|field| {
-                        if self.resolves_to_column(field) {
+                        if let Some(unified) = self.class_split_column(field) {
+                            // NAN-1337: a class-split concept (src_host / process_name /
+                            // user / url) must project its INDEXED unified column
+                            // (`<field>_unified`) — the SAME column the value/group/sort
+                            // seam (`by_field_sql`) references in later stages — so a
+                            // `stats by src_host` GROUP BY binds to it here. Projecting the
+                            // class-split *primary* (`src_endpoint.hostname`) instead left
+                            // the later `GROUP BY src_host_unified` with nothing to bind →
+                            // CH Code 47. UDM never class-splits → `None` → byte-identical.
+                            escape_identifier(&unified)
+                        } else if self.resolves_to_column(field) {
                             // Resolve to the PHYSICAL column (NAN-1248): under OCSF a
                             // UDM-semantic required field (`src_ip`) must project the
                             // promoted column (`"src_endpoint.ip"`), not a bare `src_ip`
@@ -1780,7 +2257,7 @@ impl ClickHouseSqlGenerator {
     /// Generate SQL for a command (public API without context tracking)
     pub fn generate_command_sql(&self, source: &str, cmd: &Command) -> Result<String, SqlGenError> {
         let mut no_ctx: Option<HashSet<String>> = None;
-        self.generate_command_sql_inner(source, cmd, &mut no_ctx, None, false, false)
+        self.generate_command_sql_inner(source, cmd, &mut no_ctx, None, false, false, false)
     }
 
     fn generate_command_sql_with_ctx(
@@ -1798,6 +2275,7 @@ impl ClickHouseSqlGenerator {
             Some(sparkline_span),
             has_prior_risk,
             ctx.aggregated,
+            ctx.single_resolve_identity,
         );
         if matches!(cmd, Command::Risk { .. }) {
             ctx.has_prior_risk = true;
@@ -1837,6 +2315,19 @@ pub(super) enum QueryStage<'a> {
     Command(&'a Command),
 }
 
+/// Statically known output projection of a pipeline prefix — used by `append`
+/// to align its UNION arms (see `generate_append_sql`).
+#[derive(Debug, Clone, PartialEq)]
+enum OutputShape {
+    /// Still `SELECT *`-shaped over the base select clause; the Vec holds
+    /// extra columns appended by eval/rename, in order.
+    Wide(Vec<String>),
+    /// Explicit projection (stats/chart/table/fields), output names in order.
+    Columns(Vec<String>),
+    /// Not statically modeled — append refuses to align this.
+    Unknown,
+}
+
 /// Context for SQL generation
 struct GeneratorContext<'a> {
     table_name: &'a str,
@@ -1856,6 +2347,9 @@ struct GeneratorContext<'a> {
     available_columns: Option<HashSet<String>>,
     /// Whether a prior Risk command exists in the pipeline (for score accumulation)
     has_prior_risk: bool,
+    /// Whether the pipeline contains exactly one resolve_identity — the bare
+    /// `identity_*` aliases are only emitted when unambiguous (NAN-1346 #5).
+    single_resolve_identity: bool,
     /// Whether a prior aggregating command (stats/chart/timechart/top/rare/transaction/
     /// sequence/funnel/anomaly) has run — these GROUP BY and drop the raw `timestamp`
     /// column, so order-sensitive commands (tail/reverse) must not ORDER BY timestamp.
@@ -1874,6 +2368,7 @@ impl<'a> GeneratorContext<'a> {
             ext_fields: HashSet::new(),
             available_columns: None,
             has_prior_risk: false,
+            single_resolve_identity: false,
             aggregated: false,
         }
     }
@@ -2020,8 +2515,10 @@ mod tests {
     /// on endpoint/sysmon events) must GROUP BY / project the class-spanning value,
     /// not just the primary column — otherwise `stats count by src_host` buckets
     /// every endpoint event as empty (on local OCSF data the empty bucket held
-    /// 1.07M rows; the fix attributes them to their device host). The group key and
-    /// the SELECT projection must be the SAME `if(...)` expression.
+    /// 1.07M rows; the fix attributes them to their device host).
+    /// NAN-1333: the group key + projection now reference the INDEXED unified column
+    /// (`src_host_unified`), which materializes that same union — identical buckets,
+    /// but the words index can prune. Both SELECT and GROUP BY use the same column.
     #[test]
     fn ocsf_stats_by_class_split_host_groups_on_the_union() {
         use crate::schema::OcsfProfile;
@@ -2029,21 +2526,25 @@ mod tests {
         let gen = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()));
         let query = parse_query("* | stats count by src_host").unwrap();
         let sql = gen.generate(&query, &time_range()).unwrap();
-        let union = "if(\"src_endpoint.hostname\" != '', \"src_endpoint.hostname\", \"device.hostname\")";
         assert!(
-            sql.contains(&format!("SELECT {union} AS src_host")),
-            "OCSF `stats by src_host` must PROJECT the class-spanning union, got:\n{sql}"
+            sql.contains("SELECT src_host_unified AS src_host"),
+            "OCSF `stats by src_host` must PROJECT the indexed unified column, got:\n{sql}"
         );
         assert!(
-            sql.contains(&format!("GROUP BY {union}")),
-            "OCSF `stats by src_host` must GROUP BY the same union expression, got:\n{sql}"
+            sql.contains("GROUP BY src_host_unified"),
+            "OCSF `stats by src_host` must GROUP BY the same unified column, got:\n{sql}"
+        );
+        // No inline `if(...)` union should leak into the projection/group anymore.
+        assert!(
+            !sql.contains("if(\"src_endpoint.hostname\""),
+            "OCSF `stats by src_host` must not emit the skip-index-opaque if(...), got:\n{sql}"
         );
         // The other class-split concepts go through the same seam (consistency).
         let q2 = parse_query("* | stats count by user").unwrap();
         let sql2 = gen.generate(&q2, &time_range()).unwrap();
         assert!(
-            sql2.contains("GROUP BY if(\"user.name\" != '', \"user.name\", \"actor.user.name\")"),
-            "OCSF `stats by user` must group on the class-spanning union, got:\n{sql2}"
+            sql2.contains("GROUP BY user_unified"),
+            "OCSF `stats by user` must group on the indexed unified column, got:\n{sql2}"
         );
     }
 
@@ -2067,38 +2568,50 @@ mod tests {
     }
 
     /// NAN-1321: an OCSF search FILTER on a class-split concept (`src_host="x"`)
-    /// must match the value-pick `if(...)` (so it finds the host on `device.hostname`
-    /// endpoint events), and must NOT promote the primary column to PREWHERE — that
-    /// would pre-filter to `src_endpoint.hostname = x` and silently drop every
-    /// device-host row before WHERE. Validated end-to-end on live OCSF CH: 39 → 464.
+    /// must match the union (so it finds the host on `device.hostname` endpoint
+    /// events), and must NOT promote the primary column to PREWHERE — that would
+    /// pre-filter to `src_endpoint.hostname = x` and silently drop every device-host
+    /// row before WHERE. Validated end-to-end on live OCSF CH: 39 → 464.
+    /// NAN-1333: the WHERE predicate now references the INDEXED unified column
+    /// (`src_host_unified`) instead of the inline value-pick `if(...)`, so the words
+    /// index prunes granules (prototype: 640/640 → 294/640, identical match counts).
     #[test]
     fn ocsf_filter_on_class_split_host_uses_value_pick_and_skips_prewhere() {
         use crate::schema::OcsfProfile;
         use std::sync::Arc;
         let gen = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()));
-        let union = "if(\"src_endpoint.hostname\" != '', \"src_endpoint.hostname\", \"device.hostname\")";
+        let col = "src_host_unified";
 
-        // Equality: WHERE matches the value-pick; PREWHERE must not carry the host.
+        // Equality: WHERE matches the unified column; PREWHERE must not carry the host.
+        // NAN-1333: no `toString` wrapper — `lower(<col>_unified)` matches the words
+        // text index by expression and prunes (the toString form orphans the index).
         let sql = gen
             .generate(&parse_query("src_host=\"ws-01\"").unwrap(), &time_range())
             .unwrap();
         assert!(
-            sql.contains(&format!("lower(toString({union})) = 'ws-01'")),
-            "OCSF src_host= must filter on the value-pick, got:\n{sql}"
+            sql.contains(&format!("lower({col}) = 'ws-01'"))
+                && !sql.contains(&format!("lower(toString({col}))")),
+            "OCSF src_host= must filter on the unified column WITHOUT toString (index-matchable), got:\n{sql}"
+        );
+        // The skip-index-opaque inline if(...) must NOT appear in WHERE anymore.
+        assert!(
+            !sql.contains("if(\"src_endpoint.hostname\""),
+            "OCSF src_host= must not emit the inline if(...), got:\n{sql}"
         );
         let pw = prewhere_slice(&sql);
         assert!(
-            !pw.contains("src_endpoint.hostname") && !pw.contains("device.hostname"),
+            !pw.contains("src_endpoint.hostname") && !pw.contains("device.hostname")
+                && !pw.contains("src_host_unified"),
             "OCSF src_host= must NOT promote a host column to PREWHERE, got PREWHERE:\n{pw}"
         );
 
-        // Negation stays correct with the single expression (no De Morgan).
+        // Negation stays correct with the single column (no De Morgan).
         let sql_ne = gen
             .generate(&parse_query("src_host!=\"ws-01\"").unwrap(), &time_range())
             .unwrap();
         assert!(
-            sql_ne.contains(&format!("lower(toString({union})) != 'ws-01'")),
-            "OCSF src_host!= must negate the value-pick, got:\n{sql_ne}"
+            sql_ne.contains(&format!("lower({col}) != 'ws-01'")),
+            "OCSF src_host!= must negate the unified column, got:\n{sql_ne}"
         );
 
         // IN-list (the UDM alias is not a promoted column, so it must be routed
@@ -2107,8 +2620,8 @@ mod tests {
             .generate(&parse_query("src_host IN (\"a\",\"b\")").unwrap(), &time_range())
             .unwrap();
         assert!(
-            sql_in.contains(&format!("lower({union}) IN ('a', 'b')")),
-            "OCSF src_host IN must match the value-pick, got:\n{sql_in}"
+            sql_in.contains(&format!("lower({col}) IN ('a', 'b')")),
+            "OCSF src_host IN must match the unified column, got:\n{sql_in}"
         );
     }
 

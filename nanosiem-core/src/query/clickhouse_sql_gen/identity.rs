@@ -120,6 +120,14 @@ impl ClickHouseSqlGenerator {
         field: &str,
         max_age: &std::time::Duration,
         available_columns: &Option<HashSet<String>>,
+        // When the pipeline has exactly ONE resolve_identity, the bare
+        // `identity_*` names are unambiguous — emit them as extra aliases of
+        // the prefixed (`{entity}_identity_*`) canonical columns so a
+        // downstream `| where identity_department = …` works without the
+        // prefix (NAN-1346 #5). With two resolved entities the prefix stays
+        // required. The prefixed columns match the materialized enrichment
+        // columns and remain the canonical output.
+        emit_bare_aliases: bool,
     ) -> Result<String, SqlGenError> {
         let max_age_secs = max_age.as_secs();
         // Resolve the lookup key through the active profile so OCSF reads its
@@ -228,9 +236,22 @@ impl ClickHouseSqlGenerator {
             crate::schema::FieldResolution::ExplicitColumn(c) => crate::query::escape_identifier(&c),
             _ => "\"user\"".to_string(),
         };
+        // `field_access_expr` returns a plain (possibly quoted) column for
+        // promoted fields, but a JSONExtract EXPRESSION for unpromoted OCSF
+        // tail fields — prefixing that with `main.` produces
+        // `main.JSONExtractString(…)`, which ClickHouse rejects as an unknown
+        // function (Code 46, NAN-1346 #5). An expression's inner column refs
+        // (`event`) bind to `main` anyway: the joined `i` table carries none
+        // of the event columns. UDM always yields a plain identifier, so the
+        // qualified form is byte-identical there.
+        let main_field = if field_escaped.contains('(') {
+            field_escaped.clone()
+        } else {
+            format!("main.{}", field_escaped)
+        };
         let user_expr = if is_reverse {
             // user/hostname fields: the lookup key is directly on the event row
-            format!("lower(main.{})", field_escaped)
+            format!("lower({})", main_field)
         } else {
             // IP fields: the resolved user comes from identity_observations JOIN
             format!("lower(COALESCE(i.user, main.{}))", main_user_col)
@@ -255,6 +276,13 @@ impl ClickHouseSqlGenerator {
                     prefix = entity_prefix,
                     suffix = col_suffix,
                 ));
+                if emit_bare_aliases {
+                    dict_lookup_parts.push(format!(
+                        "main.{prefix}_{suffix} AS {suffix}",
+                        prefix = entity_prefix,
+                        suffix = col_suffix,
+                    ));
+                }
             }
         } else {
             // Reverse/IP lookups: must use dictGetOrDefault since resolved user is from JOIN
@@ -264,6 +292,13 @@ impl ClickHouseSqlGenerator {
                     dict_field = dict_field, user_key = user_expr, default = default,
                     prefix = entity_prefix, suffix = col_suffix,
                 ));
+                if emit_bare_aliases {
+                    dict_lookup_parts.push(format!(
+                        "dictGetOrDefault('nanosiem.user_registry_dict', '{dict_field}', {user_key}, {default}) AS {suffix}",
+                        dict_field = dict_field, user_key = user_expr, default = default,
+                        suffix = col_suffix,
+                    ));
+                }
             }
         }
 
@@ -274,6 +309,13 @@ impl ClickHouseSqlGenerator {
                 dict_field = dict_field, user_key = user_expr, default = default,
                 prefix = entity_prefix, suffix = col_suffix,
             ));
+            if emit_bare_aliases {
+                dict_lookup_parts.push(format!(
+                    "dictGetOrDefault('nanosiem.user_registry_dict', '{dict_field}', {user_key}, {default}) AS {suffix}",
+                    dict_field = dict_field, user_key = user_expr, default = default,
+                    suffix = col_suffix,
+                ));
+            }
         }
 
         let dict_lookups = dict_lookup_parts.join(",\n    ");
@@ -285,14 +327,14 @@ impl ClickHouseSqlGenerator {
         // lowering would defeat the index).
         let asof_equi = if is_reverse {
             format!(
-                "lower(main.{field}) = lower(i.{join_col})",
-                field = field_escaped,
+                "lower({field}) = lower(i.{join_col})",
+                field = main_field,
                 join_col = join_col
             )
         } else {
             format!(
-                "main.{field} = i.{join_col}",
-                field = field_escaped,
+                "{field} = i.{join_col}",
+                field = main_field,
                 join_col = join_col
             )
         };

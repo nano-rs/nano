@@ -2,12 +2,15 @@
 //
 //! OCSF Phase 0 (NAN-1242) — materialization integration test.
 //!
-//! Proves that the ~52 `MATERIALIZED JSONExtract` expressions in
+//! Proves that the ~52 derived `JSONExtract` expressions in
 //! `clickhouse/ocsf/init.sql` actually produce the correct promoted-column
 //! values from a plain OCSF write (client inserts ONLY the `event` column).
-//! This is the gate against the silent-failure class these expressions invite:
-//! a wrong JSON path or a broken `arrayFilter` returns NULL/empty, never an
-//! error.
+//! Most are `MATERIALIZED`; the sort-key columns `class_uid` / `src_endpoint.ip`
+//! (and `timestamp`) are `DEFAULT`-derived from the same `event` (NAN-1334) — a
+//! DEFAULT derives identically on an event-only insert, so this test covers both
+//! kinds unchanged. This is the gate against the silent-failure class these
+//! expressions invite: a wrong JSON path or a broken `arrayFilter` returns
+//! NULL/empty, never an error.
 //!
 //! The test is self-validating: for each fixture it derives the expected value
 //! in Rust (lowercasing, SHA-256 array selection, ms timestamp) and compares it

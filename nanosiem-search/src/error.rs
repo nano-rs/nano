@@ -197,7 +197,20 @@ impl From<nanosiem_core::SearchError> for SearchError {
             },
             nanosiem_core::SearchError::SqlGenError(msg) => {
                 tracing::error!(error = %msg, "SQL generation error");
-                SearchError::QueryError("Query processing failed".to_string())
+                // InvalidQuery / UnsupportedOperation messages are written FOR
+                // the user — guardrails with usage guidance ("tree requires a
+                // parent field…", "asset … must be the last command", the
+                // append shape-mismatch hint). Masking them behind "Query
+                // processing failed" hides the very guidance they carry
+                // (NAN-1339). Other SqlGenError variants are internal
+                // generation failures and stay masked.
+                if msg.starts_with("Invalid query:")
+                    || msg.starts_with("Unsupported operation:")
+                {
+                    SearchError::QueryError(msg)
+                } else {
+                    SearchError::QueryError("Query processing failed".to_string())
+                }
             }
             nanosiem_core::SearchError::InvalidTimeRange => {
                 SearchError::BadRequest("Invalid time range: start must be before end".to_string())
@@ -212,6 +225,49 @@ impl From<nanosiem_core::SearchError> for SearchError {
                 tracing::error!(error = %err, "Unhandled search error");
                 SearchError::InternalError("An internal error occurred".to_string())
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// NAN-1339: InvalidQuery / UnsupportedOperation generation guardrails are
+    /// written FOR the user (usage guidance) — they must surface verbatim, while
+    /// internal generation failures stay masked.
+    #[test]
+    fn sqlgen_guardrail_messages_surface_to_the_client() {
+        let guardrail = nanosiem_core::SearchError::SqlGenError(
+            "Invalid query: tree requires a parent field: use `tree <field> parent=<parent field>`"
+                .to_string(),
+        );
+        match SearchError::from(guardrail) {
+            SearchError::QueryError(msg) => assert!(
+                msg.contains("tree requires a parent field"),
+                "guardrail guidance must reach the client; got: {msg}"
+            ),
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+
+        let unsupported = nanosiem_core::SearchError::SqlGenError(
+            "Unsupported operation: append: the main search and the appended subsearch ..."
+                .to_string(),
+        );
+        match SearchError::from(unsupported) {
+            SearchError::QueryError(msg) => assert!(msg.contains("append")),
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+
+        let internal = nanosiem_core::SearchError::SqlGenError(
+            "failed to build CTE stage 3: unexpected state".to_string(),
+        );
+        match SearchError::from(internal) {
+            SearchError::QueryError(msg) => assert_eq!(
+                msg, "Query processing failed",
+                "internal generation failures must stay masked"
+            ),
+            other => panic!("expected QueryError, got {other:?}"),
         }
     }
 }

@@ -101,8 +101,8 @@
 --       http status) are never lower()'d — they are integer columns.
 --     * Hashes are lower()'d to match UDM's hash dict-key convention.
 --
--- WHY `timestamp` IS NOT MATERIALIZED  (the one carve-out)
--- --------------------------------------------------------
+-- WHY `timestamp`, `class_uid` AND `src_endpoint.ip` ARE NOT MATERIALIZED
+-- ------------------------------------------------------------------------
 --   ClickHouse forbids MATERIALIZED columns in the sort key / partition key
 --   (scoping §2.4). The table must be ordered & partitioned on event time, so
 --   `time_dt` (OCSF `time`) CANNOT be MATERIALIZED. We therefore expose event
@@ -113,6 +113,15 @@
 --   raw ms int against DateTime64 (it coerces as *seconds* → year ~57000; this
 --   was the NAN-1123 footgun). `time_dt` remains in the manifest as the logical
 --   name; here it is the physical `timestamp` column (documented alias below).
+--   NAN-1334 EXTENDS this carve-out to `class_uid` and `src_endpoint.ip`: both
+--   now sit in the sort key (see SORT-KEY DECISION) and so they too are flipped
+--   from MATERIALIZED to DEFAULT — same expression, same type, same CODEC, but
+--   sort-key-legal. DEFAULT (unlike MATERIALIZED) means a client MAY write them
+--   and they appear in SELECT *; the DEFAULT expression still derives from
+--   `event` for any producer that ships only the blob, so the "just send the
+--   blob" wire contract is unchanged. The tradeoff — a client-supplied value is
+--   used as-is and CAN diverge from `event` — is the same one already accepted
+--   for `timestamp`.
 --
 -- ENUM FIELDS
 -- -----------
@@ -169,7 +178,8 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     `event` JSON(max_dynamic_paths = 1024) DEFAULT '{}' CODEC(ZSTD(3)),
 
     -- -------------------------------------------------------------------------
-    -- SORT / PARTITION KEY  (client-written; CANNOT be MATERIALIZED — see header)
+    -- SORT / PARTITION KEY  (client-written DEFAULT; CANNOT be MATERIALIZED — see
+    -- header. `class_uid` + `src_endpoint.ip` join this carve-out under NAN-1334.)
     -- -------------------------------------------------------------------------
     -- Logical manifest name: `time_dt`. Physical name: `timestamp` (kept in line
     -- with UDM `logs.timestamp` so shared query/codegen treats both tables the
@@ -214,8 +224,10 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     -- =========================================================================
     -- OCSF class (3002 Authentication, 4001 Network Activity, 1007 Process
     -- Activity, 1001 File System Activity). Replaces UDM source_type as the
-    -- per-source discriminator. Leads the sort key.
-    `class_uid` UInt32 MATERIALIZED JSONExtractUInt(event, 'class_uid') CODEC(T64, ZSTD(1)),
+    -- per-source discriminator. Leads the sort key — so it is DEFAULT (NOT
+    -- MATERIALIZED), as CH forbids MATERIALIZED columns in the sort key. The
+    -- DEFAULT expression still derives it from `event` (NAN-1334).
+    `class_uid` UInt32 DEFAULT JSONExtractUInt(event, 'class_uid') CODEC(T64, ZSTD(1)),
     -- Coarser category (1=System, 3=IAM, 4=Network).
     `category_uid` UInt32 MATERIALIZED JSONExtractUInt(event, 'category_uid') CODEC(T64, ZSTD(1)),
     -- Class-scoped activity enum (Auth 1=Logon; File 1=Create/4=Delete/...).
@@ -247,7 +259,10 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     -- NETWORK  (endpoints, ports, MACs, traffic, protocol)
     -- =========================================================================
     -- Initiator IP. String (handles v4+v6); lowercase-normalized like UDM src_ip.
-    `src_endpoint.ip` String MATERIALIZED lower(JSONExtractString(event, 'src_endpoint', 'ip')) CODEC(ZSTD(1)),
+    -- Part of the sort key (NAN-1334: clusters a hot IP into few granules so the
+    -- bloom prunes), so it is DEFAULT (NOT MATERIALIZED) — CH forbids MATERIALIZED
+    -- columns in the sort key. Same lower(JSONExtract...) derivation from `event`.
+    `src_endpoint.ip` String DEFAULT lower(JSONExtractString(event, 'src_endpoint', 'ip')) CODEC(ZSTD(1)),
     -- Responder IP.
     `dst_endpoint.ip` String MATERIALIZED lower(JSONExtractString(event, 'dst_endpoint', 'ip')) CODEC(ZSTD(1)),
     -- Ports: port_t -> UInt16 (NUMERIC, never lower()'d).
@@ -682,6 +697,42 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     `prevalence_dest_ip` UInt16 MATERIALIZED if(`dst_endpoint.ip` != '' AND NOT (startsWith(`dst_endpoint.ip`, '10.') OR startsWith(`dst_endpoint.ip`, '172.16.') OR startsWith(`dst_endpoint.ip`, '192.168.') OR startsWith(`dst_endpoint.ip`, '127.')), dictGetOrDefault('nanosiem.ip_prevalence_dict', 'host_count', `dst_endpoint.ip`, toUInt16(9999)), toUInt16(65535)) CODEC(T64, LZ4),
 
     -- =========================================================================
+    -- CLASS-SPLIT UNIFIED COLUMNS  (NAN-1333)
+    -- =========================================================================
+    -- A handful of UDM process/identity/url/host concepts are SPLIT across two
+    -- OCSF columns by event class: the "primary/acting" object sits in the
+    -- top-level `process`/`user`/`url`/`src_endpoint` on some classes and in
+    -- `actor.process`/`actor.user`/`http_request.url`/`device` on others (see
+    -- `class_split_udm_field` in nanosiem-core/src/schema/ocsf.rs — the source of
+    -- truth). The codegen historically emitted these as an inline value-pick
+    -- `if(primary != <sentinel>, primary, fallback)` in WHERE / GROUP BY /
+    -- raw-SQL. That `if(...)` is OPAQUE to every skip index (a function of two
+    -- columns, not a plain column reference), so every filter on a split concept
+    -- FULL-SCANS — even though both source columns are individually indexed.
+    --
+    -- Fix: materialize the EXACT same union into one plain column per concept and
+    -- give it a text index. The codegen (NAN-1333) now emits this indexed column
+    -- instead of the inline `if(...)`, so the words index actually prunes (live
+    -- prototype: src_host 640/640 → 294/640 granules, identical match counts).
+    --
+    -- Each column's TYPE mirrors its PRIMARY source column. Sentinel: numeric → 0,
+    -- else ''. These reference the ALREADY-materialized source columns, which
+    -- carry their own case-normalization (host/user/sha256 are lower()'d at
+    -- ingest; process/path/cmd/url are not) — so NO extra lower() here; the union
+    -- inherits each source's normalization, keeping codegen semantics byte-exact.
+    -- CODEC mirrors the source columns (ZSTD(1) for String, T64/LZ4 for UInt32).
+    `process_name_unified` String MATERIALIZED if(`process.name` != '', `process.name`, `actor.process.name`) CODEC(ZSTD(1)),
+    `process_path_unified` String MATERIALIZED if(`process.file.path` != '', `process.file.path`, `actor.process.file.path`) CODEC(ZSTD(1)),
+    `command_line_unified` String MATERIALIZED if(`process.cmd_line` != '', `process.cmd_line`, `actor.process.cmd_line`) CODEC(ZSTD(1)),
+    `process_id_unified` UInt32 MATERIALIZED if(`process.pid` != 0, `process.pid`, `actor.process.pid`) CODEC(T64, LZ4),
+    `process_guid_unified` String MATERIALIZED if(`process.uid` != '', `process.uid`, `actor.process.uid`) CODEC(ZSTD(1)),
+    `process_hash_unified` String MATERIALIZED if(`process.file.hashes.sha256` != '', `process.file.hashes.sha256`, `actor.process.file.hashes.sha256`) CODEC(ZSTD(1)),
+    `user_unified` String MATERIALIZED if(`user.name` != '', `user.name`, `actor.user.name`) CODEC(ZSTD(1)),
+    `url_domain_unified` String MATERIALIZED if(`http_request.url.hostname` != '', `http_request.url.hostname`, `url.hostname`) CODEC(ZSTD(1)),
+    `url_unified` String MATERIALIZED if(`http_request.url.url_string` != '', `http_request.url.url_string`, `url.url_string`) CODEC(ZSTD(1)),
+    `src_host_unified` LowCardinality(String) MATERIALIZED if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, `device.hostname`) CODEC(ZSTD(1)),
+
+    -- =========================================================================
     -- FULL-TEXT SEARCH  (NAN-1241)
     -- =========================================================================
     -- There are deliberately NO stored `.search` companion columns. The earlier
@@ -831,29 +882,86 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     -- logs.idx_source_type — the high-frequency first-filter fast-path).
     INDEX idx_source_type source_type TYPE set(100) GRANULARITY 4,
     -- Insert clock minmax (parity with UDM idx_inserted_at).
-    INDEX idx_inserted_at _inserted_at TYPE minmax GRANULARITY 4
+    INDEX idx_inserted_at _inserted_at TYPE minmax GRANULARITY 4,
+    -- =========================================================================
+    -- CLASS-SPLIT UNIFIED text indexes  (NAN-1333)
+    -- =========================================================================
+    -- One words text index per unified column. The codegen routes WHERE / GROUP
+    -- BY / raw-SQL for the split concepts to the plain `<col>_unified` reference,
+    -- so an index on `lower(<col>_unified)` is matched by EXPRESSION exactly like
+    -- the per-source `*_words` indexes above (the prototype showed the words index
+    -- is the workhorse; a bloom barely helped, so words-index only).
+    INDEX idx_process_name_unified_words lower(process_name_unified) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
+    INDEX idx_process_path_unified_words lower(process_path_unified) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
+    INDEX idx_command_line_unified_words lower(command_line_unified) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
+    -- process_id_unified is NUMERIC (UInt32): a `lower()` text index is illegal on
+    -- an integer (CH ILLEGAL_TYPE_OF_ARGUMENT), and the codegen emits an integer
+    -- equality for `process_id=N` — not a tokenized text match. Use bloom_filter,
+    -- the integer-equality pruner used across this schema (idx_class_uid etc.).
+    INDEX idx_process_id_unified process_id_unified TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_process_guid_unified_words lower(process_guid_unified) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
+    INDEX idx_process_hash_unified_words lower(process_hash_unified) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
+    INDEX idx_user_unified_words lower(user_unified) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
+    INDEX idx_url_domain_unified_words lower(url_domain_unified) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
+    INDEX idx_url_unified_words lower(url_unified) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
+    INDEX idx_src_host_unified_words lower(src_host_unified) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1
 )
 ENGINE = MergeTree
 -- Daily partitions for partition pruning on time-range queries (UDM parity).
 PARTITION BY toYYYYMMDD(timestamp)
 -- -----------------------------------------------------------------------------
--- SORT-KEY DECISION
+-- SORT-KEY DECISION  (NAN-1334 — UDM-shaped key for hot-entity bloom selectivity)
 -- -----------------------------------------------------------------------------
--- UDM orders by (source_type, timestamp, src_host, src_ip, cityHash64(id)).
--- The OCSF analog of source_type is `class_uid` (the per-source event-kind
--- discriminator). BUT `class_uid` is MATERIALIZED and ClickHouse forbids
--- MATERIALIZED columns in the sort key (§2.4) — the same constraint that forces
--- `timestamp` to be client-written. We therefore lead with the one column we are
--- allowed to sort on: `timestamp` (client-written / DEFAULT-derived, NOT
--- materialized). Time-range filters dominate SIEM queries, so a time-led sort
--- key with daily partition pruning is the safe, correct Phase 0 choice.
+-- UDM orders by (source_type, timestamp, src_host, src_ip, cityHash64(id)) and
+-- we now adopt the UDM-shaped key here:
+--     ORDER BY (class_uid, timestamp, `src_endpoint.ip`, cityHash64(id))
+--
+-- THE MECHANISM — clustering for bloom selectivity. A bloom skip index only
+-- prunes granules where the wanted value is ABSENT. Under the old time-only key
+-- `(timestamp, cityHash64(id))` a given src IP is scattered randomly w.r.t. the
+-- sort order, so every granule contains a few rows for any busy IP and the
+-- `idx_src_endpoint_ip` bloom can prune NOTHING — a hot-entity point lookup
+-- (`src_endpoint.ip = '<busy server>'`) degrades to a full scan. Putting the IP
+-- IN the sort key physically CLUSTERS each IP's rows into a handful of adjacent
+-- granules, so the same bloom now prunes the rest. The entity column need not
+-- LEAD the key for this to work — in UDM `src_ip` is the 4th key column and the
+-- clustering still holds; here `src_endpoint.ip` is likewise 3rd.
+--
+-- PROVEN (controlled A/B on live local CH, identical data + identical bloom):
+-- adding `src_endpoint.ip` to the sort key took the hot IP `198.51.100.25` from
+-- 146/146 granules / 1,190,097 rows_read  →  26/145 granules / 216,966 rows_read
+-- (~5.5x less I/O) with the SAME 7,345 matches.
+--
+-- WHY LEAD WITH `class_uid`. It is the OCSF analog of UDM `source_type` — the
+-- per-source event-kind discriminator and the highest-selectivity first filter a
+-- SIEM hunt typically pins (`class_uid = 1007`, the OCSF `source_type=...`
+-- analog). Leading with it mirrors UDM byte-for-byte and lets the bloom/PREWHERE
+-- fast-path prune on the event kind before time.
+--
+-- WHY THESE COLUMNS ARE DEFAULT, NOT MATERIALIZED. ClickHouse forbids
+-- MATERIALIZED columns in the sort key (§2.4) — the exact constraint that already
+-- forced `timestamp` to be a client-written DEFAULT column. NAN-1334 extends that
+-- same carve-out to `class_uid` and `src_endpoint.ip`: both are flipped
+-- MATERIALIZED -> DEFAULT (identical expression / type / CODEC), which is
+-- sort-key-legal while still deriving from `event` on insert.
+--
+-- TRADEOFFS (accepted, honest):
+--   * DEFAULT (unlike MATERIALIZED) lets a client WRITE `class_uid` /
+--     `src_endpoint.ip` and surfaces them in SELECT *; a client-supplied value is
+--     used AS-IS and CAN diverge from `event`. This is the identical tradeoff
+--     already accepted for `timestamp`.
+--   * Leading with `class_uid` slightly deprioritizes pure filter-less
+--     time-range scans (no class pinned) vs a time-led key — the deliberate UDM
+--     bet that real hunts pin a discriminator, and partition pruning still bounds
+--     the time range.
+--
 -- Tiebreaker is `cityHash64(id)` — `id` is the server-owned non-materialized row
 -- key (UUIDv7 DEFAULT, NAN-1241). It REPLACES the earlier `cityHash64(toString(event))`,
 -- which serialized the ENTIRE JSON record to a string per row: measured ~3000x more
 -- expensive on local CH (19.6s vs 6.6ms / 1M rows for the hash alone) — a cost paid
 -- at every background merge and every SAMPLE BY query. `id` is unique, well-distributed
 -- and 16 bytes: the cheap, correct tiebreaker the original comment said it lacked.
-ORDER BY (timestamp, cityHash64(id))
+ORDER BY (class_uid, timestamp, `src_endpoint.ip`, cityHash64(id))
 SAMPLE BY cityHash64(id)
 -- 365-day TTL (parity with UDM logs).
 TTL timestamp + toIntervalDay(365)
@@ -1164,3 +1272,66 @@ WHERE `src_endpoint.ip` != ''
   AND NOT match(`src_endpoint.ip`, '^169\\.254\\.')
   AND `src_endpoint.ip` != `dst_endpoint.ip`
 GROUP BY ip, is_private;
+
+-- =============================================================================
+-- CLASS-SPLIT UNIFIED COLUMNS — EXISTING-TENANT OVERLAY  (NAN-1333)
+-- =============================================================================
+-- The class-split unified columns + their words text indexes are declared inline
+-- in the CREATE TABLE above, so a FRESH `ocsf_logs` gets them automatically. But
+-- `CREATE TABLE IF NOT EXISTS` is a no-op against an ALREADY-EXISTING table, so an
+-- existing OCSF deployment would never grow the new columns. There is no numbered
+-- ALTER-migration mechanism for ocsf_logs (the whole schema lives in this
+-- init.sql, which the migrator re-runs whenever its hash changes — same
+-- idempotent-overlay model the prevalence section above uses). So bring existing
+-- tables forward with idempotent ALTERs here: ADD COLUMN / ADD INDEX IF NOT
+-- EXISTS are no-ops once present, and MATERIALIZE backfills the column/index over
+-- existing parts (runs as an async mutation; safe to re-issue). New rows
+-- materialize the column at insert without any mutation.
+--
+-- NOTE: these MUST stay byte-identical to the inline CREATE TABLE defs above
+-- (same expression, type, CODEC) or a re-applied init.sql diverges fresh-vs-grown
+-- tables. Keep the two blocks in lockstep.
+ALTER TABLE nanosiem.ocsf_logs ADD COLUMN IF NOT EXISTS `process_name_unified` String MATERIALIZED if(`process.name` != '', `process.name`, `actor.process.name`) CODEC(ZSTD(1));
+ALTER TABLE nanosiem.ocsf_logs ADD COLUMN IF NOT EXISTS `process_path_unified` String MATERIALIZED if(`process.file.path` != '', `process.file.path`, `actor.process.file.path`) CODEC(ZSTD(1));
+ALTER TABLE nanosiem.ocsf_logs ADD COLUMN IF NOT EXISTS `command_line_unified` String MATERIALIZED if(`process.cmd_line` != '', `process.cmd_line`, `actor.process.cmd_line`) CODEC(ZSTD(1));
+ALTER TABLE nanosiem.ocsf_logs ADD COLUMN IF NOT EXISTS `process_id_unified` UInt32 MATERIALIZED if(`process.pid` != 0, `process.pid`, `actor.process.pid`) CODEC(T64, LZ4);
+ALTER TABLE nanosiem.ocsf_logs ADD COLUMN IF NOT EXISTS `process_guid_unified` String MATERIALIZED if(`process.uid` != '', `process.uid`, `actor.process.uid`) CODEC(ZSTD(1));
+ALTER TABLE nanosiem.ocsf_logs ADD COLUMN IF NOT EXISTS `process_hash_unified` String MATERIALIZED if(`process.file.hashes.sha256` != '', `process.file.hashes.sha256`, `actor.process.file.hashes.sha256`) CODEC(ZSTD(1));
+ALTER TABLE nanosiem.ocsf_logs ADD COLUMN IF NOT EXISTS `user_unified` String MATERIALIZED if(`user.name` != '', `user.name`, `actor.user.name`) CODEC(ZSTD(1));
+ALTER TABLE nanosiem.ocsf_logs ADD COLUMN IF NOT EXISTS `url_domain_unified` String MATERIALIZED if(`http_request.url.hostname` != '', `http_request.url.hostname`, `url.hostname`) CODEC(ZSTD(1));
+ALTER TABLE nanosiem.ocsf_logs ADD COLUMN IF NOT EXISTS `url_unified` String MATERIALIZED if(`http_request.url.url_string` != '', `http_request.url.url_string`, `url.url_string`) CODEC(ZSTD(1));
+ALTER TABLE nanosiem.ocsf_logs ADD COLUMN IF NOT EXISTS `src_host_unified` LowCardinality(String) MATERIALIZED if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, `device.hostname`) CODEC(ZSTD(1));
+
+ALTER TABLE nanosiem.ocsf_logs MATERIALIZE COLUMN `process_name_unified`;
+ALTER TABLE nanosiem.ocsf_logs MATERIALIZE COLUMN `process_path_unified`;
+ALTER TABLE nanosiem.ocsf_logs MATERIALIZE COLUMN `command_line_unified`;
+ALTER TABLE nanosiem.ocsf_logs MATERIALIZE COLUMN `process_id_unified`;
+ALTER TABLE nanosiem.ocsf_logs MATERIALIZE COLUMN `process_guid_unified`;
+ALTER TABLE nanosiem.ocsf_logs MATERIALIZE COLUMN `process_hash_unified`;
+ALTER TABLE nanosiem.ocsf_logs MATERIALIZE COLUMN `user_unified`;
+ALTER TABLE nanosiem.ocsf_logs MATERIALIZE COLUMN `url_domain_unified`;
+ALTER TABLE nanosiem.ocsf_logs MATERIALIZE COLUMN `url_unified`;
+ALTER TABLE nanosiem.ocsf_logs MATERIALIZE COLUMN `src_host_unified`;
+
+ALTER TABLE nanosiem.ocsf_logs ADD INDEX IF NOT EXISTS idx_process_name_unified_words lower(process_name_unified) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1;
+ALTER TABLE nanosiem.ocsf_logs ADD INDEX IF NOT EXISTS idx_process_path_unified_words lower(process_path_unified) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1;
+ALTER TABLE nanosiem.ocsf_logs ADD INDEX IF NOT EXISTS idx_command_line_unified_words lower(command_line_unified) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1;
+-- process_id_unified is numeric (UInt32) → bloom_filter, not a lower() text index.
+ALTER TABLE nanosiem.ocsf_logs ADD INDEX IF NOT EXISTS idx_process_id_unified process_id_unified TYPE bloom_filter GRANULARITY 4;
+ALTER TABLE nanosiem.ocsf_logs ADD INDEX IF NOT EXISTS idx_process_guid_unified_words lower(process_guid_unified) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1;
+ALTER TABLE nanosiem.ocsf_logs ADD INDEX IF NOT EXISTS idx_process_hash_unified_words lower(process_hash_unified) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1;
+ALTER TABLE nanosiem.ocsf_logs ADD INDEX IF NOT EXISTS idx_user_unified_words lower(user_unified) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1;
+ALTER TABLE nanosiem.ocsf_logs ADD INDEX IF NOT EXISTS idx_url_domain_unified_words lower(url_domain_unified) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1;
+ALTER TABLE nanosiem.ocsf_logs ADD INDEX IF NOT EXISTS idx_url_unified_words lower(url_unified) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1;
+ALTER TABLE nanosiem.ocsf_logs ADD INDEX IF NOT EXISTS idx_src_host_unified_words lower(src_host_unified) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1;
+
+ALTER TABLE nanosiem.ocsf_logs MATERIALIZE INDEX idx_process_name_unified_words;
+ALTER TABLE nanosiem.ocsf_logs MATERIALIZE INDEX idx_process_path_unified_words;
+ALTER TABLE nanosiem.ocsf_logs MATERIALIZE INDEX idx_command_line_unified_words;
+ALTER TABLE nanosiem.ocsf_logs MATERIALIZE INDEX idx_process_id_unified;
+ALTER TABLE nanosiem.ocsf_logs MATERIALIZE INDEX idx_process_guid_unified_words;
+ALTER TABLE nanosiem.ocsf_logs MATERIALIZE INDEX idx_process_hash_unified_words;
+ALTER TABLE nanosiem.ocsf_logs MATERIALIZE INDEX idx_user_unified_words;
+ALTER TABLE nanosiem.ocsf_logs MATERIALIZE INDEX idx_url_domain_unified_words;
+ALTER TABLE nanosiem.ocsf_logs MATERIALIZE INDEX idx_url_unified_words;
+ALTER TABLE nanosiem.ocsf_logs MATERIALIZE INDEX idx_src_host_unified_words;

@@ -920,9 +920,22 @@ fn eval_function_to_sql(
         }
         "tostring" | "to_string" => {
             let arg = arg_sqls.first().ok_or_else(|| {
-                SqlGenError::InvalidQuery("tostring() requires 1 argument".into())
+                SqlGenError::InvalidQuery("tostring() requires at least 1 argument".into())
             })?;
-            Ok(format!("toString({})", arg))
+            // A 2-arg `tostring(value, format)` previously dropped the format and
+            // stringified the whole value (NAN-1340) — e.g. `tostring(timestamp,
+            // "%H")` produced the full timestamp string, not the hour. Splunk's
+            // `tostring` format is hex/commas/duration (strftime is `strftime()`),
+            // but migrating users routinely conflate the two; honor an strftime-style
+            // format (contains `%`) by delegating to the strftime path. This is a
+            // strict superset of Splunk behavior (Splunk would return the raw value).
+            match arg_sqls.get(1) {
+                Some(fmt_sql) if fmt_sql.trim_matches('\'').contains('%') => {
+                    let ch_format = convert_strftime_to_clickhouse(fmt_sql.trim_matches('\''));
+                    Ok(format!("formatDateTime({}, '{}')", arg, ch_format))
+                }
+                _ => Ok(format!("toString({})", arg)),
+            }
         }
         "toint" | "to_int" => {
             let arg = arg_sqls

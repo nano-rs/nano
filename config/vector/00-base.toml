@@ -71,9 +71,20 @@ if exists(.Authorization) {
 }
 
 expected_token = get_env_var("VECTOR_AUTH_TOKEN") ?? ""
+allow_unauthenticated = (get_env_var("VECTOR_ALLOW_UNAUTHENTICATED_INGEST") ?? "") == "true"
 
 if expected_token == "" {
-    .auth_status = "skipped"
+    # NAN-1351 (F1): fail closed when no ingest token is configured. Previously
+    # a blank VECTOR_AUTH_TOKEN silently accepted every event, allowing
+    # unauthenticated log injection + nano_enrich enrichment-lane poisoning by
+    # anyone able to reach :8080. Operators on a trusted network (or air-gapped)
+    # can opt back in with VECTOR_ALLOW_UNAUTHENTICATED_INGEST=true.
+    if allow_unauthenticated {
+        .auth_status = "unauthenticated"
+    } else {
+        log("Auth failed: VECTOR_AUTH_TOKEN is not set. Refusing unauthenticated ingest. Set VECTOR_AUTH_TOKEN, or set VECTOR_ALLOW_UNAUTHENTICATED_INGEST=true to explicitly allow it.", level: "error")
+        abort
+    }
 } else {
     if auth_header == "" {
         log("Auth failed: No Authorization header", level: "warn")

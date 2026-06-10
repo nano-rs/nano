@@ -384,7 +384,12 @@ impl ClickHouseSqlGenerator {
         tuple_parts.push("toUInt32(timestamp)".to_string());
         tuple_parts.push("id".to_string());
         for f in &all_fields_ordered {
-            tuple_parts.push(escape_identifier(f));
+            // Resolve the capture value through the active profile (NAN-1346): a step
+            // condition field like `action` is a UDM name with no OCSF column, so the
+            // raw `escape_identifier(f)` emits `action` → Code 47. `by_field_sql`
+            // routes it to the OCSF equivalent (and the class-split unified column for
+            // host/process/url). UDM explicit columns resolve byte-identically.
+            tuple_parts.push(by_field_sql(f, self));
         }
         for c in &condition_sqls {
             tuple_parts.push(format!("if({}, 1, 0)", c));
@@ -413,10 +418,12 @@ impl ClickHouseSqlGenerator {
             // Alias suffix must be a bare identifier — OCSF dotted fields
             // (`process.name`) would produce an invalid `step1_process.name`
             // alias, so sanitize dots to underscores (NAN-1294). The value
-            // expression still references the real (escaped) column.
+            // expression resolves through the active profile (NAN-1346) so a UDM
+            // condition field (`action`) maps to its OCSF column instead of a raw
+            // reference that 500s.
             layer0_cols.push(format!(
                 "argMinIf({}, timestamp, {}) AS step1_{}",
-                escape_identifier(f),
+                by_field_sql(f, self),
                 cond1,
                 f.replace('.', "_")
             ));
@@ -859,13 +866,27 @@ impl ClickHouseSqlGenerator {
             by_exprs.join(", ")
         };
 
-        // Normalize the agg expression: replace field refs inside parens
-        // e.g., "sum(bytes_out)" → "sum(bytes_out)" (already valid SQL)
-        // "count()" → "count()" (already valid)
-        // "dc(dest_port)" → "uniq(dest_port)" (ClickHouse equivalent)
-        let ch_agg = agg_expr
+        // Normalize the agg expression into valid ClickHouse: map dc→uniq and
+        // resolve the inner field through the active profile (NAN-1345). Without the
+        // resolution, `sum(bytes_in)` emits the raw `bytes_in`, which under OCSF is
+        // `traffic.bytes_in` → `Code 47 Unknown identifier 'bytes_in'`. `stats` /
+        // `streamstats` already resolve agg fields; anomaly's aggregation-first path
+        // did not. `count()` (empty inner) and computed aliases pass through unchanged.
+        let func_mapped = agg_expr
             .replace("dc(", "uniq(")
             .replace("distinct_count(", "uniq(");
+        let ch_agg = match (func_mapped.find('('), func_mapped.rfind(')')) {
+            (Some(lp), Some(rp)) if rp > lp => {
+                let func = &func_mapped[..lp];
+                let inner = func_mapped[lp + 1..rp].trim();
+                if inner.is_empty() {
+                    func_mapped.clone()
+                } else {
+                    format!("{}({})", func, by_field_sql(inner, self))
+                }
+            }
+            _ => func_mapped.clone(),
+        };
 
         let agg_source = format!(
             "(SELECT {group_cols}, {agg} as _agg_value, \

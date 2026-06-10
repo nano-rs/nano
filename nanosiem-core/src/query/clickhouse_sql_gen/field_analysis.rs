@@ -2,7 +2,10 @@
 
 //! Field requirement analysis for query optimization
 
-use super::{extract_fields_from_search_expr, is_known_metadata_field, normalize_field_name};
+use super::{
+    extract_fields_from_search_expr, extract_named_groups, is_known_metadata_field,
+    normalize_field_name,
+};
 use crate::query::ast::*;
 use std::collections::HashSet;
 
@@ -233,12 +236,21 @@ fn collect_fields_from_command(cmd: &Command, fields: &mut HashSet<String>, need
         Command::Table {
             fields: table_fields,
         } => {
-            // Table command explicitly selects fields
+            // Table command explicitly selects fields. A WILDCARD pattern
+            // (`table src_*`) must not be inserted as a literal required field
+            // — the slim projection then emits `toString(ext.src_) AS src_*`,
+            // a guaranteed CH Code 62 syntax error (NAN-1339). Wildcards
+            // expand against the full column set at codegen time, so they
+            // need the wide base projection.
             if table_fields.len() == 1 && table_fields[0].name == "*" {
                 *needs_all = true;
             } else {
                 for tf in table_fields {
-                    fields.insert(normalize_field_name(&tf.name).to_string());
+                    if tf.name.contains('*') {
+                        *needs_all = true;
+                    } else {
+                        fields.insert(normalize_field_name(&tf.name).to_string());
+                    }
                 }
             }
         }
@@ -247,9 +259,14 @@ fn collect_fields_from_command(cmd: &Command, fields: &mut HashSet<String>, need
             keep,
         } => {
             if *keep {
-                // Include mode - only these fields
+                // Include mode - only these fields. Wildcards need the wide
+                // base projection (same as `table`, NAN-1339).
                 for f in field_list {
-                    fields.insert(normalize_field_name(f).to_string());
+                    if f.contains('*') {
+                        *needs_all = true;
+                    } else {
+                        fields.insert(normalize_field_name(f).to_string());
+                    }
                 }
             } else {
                 // Exclude mode - we need all fields to know what to exclude
@@ -376,10 +393,18 @@ fn collect_fields_from_command(cmd: &Command, fields: &mut HashSet<String>, need
         }
         Command::Transaction {
             fields: trans_fields,
+            startswith,
+            endswith,
             ..
         } => {
             for field in trans_fields {
                 fields.insert(normalize_field_name(field).to_string());
+            }
+            // startswith/endswith markers are evaluated as row flags inside the
+            // transaction stage (NAN-1346 #6) — any fields they reference must
+            // survive into stage_0 (keywords use the always-projected `message`).
+            for marker in [startswith, endswith].into_iter().flatten() {
+                collect_fields_from_search_expr(marker, fields);
             }
         }
         Command::Risk {
@@ -472,6 +497,15 @@ fn collect_fields_from_command(cmd: &Command, fields: &mut HashSet<String>, need
             for (_, condition) in steps {
                 collect_fields_from_search_expr(condition, fields);
             }
+            // The funnel SQL gen argMax's a fixed set of "dropper attribute" columns
+            // (process_name, dest_port, user, …) that never appear in the query text.
+            // Declare them required so field pruning keeps them in stage_0 — otherwise
+            // under OCSF the resolved column (e.g. process_name_unified) is dropped and
+            // the argMax 500s with Code 47 (NAN-1346). Fields the active schema has no
+            // column for resolve to harmless JSON-tail noise the funnel argMax skips.
+            for name in crate::search::query_processing::FUNNEL_DROPPER_FIELDS {
+                fields.insert(normalize_field_name(name).to_string());
+            }
             // Need timestamp for windowFunnel
             fields.insert("timestamp".to_string());
         }
@@ -563,6 +597,44 @@ fn is_post_processing_field(field: &str) -> bool {
 /// NOT UDM fields, NOT metadata fields, and don't contain dots (which
 /// would be handled by JSON path syntax). Fields found here need to be
 /// materialized in the base SELECT so they're visible to downstream CTEs.
+/// Collect reference-side aliases for un-aliased, field-bearing aggregations
+/// (see `agg_reference_aliases`). Explicitly-aliased output names (already in
+/// `computed`) win; the first un-aliased aggregation claims a given
+/// `{func}_{field}` name.
+pub(crate) fn collect_agg_reference_aliases(
+    query: &Query,
+    computed: &HashSet<String>,
+) -> std::collections::HashMap<String, String> {
+    fn walk(query: &Query, computed: &HashSet<String>, map: &mut std::collections::HashMap<String, String>) {
+        let (source, command) = match query {
+            Query::Search(_) => return,
+            Query::Piped { source, command } => (source, command),
+        };
+        walk(source, computed, map);
+        let aggs = match command {
+            Command::Stats { aggregations, .. }
+            | Command::Chart { aggregations, .. }
+            | Command::Timechart { aggregations, .. }
+            | Command::EventStats { aggregations, .. } => aggregations,
+            _ => return,
+        };
+        for agg in aggs {
+            if agg.alias.is_some() {
+                continue;
+            }
+            let Some(field) = &agg.field else { continue };
+            let name = format!("{}_{}", agg.func.as_str(), field);
+            let target = agg.output_alias();
+            if name != target && !computed.contains(&name) {
+                map.entry(name).or_insert(target);
+            }
+        }
+    }
+    let mut map = std::collections::HashMap::new();
+    walk(query, computed, &mut map);
+    map
+}
+
 pub(crate) fn analyze_ext_fields(
     query: &Query,
     profile: &dyn crate::schema::SchemaProfile,
@@ -574,6 +646,10 @@ pub(crate) fn analyze_ext_fields(
     // Collect field names that are computed by the query pipeline (stats aliases,
     // sequence outputs, etc.) — these must NOT be materialized from ext JSON
     let computed = collect_computed_field_names(query);
+    // {func}_{field} references to un-aliased aggregations resolve to the real
+    // output column (NAN-1339) — materializing them from ext would shadow the
+    // resolution with JSON junk in stage_0.
+    let agg_aliases = collect_agg_reference_aliases(query, &computed);
 
     all_fields
         .into_iter()
@@ -591,6 +667,7 @@ pub(crate) fn analyze_ext_fields(
                 && !is_known_metadata_field(f)
                 && !f.contains('.')
                 && !computed.contains(f)
+                && !agg_aliases.contains_key(f)
                 // Skip fields added by post-processing commands (ai, anomaly, risk, etc.)
                 // These never exist in the ext JSON column
                 && !is_post_processing_field(f)
@@ -611,7 +688,43 @@ pub(crate) fn analyze_ext_fields(
 pub(crate) fn collect_computed_field_names(query: &Query) -> HashSet<String> {
     let mut computed = HashSet::new();
     collect_computed_from_query(query, &mut computed);
+    // resolve_identity output registration (NAN-1346 #5). The always-bare
+    // outputs (confidence/observed_at/source/fqdn/ip) are real stage columns
+    // whenever any resolve_identity ran; the bare `identity_*` attribute
+    // aliases are only emitted when exactly ONE resolve_identity makes them
+    // unambiguous (see generate_resolve_identity_sql) — registering them for
+    // the two-entity case would emit a bare identifier no stage carries.
+    let resolve_identity_count = count_resolve_identity(query);
+    if resolve_identity_count >= 1 {
+        for f in [
+            "identity_confidence",
+            "identity_observed_at",
+            "identity_source",
+            "identity_fqdn",
+            "identity_ip",
+        ] {
+            computed.insert(f.to_string());
+        }
+    }
+    if resolve_identity_count == 1 {
+        for (col_suffix, _, _) in super::identity::IDENTITY_COLUMN_FIELDS.iter() {
+            computed.insert((*col_suffix).to_string());
+        }
+        for (col_suffix, _, _) in super::identity::IDENTITY_DICT_ONLY_FIELDS.iter() {
+            computed.insert((*col_suffix).to_string());
+        }
+    }
     computed
+}
+
+fn count_resolve_identity(query: &Query) -> usize {
+    match query {
+        Query::Search(_) => 0,
+        Query::Piped { source, command } => {
+            count_resolve_identity(source)
+                + usize::from(matches!(command, Command::ResolveIdentity { .. }))
+        }
+    }
 }
 
 fn collect_computed_from_query(query: &Query, computed: &mut HashSet<String>) {
@@ -732,6 +845,14 @@ fn collect_computed_from_command(cmd: &Command, computed: &mut HashSet<String>) 
                 computed.insert(assignment.field.clone());
             }
         }
+        Command::Join { subsearch, .. } | Command::Append { subsearch, .. } => {
+            // The subsearch's computed output columns surface in the
+            // joined/unioned result (join re-projects them under their bare
+            // names; append name-unions them) — register them so a downstream
+            // `| where port_count > 20` references the real column instead of
+            // JSON-extracting a string from ext/event (Code 386, NAN-1346 #4).
+            collect_computed_from_query(subsearch, computed);
+        }
         Command::Risk { .. } => {
             // All real columns the risk command projects. `risk_factors` and
             // `raw_risk_score` also appear in `is_known_metadata_field`, so they
@@ -761,6 +882,50 @@ fn collect_computed_from_command(cmd: &Command, computed: &mut HashSet<String>) 
             computed.insert("ai_verdict".to_string());
             computed.insert("ai_confidence".to_string());
             computed.insert("ai_reasoning".to_string());
+        }
+        Command::Rename { mappings } => {
+            // Each rename produces an output column under its target name. Without
+            // registering it, a downstream `| table <alias>` / `| where <alias>`
+            // JSON-extracts the alias from the JSON tail (`ext`/`event`) — which a
+            // prior aggregation stage has usually dropped — yielding `Code 47
+            // UNKNOWN_IDENTIFIER` (NAN-1339). Mirrors the stats/eval registration.
+            for m in mappings {
+                computed.insert(m.to.clone());
+            }
+        }
+        Command::Rex { pattern, mode, .. } => {
+            // rex (extract mode) adds one output column per named capture group; a
+            // pattern with no named groups yields the `rex_matches` array; sed mode
+            // yields `rex_result`. Register them so downstream commands reference
+            // them as real columns instead of JSON-extracting from the tail
+            // (NAN-1339). The capture-name parsing mirrors the SQL generator's.
+            match mode {
+                RexMode::Extract => {
+                    let groups = extract_named_groups(pattern);
+                    if groups.is_empty() {
+                        computed.insert("rex_matches".to_string());
+                    } else {
+                        for g in groups {
+                            computed.insert(g);
+                        }
+                    }
+                }
+                RexMode::Sed { .. } => {
+                    computed.insert("rex_result".to_string());
+                }
+            }
+        }
+        Command::Spath { output, path, .. } => {
+            // spath writes its extracted value to the output field, defaulting to
+            // `spath_result` when none is given — mirror the SQL generator exactly so
+            // a downstream command treats it as a real column rather than
+            // JSON-extracting it from the tail (NAN-1339). `path: None` is a no-op
+            // pass-through in the generator (no new column), so skip it. The
+            // input-tail resolution (`ext` vs OCSF `event`) is a separate concern
+            // handled in the spath SQL generator.
+            if path.is_some() {
+                computed.insert(output.clone().unwrap_or_else(|| "spath_result".to_string()));
+            }
         }
         _ => {}
     }

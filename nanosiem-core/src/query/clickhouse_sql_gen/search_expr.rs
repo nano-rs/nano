@@ -869,6 +869,24 @@ impl ClickHouseSqlGenerator {
                 // would drop them).
                 let sql_op = comparator_to_sql(op);
                 match value {
+                    // NAN-1333: a class-split concept resolves to its INDEXED unified
+                    // column (`<field>_unified`), a plain non-null String/LowCardinality
+                    // column. The `toString` wrapper that NAN-1161 adds for ext/JSON-null
+                    // safety ORPHANS the `lower(<col>)` text index here (CH matches a skip
+                    // index by EXPRESSION) → full scan. Drop it for class-split fields so
+                    // `lower(<col>_unified) = v` matches the words index and prunes
+                    // (640/640 → 294/640 on local CH). toString on a real String column is
+                    // a semantic no-op, and the column is NOT NULL (MATERIALIZED ''), so the
+                    // NAN-1161 absent-key concern does not apply. UDM never class-splits →
+                    // this branch is OCSF-only → UDM byte-identical.
+                    Value::String(s) if self.profile.class_split_column(&field_path).is_some() => {
+                        Ok(format!(
+                            "lower({}) {} '{}'",
+                            field_expr,
+                            sql_op,
+                            escape_string(&s.to_lowercase())
+                        ))
+                    }
                     Value::String(s) => Ok(format!(
                         "lower({}) {} '{}'",
                         field_str,
@@ -1040,7 +1058,13 @@ impl ClickHouseSqlGenerator {
                     // SECURITY: Validate field name format for regular fields
                     crate::query::validation::validate_field_name_format(field)
                         .map_err(|e| SqlGenError::InvalidQuery(e.message))?;
-                    escape_identifier(field)
+                    // {func}_{field} reference to an UN-aliased prior aggregation
+                    // (NAN-1339): the output column is the bare func name.
+                    if let Some(target) = self.agg_reference_alias(field) {
+                        escape_identifier(&target)
+                    } else {
+                        escape_identifier(field)
+                    }
                 };
 
                 // Always treat as direct column reference

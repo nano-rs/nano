@@ -257,11 +257,14 @@ impl PrettyPrint for Command {
                 maxevents,
             } => {
                 let mut result = format!("transaction {}", fields.join(", "));
+                // Parenthesize startswith/endswith so the round-trip (NAN-1342) re-parses:
+                // a bare `startswith=login` lets the parser's greedy `search_expr` swallow the
+                // following `endswith=…`/`maxspan=…` params; the `(…)` form is bounded.
                 if let Some(expr) = startswith {
-                    result.push_str(&format!(" startswith={}", expr.pretty_print()));
+                    result.push_str(&format!(" startswith=({})", expr.pretty_print()));
                 }
                 if let Some(expr) = endswith {
-                    result.push_str(&format!(" endswith={}", expr.pretty_print()));
+                    result.push_str(&format!(" endswith=({})", expr.pretty_print()));
                 }
                 if let Some(span) = maxspan {
                     result.push_str(&format!(" maxspan={}", format_duration(*span)));
@@ -450,8 +453,11 @@ impl PrettyPrint for Command {
                     format!("funnel by {}", group_by.join(", ")),
                     format!("window={}s", window.as_secs()),
                 ];
+                // Parenthesize each step condition (NAN-1342). `step1="action="login""`
+                // (wrapping the printed condition in quotes) produces broken nested quotes
+                // that fail the re-parse; `step1=(action="login")` round-trips cleanly.
                 for (name, condition) in steps {
-                    parts.push(format!("{}=\"{}\"", name, condition.pretty_print()));
+                    parts.push(format!("{}=({})", name, condition.pretty_print()));
                 }
                 parts.join(" ")
             }
@@ -461,7 +467,11 @@ impl PrettyPrint for Command {
                 threshold,
                 method,
             } => {
-                let mut parts = vec![format!("anomaly field={}", field)];
+                // Emit the field bare, not `field={field}` (NAN-1342): the field may be an
+                // aggregation expression like `count()` or `sum(bytes)`, which the parser's
+                // `field=` branch rejects (it expects a plain name). The bare form is matched
+                // by the agg-first and bare-field branches, which accept both.
+                let mut parts = vec![format!("anomaly {}", field)];
                 if !by_fields.is_empty() {
                     parts.push(format!("by {}", by_fields.join(", ")));
                 }
@@ -509,6 +519,17 @@ impl PrettyPrint for Command {
                 prevalence_field,
                 root_filter,
             } => {
+                // Positional form: the parser's `tree <field>` syntax leaves `parent_field`
+                // empty and sets child==label. Emitting the named form with an empty
+                // `parent=` produces invalid nPL (`tree parent= child=…`) that fails the
+                // round-trip re-parse (NAN-1342); emit the positional form instead.
+                if parent_field.is_empty() {
+                    let mut parts = vec![format!("tree {}", child_field)];
+                    if let Some(root) = root_filter {
+                        parts.push(format!("root=\"{}\"", root));
+                    }
+                    return parts.join(" ");
+                }
                 let mut parts = vec![
                     "tree".to_string(),
                     format!("parent={}", parent_field),

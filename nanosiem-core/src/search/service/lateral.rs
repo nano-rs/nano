@@ -410,19 +410,24 @@ impl SearchService {
         // Result rows are JSONEachRow with FLAT keys = the physical column names.
         // Under OCSF those are the promoted dotted names (src_endpoint.ip, user.name),
         // not the UDM tokens (src_ip, user) we auto-detect on, so resolve each UDM
-        // field to its physical result-key before the lookup. UDM byte-identical
-        // (resolve returns the same name). (NAN-1248)
+        // field to its physical result-key(s) before the lookup. resolve() alone
+        // returns only the class-split PRIMARY (`src_endpoint.hostname`), which is
+        // empty on endpoint/sysmon events — their host lives in the FALLBACK
+        // (`device.hostname`) and their user in `actor.user.name`, so `* | lateral`
+        // found no seed on OCSF endpoint data (NAN-1348). Try the class-spanning
+        // UNIFIED column first (materialized coalesce of primary+fallback, present
+        // in result rows), then the resolved primary, then the raw name. UDM is
+        // byte-identical: no class splits, resolve() returns the same name.
         let profile = self.active_profile.as_ref();
-        let result_key = |udm: &str| -> String {
-            match profile.resolve(udm) {
-                crate::schema::FieldResolution::ExplicitColumn(c) => c,
-                _ => udm.to_string(),
-            }
+        let lookup = |udm: &str| -> Option<String> {
+            lateral_seed_keys(profile, udm)
+                .iter()
+                .find_map(|key| extract_field_value(results, key))
         };
 
         // If entity_field is specified, use it directly
         if let Some(ref field) = lateral_info.entity_field {
-            if let Some(value) = extract_field_value(results, &result_key(field)) {
+            if let Some(value) = lookup(field) {
                 return Ok((field.clone(), value));
             }
             return Err(SearchError::ParseError(format!(
@@ -445,7 +450,7 @@ impl SearchService {
         };
 
         for &field in &fields_to_try {
-            if let Some(value) = extract_field_value(results, &result_key(field)) {
+            if let Some(value) = lookup(field) {
                 return Ok((field.to_string(), value));
             }
         }
@@ -964,6 +969,27 @@ fn is_localhost(ip: &str) -> bool {
     matches!(ip, "::1" | "127.0.0.1" | "0.0.0.0" | "0:0:0:0:0:0:0:1")
 }
 
+/// Physical result-row keys to try for a UDM seed candidate, in priority
+/// order: the class-spanning UNIFIED column (OCSF materializes
+/// coalesce(primary, fallback); present in result rows), the resolved
+/// primary column, then the raw name. UDM yields just the raw name
+/// (NAN-1348).
+fn lateral_seed_keys(profile: &dyn crate::schema::SchemaProfile, udm: &str) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    if let Some(unified) = profile.class_split_column(udm) {
+        keys.push(unified);
+    }
+    if let crate::schema::FieldResolution::ExplicitColumn(c) = profile.resolve(udm) {
+        if !keys.contains(&c) {
+            keys.push(c);
+        }
+    }
+    if !keys.iter().any(|k| k == udm) {
+        keys.push(udm.to_string());
+    }
+    keys
+}
+
 /// Extract the first non-empty value for a field from the result set
 fn extract_field_value(results: &[serde_json::Value], field: &str) -> Option<String> {
     for result in results {
@@ -974,4 +1000,44 @@ fn extract_field_value(results: &[serde_json::Value], field: &str) -> Option<Str
         }
     }
     None
+}
+
+#[cfg(test)]
+mod lateral_seed_tests {
+    use super::*;
+
+    /// NAN-1348: OCSF seed candidates must include the class-split UNIFIED
+    /// column — endpoint/sysmon events carry their host in the fallback
+    /// (`device.hostname`) and user in `actor.user.name`, both of which only
+    /// the unified column spans. resolve() alone (the primary) found nothing.
+    #[test]
+    fn ocsf_seed_keys_span_class_splits() {
+        let p = crate::schema::OcsfProfile::new();
+        let host_keys = lateral_seed_keys(&p, "src_host");
+        assert_eq!(
+            host_keys.first().map(String::as_str),
+            Some("src_host_unified"),
+            "unified column must be tried first: {host_keys:?}"
+        );
+        let user_keys = lateral_seed_keys(&p, "user");
+        assert!(
+            user_keys.iter().any(|k| k == "user_unified"),
+            "user must span actor.user.name via the unified column: {user_keys:?}"
+        );
+        let ip_keys = lateral_seed_keys(&p, "src_ip");
+        assert!(
+            ip_keys.iter().any(|k| k == "src_endpoint.ip"),
+            "non-split concepts resolve to their promoted column: {ip_keys:?}"
+        );
+    }
+
+    /// UDM is byte-identical: no class splits, resolve() returns the name
+    /// itself — exactly the raw-key lookup the code always did.
+    #[test]
+    fn udm_seed_keys_are_the_raw_names() {
+        let p = crate::schema::UdmProfile::new();
+        for f in ["src_host", "dest_host", "src_ip", "dest_ip", "user"] {
+            assert_eq!(lateral_seed_keys(&p, f), vec![f.to_string()]);
+        }
+    }
 }

@@ -5,18 +5,27 @@
     The clickhouse-server entrypoint's CREATE DATABASE step uses
     `clickhouse-client -u default`; removing the user here would fire during
     init, fail that step with AUTHENTICATION_FAILED, and leave the `nanosiem`
-    database uncreated. We only override the password (to empty, matching
-    the upstream image default).
+    database uncreated. We keep the user (empty password, matching the upstream
+    image default) but harden it — see below.
+
+    NAN-1351 (F2): the default user previously accepted connections from any
+    address (`::/0`) and carried `access_management`, i.e. a passwordless,
+    user-managing, DDL-capable account. The runtime app uses the
+    password-protected `nanosiem` user; only the in-container entrypoint init
+    connects as `default`, and it does so over loopback. So we restrict
+    `default` to localhost and drop access_management. (CH ports are not
+    host-exposed, so this is defense-in-depth against lateral movement.)
   -->
   <users>
     <default>
       <profile>default</profile>
       <networks>
-        <ip>::/0</ip>
+        <ip>::1</ip>
+        <ip>127.0.0.1</ip>
       </networks>
       <password><![CDATA[]]></password>
       <quota>default</quota>
-      <access_management>1</access_management>
+      <access_management>0</access_management>
     </default>
   </users>
 </clickhouse>

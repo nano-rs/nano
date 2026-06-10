@@ -900,7 +900,10 @@ pub(super) fn field_list_fn(input: &str) -> ParseResult<'_, Vec<String>> {
 fn is_field_list_stop_keyword(s: &str) -> bool {
     matches!(
         s.to_lowercase().as_str(),
-        "sortby" | "keepfirst" | "keeplast"
+        // `by`/`over` are clause keywords (NAN-1344): in a space-separated field list
+        // they must terminate it, not be consumed as bare field names — otherwise
+        // `chart … over X by Y` swallows `by Y` into the over-clause group list.
+        "sortby" | "keepfirst" | "keeplast" | "by" | "over"
     )
 }
 
