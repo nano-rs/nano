@@ -170,6 +170,15 @@ pub const CREDENTIAL_ROLLED_BACK: &str = "credential_rolled_back";
 /// Saved search sharing was updated
 pub const SAVED_SEARCH_SHARED: &str = "saved_search_shared";
 
+/// A single search-history entry was deleted (anti-forensics relevant)
+pub const SEARCH_HISTORY_DELETED: &str = "search_history_deleted";
+/// All of a user's search history was cleared (anti-forensics relevant)
+pub const SEARCH_HISTORY_CLEARED: &str = "search_history_cleared";
+/// Search-history tracking was turned on
+pub const SEARCH_HISTORY_ENABLED: &str = "search_history_enabled";
+/// Search-history tracking was turned off (evasion lever — single-filter hunt)
+pub const SEARCH_HISTORY_DISABLED: &str = "search_history_disabled";
+
 // =============================================================================
 // System Actions
 // =============================================================================
@@ -569,10 +578,19 @@ pub const RISK_ALL_CLEARED: &str = "risk_all_cleared";
 
 /// Detection rules were imported
 pub const RULES_IMPORTED: &str = "rules_imported";
+/// Detection rules were exported (bulk download of the rule corpus)
+pub const RULES_EXPORTED: &str = "rules_exported";
 /// Detection rule was manually triggered
 pub const RULE_TRIGGERED: &str = "rule_triggered";
 /// Realtime rules were reloaded
 pub const REALTIME_RULES_RELOADED: &str = "realtime_rules_reloaded";
+
+// =============================================================================
+// Audit Subsystem Actions
+// =============================================================================
+
+/// Audit trail was exported (bulk download of audit logs)
+pub const AUDIT_LOGS_EXPORTED: &str = "audit_logs_exported";
 
 // =============================================================================
 // Lookup Table Actions

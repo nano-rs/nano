@@ -36,7 +36,8 @@
     "array_key": null,
     "entity_type": null,
     "category": "Taxonomy",
-    "notes": "Enum int; sibling display string is `activity` (activity_name in some emitters). class-scoped (e.g. Auth activity_id 1=Logon, File activity_id 4=Delete). Maps to UDM event_type/action. Filter on the int (fast); resolve enum-name->id at query layer."
+    "enum_label_column": "activity",
+    "notes": "Enum int; sibling display string is `activity` (activity_name in some emitters). class-scoped (e.g. Auth activity_id 1=Logon, File activity_id 4=Delete) — so there is NO fixed enum_values table; a string-verb filter must match the sibling `activity` label column (enum_label_column, NAN-1382). Maps to UDM event_type/action. Filter on the int (fast) when the id is known."
   },
   {
     "udm_field": "action",
@@ -75,7 +76,8 @@
     "array_key": null,
     "entity_type": null,
     "category": "Taxonomy",
-    "notes": "Enum int (0=Unknown,1=Informational..6=Fatal,99=Other); sibling `severity` string. UDM severity is a LowCardinality(String); here the int is canonical/indexed, string is display."
+    "enum_values": {"unknown": 0, "informational": 1, "low": 2, "medium": 3, "high": 4, "critical": 5, "fatal": 6, "other": 99},
+    "notes": "Enum int (0=Unknown,1=Informational..6=Fatal,99=Other); sibling `severity` string. UDM severity is a LowCardinality(String); here the int is canonical/indexed, string is display. enum_values is the fixed base-event label->id table the query layer uses to translate string verbs onto the indexed int (NAN-1382)."
   },
   {
     "udm_field": "severity",
@@ -517,7 +519,8 @@
     "array_key": null,
     "entity_type": null,
     "category": "File",
-    "notes": "On File System Activity 1001, the file action (Create=1, Read=2, Update=3, Delete=4, Rename=5, Open=14...) is encoded in activity_id (same column as the taxonomy activity_id above). UDM file_action is class-scoped to the activity enum; no separate column - reuses activity_id with class_uid=1001 context."
+    "enum_label_column": "activity",
+    "notes": "On File System Activity 1001, the file action (Create=1, Read=2, Update=3, Delete=4, Rename=5, Open=14...) is encoded in activity_id (same column as the taxonomy activity_id above). UDM file_action is class-scoped to the activity enum; no separate column - reuses activity_id with class_uid=1001 context. String verbs match the sibling `activity` label column (enum_label_column, NAN-1382)."
   },
   {
     "udm_field": "protocol",
@@ -595,7 +598,8 @@
     "array_key": null,
     "entity_type": null,
     "category": "Authentication",
-    "notes": "Authentication 3002 only. Enum int (1=NTLM,2=Kerberos,5=SAML,6=OAUTH 2.0,...,99=Other); sibling string `auth_protocol`. Maps to UDM auth_type. Filter on int (fast); string for display."
+    "enum_values": {"unknown": 0, "ntlm": 1, "kerberos": 2, "digest": 3, "openid": 4, "saml": 5, "oauth 2.0": 6, "pap": 7, "chap": 8, "eap": 9, "radius": 10, "other": 99},
+    "notes": "Authentication 3002 only. Enum int (1=NTLM,2=Kerberos,5=SAML,6=OAUTH 2.0,...,99=Other); sibling string `auth_protocol`. Maps to UDM auth_type. Filter on int (fast); string for display. enum_values is the fixed OCSF 1.8.0 auth_protocol_id label->id table for query-layer verb translation (NAN-1382); vendor labels outside the spec enum (e.g. Windows 'Negotiate' -> 99/Other) are NOT translatable and fail validation."
   },
   {
     "udm_field": "auth_type",
@@ -621,7 +625,8 @@
     "array_key": null,
     "entity_type": null,
     "category": "Authentication",
-    "notes": "Generic outcome enum (1=Success, 2=Failure, 0=Unknown, 99=Other) present on base_event, used across classes. Maps to UDM auth_result / status. Sibling string `status`. Filter on int."
+    "enum_values": {"unknown": 0, "success": 1, "failure": 2, "other": 99},
+    "notes": "Generic outcome enum (1=Success, 2=Failure, 0=Unknown, 99=Other) present on base_event, used across classes. Maps to UDM auth_result / status. Sibling string `status`. Filter on int — enum_values is the fixed label->id table the query layer uses to translate `auth_result=\"failure\"` onto the indexed int (NAN-1382); the int is also more complete than the sibling string (emitters may omit `status`)."
   },
   {
     "udm_field": "status",
@@ -985,6 +990,7 @@
     "array_key": null,
     "entity_type": null,
     "category": "Cloud",
+    "enum_label_column": "activity",
     "notes": "VALUE-SEMANTICS CAVEAT (like auth_result string->int). On API Activity 6003 the change action is encoded in activity_id (Create=1, Read=2, Update=3, Delete=4, Unknown=0, Other=99) — there is NO scalar OCSF `change_type` string column. UDM change_type values are 'permission_change' | 'create' | 'delete' | 'update'. Partial mapping ONLY: create<->1, update<->3, delete<->4. UDM 'permission_change' has NO OCSF activity_id equivalent (it is a UDM-specific normalization, not in the 6003 enum), and OCSF activity_id=2 (Read) has no UDM change_type. So change_type is class-scoped to activity_id with class_uid=6003 (reuses the shared activity_id column, exactly like file_action reuses it for class_uid=1001) and the query layer must translate enum int<->UDM string with the lossy mapping above; 'permission_change' is unrepresentable and must be derived from richer context (api.operation / resource type) at the query layer, NOT from this column. NO new column is added — this is a documented reuse of the existing taxonomy activity_id."
   },
   {
@@ -1337,5 +1343,18 @@
     "entity_type": null,
     "category": "Prevalence",
     "notes": "Ingest-time host_count for the destination IP against nanosiem.ip_prevalence_dict (NAN-1248). Mirrors UDM logs.prevalence_dest_ip. Keyed on dst_endpoint.ip; skipped (65535) for RFC1918/loopback ranges. NUMERIC."
+  },
+  {
+    "udm_field": "prevalence_min",
+    "ocsf_path": null,
+    "ch_column_name": "prevalence_min",
+    "ch_type": "UInt16",
+    "index": "none",
+    "prewhere": false,
+    "is_search_col": false,
+    "array_key": null,
+    "entity_type": null,
+    "category": "Prevalence",
+    "notes": "least() of the four prevalence_* columns, mirroring UDM logs.prevalence_min (NAN-1383). DERIVED (no single OCSF source path, ocsf_path=null): each per-column 65535 'no entity' sentinel remaps to 9999 before the least(), so all-entities-absent reads 9999 exactly like UDM's inline definition. Powers prevalence-gated saved content ('| where prevalence_min < N') under OCSF. NUMERIC."
   }
 ]

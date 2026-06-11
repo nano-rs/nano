@@ -251,7 +251,14 @@ impl OidcService {
             user_repo,
             group_repo,
             audit_repo,
-            http_client: Client::new(),
+            // SSRF (NAN-1369): discovery/JWKS URLs are validated with
+            // validate_with_dns, but the fetch must not follow a 302 to a
+            // private/metadata IP. Use the shared restricted redirect policy
+            // (allows legitimate hostname redirects, blocks IP-literal/non-https).
+            http_client: Client::builder()
+                .redirect(crate::inputlookup::restricted_redirect_policy())
+                .build()
+                .unwrap_or_default(),
             discovery_cache: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             jwks_cache: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         }

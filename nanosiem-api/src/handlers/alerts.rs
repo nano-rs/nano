@@ -205,7 +205,7 @@ pub async fn list_alerts(
         } else {
             alerts
                 .into_iter()
-                .filter(|a| !exclude_rule_ids.contains(&a.rule_id))
+                .filter(|a| a.rule_id.map_or(true, |rid| !exclude_rule_ids.contains(&rid)))
                 .collect()
         }
     } else {
@@ -297,7 +297,7 @@ pub async fn stream_alerts(
         } else {
             alerts
                 .into_iter()
-                .filter(|a| !exclude_rule_ids.contains(&a.rule_id))
+                .filter(|a| a.rule_id.map_or(true, |rid| !exclude_rule_ids.contains(&rid)))
                 .collect()
         }
     } else {
@@ -341,7 +341,7 @@ pub async fn get_alert(
         let exclude_rule_ids = state
             .get_demo_exclude_ids(auth.user_id(), nanosiem_core::demo::DemoResourceType::Rule)
             .await;
-        if exclude_rule_ids.contains(&alert.rule_id) {
+        if alert.rule_id.map_or(false, |rid| exclude_rule_ids.contains(&rid)) {
             return Err(ApiError::NotFound("Alert not found".to_string()));
         }
     }
@@ -380,7 +380,7 @@ pub async fn acknowledge_alert(
         let exclude_rule_ids = state
             .get_demo_exclude_ids(auth.user_id(), nanosiem_core::demo::DemoResourceType::Rule)
             .await;
-        if exclude_rule_ids.contains(&alert.rule_id) {
+        if alert.rule_id.map_or(false, |rid| exclude_rule_ids.contains(&rid)) {
             return Err(ApiError::NotFound("Alert not found".to_string()));
         }
     }
@@ -435,7 +435,7 @@ pub async fn close_alert(
         let exclude_rule_ids = state
             .get_demo_exclude_ids(auth.user_id(), nanosiem_core::demo::DemoResourceType::Rule)
             .await;
-        if exclude_rule_ids.contains(&alert.rule_id) {
+        if alert.rule_id.map_or(false, |rid| exclude_rule_ids.contains(&rid)) {
             return Err(ApiError::NotFound("Alert not found".to_string()));
         }
     }
@@ -494,7 +494,7 @@ pub async fn assign_alert(
         let exclude_rule_ids = state
             .get_demo_exclude_ids(auth.user_id(), nanosiem_core::demo::DemoResourceType::Rule)
             .await;
-        if exclude_rule_ids.contains(&alert.rule_id) {
+        if alert.rule_id.map_or(false, |rid| exclude_rule_ids.contains(&rid)) {
             return Err(ApiError::NotFound("Alert not found".to_string()));
         }
     }
@@ -530,7 +530,7 @@ pub async fn assign_alert(
                 link: Some(format!("/alerts/{}", id)),
                 metadata: serde_json::json!({
                     "alert_id": id.to_string(),
-                    "rule_id": alert.rule_id.to_string(),
+                    "rule_id": alert.rule_id.map(|r| r.to_string()),
                     "rule_name": alert.rule_name,
                     "severity": format!("{:?}", alert.severity),
                     "assigner_id": auth.user_id().to_string(),
@@ -614,7 +614,7 @@ pub async fn bulk_alerts(
             let mut allowed = Vec::new();
             for id in &request.ids {
                 if let Ok(alert) = state.detection_service.get_alert(*id).await {
-                    if !exclude_rule_ids.contains(&alert.rule_id) {
+                    if alert.rule_id.map_or(true, |rid| !exclude_rule_ids.contains(&rid)) {
                         allowed.push(*id);
                     }
                 }
@@ -690,7 +690,7 @@ pub async fn alert_counts(
                 .await?;
             let filtered: Vec<_> = all_alerts
                 .into_iter()
-                .filter(|a| !exclude_rule_ids.contains(&a.rule_id))
+                .filter(|a| a.rule_id.map_or(true, |rid| !exclude_rule_ids.contains(&rid)))
                 .collect();
 
             let mut total = 0i64;

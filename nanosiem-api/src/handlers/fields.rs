@@ -14,30 +14,12 @@ use axum::{
 use chrono::{Duration, Utc};
 use nanosiem_core::auth::permissions;
 use nanosiem_core::udm::UdmField;
-use nanosiem_core::{TimeRangeInput, UdmFieldStats};
+use nanosiem_core::TimeRangeInput;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use crate::middleware::{check_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
-
-/// Query parameters for field endpoints
-#[derive(Debug, Deserialize, IntoParams)]
-pub struct FieldsQuery {
-    /// Start of time range (defaults to 24 hours ago)
-    pub start: Option<chrono::DateTime<chrono::Utc>>,
-    /// End of time range (defaults to now)
-    pub end: Option<chrono::DateTime<chrono::Utc>>,
-}
-
-impl FieldsQuery {
-    /// Get the time range, defaulting to last 24 hours
-    pub fn time_range(&self) -> TimeRangeInput {
-        let end = self.end.unwrap_or_else(Utc::now);
-        let start = self.start.unwrap_or_else(|| end - Duration::hours(24));
-        TimeRangeInput::new(start, end)
-    }
-}
 
 /// Query parameters for field values endpoint
 #[derive(Debug, Deserialize, IntoParams)]
@@ -70,29 +52,6 @@ pub struct FieldValuesResponse {
 pub struct FieldValue {
     pub value: String,
     pub count: u64,
-}
-
-/// List all available UDM fields with statistics
-#[utoipa::path(
-    get,
-    path = "/api/fields",
-    tag = "fields",
-    params(FieldsQuery),
-    responses(
-        (status = 200, description = "List of UDM field statistics", body = Vec<UdmFieldStats>),
-    ),
-    security(("bearer_auth" = []), ("api_key" = []))
-)]
-pub async fn list_fields(
-    State(state): State<AppState>,
-    Query(query): Query<FieldsQuery>,
-) -> Result<Json<Vec<UdmFieldStats>>, ApiError> {
-    let time_range = query.time_range();
-    let stats = state
-        .search_service
-        .get_udm_field_stats(&time_range)
-        .await?;
-    Ok(Json(stats))
 }
 
 /// Get top values for a specific field
@@ -407,7 +366,6 @@ pub async fn get_udm_fields() -> Result<Json<UdmFieldsResponse>, ApiError> {
 #[derive(OpenApi)]
 #[openapi(
     paths(
-        list_fields,
         get_field_values,
         get_source_types,
         get_ext_fields,

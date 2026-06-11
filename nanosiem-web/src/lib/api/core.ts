@@ -6,7 +6,6 @@
  */
 
 import type {
-  FieldInfo,
   SchemaFieldsResponse,
   SystemOverview,
   SystemConfig,
@@ -30,10 +29,6 @@ export class CoreApi {
   }
 
   // Fields
-  async listFields(): Promise<FieldInfo[]> {
-    return this.request('/api/fields');
-  }
-
   async getExtFieldNames(): Promise<string[]> {
     return this.request('/api/fields/ext');
   }

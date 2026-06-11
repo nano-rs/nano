@@ -50,9 +50,12 @@ impl SearchService {
         // MergeTree, so pass the bare local table key (UDM `logs` / OCSF
         // `ocsf_logs`) — never the `_distributed` read alias (NAN-1241).
         let logs_table = Self::logs_table_key(self.active_profile.as_ref());
-        // Get column list dynamically
+        // Get column list dynamically. The profile's materialized re-add list
+        // scopes the inventory to columns resolvable inside a CTE wrap and
+        // keeps internal bookkeeping (e.g. OCSF `event_bytes`) out of the
+        // analyst-facing field panel (NAN-1397).
         let columns = ch_executor
-            .get_table_columns(logs_table)
+            .get_table_columns(logs_table, self.active_profile.materialized_columns())
             .await
             .unwrap_or_else(|e| {
             warn!(
@@ -300,53 +303,6 @@ impl SearchService {
         ch_executor
             .get_ext_field_names(&table, json_col, is_ocsf)
             .await
-    }
-
-    /// Get available UDM fields with their statistics
-    #[instrument(skip(self))]
-    pub async fn get_udm_field_stats(
-        &self,
-        time_range: &TimeRangeInput,
-    ) -> Result<Vec<UdmFieldStats>, SearchError> {
-        time_range.validate()?;
-
-        let mut field_stats = Vec::new();
-
-        for field in UdmField::all() {
-            let column = field.column_name();
-
-            // Query for non-null count and distinct count (always use PostgreSQL for this)
-            let sql = format!(
-                r#"
-                SELECT 
-                    COUNT(*) FILTER (WHERE "{}" IS NOT NULL) as non_null_count,
-                    COUNT(DISTINCT "{}") as distinct_count
-                FROM logs
-                WHERE timestamp BETWEEN $1 AND $2
-                "#,
-                column, column
-            );
-
-            let row = sqlx::query(&sql)
-                .bind(time_range.start)
-                .bind(time_range.end)
-                .fetch_one(&self.pg_pool)
-                .await?;
-
-            let non_null_count: i64 = row.try_get("non_null_count").unwrap_or(0);
-            let distinct_count: i64 = row.try_get("distinct_count").unwrap_or(0);
-
-            field_stats.push(UdmFieldStats {
-                field: *field,
-                column_name: column.to_string(),
-                category: field.category().to_string(),
-                data_type: format!("{:?}", field.data_type()),
-                non_null_count: non_null_count as u64,
-                distinct_count: distinct_count as u64,
-            });
-        }
-
-        Ok(field_stats)
     }
 
     /// Get top values for a specific UDM field

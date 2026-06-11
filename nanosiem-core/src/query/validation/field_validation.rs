@@ -94,6 +94,29 @@ pub fn validate_field_name_format(field_name: &str) -> Result<(), FieldValidatio
     Ok(())
 }
 
+/// Validate the syntactic format of a wildcard field pattern (`src_*`, `*_ip`).
+///
+/// `table` / `fields` accept glob-style patterns that codegen expands against
+/// schema columns and pipeline-computed fields (`expand_wildcard`, #2064), so
+/// they are not literal field references and must bypass [`is_valid_field`]
+/// (NAN-1380). They still get a format gate: the same alphabet as field names
+/// plus `*`, so SQL metacharacters can't ride in on a "pattern".
+fn validate_wildcard_pattern_format(pattern: &str) -> Result<(), FieldValidationError> {
+    for ch in pattern.chars() {
+        if !ch.is_ascii_alphanumeric() && ch != '_' && ch != '.' && ch != '*' {
+            return Err(FieldValidationError {
+                field_name: pattern.to_string(),
+                message: format!(
+                    "Invalid field pattern '{}': contains illegal character '{}'. Field patterns may only contain letters, digits, underscores, dots, and '*' wildcards.",
+                    pattern, ch
+                ),
+                suggestions: vec![],
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_field_name(field_name: &str) -> Result<UdmField, FieldValidationError> {
     // Reject syntactically invalid field names (e.g. "version()", "1+1")
     validate_field_name_format(field_name)?;
@@ -232,9 +255,26 @@ fn levenshtein_distance(s1: &str, s2: &str) -> usize {
 /// assert_eq!(errors[0].field_name, "source_ip");
 /// ```
 pub fn validate_query_fields(query: &Query) -> Vec<FieldValidationError> {
+    validate_query_fields_with_profile(query, None)
+}
+
+/// Profile-aware variant of [`validate_query_fields`] (NAN-1380).
+///
+/// The typo gate in [`is_valid_field`] measures edit distance against the UDM
+/// field universe only, so a real column of the *active* schema that happens to
+/// sit near a UDM name (`.`→`_` costs one edit: OCSF `user.name` vs UDM
+/// `user_name`) would be rejected as a typo. Passing the active
+/// [`SchemaProfile`](crate::schema::SchemaProfile) lets the validator accept any
+/// name the schema itself knows (promoted OCSF columns, UDM explicit columns)
+/// before the distance heuristic runs. `None` preserves the profile-blind
+/// behavior for callers without a schema context.
+pub fn validate_query_fields_with_profile(
+    query: &Query,
+    profile: Option<&dyn crate::schema::SchemaProfile>,
+) -> Vec<FieldValidationError> {
     let mut errors = Vec::new();
     let mut derived = HashSet::new();
-    validate_query_fields_recursive(query, &mut errors, &mut derived);
+    validate_query_fields_recursive(query, &mut errors, &mut derived, profile);
     errors
 }
 
@@ -245,16 +285,44 @@ pub fn validate_query_fields(query: &Query) -> Vec<FieldValidationError> {
 /// 2. A known UDM field or alias
 /// 3. An unknown field that doesn't closely resemble a UDM field (likely an ext JSON field)
 ///
-/// Only rejects fields that have similar UDM matches (suggesting a typo). Fields with
-/// no close UDM match are allowed through as potential ext JSON fields — the SQL generator
-/// handles these via JSON extraction.
-fn is_valid_field(field_name: &str, derived: &HashSet<String>) -> Result<(), FieldValidationError> {
+/// Only rejects fields that have similar UDM matches (suggesting a typo) or that fail
+/// the safe-format check. Fields with no close UDM match (but a valid format) are allowed
+/// through as potential ext JSON fields — the SQL generator handles these via JSON extraction.
+fn is_valid_field(
+    field_name: &str,
+    derived: &HashSet<String>,
+    profile: Option<&dyn crate::schema::SchemaProfile>,
+) -> Result<(), FieldValidationError> {
     if derived.contains(&field_name.to_lowercase()) {
         return Ok(());
     }
+    // SECURITY (NAN-1354): enforce a safe syntactic format for EVERY non-derived
+    // field reference, unconditionally. Previously the format check lived only
+    // inside `validate_field_name` and was re-raised below solely when the name
+    // was close to a UDM field — so a format-invalid name far from any UDM field
+    // (e.g. a quoted `rename "v()" as x`) slipped through this gate. Codegen still
+    // escapes such names, but this validator is the documented input-side guard
+    // and must reject them outright. Derived fields (pipeline output aliases) are
+    // exempt by the early return above: codegen owns their escaping (see the
+    // output-name note in `validate_command_fields`).
+    validate_field_name_format(field_name)?;
+
     match validate_field_name(field_name) {
         Ok(_) => Ok(()),
         Err(err) => {
+            // NAN-1380 (G5): before the UDM-distance typo gate, consult the
+            // active schema profile. A name the active schema itself knows —
+            // a promoted OCSF column (`user.name`, `file.path`, `process.pid`)
+            // or a UDM explicit column — is a real column reference, never a
+            // typo, even when it sits one edit away from a UDM field name
+            // (`.`→`_` costs exactly 1). Without this, native OCSF names near
+            // a UDM alias are 400-rejected under the OCSF profile.
+            if let Some(p) = profile {
+                if p.is_known_field(field_name) {
+                    return Ok(());
+                }
+            }
+            // Format already passed above, so `err` here is an "unknown field".
             // Compute minimum edit distance to any UDM field. Use a tight threshold
             // (≤ 33% of name length, min 2) to catch likely typos while allowing
             // legitimate ext fields. The suggestion list uses a looser threshold
@@ -280,14 +348,15 @@ fn validate_query_fields_recursive(
     query: &Query,
     errors: &mut Vec<FieldValidationError>,
     derived: &mut HashSet<String>,
+    profile: Option<&dyn crate::schema::SchemaProfile>,
 ) {
     match query {
         Query::Search(search_expr) => {
-            validate_search_expr_fields(search_expr, errors, derived);
+            validate_search_expr_fields(search_expr, errors, derived, profile);
         }
         Query::Piped { source, command } => {
-            validate_query_fields_recursive(source, errors, derived);
-            validate_command_fields(command, errors, derived);
+            validate_query_fields_recursive(source, errors, derived, profile);
+            validate_command_fields(command, errors, derived, profile);
             collect_command_output_fields(command, derived);
         }
     }
@@ -298,54 +367,55 @@ fn validate_search_expr_fields(
     expr: &SearchExpr,
     errors: &mut Vec<FieldValidationError>,
     derived: &HashSet<String>,
+    profile: Option<&dyn crate::schema::SchemaProfile>,
 ) {
     match expr {
         SearchExpr::Keyword(_) => {
             // Keywords don't reference fields
         }
         SearchExpr::FieldFilter { field, .. } => {
-            if let Err(err) = is_valid_field(field, derived) {
+            if let Err(err) = is_valid_field(field, derived, profile) {
                 errors.push(err);
             }
         }
         SearchExpr::FunctionFilter { function, .. } => {
             // Validate fields referenced in function arguments
-            validate_eval_expr_fields(function, errors, derived);
+            validate_eval_expr_fields(function, errors, derived, profile);
         }
         SearchExpr::FieldFunctionFilter {
             field, function, ..
         } => {
             // Validate the field and fields referenced in function arguments
-            if let Err(err) = is_valid_field(field, derived) {
+            if let Err(err) = is_valid_field(field, derived, profile) {
                 errors.push(err);
             }
-            validate_eval_expr_fields(function, errors, derived);
+            validate_eval_expr_fields(function, errors, derived, profile);
         }
         SearchExpr::InList { field, .. } => {
-            if let Err(err) = is_valid_field(field, derived) {
+            if let Err(err) = is_valid_field(field, derived, profile) {
                 errors.push(err);
             }
         }
         SearchExpr::And(left, right) | SearchExpr::Or(left, right) => {
-            validate_search_expr_fields(left, errors, derived);
-            validate_search_expr_fields(right, errors, derived);
+            validate_search_expr_fields(left, errors, derived, profile);
+            validate_search_expr_fields(right, errors, derived, profile);
         }
         SearchExpr::Not(expr) | SearchExpr::Group(expr) => {
-            validate_search_expr_fields(expr, errors, derived);
+            validate_search_expr_fields(expr, errors, derived, profile);
         }
         SearchExpr::BooleanFunction(function) => {
-            validate_eval_expr_fields(function, errors, derived);
+            validate_eval_expr_fields(function, errors, derived, profile);
         }
         SearchExpr::LiteralComparison { .. } => {
             // Literal comparisons don't reference fields
         }
         SearchExpr::InSubsearch { field, subsearch, .. } => {
-            if let Err(err) = is_valid_field(field, derived) {
+            if let Err(err) = is_valid_field(field, derived, profile) {
                 errors.push(err);
             }
             // Validate fields in the subsearch query
             let mut sub_derived = HashSet::new();
-            validate_query_fields_recursive(subsearch, errors, &mut sub_derived);
+            validate_query_fields_recursive(subsearch, errors, &mut sub_derived, profile);
         }
     }
 }
@@ -355,12 +425,13 @@ fn validate_eval_expr_fields(
     expr: &crate::query::EvalExpression,
     errors: &mut Vec<FieldValidationError>,
     derived: &HashSet<String>,
+    profile: Option<&dyn crate::schema::SchemaProfile>,
 ) {
     use crate::query::EvalExpression;
 
     match expr {
         EvalExpression::Field(field) => {
-            if let Err(err) = is_valid_field(field, derived) {
+            if let Err(err) = is_valid_field(field, derived, profile) {
                 errors.push(err);
             }
         }
@@ -370,12 +441,12 @@ fn validate_eval_expr_fields(
         EvalExpression::FunctionCall { args, .. } => {
             // Validate fields in function arguments
             for arg in args {
-                validate_eval_expr_fields(arg, errors, derived);
+                validate_eval_expr_fields(arg, errors, derived, profile);
             }
         }
         EvalExpression::BinaryOp { left, right, .. } => {
-            validate_eval_expr_fields(left, errors, derived);
-            validate_eval_expr_fields(right, errors, derived);
+            validate_eval_expr_fields(left, errors, derived, profile);
+            validate_eval_expr_fields(right, errors, derived, profile);
         }
     }
 }
@@ -385,6 +456,7 @@ fn validate_command_fields(
     command: &Command,
     errors: &mut Vec<FieldValidationError>,
     derived: &mut HashSet<String>,
+    profile: Option<&dyn crate::schema::SchemaProfile>,
 ) {
     match command {
         Command::Stats {
@@ -398,7 +470,7 @@ fn validate_command_fields(
             // Validate aggregation fields
             for agg in aggregations {
                 if let Some(field) = &agg.field {
-                    if let Err(err) = is_valid_field(field, derived) {
+                    if let Err(err) = is_valid_field(field, derived, profile) {
                         errors.push(err);
                     }
                 }
@@ -406,7 +478,7 @@ fn validate_command_fields(
             // Validate group by fields
             if let Some(fields) = group_by {
                 for field in fields {
-                    if let Err(err) = is_valid_field(field, derived) {
+                    if let Err(err) = is_valid_field(field, derived, profile) {
                         errors.push(err);
                     }
                 }
@@ -420,7 +492,7 @@ fn validate_command_fields(
             // Validate aggregation fields
             for agg in aggregations {
                 if let Some(field) = &agg.field {
-                    if let Err(err) = is_valid_field(field, derived) {
+                    if let Err(err) = is_valid_field(field, derived, profile) {
                         errors.push(err);
                     }
                 }
@@ -428,18 +500,18 @@ fn validate_command_fields(
             // Validate group by fields
             if let Some(fields) = group_by {
                 for field in fields {
-                    if let Err(err) = is_valid_field(field, derived) {
+                    if let Err(err) = is_valid_field(field, derived, profile) {
                         errors.push(err);
                     }
                 }
             }
         }
         Command::Where { condition } => {
-            validate_search_expr_fields(condition, errors, derived);
+            validate_search_expr_fields(condition, errors, derived, profile);
         }
         Command::Sort { fields, .. } => {
             for sf in fields {
-                if let Err(err) = is_valid_field(&sf.field, derived) {
+                if let Err(err) = is_valid_field(&sf.field, derived, profile) {
                     errors.push(err);
                 }
             }
@@ -452,32 +524,39 @@ fn validate_command_fields(
             // Validate aggregation fields
             for agg in aggregations {
                 if let Some(field) = &agg.field {
-                    if let Err(err) = is_valid_field(field, derived) {
+                    if let Err(err) = is_valid_field(field, derived, profile) {
                         errors.push(err);
                     }
                 }
             }
             // Validate split by fields
             for field in split_by {
-                if let Err(err) = is_valid_field(field, derived) {
+                if let Err(err) = is_valid_field(field, derived, profile) {
                     errors.push(err);
                 }
             }
         }
         Command::Table { fields } => {
             for table_field in fields {
-                // Skip validation for wildcard
-                if table_field.name == "*" {
+                // Wildcard patterns (`*`, `src_*`, `*_ip`) are not literal field
+                // references — codegen expands them against schema columns and
+                // pipeline-computed fields (#2064, `expand_wildcard`). Skip
+                // field-name validation but keep a format gate so SQL
+                // metacharacters can't ride in on a "pattern" (NAN-1380).
+                if table_field.name.contains('*') {
+                    if let Err(err) = validate_wildcard_pattern_format(&table_field.name) {
+                        errors.push(err);
+                    }
                     continue;
                 }
-                if let Err(err) = is_valid_field(&table_field.name, derived) {
+                if let Err(err) = is_valid_field(&table_field.name, derived, profile) {
                     errors.push(err);
                 }
             }
         }
         Command::Rename { mappings } => {
             for mapping in mappings {
-                if let Err(err) = is_valid_field(&mapping.from, derived) {
+                if let Err(err) = is_valid_field(&mapping.from, derived, profile) {
                     errors.push(err);
                 }
                 // Note: We don't validate the 'to' field since it's a new name being created
@@ -488,12 +567,19 @@ fn validate_command_fields(
             output_fields,
             ..
         } => {
-            if let Err(err) = is_valid_field(key_field, derived) {
+            if let Err(err) = is_valid_field(key_field, derived, profile) {
                 errors.push(err);
             }
+            // OUTPUT names are columns of the lookup TABLE that the command
+            // adds to the result — not event-field references — so the UDM
+            // typo gate doesn't apply (NAN-1396: `OUTPUT confidence` sat 3
+            // edits from `ai_confidence` and was rejected as a typo). Keep
+            // the safe-format gate: the names are interpolated into the
+            // lookup SQL (the lookup repository re-validates and quotes them,
+            // this is the documented input-side guard).
             if let Some(fields) = output_fields {
                 for field in fields {
-                    if let Err(err) = is_valid_field(field, derived) {
+                    if let Err(err) = validate_field_name_format(field) {
                         errors.push(err);
                     }
                 }
@@ -501,28 +587,37 @@ fn validate_command_fields(
         }
         Command::Dedup { fields, .. } => {
             for field in fields {
-                if let Err(err) = is_valid_field(field, derived) {
+                if let Err(err) = is_valid_field(field, derived, profile) {
                     errors.push(err);
                 }
             }
         }
         Command::Bin { field, .. } => {
             if let Some(field_name) = field {
-                if let Err(err) = is_valid_field(field_name, derived) {
+                if let Err(err) = is_valid_field(field_name, derived, profile) {
                     errors.push(err);
                 }
             }
         }
         Command::Rex { field, .. } => {
             if let Some(field_name) = field {
-                if let Err(err) = is_valid_field(field_name, derived) {
+                if let Err(err) = is_valid_field(field_name, derived, profile) {
                     errors.push(err);
                 }
             }
         }
         Command::Fields { fields, .. } => {
             for field in fields {
-                if let Err(err) = is_valid_field(field, derived) {
+                // Same wildcard-pattern skip as `table` above (NAN-1380):
+                // `fields src_*` / `fields - src_*` / bare `fields *` are
+                // expanded by codegen, not literal field references.
+                if field.contains('*') {
+                    if let Err(err) = validate_wildcard_pattern_format(field) {
+                        errors.push(err);
+                    }
+                    continue;
+                }
+                if let Err(err) = is_valid_field(field, derived, profile) {
                     errors.push(err);
                 }
             }
@@ -533,11 +628,11 @@ fn validate_command_fields(
         | Command::Rare {
             field, by_fields, ..
         } => {
-            if let Err(err) = is_valid_field(field, derived) {
+            if let Err(err) = is_valid_field(field, derived, profile) {
                 errors.push(err);
             }
             for by in by_fields {
-                if let Err(err) = is_valid_field(by, derived) {
+                if let Err(err) = is_valid_field(by, derived, profile) {
                     errors.push(err);
                 }
             }
@@ -549,34 +644,34 @@ fn validate_command_fields(
             ..
         } => {
             for field in fields {
-                if let Err(err) = is_valid_field(field, derived) {
+                if let Err(err) = is_valid_field(field, derived, profile) {
                     errors.push(err);
                 }
             }
             if let Some(expr) = startswith {
-                validate_search_expr_fields(expr, errors, derived);
+                validate_search_expr_fields(expr, errors, derived, profile);
             }
             if let Some(expr) = endswith {
-                validate_search_expr_fields(expr, errors, derived);
+                validate_search_expr_fields(expr, errors, derived, profile);
             }
         }
         Command::Fillnull { fields, .. } => {
             if let Some(field_list) = fields {
                 for field in field_list {
-                    if let Err(err) = is_valid_field(field, derived) {
+                    if let Err(err) = is_valid_field(field, derived, profile) {
                         errors.push(err);
                     }
                 }
             }
         }
         Command::Mvexpand { field, .. } => {
-            if let Err(err) = is_valid_field(field, derived) {
+            if let Err(err) = is_valid_field(field, derived, profile) {
                 errors.push(err);
             }
         }
         Command::Spath { input, output, .. } => {
             if let Some(field_name) = input {
-                if let Err(err) = is_valid_field(field_name, derived) {
+                if let Err(err) = is_valid_field(field_name, derived, profile) {
                     errors.push(err);
                 }
             }
@@ -589,26 +684,26 @@ fn validate_command_fields(
             // Validate subsearch in its own context, then merge its output
             // fields into the parent pipeline (appended rows carry those fields)
             let mut sub_derived = HashSet::new();
-            validate_query_fields_recursive(subsearch, errors, &mut sub_derived);
+            validate_query_fields_recursive(subsearch, errors, &mut sub_derived, profile);
             derived.extend(sub_derived);
         }
         Command::Join {
             fields, subsearch, ..
         } => {
             for field in fields {
-                if let Err(err) = is_valid_field(field, derived) {
+                if let Err(err) = is_valid_field(field, derived, profile) {
                     errors.push(err);
                 }
             }
             // Validate subsearch in its own context, then merge its output
             // fields into the parent pipeline (joined columns are available downstream)
             let mut sub_derived = HashSet::new();
-            validate_query_fields_recursive(subsearch, errors, &mut sub_derived);
+            validate_query_fields_recursive(subsearch, errors, &mut sub_derived, profile);
             derived.extend(sub_derived);
         }
         Command::Return { fields, .. } => {
             for field in fields {
-                if let Err(err) = is_valid_field(field, derived) {
+                if let Err(err) = is_valid_field(field, derived, profile) {
                     errors.push(err);
                 }
             }
@@ -620,7 +715,7 @@ fn validate_command_fields(
             ..
         } => {
             if let Some(field) = entity_field {
-                if let Err(err) = is_valid_field(field, derived) {
+                if let Err(err) = is_valid_field(field, derived, profile) {
                     errors.push(err);
                 }
             }
@@ -646,7 +741,7 @@ fn validate_command_fields(
             }
             // For dynamic expressions, validate field references
             if let RiskScoreExpr::Dynamic(expr) = score {
-                validate_eval_expr_fields(expr, errors, derived);
+                validate_eval_expr_fields(expr, errors, derived, profile);
             }
         }
         Command::Prevalence { conditions, .. } => {
@@ -661,7 +756,7 @@ fn validate_command_fields(
             // Validate aggregation fields
             for agg in aggregations {
                 if let Some(field) = &agg.field {
-                    if let Err(err) = is_valid_field(field, derived) {
+                    if let Err(err) = is_valid_field(field, derived, profile) {
                         errors.push(err);
                     }
                 }
@@ -669,7 +764,7 @@ fn validate_command_fields(
             // Validate group by fields
             if let Some(fields) = group_by {
                 for field in fields {
-                    if let Err(err) = is_valid_field(field, derived) {
+                    if let Err(err) = is_valid_field(field, derived, profile) {
                         errors.push(err);
                     }
                 }
@@ -695,12 +790,12 @@ fn validate_command_fields(
                 });
             }
             for field in group_by {
-                if let Err(err) = is_valid_field(field, derived) {
+                if let Err(err) = is_valid_field(field, derived, profile) {
                     errors.push(err);
                 }
             }
             for condition in conditions {
-                validate_search_expr_fields(condition, errors, derived);
+                validate_search_expr_fields(condition, errors, derived, profile);
             }
         }
         Command::Funnel {
@@ -721,12 +816,12 @@ fn validate_command_fields(
                 });
             }
             for field in group_by {
-                if let Err(err) = is_valid_field(field, derived) {
+                if let Err(err) = is_valid_field(field, derived, profile) {
                     errors.push(err);
                 }
             }
             for (_, condition) in steps {
-                validate_search_expr_fields(condition, errors, derived);
+                validate_search_expr_fields(condition, errors, derived, profile);
             }
         }
         Command::Anomaly {
@@ -734,12 +829,12 @@ fn validate_command_fields(
         } => {
             // Skip validation for aggregation expressions like "count()" or "sum(bytes_out)"
             if !field.contains('(') {
-                if let Err(err) = is_valid_field(field, derived) {
+                if let Err(err) = is_valid_field(field, derived, profile) {
                     errors.push(err);
                 }
             }
             for by in by_fields {
-                if let Err(err) = is_valid_field(by, derived) {
+                if let Err(err) = is_valid_field(by, derived, profile) {
                     errors.push(err);
                 }
             }
@@ -747,9 +842,19 @@ fn validate_command_fields(
         Command::Eval { assignments } => {
             // Validate RHS expressions. Assignments are sequential: earlier
             // assignments in the same eval are available to later ones.
+            //
+            // NOTE (NAN-1354): the LHS target name (`assignment.field`) is an
+            // OUTPUT alias, not an input reference, and is deliberately NOT
+            // format-validated here. Output-name safety is owned by codegen
+            // escaping — `clickhouse_sql_gen` wraps it in `escape_identifier`
+            // (NAN-1352) just like rename's `to`, spath's `output`, and the
+            // bin/rex/mvexpand aliases. Format-validating output names would
+            // reject legitimate quoted aliases (`eval "p95 latency" = …`) that
+            // codegen handles safely. Same rationale for the un-validated
+            // `to`/`output` fields in the Rename and Spath arms above.
             let mut local_derived = derived.clone();
             for assignment in assignments {
-                validate_eval_expr_fields(&assignment.expression, errors, &local_derived);
+                validate_eval_expr_fields(&assignment.expression, errors, &local_derived, profile);
                 local_derived.insert(assignment.field.to_lowercase());
             }
         }
@@ -1071,6 +1176,324 @@ mod tests {
             errors.len(),
             0,
             "eval should accept derived fields from prior stages: {:?}",
+            errors
+        );
+    }
+
+    // --- NAN-1354: unconditional format enforcement on field references ---
+
+    #[test]
+    fn test_format_invalid_field_rejected_regardless_of_udm_distance() {
+        // A quoted field name carrying SQL metacharacters reaches a validated
+        // INPUT position (rename's `from`). It is far from any UDM field, so
+        // pre-NAN-1354 the distance gate let it through. It must now be rejected
+        // by the unconditional format check.
+        for q in [
+            r#"error | rename "v()" as x"#,
+            r#"error | rename "a;DROP" as x"#,
+            r#"error | rename "a, b" as x"#,
+        ] {
+            let query = parse_query(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+            let errors = validate_query_fields(&query);
+            assert!(
+                !errors.is_empty(),
+                "format-invalid field must be rejected: {q}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_valid_non_udm_fields_still_pass() {
+        // Ext-JSON fields and native OCSF dotted names typed directly are
+        // format-valid and far from UDM — they must keep passing as ext fields.
+        for q in [
+            "threat_score=high",
+            r#"src_endpoint.ip="1.2.3.4""#,
+            "* | where vendor_severity > 5",
+        ] {
+            let query = parse_query(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+            let errors = validate_query_fields(&query);
+            assert_eq!(errors.len(), 0, "format-valid ext/OCSF field must pass: {q}");
+        }
+    }
+
+    // --- NAN-1380 G7: table/fields wildcard patterns are not field references ---
+
+    #[test]
+    fn test_table_and_fields_wildcard_patterns_pass() {
+        for q in [
+            "* | table src_*",
+            "* | table *",
+            "* | table src_*, dest_*",
+            "* | fields src_*",
+            "* | fields - src_*",
+            "* | fields *",
+        ] {
+            let query = parse_query(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+            let errors = validate_query_fields(&query);
+            assert_eq!(
+                errors.len(),
+                0,
+                "wildcard pattern must pass validation: {q} -> {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_table_wildcard_does_not_mask_typos() {
+        // The wildcard skip applies per-field: a literal typo alongside a
+        // wildcard pattern must still be caught.
+        let query = parse_query("* | table src_*, src_ipp").unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field_name, "src_ipp");
+    }
+
+    // --- NAN-1380 G8: resolve_identity bare identity_* aliases are derived fields ---
+
+    #[test]
+    fn test_resolve_identity_bare_aliases_accepted_downstream() {
+        for f in [
+            // 8 column-backed + 5 dict-only attribute aliases (IDENTITY_*_FIELDS)
+            "identity_department",
+            "identity_title",
+            "identity_groups",
+            "identity_account_status",
+            "identity_employee_type",
+            "identity_mfa_enabled",
+            "identity_country",
+            "identity_display_name",
+            "identity_email",
+            "identity_manager",
+            "identity_manager_upn",
+            "identity_company",
+            "identity_office_location",
+            // always-bare resolve_identity outputs
+            "identity_confidence",
+            "identity_observed_at",
+            "identity_source",
+            "identity_fqdn",
+            "identity_ip",
+        ] {
+            let q = format!(r#"* | resolve_identity | where {f}="x""#);
+            let query = parse_query(&q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+            let errors = validate_query_fields(&query);
+            assert_eq!(
+                errors.len(),
+                0,
+                "bare identity alias must pass after resolve_identity: {q} -> {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_identity_alias_without_resolve_identity_still_typo_gated() {
+        // Without a resolve_identity stage the bare alias is NOT derived; it
+        // stays subject to the typo gate (close to user_identity_department).
+        let query = parse_query(r#"* | where identity_department="x""#).unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field_name, "identity_department");
+    }
+
+    // --- NAN-1380 G5: profile-aware validation of promoted schema columns ---
+
+    #[test]
+    fn test_promoted_ocsf_columns_pass_under_ocsf_profile() {
+        let profile = crate::schema::OcsfProfile::new();
+        for q in [
+            r#"user.name="admin""#,
+            r#"file.path="/etc/passwd""#,
+            r#"file.name="evil.exe""#,
+            "process.pid=4",
+            r#"cloud.provider="AWS""#,
+            r#"cloud.region="us-east-1""#,
+            r#"api.operation="GetObject""#,
+            // pipeline positions hit the same gate
+            "* | stats count() by user.name",
+            "* | table file.path, process.pid",
+            "* | sort cloud.region",
+        ] {
+            let query = parse_query(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+            let errors = validate_query_fields_with_profile(&query, Some(&profile));
+            assert_eq!(
+                errors.len(),
+                0,
+                "promoted OCSF column must pass under the OCSF profile: {q} -> {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_typos_still_rejected_under_both_profiles() {
+        let ocsf = crate::schema::OcsfProfile::new();
+        let udm = crate::schema::UdmProfile::new();
+        for q in [
+            r#"usre="x""#,
+            r#"source_ip="1.2.3.4""#,
+            "* | stats count() by src_ipp",
+        ] {
+            let query = parse_query(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+            for profile in [
+                &ocsf as &dyn crate::schema::SchemaProfile,
+                &udm as &dyn crate::schema::SchemaProfile,
+            ] {
+                let errors = validate_query_fields_with_profile(&query, Some(profile));
+                assert_eq!(
+                    errors.len(),
+                    1,
+                    "genuine typo must still be rejected under {:?}: {q}",
+                    profile.id()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_udm_profile_matches_profile_blind_behavior() {
+        // UDM safety: passing Some(UdmProfile) must not change outcomes vs the
+        // profile-blind path for representative queries (valid, typo, ext,
+        // dotted-near-UDM, wildcards).
+        let udm = crate::schema::UdmProfile::new();
+        for q in [
+            "src_ip=192.168.1.1 AND dest_port=80",
+            r#"source_ip="1.2.3.4""#,
+            "threat_score=high",
+            r#"user.name="admin""#,
+            "* | table src_*",
+            "* | fields - src_*",
+            "* | stats count() by src_ipp",
+        ] {
+            let query = parse_query(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+            let blind: Vec<String> = validate_query_fields(&query)
+                .into_iter()
+                .map(|e| e.field_name)
+                .collect();
+            let with_udm: Vec<String> = validate_query_fields_with_profile(&query, Some(&udm))
+                .into_iter()
+                .map(|e| e.field_name)
+                .collect();
+            assert_eq!(blind, with_udm, "UDM profile must not change outcomes: {q}");
+        }
+    }
+
+    // --- NAN-1396 Bug A: unaliased {func}_{field} aggregate references ---
+
+    #[test]
+    fn test_unaliased_agg_func_field_reference_accepted() {
+        // Codegen (NAN-1339) accepts `avg_bytes_in` as a reference to
+        // un-aliased `avg(bytes_in)` for stats/chart/timechart/eventstats —
+        // validation must too, under both profiles identically.
+        let ocsf = crate::schema::OcsfProfile::new();
+        let udm = crate::schema::UdmProfile::new();
+        for q in [
+            "* | stats avg(bytes_in) by dest_port | sort -avg_bytes_in",
+            "* | chart avg(bytes_in) by dest_port | sort -avg_bytes_in",
+            "* | chart avg(bytes_in) over dest_port | sort -avg_bytes_in",
+            "* | timechart span=1h avg(bytes_in) | sort -avg_bytes_in",
+            "* | eventstats avg(bytes_in) | where avg_bytes_in > 100",
+            "* | stats sum(bytes_out) by src_ip | where sum_bytes_out > 0 | table src_ip, sum_bytes_out",
+        ] {
+            let query = parse_query(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+            let errors = validate_query_fields(&query);
+            assert_eq!(
+                errors.len(),
+                0,
+                "{{func}}_{{field}} reference must pass: {q} -> {errors:?}"
+            );
+            for profile in [
+                &ocsf as &dyn crate::schema::SchemaProfile,
+                &udm as &dyn crate::schema::SchemaProfile,
+            ] {
+                let errors = validate_query_fields_with_profile(&query, Some(profile));
+                assert_eq!(
+                    errors.len(),
+                    0,
+                    "{{func}}_{{field}} reference must pass under {:?}: {q} -> {errors:?}",
+                    profile.id()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_streamstats_func_field_reference_still_rejected() {
+        // The codegen remap doesn't cover streamstats, so the validator must
+        // not accept the reference form there (it would only unmask a later
+        // codegen failure).
+        let query = parse_query("* | streamstats avg(bytes_in) | sort -avg_bytes_in").unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(errors.len(), 1, "expected typo rejection: {errors:?}");
+        assert_eq!(errors[0].field_name, "avg_bytes_in");
+    }
+
+    // --- NAN-1396 Bug B: lookup OUTPUT names are not event-field references ---
+
+    #[test]
+    fn test_lookup_output_fields_not_typo_gated() {
+        // `confidence` sits 3 edits from `ai_confidence` (threshold for a
+        // 10-char name is 3) and was rejected as a typo even though it's a
+        // lookup-table column, not an event-field reference.
+        let ocsf = crate::schema::OcsfProfile::new();
+        let udm = crate::schema::UdmProfile::new();
+        for q in [
+            "* | lookup threats src_ip OUTPUT threat_type, confidence | where isnotnull(confidence)",
+            "* | lookup threats src_ip OUTPUT confidence | where isnotnull(confidence)",
+        ] {
+            let query = parse_query(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+            let errors = validate_query_fields(&query);
+            assert_eq!(
+                errors.len(),
+                0,
+                "lookup OUTPUT names must not be typo-gated: {q} -> {errors:?}"
+            );
+            for profile in [
+                &ocsf as &dyn crate::schema::SchemaProfile,
+                &udm as &dyn crate::schema::SchemaProfile,
+            ] {
+                let errors = validate_query_fields_with_profile(&query, Some(profile));
+                assert_eq!(
+                    errors.len(),
+                    0,
+                    "lookup OUTPUT must pass under {:?}: {q} -> {errors:?}",
+                    profile.id()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_lookup_output_fields_still_format_gated() {
+        // The safe-format gate stays: OUTPUT names are interpolated into the
+        // lookup SQL (the repository re-validates, this is the input-side guard).
+        let query = parse_query(r#"* | lookup threats src_ip OUTPUT "a;DROP""#).unwrap();
+        let errors = validate_query_fields(&query);
+        assert!(
+            !errors.is_empty(),
+            "format-invalid lookup OUTPUT name must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_lookup_key_field_still_typo_gated() {
+        // The key field IS an event-field reference — the typo gate stays.
+        let query = parse_query("* | lookup threats src_ipp OUTPUT threat_type").unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].field_name, "src_ipp");
+    }
+
+    #[test]
+    fn test_quoted_output_alias_not_format_checked() {
+        // Output aliases (eval/rename `to`/spath `output`) are owned by codegen
+        // escaping (NAN-1352), not format-validated here. A spaced quoted alias
+        // plus a downstream reference to it (derived) must both pass.
+        let query = parse_query(r#"* | eval "p95 latency"=1 | where "p95 latency" > 0"#).unwrap();
+        let errors = validate_query_fields(&query);
+        assert_eq!(
+            errors.len(),
+            0,
+            "quoted output alias + downstream derived ref must pass: {:?}",
             errors
         );
     }

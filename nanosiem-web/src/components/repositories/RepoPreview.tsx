@@ -527,6 +527,21 @@ function OverviewTab({
         </div>
       )}
 
+      {conversionStatus === 'untranslated' && (
+        <div className="rounded-md border border-warning/30 bg-warning/5 px-3 py-2.5">
+          <div className="flex items-center gap-1.5 text-[11.5px] font-medium text-warning mb-1">
+            <AlertTriangle className="w-[12px] h-[12px]" strokeWidth={2} />
+            No OCSF variant available
+          </div>
+          <div className="text-[10.5px] text-foreground/70 leading-relaxed">
+            This rule was synced from the repository's UDM tree because no OCSF
+            counterpart exists yet. Its field names target the UDM schema and it
+            will not match OCSF events as-is — review and adapt the query before
+            importing.
+          </div>
+        </div>
+      )}
+
       {missingTypes.length > 0 && (
         <div className="rounded-md border border-warning/30 bg-warning/5 px-3 py-2.5">
           <div className="flex items-center gap-1.5 text-[11.5px] font-medium text-warning mb-1">

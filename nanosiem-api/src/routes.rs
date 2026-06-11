@@ -695,7 +695,6 @@ pub fn create_router(state: AppState) -> Router {
 
     app = app
         // Fields
-        .route("/api/fields", get(handlers::list_fields))
         .route("/api/fields/ext", get(handlers::get_ext_fields))
         .route("/api/fields/{name}/values", get(handlers::get_field_values))
         // Enrichment

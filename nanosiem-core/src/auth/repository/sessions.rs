@@ -211,29 +211,39 @@ impl SessionRepository {
         Ok(())
     }
 
-    /// Update session with new refresh token (rotation)
+    /// Atomically rotate a session's refresh token (single-use rotation).
+    ///
+    /// The UPDATE is a compare-and-swap: it only matches when the session
+    /// still holds `current_token_hash`. Concurrent refreshes that read the
+    /// same session race here — exactly one wins, and the losers (or any
+    /// replay of an already-rotated token) match 0 rows and get
+    /// `NotFoundByToken`, which the handler surfaces as 401. Without the
+    /// `refresh_token_hash` predicate every concurrent request would succeed,
+    /// minting multiple valid token pairs from a single-use token (NAN-1391).
     pub async fn rotate_refresh_token(
         &self,
         id: Uuid,
+        current_token_hash: &str,
         new_token_hash: &str,
         new_expires_at: DateTime<Utc>,
     ) -> Result<Session, SessionRepositoryError> {
         let session = sqlx::query_as::<_, Session>(
             r#"
             UPDATE sessions SET
-                refresh_token_hash = $2,
-                expires_at = $3,
+                refresh_token_hash = $3,
+                expires_at = $4,
                 last_used_at = NOW()
-            WHERE id = $1
+            WHERE id = $1 AND refresh_token_hash = $2
             RETURNING *
             "#,
         )
         .bind(id)
+        .bind(current_token_hash)
         .bind(new_token_hash)
         .bind(new_expires_at)
         .fetch_optional(&self.pool)
         .await?
-        .ok_or(SessionRepositoryError::NotFound(id))?;
+        .ok_or(SessionRepositoryError::NotFoundByToken)?;
 
         Ok(session)
     }

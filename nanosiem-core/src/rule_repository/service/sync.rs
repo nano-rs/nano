@@ -134,20 +134,56 @@ impl RuleRepositoryService {
         // Get rule files - use git sparse-checkout for selected paths (avoids API rate limits entirely)
         // NAN-1266: under NANO_SCHEMA_PROFILE=ocsf the sync walks the sibling
         // `rules-ocsf/` tree so imported rules target OCSF; UDM is unchanged.
-        let rules_path = crate::schema::active_repo_path(repo.rules_path.as_deref().unwrap_or("rules/"));
+        let stored_rules_path = repo.rules_path.as_deref().unwrap_or("rules/");
+        let rules_path = crate::schema::active_repo_path(stored_rules_path);
         let rules_path = rules_path.as_str();
+
+        // NAN-1387: file paths imported from a UDM tree because no `-ocsf`
+        // sibling exists upstream (OCSF profile only). These are flagged
+        // `conversion_status="untranslated"` instead of `"success"` so
+        // schema-mismatched rules surface honestly rather than importing as
+        // ready and silently never firing.
+        let mut untranslated_paths: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         let (rule_files, temp_dir, commit) = if let Some(ref selected) = repo.selected_paths {
             if !selected.is_empty() {
+                // NAN-1387: remap each selected path to its `-ocsf` sibling
+                // under OCSF, mirroring the Tree-API `rules_path` remap above
+                // (identity under UDM). Clone both trees so the sync can fall
+                // back to the UDM tree (flagged) when no sibling exists.
+                let path_pairs: Vec<(String, String)> = selected
+                    .iter()
+                    .map(|p| {
+                        (
+                            crate::schema::active_selected_repo_path(stored_rules_path, p),
+                            p.clone(),
+                        )
+                    })
+                    .collect();
+                let mut clone_paths: Vec<String> = Vec::with_capacity(path_pairs.len());
+                for (mapped, original) in &path_pairs {
+                    clone_paths.push(mapped.clone());
+                    if mapped != original {
+                        clone_paths.push(original.clone());
+                    }
+                }
+
                 // Use git sparse-checkout to clone only selected paths (NO API CALLS!)
-                info!("Using sparse checkout for paths: {:?}", selected);
+                info!("Using sparse checkout for paths: {:?}", clone_paths);
 
                 let temp_dir = tempfile::tempdir().map_err(|e| {
                     RuleRepositoryError::Internal(format!("Failed to create temp dir: {}", e))
                 })?;
 
                 github_client
-                    .sparse_clone(&owner, &repo_name, &repo.branch, selected, temp_dir.path())
+                    .sparse_clone(
+                        &owner,
+                        &repo_name,
+                        &repo.branch,
+                        &clone_paths,
+                        temp_dir.path(),
+                    )
                     .await
                     .map_err(|e| RuleRepositoryError::GitHubApi(e.to_string()))?;
 
@@ -176,52 +212,14 @@ impl RuleRepositoryService {
                     });
                 }
 
-                // Walk local filesystem to find rule files
-                let mut files = Vec::new();
-                let temp_canonical = temp_dir.path().canonicalize().map_err(|e| {
-                    RuleRepositoryError::Internal(format!("Failed to canonicalize temp dir: {}", e))
-                })?;
-
-                for selected_path in selected {
-                    // Reject paths with traversal sequences before joining
-                    if selected_path.contains("..") {
-                        warn!("Path traversal attempt blocked: {}", selected_path);
-                        continue;
-                    }
-
-                    let full_path = temp_dir.path().join(selected_path);
-
-                    info!("Checking path: {:?} (exists={})", full_path, full_path.exists());
-                    // Debug: list directory contents
-                    if let Ok(entries) = std::fs::read_dir(&full_path) {
-                        for entry in entries.flatten() {
-                            info!("  dir entry: {:?} (is_file={}, is_dir={})", entry.path(), entry.path().is_file(), entry.path().is_dir());
-                        }
-                    }
-                    info!("  rule_extensions: {:?}", config.rule_extensions);
-                    // Verify the canonicalized path is within the temp directory
-                    if full_path.exists() {
-                        let canonical = match full_path.canonicalize() {
-                            Ok(p) => p,
-                            Err(_) => continue, // Skip if canonicalization fails
-                        };
-
-                        if !canonical.starts_with(&temp_canonical) {
-                            warn!(
-                                "Path traversal attempt blocked (escaped temp dir): {}",
-                                selected_path
-                            );
-                            continue;
-                        }
-
-                        collect_rule_files(
-                            &canonical,
-                            &temp_canonical,
-                            &config.rule_extensions,
-                            &mut files,
-                        );
-                    }
-                }
+                // Walk local filesystem to find rule files (falling back to
+                // the UDM tree, flagged, where no `-ocsf` sibling exists)
+                let (files, fallback_paths) = collect_selected_rule_files(
+                    &path_pairs,
+                    temp_dir.path(),
+                    &config.rule_extensions,
+                )?;
+                untranslated_paths = fallback_paths;
 
                 info!("Found {} rule files via sparse checkout (selected_paths={:?}, temp_dir={:?})", files.len(), selected, temp_dir.path());
                 for f in &files {
@@ -328,14 +326,31 @@ impl RuleRepositoryService {
             use sha2::{Digest, Sha256};
             let content_hash = hex::encode(Sha256::digest(content.as_bytes()));
 
+            // NAN-1387: whether this file came from a UDM-tree fallback (no
+            // `-ocsf` sibling under the OCSF profile) and must be flagged.
+            // Only nPL-native rules carry the flag — Sigma rules already
+            // surface as `pending` until conversion.
+            let untranslated = untranslated_paths.contains(&entry.path);
+
             // Check if content has changed (use content hash for sparse checkout, SHA for API)
             if let Some(ref existing_rule) = existing {
+                // NAN-1387: a profile change can flip success ⇄ untranslated
+                // without the content changing — never skip past a stale
+                // conversion_status.
+                let status_stale = repo.rule_format != "sigma"
+                    && matches!(
+                        existing_rule.conversion_status.as_str(),
+                        "success" | "untranslated"
+                    )
+                    && (existing_rule.conversion_status == "untranslated") != untranslated;
                 let stored_sha = existing_rule.file_sha.as_deref().unwrap_or("");
-                if !entry.sha.is_empty() && stored_sha == entry.sha {
-                    continue; // No changes (API path)
-                }
-                if entry.sha.is_empty() && stored_sha == content_hash {
-                    continue; // No changes (sparse checkout path)
+                if !status_stale {
+                    if !entry.sha.is_empty() && stored_sha == entry.sha {
+                        continue; // No changes (API path)
+                    }
+                    if entry.sha.is_empty() && stored_sha == content_hash {
+                        continue; // No changes (sparse checkout path)
+                    }
                 }
             }
 
@@ -434,7 +449,10 @@ impl RuleRepositoryService {
                         } else {
                             Some(npl.source_types)
                         },
-                        Some("success"), // nPL rules are already native format
+                        // nPL rules are already native format — unless they
+                        // were pulled from the UDM tree because no `-ocsf`
+                        // sibling exists under the OCSF profile (NAN-1387)
+                        Some(if untranslated { "untranslated" } else { "success" }),
                     ),
                     Err(e) => {
                         warn!("Failed to parse nPL rule {}: {}", entry.path, e);
@@ -699,3 +717,212 @@ impl RuleRepositoryService {
         Ok(())
     }
 }
+
+/// Resolve the rule files for a sparse-checkout (folder-picker) sync.
+///
+/// `path_pairs` is `(remapped, original)` per selected path — identical under
+/// UDM, the `-ocsf` sibling under OCSF (NAN-1387). Files are collected from
+/// the remapped tree when it exists in the clone; when it is missing but
+/// differs from the original (OCSF profile, no `-ocsf` sibling upstream), the
+/// walk falls back to the original (UDM) tree and records every file found
+/// there in the returned set so the caller imports them flagged
+/// `conversion_status="untranslated"` instead of `"success"`.
+pub(crate) fn collect_selected_rule_files(
+    path_pairs: &[(String, String)],
+    temp_root: &std::path::Path,
+    rule_extensions: &[String],
+) -> Result<(Vec<TreeEntry>, std::collections::HashSet<String>), RuleRepositoryError> {
+    let temp_canonical = temp_root.canonicalize().map_err(|e| {
+        RuleRepositoryError::Internal(format!("Failed to canonicalize temp dir: {}", e))
+    })?;
+
+    let mut files = Vec::new();
+    let mut untranslated_paths = std::collections::HashSet::new();
+    // Two selections can resolve to the same effective directory under OCSF
+    // (e.g. selecting both `demo` and `demo-ocsf`) — collect each dir once.
+    let mut visited_dirs: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
+
+    for (mapped, original) in path_pairs {
+        // Reject paths with traversal sequences before joining
+        if mapped.contains("..") || original.contains("..") {
+            warn!("Path traversal attempt blocked: {}", original);
+            continue;
+        }
+
+        let (effective_path, is_udm_fallback) = if temp_root.join(mapped).exists() {
+            (mapped, false)
+        } else if mapped != original && temp_root.join(original).exists() {
+            warn!(
+                "No OCSF variant ({}) for selected path {}; importing UDM rules flagged 'untranslated'",
+                mapped, original
+            );
+            (original, true)
+        } else {
+            debug!("Selected path {} not present in clone, skipping", original);
+            continue;
+        };
+
+        // Verify the canonicalized path is within the temp directory
+        let canonical = match temp_root.join(effective_path).canonicalize() {
+            Ok(p) => p,
+            Err(_) => continue, // Skip if canonicalization fails
+        };
+
+        if !canonical.starts_with(&temp_canonical) {
+            warn!(
+                "Path traversal attempt blocked (escaped temp dir): {}",
+                effective_path
+            );
+            continue;
+        }
+
+        if !visited_dirs.insert(canonical.clone()) {
+            continue; // Already collected via another selection
+        }
+
+        let before = files.len();
+        collect_rule_files(&canonical, &temp_canonical, rule_extensions, &mut files);
+        if is_udm_fallback {
+            for file in &files[before..] {
+                untranslated_paths.insert(file.path.clone());
+            }
+        }
+    }
+
+    Ok((files, untranslated_paths))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_rule(root: &std::path::Path, rel: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "title: t\nquery: \"error\"\n").unwrap();
+    }
+
+    fn yml() -> Vec<String> {
+        vec![".yml".to_string(), ".yaml".to_string()]
+    }
+
+    // UDM profile (remapped == original): files come from the selected tree
+    // verbatim and nothing is flagged untranslated — byte-identical behavior.
+    #[test]
+    fn udm_identity_pairs_collect_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        write_rule(dir.path(), "rules/credential_access/brute.yml");
+
+        let pairs = vec![(
+            "rules/credential_access".to_string(),
+            "rules/credential_access".to_string(),
+        )];
+        let (files, untranslated) =
+            collect_selected_rule_files(&pairs, dir.path(), &yml()).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "rules/credential_access/brute.yml");
+        assert!(untranslated.is_empty());
+    }
+
+    // OCSF profile with an `-ocsf` sibling present: files come from the
+    // sibling tree only, and none are flagged untranslated.
+    #[test]
+    fn ocsf_sibling_present_collects_from_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        write_rule(dir.path(), "demo/udm_rule.yml");
+        write_rule(dir.path(), "demo-ocsf/ocsf_rule.yml");
+
+        let pairs = vec![("demo-ocsf".to_string(), "demo".to_string())];
+        let (files, untranslated) =
+            collect_selected_rule_files(&pairs, dir.path(), &yml()).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "demo-ocsf/ocsf_rule.yml");
+        assert!(untranslated.is_empty());
+    }
+
+    // OCSF profile with NO `-ocsf` sibling: falls back to the UDM tree and
+    // flags every collected file untranslated (NAN-1387 — previously these
+    // imported verbatim as conversion_status="success" and never fired).
+    #[test]
+    fn ocsf_sibling_missing_falls_back_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        write_rule(dir.path(), "credential_access/brute.yml");
+        write_rule(dir.path(), "credential_access/spray.yaml");
+
+        let pairs = vec![(
+            "credential_access-ocsf".to_string(),
+            "credential_access".to_string(),
+        )];
+        let (files, untranslated) =
+            collect_selected_rule_files(&pairs, dir.path(), &yml()).unwrap();
+
+        assert_eq!(files.len(), 2);
+        assert_eq!(untranslated.len(), 2);
+        for file in &files {
+            assert!(
+                untranslated.contains(&file.path),
+                "UDM-fallback file {} must be flagged untranslated",
+                file.path
+            );
+        }
+    }
+
+    // Mixed selection: the sibling-backed folder imports clean while the
+    // sibling-less folder is flagged — per-path, not per-sync.
+    #[test]
+    fn mixed_selection_flags_only_fallback_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        write_rule(dir.path(), "demo-ocsf/ocsf_rule.yml");
+        write_rule(dir.path(), "impact/udm_rule.yml");
+
+        let pairs = vec![
+            ("demo-ocsf".to_string(), "demo".to_string()),
+            ("impact-ocsf".to_string(), "impact".to_string()),
+        ];
+        let (files, untranslated) =
+            collect_selected_rule_files(&pairs, dir.path(), &yml()).unwrap();
+
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"demo-ocsf/ocsf_rule.yml"));
+        assert!(paths.contains(&"impact/udm_rule.yml"));
+        assert_eq!(untranslated.len(), 1);
+        assert!(untranslated.contains("impact/udm_rule.yml"));
+        assert!(!untranslated.contains("demo-ocsf/ocsf_rule.yml"));
+    }
+
+    // Selecting both a folder and its `-ocsf` sibling resolves to the same
+    // effective directory — files must be collected only once.
+    #[test]
+    fn overlapping_selections_collect_once() {
+        let dir = tempfile::tempdir().unwrap();
+        write_rule(dir.path(), "demo-ocsf/ocsf_rule.yml");
+
+        let pairs = vec![
+            ("demo-ocsf".to_string(), "demo".to_string()),
+            ("demo-ocsf".to_string(), "demo-ocsf".to_string()),
+        ];
+        let (files, untranslated) =
+            collect_selected_rule_files(&pairs, dir.path(), &yml()).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert!(untranslated.is_empty());
+    }
+
+    // Traversal sequences are rejected on both halves of the pair.
+    #[test]
+    fn traversal_paths_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        write_rule(dir.path(), "rules/ok.yml");
+
+        let pairs = vec![("../escape".to_string(), "../escape".to_string())];
+        let (files, untranslated) =
+            collect_selected_rule_files(&pairs, dir.path(), &yml()).unwrap();
+
+        assert!(files.is_empty());
+        assert!(untranslated.is_empty());
+    }
+}
+

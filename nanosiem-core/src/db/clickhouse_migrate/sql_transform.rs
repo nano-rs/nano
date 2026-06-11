@@ -28,6 +28,27 @@ impl ClickHouseMigrator {
             .join("\n")
     }
 
+    /// NAN-1384: detect the `nano:skip-if-unknown-table` block-comment marker.
+    ///
+    /// ClickHouse has no `ALTER TABLE IF EXISTS`, so migrations that target a
+    /// profile-gated table (e.g. `nanosiem.ocsf_logs`, which only exists on
+    /// OCSF-profile deployments) tag each statement with an inline
+    /// `/* nano:skip-if-unknown-table */` marker. The runner then tolerates an
+    /// UNKNOWN_TABLE failure on exactly those statements. The marker must be a
+    /// `/* */` block comment — `--` line comments are stripped before
+    /// statement splitting (see `strip_sql_line_comments`).
+    pub(super) fn has_skip_if_unknown_table_marker(sql: &str) -> bool {
+        sql.contains("nano:skip-if-unknown-table")
+    }
+
+    /// NAN-1384: does this ClickHouse error message indicate the target table
+    /// does not exist? Matches the stable `UNKNOWN_TABLE` error-code name that
+    /// CH embeds in the exception text (e.g. `Code: 60. DB::Exception: Table
+    /// nanosiem.ocsf_logs does not exist. (UNKNOWN_TABLE)`).
+    pub(super) fn is_unknown_table_error(message: &str) -> bool {
+        message.contains("UNKNOWN_TABLE")
+    }
+
     /// Escape a value for use inside a single-quoted ClickHouse string literal.
     ///
     /// CH treats `\` as an escape character inside `'...'` strings, so a

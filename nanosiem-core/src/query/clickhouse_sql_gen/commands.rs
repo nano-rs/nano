@@ -86,8 +86,10 @@ impl ClickHouseSqlGenerator {
                             // func name — sort by it.
                             escape_identifier(&target)
                         } else {
-                            // Regular field - normalize (e.g., _time -> timestamp)
-                            let normalized_field = normalize_field_name(&sf.field);
+                            // Regular field - normalize (e.g., _time -> timestamp),
+                            // except an upstream value-computed field, which keeps
+                            // its raw (shadowing) column name (NAN-1341).
+                            let normalized_field = by_field_output_name(&sf.field, self);
                             escape_identifier(normalized_field)
                         };
                         format!("{} {}", field_expr, order)
@@ -210,45 +212,16 @@ impl ClickHouseSqlGenerator {
                 let renamed_fields = rename_exprs.join(", ");
                 Ok(format!("  SELECT *, {} FROM {}", renamed_fields, source))
             }
-            Command::Lookup {
-                table_name,
-                key_field,
-                output_fields,
-                case_insensitive,
-            } => {
-                // Generate a LEFT JOIN with the lookup table
-                // Lookup tables are stored as lookup_<table_name> in ClickHouse
-                let lookup_table = format!("lookup_{}", table_name);
-
-                // Build the join condition
-                let join_condition = if *case_insensitive {
-                    format!(
-                        "lower(main.{}) = lower(lkp.{})",
-                        escape_identifier(key_field),
-                        escape_identifier(key_field)
-                    )
-                } else {
-                    format!(
-                        "main.{} = lkp.{}",
-                        escape_identifier(key_field),
-                        escape_identifier(key_field)
-                    )
-                };
-
-                // Select fields from lookup
-                let lookup_fields = match output_fields {
-                    Some(fields) => fields
-                        .iter()
-                        .map(|f| format!("lkp.{}", escape_identifier(f)))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    None => "lkp.*".to_string(),
-                };
-
-                Ok(format!(
-                    "  SELECT main.*, {} FROM {} AS main\n  LEFT JOIN {} AS lkp ON {}",
-                    lookup_fields, source, lookup_table, join_condition
-                ))
+            Command::Lookup { .. } => {
+                // Lookup enrichment is handled entirely in Rust post-processing
+                // (`apply_lookup_enrichment` joins against the PostgreSQL-backed
+                // lookup tables after the ClickHouse fetch). This stage is a
+                // pass-through, like `Command::Prevalence`. The previous code
+                // emitted `LEFT JOIN lookup_<name>` against ClickHouse — but
+                // lookup tables have never existed in ClickHouse, so every
+                // `| lookup` query died with CH Code 60 UNKNOWN_TABLE masked as
+                // a generic 500 (NAN-1389).
+                Ok(format!("  SELECT * FROM {}", source))
             }
             Command::Eval { assignments } => {
                 let mut select_parts = vec!["*".to_string()];
@@ -552,8 +525,9 @@ impl ClickHouseSqlGenerator {
                 show_count,
                 show_percent,
             } => {
-                // Normalize field name for consistent output
-                let normalized_field = normalize_field_name(field);
+                // Normalized output alias (raw name for an upstream
+                // value-computed field — it shadows the schema alias, NAN-1341)
+                let normalized_field = by_field_output_name(field, self);
                 let (field_expr, needs_alias) = field_to_sql_expr(field, self);
                 // Wrap dynamic/JSON fields with toString() for both SELECT and GROUP BY
                 // Always add explicit alias to ensure column name appears in output
@@ -589,7 +563,7 @@ impl ClickHouseSqlGenerator {
                     if by_lower == "count" || by_lower == "percent" {
                         continue;
                     }
-                    let normalized_by = normalize_field_name(by);
+                    let normalized_by = by_field_output_name(by, self);
                     let (by_expr, by_needs_alias) = field_to_sql_expr(by, self);
                     let by_select = if by_needs_alias {
                         format!(
@@ -625,8 +599,9 @@ impl ClickHouseSqlGenerator {
                 show_count,
                 show_percent,
             } => {
-                // Normalize field name for consistent output
-                let normalized_field = normalize_field_name(field);
+                // Normalized output alias (raw name for an upstream
+                // value-computed field — it shadows the schema alias, NAN-1341)
+                let normalized_field = by_field_output_name(field, self);
                 let (field_expr, needs_alias) = field_to_sql_expr(field, self);
                 // Wrap dynamic/JSON fields with toString() for both SELECT and GROUP BY
                 // Always add explicit alias to ensure column name appears in output
@@ -662,7 +637,7 @@ impl ClickHouseSqlGenerator {
                     if by_lower == "count" || by_lower == "percent" {
                         continue;
                     }
-                    let normalized_by = normalize_field_name(by);
+                    let normalized_by = by_field_output_name(by, self);
                     let (by_expr, by_needs_alias) = field_to_sql_expr(by, self);
                     let by_select = if by_needs_alias {
                         format!(
@@ -702,7 +677,7 @@ impl ClickHouseSqlGenerator {
                 let group_by_fields: Vec<String> = fields
                     .iter()
                     .map(|f| {
-                        let normalized = normalize_field_name(f);
+                        let normalized = by_field_output_name(f, self);
                         let (expr, needs_cast) = field_to_sql_expr(f, self);
                         if needs_cast {
                             format!("toString({}) AS {}", expr, escape_identifier(normalized))

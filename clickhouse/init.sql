@@ -1172,8 +1172,14 @@ ORDER BY (entity_type, entity_value, time_bucket)
 TTL time_bucket + toIntervalDay(90)
 SETTINGS index_granularity = 8192;
 
--- Materialized View: entity_time_range_mv
-CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.entity_time_range_mv TO nanosiem.entity_time_range_agg AS
+-- Materialized Views: entity_time_range_{src_ip,src_host,user}_mv
+-- ONE MV PER ENTITY BRANCH (NAN-1386). ClickHouse attaches an MV's insert
+-- trigger only to the FIRST SELECT of a UNION ALL body — the previous single
+-- UNION ALL view never fired its src_host branch (and had no user branch at
+-- all, though the asset reader queries entity_type='user'). Do NOT merge
+-- these back into one view. Migration 128 mirrors this block.
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.entity_time_range_src_ip_mv
+TO nanosiem.entity_time_range_agg AS
 SELECT
     'src_ip' AS entity_type,
     src_ip AS entity_value,
@@ -1183,8 +1189,10 @@ SELECT
     count() AS event_count
 FROM nanosiem.logs
 WHERE src_ip != ''
-GROUP BY entity_type, entity_value, time_bucket
-UNION ALL
+GROUP BY entity_type, entity_value, time_bucket;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.entity_time_range_src_host_mv
+TO nanosiem.entity_time_range_agg AS
 SELECT
     'src_host' AS entity_type,
     lower(src_host) AS entity_value,
@@ -1194,6 +1202,19 @@ SELECT
     count() AS event_count
 FROM nanosiem.logs
 WHERE src_host != ''
+GROUP BY entity_type, entity_value, time_bucket;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.entity_time_range_user_mv
+TO nanosiem.entity_time_range_agg AS
+SELECT
+    'user' AS entity_type,
+    lower(user) AS entity_value,
+    toStartOfHour(timestamp) AS time_bucket,
+    min(timestamp) AS first_seen,
+    max(timestamp) AS last_seen,
+    count() AS event_count
+FROM nanosiem.logs
+WHERE user != ''
 GROUP BY entity_type, entity_value, time_bucket;
 
 -- ============================================================================

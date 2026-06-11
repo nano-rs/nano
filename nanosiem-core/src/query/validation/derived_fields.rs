@@ -76,6 +76,22 @@ fn get_aggregation_output_name(agg: &Aggregation) -> String {
     agg.func.as_str().to_lowercase()
 }
 
+/// Register the additional `{func}_{field}` reference alias codegen accepts for
+/// un-aliased, field-bearing aggregations (NAN-1339, PR #2063): downstream
+/// commands may reference `avg(bytes_in)` as `avg_bytes_in`, which
+/// `collect_agg_reference_aliases` in `clickhouse_sql_gen::field_analysis`
+/// remaps to the real output column. Must be called from EXACTLY the command
+/// arms that remap covers — Stats, Chart, Timechart, EventStats. StreamStats is
+/// deliberately excluded: the codegen remap doesn't cover it, so registering
+/// the name here would only unmask a later codegen failure (NAN-1396).
+fn insert_agg_reference_alias(agg: &Aggregation, fields: &mut HashSet<String>) {
+    if agg.alias.is_none() {
+        if let Some(field) = &agg.field {
+            fields.insert(format!("{}_{}", agg.func.as_str(), field).to_lowercase());
+        }
+    }
+}
+
 pub(super) fn collect_command_output_fields(command: &Command, fields: &mut HashSet<String>) {
     match command {
         Command::Stats {
@@ -88,6 +104,7 @@ pub(super) fn collect_command_output_fields(command: &Command, fields: &mut Hash
         } => {
             for agg in aggregations {
                 fields.insert(get_aggregation_output_name(agg));
+                insert_agg_reference_alias(agg, fields);
             }
             if let Some(gb) = group_by {
                 for f in gb {
@@ -95,7 +112,17 @@ pub(super) fn collect_command_output_fields(command: &Command, fields: &mut Hash
                 }
             }
         }
-        Command::StreamStats { aggregations, .. } | Command::EventStats { aggregations, .. } => {
+        Command::EventStats { aggregations, .. } => {
+            for agg in aggregations {
+                fields.insert(get_aggregation_output_name(agg));
+                insert_agg_reference_alias(agg, fields);
+            }
+        }
+        Command::StreamStats { aggregations, .. } => {
+            // No `insert_agg_reference_alias` here: codegen's
+            // `collect_agg_reference_aliases` does not remap `{func}_{field}`
+            // for streamstats, so the only valid downstream name is the
+            // output alias itself.
             for agg in aggregations {
                 fields.insert(get_aggregation_output_name(agg));
             }
@@ -163,6 +190,7 @@ pub(super) fn collect_command_output_fields(command: &Command, fields: &mut Hash
             }
             for agg in aggregations {
                 fields.insert(get_aggregation_output_name(agg));
+                insert_agg_reference_alias(agg, fields);
             }
         }
         Command::Risk { .. } => {
@@ -245,6 +273,36 @@ pub(super) fn collect_command_output_fields(command: &Command, fields: &mut Hash
             fields.insert("anomaly_score".to_string());
             fields.insert("is_anomaly".to_string());
         }
+        Command::ResolveIdentity { .. } => {
+            // Mirror the codegen registration (NAN-1380, regression of #2057):
+            // `collect_computed_field_names` in `clickhouse_sql_gen::field_analysis`
+            // registers the always-bare resolve_identity outputs plus the bare
+            // `identity_*` attribute aliases. Without this arm the validator's
+            // typo gate rejected 11 of the 13 bare aliases. Validation is
+            // permissive by design, so the aliases are registered for every
+            // resolve_identity (codegen only emits them when a single
+            // resolve_identity makes them unambiguous — an ambiguous reference
+            // is codegen's diagnostic to give, not a "did you mean" typo).
+            for f in [
+                "identity_confidence",
+                "identity_observed_at",
+                "identity_source",
+                "identity_fqdn",
+                "identity_ip",
+            ] {
+                fields.insert(f.to_string());
+            }
+            for (col_suffix, _, _) in
+                crate::query::clickhouse_sql_gen::identity::IDENTITY_COLUMN_FIELDS.iter()
+            {
+                fields.insert((*col_suffix).to_string());
+            }
+            for (col_suffix, _, _) in
+                crate::query::clickhouse_sql_gen::identity::IDENTITY_DICT_ONLY_FIELDS.iter()
+            {
+                fields.insert((*col_suffix).to_string());
+            }
+        }
         // Commands that don't create new field names
         _ => {}
     }
@@ -270,6 +328,160 @@ mod tests {
         assert!(fields.contains("count"));
         assert!(fields.contains("dc"));
         assert!(fields.contains("src_ip"));
+    }
+
+    #[test]
+    fn test_unaliased_agg_registers_func_field_reference_alias() {
+        // NAN-1396 Bug A: codegen accepts `avg_bytes_in` as a downstream
+        // reference to un-aliased `avg(bytes_in)` (NAN-1339 remap), so the
+        // validator must register that name too — for exactly the command
+        // arms the remap covers.
+        for q in [
+            "* | stats avg(bytes_in) by src_ip",
+            "* | chart avg(bytes_in) by src_ip",
+            "* | timechart span=1h avg(bytes_in)",
+            "* | eventstats avg(bytes_in)",
+        ] {
+            let query = parse_query(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+            let fields = collect_derived_fields(&query);
+            assert!(fields.contains("avg"), "{q}: missing output alias");
+            assert!(
+                fields.contains("avg_bytes_in"),
+                "{q}: missing {{func}}_{{field}} reference alias"
+            );
+        }
+    }
+
+    #[test]
+    fn test_streamstats_does_not_register_reference_alias() {
+        // The codegen remap (`collect_agg_reference_aliases`) doesn't cover
+        // streamstats — registering `avg_bytes_in` here would just unmask a
+        // later codegen failure.
+        let query = parse_query("* | streamstats avg(bytes_in)").unwrap();
+        let fields = collect_derived_fields(&query);
+        assert!(fields.contains("avg"));
+        assert!(!fields.contains("avg_bytes_in"));
+    }
+
+    #[test]
+    fn test_aliased_agg_does_not_register_reference_alias() {
+        // The codegen remap only fires when `agg.alias.is_none()`.
+        let query = parse_query("* | stats avg(bytes_in) as mean_bytes by src_ip").unwrap();
+        let fields = collect_derived_fields(&query);
+        assert!(fields.contains("mean_bytes"));
+        assert!(!fields.contains("avg_bytes_in"));
+    }
+
+    /// NAN-1396 drift pin: for every `AggFunc` variant, validation's registered
+    /// names for an un-aliased field-bearing aggregation must cover BOTH
+    /// `output_alias()` and the `{func}_{field}` reference form — and the
+    /// codegen remap (`collect_agg_reference_aliases`) must agree that the
+    /// reference form resolves to `output_alias()`. The exhaustive match below
+    /// forces a decision here if `AggFunc` gains a variant.
+    #[test]
+    fn test_agg_output_names_match_codegen_for_every_func() {
+        use crate::query::ast::{Command, Query, SearchExpr};
+        use crate::query::clickhouse_sql_gen::field_analysis::collect_agg_reference_aliases;
+
+        let all_funcs = [
+            AggFunc::Count,
+            AggFunc::Dc,
+            AggFunc::Sum,
+            AggFunc::Avg,
+            AggFunc::Min,
+            AggFunc::Max,
+            AggFunc::Values,
+            AggFunc::List,
+            AggFunc::First,
+            AggFunc::Last,
+            AggFunc::Range,
+            AggFunc::Earliest,
+            AggFunc::Latest,
+            AggFunc::Stdev,
+            AggFunc::Var,
+            AggFunc::Median,
+            AggFunc::Perc95,
+            AggFunc::Percentile(90),
+            AggFunc::Mode,
+            AggFunc::Sparkline,
+        ];
+        // Exhaustiveness guard: a new AggFunc variant fails compilation here
+        // until it's added to `all_funcs` above (and a naming decision made).
+        for f in &all_funcs {
+            match f {
+                AggFunc::Count
+                | AggFunc::Dc
+                | AggFunc::Sum
+                | AggFunc::Avg
+                | AggFunc::Min
+                | AggFunc::Max
+                | AggFunc::Values
+                | AggFunc::List
+                | AggFunc::First
+                | AggFunc::Last
+                | AggFunc::Range
+                | AggFunc::Earliest
+                | AggFunc::Latest
+                | AggFunc::Stdev
+                | AggFunc::Var
+                | AggFunc::Median
+                | AggFunc::Perc95
+                | AggFunc::Percentile(_)
+                | AggFunc::Mode
+                | AggFunc::Sparkline => {}
+            }
+        }
+
+        for func in all_funcs {
+            let agg = Aggregation::new(func, Some("bytes_in".to_string()));
+            let command = Command::Stats {
+                aggregations: vec![agg.clone()],
+                group_by: None,
+            };
+            let mut registered = HashSet::new();
+            collect_command_output_fields(&command, &mut registered);
+
+            let output_alias = agg.output_alias().to_lowercase();
+            let reference = format!("{}_bytes_in", func.as_str()).to_lowercase();
+            assert!(
+                registered.contains(&output_alias),
+                "{func:?}: validation missing output_alias '{output_alias}'"
+            );
+            assert!(
+                registered.contains(&reference),
+                "{func:?}: validation missing reference form '{reference}'"
+            );
+
+            // Codegen agreement: the reference form must resolve to the output
+            // alias (or already BE the output alias, as for values/list).
+            let query = Query::Piped {
+                source: Box::new(Query::Search(SearchExpr::Keyword("*".to_string()))),
+                command,
+            };
+            let remap = collect_agg_reference_aliases(&query, &HashSet::new());
+            if reference == agg.output_alias() {
+                assert!(
+                    !remap.contains_key(&reference),
+                    "{func:?}: remap should not contain identity mapping"
+                );
+            } else {
+                assert_eq!(
+                    remap.get(&format!("{}_bytes_in", func.as_str())),
+                    Some(&agg.output_alias()),
+                    "{func:?}: codegen remap disagrees with validation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_lookup_multi_field_output_registered() {
+        // NAN-1396 Bug B companion: every OUTPUT field is a derived field.
+        let query =
+            parse_query("* | lookup threats src_ip OUTPUT threat_type, confidence").unwrap();
+        let fields = collect_derived_fields(&query);
+        assert!(fields.contains("threat_type"));
+        assert!(fields.contains("confidence"));
     }
 
     #[test]
@@ -367,6 +579,31 @@ mod tests {
         assert!(fields.contains("src_ip"));
         assert!(fields.contains("count"));
         assert!(fields.contains("percent"));
+    }
+
+    #[test]
+    fn test_resolve_identity_derived_fields() {
+        // NAN-1380 (G8): the bare identity_* aliases registered for codegen in
+        // field_analysis::collect_computed_field_names must also be derived
+        // fields here, or downstream references are rejected as typos.
+        let query = parse_query("* | resolve_identity").unwrap();
+        let fields = collect_derived_fields(&query);
+        for f in [
+            "identity_confidence",
+            "identity_observed_at",
+            "identity_source",
+            "identity_fqdn",
+            "identity_ip",
+        ] {
+            assert!(fields.contains(f), "missing always-bare output: {f}");
+        }
+        for (col_suffix, _, _) in
+            crate::query::clickhouse_sql_gen::identity::IDENTITY_COLUMN_FIELDS
+                .iter()
+                .chain(crate::query::clickhouse_sql_gen::identity::IDENTITY_DICT_ONLY_FIELDS.iter())
+        {
+            assert!(fields.contains(*col_suffix), "missing bare alias: {col_suffix}");
+        }
     }
 
     #[test]

@@ -61,8 +61,9 @@ impl EncryptionService {
     /// for backward compatibility.
     ///
     /// # Panics
-    /// Panics if no encryption key is configured and `NANOSIEM_DEV_MODE` is not set to "true".
-    /// This ensures production deployments cannot accidentally run with default keys.
+    /// Panics if no encryption key is configured and `NANOSIEM_ALLOW_DEFAULT_KEYS` is not
+    /// set to "true". This ensures production deployments cannot accidentally run with the
+    /// built-in public default key — even when `NANOSIEM_DEV_MODE` is on for HTTP cookies.
     pub fn from_env() -> Self {
         let key =
             std::env::var("NANOSIEM_ENCRYPTION_KEY").or_else(|_| std::env::var("OIDC_SECRET_KEY"));
@@ -78,22 +79,28 @@ impl EncryptionService {
                 Self::new(key.as_bytes())
             }
             _ => {
-                // Check if development mode is explicitly enabled
-                let dev_mode = std::env::var("NANOSIEM_DEV_MODE")
-                    .map(|v| v.to_lowercase() == "true")
+                // NAN-1355: gate the built-in public key behind NANOSIEM_ALLOW_DEFAULT_KEYS,
+                // not NANOSIEM_DEV_MODE. Dev-mode only relaxes the cookie Secure flag for
+                // plain-HTTP deploys; it must not also unlock the default encryption key, or
+                // an http:// deployment that enables dev-mode for cookies would encrypt all
+                // stored credentials under a publicly-known key.
+                let allow_default_keys = std::env::var("NANOSIEM_ALLOW_DEFAULT_KEYS")
+                    .map(|v| v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false);
 
-                if dev_mode {
+                if allow_default_keys {
                     tracing::warn!(
-                        "SECURITY WARNING: Using default development encryption key. \
-                         This is only acceptable in development environments!"
+                        "SECURITY WARNING: Using the built-in public development encryption key \
+                         (NANOSIEM_ALLOW_DEFAULT_KEYS=true). Only acceptable in development — \
+                         never set this in production!"
                     );
                     Self::new(b"nanosiem-default-key-32bytes!!")
                 } else {
                     panic!(
                         "SECURITY ERROR: No encryption key configured. \
                          Set NANOSIEM_ENCRYPTION_KEY environment variable to a secure random 32-byte value. \
-                         If this is a development environment, set NANOSIEM_DEV_MODE=true to use default keys."
+                         For local development only, set NANOSIEM_ALLOW_DEFAULT_KEYS=true to use the \
+                         insecure built-in default key."
                     );
                 }
             }
@@ -192,6 +199,57 @@ impl EncryptionService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NAN-1355: the built-in public default key must be unlocked ONLY by
+    /// `NANOSIEM_ALLOW_DEFAULT_KEYS` — never by `NANOSIEM_DEV_MODE` (which exists
+    /// solely to relax the cookie `Secure` flag for plain-HTTP deployments).
+    /// `from_env` reads `NANOSIEM_ENCRYPTION_KEY` / `OIDC_SECRET_KEY` /
+    /// `NANOSIEM_ALLOW_DEFAULT_KEYS`, none of which any other test sets, so this
+    /// single sequential test manipulates them without racing other tests.
+    #[test]
+    fn from_env_default_key_gated_by_allow_default_keys_not_dev_mode() {
+        fn save(k: &str) -> Option<String> {
+            std::env::var(k).ok()
+        }
+        fn restore(k: &str, v: Option<String>) {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+        let saved = [
+            ("NANOSIEM_ENCRYPTION_KEY", save("NANOSIEM_ENCRYPTION_KEY")),
+            ("OIDC_SECRET_KEY", save("OIDC_SECRET_KEY")),
+            ("NANOSIEM_ALLOW_DEFAULT_KEYS", save("NANOSIEM_ALLOW_DEFAULT_KEYS")),
+            ("NANOSIEM_DEV_MODE", save("NANOSIEM_DEV_MODE")),
+        ];
+
+        // No real key configured.
+        std::env::remove_var("NANOSIEM_ENCRYPTION_KEY");
+        std::env::remove_var("OIDC_SECRET_KEY");
+
+        // (1) dev-mode ON, allow-default-keys OFF -> must STILL fail closed (panic).
+        std::env::set_var("NANOSIEM_DEV_MODE", "true");
+        std::env::remove_var("NANOSIEM_ALLOW_DEFAULT_KEYS");
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // silence the expected panic
+        let dev_mode_only = std::panic::catch_unwind(EncryptionService::from_env);
+        std::panic::set_hook(prev_hook);
+        assert!(
+            dev_mode_only.is_err(),
+            "NANOSIEM_DEV_MODE alone must NOT unlock the built-in default encryption key"
+        );
+
+        // (2) allow-default-keys ON -> default key used, encrypt/decrypt round-trips.
+        std::env::set_var("NANOSIEM_ALLOW_DEFAULT_KEYS", "true");
+        let svc = EncryptionService::from_env();
+        let ct = svc.encrypt(b"secret").unwrap();
+        assert_eq!(svc.decrypt(&ct).unwrap().as_slice(), b"secret");
+
+        for (k, v) in saved {
+            restore(k, v);
+        }
+    }
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {

@@ -40,9 +40,12 @@ pub struct Alert {
     #[serde(with = "typeid::alert")]
     #[schema(value_type = String)]
     pub id: Uuid,
-    #[serde(with = "typeid::rule")]
-    #[schema(value_type = String)]
-    pub rule_id: Uuid,
+    // NAN-1356: nullable — the FK `alerts_rule_id_fkey ... ON DELETE SET NULL`
+    // sets this to NULL when the source detection rule is deleted. Decoding it as
+    // a non-optional `Uuid` 500'd the entire `GET /api/alerts` list.
+    #[serde(with = "typeid::rule::opt", default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub rule_id: Option<Uuid>,
     #[sqlx(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule_name: Option<String>,

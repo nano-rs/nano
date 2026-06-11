@@ -38,6 +38,11 @@ pub(crate) fn lookup_error_to_api(err: LookupError) -> ApiError {
         }
         LookupError::InvalidTableName(msg) => ApiError::ValidationError(msg),
         LookupError::InvalidColumn(msg) => ApiError::ValidationError(msg),
+        // NAN-1361: malformed-but-parseable upload data fails at the DB layer;
+        // surface it as a 4xx validation error rather than a 500.
+        LookupError::InvalidData(msg) => {
+            ApiError::ValidationError(format!("Invalid upload data: {}", msg))
+        }
         LookupError::RowLimitExceeded(max) => {
             ApiError::ValidationError(format!("Row limit exceeded: maximum {} rows allowed", max))
         }

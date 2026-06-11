@@ -45,3 +45,17 @@ fn tree_positional_roundtrips() {
     assert_roundtrips("* | tree process_name by src_host");
     assert_roundtrips("* | tree process_name");
 }
+
+#[test]
+fn lookup_multi_field_output_roundtrips() {
+    // NAN-1396 Bug B investigation: pins that the lookup formatter's comma
+    // OUTPUT list survives the enforce_non_audit_query round-trip intact
+    // (the actual bug was the validator typo-gating OUTPUT names, but a
+    // formatter regression here would silently shrink `output_fields`).
+    assert_roundtrips("* | lookup threats src_ip OUTPUT threat_type, confidence");
+    assert_roundtrips(
+        r#"* | lookup threats src_endpoint.ip OUTPUT threat_type, confidence | where isnotnull(confidence)"#,
+    );
+    assert_roundtrips("* | lookup threats src_ip OUTPUT threat_type CASE_INSENSITIVE");
+    assert_roundtrips("* | lookup threats src_ip");
+}

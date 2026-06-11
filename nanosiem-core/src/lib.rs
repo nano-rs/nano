@@ -28,6 +28,7 @@
 pub mod airgap;
 pub mod audit;
 pub mod auth;
+pub(crate) mod config_safety;
 pub mod crypto;
 pub mod db;
 pub mod demo;
@@ -307,13 +308,14 @@ pub use rule_repository::{
     UpdatedRule,
 };
 pub use scheduler::{
-    calculate_next_run, calculate_next_runs, describe_cron, validate_cron, JobExecution, JobFilter,
-    JobStats, JobStatus, NewScheduledJob, RetryPolicy, ScheduledJob, SchedulerError,
-    SchedulerRepository, SchedulerRepositoryError, SchedulerService, UpdateScheduledJob,
+    calculate_next_run, calculate_next_runs, describe_cron, merge_auth_headers,
+    redact_auth_headers, validate_cron, JobExecution, JobFilter, JobStats, JobStatus,
+    NewScheduledJob, RetryPolicy, ScheduledJob, SchedulerError, SchedulerRepository,
+    SchedulerRepositoryError, SchedulerService, UpdateScheduledJob,
 };
 pub use search::{
     HistogramBucket, RawSqlRequest, SearchBackend, SearchError, SearchRequest, SearchResponse,
-    SearchService, TimeRangeInput, UdmFieldQueryRequest, UdmFieldStats, UdmQueryOperator,
+    SearchService, TimeRangeInput, UdmFieldQueryRequest, UdmQueryOperator,
 };
 pub use settings::{
     ai_request_cost, check_api_access, check_api_write_access, check_limit, check_model_access,

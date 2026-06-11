@@ -74,32 +74,11 @@ const DDL: &str = include_str!(concat!(
 ));
 
 /// Columns the DDL owns for bookkeeping/ingest that legitimately have no
-/// manifest promotion entry. `source_type` is the operational provenance/routing
-/// key — ingest-written from the `X-Source-Type` header (not derived from the
-/// OCSF `event`), so like `event`/`timestamp`/`_inserted_at` it must NOT be
-/// required as a manifest promotion (NAN-1241).
-///
-/// NAN-1333: the `*_unified` columns are DERIVED — a class-spanning
-/// `if(primary != s, primary, fallback)` union of two ALREADY-promoted manifest
-/// columns, not a new OCSF source field. They exist only to give the codegen a
-/// single indexed column to filter/group on. Each one's two source columns ARE in
-/// the manifest; the union itself is bookkeeping, like the prevalence_* derivations.
-const BOOKKEEPING: &[&str] = &[
-    "event",
-    "timestamp",
-    "_inserted_at",
-    "source_type",
-    "process_name_unified",
-    "process_path_unified",
-    "command_line_unified",
-    "process_id_unified",
-    "process_guid_unified",
-    "process_hash_unified",
-    "user_unified",
-    "url_domain_unified",
-    "url_unified",
-    "src_host_unified",
-];
+/// manifest promotion entry. Hoisted to
+/// `nanosiem_core::schema::OCSF_BOOKKEEPING_COLUMNS` (NAN-1397) so the
+/// field-stats inventory regression tests consume the SAME registry this gate
+/// enforces — see the const's doc for the per-column rationale.
+const BOOKKEEPING: &[&str] = nanosiem_core::schema::OCSF_BOOKKEEPING_COLUMNS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {

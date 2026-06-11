@@ -74,6 +74,10 @@ impl SearchService {
         // Parse the cleaned query
         let parsed = parse_query(&cleaned_query).map_err(|e| convert_parse_error(e))?;
 
+        // NAN-1354: input-side field-name validation (defense-in-depth behind
+        // codegen escaping). Keep `explain` consistent with the executed path.
+        validate_query_field_names(&parsed, self.active_profile.as_ref())?;
+
         // NAN-806: keep `explain` honest — the executed query has implicit
         // top-N sorting injected after a trailing `stats … by …`, and the
         // explained SQL should reflect that.

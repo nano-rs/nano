@@ -1475,6 +1475,51 @@ mod tests {
         );
     }
 
+    /// NAN-1378: `ocsf_prepare` reads `%source_type` (with an `?? "unknown"`
+    /// fallback) to restore provenance after the OCSF parsers' `. = {...}`
+    /// root-replacement wipes `.source_type`. The writer lives in 00-base.toml's
+    /// `source_type_extract` remap; if it goes missing, every Vector-ingested
+    /// OCSF row silently lands as source_type='unknown'. Pin the writer here.
+    #[test]
+    fn base_config_stashes_source_type_metadata() {
+        let base = include_str!("../../../../config/vector/00-base.toml");
+        assert!(
+            base.contains("%source_type = downcase(source_type)"),
+            "00-base.toml must stash `%source_type` event metadata for the OCSF lane"
+        );
+    }
+
+    /// NAN-1378: same guard as `pipeline_config_vrl_blocks_compile`, for the
+    /// statically embedded 00-base.toml (deployed verbatim via `include_str!`).
+    /// A VRL diagnostic here would take ingestion down on the next Vector reload.
+    #[test]
+    fn base_config_vrl_blocks_compile() {
+        use vrl::compiler::compile;
+        use vrl::diagnostic::Formatter;
+
+        let content = include_str!("../../../../config/vector/00-base.toml");
+        let blocks = extract_vrl_blocks(content);
+        assert!(!blocks.is_empty(), "expected ≥1 VRL block in 00-base.toml");
+
+        let fns = vrl::stdlib::all();
+        let failures: Vec<String> = blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, block)| {
+                compile(block, &fns).err().map(|diagnostics| {
+                    let formatted = Formatter::new(block, diagnostics).to_string();
+                    format!("block #{idx}:\n{formatted}")
+                })
+            })
+            .collect();
+
+        assert!(
+            failures.is_empty(),
+            "00-base.toml VRL failed to compile:\n{}",
+            failures.join("\n----\n")
+        );
+    }
+
     /// NAN-1325: the generic OCSF Base Event lane's VRL must compile, or an OCSF
     /// deploy would take ingestion down on the next Vector reload. Compiled here
     /// independent of `NANO_SCHEMA_PROFILE` (the block is appended only under OCSF,

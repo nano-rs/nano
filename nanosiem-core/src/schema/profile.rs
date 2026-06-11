@@ -13,8 +13,8 @@
 use std::borrow::Cow;
 
 use super::types::{
-    EnrichmentKind, EnrichmentMode, EntityRole, EntityType, FieldCategory, FieldDef,
-    FieldResolution, FieldType, SchemaId,
+    EnrichmentKind, EnrichmentMode, EntityRole, EntityType, EnumIntMapping, FieldCategory,
+    FieldDef, FieldResolution, FieldType, SchemaId,
 };
 
 /// The contract that `UdmProfile` and (later) `OcsfProfile` both satisfy.
@@ -211,6 +211,21 @@ pub trait SchemaProfile: Send + Sync {
     /// Default: `None` — UDM has no class-split, so all UDM codegen paths keep
     /// their single-column resolution byte-identical. OCSF overrides this.
     fn class_split_column(&self, _udm_field: &str) -> Option<String> {
+        None
+    }
+
+    /// Enum label→int translation for a field whose RESOLVED physical column is
+    /// an enum-encoded integer (NAN-1382 / parity gap G6). `field` is the nPL
+    /// token (a UDM-semantic alias like `auth_result`, or the native column name
+    /// like `status_id`); the implementation resolves it and returns how string
+    /// verbs map onto the int — a fixed [`EnumIntMapping::Values`] table or a
+    /// sibling [`EnumIntMapping::LabelColumn`]. Returns `None` when the field
+    /// does not resolve to an enum-int column under this schema.
+    ///
+    /// Default: `None` — UDM stores verbs as strings (`auth_result` IS a String
+    /// column), so every UDM codegen path is byte-identical. OCSF overrides this
+    /// from the manifest's `enum_values` / `enum_label_column` metadata.
+    fn enum_int_mapping(&self, _field: &str) -> Option<EnumIntMapping<'_>> {
         None
     }
 

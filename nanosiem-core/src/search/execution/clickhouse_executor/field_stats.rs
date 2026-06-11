@@ -88,6 +88,31 @@ fn field_stats_alias(name: &str) -> String {
 }
 
 impl ClickHouseExecutor {
+    /// Whether a column enumerated from `system.columns` is safe for the
+    /// field-stats companion query.
+    ///
+    /// ClickHouse excludes MATERIALIZED columns from `SELECT *`. The companion
+    /// wraps multi-CTE pipelines as a subquery (NAN-1315) whose `stage_0`
+    /// projects `SELECT *, <the active profile's materialized re-add list>` —
+    /// so a MATERIALIZED column that is NOT in that re-add list does not exist
+    /// in the wrapped scope, and a `topK(toString(col))` over it fails with
+    /// Code 47 on every wrapped search (NAN-1397: the `event_bytes` metering
+    /// column added by NAN-1385). Such columns are internal bookkeeping by
+    /// construction — analyst-relevant columns are manifest-promoted and
+    /// therefore re-added — so they are dropped from the analyst-facing
+    /// inventory entirely instead of being projected into every CTE stage.
+    ///
+    /// `default_kind` is `system.columns.default_kind` (`""`, `"DEFAULT"`,
+    /// `"MATERIALIZED"`, … — `ALIAS` rows are filtered out in SQL). Plain and
+    /// DEFAULT columns survive `SELECT *`, so they are always safe.
+    pub fn is_companion_safe_column(
+        name: &str,
+        default_kind: &str,
+        cte_visible_materialized: &[&str],
+    ) -> bool {
+        default_kind != "MATERIALIZED" || cte_visible_materialized.contains(&name)
+    }
+
     /// Get list of queryable columns from the active schema's logs table.
     /// Excludes arrays, maps, and internal columns (starting with _).
     ///
@@ -97,18 +122,28 @@ impl ClickHouseExecutor {
     /// hardcoded query); an OCSF deployment passes `"ocsf_logs"` so the field
     /// panel enumerates OCSF columns instead of UDM ones (NAN-1241).
     ///
+    /// `cte_visible_materialized` is the active profile's materialized-column
+    /// re-add list (`SchemaProfile::materialized_columns`). MATERIALIZED
+    /// columns outside it are excluded — see [`Self::is_companion_safe_column`]
+    /// (NAN-1397). For UDM the re-add list covers every MATERIALIZED column on
+    /// `logs` (NAN-1147), so the returned set is unchanged.
+    ///
     /// The `%.search` exclusion drops OCSF's dotted `_search` companion columns
     /// (e.g. `src_endpoint.ip.search`); it sits alongside the existing `%_search`
     /// exclusion that drops UDM's snake_case companions (`message_search`, …).
     /// Both are harmless no-ops against the other schema.
-    pub async fn get_table_columns(&self, table: &str) -> Result<Vec<String>, SearchError> {
+    pub async fn get_table_columns(
+        &self,
+        table: &str,
+        cte_visible_materialized: &[&str],
+    ) -> Result<Vec<String>, SearchError> {
         // Escape single quotes in the table name to avoid injection in the
         // string literal (table names are internal/registry-derived, but keep
         // it safe regardless).
         let table_lit = table.replace('\'', "''");
         let sql = format!(
             r#"
-            SELECT name
+            SELECT name, default_kind
             FROM system.columns
             WHERE database = 'nanosiem'
               AND table = '{table}'
@@ -156,9 +191,11 @@ impl ClickHouseExecutor {
         let columns: Vec<String> = response_str
             .lines()
             .filter_map(|line| {
-                serde_json::from_str::<serde_json::Value>(line)
-                    .ok()
-                    .and_then(|v| v.get("name")?.as_str().map(|s| s.to_string()))
+                let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
+                let name = v.get("name")?.as_str()?;
+                let default_kind = v.get("default_kind").and_then(|k| k.as_str()).unwrap_or("");
+                Self::is_companion_safe_column(name, default_kind, cte_visible_materialized)
+                    .then(|| name.to_string())
             })
             .collect();
 
@@ -766,6 +803,74 @@ mod tests {
             field_stats_alias("actor.process.cmd_line"),
             "actor_process_cmd_line"
         );
+    }
+
+    /// NAN-1397: a MATERIALIZED column that the active profile does NOT re-add
+    /// in CTE stages (e.g. the `event_bytes` metering column, NAN-1385) is
+    /// invisible inside the companion's subquery wrap and must be dropped from
+    /// the inventory. MATERIALIZED columns IN the re-add list, and plain /
+    /// DEFAULT columns (which survive `SELECT *`), stay.
+    #[test]
+    fn companion_safe_column_excludes_unreadded_materialized_only() {
+        let readd: &[&str] = &["enriched_src_country", "user_unified"];
+
+        // Pure metering bookkeeping: MATERIALIZED, not re-added → excluded.
+        assert!(!ClickHouseExecutor::is_companion_safe_column(
+            "event_bytes",
+            "MATERIALIZED",
+            readd
+        ));
+        // MATERIALIZED but in the profile's re-add list → kept.
+        assert!(ClickHouseExecutor::is_companion_safe_column(
+            "enriched_src_country",
+            "MATERIALIZED",
+            readd
+        ));
+        assert!(ClickHouseExecutor::is_companion_safe_column(
+            "user_unified",
+            "MATERIALIZED",
+            readd
+        ));
+        // DEFAULT / plain columns survive `SELECT *` → always kept.
+        assert!(ClickHouseExecutor::is_companion_safe_column(
+            "source_type",
+            "DEFAULT",
+            readd
+        ));
+        assert!(ClickHouseExecutor::is_companion_safe_column("message", "", readd));
+    }
+
+    /// The OCSF profile's bookkeeping columns must never reach the field-stats
+    /// inventory unless the profile itself re-adds them in CTE stages
+    /// (timestamp/source_type are DEFAULT — `SELECT *`-visible — and the
+    /// `*_unified` columns are re-added; `event` is JSON-filtered in SQL;
+    /// `event_bytes` is the one that must fall out here).
+    #[test]
+    fn ocsf_bookkeeping_metering_columns_are_companion_unsafe() {
+        use crate::schema::{SchemaProfile, OCSF_BOOKKEEPING_COLUMNS};
+        let profile = crate::schema::OcsfProfile::new();
+        let readd = profile.materialized_columns();
+
+        // `event_bytes` is MATERIALIZED and not re-added → must be excluded.
+        assert!(OCSF_BOOKKEEPING_COLUMNS.contains(&"event_bytes"));
+        assert!(!ClickHouseExecutor::is_companion_safe_column(
+            "event_bytes",
+            "MATERIALIZED",
+            readd
+        ));
+
+        // No bookkeeping column may be BOTH MATERIALIZED-style-invisible and
+        // companion-listed: every bookkeeping column is either re-added by the
+        // profile or excluded by this filter — so the next metering column
+        // registered in OCSF_BOOKKEEPING_COLUMNS cannot repeat NAN-1397.
+        for col in OCSF_BOOKKEEPING_COLUMNS {
+            let safe = ClickHouseExecutor::is_companion_safe_column(col, "MATERIALIZED", readd);
+            assert_eq!(
+                safe,
+                readd.contains(col),
+                "bookkeeping column {col} must be companion-safe iff the profile re-adds it"
+            );
+        }
     }
 
     #[test]

@@ -27,6 +27,11 @@ pub enum LookupError {
     InvalidTableName(String),
     #[error("Invalid column: {0}")]
     InvalidColumn(String),
+    /// A database error caused by the uploaded data/schema rather than
+    /// infrastructure (e.g. a value that doesn't match its column type, a
+    /// duplicate primary key, too many columns). Surfaced as a 4xx, not a 500.
+    #[error("Invalid upload data: {0}")]
+    InvalidData(String),
     #[error("Row limit exceeded: maximum {0} rows allowed")]
     RowLimitExceeded(i64),
     #[error("Primary key column not found in columns: {0}")]
@@ -45,8 +50,43 @@ impl From<LookupRepositoryError> for LookupError {
             LookupRepositoryError::PrimaryKeyNotFound(n) => LookupError::PrimaryKeyNotFound(n),
             LookupRepositoryError::RowLimitExceeded(n) => LookupError::RowLimitExceeded(n),
             LookupRepositoryError::RowNotFound(id) => LookupError::RowNotFound(id),
-            LookupRepositoryError::DatabaseError(e) => LookupError::RepositoryError(e.to_string()),
+            // NAN-1361: a malformed-but-parseable upload (e.g. a value that can't
+            // be coerced to its inferred column type, a duplicate primary key, or
+            // too many columns) fails at the DB layer. Classify those input-caused
+            // errors as a validation error (4xx) instead of an internal 500.
+            LookupRepositoryError::DatabaseError(e) => {
+                let sqlstate = e.as_database_error().and_then(|d| d.code());
+                match sqlstate.as_deref().and_then(input_error_message) {
+                    Some(msg) => LookupError::InvalidData(msg.to_string()),
+                    None => LookupError::RepositoryError(e.to_string()),
+                }
+            }
         }
+    }
+}
+
+/// Map a Postgres `SQLSTATE` to a user-facing validation message when the error
+/// is caused by the uploaded data/schema rather than infrastructure. Returns
+/// `None` for classes that indicate a genuine server/infra failure (→ 500).
+///
+/// Classes (first two chars): `22` data-exception, `23` integrity-constraint
+/// violation, `54` program-limit-exceeded. We deliberately do NOT include the
+/// whole `42` class (syntax/access) — those usually indicate a real bug — but we
+/// do special-case `42804` (datatype_mismatch), which in the dynamic
+/// lookup-insert path is always caused by the uploaded data (NAN-1361).
+fn input_error_message(sqlstate: &str) -> Option<&'static str> {
+    // 42804 datatype_mismatch: belt-and-suspenders behind the typed-NULL bind
+    // fix in `repository::bind_value` — any residual mismatch is a 4xx, not 500.
+    if sqlstate == "42804" {
+        return Some("a value in the upload is not valid for its column type");
+    }
+    match sqlstate.get(..2) {
+        Some("22") => Some("a value in the upload is not valid for its column type"),
+        Some("23") => {
+            Some("the upload violates a table constraint (e.g. a duplicate primary key)")
+        }
+        Some("54") => Some("the upload exceeds a database limit (e.g. too many columns)"),
+        _ => None,
     }
 }
 
@@ -146,6 +186,83 @@ impl LookupService {
             .await?;
 
         Ok(table)
+    }
+
+    /// Atomically replace an existing lookup table's schema + data (NAN-1362).
+    ///
+    /// Builds and populates a fresh, uniquely-named *staging* table first; only
+    /// if that fully succeeds does it swap the staging table in for the live one
+    /// inside a single transaction (`swap_staged_table`). A malformed or failing
+    /// payload therefore leaves the existing table and its data completely
+    /// intact — replacing the old drop-then-recreate-then-insert flow that
+    /// destroyed data when the insert failed. The table must already exist.
+    #[instrument(skip(self, records))]
+    pub async fn replace_table(
+        &self,
+        new_table: NewLookupTable,
+        records: Vec<HashMap<String, serde_json::Value>>,
+    ) -> Result<LookupTable, LookupError> {
+        if new_table.columns.is_empty() {
+            return Err(LookupError::InvalidColumn(
+                "At least one column is required".to_string(),
+            ));
+        }
+        if let Some(ref pk) = new_table.primary_key {
+            if !new_table.columns.iter().any(|c| &c.name == pk) {
+                return Err(LookupError::PrimaryKeyNotFound(pk.clone()));
+            }
+        }
+        if records.len() as i64 > MAX_LOOKUP_TABLE_ROWS {
+            return Err(LookupError::RowLimitExceeded(MAX_LOOKUP_TABLE_ROWS));
+        }
+
+        // The table must already exist for a replace; keep its physical name.
+        let existing = self.repository.get_table(&new_table.name).await?;
+
+        // Fresh, uniquely-named staging table (bounded to Postgres' 63-byte
+        // identifier limit). The live table is never touched until the swap.
+        let base: String = existing.table_name.chars().take(48).collect();
+        let staging = format!(
+            "{}_stg_{}",
+            base,
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        );
+        let pk = new_table.primary_key.as_deref();
+
+        self.repository
+            .create_dynamic_table(&staging, &new_table.columns, pk)
+            .await?;
+
+        let inserted = match self
+            .repository
+            .insert_records(&staging, &new_table.columns, &records)
+            .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                // Clean up staging; the live table + data are untouched.
+                let _ = self.repository.drop_dynamic_table(&staging).await;
+                return Err(e.into());
+            }
+        };
+
+        if let Err(e) = self
+            .repository
+            .swap_staged_table(
+                &existing.table_name,
+                &staging,
+                &new_table.name,
+                &new_table.columns,
+                pk,
+                inserted as i64,
+            )
+            .await
+        {
+            let _ = self.repository.drop_dynamic_table(&staging).await;
+            return Err(e.into());
+        }
+
+        Ok(self.repository.get_table(&new_table.name).await?)
     }
 
     /// Drop a lookup table
@@ -688,6 +805,30 @@ impl LookupService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_error_message_classifies_data_errors_as_4xx() {
+        // Input-caused classes -> a user-facing message (=> 4xx).
+        assert!(input_error_message("22P02").is_some()); // invalid_text_representation (type)
+        assert!(input_error_message("22003").is_some()); // numeric_value_out_of_range
+        assert!(input_error_message("23505").is_some()); // unique_violation (dup PK)
+        assert!(input_error_message("23502").is_some()); // not_null_violation
+        assert!(input_error_message("54011").is_some()); // too_many_columns
+        assert!(input_error_message("42804").is_some()); // datatype_mismatch (NAN-1361 F-4)
+        // ...but the rest of class 42 stays a 500 (real bug, not bad input).
+        assert!(input_error_message("42601").is_none()); // syntax_error
+        assert!(input_error_message("42P01").is_none()); // undefined_table
+    }
+
+    #[test]
+    fn input_error_message_leaves_infra_errors_as_500() {
+        // Genuine server/infra (or ambiguous) classes -> None (=> stays a 500).
+        assert!(input_error_message("08006").is_none()); // connection_failure
+        assert!(input_error_message("53300").is_none()); // too_many_connections
+        assert!(input_error_message("42601").is_none()); // syntax_error (real bug, not input)
+        assert!(input_error_message("XX000").is_none()); // internal_error
+        assert!(input_error_message("").is_none());
+    }
 
     #[test]
     fn test_detect_column_types_integers() {

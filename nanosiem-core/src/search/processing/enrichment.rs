@@ -13,6 +13,75 @@ use crate::search::{
 };
 use tracing::{debug, info, warn};
 
+/// Pre-validate that every `| lookup` table referenced by the query exists.
+///
+/// Returns an actionable 400-class error naming the missing lookup (and the
+/// available tables) instead of letting execution proceed to a masked failure
+/// or silently un-enriched results (NAN-1389).
+///
+/// A registry read failure (PostgreSQL hiccup) skips the pre-check rather than
+/// failing the search — the enrichment step downstream surfaces its own error.
+pub async fn validate_lookup_tables(
+    lookup_commands: &[LookupCommandInfo],
+    lookup_service: Option<&LookupService>,
+) -> Result<(), SearchError> {
+    let Some(lookup_service) = lookup_service else {
+        // No service wired (test/minimal construction) — the enrichment step
+        // logs and skips, matching pre-existing behavior.
+        return Ok(());
+    };
+
+    for cmd in lookup_commands {
+        match lookup_service.table_exists(&cmd.table_name).await {
+            Ok(true) => {}
+            Ok(false) => {
+                let available: Vec<String> = match lookup_service.list_tables().await {
+                    Ok(tables) => tables.into_iter().map(|t| t.name).collect(),
+                    Err(_) => Vec::new(),
+                };
+                return Err(SearchError::SqlValidationError(missing_lookup_message(
+                    &cmd.table_name,
+                    &available,
+                )));
+            }
+            Err(e) => {
+                warn!(
+                    "Lookup table existence pre-check failed for '{}' (skipping): {}",
+                    cmd.table_name, e
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Build the user-facing message for a `| lookup` against a missing table.
+fn missing_lookup_message(table_name: &str, available: &[String]) -> String {
+    const MAX_LISTED: usize = 10;
+    if available.is_empty() {
+        format!(
+            "Lookup table '{}' does not exist and no lookup tables are defined. \
+             Create the lookup table first, or remove the `| lookup {}` stage.",
+            table_name, table_name
+        )
+    } else {
+        let mut listed = available
+            .iter()
+            .take(MAX_LISTED)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if available.len() > MAX_LISTED {
+            listed.push_str(", …");
+        }
+        format!(
+            "Lookup table '{}' does not exist. Available lookup tables: {}",
+            table_name, listed
+        )
+    }
+}
+
 /// Apply lookup enrichment to search results
 ///
 /// For each lookup command, this function:
@@ -73,6 +142,21 @@ pub async fn apply_lookup_enrichment(
 
         let batch_result = match lookup_service.lookup_batch(batch_query).await {
             Ok(result) => result,
+            // The pre-check (`validate_lookup_tables`) runs before execution,
+            // but the table can be dropped mid-flight — surface that the same
+            // actionable way instead of silently returning un-enriched rows
+            // (NAN-1389).
+            Err(crate::lookup::LookupError::TableNotFound(name)) => {
+                return Err(SearchError::SqlValidationError(format!(
+                    "Lookup table '{}' does not exist (it may have been deleted \
+                     while the search was running)",
+                    name
+                )));
+            }
+            // Infra failure (e.g. a PostgreSQL hiccup): preserve the
+            // pre-existing degrade-and-log behavior — the table is known to
+            // exist, so failing the whole search here would turn transient
+            // metadata-store blips into search outages.
             Err(e) => {
                 warn!("Lookup failed for table {}: {}", lookup_cmd.table_name, e);
                 continue;
@@ -131,10 +215,19 @@ pub async fn apply_lookup_enrichment(
 /// 2. In enrichment mode: Substitutes key values into URL, fetches, and merges
 ///
 /// Fetched fields are prefixed with "inputlookup_" to indicate source.
+///
+/// Failure surfacing (NAN-1389): an inputlookup that cannot produce data is an
+/// error, not a silent no-op. Previously a failed fetch was logged and the
+/// original rows returned as HTTP 200 — in data-source mode that substituted
+/// raw log rows for the requested external data, and in enrichment mode it fed
+/// silently un-enriched rows into downstream `where`/`stats` stages. Partial
+/// enrichment failures (some keys fetched, some failed) degrade gracefully and
+/// are reported through `warnings`.
 pub async fn apply_inputlookup_enrichment(
     results: Vec<serde_json::Value>,
     inputlookup_commands: &[InputLookupCommandInfo],
     inputlookup_service: Option<&InputLookupService>,
+    warnings: &mut Vec<String>,
 ) -> Result<Vec<serde_json::Value>, SearchError> {
     let inputlookup_service = match inputlookup_service {
         Some(service) => service,
@@ -168,24 +261,95 @@ pub async fn apply_inputlookup_enrichment(
             .execute(current_results.clone(), &params)
             .await
         {
-            Ok(enriched) => {
+            Ok(outcome) => {
                 info!(
-                    "InputLookup enrichment complete: {} results",
-                    enriched.len()
+                    "InputLookup enrichment complete: {} results ({} warnings)",
+                    outcome.results.len(),
+                    outcome.warnings.len()
                 );
-                current_results = enriched;
+                warnings.extend(outcome.warnings);
+                current_results = outcome.results;
             }
             Err(e) => {
-                // Log at error level to make failures more visible
-                tracing::error!(
-                    "InputLookup failed for url='{}': {}. Returning original results.",
-                    cmd.url.template,
-                    e
-                );
-                // Continue with original results on failure
+                tracing::error!("InputLookup failed for url='{}': {}", cmd.url.template, e);
+                return Err(SearchError::SqlValidationError(format!(
+                    "inputlookup failed for URL '{}': {}. Verify the URL is reachable \
+                     and returns the expected format, or remove the `| inputlookup` stage.",
+                    cmd.url.template, e
+                )));
             }
         }
     }
 
     Ok(current_results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inputlookup::{InputLookupConfig, InputLookupFormat, UrlTemplate};
+
+    /// NAN-1389: the missing-lookup message must name the table and guide the
+    /// user (it surfaces verbatim through the 400 QUERY_ERROR mapping).
+    #[test]
+    fn missing_lookup_message_names_table_and_lists_available() {
+        let msg = missing_lookup_message("nonexistent", &[]);
+        assert!(msg.contains("'nonexistent'"), "must name the table: {msg}");
+        assert!(
+            msg.contains("no lookup tables are defined"),
+            "empty registry guidance: {msg}"
+        );
+
+        let available = vec!["assets".to_string(), "threat_actors".to_string()];
+        let msg = missing_lookup_message("asets", &available);
+        assert!(msg.contains("'asets'"), "must name the table: {msg}");
+        assert!(
+            msg.contains("assets") && msg.contains("threat_actors"),
+            "must list available tables: {msg}"
+        );
+
+        // Long registries are capped at 10 entries + ellipsis
+        let many: Vec<String> = (0..15).map(|i| format!("t{i}")).collect();
+        let msg = missing_lookup_message("missing", &many);
+        assert!(msg.contains('…'), "long lists are truncated: {msg}");
+    }
+
+    /// NAN-1389 regression: a failed inputlookup execution must surface as an
+    /// error (mapped to 400 by the search service), never a clean Ok with
+    /// un-enriched rows. Induced failure: the default SSRF guard blocks the
+    /// private-range URL synchronously, no network needed.
+    #[tokio::test]
+    async fn apply_inputlookup_enrichment_surfaces_fetch_failure() {
+        let service = InputLookupService::new(InputLookupConfig::default());
+        let cmd = InputLookupCommandInfo {
+            url: UrlTemplate::new("https://10.255.255.1/feed.csv"),
+            format: InputLookupFormat::Csv,
+            key_field: None, // data source mode
+            timeout_secs: 1,
+            max_rows: 100,
+            cache_ttl_secs: 0,
+        };
+        let mut warnings = Vec::new();
+        let err = apply_inputlookup_enrichment(
+            vec![serde_json::json!({"src_ip": "1.2.3.4"})],
+            &[cmd],
+            Some(&service),
+            &mut warnings,
+        )
+        .await
+        .expect_err("failed fetch must error, not silently return un-enriched rows");
+        match err {
+            SearchError::SqlValidationError(msg) => {
+                assert!(
+                    msg.contains("inputlookup failed for URL"),
+                    "actionable message expected: {msg}"
+                );
+                assert!(
+                    msg.contains("10.255.255.1"),
+                    "message must name the URL: {msg}"
+                );
+            }
+            other => panic!("expected SqlValidationError (→ 400), got: {other:?}"),
+        }
+    }
 }

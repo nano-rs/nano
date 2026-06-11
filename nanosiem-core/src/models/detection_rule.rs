@@ -366,8 +366,6 @@ pub enum RiskValidationError {
 pub enum AutoTuningValidationError {
     /// Auto-tuning confidence threshold is outside the valid range (0.0-1.0)
     ConfidenceOutOfBounds(f64),
-    /// Critical rules cannot have auto-tuning enabled
-    CriticalRuleCannotBeAutoTuned,
 }
 
 /// Validation error for detection rule fields
@@ -420,9 +418,6 @@ impl std::fmt::Display for AutoTuningValidationError {
                     "Auto-tuning confidence threshold {} is out of bounds (must be 0.0-1.0)",
                     confidence
                 )
-            }
-            AutoTuningValidationError::CriticalRuleCannotBeAutoTuned => {
-                write!(f, "Critical rules cannot have auto-tuning enabled")
             }
         }
     }
@@ -518,16 +513,13 @@ impl NewDetectionRule {
     ///
     /// Returns Ok(()) if all auto-tuning fields are valid, or an error describing the validation failure.
     pub fn validate_auto_tuning_fields(&self) -> Result<(), AutoTuningValidationError> {
-        // Validate auto_tuning_min_confidence bounds (0.0-1.0)
+        // Validate auto_tuning_min_confidence bounds (0.0-1.0); the negated
+        // contains() also rejects NaN, which would otherwise pass both
+        // comparisons and trip the database check constraint
         if let Some(confidence) = self.auto_tuning_min_confidence {
-            if confidence < 0.0 || confidence > 1.0 {
+            if !(0.0..=1.0).contains(&confidence) {
                 return Err(AutoTuningValidationError::ConfidenceOutOfBounds(confidence));
             }
-        }
-
-        // Validate that critical rules cannot have auto-tuning enabled
-        if self.auto_tuning_critical.unwrap_or(false) && self.auto_tuning_enabled.unwrap_or(true) {
-            return Err(AutoTuningValidationError::CriticalRuleCannotBeAutoTuned);
         }
 
         Ok(())
@@ -629,16 +621,13 @@ impl UpdateDetectionRule {
     ///
     /// Returns Ok(()) if all auto-tuning fields are valid, or an error describing the validation failure.
     pub fn validate_auto_tuning_fields(&self) -> Result<(), AutoTuningValidationError> {
-        // Validate auto_tuning_min_confidence bounds (0.0-1.0)
+        // Validate auto_tuning_min_confidence bounds (0.0-1.0); the negated
+        // contains() also rejects NaN, which would otherwise pass both
+        // comparisons and trip the database check constraint
         if let Some(confidence) = self.auto_tuning_min_confidence {
-            if confidence < 0.0 || confidence > 1.0 {
+            if !(0.0..=1.0).contains(&confidence) {
                 return Err(AutoTuningValidationError::ConfidenceOutOfBounds(confidence));
             }
-        }
-
-        // Validate that critical rules cannot have auto-tuning enabled
-        if self.auto_tuning_critical.unwrap_or(false) && self.auto_tuning_enabled.unwrap_or(true) {
-            return Err(AutoTuningValidationError::CriticalRuleCannotBeAutoTuned);
         }
 
         Ok(())
@@ -734,4 +723,129 @@ pub struct UpdateRuleCasePermissionsRequest {
     pub case_group_ids: Option<Vec<Uuid>>,
     /// Group to assign cases to (queue routing). Overrides system default.
     pub case_assigned_group: Option<Uuid>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_rule_with_confidence(confidence: Option<f64>) -> NewDetectionRule {
+        NewDetectionRule {
+            name: "Test Rule".to_string(),
+            description: None,
+            query: "error".to_string(),
+            severity: Severity::Medium,
+            mitre_tactics: None,
+            mitre_techniques: None,
+            schedule_cron: None,
+            mode: None,
+            narrative: None,
+            reference_url: None,
+            author: None,
+            tags: None,
+            ai_generated: None,
+            realtime_enabled: None,
+            detection_mode: None,
+            risk_score: None,
+            risk_entity_field: None,
+            risk_modifiers: None,
+            lookback_minutes: None,
+            auto_tuning_enabled: None,
+            auto_tuning_min_confidence: confidence,
+            auto_tuning_critical: None,
+            ai_triage_hints: None,
+            folder: None,
+            case_visibility: None,
+            case_group_ids: None,
+            case_assigned_group: None,
+            alert_mode: None,
+            playbook_selector_mode: None,
+            playbook_id: None,
+        }
+    }
+
+    #[test]
+    fn new_rule_confidence_out_of_bounds_rejected() {
+        for confidence in [-1.0, -0.001, 1.001, 1.5, f64::NAN, f64::INFINITY] {
+            let rule = new_rule_with_confidence(Some(confidence));
+            assert!(
+                matches!(
+                    rule.validate_auto_tuning_fields(),
+                    Err(AutoTuningValidationError::ConfidenceOutOfBounds(_))
+                ),
+                "confidence {} should be rejected",
+                confidence
+            );
+        }
+    }
+
+    #[test]
+    fn new_rule_confidence_in_bounds_accepted() {
+        for confidence in [0.0, 0.5, 1.0] {
+            let rule = new_rule_with_confidence(Some(confidence));
+            assert!(
+                rule.validate_auto_tuning_fields().is_ok(),
+                "confidence {} should be accepted",
+                confidence
+            );
+        }
+        assert!(new_rule_with_confidence(None)
+            .validate_auto_tuning_fields()
+            .is_ok());
+    }
+
+    #[test]
+    fn new_rule_critical_with_auto_tuning_enabled_accepted() {
+        // The rule editor's auto-tune popover allows marking a rule critical
+        // while auto-tuning stays enabled (critical = reviewer sign-off
+        // required); validation must not reject that combination
+        let mut rule = new_rule_with_confidence(Some(0.8));
+        rule.auto_tuning_enabled = Some(true);
+        rule.auto_tuning_critical = Some(true);
+        assert!(rule.validate_auto_tuning_fields().is_ok());
+    }
+
+    #[test]
+    fn update_rule_confidence_out_of_bounds_rejected() {
+        for confidence in [-1.0, 1.5, f64::NAN] {
+            let update = UpdateDetectionRule {
+                auto_tuning_min_confidence: Some(confidence),
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    update.validate_auto_tuning_fields(),
+                    Err(AutoTuningValidationError::ConfidenceOutOfBounds(_))
+                ),
+                "confidence {} should be rejected",
+                confidence
+            );
+        }
+    }
+
+    #[test]
+    fn update_rule_confidence_in_bounds_accepted() {
+        for confidence in [Some(0.0), Some(0.5), Some(1.0), None] {
+            let update = UpdateDetectionRule {
+                auto_tuning_min_confidence: confidence,
+                ..Default::default()
+            };
+            assert!(
+                update.validate_auto_tuning_fields().is_ok(),
+                "confidence {:?} should be accepted",
+                confidence
+            );
+        }
+    }
+
+    #[test]
+    fn update_rule_critical_only_partial_update_accepted() {
+        // A partial update flipping only auto_tuning_critical must not be
+        // rejected regardless of the rule's stored auto_tuning_enabled state
+        let update = UpdateDetectionRule {
+            auto_tuning_critical: Some(true),
+            ..Default::default()
+        };
+        assert!(update.validate_auto_tuning_fields().is_ok());
+    }
 }

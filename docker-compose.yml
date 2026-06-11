@@ -1,3 +1,18 @@
+# =============================================================================
+# DEV ONLY — DO NOT RUN ON A PUBLIC HOST
+# =============================================================================
+# This compose file is for local development. It binds internal services —
+# Postgres (5432), ClickHouse HTTP/native (8123/9000), Prometheus (9090, started
+# with --web.enable-admin-api), Grafana (3001, default creds), Dragonfly, and the
+# exporters — to 0.0.0.0. On a machine with a public IP they are reachable,
+# unauthenticated, from the internet.
+#
+# To deploy nano, use the open-core stack instead: docker-compose.opensource.yml
+# (via install.sh / get.nano.rs). That file publishes only the nginx entrypoint
+# and the Vector ingest ports; the databases and app services stay on the internal
+# Docker network. See SECURITY.md ("Deployment & network exposure") and
+# docs/getting-started/docker-deployment.md ("Network exposure & firewall").
+# =============================================================================
 version: '3.8'
 
 services:
@@ -99,9 +114,13 @@ services:
       # Authentication
       JWT_SECRET: ${JWT_SECRET:-nanosiem-dev-secret-change-in-production}
       AUTH_ENABLED: ${AUTH_ENABLED:-true}
-      # Encryption (required in production, set NANOSIEM_DEV_MODE=true for dev)
+      # Encryption (required in production; dev uses NANOSIEM_ALLOW_DEFAULT_KEYS below)
       NANOSIEM_ENCRYPTION_KEY: ${NANOSIEM_ENCRYPTION_KEY:-}
       NANOSIEM_DEV_MODE: ${NANOSIEM_DEV_MODE:-false}
+      # NAN-1355: lets the built-in public dev JWT/encryption keys be used when no real
+      # secret is set. Local-dev only — prod composes (opensource) never set this, so a
+      # missing secret fails closed even when DEV_MODE is on for HTTP cookies.
+      NANOSIEM_ALLOW_DEFAULT_KEYS: ${NANOSIEM_ALLOW_DEFAULT_KEYS:-true}
       NRT_LAG_BUFFER_SECS: ${NRT_LAG_BUFFER_SECS:-60}
       NRT_MAX_BATCH_SIZE: ${NRT_MAX_BATCH_SIZE:-100000}
       NRT_MAX_CONCURRENT_RULES: ${NRT_MAX_CONCURRENT_RULES:-10}
@@ -157,9 +176,13 @@ services:
       # Authentication (same as API)
       JWT_SECRET: ${JWT_SECRET:-nanosiem-dev-secret-change-in-production}
       AUTH_ENABLED: ${AUTH_ENABLED:-true}
-      # Encryption (required in production, set NANOSIEM_DEV_MODE=true for dev)
+      # Encryption (required in production; dev uses NANOSIEM_ALLOW_DEFAULT_KEYS below)
       NANOSIEM_ENCRYPTION_KEY: ${NANOSIEM_ENCRYPTION_KEY:-}
       NANOSIEM_DEV_MODE: ${NANOSIEM_DEV_MODE:-false}
+      # NAN-1355: lets the built-in public dev JWT/encryption keys be used when no real
+      # secret is set. Local-dev only — prod composes (opensource) never set this, so a
+      # missing secret fails closed even when DEV_MODE is on for HTTP cookies.
+      NANOSIEM_ALLOW_DEFAULT_KEYS: ${NANOSIEM_ALLOW_DEFAULT_KEYS:-true}
       # Search service settings
       SEARCH_PORT: 3002
       # CORS: Set CORS_ORIGINS in .env for production (e.g., https://your-domain.com)
@@ -217,6 +240,10 @@ services:
       AUTH_ENABLED: ${AUTH_ENABLED:-true}
       NANOSIEM_ENCRYPTION_KEY: ${NANOSIEM_ENCRYPTION_KEY:-}
       NANOSIEM_DEV_MODE: ${NANOSIEM_DEV_MODE:-false}
+      # NAN-1355: lets the built-in public dev JWT/encryption keys be used when no real
+      # secret is set. Local-dev only — prod composes (opensource) never set this, so a
+      # missing secret fails closed even when DEV_MODE is on for HTTP cookies.
+      NANOSIEM_ALLOW_DEFAULT_KEYS: ${NANOSIEM_ALLOW_DEFAULT_KEYS:-true}
       CLOUDFLARE_AI_GATEWAY_URL: ${CLOUDFLARE_AI_GATEWAY_URL:-}
       CF_AIG_AUTH_TOKEN: ${CF_AIG_AUTH_TOKEN:-}
       JOBS_PORT: 3003
@@ -322,6 +349,9 @@ services:
       # and the healthcheck below.
       CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD:-nanosiem_admin_secret}
       CLICKHOUSE_NANOSIEM_PASSWORD: ${CLICKHOUSE_NANOSIEM_PASSWORD:-nanosiem}
+      # NAN-1384 (G18): INSERT-only credential for direct OCSF writers
+      # (users.d/nanosiem-users.xml `nanosiem_ingest`).
+      CLICKHOUSE_INGEST_PASSWORD: ${CLICKHOUSE_INGEST_PASSWORD:-nanosiem_ingest}
     ports:
       # Native protocol (for clickhouse-rs client)
       - "9000:9000"

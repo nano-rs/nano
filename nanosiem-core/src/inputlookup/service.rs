@@ -35,6 +35,18 @@ pub enum InputLookupError {
 
     #[error("No data returned from URL")]
     EmptyResponse,
+
+    #[error("all {attempted} enrichment fetch(es) failed; last error: {last_error}")]
+    AllFetchesFailed { attempted: usize, last_error: String },
+}
+
+/// Result of an inputlookup execution: the (possibly enriched) rows plus any
+/// non-fatal warnings — e.g. a subset of per-key enrichment fetches failed and
+/// the affected rows are un-enriched (NAN-1389).
+#[derive(Debug)]
+pub struct InputLookupOutcome {
+    pub results: Vec<Value>,
+    pub warnings: Vec<String>,
 }
 
 /// InputLookup service for URL-based data fetching and enrichment
@@ -100,7 +112,7 @@ impl InputLookupService {
         &self,
         results: Vec<Value>,
         params: &InputLookupParams,
-    ) -> Result<Vec<Value>, InputLookupError> {
+    ) -> Result<InputLookupOutcome, InputLookupError> {
         let key_field = params
             .key_field
             .as_ref()
@@ -128,7 +140,10 @@ impl InputLookupService {
 
         if unique_keys.is_empty() {
             debug!("No key values found in results for field '{}'", key_field);
-            return Ok(results);
+            return Ok(InputLookupOutcome {
+                results,
+                warnings: Vec::new(),
+            });
         }
 
         debug!(
@@ -136,8 +151,11 @@ impl InputLookupService {
             unique_keys.len()
         );
 
-        // Fetch data for each unique key
+        // Fetch data for each unique key, tracking failures so they can be
+        // surfaced instead of silently producing un-enriched rows (NAN-1389)
         let mut enrichment_data: HashMap<String, Value> = HashMap::new();
+        let mut failed_fetches = 0usize;
+        let mut last_error: Option<String> = None;
 
         for key_value in &unique_keys {
             // Substitute key value into URL template
@@ -182,20 +200,48 @@ impl InputLookupService {
                         }
                         Err(e) => {
                             warn!("Failed to parse response for key '{}': {}", key_value, e);
+                            failed_fetches += 1;
+                            last_error = Some(e.to_string());
                         }
                     }
                 }
                 Err(e) => {
                     warn!("Failed to fetch URL for key '{}': {}", key_value, e);
+                    failed_fetches += 1;
+                    last_error = Some(e.to_string());
                 }
             }
         }
 
         info!(
-            "Fetched enrichment data for {}/{} keys",
+            "Fetched enrichment data for {}/{} keys ({} failed)",
             enrichment_data.len(),
-            unique_keys.len()
+            unique_keys.len(),
+            failed_fetches
         );
+
+        // Every fetch failed: the enrichment cannot happen at all — surface an
+        // error instead of returning every row silently un-enriched.
+        if failed_fetches == unique_keys.len() {
+            return Err(InputLookupError::AllFetchesFailed {
+                attempted: unique_keys.len(),
+                last_error: last_error.unwrap_or_else(|| "unknown error".to_string()),
+            });
+        }
+
+        // Some fetches failed: degrade gracefully (matched rows are enriched)
+        // but report the gap as a response warning.
+        let mut warnings = Vec::new();
+        if failed_fetches > 0 {
+            warnings.push(format!(
+                "inputlookup: {}/{} enrichment fetches failed for '{}' (last error: {}); \
+                 rows for the failed keys are un-enriched",
+                failed_fetches,
+                unique_keys.len(),
+                params.url.template,
+                last_error.unwrap_or_else(|| "unknown error".to_string()),
+            ));
+        }
 
         // Merge enrichment data into results
         let enriched_results = results
@@ -225,7 +271,10 @@ impl InputLookupService {
             })
             .collect();
 
-        Ok(enriched_results)
+        Ok(InputLookupOutcome {
+            results: enriched_results,
+            warnings,
+        })
     }
 
     /// Execute an inputlookup command (auto-detects mode based on params)
@@ -233,10 +282,16 @@ impl InputLookupService {
         &self,
         results: Vec<Value>,
         params: &InputLookupParams,
-    ) -> Result<Vec<Value>, InputLookupError> {
+    ) -> Result<InputLookupOutcome, InputLookupError> {
         if params.is_data_source_mode() {
-            // Data source mode: ignore input results, return fetched data
-            self.fetch_data_source(params).await
+            // Data source mode: ignore input results, return fetched data.
+            // A failed fetch here is always an error — the user asked for the
+            // URL's data, so substituting the original rows would be wrong.
+            let results = self.fetch_data_source(params).await?;
+            Ok(InputLookupOutcome {
+                results,
+                warnings: Vec::new(),
+            })
         } else {
             // Enrichment mode: join fetched data with input results
             self.enrich_results(results, params).await
@@ -336,11 +391,61 @@ mod tests {
         );
 
         // Should return original results when key field not found
-        let enriched = service
+        let outcome = service
             .enrich_results(results.clone(), &params)
             .await
             .unwrap();
-        assert_eq!(enriched.len(), 1);
-        assert_eq!(enriched[0]["other_field"], "value");
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0]["other_field"], "value");
+        assert!(outcome.warnings.is_empty());
+    }
+
+    /// NAN-1389 regression: when every enrichment fetch fails, the inputlookup
+    /// must surface an error instead of returning the rows silently
+    /// un-enriched. The default SSRF guard blocks private addresses, so a
+    /// 10.x target fails synchronously without touching the network.
+    #[tokio::test]
+    async fn test_enrich_results_all_fetches_failed_is_an_error() {
+        let service = test_service();
+        let results = vec![json!({"src_ip": "1.2.3.4"})];
+        let params = params_from_command(
+            "https://10.255.255.1/{src_ip}",
+            InputLookupFormat::Json,
+            Some("src_ip".to_string()),
+            1,
+            100,
+            0,
+        );
+
+        let err = service
+            .enrich_results(results, &params)
+            .await
+            .expect_err("all fetches failed — must be an error, not a silent 200");
+        match err {
+            InputLookupError::AllFetchesFailed { attempted, .. } => assert_eq!(attempted, 1),
+            other => panic!("expected AllFetchesFailed, got: {other:?}"),
+        }
+    }
+
+    /// NAN-1389 regression: a failed data-source fetch must bubble out of
+    /// `execute` (previously the caller swallowed it and returned the raw log
+    /// rows in place of the requested external data).
+    #[tokio::test]
+    async fn test_execute_data_source_fetch_failure_is_an_error() {
+        let service = test_service();
+        let params = params_from_command(
+            "https://10.255.255.1/feed.csv",
+            InputLookupFormat::Csv,
+            None,
+            1,
+            100,
+            0,
+        );
+
+        let err = service
+            .execute(vec![json!({"src_ip": "1.2.3.4"})], &params)
+            .await
+            .expect_err("data-source fetch failure must be an error");
+        assert!(matches!(err, InputLookupError::FetchError(_)));
     }
 }

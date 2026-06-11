@@ -811,8 +811,15 @@ impl AuthService {
         let new_refresh_token_hash = hash_token(&new_token_pair.refresh_token);
         let new_expires_at = Utc::now() + Duration::seconds(self.token_service.refresh_token_ttl());
 
+        // Compare-and-swap on the old hash so only one concurrent refresh of a
+        // single-use token wins; losers/replays get NotFoundByToken -> 401.
         self.session_repo
-            .rotate_refresh_token(session.id, &new_refresh_token_hash, new_expires_at)
+            .rotate_refresh_token(
+                session.id,
+                &refresh_token_hash,
+                &new_refresh_token_hash,
+                new_expires_at,
+            )
             .await?;
 
         // Log token refresh

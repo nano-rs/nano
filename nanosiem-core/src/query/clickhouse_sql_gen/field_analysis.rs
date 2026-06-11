@@ -70,6 +70,11 @@ pub(crate) fn analyze_required_fields(
                         "src_endpoint.port",
                         "dst_endpoint.port",
                         "connection_info.protocol_num",
+                        // prevalence_min (NAN-1383): MATERIALIZED least() of the
+                        // four prevalence_* columns — mirror the UDM list below so
+                        // tree_view's prevalence read (`r.get("prevalence_min")`)
+                        // sees a value under OCSF too.
+                        "prevalence_min",
                         // Enrichment columns are MATERIALIZED — must be explicitly
                         // selected (SELECT * excludes them) to show up front + in
                         // the field-stats sidebar (parity with the UDM list).
@@ -733,6 +738,84 @@ fn collect_computed_from_query(query: &Query, computed: &mut HashSet<String>) {
         Query::Piped { source, command } => {
             collect_computed_from_query(source, computed);
             collect_computed_from_command(command, computed);
+        }
+    }
+}
+
+/// The fields `cmd` creates with NEW VALUES (rex captures, eval assignments,
+/// rename targets, aggregation aliases, command outputs) — the names that must
+/// SHADOW a same-named schema field / UDM alias for the pipeline stages after
+/// it (NAN-1341). `upstream` is the same set accumulated over the stages
+/// before `cmd`.
+///
+/// Differs from [`collect_computed_from_command`] in one way: a
+/// stats/chart/eventstats BY-field is a passthrough of an existing column, not
+/// a new value — it surfaces under its OUTPUT alias (the raw name when it was
+/// itself upstream-computed, the normalized canonical name otherwise — see
+/// `by_field_output_name`), never under a raw name that still resolves to the
+/// schema. Registering the raw name (as the NAN-1236 set does) would make a
+/// plain `stats count by method` shadow its own schema resolution.
+pub(crate) fn upstream_computed_added_by_command(
+    cmd: &Command,
+    upstream: &HashSet<String>,
+) -> HashSet<String> {
+    let mut out = HashSet::new();
+    match cmd {
+        // A join/append surfaces the SUBSEARCH's output columns into the outer
+        // pipeline — fold the subsearch's own stages from an empty scope.
+        Command::Join { subsearch, .. } | Command::Append { subsearch, .. } => {
+            out.extend(collect_upstream_computed_from_query(subsearch));
+        }
+        _ => {
+            collect_computed_from_command(cmd, &mut out);
+            match cmd {
+                // stats/chart project their by-fields as `<expr> AS <output
+                // alias>` (aggregation.rs) — surface them under that alias.
+                Command::Stats {
+                    group_by: Some(gb), ..
+                }
+                | Command::Chart {
+                    group_by: Some(gb), ..
+                } => {
+                    for f in gb {
+                        if !upstream.contains(f.as_str()) {
+                            out.remove(f.as_str());
+                            out.insert(normalize_field_name(f).to_string());
+                        }
+                    }
+                }
+                // eventstats appends window columns to UNCHANGED input rows
+                // (`SELECT *, … OVER (PARTITION BY …)`) — its by-fields are not
+                // output columns at all. Registering them (raw OR normalized)
+                // would shadow downstream schema resolution toward a column
+                // the stage never created.
+                Command::EventStats {
+                    group_by: Some(gb), ..
+                } => {
+                    for f in gb {
+                        if !upstream.contains(f.as_str()) {
+                            out.remove(f.as_str());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// The value-computed fields visible AFTER the final stage of `query` — i.e.
+/// the output columns a join/append subsearch surfaces into the outer
+/// pipeline (NAN-1341).
+pub(crate) fn collect_upstream_computed_from_query(query: &Query) -> HashSet<String> {
+    match query {
+        Query::Search(_) => HashSet::new(),
+        Query::Piped { source, command } => {
+            let mut upstream = collect_upstream_computed_from_query(source);
+            let added = upstream_computed_added_by_command(command, &upstream);
+            upstream.extend(added);
+            upstream
         }
     }
 }

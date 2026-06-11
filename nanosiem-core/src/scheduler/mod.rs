@@ -8,10 +8,12 @@
 //! Requirements: 4.1, 4.2, 4.3, 4.4, 4.5, 4.6, 4.7
 
 pub mod repository;
+pub mod secrets;
 pub mod service;
 pub mod types;
 
 pub use repository::{JobStats, SchedulerRepository, SchedulerRepositoryError};
+pub use secrets::{merge_auth_headers, redact_auth_headers};
 pub use service::{
     calculate_next_run, calculate_next_runs, describe_cron, normalize_cron, validate_cron,
     SchedulerError, SchedulerService,

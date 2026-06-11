@@ -665,7 +665,9 @@ export type UpdateDetectionRequest = Partial<CreateDetectionRequest>;
 
 export interface Alert {
   id: string;
-  rule_id: string;
+  // NAN-1356: absent when the source detection rule was deleted
+  // (FK ON DELETE SET NULL); the API omits it via skip_serializing_if.
+  rule_id?: string;
   rule_name?: string;
   rule_query?: string;
   severity: 'critical' | 'high' | 'medium' | 'low' | 'informational';

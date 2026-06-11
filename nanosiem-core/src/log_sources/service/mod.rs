@@ -44,6 +44,8 @@ pub enum LogSourceServiceError {
     InvalidVrl(String),
     #[error("Invalid source type: {0}")]
     InvalidSourceType(String),
+    #[error("Invalid source config: {0}")]
+    InvalidSourceConfig(String),
     #[error("Log source must be validated before enabling")]
     NotValidated,
     #[error("Vector config error: {0}")]

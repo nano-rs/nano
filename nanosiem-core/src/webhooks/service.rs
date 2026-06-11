@@ -9,13 +9,13 @@ use chrono::Utc;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
-use url::Url;
 use uuid::Uuid;
+
+use crate::inputlookup::{SsrfConfig, SsrfValidator};
 
 use super::models::*;
 use super::repository::WebhookRepository;
@@ -63,93 +63,31 @@ impl WebhookService {
     /// self-referencing URLs, and non-HTTP schemes. Performs DNS resolution to prevent
     /// DNS rebinding attacks.
     pub async fn validate_url(url: &str) -> Result<(), String> {
-        let parsed = Url::parse(url).map_err(|e| format!("Invalid URL: {}", e))?;
-
-        match parsed.scheme() {
-            "http" | "https" => {}
-            scheme => {
-                return Err(format!(
-                    "URL scheme '{}' is not allowed; use http or https",
-                    scheme
-                ))
-            }
-        }
-
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| "URL must have a host".to_string())?;
-
-        // Check for localhost variants
-        if host == "localhost" || host == "ip6-localhost" {
-            return Err("Webhook URLs must not target localhost".to_string());
-        }
-
-        // Block known cloud metadata hostnames (DNS rebinding protection)
-        const METADATA_HOSTS: &[&str] = &[
-            "metadata.google.internal",
-            "metadata.goog",
-            "169.254.169.254.nip.io",
-            "instance-data",
-            "kubernetes.default.svc",
-        ];
-        let host_lower = host.to_lowercase();
-        if METADATA_HOSTS
-            .iter()
-            .any(|&h| host_lower == h || host_lower.ends_with(&format!(".{}", h)))
-        {
-            return Err("Webhook URLs must not target cloud metadata endpoints".to_string());
-        }
-
-        // Block self-referencing URLs (prevent alert → webhook → alert loops)
+        // Delegates to the shared DNS-aware SsrfValidator (NAN-1369) so webhook
+        // delivery uses exactly the same SSRF rules — loopback / private /
+        // CGNAT / link-local / cloud-metadata / scheme — as every other
+        // outbound path. Webhooks may target plain-http receivers, so allow_http
+        // is on. The instance's own hostname is added as a blocked domain to
+        // keep the self-referencing (alert → webhook → alert loop) guard.
+        // The delivery client separately disables redirect-following (see new()).
+        let mut blocked_domains = vec!["localhost".to_string()];
         if let Ok(self_hostname) = std::env::var("NANOSIEM_HOSTNAME") {
-            if host.eq_ignore_ascii_case(&self_hostname) {
-                return Err("Webhook URLs must not target the NanoSIEM instance itself".to_string());
+            if !self_hostname.is_empty() {
+                blocked_domains.push(self_hostname);
             }
         }
 
-        // Parse IP addresses and check for private/reserved ranges
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            if is_private_or_reserved(ip) {
-                return Err(format!(
-                    "Webhook URLs must not target private or reserved IP addresses ({})",
-                    ip
-                ));
-            }
-            return Ok(());
-        }
+        let validator = SsrfValidator::new(SsrfConfig {
+            allow_http: true,
+            blocked_domains,
+            ..Default::default()
+        });
 
-        // Check for bracket-wrapped IPv6
-        let trimmed = host.trim_start_matches('[').trim_end_matches(']');
-        if let Ok(ip) = trimmed.parse::<IpAddr>() {
-            if is_private_or_reserved(ip) {
-                return Err(format!(
-                    "Webhook URLs must not target private or reserved IP addresses ({})",
-                    ip
-                ));
-            }
-            return Ok(());
-        }
-
-        // DNS resolution check — resolve hostname and validate all resolved IPs
-        let port = parsed.port_or_known_default().unwrap_or(443);
-        let addr = format!("{}:{}", host, port);
-        let addrs: Vec<_> = tokio::net::lookup_host(&addr)
+        validator
+            .validate_with_dns(url)
             .await
-            .map_err(|e| format!("DNS resolution failed for {}: {}", host, e))?
-            .collect();
-        if addrs.is_empty() {
-            return Err(format!("DNS resolution returned no addresses for {}", host));
-        }
-        for sock_addr in &addrs {
-            if is_private_or_reserved(sock_addr.ip()) {
-                return Err(format!(
-                    "Webhook URL resolves to private/reserved IP: {}",
-                    sock_addr.ip()
-                ));
-            }
-        }
-
-        Ok(())
+            .map(|_| ())
+            .map_err(|e| format!("Webhook URL rejected: {}", e))
     }
 
     /// Fire webhook notifications for a newly created alert.
@@ -467,30 +405,3 @@ impl WebhookService {
     }
 }
 
-/// Check if an IP address is private, loopback, link-local, or otherwise reserved.
-fn is_private_or_reserved(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()              // 127.0.0.0/8
-            || v4.is_private()            // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-            || v4.is_link_local()         // 169.254.0.0/16 (cloud metadata)
-            || v4.is_broadcast()          // 255.255.255.255
-            || v4.is_unspecified()        // 0.0.0.0
-            || v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64 // 100.64.0.0/10 (CGNAT)
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()              // ::1
-            || v6.is_unspecified()        // ::
-            // H1: Check link-local (fe80::/10)
-            || (v6.segments()[0] & 0xffc0) == 0xfe80
-            // H1: Check unique local (fc00::/7)
-            || (v6.segments()[0] & 0xfe00) == 0xfc00
-            // H1: Check IPv6-mapped IPv4 (::ffff:x.x.x.x) — validate inner IPv4
-            || v6.to_ipv4_mapped().map_or(false, |v4| {
-                v4.is_loopback() || v4.is_private() || v4.is_link_local()
-                || v4.is_broadcast() || v4.is_unspecified()
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
-            })
-        }
-    }
-}

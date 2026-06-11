@@ -260,6 +260,26 @@ pub enum EnrichmentKind {
     Prevalence,
 }
 
+/// How a schema translates human enum LABELS onto an enum-INT column so a
+/// string-verb predicate (`auth_result="failure"`) can compare against the
+/// integer the column actually stores (NAN-1382 / parity gap G6). Without a
+/// mapping the codegen falls back to `lower(toString(<int col>))`, which can
+/// never equal a verb → silent zero matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnumIntMapping<'a> {
+    /// Fixed, class-independent `lowercase label → integer id` table (manifest
+    /// `enum_values`), e.g. OCSF `status_id` 1=Success / 2=Failure. The verb is
+    /// translated to the id and compared on the indexed int column; a label
+    /// outside the table is a loud validation error (never a silent 0-match).
+    Values(&'a std::collections::HashMap<String, i64>),
+    /// Class-scoped enum whose integer meaning depends on another column
+    /// (OCSF `activity_id`: 1=Logon on class 3002 but 1=Create on 1001), so no
+    /// fixed table exists. The label lives in the named SIBLING string column
+    /// (manifest `enum_label_column`, e.g. `activity`); a string verb is
+    /// compared case-insensitively against that column instead.
+    LabelColumn(&'a str),
+}
+
 /// Static description of a single queryable field in a schema's universe.
 ///
 /// Borrowed string slices (`&'static str`) because both `UdmProfile` and the

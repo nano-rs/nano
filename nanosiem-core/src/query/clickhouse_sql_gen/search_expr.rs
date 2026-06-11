@@ -141,6 +141,31 @@ impl ClickHouseSqlGenerator {
             && !self.profile.is_uuid_field(field)
     }
 
+    /// True when a field on the spill/JSON path resolves to a plain non-null
+    /// String column after all: the class-split unified column (NAN-1333) or a
+    /// promoted `ExplicitColumn` whose schema type is String — under OCSF a
+    /// UDM-named alias (`user`, `file_hash`, …) resolves to a DIFFERENT column
+    /// name, so the type check must consult the RESOLVED column, not the nPL
+    /// token (`is_numeric_field("src_port")` is false under OCSF even though it
+    /// resolves to the numeric `src_endpoint.port`). For these targets the
+    /// NAN-1161 `toString()` JSON-null guard is a pure pessimization: the
+    /// column is non-Nullable (MATERIALIZED `''`), `toString` is a semantic
+    /// no-op, and ClickHouse matches a skip index by EXPRESSION — the wrapper
+    /// orphans every `lower(col)` text/bloom index → full scan (NAN-1381,
+    /// root cause of NAN-1247). Always false under UDM on this path (unknown
+    /// fields resolve to `Unknown` → ext-JSON access keeps the guard).
+    fn resolves_to_plain_string_column(&self, field: &str) -> bool {
+        if self.profile.class_split_column(field).is_some() {
+            return true;
+        }
+        match self.profile.resolve(field) {
+            crate::schema::FieldResolution::ExplicitColumn(col) => {
+                self.profile.field_type(&col) == Some(crate::schema::FieldType::String)
+            }
+            _ => false,
+        }
+    }
+
     /// Lowercased, index-matchable expression for case-insensitive substring /
     /// full-text search on `field` (whose access SQL is `field_expr`). Plain
     /// String columns → `lower(field_expr)` (matches the `lower(col)` text index);
@@ -290,7 +315,15 @@ impl ClickHouseSqlGenerator {
         // matches the value-pick `if(...)` like the `=` filter does. UDM never
         // class-splits → gate unchanged → byte-identical.
         let is_class_split = self.profile.class_split_value_sql(field).is_some();
-        if self.profile.is_known_field(field) || is_class_split {
+        // NAN-1382 (G6): a UDM verb-valued alias resolving to an enum-INT OCSF
+        // column (`auth_result` → `status_id`) is neither a known field nor
+        // class-split, so it fell to the metadata-JSON branch below
+        // (`JSONExtractString(metadata, 'auth_result')` — silently empty under
+        // OCSF). Route enum-mapped fields through the column branch and translate
+        // the string verbs there. UDM has no enum-int columns → None → gate (and
+        // everything below) byte-identical.
+        let enum_mapping = self.profile.enum_int_mapping(field);
+        if self.profile.is_known_field(field) || is_class_split || enum_mapping.is_some() {
             // Determine the physical access expression via the active profile:
             // ExplicitColumn → escaped column, JsonPath → JSONExtract, Unknown →
             // `ext.{field}` (UDM's spill). For OCSF a known field is always a
@@ -299,6 +332,62 @@ impl ClickHouseSqlGenerator {
             // an IN-list filter matches the host/user/process wherever the class put
             // it (UDM unaffected → bare column).
             let field_expr = self.filter_field_expr(field, "String");
+
+            // NAN-1382 (G6): enum-int targets translate string verbs before the
+            // generic string/numeric arms (which would emit `lower(<int col>)` — a
+            // CH type error — or the never-matching `0` fallback).
+            if let Some(mapping) = enum_mapping {
+                return match mapping {
+                    crate::schema::EnumIntMapping::Values(labels) => {
+                        // Fixed table: every verb maps to its id (numeric strings
+                        // pass through; unknown labels fail loudly).
+                        let values_sql: Result<Vec<String>, SqlGenError> = values
+                            .iter()
+                            .map(|v| match v {
+                                Value::String(s) => enum_values_literal_sql(field, labels, s),
+                                _ => Ok(value_to_sql(v)),
+                            })
+                            .collect();
+                        Ok(format!("{} {} ({})", field_expr, op, values_sql?.join(", ")))
+                    }
+                    crate::schema::EnumIntMapping::LabelColumn(sibling) => {
+                        // Class-scoped enum: integer ids hit the int column, verbs
+                        // hit the sibling label column. A mixed list ORs the two
+                        // memberships (AND when negated — De Morgan).
+                        let mut int_vals: Vec<String> = Vec::new();
+                        let mut label_vals: Vec<String> = Vec::new();
+                        for v in values {
+                            match v {
+                                // Parsed (not raw) so "+2"/"007" emit canonically.
+                                Value::String(s) => match s.parse::<i64>() {
+                                    Ok(id) => int_vals.push(id.to_string()),
+                                    Err(_) => label_vals
+                                        .push(format!("'{}'", escape_string(&s.to_lowercase()))),
+                                },
+                                _ => int_vals.push(value_to_sql(v)),
+                            }
+                        }
+                        let mut parts: Vec<String> = Vec::new();
+                        if !int_vals.is_empty() {
+                            parts.push(format!("{} {} ({})", field_expr, op, int_vals.join(", ")));
+                        }
+                        if !label_vals.is_empty() {
+                            parts.push(format!(
+                                "lower({}) {} ({})",
+                                escape_identifier(sibling),
+                                op,
+                                label_vals.join(", ")
+                            ));
+                        }
+                        let joiner = if negated { " AND " } else { " OR " };
+                        Ok(if parts.len() == 1 {
+                            parts.remove(0)
+                        } else {
+                            format!("({})", parts.join(joiner))
+                        })
+                    }
+                };
+            }
 
             if self.profile.is_uuid_field(field) {
                 // UUID fields: use toString() instead of lower()
@@ -435,7 +524,16 @@ impl ClickHouseSqlGenerator {
                 } else {
                     "NOT iLike"
                 };
-                return Ok(format!("{} {} '{}'", field_expr, sql_op, pattern));
+                // NAN-1381: lowered, index-matchable form — bare `col iLike` cannot
+                // use the `lower(col)` text indexes (CH matches a skip index by
+                // EXPRESSION), and `lower()` never changes what iLike (already
+                // case-insensitive) matches. Mirrors the Contains arm below.
+                return Ok(format!(
+                    "{} {} '{}'",
+                    self.search_lowered(field, &field_expr),
+                    sql_op,
+                    pattern
+                ));
             }
         }
 
@@ -493,10 +591,20 @@ impl ClickHouseSqlGenerator {
                 Ok(format!("match({}, {}) = 0", field_expr, value_sql))
             }
             Comparator::Like => {
-                // Use iLike for case-insensitive matching
-                Ok(format!("{} iLike {}", field_expr, value_sql))
+                // Use iLike for case-insensitive matching. NAN-1381: lowered form so
+                // the `lower(col)` text indexes apply — semantics unchanged, iLike is
+                // already case-insensitive.
+                Ok(format!(
+                    "{} iLike {}",
+                    self.search_lowered(field, &field_expr),
+                    value_sql
+                ))
             }
-            Comparator::NotLike => Ok(format!("{} NOT iLike {}", field_expr, value_sql)),
+            Comparator::NotLike => Ok(format!(
+                "{} NOT iLike {}",
+                self.search_lowered(field, &field_expr),
+                value_sql
+            )),
             Comparator::Contains => {
                 // NAN-1026 Phase 2: every CONTAINS lowers to substring iLike
                 // (case-insensitive, substring-correct). splitByNonAlpha indexes
@@ -546,7 +654,12 @@ impl ClickHouseSqlGenerator {
                     }
                     _ => format!("concat(lower({}), '%')", value_sql),
                 };
-                Ok(format!("{} iLike {}", field_expr, pattern))
+                // NAN-1381: lowered, index-matchable form (see Like/Contains arms).
+                Ok(format!(
+                    "{} iLike {}",
+                    self.search_lowered(field, &field_expr),
+                    pattern
+                ))
             }
             Comparator::NotStartsWith => {
                 let pattern = match value {
@@ -557,7 +670,12 @@ impl ClickHouseSqlGenerator {
                     }
                     _ => format!("concat(lower({}), '%')", value_sql),
                 };
-                Ok(format!("{} NOT iLike {}", field_expr, pattern))
+                // NAN-1381: lowered, index-matchable form (see Like/Contains arms).
+                Ok(format!(
+                    "{} NOT iLike {}",
+                    self.search_lowered(field, &field_expr),
+                    pattern
+                ))
             }
             Comparator::EndsWith => {
                 let pattern = match value {
@@ -568,7 +686,12 @@ impl ClickHouseSqlGenerator {
                     }
                     _ => format!("concat('%', lower({}))", value_sql),
                 };
-                Ok(format!("{} iLike {}", field_expr, pattern))
+                // NAN-1381: lowered, index-matchable form (see Like/Contains arms).
+                Ok(format!(
+                    "{} iLike {}",
+                    self.search_lowered(field, &field_expr),
+                    pattern
+                ))
             }
             Comparator::NotEndsWith => {
                 let pattern = match value {
@@ -579,7 +702,12 @@ impl ClickHouseSqlGenerator {
                     }
                     _ => format!("concat('%', lower({}))", value_sql),
                 };
-                Ok(format!("{} NOT iLike {}", field_expr, pattern))
+                // NAN-1381: lowered, index-matchable form (see Like/Contains arms).
+                Ok(format!(
+                    "{} NOT iLike {}",
+                    self.search_lowered(field, &field_expr),
+                    pattern
+                ))
             }
             Comparator::Eq | Comparator::Ne => {
                 let sql_op = comparator_to_sql(op);
@@ -594,6 +722,33 @@ impl ClickHouseSqlGenerator {
                                 Ok(format!("{} {} {}", field_expr, sql_op, s))
                             } else if s.parse::<f64>().is_ok() {
                                 Ok(format!("{} {} {}", field_expr, sql_op, s))
+                            } else if let Some(mapping) = self.profile.enum_int_mapping(field) {
+                                // NAN-1382 (G6): a verb on a NATIVE enum-int column
+                                // (`status_id="failure"`, `severity_id="high"`) translates
+                                // via the manifest enum metadata instead of the dead
+                                // `toString(<int>) = 'verb'` fallback (which matches 0
+                                // rows). Fixed table → indexed int compare (loud error on
+                                // an unknown label); class-scoped (activity_id) → sibling
+                                // label String column. UDM has no enum-int columns → None
+                                // → byte-identical.
+                                match mapping {
+                                    crate::schema::EnumIntMapping::Values(labels) => {
+                                        Ok(format!(
+                                            "{} {} {}",
+                                            field_expr,
+                                            sql_op,
+                                            enum_values_literal_sql(field, labels, s)?
+                                        ))
+                                    }
+                                    crate::schema::EnumIntMapping::LabelColumn(sibling) => {
+                                        Ok(format!(
+                                            "lower({}) {} '{}'",
+                                            escape_identifier(sibling),
+                                            sql_op,
+                                            escape_string(&s.to_lowercase())
+                                        ))
+                                    }
+                                }
                             } else {
                                 // Non-numeric string on numeric field - use toString for comparison
                                 Ok(format!(
@@ -687,9 +842,15 @@ impl ClickHouseSqlGenerator {
             (false, field.to_string())
         };
 
-        // Generate field expression: ext.field or JSONExtract for metadata
+        // Generate field expression: ext.field or JSONExtract for metadata.
+        // NAN-1383: the suffix interpolates into `JSONExtract{suffix}` and the
+        // typed extractor for Float64 is `JSONExtractFloat` (there is NO
+        // `JSONExtractFloat64` in ClickHouse — emitting it 400s with
+        // UNKNOWN_FUNCTION on every numeric comparison routed through JSON
+        // extraction: metadata.* under both profiles, unmapped `event` tail
+        // fields under OCSF).
         let json_type = match value {
-            Value::Number(_) => "Float64",
+            Value::Number(_) => "Float",
             Value::Bool(_) => "Bool",
             _ => "String",
         };
@@ -716,6 +877,26 @@ impl ClickHouseSqlGenerator {
         // build_optimized_regex_sql is passed the raw field_expr (it wraps internally). NAN-1161.
         let field_str = format!("toString({})", field_expr);
 
+        // NAN-1381: when the field resolves to a plain non-null String column
+        // (class-split unified, or a promoted String column reached via a UDM
+        // alias) the toString guard is a pure pessimization: ClickHouse matches
+        // a skip index by EXPRESSION, so `toString(col)` orphans every
+        // `lower(col)` text/bloom index (600/600 granules read vs 55/600 via
+        // idx_user_unified_words on a `user CONTAINS` probe, local CH) while
+        // being a semantic no-op on a non-Nullable String column — the NAN-1161
+        // missing-key concern cannot apply, the column always exists. The
+        // case-insensitive pattern arms (iLike / wildcard / simple-regex /
+        // prefix / suffix) therefore use `lower(col)` — the exact index
+        // expression — for these targets. Case-SENSITIVE arms (full `match()`)
+        // and ext/JSON/metadata targets keep `field_str` untouched.
+        let plain_string_target =
+            !use_metadata && self.resolves_to_plain_string_column(&field_path);
+        let pattern_expr = if plain_string_target {
+            format!("lower({})", field_expr)
+        } else {
+            field_str.clone()
+        };
+
         // Check if the value contains wildcards (* or ?) and we're using Eq/Ne
         if let Value::String(s) = value {
             if (s.contains('*') || s.contains('?')) && matches!(op, Comparator::Eq | Comparator::Ne)
@@ -735,13 +916,14 @@ impl ClickHouseSqlGenerator {
                 } else {
                     "NOT iLike"
                 };
-                return Ok(format!("{} {} '{}'", field_str, sql_op, pattern));
+                return Ok(format!("{} {} '{}'", pattern_expr, sql_op, pattern));
             }
         }
 
-        // NAN-1161: string/pattern arms compare `field_str` (= toString(field_expr)) so a
-        // missing ext key reads as '' not NULL — see the binding above. build_optimized_regex_sql
-        // gets the raw field_expr (it wraps internally); the numeric arm stays raw.
+        // NAN-1161: string/pattern arms compare `pattern_expr` (= toString(field_expr), or
+        // lower(col) for plain String columns — see the bindings above) so a missing ext key
+        // reads as '' not NULL. build_optimized_regex_sql gets the raw field_expr (it wraps
+        // internally); the numeric arm stays raw.
         match op {
             Comparator::Regex => {
                 // For simple patterns (no regex metacharacters), use substring iLike.
@@ -753,7 +935,7 @@ impl ClickHouseSqlGenerator {
                         // so hasToken under-matched AND bought no acceleration.
                         return Ok(format!(
                             "{} iLike '%{}%'",
-                            field_str,
+                            pattern_expr,
                             escape_like_pattern(&escape_string(&token.to_lowercase()))
                         ));
                     }
@@ -761,7 +943,7 @@ impl ClickHouseSqlGenerator {
                     return Ok(build_optimized_regex_sql(
                         &field_expr,
                         pattern,
-                        false,
+                        plain_string_target,
                         false,
                     ));
                 }
@@ -773,12 +955,17 @@ impl ClickHouseSqlGenerator {
                     if let Some(token) = extract_simple_regex_token(pattern) {
                         return Ok(format!(
                             "{} NOT iLike '%{}%'",
-                            field_str,
+                            pattern_expr,
                             escape_like_pattern(&escape_string(&token.to_lowercase()))
                         ));
                     }
                     // Complex regex — try pattern rewrites
-                    return Ok(build_optimized_regex_sql(&field_expr, pattern, false, true));
+                    return Ok(build_optimized_regex_sql(
+                        &field_expr,
+                        pattern,
+                        plain_string_target,
+                        true,
+                    ));
                 }
                 Ok(format!(
                     "match({}, {}) = 0",
@@ -786,8 +973,12 @@ impl ClickHouseSqlGenerator {
                     value_to_sql(value)
                 ))
             }
-            Comparator::Like => Ok(format!("{} iLike {}", field_str, value_to_sql(value))),
-            Comparator::NotLike => Ok(format!("{} NOT iLike {}", field_str, value_to_sql(value))),
+            Comparator::Like => Ok(format!("{} iLike {}", pattern_expr, value_to_sql(value))),
+            Comparator::NotLike => Ok(format!(
+                "{} NOT iLike {}",
+                pattern_expr,
+                value_to_sql(value)
+            )),
             Comparator::Contains => {
                 if let Value::String(s) = value {
                     // NAN-1160: always substring iLike, never hasTokenCaseInsensitive. hasToken
@@ -795,11 +986,11 @@ impl ClickHouseSqlGenerator {
                     // JSON with no token index (idx_ext_text dropped, migration 118) — wrong AND
                     // no faster. Mirrors the UDM Contains path.
                     let escaped = escape_like_pattern(&escape_string(&s.to_lowercase()));
-                    Ok(format!("{} iLike '%{}%'", field_str, escaped))
+                    Ok(format!("{} iLike '%{}%'", pattern_expr, escaped))
                 } else {
                     Ok(format!(
                         "{} iLike concat('%', {}, '%')",
-                        field_str,
+                        pattern_expr,
                         value_to_sql(value)
                     ))
                 }
@@ -810,11 +1001,11 @@ impl ClickHouseSqlGenerator {
                     // leaked sub-token matches through the exclusion (e.g. `NOT CONTAINS "medi"`
                     // failed to exclude `Medium`).
                     let escaped = escape_like_pattern(&escape_string(&s.to_lowercase()));
-                    Ok(format!("{} NOT iLike '%{}%'", field_str, escaped))
+                    Ok(format!("{} NOT iLike '%{}%'", pattern_expr, escaped))
                 } else {
                     Ok(format!(
                         "{} NOT iLike concat('%', {}, '%')",
-                        field_str,
+                        pattern_expr,
                         value_to_sql(value)
                     ))
                 }
@@ -828,7 +1019,7 @@ impl ClickHouseSqlGenerator {
                     }
                     _ => format!("concat(lower({}), '%')", value_to_sql(value)),
                 };
-                Ok(format!("{} iLike {}", field_str, pattern))
+                Ok(format!("{} iLike {}", pattern_expr, pattern))
             }
             Comparator::NotStartsWith => {
                 let pattern = match value {
@@ -839,7 +1030,7 @@ impl ClickHouseSqlGenerator {
                     }
                     _ => format!("concat(lower({}), '%')", value_to_sql(value)),
                 };
-                Ok(format!("{} NOT iLike {}", field_str, pattern))
+                Ok(format!("{} NOT iLike {}", pattern_expr, pattern))
             }
             Comparator::EndsWith => {
                 let pattern = match value {
@@ -850,7 +1041,7 @@ impl ClickHouseSqlGenerator {
                     }
                     _ => format!("concat('%', lower({}))", value_to_sql(value)),
                 };
-                Ok(format!("{} iLike {}", field_str, pattern))
+                Ok(format!("{} iLike {}", pattern_expr, pattern))
             }
             Comparator::NotEndsWith => {
                 let pattern = match value {
@@ -861,13 +1052,51 @@ impl ClickHouseSqlGenerator {
                     }
                     _ => format!("concat('%', lower({}))", value_to_sql(value)),
                 };
-                Ok(format!("{} NOT iLike {}", field_str, pattern))
+                Ok(format!("{} NOT iLike {}", pattern_expr, pattern))
             }
             Comparator::Eq | Comparator::Ne => {
                 // Case-insensitive string comparison. NAN-1161: lower(toString(field)) so a
                 // missing key compares as '' — `field != "x"` keeps absent-key rows (NULL != x
                 // would drop them).
                 let sql_op = comparator_to_sql(op);
+                // NAN-1382 (G6): a UDM verb-valued alias whose resolved OCSF column is
+                // an enum-encoded INT (`auth_result` → `status_id` UInt32) cannot be
+                // string-compared — `lower(toString(status_id)) = 'failure'` matches 0
+                // rows against 127k `status_id = 2` rows. Translate the verb via the
+                // manifest enum metadata: a fixed label table compares the indexed int
+                // (`status_id = 2`); a class-scoped enum (activity_id, whose int
+                // meaning depends on class_uid) compares the sibling label String
+                // column instead (`lower(activity) = 'logon'`). Numeric strings pass
+                // through as the id; an unknown label on a fixed table fails LOUDLY.
+                // UDM returns no mapping (verbs are String columns) → byte-identical.
+                if !use_metadata {
+                    if let (Value::String(s), Some(mapping)) =
+                        (value, self.profile.enum_int_mapping(&field_path))
+                    {
+                        return match mapping {
+                            crate::schema::EnumIntMapping::Values(labels) => Ok(format!(
+                                "{} {} {}",
+                                field_expr,
+                                sql_op,
+                                enum_values_literal_sql(&field_path, labels, s)?
+                            )),
+                            crate::schema::EnumIntMapping::LabelColumn(sibling) => {
+                                if let Ok(id) = s.parse::<i64>() {
+                                    // The integer id targets the int column directly
+                                    // (parsed, so "+2"/"007" emit canonically).
+                                    Ok(format!("{} {} {}", field_expr, sql_op, id))
+                                } else {
+                                    Ok(format!(
+                                        "lower({}) {} '{}'",
+                                        escape_identifier(sibling),
+                                        sql_op,
+                                        escape_string(&s.to_lowercase())
+                                    ))
+                                }
+                            }
+                        };
+                    }
+                }
                 match value {
                     // NAN-1333: a class-split concept resolves to its INDEXED unified
                     // column (`<field>_unified`), a plain non-null String/LowCardinality
@@ -879,14 +1108,15 @@ impl ClickHouseSqlGenerator {
                     // a semantic no-op, and the column is NOT NULL (MATERIALIZED ''), so the
                     // NAN-1161 absent-key concern does not apply. UDM never class-splits →
                     // this branch is OCSF-only → UDM byte-identical.
-                    Value::String(s) if self.profile.class_split_column(&field_path).is_some() => {
-                        Ok(format!(
-                            "lower({}) {} '{}'",
-                            field_expr,
-                            sql_op,
-                            escape_string(&s.to_lowercase())
-                        ))
-                    }
+                    // NAN-1381 broadened the guard from class-split-only to every plain
+                    // non-null String target (a UDM alias resolving to a promoted String
+                    // column gets the same index-preserving form).
+                    Value::String(s) if plain_string_target => Ok(format!(
+                        "lower({}) {} '{}'",
+                        field_expr,
+                        sql_op,
+                        escape_string(&s.to_lowercase())
+                    )),
                     Value::String(s) => Ok(format!(
                         "lower({}) {} '{}'",
                         field_str,

@@ -13,6 +13,7 @@ use nanosiem_core::audit::{
 };
 use nanosiem_core::auth::permissions;
 use nanosiem_core::crypto::EncryptionService;
+use nanosiem_core::inputlookup::ai_base_url_validator;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use utoipa::ToSchema;
@@ -295,6 +296,12 @@ pub async fn update_ai_provider(
     check_not_managed(&state)?;
     check_permission(&auth, permissions::SETTINGS_AI)
         .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+
+    // SSRF guard (NAN-1368): reject a loopback / private / link-local /
+    // cloud-metadata base_url before it is ever persisted, so neither the
+    // validate path nor runtime inference can later post to it. On-prem
+    // operators opt private endpoints in via NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS.
+    validate_config_base_url(request.config.as_ref()).await?;
 
     // Encrypt the API key if provided using AES-256-GCM
     let encrypted_creds: Option<Vec<u8>> = if let Some(ref api_key) = request.api_key {
@@ -758,12 +765,39 @@ impl nanosiem_core::health::AiProviderConnectivityChecker for ApiAiProviderCheck
 }
 
 /// Test a provider connection by making a minimal API call
+/// SSRF-guard the `base_url` carried in an AI provider config before it is
+/// stored. No-op when no `base_url` is set (the provider then uses the managed
+/// gateway). Returns a 400 on a blocked target (NAN-1368).
+async fn validate_config_base_url(config: Option<&serde_json::Value>) -> Result<(), ApiError> {
+    let base_url = config
+        .and_then(|c| c.get("base_url"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if let Some(base_url) = base_url {
+        ai_base_url_validator()
+            .validate_with_dns(base_url.trim_end_matches('/'))
+            .await
+            .map_err(|e| ApiError::BadRequest(format!("Invalid AI provider base_url: {}", e)))?;
+    }
+
+    Ok(())
+}
+
 async fn test_provider_connection(
     provider: &str,
     api_key: &str,
     config: Option<&serde_json::Value>,
 ) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    // SSRF (NAN-1368): do not follow redirects. The base_url SSRF guard below
+    // (and on save) only validates the initial URL, so a public endpoint that
+    // 302-redirects to http://127.0.0.1 / a metadata IP would otherwise bypass
+    // it. Matches the redirect posture of the webhook / enrichment clients.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_default();
 
     // NAN-1207: air-gapped direct path. When the provider config carries a
     // non-empty `base_url`, the operator is pointing nano at an on-prem
@@ -779,6 +813,16 @@ async fn test_provider_connection(
         .map(|s| s.trim_end_matches('/').to_string());
 
     if let Some(base_url) = direct_base_url {
+        // SSRF guard (NAN-1368): base_url is admin-configurable and was posted
+        // to directly. Reject loopback / private / link-local / cloud-metadata
+        // targets before any outbound request. On-prem / air-gapped operators
+        // opt private endpoints back in via NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS;
+        // metadata endpoints stay blocked regardless.
+        ai_base_url_validator()
+            .validate_with_dns(&base_url)
+            .await
+            .map_err(|e| format!("base_url rejected: {}", e))?;
+
         let model = config
             .and_then(|c| c["test_model"].as_str())
             .filter(|s| !s.is_empty())

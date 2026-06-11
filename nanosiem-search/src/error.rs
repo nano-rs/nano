@@ -170,6 +170,22 @@ impl From<nanosiem_core::SearchError> for SearchError {
     fn from(err: nanosiem_core::SearchError) -> Self {
         match err {
             nanosiem_core::SearchError::ParseError(msg) => SearchError::ParseError(msg),
+            // NAN-1354: input-side field validation rejections (a malformed or
+            // typo'd field name). User-actionable → 400 with the message and any
+            // "did you mean" suggestions, mirroring the field guidance the parse
+            // path already returns.
+            nanosiem_core::SearchError::FieldNotFound {
+                message,
+                suggestions,
+                ..
+            } => {
+                let detail = if suggestions.is_empty() {
+                    message
+                } else {
+                    format!("{message}. Did you mean: {}", suggestions.join(", "))
+                };
+                SearchError::BadRequest(detail)
+            }
             nanosiem_core::SearchError::StructuredParseError {
                 message,
                 position,

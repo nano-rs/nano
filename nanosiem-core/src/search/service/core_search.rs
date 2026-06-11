@@ -388,6 +388,10 @@ impl SearchService {
             Err(e) => return Err(convert_parse_error(e)),
         };
 
+        // NAN-1354: input-side field-name validation (defense-in-depth behind
+        // codegen escaping). Reject malformed / typo'd field references early.
+        validate_query_field_names(&query, self.active_profile.as_ref())?;
+
         // NAN-806: a bare `… | stats count by x` runs aggregation over the full
         // event set but the executor's outer `LIMIT N` would trim the GROUP BY
         // result in ClickHouse hash-bucket order — analysts would see a random
@@ -404,6 +408,13 @@ impl SearchService {
 
         // Extract lookup commands for post-processing
         let lookup_commands = extract_lookup_commands(&query);
+
+        // NAN-1389: pre-validate lookup table existence so a typo'd or missing
+        // `| lookup <table>` surfaces as an actionable 400 naming the table
+        // (and listing the available ones) instead of a masked failure.
+        if !lookup_commands.is_empty() {
+            validate_lookup_tables(&lookup_commands, self.lookup_service.as_ref()).await?;
+        }
 
         // Extract inputlookup commands for URL-based enrichment
         let inputlookup_commands = extract_inputlookup_commands(&query);
@@ -686,11 +697,22 @@ impl SearchService {
 
         // Execute the query based on backend
         // For ClickHouse non-aggregation queries, also run field stats query in parallel
+        //
+        // NAN-1395: the companion aggregates topK/uniq over the BASE table's
+        // column inventory, which is only resolvable while the pipeline output
+        // is still wide (`SELECT *`-shaped: filters/sort/head/eval/...).
+        // Transformative pipelines (funnel/sequence/table/chart/...) project a
+        // new column set containing none of the base columns — the companion
+        // was a guaranteed Code 47 + a wasted CH round-trip before falling
+        // back. Statically non-wide (or unmodeled → Unknown) output shapes go
+        // straight to the client-side fallback, which computes exact stats
+        // over the (small) transformed result set the response already carries.
         let should_run_server_field_stats = self.backend == SearchBackend::ClickHouse
             && !is_aggregation_query
             && !is_tree_query
             && !is_asset_query
-            && !request.skip_field_stats;
+            && !request.skip_field_stats
+            && self.ch_sql_generator.pipeline_output_is_wide(&query_for_sql);
 
         let (mut results, total_count, server_field_stats) = {
             if should_run_server_field_stats {
@@ -703,10 +725,13 @@ impl SearchService {
                     // Get column list dynamically (run in parallel with data query)
                     // for the ACTIVE schema's logs table (UDM `logs` / OCSF
                     // `ocsf_logs`), so OCSF deployments enumerate OCSF columns
-                    // rather than a hardcoded `logs` (NAN-1241).
+                    // rather than a hardcoded `logs` (NAN-1241). The profile's
+                    // materialized re-add list scopes the inventory to columns
+                    // that actually resolve inside the companion's CTE wrap
+                    // (NAN-1397: excludes bookkeeping like `event_bytes`).
                     let logs_table = Self::logs_table_key(self.active_profile.as_ref());
                     let columns =
-                        ch_executor.get_table_columns(logs_table).await.unwrap_or_else(|e| {
+                        ch_executor.get_table_columns(logs_table, self.active_profile.materialized_columns()).await.unwrap_or_else(|e| {
                         warn!("Failed to get table columns, using defaults: {}", e);
                         vec![
                             "user",
@@ -790,6 +815,11 @@ impl SearchService {
         // the merge point below to keep the labelling honest.
         let mut runtime_warnings: Vec<String> = Vec::new();
 
+        // Enrichment degradation warnings (e.g. a subset of inputlookup fetches
+        // failed) get their own `ENRICHMENT_DEGRADED` code — they are not
+        // truncation events (NAN-1389).
+        let mut enrichment_warnings: Vec<String> = Vec::new();
+
         // Strip internal lookup fields used for SQL JOINs (these are implementation details)
         strip_internal_lookup_fields(&mut results);
 
@@ -811,6 +841,7 @@ impl SearchService {
                 results,
                 &inputlookup_commands,
                 self.inputlookup_service.as_ref(),
+                &mut enrichment_warnings,
             )
             .await?;
             tracing::debug!("After inputlookup enrichment: {} results", results.len());
@@ -1106,6 +1137,54 @@ impl SearchService {
             });
         }
 
+        // Add enrichment degradation warnings (e.g. partial inputlookup fetch
+        // failures) with their own code so the UI doesn't label them as
+        // truncation (NAN-1389)
+        for msg in &enrichment_warnings {
+            all_warnings.push(QueryWarningOutput {
+                severity: "warning".to_string(),
+                code: "ENRICHMENT_DEGRADED".to_string(),
+                message: msg.clone(),
+                suggestion: Some(
+                    "Verify the inputlookup URL is reachable and returns the expected format"
+                        .to_string(),
+                ),
+                impact: Some("Some rows are missing enrichment fields".to_string()),
+            });
+        }
+
+        // NAN-1388 (G14): under OCSF, `ext.foo` predicates are strip-and-remapped
+        // to the OCSF spill location `unmapped.foo` (OcsfProfile::resolve) so
+        // UDM-era saved searches keep working. UDM `ext` and OCSF `unmapped` key
+        // layouts are not guaranteed to coincide though — when a remapped
+        // predicate produced an empty result set, say so honestly instead of
+        // leaving a silent zero. Info severity: the remap itself is correct
+        // behavior, the note just explains the empty result.
+        if results.is_empty() && self.active_profile.id() == crate::schema::SchemaId::Ocsf {
+            let ext_fields = collect_ext_prefixed_predicate_fields(&query);
+            if !ext_fields.is_empty() {
+                let remapped: Vec<String> = ext_fields
+                    .iter()
+                    .map(|f| format!("{f} → unmapped.{}", &f["ext.".len()..]))
+                    .collect();
+                all_warnings.push(QueryWarningOutput {
+                    severity: "info".to_string(),
+                    code: "OCSF_EXT_REMAPPED".to_string(),
+                    message: format!(
+                        "No rows matched. UDM-style ext.* fields were remapped to the OCSF \
+                         unmapped.* spill location: {}",
+                        remapped.join(", ")
+                    ),
+                    suggestion: Some(
+                        "OCSF stores unconverted source fields under unmapped.*; the key may \
+                         have a different name there than under UDM ext.*"
+                            .to_string(),
+                    ),
+                    impact: None,
+                });
+            }
+        }
+
         let (warnings, cost_score) = if all_warnings.is_empty() {
             (None, None)
         } else {
@@ -1150,5 +1229,78 @@ impl SearchService {
             display_type: Some(display_type),
             column_order,
         })
+    }
+}
+
+/// Collect `ext.`-prefixed field names referenced by predicates in the query —
+/// base search terms and `| where` conditions (NAN-1388 / G14).
+///
+/// Best-effort by design: it feeds the `OCSF_EXT_REMAPPED` empty-result note
+/// only, so it deliberately covers the surfaces where an analyst types a
+/// filtering predicate (the demo trap is `ext.error_code=0`). Non-predicate
+/// references (`| stats by ext.foo`, `| table ext.foo`) project empty values
+/// rather than filtering to zero rows, so they are out of scope here. BTreeSet
+/// keeps the note's field list deterministic.
+fn collect_ext_prefixed_predicate_fields(query: &Query) -> std::collections::BTreeSet<String> {
+    fn from_expr(expr: &crate::query::SearchExpr, out: &mut std::collections::BTreeSet<String>) {
+        use crate::query::SearchExpr as E;
+        match expr {
+            E::FieldFilter { field, .. }
+            | E::FieldFunctionFilter { field, .. }
+            | E::InList { field, .. } => {
+                if field.starts_with("ext.") {
+                    out.insert(field.clone());
+                }
+            }
+            E::And(left, right) | E::Or(left, right) => {
+                from_expr(left, out);
+                from_expr(right, out);
+            }
+            E::Not(inner) | E::Group(inner) => from_expr(inner, out),
+            _ => {}
+        }
+    }
+    fn walk(query: &Query, out: &mut std::collections::BTreeSet<String>) {
+        match query {
+            Query::Search(expr) => from_expr(expr, out),
+            Query::Piped { source, command } => {
+                walk(source, out);
+                if let Command::Where { condition } = command {
+                    from_expr(condition, out);
+                }
+            }
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    walk(query, &mut out);
+    out
+}
+
+#[cfg(test)]
+mod ext_remap_note_tests {
+    use super::*;
+    use crate::query::parse_query;
+
+    /// NAN-1388: the OCSF empty-result note collects `ext.*` predicate fields
+    /// from base search terms and `| where` stages — and nothing else.
+    #[test]
+    fn collects_ext_predicates_from_search_and_where() {
+        let q = parse_query(
+            r#"ext.error_code=5 AND NOT ext.cache_status="hit" | where ext.threat_tier!="low" | stats count by ext.category"#,
+        )
+        .unwrap();
+        let fields = collect_ext_prefixed_predicate_fields(&q);
+        let got: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
+        // stats-by ext.category is a projection, not a predicate — excluded.
+        assert_eq!(
+            got,
+            vec!["ext.cache_status", "ext.error_code", "ext.threat_tier"],
+        );
+    }
+
+    #[test]
+    fn ignores_non_ext_fields() {
+        let q = parse_query(r#"src_ip="10.0.0.1" | where unmapped.foo="x""#).unwrap();
+        assert!(collect_ext_prefixed_predicate_fields(&q).is_empty());
     }
 }

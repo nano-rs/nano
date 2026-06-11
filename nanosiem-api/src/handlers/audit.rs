@@ -20,9 +20,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use nanosiem_core::audit::{ClickHouseAuditEntry, ClickHouseAuditQuery};
+use nanosiem_core::audit::{
+    AuditEvent, AuditSource, ClickHouseAuditEntry, ClickHouseAuditQuery, ClientContext,
+    AUDIT_LOGS_EXPORTED,
+};
 use nanosiem_core::auth::{permissions, AuditLogWithNames, AuditRepositoryError};
 
+use crate::handlers::AuditExt;
 use crate::middleware::{check_permission, AuthContext};
 use crate::state::AppState;
 
@@ -280,6 +284,7 @@ pub struct ExportAuditLogsQuery {
 pub async fn export_audit_logs(
     State(state): State<AppState>,
     auth: axum::Extension<AuthContext>,
+    client: axum::Extension<ClientContext>,
     Query(query): Query<ExportAuditLogsQuery>,
 ) -> Result<Response, (StatusCode, Json<AuditApiError>)> {
     check_permission(&auth, permissions::AUDIT_VIEW)
@@ -315,6 +320,28 @@ pub async fn export_audit_logs(
     })?;
 
     let entries: Vec<AuditLogEntry> = logs.into_iter().map(AuditLogEntry::from).collect();
+
+    // Exporting the audit trail is itself a defender-relevant exfil surface —
+    // record who pulled how much, in what format, and whether an admin reached
+    // across users, so the export is never invisible (NAN-1365).
+    let format_label = match &format {
+        ExportFormat::Json => "json",
+        ExportFormat::Csv => "csv",
+    };
+    state.emit_audit(
+        AuditEvent::builder(AuditSource::Audit, AUDIT_LOGS_EXPORTED)
+            .actor(Some(auth.user_id()), None)
+            .api_key(auth.api_key_id, auth.api_key_name.clone())
+            .client_context(&client)
+            .details(serde_json::json!({
+                "format": format_label,
+                "limit": limit,
+                "exported": entries.len(),
+                "admin_cross_user": is_admin && query.user_id != Some(auth.user_id()),
+                "target_user_id": effective_user_id,
+            }))
+            .build(),
+    );
 
     match format {
         ExportFormat::Json => {

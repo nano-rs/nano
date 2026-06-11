@@ -10,7 +10,7 @@ pub mod enrichment;
 pub mod post_processing;
 
 // Re-export the main functions used by service
-pub use enrichment::{apply_inputlookup_enrichment, apply_lookup_enrichment};
+pub use enrichment::{apply_inputlookup_enrichment, apply_lookup_enrichment, validate_lookup_tables};
 pub use post_processing::{
     apply_post_prevalence_commands, apply_post_prevalence_commands_with_limit,
 };

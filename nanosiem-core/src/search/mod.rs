@@ -30,6 +30,8 @@ pub use admission::{
 };
 pub use config::{SearchBackend, SearchConfig};
 pub use execution::{inject_audit_filter, validate_sql_query};
+// NAN-1389: exposed for the lookup pre-check PG integration suite
+pub use processing::validate_lookup_tables;
 pub use jobs::{
     AdminSearchJobSummary, AsyncSearchResponse, InMemoryJobStore, RedisJobStore, SearchJob,
     SearchJobProgress, SearchJobRegistry, SearchJobStatus, SearchJobStatusResponse, SearchJobStore,
@@ -63,5 +65,5 @@ pub use types::{
     CloudFacets, CloudUserActivity, CloudUserSessionSummary, DisplayType, EntityCrossReference,
     FieldInfo, FieldStatistics, FieldValueInfo, HistogramBucket, QueryWarningOutput, RawSqlRequest,
     SearchError, SearchRequest, SearchResponse, TimeRangeInput, UdmFieldQueryRequest,
-    UdmFieldStats, UdmQueryOperator,
+    UdmQueryOperator,
 };

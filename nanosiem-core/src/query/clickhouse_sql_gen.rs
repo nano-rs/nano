@@ -24,9 +24,14 @@ mod aggregation;
 mod commands;
 mod commands_advanced;
 mod eval_functions;
-mod field_analysis;
+// pub(crate): `query::validation::derived_fields` pins its registered
+// aggregation reference names against `collect_agg_reference_aliases`
+// (NAN-1396 drift test).
+pub(crate) mod field_analysis;
 mod helpers;
-mod identity;
+// pub(crate): `query::validation::derived_fields` mirrors the resolve_identity
+// output registration from the IDENTITY_*_FIELDS tables (NAN-1380).
+pub(crate) mod identity;
 mod search_expr;
 
 // Re-export helpers so submodules and external code can access them
@@ -34,7 +39,7 @@ pub(crate) use helpers::*;
 
 use super::ast::*;
 use super::sql_gen::{SqlGenError, TimeRange};
-use crate::schema::{FieldResolution, SchemaProfile, UdmProfile};
+use crate::schema::{EnumIntMapping, FieldResolution, FieldType, SchemaProfile, UdmProfile};
 use once_cell::sync::Lazy;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -597,6 +602,14 @@ pub(super) fn extract_prewhere_conditions(expr: &SearchExpr, profile: &dyn Schem
                 collect_prewhere(left, profile, conditions);
                 collect_prewhere(right, profile, conditions);
             }
+            // NAN-1379: `Group` is pure parenthesization — recurse through it.
+            // `enforce_non_audit_query` wraps every non-AUDIT_VIEW user
+            // expression in `Group(expr) AND source_type != 'audit'`, so
+            // without this arm the entity-Eq PREWHERE rescue (NAN-1299) was
+            // dead code on the standard API path (full scan, ~8x I/O).
+            SearchExpr::Group(inner) => {
+                collect_prewhere(inner, profile, conditions);
+            }
             SearchExpr::FieldFilter {
                 field,
                 op: Comparator::Eq,
@@ -637,6 +650,39 @@ pub(super) fn extract_prewhere_conditions(expr: &SearchExpr, profile: &dyn Schem
                         // correctly (pure "*" → 1, patterns → iLike). Adding a literal
                         // '*' to PREWHERE would match nothing and break the query.
                         if s.contains('*') || s.contains('?') {
+                            return;
+                        }
+                        // NAN-1382 (G6): a NUMERIC resolved column (OCSF enum/taxonomy
+                        // ints — severity_id, activity_id, …) must never get the string
+                        // form below: `lower(<int col>) = 'verb'` is a CH type error
+                        // (Code 43). A numeric string compares as the number; an enum
+                        // verb with a fixed manifest label table compares as its id
+                        // (in lockstep with the WHERE clause); anything else (class-
+                        // scoped enums, unknown labels) is left to WHERE — which
+                        // matches the sibling label column or raises the loud
+                        // validation error. No UDM PREWHERE field is numeric → UDM
+                        // byte-identical.
+                        let is_numeric_col = matches!(
+                            profile.field_type(&col),
+                            Some(FieldType::Integer | FieldType::Long | FieldType::Float)
+                        );
+                        if is_numeric_col {
+                            // Emit the PARSED value so only canonical numeric
+                            // literals reach the SQL ("+2"/"007" normalize;
+                            // f64 "inf"/"NaN" spellings are rejected).
+                            if let Ok(n) = s.parse::<i64>() {
+                                conditions.push(format!("{col_sql} = {n}"));
+                            } else if let Ok(f) = s.parse::<f64>() {
+                                if f.is_finite() {
+                                    conditions.push(format!("{col_sql} = {f}"));
+                                }
+                            } else if let Some(EnumIntMapping::Values(labels)) =
+                                profile.enum_int_mapping(normalized)
+                            {
+                                if let Some(id) = labels.get(s.to_lowercase().as_str()) {
+                                    conditions.push(format!("{col_sql} = {id}"));
+                                }
+                            }
                             return;
                         }
                         let escaped = escape_string(&s.to_lowercase());
@@ -687,6 +733,11 @@ pub(super) fn has_selective_prewhere(expr: &SearchExpr, profile: &dyn SchemaProf
     fn check(expr: &SearchExpr, profile: &dyn SchemaProfile) -> bool {
         match expr {
             SearchExpr::And(left, right) => check(left, profile) || check(right, profile),
+            // NAN-1379: recurse through pure parenthesization, in lockstep
+            // with `collect_prewhere` (audit-wrap `Group(expr)` must not hide
+            // selective conditions, or `optimize_read_in_order` stays on for
+            // a PREWHERE that was emitted).
+            SearchExpr::Group(inner) => check(inner, profile),
             SearchExpr::FieldFilter {
                 field,
                 op: Comparator::Eq,
@@ -751,6 +802,18 @@ pub struct ClickHouseSqlGenerator {
     /// it collides with a "known metadata" field (e.g. `risk_factors` after a
     /// `| risk` command). (NAN-1236)
     computed_fields: RwLock<HashSet<String>>,
+    /// Fields created with NEW VALUES (rex captures, eval assignments, rename
+    /// targets, aggregation aliases, command outputs) by pipeline stages
+    /// strictly UPSTREAM of the stage currently being generated (NAN-1341).
+    /// Unlike `computed_fields` — the whole-query set consulted after schema
+    /// resolution — this set is maintained incrementally as stages generate and
+    /// is consulted BEFORE `normalize_field_name` / `resolves_to_column`: a rex
+    /// capture or eval output shadows a same-named schema field or UDM alias
+    /// for the rest of the pipeline. Whole-query population can't work here:
+    /// stats group_by self-registers raw by-field names, which would make a
+    /// plain `stats count by method` (no rex) shadow its own schema resolution.
+    /// Empty outside `generate_with_options`.
+    upstream_computed_fields: RwLock<HashSet<String>>,
     /// Reference-side aliases for UN-aliased aggregations (NAN-1339): an
     /// un-aliased `avg(bytes_in)` outputs a column literally named `avg`
     /// (`Aggregation::output_alias` fallback), but users following the
@@ -775,6 +838,7 @@ impl Clone for ClickHouseSqlGenerator {
             max_mvexpand_rows: self.max_mvexpand_rows,
             generation_time_range: RwLock::new(None),
             computed_fields: RwLock::new(HashSet::new()),
+            upstream_computed_fields: RwLock::new(HashSet::new()),
             agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
             profile: Arc::clone(&self.profile),
         }
@@ -797,6 +861,7 @@ impl ClickHouseSqlGenerator {
             max_mvexpand_rows: DEFAULT_MAX_MVEXPAND_ROWS,
             generation_time_range: RwLock::new(None),
             computed_fields: RwLock::new(HashSet::new()),
+            upstream_computed_fields: RwLock::new(HashSet::new()),
             agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
             profile: Arc::new(UdmProfile::new()),
         }
@@ -811,6 +876,7 @@ impl ClickHouseSqlGenerator {
             max_mvexpand_rows: DEFAULT_MAX_MVEXPAND_ROWS,
             generation_time_range: RwLock::new(None),
             computed_fields: RwLock::new(HashSet::new()),
+            upstream_computed_fields: RwLock::new(HashSet::new()),
             agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
             profile: Arc::new(UdmProfile::new()),
         }
@@ -900,7 +966,8 @@ impl ClickHouseSqlGenerator {
     ///   promoted column — backtick/quote-safe).
     /// - [`JsonPath`] → an N-level `JSONExtract<T>(col, 'p1', 'p2', …)` against the
     ///   JSON-typed column (OCSF's `event` tail). `json_type` is chosen by the
-    ///   caller from the comparison/value (`String`/`Float64`/`Bool`).
+    ///   caller from the comparison/value (`String`/`Float`/`Bool` — the typed
+    ///   extractor suffixes; numeric is `Float`, NOT `Float64`, NAN-1383).
     /// - [`Unknown`] (and the array/alias variants, which the tokenizer never
     ///   produces on this path) → `ext.{field}` — UDM's existing behavior, kept
     ///   **byte-for-byte identical** because `UdmProfile::resolve` only ever
@@ -1000,6 +1067,45 @@ impl ClickHouseSqlGenerator {
         }
     }
 
+    /// Whether `field` (the PRE-normalization name) was created with a new
+    /// value by a pipeline stage upstream of the one currently being generated
+    /// — and therefore shadows any same-named schema field / UDM alias
+    /// (NAN-1341). See `upstream_computed_fields`.
+    pub(crate) fn is_upstream_computed_field(&self, field: &str) -> bool {
+        match self.upstream_computed_fields.read() {
+            Ok(guard) => guard.contains(field),
+            Err(poisoned) => poisoned.get_ref().contains(field),
+        }
+    }
+
+    /// Record the value-computed outputs of a just-generated pipeline stage so
+    /// the stages after it see them as shadowing columns (NAN-1341).
+    fn note_upstream_computed(&self, cmd: &Command) {
+        let added = {
+            let guard = self
+                .upstream_computed_fields
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            field_analysis::upstream_computed_added_by_command(cmd, &guard)
+        };
+        match self.upstream_computed_fields.write() {
+            Ok(mut guard) => guard.extend(added),
+            Err(poisoned) => poisoned.into_inner().extend(added),
+        }
+    }
+
+    /// Swap the upstream-computed scope (NAN-1341). A subsearch is its own
+    /// pipeline scope — its references must not see the outer pipeline's
+    /// computed fields — so its generation swaps in an empty set and restores
+    /// the outer scope afterwards. Also used to reset the scope at the start
+    /// and end of `generate_with_options`.
+    fn swap_upstream_computed(&self, new: HashSet<String>) -> HashSet<String> {
+        match self.upstream_computed_fields.write() {
+            Ok(mut guard) => std::mem::replace(&mut *guard, new),
+            Err(poisoned) => std::mem::replace(&mut *poisoned.into_inner(), new),
+        }
+    }
+
     /// Resolve a `{func}_{field}` reference to the actual output column of an
     /// UN-aliased aggregation earlier in this pipeline (NAN-1339). Returns
     /// `None` for everything else — including names an explicit alias already
@@ -1081,6 +1187,9 @@ impl ClickHouseSqlGenerator {
         // materialized in stage_0 SELECT, making them visible to downstream CTEs
         ctx.ext_fields = field_analysis::analyze_ext_fields(query, self.profile.as_ref());
 
+        // Fresh upstream-computed scope for this generation (NAN-1341).
+        self.swap_upstream_computed(HashSet::new());
+
         let result = self.generate_query(query, &mut ctx);
         match self.generation_time_range.write() {
             Ok(mut guard) => *guard = None,
@@ -1090,6 +1199,7 @@ impl ClickHouseSqlGenerator {
             Ok(mut guard) => guard.clear(),
             Err(poisoned) => poisoned.into_inner().clear(),
         }
+        self.swap_upstream_computed(HashSet::new());
         result
     }
 
@@ -1412,7 +1522,13 @@ impl ClickHouseSqlGenerator {
                         }
                         _ => {}
                     }
-                    self.generate_command_cte(&cte_name, &prev_cte, cmd, ctx, &stages[..i])?
+                    let cte =
+                        self.generate_command_cte(&cte_name, &prev_cte, cmd, ctx, &stages[..i])?;
+                    // This stage's value-computed outputs (rex captures, eval
+                    // assignments, …) shadow schema fields / UDM aliases for
+                    // every stage after it (NAN-1341).
+                    self.note_upstream_computed(cmd);
+                    cte
                 }
             };
             cte_parts.push(cte_sql);
@@ -1598,6 +1714,25 @@ impl ClickHouseSqlGenerator {
         }
     }
 
+    /// Whether the full pipeline's terminal output is still wide — i.e.
+    /// `SELECT *`-shaped over the base table (filters / sort / head / dedup /
+    /// eval / rename / join only).
+    ///
+    /// Consumed by the field-stats companion gate (NAN-1395): the companion
+    /// aggregates `topK`/`uniq` over the base table's column inventory, which
+    /// only resolves against a wide output. `Columns(...)` shapes
+    /// (stats/chart/table/fields) project a new column set with none of the
+    /// base columns, and `Unknown` shapes (funnel/sequence/transaction and
+    /// every unmodeled command) cannot be proven safe — both must skip the
+    /// companion rather than fire a guaranteed-Code-47 query (the semantic
+    /// sibling of NAN-1315's Code 62 slicing bug).
+    pub fn pipeline_output_is_wide(&self, query: &Query) -> bool {
+        matches!(
+            self.pipeline_output_shape(&self.collect_stages(query)),
+            OutputShape::Wide(_)
+        )
+    }
+
     /// Compute the statically known output shape of a pipeline stage prefix.
     ///
     /// Used by `append` to align UNION arms (see [`generate_append_sql`]).
@@ -1605,11 +1740,16 @@ impl ClickHouseSqlGenerator {
     /// here yield [`OutputShape::Unknown`], which makes `append` refuse with an
     /// actionable error rather than emit a misaligned UNION. Column names must
     /// match what the corresponding SQL generators alias their outputs to:
-    /// `stats`/`chart` alias group-bys to `normalize_field_name(f)` and
-    /// aggregations to `Aggregation::output_alias()` (aggregation.rs);
-    /// `table`/`fields` alias to the requested name (commands.rs).
+    /// `stats`/`chart` alias group-bys to `by_field_output_name(f)` — the raw
+    /// name when an upstream stage value-computed it (NAN-1341), the
+    /// normalized canonical name otherwise — and aggregations to
+    /// `Aggregation::output_alias()` (aggregation.rs); `table`/`fields` alias
+    /// to the requested name (commands.rs).
     fn pipeline_output_shape(&self, stages: &[QueryStage]) -> OutputShape {
         let mut shape = OutputShape::Unknown;
+        // Mirror the generator's upstream value-computed tracking so the
+        // modeled group-by column names match the emitted aliases (NAN-1341).
+        let mut upstream: HashSet<String> = HashSet::new();
         for stage in stages {
             match stage {
                 QueryStage::Search(_) => shape = OutputShape::Wide(Vec::new()),
@@ -1634,7 +1774,13 @@ impl ClickHouseSqlGenerator {
                                 .as_deref()
                                 .unwrap_or(&[])
                                 .iter()
-                                .map(|f| normalize_field_name(f).to_string())
+                                .map(|f| {
+                                    if upstream.contains(f.as_str()) {
+                                        f.clone()
+                                    } else {
+                                        normalize_field_name(f).to_string()
+                                    }
+                                })
                                 .collect();
                             cols.extend(aggregations.iter().map(|a| a.output_alias()));
                             OutputShape::Columns(cols)
@@ -1751,6 +1897,9 @@ impl ClickHouseSqlGenerator {
                         }
                         _ => OutputShape::Unknown,
                     };
+                    let added =
+                        field_analysis::upstream_computed_added_by_command(cmd, &upstream);
+                    upstream.extend(added);
                 }
             }
         }
@@ -1878,6 +2027,23 @@ impl ClickHouseSqlGenerator {
         ctx: &GeneratorContext,
         limit: usize,
     ) -> Result<String, SqlGenError> {
+        // A subsearch is its own pipeline scope: its field references must not
+        // see the OUTER pipeline's value-computed fields as shadowing columns,
+        // and its own stage tracking must not leak out (the outer loop adds
+        // the join/append OUTPUT columns itself via `note_upstream_computed`).
+        // Swap in an empty scope, restore the outer one afterwards (NAN-1341).
+        let outer_scope = self.swap_upstream_computed(HashSet::new());
+        let result = self.generate_subsearch_sql_inner(subsearch, ctx, limit);
+        self.swap_upstream_computed(outer_scope);
+        result
+    }
+
+    fn generate_subsearch_sql_inner(
+        &self,
+        subsearch: &Query,
+        ctx: &GeneratorContext,
+        limit: usize,
+    ) -> Result<String, SqlGenError> {
         // Collect stages from subsearch
         let stages = self.collect_stages(subsearch);
 
@@ -1987,6 +2153,9 @@ impl ClickHouseSqlGenerator {
                     // Use previous result as source, wrapped in parentheses with alias
                     let source = format!("({}) AS stage_{}", current_sql, i - 1);
                     let cmd_sql = self.generate_command_sql(&source, cmd)?;
+                    // Track this subsearch stage's value-computed outputs for
+                    // the subsearch stages after it (NAN-1341).
+                    self.note_upstream_computed(cmd);
                     // Wrap the command result for next iteration
                     current_sql = cmd_sql.trim().to_string();
                 }
@@ -2421,6 +2590,49 @@ mod tests {
         );
     }
 
+    /// NAN-1384 (G18): `source_type` equality must be case-tolerant under OCSF.
+    /// `ocsf_logs` accepts direct client INSERTs, and a client-written DEFAULT
+    /// column cannot be lowercase-normalized server-side — so a MixedCase
+    /// `source_type` row used to be silently invisible to the
+    /// `source_type = '<lowered>'` fast-path (verified live: a `MixedCase` probe
+    /// row matched 0 rows). The generator must emit `lower(source_type)` in both
+    /// WHERE and PREWHERE under OCSF, while UDM (whose ingest is exclusively
+    /// Vector-owned and lowercases at the edge) keeps the index fast-path.
+    #[test]
+    fn ocsf_source_type_eq_is_case_tolerant_udm_keeps_fast_path() {
+        use crate::schema::OcsfProfile;
+        use std::sync::Arc;
+        let q = parse_query("source_type=MixedCase").unwrap();
+
+        let ocsf = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()));
+        let ocsf_sql = ocsf.generate(&q, &time_range()).unwrap();
+        assert!(
+            ocsf_sql.contains("lower(source_type) = 'mixedcase'"),
+            "OCSF source_type equality must lower() the stored column, got:\n{ocsf_sql}"
+        );
+        assert!(
+            !ocsf_sql.contains("source_type = 'mixedcase'"),
+            "OCSF must not emit the bare ingest-lowercased fast-path, got:\n{ocsf_sql}"
+        );
+        let prewhere = &ocsf_sql[ocsf_sql.find("PREWHERE").expect("source_type is PREWHERE-eligible")..];
+        assert!(
+            prewhere.contains("lower(source_type) = 'mixedcase'"),
+            "OCSF PREWHERE must stay in lockstep with WHERE (lower()), got:\n{prewhere}"
+        );
+
+        // UDM safety: byte-identical fast-path emission (no lower() wrapper).
+        let udm = ClickHouseSqlGenerator::new();
+        let udm_sql = udm.generate(&q, &time_range()).unwrap();
+        assert!(
+            udm_sql.contains("source_type = 'mixedcase'"),
+            "UDM must keep the ingest-lowercased equality fast-path, got:\n{udm_sql}"
+        );
+        assert!(
+            !udm_sql.contains("lower(source_type)"),
+            "UDM source_type emission must be unchanged by NAN-1384, got:\n{udm_sql}"
+        );
+    }
+
     /// NAN-1323: `| resolve_identity` must not reference UDM column names that do
     /// not exist under OCSF (`src_mac`, `user`, `user_identity_*`) — doing so 500s
     /// with an unknown-identifier error. Across src_host / src_ip / user lookups the
@@ -2656,6 +2868,139 @@ mod tests {
         assert!(
             prewhere.contains("src_ip = '89.248.167.131'"),
             "UDM PREWHERE must stay byte-identical (direct `src_ip = '…'`), got:\n{prewhere}"
+        );
+    }
+
+    /// NAN-1381 (root cause of NAN-1247): non-Eq string operators on a UDM alias
+    /// that resolves to a plain non-null String column must reference `lower(col)`,
+    /// never `toString(col)` — ClickHouse matches a text/bloom skip index by
+    /// EXPRESSION, so the toString wrapper orphans every `lower(col)` index and
+    /// full-scans (601/601 granules vs 55/601 via idx_user_unified_words on a
+    /// `user CONTAINS "intern"` probe, local CH; counts identical — toString is a
+    /// semantic no-op on a MATERIALIZED-'' String column).
+    #[test]
+    fn ocsf_alias_string_pattern_ops_use_lower_not_tostring() {
+        use crate::schema::OcsfProfile;
+        let gen = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()));
+
+        // Class-split alias → unified column, every string-pattern arm.
+        for (q, want) in [
+            ("user CONTAINS \"intern\"", "lower(user_unified) iLike '%intern%'"),
+            (
+                "NOT user CONTAINS \"intern\"",
+                "lower(user_unified) iLike '%intern%'",
+            ),
+            ("user=/intern/", "lower(user_unified) iLike '%intern%'"),
+            ("user=\"inte*\"", "lower(user_unified) iLike 'inte%'"),
+            ("user!=\"inte*\"", "lower(user_unified) NOT iLike 'inte%'"),
+            ("user STARTSWITH \"inte\"", "lower(user_unified) iLike 'inte%'"),
+            ("user ENDSWITH \"ern\"", "lower(user_unified) iLike '%ern'"),
+            ("user LIKE \"%intern%\"", "lower(user_unified) iLike '%intern%'"),
+        ] {
+            let sql = gen.generate(&parse_query(q).unwrap(), &time_range()).unwrap();
+            assert!(
+                sql.contains(want) && !sql.contains("toString(user_unified)"),
+                "OCSF `{q}` must use the index-matchable lower(user_unified) form, got:\n{sql}"
+            );
+        }
+
+        // Promoted-column alias (Eq exception broadened beyond class-split): the
+        // String target gets lower(col), not lower(toString(col)).
+        let sql = gen
+            .generate(&parse_query("file_hash=\"ab12\"").unwrap(), &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("lower(\"file.hashes.sha256\") = 'ab12'")
+                && !sql.contains("toString(\"file.hashes.sha256\")"),
+            "OCSF file_hash= must compare lower(col) without toString, got:\n{sql}"
+        );
+        let sql = gen
+            .generate(
+                &parse_query("file_hash CONTAINS \"ab12\"").unwrap(),
+                &time_range(),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("lower(\"file.hashes.sha256\") iLike '%ab12%'"),
+            "OCSF file_hash CONTAINS must use lower(col), got:\n{sql}"
+        );
+
+        // A UDM alias resolving to a NUMERIC column must keep the toString guard —
+        // the type check consults the RESOLVED column (`is_numeric_field("src_port")`
+        // is false under OCSF even though `src_endpoint.port` is UInt16; lower()
+        // on a numeric column is a CH type error).
+        let sql = gen
+            .generate(
+                &parse_query("src_port CONTAINS \"44\"").unwrap(),
+                &time_range(),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("toString(\"src_endpoint.port\") iLike '%44%'"),
+            "OCSF src_port CONTAINS must keep toString on the numeric target, got:\n{sql}"
+        );
+
+        // An unpromoted JSON-tail field keeps the NAN-1161 toString null-guard:
+        // a missing key must read as '' so negation keeps absent-key rows.
+        let sql = gen
+            .generate(
+                &parse_query("custom_tail_key CONTAINS \"x\"").unwrap(),
+                &time_range(),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("toString(JSONExtractString(event, 'custom_tail_key')) iLike '%x%'"),
+            "OCSF JSON-tail CONTAINS must keep the toString null-guard, got:\n{sql}"
+        );
+    }
+
+    /// NAN-1381 (UDM side of the shared gap): wildcard / STARTSWITH / ENDSWITH /
+    /// LIKE previously emitted the bare column (`user iLike 'bob%'`), which cannot
+    /// use the `lower(col)` text indexes. They now emit the lowered form the
+    /// Contains/Regex arms already used — iLike is case-insensitive either way, so
+    /// matches are unchanged (count-identity verified on local CH, 543/543 →
+    /// 334/543 granules on a `user` contains-shaped probe).
+    #[test]
+    fn udm_wildcard_prefix_suffix_like_use_lowered_column() {
+        let gen = ClickHouseSqlGenerator::new();
+        for (q, want) in [
+            ("user=\"bob*\"", "lower(\"user\") iLike 'bob%'"),
+            ("user!=\"bob*\"", "lower(\"user\") NOT iLike 'bob%'"),
+            ("user STARTSWITH \"bob\"", "lower(\"user\") iLike 'bob%'"),
+            ("user ENDSWITH \"son\"", "lower(\"user\") iLike '%son'"),
+            ("user LIKE \"%wilson%\"", "lower(\"user\") iLike '%wilson%'"),
+            // Contains was already lowered (NAN-1026/NAN-1247) — pinned here so the
+            // whole pattern family stays on one form.
+            ("user CONTAINS \"wilson\"", "lower(\"user\") iLike '%wilson%'"),
+        ] {
+            let sql = gen.generate(&parse_query(q).unwrap(), &time_range()).unwrap();
+            assert!(
+                sql.contains(want),
+                "UDM `{q}` must use the lowered index-matchable form, got:\n{sql}"
+            );
+        }
+
+        // UDM ext-spill fields keep the NAN-1161 toString null-guard on the
+        // pattern arms (missing key must read '' so negation keeps absent rows).
+        let sql = gen
+            .generate(
+                &parse_query("integrity_level CONTAINS \"high\"").unwrap(),
+                &time_range(),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("toString(ext.integrity_level) iLike '%high%'"),
+            "UDM ext CONTAINS must keep the toString null-guard, got:\n{sql}"
+        );
+
+        // UDM equality / keyword paths are byte-identical: Eq on an
+        // ingest-lowercased column stays the bare indexed comparison.
+        let sql = gen
+            .generate(&parse_query("user=\"bob\" error").unwrap(), &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("\"user\" = 'bob'") && sql.contains("lower(message) iLike '%error%'"),
+            "UDM Eq/keyword paths must stay byte-identical, got:\n{sql}"
         );
     }
 
@@ -2956,5 +3301,51 @@ mod tests {
             "should NOT emit a redundant bloom-guard iLike alongside the main one, got:\n{}",
             sql
         );
+    }
+
+    /// NAN-1395: the field-stats companion gate. Wide (filter-only / row-shape
+    /// preserving) pipelines keep the companion; transformative pipelines whose
+    /// output projection replaces the base columns — `Columns(...)` from
+    /// stats/chart/table/fields, or `Unknown` from funnel/sequence/transaction
+    /// and any unmodeled command — must report non-wide so the companion is
+    /// skipped instead of firing a guaranteed-Code-47 query.
+    #[test]
+    fn pipeline_output_is_wide_gates_field_stats_companion() {
+        let generator = ClickHouseSqlGenerator::new();
+        let wide = [
+            "error",
+            "status=500 | head 5",
+            "* | where status=500 | sort -timestamp",
+            "* | eval hash = md5(message) | head 10",
+            "* | dedup src_ip | eval x = 1 | rename x as y",
+        ];
+        for q in wide {
+            let query = parse_query(q).unwrap();
+            assert!(
+                generator.pipeline_output_is_wide(&query),
+                "expected wide output (companion runs) for: {q}"
+            );
+        }
+
+        let non_wide = [
+            // Columns(...) — explicit reprojection.
+            "* | stats count by src_ip",
+            "* | chart count() by src_ip",
+            "* | head 10 | table timestamp, src_ip, user",
+            "* | fields src_ip, user",
+            // Unknown — transformative commands not statically modeled.
+            "* | transaction user",
+            "* | sequence by src_ip maxspan=300s [status=403] [status=200]",
+            // Columns appears mid-pipeline: downstream filters keep the
+            // transformed (non-base) projection.
+            "* | stats count by src_ip | where count > 10",
+        ];
+        for q in non_wide {
+            let query = parse_query(q).unwrap();
+            assert!(
+                !generator.pipeline_output_is_wide(&query),
+                "expected non-wide output (companion skipped) for: {q}"
+            );
+        }
     }
 }

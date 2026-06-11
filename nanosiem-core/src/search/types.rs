@@ -738,24 +738,6 @@ impl Default for UdmQueryOperator {
     }
 }
 
-/// Statistics for a UDM field
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct UdmFieldStats {
-    /// The UDM field
-    #[schema(value_type = String)]
-    pub field: UdmField,
-    /// Database column name
-    pub column_name: String,
-    /// Field category
-    pub category: String,
-    /// Data type
-    pub data_type: String,
-    /// Count of non-null values
-    pub non_null_count: u64,
-    /// Count of distinct values
-    pub distinct_count: u64,
-}
-
 impl UdmFieldCategory {
     /// Convert to string representation
     pub fn to_string(&self) -> String {

@@ -14,7 +14,7 @@ use thiserror::Error;
 use tracing::instrument;
 use uuid::Uuid;
 
-use super::parser::{FileParser, ParseError, ParseResult, ParserConfig};
+use super::parser::{FileParser, ParseError, ParseResult, ParserConfig, RecordError};
 use super::repository::{UploadRepository, UploadRepositoryError};
 use super::types::*;
 
@@ -32,6 +32,17 @@ pub const DEFAULT_PREVIEW_ROWS: usize = 10;
 pub const MAX_PREVIEW_CELL_BYTES: usize = 1024;
 
 const PREVIEW_TRUNCATION_SUFFIX: &str = "…[truncated]";
+
+/// Maximum number of per-line parse errors echoed back in a preview. A file
+/// where every line is malformed would otherwise reflect one error per line
+/// straight back into the response (NAN-1364).
+pub const MAX_PREVIEW_ERRORS: usize = 50;
+
+/// Upper bound on preview rows, regardless of the caller-supplied `limit`. A
+/// preview is a sample to confirm parsing — there's no reason to return more
+/// than this many rows, and clamping keeps a large `limit` from reflecting the
+/// whole (size-capped) file back into the response (NAN-1392).
+pub const MAX_PREVIEW_ROWS: usize = 100;
 
 #[derive(Error, Debug)]
 pub enum UploadError {
@@ -147,58 +158,37 @@ impl UploadService {
             .await
             .map_err(|e| UploadError::IngestionError(e.to_string()))?;
 
-        let lookup_repo_inner = LookupRepository::new(self.pool.clone());
-
         let records_ingested = match mode {
             super::types::LookupMode::Replace => {
+                // Upload service runs in system context (scheduled ingestion
+                // jobs etc.) — no user identity available, so auto-created
+                // tables have no recorded owner.
+                let new_table = NewLookupTable {
+                    name: table_name.clone(),
+                    description: None,
+                    columns,
+                    primary_key: primary_key.clone(),
+                };
+                let record_count = records.len();
                 if table_exists {
-                    // Get current table info to find the dynamic table name
-                    let existing = lookup_repo_inner
-                        .get_table(table_name)
+                    // NAN-1362: atomic staging + swap. A malformed remote payload
+                    // (these run unattended) no longer wipes the existing table —
+                    // the live table is only swapped after the new data is loaded.
+                    lookup_service
+                        .replace_table(new_table, records)
                         .await
                         .map_err(|e| UploadError::IngestionError(e.to_string()))?;
-
-                    // Drop the dynamic PG table (NOT the registry — avoids FK cascade)
-                    lookup_repo_inner
-                        .drop_dynamic_table(&existing.table_name)
-                        .await
-                        .map_err(|e| UploadError::IngestionError(e.to_string()))?;
-
-                    // Recreate the dynamic table with new schema
-                    lookup_repo_inner
-                        .create_dynamic_table(
-                            &existing.table_name,
-                            &columns,
-                            primary_key.as_deref(),
-                        )
-                        .await
-                        .map_err(|e| UploadError::IngestionError(e.to_string()))?;
-
-                    // Update registry columns to match new schema
-                    lookup_repo_inner
-                        .update_table_columns(table_name, &columns, primary_key.as_deref())
-                        .await
-                        .map_err(|e| UploadError::IngestionError(e.to_string()))?;
+                    record_count
                 } else {
-                    let new_table = NewLookupTable {
-                        name: table_name.clone(),
-                        description: None,
-                        columns,
-                        primary_key: primary_key.clone(),
-                    };
-                    // Upload service runs in system context (scheduled
-                    // ingestion jobs etc.) — no user identity available, so
-                    // tables auto-created on ingest have no recorded owner.
                     lookup_service
                         .create_table(new_table, None)
                         .await
                         .map_err(|e| UploadError::IngestionError(e.to_string()))?;
+                    lookup_service
+                        .insert_records(table_name, records)
+                        .await
+                        .map_err(|e| UploadError::IngestionError(e.to_string()))?
                 }
-
-                lookup_service
-                    .insert_records(table_name, records)
-                    .await
-                    .map_err(|e| UploadError::IngestionError(e.to_string()))?
             }
             super::types::LookupMode::Append => {
                 if !table_exists {
@@ -274,7 +264,9 @@ impl UploadService {
             });
         }
 
-        let limit = limit.unwrap_or(DEFAULT_PREVIEW_ROWS);
+        // Clamp the caller-supplied limit to a server-side maximum so a large
+        // `limit` can't reflect the whole file back into the response (NAN-1392).
+        let limit = limit.unwrap_or(DEFAULT_PREVIEW_ROWS).min(MAX_PREVIEW_ROWS);
 
         // Parse first N rows
         let parse_result = self.parser.preview(content, config, limit)?;
@@ -303,12 +295,47 @@ impl UploadService {
             0
         };
 
+        // Surface lines the parser skipped (skip_invalid is on by default) so
+        // a partial preview can't masquerade as a clean one (NAN-1364).
+        let (rejected_count, errors) = Self::collect_preview_errors(&parse_result);
+
         Ok(PreviewResult {
             format: config.format,
             columns,
             rows,
             total_rows_estimate,
+            rejected_count,
+            errors,
         })
+    }
+
+    /// Pull the rejected-line count and a capped sample of per-line errors out
+    /// of a parse result for the preview response. The sample is capped at
+    /// `MAX_PREVIEW_ERRORS` lines, and each line's echoed `raw` content is
+    /// truncated to `MAX_PREVIEW_CELL_BYTES` — together these keep a
+    /// fully-malformed (or single-giant-line) file from reflecting itself back
+    /// amplified, the same guard preview cells already apply (NAN-660/NAN-1364).
+    fn collect_preview_errors(parse_result: &ParseResult) -> (usize, Vec<RecordError>) {
+        let errors = parse_result
+            .errors
+            .iter()
+            .take(MAX_PREVIEW_ERRORS)
+            .map(|e| {
+                let raw = e.raw.as_ref().map(|r| {
+                    if r.len() > MAX_PREVIEW_CELL_BYTES {
+                        Self::truncate_str_for_preview(r)
+                    } else {
+                        r.clone()
+                    }
+                });
+                RecordError {
+                    line_number: e.line_number,
+                    error_message: e.error_message.clone(),
+                    raw,
+                }
+            })
+            .collect();
+        (parse_result.failed, errors)
     }
 
     /// Detect column information from parsed records
@@ -619,5 +646,120 @@ mod tests {
             }
             other => panic!("expected oversized object to collapse to string, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_collect_preview_errors_reports_rejected_lines() {
+        // Mirror the parser's output for a 2-line NDJSON file where line 2 is
+        // malformed: one record kept, one error recorded (NAN-1364).
+        let mut parse_result = ParseResult::new();
+        parse_result.total_lines = 2;
+        parse_result.successful = 1;
+        parse_result.add_error(RecordError::with_content(
+            2,
+            "Invalid JSON: trailing comma",
+            "{bad,}",
+        ));
+
+        let (rejected_count, errors) = UploadService::collect_preview_errors(&parse_result);
+        assert_eq!(rejected_count, 1);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].line_number, 2);
+    }
+
+    #[test]
+    fn test_collect_preview_errors_clean_file_has_none() {
+        let mut parse_result = ParseResult::new();
+        parse_result.total_lines = 2;
+        parse_result.successful = 2;
+
+        let (rejected_count, errors) = UploadService::collect_preview_errors(&parse_result);
+        assert_eq!(rejected_count, 0);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_collect_preview_errors_caps_sample_but_not_count() {
+        // A fully-malformed file must not reflect one error per line back to
+        // the caller: the sample is capped, the count is not.
+        let mut parse_result = ParseResult::new();
+        parse_result.total_lines = MAX_PREVIEW_ERRORS * 4;
+        for line in 0..MAX_PREVIEW_ERRORS * 4 {
+            parse_result.add_error(RecordError::new(line + 1, "Invalid JSON"));
+        }
+
+        let (rejected_count, errors) = UploadService::collect_preview_errors(&parse_result);
+        assert_eq!(rejected_count, MAX_PREVIEW_ERRORS * 4);
+        assert_eq!(errors.len(), MAX_PREVIEW_ERRORS);
+    }
+
+    // A lazily-connected pool: `preview` never queries the database (size
+    // guard -> clamp -> parser -> column detection -> truncation), so these
+    // tests exercise the real method without a live Postgres.
+    fn preview_service() -> UploadService {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .expect("lazy pool");
+        UploadService::new(pool)
+    }
+
+    fn csv_with_rows(n: usize) -> Vec<u8> {
+        let mut s = String::from("id,value\n");
+        for i in 0..n {
+            s.push_str(&format!("{i},v{i}\n"));
+        }
+        s.into_bytes()
+    }
+
+    #[tokio::test]
+    async fn preview_clamps_limit_above_maximum() {
+        let svc = preview_service();
+        let content = csv_with_rows(MAX_PREVIEW_ROWS * 3);
+        let result = svc
+            .preview(&content, &ParserConfig::default(), Some(MAX_PREVIEW_ROWS * 3))
+            .await
+            .expect("preview");
+        assert_eq!(
+            result.rows.len(),
+            MAX_PREVIEW_ROWS,
+            "an oversized limit must be clamped to MAX_PREVIEW_ROWS"
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_default_limit_unchanged() {
+        let svc = preview_service();
+        let content = csv_with_rows(MAX_PREVIEW_ROWS * 3);
+        let result = svc
+            .preview(&content, &ParserConfig::default(), None)
+            .await
+            .expect("preview");
+        assert_eq!(result.rows.len(), DEFAULT_PREVIEW_ROWS);
+    }
+
+    #[tokio::test]
+    async fn preview_small_limit_unchanged() {
+        let svc = preview_service();
+        let content = csv_with_rows(MAX_PREVIEW_ROWS * 3);
+        let result = svc
+            .preview(&content, &ParserConfig::default(), Some(7))
+            .await
+            .expect("preview");
+        assert_eq!(result.rows.len(), 7);
+    }
+
+    #[test]
+    fn test_collect_preview_errors_truncates_oversized_raw_line() {
+        // A single giant malformed line must not reflect itself back amplified
+        // — same response-amplification guard preview cells apply (NAN-660).
+        let mut parse_result = ParseResult::new();
+        parse_result.total_lines = 1;
+        let huge = "x".repeat(MAX_PREVIEW_CELL_BYTES * 4);
+        parse_result.add_error(RecordError::with_content(1, "Invalid JSON", &huge));
+
+        let (_, errors) = UploadService::collect_preview_errors(&parse_result);
+        let raw = errors[0].raw.as_ref().expect("raw content preserved");
+        assert!(raw.ends_with(PREVIEW_TRUNCATION_SUFFIX));
+        assert!(raw.len() <= MAX_PREVIEW_CELL_BYTES + PREVIEW_TRUNCATION_SUFFIX.len());
     }
 }

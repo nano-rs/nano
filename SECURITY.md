@@ -45,6 +45,53 @@ Out of scope here (report through the same channel — we'll route them):
   exploitation path. (We still want to know — we'll just defer to the
   upstream's process.)
 
+## Deployment & network exposure
+
+nano ships more than one compose file, and they have very different exposure
+profiles. Pick the right one:
+
+- **`docker-compose.opensource.yml`** — the supported deployment, what
+  `install.sh` (`curl … | bash` from get.nano.rs) brings up. It publishes only
+  the **nginx entrypoint** (`:80`, add TLS with `docker-compose.tls.yml`) and the
+  **Vector ingest ports**. Postgres, ClickHouse, Dragonfly, and the api / search /
+  jobs services have **no published host ports** — they are reachable only on the
+  internal Docker network. There is no Prometheus, Grafana, or exporter in this
+  file. A default install does **not** expose a database or monitoring/control
+  plane to the host.
+
+- **`docker-compose.yml`** — **local development only.** It binds internal
+  services (Postgres, ClickHouse HTTP/native, Prometheus with
+  `--web.enable-admin-api`, Grafana with default credentials, the exporters) to
+  `0.0.0.0`. **Do not run it on a public host** — on a machine with a public IP
+  those services are reachable, unauthenticated, from the internet. This is by
+  design for loopback development; it is not a supported production posture.
+
+### Ingest ports and authentication
+
+In the open-core stack, Vector's `8080` (HTTP) and `8088` (Splunk HEC) require
+`VECTOR_AUTH_TOKEN` — a blank token **fails closed** (`config/vector/00-base.toml`),
+so misconfiguration doesn't silently accept anonymous ingest.
+
+The Vector native port `6000` does **not** verify a token — it trusts the upstream
+forwarder. Treat it as an unauthenticated, **ingest-only** path (a caller can push
+logs; it cannot read stored data or control the system) and **firewall it to your
+trusted aggregators**.
+
+`docker-compose.opensource.yml` also publishes `4317`/`4318` (OpenTelemetry) and
+`24224` (Fluent Forward), but the shipped config defines **no source on those
+ports** — nothing listens there until you add one. If you do enable an OTel or
+Fluent source, it won't carry built-in auth either, so firewall it the same way.
+
+### Recommended firewall posture for a public deployment
+
+- Allow `:80`/`:443` (the nginx UI/API entrypoint) from your users.
+- Allow only the **ingest ports you use**, and only from your log sources' CIDRs.
+- Keep everything else off the public interface.
+- Put TLS in front (`docker-compose.tls.yml`) and set `BASE_URL` to your HTTPS URL.
+
+See `docs/getting-started/docker-deployment.md` → "Network exposure & firewall"
+for concrete rules.
+
 ## Disclosure timeline
 
 We commit to:

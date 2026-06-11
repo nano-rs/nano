@@ -17,9 +17,9 @@ use utoipa::ToSchema;
 use nanosiem_core::auth::permissions;
 use nanosiem_core::upload::{LookupMode, ParserConfig, UploadDestination};
 use nanosiem_core::{
-    calculate_next_runs, describe_cron, validate_cron, JobExecution, LookupRepository,
-    LookupService, NewScheduledJob, ScheduledJob, SchedulerError, SchedulerService, SsrfConfig,
-    SsrfError, SsrfValidator, UpdateScheduledJob,
+    calculate_next_runs, describe_cron, merge_auth_headers, redact_auth_headers, validate_cron,
+    JobExecution, LookupRepository, LookupService, NewScheduledJob, ScheduledJob, SchedulerError,
+    SchedulerService, SsrfConfig, SsrfError, SsrfValidator, UpdateScheduledJob,
 };
 
 use crate::middleware::{check_permission, AuthContext};
@@ -98,10 +98,16 @@ pub async fn get_lookup_ingestion(
 
     let scheduler_service = SchedulerService::new(state.pool.clone());
 
-    let job = scheduler_service
+    let mut job = scheduler_service
         .get_job_for_lookup_table(&name)
         .await
         .map_err(scheduler_error_to_api)?;
+
+    // NAN-1358: never return auth-header secrets in cleartext (this endpoint is
+    // readable with only lookup:view).
+    if let Some(job) = job.as_mut() {
+        redact_auth_headers(&mut job.auth_headers);
+    }
 
     Ok(Json(job))
 }
@@ -157,12 +163,20 @@ pub async fn upsert_lookup_ingestion(
         .await
         .map_err(scheduler_error_to_api)?;
 
-    let job = if let Some(existing_job) = existing {
+    // NAN-1358: resolve auth headers so a read-modify-write round-trip can't wipe
+    // stored secrets. Omitted headers are preserved; the redacted placeholder
+    // echoed back keeps the stored value; only real values overwrite.
+    let merged_auth = merge_auth_headers(
+        request.auth_headers,
+        existing.as_ref().and_then(|j| j.auth_headers.as_ref()),
+    );
+
+    let mut job = if let Some(existing_job) = existing {
         // Update existing job
         let update = UpdateScheduledJob {
             url: Some(request.url),
             cron_expression: Some(request.cron_expression),
-            auth_headers: Some(request.auth_headers),
+            auth_headers: merged_auth,
             destination: Some(destination),
             parser_config: Some(request.parser_config),
             retry_policy: request.retry_policy,
@@ -181,7 +195,7 @@ pub async fn upsert_lookup_ingestion(
             description: Some(format!("Automated ingestion for lookup table {}", name)),
             cron_expression: request.cron_expression,
             url: request.url,
-            auth_headers: request.auth_headers,
+            auth_headers: merged_auth.flatten(),
             destination,
             parser_config: request.parser_config,
             retry_policy: request.retry_policy.unwrap_or_default(),
@@ -195,6 +209,8 @@ pub async fn upsert_lookup_ingestion(
     };
 
     info!(lookup_table = %name, job_id = %job.id, "Lookup ingestion upserted");
+    // NAN-1358: don't echo the stored secrets back in the response.
+    redact_auth_headers(&mut job.auth_headers);
     Ok(Json(job))
 }
 
@@ -309,12 +325,13 @@ pub async fn enable_lookup_ingestion(
             ApiError::NotFound(format!("No ingestion config for lookup table: {}", name))
         })?;
 
-    let job = scheduler_service
+    let mut job = scheduler_service
         .enable_job(existing.id)
         .await
         .map_err(scheduler_error_to_api)?;
 
     info!(lookup_table = %name, "Lookup ingestion enabled");
+    redact_auth_headers(&mut job.auth_headers);
     Ok(Json(job))
 }
 
@@ -353,12 +370,13 @@ pub async fn disable_lookup_ingestion(
             ApiError::NotFound(format!("No ingestion config for lookup table: {}", name))
         })?;
 
-    let job = scheduler_service
+    let mut job = scheduler_service
         .disable_job(existing.id)
         .await
         .map_err(scheduler_error_to_api)?;
 
     info!(lookup_table = %name, "Lookup ingestion disabled");
+    redact_auth_headers(&mut job.auth_headers);
     Ok(Json(job))
 }
 

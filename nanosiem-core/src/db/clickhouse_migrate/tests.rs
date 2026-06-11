@@ -699,6 +699,42 @@ mod tests {
         assert!(result.contains("PORT 9000"), "port: {}", result);
     }
 
+    /// NAN-1384: the `nano:skip-if-unknown-table` marker lets a migration
+    /// statement targeting a profile-gated table (nanosiem.ocsf_logs exists
+    /// only on OCSF-profile deployments; ClickHouse has no `ALTER TABLE IF
+    /// EXISTS`) tolerate exactly an UNKNOWN_TABLE failure. The marker must be
+    /// a `/* */` block comment so it survives `strip_sql_line_comments`, and
+    /// the error matcher must not treat unrelated failures as skippable.
+    #[test]
+    fn skip_if_unknown_table_marker_detected_and_survives_comment_strip() {
+        let stmt = "ALTER TABLE nanosiem.ocsf_logs /* nano:skip-if-unknown-table */ \
+                    MODIFY TTL timestamp + toIntervalDay(365)";
+        assert!(ClickHouseMigrator::has_skip_if_unknown_table_marker(stmt));
+        // Block-comment marker survives the line-comment strip that runs
+        // before statement splitting in apply_migration.
+        let stripped = ClickHouseMigrator::strip_sql_line_comments(stmt);
+        assert!(ClickHouseMigrator::has_skip_if_unknown_table_marker(&stripped));
+        // Unmarked statements are never skip-eligible.
+        assert!(!ClickHouseMigrator::has_skip_if_unknown_table_marker(
+            "ALTER TABLE nanosiem.ocsf_logs MODIFY TTL timestamp + toIntervalDay(365)"
+        ));
+    }
+
+    #[test]
+    fn unknown_table_error_matcher_is_precise() {
+        // Real CH 26.4 shape for an ALTER on a missing table.
+        assert!(ClickHouseMigrator::is_unknown_table_error(
+            "Code: 60. DB::Exception: Table nanosiem.ocsf_logs does not exist. (UNKNOWN_TABLE)"
+        ));
+        // A marked statement failing for any OTHER reason must still abort.
+        assert!(!ClickHouseMigrator::is_unknown_table_error(
+            "Code: 62. DB::Exception: Syntax error: failed at position 16"
+        ));
+        assert!(!ClickHouseMigrator::is_unknown_table_error(
+            "Code: 497. DB::Exception: Not enough privileges. (ACCESS_DENIED)"
+        ));
+    }
+
     /// NAN-788: strip_sql_line_comments must remove `--` line comments, but
     /// the order in runner.rs is what matters most — comments are stripped
     /// before credentials are substituted, so a password containing `--`

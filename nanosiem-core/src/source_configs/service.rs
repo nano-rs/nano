@@ -356,18 +356,9 @@ impl SourceConfigService {
     /// parsed as TOML structure, which the structured-emission defense
     /// can't catch.
     fn validate_name(name: &str) -> Result<(), SourceConfigServiceError> {
-        if name.is_empty() {
-            return Err(SourceConfigServiceError::InvalidConfig(
-                "name must not be empty".to_string(),
-            ));
-        }
-        if let Some(c) = name.chars().find(|c| Self::is_unsafe_scalar_char(*c)) {
-            return Err(SourceConfigServiceError::InvalidConfig(format!(
-                "name contains disallowed control character (U+{code:04X})",
-                code = c as u32,
-            )));
-        }
-        Ok(())
+        // Shared with the legacy log-source path (NAN-1371).
+        crate::config_safety::validate_config_name(name)
+            .map_err(SourceConfigServiceError::InvalidConfig)
     }
 
     /// Per-driver validation of the `connection_config` JSON payload.
@@ -537,55 +528,15 @@ impl SourceConfigService {
         v: &serde_json::Value,
         path: &str,
     ) -> Result<(), SourceConfigServiceError> {
-        Self::validate_safe_strings_inner(v, path, 0)
-    }
-
-    fn validate_safe_strings_inner(
-        v: &serde_json::Value,
-        path: &str,
-        depth: usize,
-    ) -> Result<(), SourceConfigServiceError> {
-        if depth > Self::VALIDATE_SAFE_STRINGS_MAX_DEPTH {
-            return Err(SourceConfigServiceError::InvalidConfig(format!(
-                "{path} exceeds maximum nesting depth of {} — refusing to validate \
-                 deeply-nested connection_config",
-                Self::VALIDATE_SAFE_STRINGS_MAX_DEPTH
-            )));
-        }
-        match v {
-            serde_json::Value::String(s) => {
-                if let Some(c) = s.chars().find(|c| Self::is_unsafe_scalar_char(*c)) {
-                    return Err(SourceConfigServiceError::InvalidConfig(format!(
-                        "{path} contains disallowed control character (U+{code:04X})",
-                        code = c as u32,
-                    )));
-                }
-            }
-            serde_json::Value::Array(arr) => {
-                for (i, item) in arr.iter().enumerate() {
-                    Self::validate_safe_strings_inner(item, &format!("{path}[{i}]"), depth + 1)?;
-                }
-            }
-            serde_json::Value::Object(map) => {
-                for (k, val) in map {
-                    // Reject control chars in keys too — they'd produce
-                    // malformed TOML headers if interpolated unquoted.
-                    if k.chars().any(Self::is_unsafe_scalar_char) {
-                        return Err(SourceConfigServiceError::InvalidConfig(format!(
-                            "{path} contains disallowed control character in key '{k}'"
-                        )));
-                    }
-                    Self::validate_safe_strings_inner(val, &format!("{path}.{k}"), depth + 1)?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
+        // Delegates to the shared char-safety validator (NAN-1371) so this path
+        // and the legacy LogSourceService source_config path can't drift. No
+        // exempt keys: connection_config carries no file-written multi-line blobs.
+        crate::config_safety::validate_safe_config_strings(v, path, &[])
+            .map_err(SourceConfigServiceError::InvalidConfig)
     }
 
     fn is_unsafe_scalar_char(c: char) -> bool {
-        // Newlines, CR, NUL, all other C0 controls; DEL. Tab is allowed.
-        matches!(c, '\n' | '\r' | '\0' | '\x7f') || (c.is_control() && c != '\t')
+        crate::config_safety::is_unsafe_scalar_char(c)
     }
 
     /// Delete a source configuration

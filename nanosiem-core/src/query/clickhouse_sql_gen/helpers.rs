@@ -152,6 +152,18 @@ pub(crate) fn normalize_field_name(field: &str) -> &str {
 /// Returns (sql_expression, needs_alias) where needs_alias indicates if the field
 /// should be aliased to its original name for clean output
 pub(crate) fn field_to_sql_expr(field: &str, gen: &ClickHouseSqlGenerator) -> (String, bool) {
+    // A field an UPSTREAM pipeline stage created with a new value (rex capture,
+    // eval assignment, rename target, …) shadows any same-named schema field or
+    // UDM alias for the rest of the pipeline — checked on the PRE-normalization
+    // name, BEFORE alias normalization and schema resolution. Otherwise
+    // `rex "(?P<method>…)" | stats count by method` normalizes `method` →
+    // `http_method`, resolves it to the schema column, and silently discards
+    // the capture (NAN-1341). Plain `stats by method` (no upstream compute) is
+    // untouched: stats by-field passthroughs are deliberately NOT in this set.
+    if gen.is_upstream_computed_field(field) {
+        return (escape_identifier(field), false);
+    }
+
     // Normalize field name (apply aliases)
     let field = normalize_field_name(field);
 
@@ -254,6 +266,12 @@ pub(crate) fn field_to_sql_expr(field: &str, gen: &ClickHouseSqlGenerator) -> (S
 ///
 /// [`field_access_expr`]: ClickHouseSqlGenerator::field_access_expr
 pub(crate) fn by_field_sql(field: &str, gen: &ClickHouseSqlGenerator) -> String {
+    // Upstream value-computed fields shadow schema fields / UDM aliases —
+    // checked on the PRE-normalization name, before alias normalization and
+    // schema resolution, mirroring `field_to_sql_expr` (NAN-1341).
+    if gen.is_upstream_computed_field(field) {
+        return escape_identifier(field);
+    }
     let field = normalize_field_name(field);
     if gen.resolves_to_column(field) {
         // NAN-1319: class-split UDM concepts (OCSF host/user/process/url) PARTITION
@@ -276,6 +294,20 @@ pub(crate) fn by_field_sql(field: &str, gen: &ClickHouseSqlGenerator) -> String 
         gen.field_access_expr(field, "String")
     } else {
         escape_identifier(field)
+    }
+}
+
+/// The OUTPUT alias for a by-field / projected field: an upstream
+/// value-computed field keeps its PRE-normalization name — it shadows the
+/// schema alias, and the bare raw name is exactly what `field_to_sql_expr` /
+/// `by_field_sql` emit for it, so the alias must follow or downstream stages
+/// reference a column that no longer exists (NAN-1341). Everything else keeps
+/// the canonical `normalize_field_name` alias exactly as before.
+pub(crate) fn by_field_output_name<'a>(field: &'a str, gen: &ClickHouseSqlGenerator) -> &'a str {
+    if gen.is_upstream_computed_field(field) {
+        field
+    } else {
+        normalize_field_name(field)
     }
 }
 
@@ -456,6 +488,38 @@ pub(crate) fn is_text_column(field: &str, profile: &dyn crate::schema::SchemaPro
         profile.resolve(field),
         crate::schema::FieldResolution::ExplicitColumn(_)
     ) && !profile.is_numeric_field(field)
+}
+
+/// Translate a string literal against a field whose resolved physical column is
+/// an enum-encoded INT with a fixed label table (NAN-1382 / parity gap G6) into
+/// the integer SQL literal to compare with:
+/// - a known label (case-insensitive) → its enum id (`"failure"` → `2`)
+/// - a numeric string → passed through as the id (UI drilldowns send the int as
+///   a string: `status_id="2"` → `2`)
+/// - anything else → a LOUD validation error listing the valid labels — never a
+///   silent zero-match (`lower(toString(<int col>)) = 'verb'` matched nothing).
+pub(crate) fn enum_values_literal_sql(
+    field: &str,
+    labels: &std::collections::HashMap<String, i64>,
+    s: &str,
+) -> Result<String, crate::query::sql_gen::SqlGenError> {
+    let lower = s.to_lowercase();
+    if let Some(id) = labels.get(lower.as_str()) {
+        return Ok(id.to_string());
+    }
+    // Emit the PARSED value (not the raw string) so oddly-spelled-but-parseable
+    // inputs ("+2", "007") become canonical integer literals.
+    if let Ok(id) = lower.parse::<i64>() {
+        return Ok(id.to_string());
+    }
+    let mut known: Vec<&str> = labels.keys().map(|k| k.as_str()).collect();
+    known.sort_unstable();
+    Err(crate::query::sql_gen::SqlGenError::InvalidQuery(format!(
+        "'{}' is not a valid value for '{}' — expected one of: {} (or the integer enum id)",
+        s,
+        field,
+        known.join(", ")
+    )))
 }
 
 /// Escape a string for SQL (single quotes)

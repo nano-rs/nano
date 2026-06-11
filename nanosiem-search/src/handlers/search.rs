@@ -300,6 +300,13 @@ pub async fn explain(
         tracing::error!(error = %e, "Query explain failed");
         // Surface user-actionable generation guardrails (see the SqlGenError
         // mapping in error.rs); mask internal failures.
+        // FieldNotFound is the input-side field-validation rejection (NAN-1354)
+        // — /api/search surfaces it verbatim via the From impl in error.rs, so
+        // explain must match instead of masking it as "Query processing failed"
+        // (NAN-1396). Only the user's own field names are echoed.
+        if matches!(e, nanosiem_core::SearchError::FieldNotFound { .. }) {
+            return e.into();
+        }
         if let nanosiem_core::SearchError::SqlGenError(ref msg) = e {
             if msg.starts_with("Invalid query:")
                 || msg.starts_with("Unsupported operation:")

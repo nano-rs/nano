@@ -315,4 +315,10 @@ if source_type == "unknown" {
 
 .source_type = source_type
 .routing_timestamp = now()
+
+# OCSF lane (NAN-1241): stash the operational routing key into Vector EVENT
+# METADATA so it survives the OCSF parsers' `. = {OCSF object}` root-replacement
+# (which wipes `.source_type`). `%` metadata persists across `.` replacement on
+# Vector 0.54. `ocsf_prepare` reads `%source_type` back onto the ocsf_logs row.
+%source_type = downcase(source_type)
 '''

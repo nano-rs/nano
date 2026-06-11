@@ -36,7 +36,8 @@ import { LatencyPill } from '@/components/matches/LatencyPill';
 
 interface AlertHeroAlert {
   id: string;
-  ruleId: string;
+  // NAN-1356: undefined when the source detection rule was deleted.
+  ruleId?: string;
   ruleName: string;
   severity: string;
   status: 'open' | 'acknowledged' | 'closed';
@@ -217,7 +218,8 @@ export function AlertHero({
             </span>
             <span className="text-muted-foreground/60">·</span>
             <span>
-              rule: <span className="text-foreground">{alert.ruleId}</span>
+              rule:{' '}
+              <span className="text-foreground">{alert.ruleId ?? '(deleted)'}</span>
             </span>
             {rule?.author && (
               <>
@@ -438,15 +440,17 @@ export function AlertHero({
                     {linkedNotebookCount}
                   </span>
                 </div>
-                <div className="flex items-center justify-between gap-2 pt-1">
-                  <Link
-                    to={`/rules/${alert.ruleId}`}
-                    className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1"
-                  >
-                    Open rule
-                    <ExternalLink className="w-3 h-3" strokeWidth={2} />
-                  </Link>
-                </div>
+                {alert.ruleId && (
+                  <div className="flex items-center justify-between gap-2 pt-1">
+                    <Link
+                      to={`/rules/${alert.ruleId}`}
+                      className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1"
+                    >
+                      Open rule
+                      <ExternalLink className="w-3 h-3" strokeWidth={2} />
+                    </Link>
+                  </div>
+                )}
               </div>
             ) : (
               <div className="mt-2 text-[10.5px] text-muted-foreground/70 font-mono">

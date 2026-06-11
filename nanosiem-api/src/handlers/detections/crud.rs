@@ -184,6 +184,18 @@ pub async fn create_detection(
     check_permission(&auth, permissions::DETECTIONS_CREATE)
         .map_err(|_| ApiError::Forbidden("Missing permission: detections:create".to_string()))?;
 
+    // Production-activation fields require detections:promote, matching the gate
+    // on update/lifecycle/bulk-update. Without it, a create-only key could mint
+    // rules directly in alerting/paused/live mode, bypassing the
+    // Staging -> Live -> Alerting promotion boundary (NAN-1375).
+    if requires_promote_for_create(&request)
+        && !auth.has_permission(permissions::DETECTIONS_PROMOTE)
+    {
+        return Err(ApiError::Forbidden(
+            "Missing permission: detections:promote".to_string(),
+        ));
+    }
+
     // Tier enforcement: check detection rule limit
     let tier_settings = nanosiem_core::TierSettings::new(state.pool.clone());
     let tier_limits = tier_settings.get_tier_limits().await?;
@@ -221,6 +233,11 @@ pub async fn create_detection(
 
     // Validate field constraints (case_visibility, lookback_minutes, folder)
     if let Err(e) = request.validate_fields() {
+        return Err(ApiError::ValidationError(e.to_string()));
+    }
+
+    // Validate auto-tuning fields (confidence bounds)
+    if let Err(e) = request.validate_auto_tuning_fields() {
         return Err(ApiError::ValidationError(e.to_string()));
     }
 
@@ -364,6 +381,11 @@ pub async fn update_detection(
 
     // Validate field constraints (case_visibility, lookback_minutes, folder)
     if let Err(e) = request.validate_fields() {
+        return Err(ApiError::ValidationError(e.to_string()));
+    }
+
+    // Validate auto-tuning fields (confidence bounds)
+    if let Err(e) = request.validate_auto_tuning_fields() {
         return Err(ApiError::ValidationError(e.to_string()));
     }
 
@@ -579,6 +601,35 @@ fn severity_rank(s: Severity) -> u8 {
         Severity::Low => 1,
         Severity::Informational => 0,
     }
+}
+
+/// Returns true when a create request asks for anything beyond an inert
+/// staging rule, which should be gated on `detections:promote` rather than
+/// `detections:create` (NAN-1375). Mirrors `requires_promote_for_update`:
+/// the promotion boundary is meaningless if it can be skipped at creation.
+///
+/// Authoring fields (schedule, severity, lookback, auto-tuning) are NOT gated
+/// here — a staging rule never executes, and promoting it later still requires
+/// `detections:promote`, at which point those fields are under review. On
+/// update they stay gated because there they can weaken an already-live rule.
+pub(super) fn requires_promote_for_create(req: &NewDetectionRule) -> bool {
+    use nanosiem_core::models::detection_rule::DetectionMode;
+
+    // Creating directly in live/alerting/paused skips the promotion boundary.
+    if let Some(mode) = req.mode {
+        if mode != RuleMode::Staging {
+            return true;
+        }
+    }
+    // Production activation: takes effect the moment the rule is promoted.
+    if req.realtime_enabled == Some(true) {
+        return true;
+    }
+    // Real-time mode provisions a ClickHouse materialized view at create time.
+    if req.detection_mode == Some(DetectionMode::RealTime) {
+        return true;
+    }
+    false
 }
 
 /// Returns true when the request mutates a field that should be gated on
@@ -832,5 +883,114 @@ mod tests {
             ..Default::default()
         };
         assert!(requires_promote_for_update(&old, &req));
+    }
+
+    fn baseline_new_rule() -> NewDetectionRule {
+        NewDetectionRule {
+            name: "test".into(),
+            description: None,
+            query: "*".into(),
+            severity: Severity::High,
+            mitre_tactics: None,
+            mitre_techniques: None,
+            schedule_cron: Some("*/1 * * * *".into()),
+            mode: None,
+            narrative: None,
+            reference_url: None,
+            author: None,
+            tags: None,
+            ai_generated: None,
+            realtime_enabled: None,
+            detection_mode: None,
+            risk_score: None,
+            risk_entity_field: None,
+            risk_modifiers: None,
+            lookback_minutes: Some(60),
+            auto_tuning_enabled: None,
+            auto_tuning_min_confidence: None,
+            auto_tuning_critical: None,
+            ai_triage_hints: None,
+            folder: None,
+            case_visibility: None,
+            case_group_ids: None,
+            case_assigned_group: None,
+            alert_mode: None,
+            playbook_selector_mode: None,
+            playbook_id: None,
+        }
+    }
+
+    #[test]
+    fn create_without_mode_does_not_require_promote() {
+        assert!(!requires_promote_for_create(&baseline_new_rule()));
+    }
+
+    #[test]
+    fn create_explicit_staging_does_not_require_promote() {
+        let mut req = baseline_new_rule();
+        req.mode = Some(RuleMode::Staging);
+        assert!(!requires_promote_for_create(&req));
+    }
+
+    #[test]
+    fn create_in_alerting_requires_promote() {
+        let mut req = baseline_new_rule();
+        req.mode = Some(RuleMode::Alerting);
+        assert!(requires_promote_for_create(&req));
+    }
+
+    #[test]
+    fn create_in_paused_requires_promote() {
+        let mut req = baseline_new_rule();
+        req.mode = Some(RuleMode::Paused);
+        assert!(requires_promote_for_create(&req));
+    }
+
+    #[test]
+    fn create_in_live_requires_promote() {
+        let mut req = baseline_new_rule();
+        req.mode = Some(RuleMode::Live);
+        assert!(requires_promote_for_create(&req));
+    }
+
+    #[test]
+    fn create_with_realtime_enabled_requires_promote() {
+        let mut req = baseline_new_rule();
+        req.realtime_enabled = Some(true);
+        assert!(requires_promote_for_create(&req));
+    }
+
+    #[test]
+    fn create_with_realtime_disabled_does_not_require_promote() {
+        let mut req = baseline_new_rule();
+        req.realtime_enabled = Some(false);
+        assert!(!requires_promote_for_create(&req));
+    }
+
+    #[test]
+    fn create_with_realtime_detection_mode_requires_promote() {
+        let mut req = baseline_new_rule();
+        req.detection_mode = Some(DetectionMode::RealTime);
+        assert!(requires_promote_for_create(&req));
+    }
+
+    #[test]
+    fn create_with_scheduled_detection_mode_does_not_require_promote() {
+        let mut req = baseline_new_rule();
+        req.detection_mode = Some(DetectionMode::Scheduled);
+        assert!(!requires_promote_for_create(&req));
+    }
+
+    #[test]
+    fn create_authoring_fields_do_not_require_promote() {
+        // Schedule / severity / lookback / auto-tuning are reviewed at
+        // promotion time; a staging rule never executes.
+        let mut req = baseline_new_rule();
+        req.schedule_cron = Some("*/30 * * * * *".into());
+        req.severity = Severity::Informational;
+        req.lookback_minutes = Some(5);
+        req.auto_tuning_enabled = Some(false);
+        req.auto_tuning_critical = Some(false);
+        assert!(!requires_promote_for_create(&req));
     }
 }

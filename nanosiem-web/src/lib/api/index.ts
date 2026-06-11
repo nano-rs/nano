@@ -699,10 +699,6 @@ class ApiClient {
   }
 
   // Fields
-  async listFields(): Promise<import('./types').FieldInfo[]> {
-    return this._core.listFields();
-  }
-
   async getFieldValues(name: string, limit: number = 10): Promise<[string, number][]> {
     return this._core.getFieldValues(name, limit);
   }

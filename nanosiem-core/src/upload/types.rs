@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::parser::{FileFormat, ParserConfig};
+use super::parser::{FileFormat, ParserConfig, RecordError};
 
 /// Upload destination type
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -225,6 +225,16 @@ pub struct PreviewResult {
     pub rows: Vec<serde_json::Map<String, serde_json::Value>>,
     /// Estimated total rows in file
     pub total_rows_estimate: usize,
+    /// Number of source lines that failed to parse and were skipped. When
+    /// non-zero the preview is partial — surfacing this prevents the
+    /// "looks clean" trap during parser/upload review (NAN-1364).
+    #[serde(default)]
+    pub rejected_count: usize,
+    /// Per-line parse errors for rejected lines, capped at
+    /// `MAX_PREVIEW_ERRORS` so a fully-malformed file can't amplify the
+    /// response. Empty (and omitted) when nothing was rejected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<RecordError>,
 }
 
 /// Column information for preview

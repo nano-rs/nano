@@ -93,6 +93,12 @@ services:
       # Pass per-deployment passwords into users.d/*.xml via from_env="..." (NAN-807 bug #2).
       CLICKHOUSE_NANOSIEM_PASSWORD: ${CLICKHOUSE_PASSWORD}
       CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD}
+      # NAN-1384 (G18): INSERT-only credential for direct OCSF writers
+      # (users.d/nanosiem-users.xml `nanosiem_ingest`). install.sh generates
+      # CLICKHOUSE_INGEST_PASSWORD for new installs; pre-NAN-1384 .env files
+      # fall back to the app password so an upgrade never resolves from_env
+      # to "" (an empty-password user).
+      CLICKHOUSE_INGEST_PASSWORD: ${CLICKHOUSE_INGEST_PASSWORD:-${CLICKHOUSE_PASSWORD}}
     volumes:
       - nano-clickhouse-data:/var/lib/clickhouse
       - nano-clickhouse-logs:/var/log/clickhouse-server

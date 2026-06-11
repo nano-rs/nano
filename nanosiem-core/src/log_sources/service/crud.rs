@@ -11,6 +11,12 @@ use super::LogSourceServiceError;
 use crate::log_sources::types::{ListParams, LogSource, NewLogSource, SourceType, UpdateLogSource};
 use crate::parsers::Parser;
 
+/// Keys whose values are file-written multi-line blobs (PEM certs, GCP
+/// credential JSON) — their content is written to a file and only the generated
+/// path is interpolated into the Vector TOML, so they legitimately contain
+/// newlines and are exempt from the source_config char-safety check (NAN-1371).
+const SOURCE_CONFIG_EXEMPT_KEYS: &[&str] = &["tls_ca_cert", "credentials_json"];
+
 impl LogSourceService {
     /// List all log sources with optional filtering
     pub async fn list(
@@ -49,6 +55,22 @@ impl LogSourceService {
                 new.source_type.clone(),
             ));
         }
+
+        // The name lands in a generated TOML section/comment header — reject
+        // control chars at the boundary, not just via generator escaping (NAN-1371).
+        crate::config_safety::validate_config_name(&new.name)
+            .map_err(LogSourceServiceError::InvalidSourceConfig)?;
+
+        // Config-injection guard (NAN-1371): source_config is string-interpolated
+        // into the generated Vector TOML, so reject newlines / control chars that
+        // could close a TOML string and inject `[sinks.*]` / `[sources.*]`
+        // sections at deploy time. Mirrors SourceConfigService on the new path.
+        crate::config_safety::validate_safe_config_strings(
+            &new.source_config,
+            "source_config",
+            SOURCE_CONFIG_EXEMPT_KEYS,
+        )
+        .map_err(LogSourceServiceError::InvalidSourceConfig)?;
 
         // Create in database
         let log_source = self.repository().create(&new).await?;
@@ -110,6 +132,21 @@ impl LogSourceService {
                     )));
                 }
             }
+        }
+
+        // Config-injection guard (NAN-1371): same char-safety checks as create,
+        // applied to the fields being updated.
+        if let Some(ref name) = update.name {
+            crate::config_safety::validate_config_name(name)
+                .map_err(LogSourceServiceError::InvalidSourceConfig)?;
+        }
+        if let Some(ref source_config) = update.source_config {
+            crate::config_safety::validate_safe_config_strings(
+                source_config,
+                "source_config",
+                SOURCE_CONFIG_EXEMPT_KEYS,
+            )
+            .map_err(LogSourceServiceError::InvalidSourceConfig)?;
         }
 
         let log_source = self.repository().update(id, &update).await?;

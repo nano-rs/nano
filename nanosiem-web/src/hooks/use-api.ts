@@ -425,10 +425,6 @@ export function useGetQueryExplanation() {
 }
 
 // Field hooks
-export function useFields() {
-  return useQuery(() => api.listFields(), []);
-}
-
 export function useFieldValues(name: string, limit: number = 10) {
   return useQuery(
     () => api.getFieldValues(name, limit),

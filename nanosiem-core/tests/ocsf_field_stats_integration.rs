@@ -161,10 +161,16 @@ fn test_table_ddl(db: &str) -> String {
 
 /// Mirror of `ClickHouseExecutor::get_table_columns`'s `system.columns` filter,
 /// including the new `%.search` exclusion that drops OCSF's dotted `_search`
-/// companion columns. Returns the queryable column names for `<db>.ocsf_logs`.
-async fn field_stats_columns(client: &reqwest::Client, db: &str) -> Result<Vec<String>, String> {
+/// companion columns. Returns `(name, default_kind)` rows for `<db>.ocsf_logs`;
+/// the NAN-1397 companion-safety filter (MATERIALIZED ∧ not re-added →
+/// excluded) is applied by the caller so the raw enumeration can also be
+/// asserted against.
+async fn field_stats_column_rows(
+    client: &reqwest::Client,
+    db: &str,
+) -> Result<Vec<(String, String)>, String> {
     let sql = format!(
-        "SELECT name FROM system.columns \
+        "SELECT name, default_kind FROM system.columns \
          WHERE database = '{db}' AND table = 'ocsf_logs' \
            AND type NOT LIKE '%Array%' \
            AND type NOT LIKE '%Map%' \
@@ -181,17 +187,46 @@ async fn field_stats_columns(client: &reqwest::Client, db: &str) -> Result<Vec<S
     Ok(body
         .lines()
         .filter_map(|l| {
-            serde_json::from_str::<Value>(l)
-                .ok()
-                .and_then(|v| v.get("name")?.as_str().map(String::from))
+            let v = serde_json::from_str::<Value>(l).ok()?;
+            let name = v.get("name")?.as_str()?.to_string();
+            let kind = v
+                .get("default_kind")
+                .and_then(|k| k.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some((name, kind))
         })
         .collect())
+}
+
+/// Mirror of `ClickHouseExecutor::is_companion_safe_column` (NAN-1397): a
+/// MATERIALIZED column survives the inventory only if the active profile's
+/// CTE re-add list projects it — otherwise it is invisible inside the
+/// companion's subquery wrap (`SELECT *` excludes MATERIALIZED) and the
+/// `topK(toString(col))` is a guaranteed Code 47.
+fn apply_companion_safety_filter(
+    rows: &[(String, String)],
+    cte_visible_materialized: &[&str],
+) -> Vec<String> {
+    rows.iter()
+        .filter(|(name, kind)| {
+            kind != "MATERIALIZED" || cte_visible_materialized.contains(&name.as_str())
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 /// Replicate the exact `topK`/`uniq` field-stats SELECT shape that
 /// `build_field_stats_sql` emits: dotted columns double-quoted inside
 /// `toString`/`uniq`, alias dots collapsed to underscores.
 fn build_field_stats_sql(db: &str, cols: &[String]) -> String {
+    format!(
+        "SELECT {} FROM {db}.ocsf_logs FORMAT JSONEachRow",
+        field_stats_select_parts(cols).join(", ")
+    )
+}
+
+fn field_stats_select_parts(cols: &[String]) -> Vec<String> {
     let mut parts = Vec::new();
     for f in cols {
         let col = if f.contains('.') {
@@ -203,9 +238,29 @@ fn build_field_stats_sql(db: &str, cols: &[String]) -> String {
         parts.push(format!("topK(100)(toString({col})) as {alias}_top"));
         parts.push(format!("uniq({col}) as {alias}_cardinality"));
     }
+    parts
+}
+
+/// Replicate the companion shape the production path emits for multi-CTE
+/// pipelines (the NAN-1315 subquery wrap): the inner scope mirrors stage_0's
+/// `SELECT *, <profile re-add list>` projection, so any inventory column that
+/// is MATERIALIZED and NOT re-added (e.g. `event_bytes`) does not resolve —
+/// the exact NAN-1397 Code 47.
+fn build_wrapped_field_stats_sql(db: &str, cols: &[String], readd: &[&str]) -> String {
+    let readd_cols = readd
+        .iter()
+        .map(|c| {
+            if c.contains('.') {
+                format!("\"{}\"", c.replace('"', "\"\""))
+            } else {
+                (*c).to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "SELECT {} FROM {db}.ocsf_logs FORMAT JSONEachRow",
-        parts.join(", ")
+        "SELECT {} FROM (SELECT *, {readd_cols} FROM {db}.ocsf_logs) FORMAT JSONEachRow",
+        field_stats_select_parts(cols).join(", ")
     )
 }
 
@@ -250,17 +305,59 @@ async fn run_assertions(client: &reqwest::Client, db: &str) -> Result<(), String
     }
 
     // Enumerate the OCSF columns the field panel would query.
-    let cols = field_stats_columns(client, db).await?;
-    if cols.is_empty() {
+    let rows = field_stats_column_rows(client, db).await?;
+    if rows.is_empty() {
         return Err("field-stats column enumeration returned no columns".into());
+    }
+
+    // The raw enumeration DOES surface `event_bytes` (a MATERIALIZED metering
+    // column with no manifest promotion, NAN-1385) — proving the
+    // companion-safety filter below is what excludes it, not the SQL filters.
+    if !rows.iter().any(|(n, _)| n == "event_bytes") {
+        return Err(format!(
+            "expected raw enumeration to contain `event_bytes` (did the DDL drop it?); got: {rows:?}"
+        ));
+    }
+
+    use nanosiem_core::schema::{OcsfProfile, SchemaProfile, OCSF_BOOKKEEPING_COLUMNS};
+    let profile = OcsfProfile::new();
+    let readd = profile.materialized_columns();
+    let cols = apply_companion_safety_filter(&rows, readd);
+
+    // NAN-1397 regression: `event_bytes` must NOT reach the analyst-facing
+    // field-stats inventory — inside the companion's CTE wrap it does not
+    // resolve (`SELECT *` excludes MATERIALIZED; it is not in the re-add list),
+    // so its presence fails EVERY wrapped OCSF search with Code 47.
+    if cols.iter().any(|c| c == "event_bytes") {
+        return Err("`event_bytes` leaked into the field-stats inventory (NAN-1397)".into());
+    }
+
+    // Chokepoint for the next metering column: every surviving inventory
+    // column registered in the BOOKKEEPING set must be CTE-visible — either
+    // `SELECT *`-visible (non-MATERIALIZED) or in the profile's re-add list.
+    for (name, kind) in &rows {
+        if OCSF_BOOKKEEPING_COLUMNS.contains(&name.as_str())
+            && cols.contains(name)
+            && kind == "MATERIALIZED"
+            && !readd.contains(&name.as_str())
+        {
+            return Err(format!(
+                "bookkeeping column `{name}` is MATERIALIZED, not re-added, and still in the field-stats inventory (NAN-1397 regression)"
+            ));
+        }
     }
 
     // `.search` companion columns must NOT appear (the new exclusion). The OCSF
     // table has dotted `.search` companions like `src_endpoint.hostname.search`.
-    if cols.iter().any(|c| c.ends_with(".search")) {
+    // Asserted against the RAW enumeration so the SQL-level `%.search` filter is
+    // pinned independently of the NAN-1397 companion-safety filter (which would
+    // otherwise mask a regression — `.search` columns are also MATERIALIZED).
+    if rows.iter().any(|(c, _)| c.ends_with(".search")) {
         return Err(format!(
             "`.search` companion columns leaked into field-stats columns: {:?}",
-            cols.iter().filter(|c| c.ends_with(".search")).collect::<Vec<_>>()
+            rows.iter()
+                .filter(|(c, _)| c.ends_with(".search"))
+                .collect::<Vec<_>>()
         ));
     }
 
@@ -314,6 +411,19 @@ async fn run_assertions(client: &reqwest::Client, db: &str) -> Result<(), String
     if class_card == 0 {
         return Err("class_uid cardinality is 0, expected > 0".into());
     }
+
+    // NAN-1397 end-to-end: the companion in its multi-CTE WRAPPED shape
+    // (`FROM (SELECT *, <re-add list> FROM ocsf_logs)`) must also execute
+    // cleanly over the filtered inventory. Before the fix, `event_bytes` was
+    // in the inventory but invisible in this scope → Code 47 on every wrapped
+    // OCSF search (eval/rex/risk/join pipelines).
+    let wrapped_sql = build_wrapped_field_stats_sql(db, &cols, readd);
+    exec(client, &wrapped_sql).await.map_err(|e| {
+        format!(
+            "WRAPPED field-stats query failed (the NAN-1397 bug — a MATERIALIZED \
+             non-re-added column leaked into the inventory):\n{e}"
+        )
+    })?;
 
     Ok(())
 }

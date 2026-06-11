@@ -33,9 +33,60 @@
       <grants>
         <query>GRANT SELECT, INSERT, ALTER, CREATE, DROP ON nanosiem.*</query>
         <query>GRANT dictGet ON nanosiem.*</query>
+        <!-- NAN-1399: the enrichment scheduler hot-reloads dictionaries after
+             auto-sync so fresh data applies immediately instead of waiting out
+             the dict LIFETIME. *.* is the only scope CH accepts for this grant;
+             it adds no read/write/DDL capability beyond the grants above. -->
+        <query>GRANT SYSTEM RELOAD DICTIONARY ON *.*</query>
         <query>GRANT SELECT(bytes_on_disk, rows, data_uncompressed_bytes, partition, database, table, active) ON system.parts</query>
         <query>GRANT SELECT(total_space, free_space, type) ON system.disks</query>
       </grants>
     </nanosiem>
+
+    <!--
+      NAN-1384 (G18): INSERT-only credential for DIRECT OCSF writers (Tenzir /
+      Cribl-style pipelines inserting into nanosiem.ocsf_logs without Vector).
+      The shared `nanosiem` user grants SELECT+INSERT+DDL on all of nanosiem.* —
+      handing it to a foreign pipeline means read access to every log and write
+      access to the identity/prevalence dictionaries' source tables. This user
+      is scoped to exactly what an INSERT into ocsf_logs requires:
+        * INSERT on ocsf_logs itself.
+        * dictGet on the 6 dictionaries its MATERIALIZED enrichment/prevalence
+          columns call at insert time (insert fails ACCESS_DENIED otherwise —
+          verified on CH 26.4).
+        * column-scoped SELECT on ocsf_logs for the columns the OCSF prevalence
+          summary MVs read while pushing (CH checks the INSERTING user's SELECT
+          on MV source columns). If you add/widen an MV over ocsf_logs, extend
+          this list — see the warning in clickhouse/ocsf/init.sql.
+      Residual surface: dictGet exposes dictionary lookups and the column-scoped
+      SELECT exposes entity columns (IPs/hostnames/hashes) — but no message/event
+      content and no write path beyond ocsf_logs.
+      Contract: docs/user-guide/direct-ocsf-ingestion.md.
+    -->
+    <nanosiem_ingest>
+      <profile>default</profile>
+      <networks>
+        <ip>::/0</ip>
+      </networks>
+      <password from_env="CLICKHOUSE_INGEST_PASSWORD"/>
+      <quota>default</quota>
+      <access_management>0</access_management>
+      <allow_ddl>0</allow_ddl>
+      <grants>
+        <query>GRANT INSERT ON nanosiem.ocsf_logs</query>
+        <query>GRANT SELECT(`timestamp`, `src_endpoint.ip`, `dst_endpoint.ip`, `src_endpoint.hostname`, `dst_endpoint.hostname`, `query.hostname`, `url.hostname`, `file.hashes.sha256`, `process.file.hashes.sha256`, `actor.process.file.hashes.sha256`, `src_host_unified`, `user_unified`, `src_endpoint.mac`, `source_type`, `metadata.product.name`, `event_bytes`, `http_response.code`, `status_id`, `activity_id`, `class_uid`, `is_mfa`, `api.service.name`, `cloud.region`, `cloud.provider`) ON nanosiem.ocsf_logs</query>
+        <!-- NAN-1400: nat_detection_mv chains off identity_observations (which
+             ocsf_identity_observations_mv writes into); CH checks the INSERTING
+             user's SELECT on the chained MV's source columns too. Without this,
+             the whole flush fails 497 AFTER committing the ocsf_logs parts. -->
+        <query>GRANT SELECT(ip, observed_at) ON nanosiem.identity_observations</query>
+        <query>GRANT dictGet ON nanosiem.custom_enrichment_dict</query>
+        <query>GRANT dictGet ON nanosiem.domain_prevalence_dict</query>
+        <query>GRANT dictGet ON nanosiem.hash_prevalence_dict</query>
+        <query>GRANT dictGet ON nanosiem.ioc_enrichment_dict</query>
+        <query>GRANT dictGet ON nanosiem.ip_enrichment_dict</query>
+        <query>GRANT dictGet ON nanosiem.ip_prevalence_dict</query>
+      </grants>
+    </nanosiem_ingest>
   </users>
 </clickhouse>

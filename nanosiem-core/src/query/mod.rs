@@ -45,6 +45,7 @@ pub use validation::{
     validate_field_name,
     validate_field_name_format,
     validate_query_fields,
+    validate_query_fields_with_profile,
     FieldValidationError,
     QueryCostAnalysis,
     QueryWarning,

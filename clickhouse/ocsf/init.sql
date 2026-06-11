@@ -57,6 +57,10 @@
 --       1. `event`     — the full, standard OCSF JSON record (the entire object).
 --       2. `timestamp` — the row's event time as DateTime64(3,'UTC').
 --                        (See "WHY timestamp IS NOT MATERIALIZED" below.)
+--   Direct (no-Vector) writers: the full producer-facing contract — required
+--   fields, the INSERT-only `nanosiem_ingest` credential, the lowercase
+--   `source_type` rule, and the bad-`time` fallback semantics — lives in
+--   docs/user-guide/direct-ocsf-ingestion.md (NAN-1384).
 --
 --   EVERYTHING ELSE on this table is a MATERIALIZED column derived from `event`
 --   at INSERT time via JSONExtract*, plus server-side skip indexes. Because the
@@ -184,8 +188,39 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     -- Logical manifest name: `time_dt`. Physical name: `timestamp` (kept in line
     -- with UDM `logs.timestamp` so shared query/codegen treats both tables the
     -- same). DEFAULT derives from event.time (epoch ms) when the client omits it.
+    --
+    -- NAN-1384 (G17): the original DEFAULT was a bare
+    -- `fromUnixTimestamp64Milli(toInt64OrZero(...))`, so a missing / RFC3339 /
+    -- epoch-SECONDS / otherwise non-ms `time` derived 1970 — and the 365d row
+    -- TTL then annihilated the row at part-write while the INSERT returned
+    -- HTTP 200. Direct writers (no Vector `now()` fallback) lost rows silently.
+    -- The DEFAULT now NEVER yields 1970: spec-conformant epoch-ms passes through
+    -- unchanged, common nonconformant shapes are repaired, and everything else
+    -- falls back to insert time:
+    --   * >= 1e14            -> epoch MICROSECONDS (÷1000; would otherwise
+    --                           overflow DateTime64(3)'s 2299 ceiling)
+    --   * >= 1e10            -> epoch MILLISECONDS (the OCSF timestamp_t spec
+    --                           shape; 1e10 ms = 2001-09-09, so every real
+    --                           event-time lands here)
+    --   * > 0                -> epoch SECONDS (×1000; the most common
+    --                           real-world pipeline mistake)
+    --   * RFC3339/ISO string -> parseDateTime64BestEffortOrZero
+    --   * anything else      -> now64(3) (missing, garbage, negative)
+    -- The Vector lane always writes `timestamp` explicitly, so this DEFAULT only
+    -- fires on the direct-write path. See also the TTL guard at the bottom of
+    -- this CREATE and docs/user-guide/direct-ocsf-ingestion.md.
     `timestamp` DateTime64(3, 'UTC')
-        DEFAULT fromUnixTimestamp64Milli(toInt64OrZero(JSONExtractString(event, 'time')), 'UTC')
+        DEFAULT multiIf(
+            toInt64OrZero(JSONExtractString(event, 'time')) >= 100000000000000,
+                fromUnixTimestamp64Milli(intDiv(toInt64OrZero(JSONExtractString(event, 'time')), 1000), 'UTC'),
+            toInt64OrZero(JSONExtractString(event, 'time')) >= 10000000000,
+                fromUnixTimestamp64Milli(toInt64OrZero(JSONExtractString(event, 'time')), 'UTC'),
+            toInt64OrZero(JSONExtractString(event, 'time')) > 0,
+                fromUnixTimestamp64Milli(toInt64OrZero(JSONExtractString(event, 'time')) * 1000, 'UTC'),
+            parseDateTime64BestEffortOrZero(JSONExtractString(event, 'time'), 3, 'UTC') != toDateTime64(0, 3, 'UTC'),
+                parseDateTime64BestEffortOrZero(JSONExtractString(event, 'time'), 3, 'UTC'),
+            now64(3, 'UTC')
+        )
         CODEC(Delta(8), ZSTD(3)),
     -- Manifest alias: queries written against `time_dt` resolve to `timestamp`.
     `time_dt` DateTime64(3, 'UTC') ALIAS timestamp,
@@ -214,9 +249,18 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     -- stays 100% pure. It lives here, next to `timestamp`/`_inserted_at`, as a
     -- plain client/ingest-written column so analysts can lead a hunt with the
     -- fast `source_type=apache` first-filter. Mirrors UDM `logs.source_type`
-    -- byte-for-byte (LowCardinality + DEFAULT 'unknown' + set(100) skip index) so
-    -- the SQL generator's PREWHERE + lowercase-normalized fast-path engages
-    -- exactly as it does for UDM (NAN-1241).
+    -- byte-for-byte (LowCardinality + DEFAULT 'unknown' + set(100) skip index).
+    --
+    -- NAN-1384 (G18): the direct-write contract REQUIRES lowercase values, but a
+    -- client-written DEFAULT column cannot be normalized server-side (DEFAULT
+    -- only fires when the column is omitted; MATERIALIZED is not client-
+    -- writable). A MixedCase direct write used to produce filter-invisible rows
+    -- because the generator's lowercase-normalized fast-path compared the stored
+    -- value verbatim. The OCSF profile therefore no longer claims `source_type`
+    -- as lowercased-at-ingest — queries emit `lower(source_type) = '...'`
+    -- (dictionary-evaluated on LowCardinality, so effectively free) and
+    -- nonconformant rows stay findable. UDM keeps its fast-path: its ingestion
+    -- is exclusively Vector-owned, which lowercases at the edge.
     `source_type` LowCardinality(String) DEFAULT 'unknown' CODEC(ZSTD(1)),
 
     -- =========================================================================
@@ -695,6 +739,21 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     `prevalence_process_hash` UInt16 MATERIALIZED if(`process.file.hashes.sha256` != '', dictGetOrDefault('nanosiem.hash_prevalence_dict', 'host_count', `process.file.hashes.sha256`, toUInt16(9999)), toUInt16(65535)) CODEC(T64, LZ4),
     `prevalence_dest_domain` UInt16 MATERIALIZED if(`dst_endpoint.hostname` != '' AND NOT match(`dst_endpoint.hostname`, '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$'), dictGetOrDefault('nanosiem.domain_prevalence_dict', 'host_count', lower(`dst_endpoint.hostname`), toUInt16(9999)), toUInt16(65535)) CODEC(T64, LZ4),
     `prevalence_dest_ip` UInt16 MATERIALIZED if(`dst_endpoint.ip` != '' AND NOT (startsWith(`dst_endpoint.ip`, '10.') OR startsWith(`dst_endpoint.ip`, '172.16.') OR startsWith(`dst_endpoint.ip`, '192.168.') OR startsWith(`dst_endpoint.ip`, '127.')), dictGetOrDefault('nanosiem.ip_prevalence_dict', 'host_count', `dst_endpoint.ip`, toUInt16(9999)), toUInt16(65535)) CODEC(T64, LZ4),
+    -- prevalence_min: least() of the four prevalence columns above, mirroring UDM
+    -- logs.prevalence_min EXACTLY (NAN-1383). UDM's inline definition contributes
+    -- 9999 (not 65535) for an ABSENT entity, so the per-column 65535 "no entity"
+    -- sentinel is remapped to 9999 before the least() — an event with no tracked
+    -- entities reads 9999 ("common/not-tracked"), never 65535. Unlike UDM (which
+    -- had to inline the dict lookups — CH 26.x couldn't resolve inter-column
+    -- DEFAULT refs during INSERT), MATERIALIZED→MATERIALIZED references resolve
+    -- fine at insert on this table (prevalence_file_hash itself reads the
+    -- MATERIALIZED `file.hashes.sha256`), so reference the columns directly.
+    `prevalence_min` UInt16 MATERIALIZED least(
+        if(prevalence_file_hash = 65535, toUInt16(9999), prevalence_file_hash),
+        if(prevalence_process_hash = 65535, toUInt16(9999), prevalence_process_hash),
+        if(prevalence_dest_domain = 65535, toUInt16(9999), prevalence_dest_domain),
+        if(prevalence_dest_ip = 65535, toUInt16(9999), prevalence_dest_ip)
+    ) CODEC(T64, LZ4),
 
     -- =========================================================================
     -- CLASS-SPLIT UNIFIED COLUMNS  (NAN-1333)
@@ -731,6 +790,18 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     `url_domain_unified` String MATERIALIZED if(`http_request.url.hostname` != '', `http_request.url.hostname`, `url.hostname`) CODEC(ZSTD(1)),
     `url_unified` String MATERIALIZED if(`http_request.url.url_string` != '', `http_request.url.url_string`, `url.url_string`) CODEC(ZSTD(1)),
     `src_host_unified` LowCardinality(String) MATERIALIZED if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, `device.hostname`) CODEC(ZSTD(1)),
+
+    -- =========================================================================
+    -- TELEMETRY  (NAN-1385)
+    -- =========================================================================
+    -- Stored payload size for the per-source telemetry rollup
+    -- (ocsf_logs_per_source_5m_mv below). The UDM lane sums length(message) +
+    -- length(metadata); the OCSF analog of "the stored payload" is the `event`
+    -- JSON itself. Materialized so the rollup MV reads a plain UInt64 —
+    -- granting the INSERT-only nanosiem_ingest user SELECT on `event` (raw log
+    -- content) would defeat the NAN-1384 least-privilege contract, and
+    -- MATERIALIZED-column expressions are exempt from the MV-push SELECT check.
+    `event_bytes` UInt64 MATERIALIZED length(toString(event)) CODEC(T64, LZ4),
 
     -- =========================================================================
     -- FULL-TEXT SEARCH  (NAN-1241)
@@ -964,7 +1035,13 @@ PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (class_uid, timestamp, `src_endpoint.ip`, cityHash64(id))
 SAMPLE BY cityHash64(id)
 -- 365-day TTL (parity with UDM logs).
-TTL timestamp + toIntervalDay(365)
+-- NAN-1384 (G17) GUARD: only rows with a sane (post-2000) timestamp are subject
+-- to retention expiry. Without the WHERE, a row whose timestamp landed at 1970
+-- (e.g. a client explicitly writing a bad `timestamp`) was deleted at part-write
+-- while the INSERT returned HTTP 200 — silent annihilation with no dead-letter.
+-- Garbage-timestamped rows now survive (visible, debuggable) instead of
+-- vanishing; normal rows expire exactly as before.
+TTL timestamp + toIntervalDay(365) DELETE WHERE timestamp > toDateTime64('2000-01-01 00:00:00', 3, 'UTC')
 SETTINGS index_granularity = 8192, non_replicated_deduplication_window = 1000
 ;
 
@@ -1135,6 +1212,15 @@ LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 5000000));
 -- (src_host else src_ip else 'unknown'); OCSF's equivalents are
 -- src_endpoint.hostname / src_endpoint.ip. Domain/ip/hash validity filters and
 -- normalization mirror the UDM *_prevalence_mv definitions in init.sql.
+--
+-- ⚠ INGEST-CREDENTIAL COUPLING (NAN-1384): ClickHouse checks the INSERTING
+-- user's column-level SELECT on nanosiem.ocsf_logs for every column these MVs
+-- read while pushing. The INSERT-only `nanosiem_ingest` user (users.d /
+-- deploy templates) is granted SELECT on exactly the columns below. If you add
+-- an MV over ocsf_logs or widen one's SELECT list, extend that grant in
+-- clickhouse/users.d/nanosiem-users.xml + deploy/k8s/clickhouse/clickhouse.yaml
+-- + deploy/k8s/{rackspace,aws}-db/clickhouse.yaml.tpl, or direct-writer inserts
+-- start failing with ACCESS_DENIED (loud, but an outage).
 -- -----------------------------------------------------------------------------
 
 -- Hash prevalence (file + process hashes), OCSF columns -> hash_prevalence_summary.
@@ -1273,6 +1359,219 @@ WHERE `src_endpoint.ip` != ''
   AND `src_endpoint.ip` != `dst_endpoint.ip`
 GROUP BY ip, is_private;
 
+-- -----------------------------------------------------------------------------
+-- OCSF aggregation MVs (NAN-1385, G13). Same write-directly-into-the-shared-
+-- target pattern as the prevalence MVs above: entity first/last-seen, identity
+-- observations (which chains into nat_detection_mv — MV chaining fires
+-- downstream MVs on MV-pushed inserts, so NAT detection needs no OCSF-specific
+-- MV), cloud Users activity, and per-source telemetry, so data ingested ONLY
+-- into ocsf_logs (the direct-write / no-Vector path) reaches every aggregation
+-- surface. One MV per entity branch — NEVER a UNION ALL body: ClickHouse only
+-- attaches the insert trigger to the first SELECT (NAN-1386).
+--
+-- Under the transitional Vector dual-write (Vector writes both `logs` and
+-- `ocsf_logs`), Vector-lane events are counted by BOTH MV sets — uniq states
+-- merge exactly; sum/count aggregates double only while dual-write is in
+-- place, same accepted behavior as the prevalence MVs above.
+--
+-- The ⚠ INGEST-CREDENTIAL COUPLING warning above applies: every column these
+-- MVs read is mirrored into the nanosiem_ingest SELECT grant.
+-- Migration 128 mirrors this block for existing deployments.
+-- -----------------------------------------------------------------------------
+
+-- Entity first/last-seen (asset views), OCSF columns -> entity_time_range_agg.
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_entity_time_range_src_ip_mv
+TO nanosiem.entity_time_range_agg
+(
+    `entity_type` String,
+    `entity_value` String,
+    `time_bucket` DateTime('UTC'),
+    `first_seen` DateTime64(6, 'UTC'),
+    `last_seen` DateTime64(6, 'UTC'),
+    `event_count` UInt64
+)
+AS SELECT
+    'src_ip' AS entity_type,
+    `src_endpoint.ip` AS entity_value,
+    toStartOfHour(timestamp) AS time_bucket,
+    min(timestamp) AS first_seen,
+    max(timestamp) AS last_seen,
+    count() AS event_count
+FROM nanosiem.ocsf_logs
+WHERE `src_endpoint.ip` != ''
+GROUP BY entity_type, entity_value, time_bucket;
+
+-- src_host_unified (src_endpoint.hostname else device.hostname) is already
+-- lower()'d at ingest — no extra lower(), matching the agg's lowercase
+-- entity_value convention.
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_entity_time_range_src_host_mv
+TO nanosiem.entity_time_range_agg
+(
+    `entity_type` String,
+    `entity_value` String,
+    `time_bucket` DateTime('UTC'),
+    `first_seen` DateTime64(6, 'UTC'),
+    `last_seen` DateTime64(6, 'UTC'),
+    `event_count` UInt64
+)
+AS SELECT
+    'src_host' AS entity_type,
+    src_host_unified AS entity_value,
+    toStartOfHour(timestamp) AS time_bucket,
+    min(timestamp) AS first_seen,
+    max(timestamp) AS last_seen,
+    count() AS event_count
+FROM nanosiem.ocsf_logs
+WHERE src_host_unified != ''
+GROUP BY entity_type, entity_value, time_bucket;
+
+-- user_unified is already lower()'d at ingest (both user.name and
+-- actor.user.name materialize through lower()); the lower() here is defensive
+-- and keeps the branch self-evidently aligned with the asset reader, which
+-- binds lowercased user identifiers.
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_entity_time_range_user_mv
+TO nanosiem.entity_time_range_agg
+(
+    `entity_type` String,
+    `entity_value` String,
+    `time_bucket` DateTime('UTC'),
+    `first_seen` DateTime64(6, 'UTC'),
+    `last_seen` DateTime64(6, 'UTC'),
+    `event_count` UInt64
+)
+AS SELECT
+    'user' AS entity_type,
+    lower(user_unified) AS entity_value,
+    toStartOfHour(timestamp) AS time_bucket,
+    min(timestamp) AS first_seen,
+    max(timestamp) AS last_seen,
+    count() AS event_count
+FROM nanosiem.ocsf_logs
+WHERE user_unified != ''
+GROUP BY entity_type, entity_value, time_bucket;
+
+-- Identity observations (resolve_identity / lateral movement / NAT via the
+-- chained nat_detection_mv). Filters and derivations mirror
+-- identity_observations_mv (clickhouse/init.sql): private src IPs only, junk
+-- hostnames excluded. `source` falls back to metadata.product.name — THE OCSF
+-- source identifier — for direct writers that omit source_type (which
+-- DEFAULTs to 'unknown'). namespace/source_priority take the table defaults.
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_identity_observations_mv
+TO nanosiem.identity_observations
+(
+    `observed_at` DateTime64(3, 'UTC'),
+    `ip` String,
+    `hostname` String,
+    `fqdn` String,
+    `mac` String,
+    `user` String,
+    `source` LowCardinality(String),
+    `domain` LowCardinality(String),
+    `ip_type` LowCardinality(String)
+)
+AS SELECT
+    timestamp AS observed_at,
+    `src_endpoint.ip` AS ip,
+    if(
+        position(src_host_unified, '.') > 0 AND position(src_host_unified, '.corp.') > 0,
+        substring(src_host_unified, 1, position(src_host_unified, '.') - 1),
+        src_host_unified
+    ) AS hostname,
+    src_host_unified AS fqdn,
+    `src_endpoint.mac` AS mac,
+    user_unified AS user,
+    if(source_type != '' AND source_type != 'unknown', lower(source_type),
+       if(`metadata.product.name` != '', lower(`metadata.product.name`), 'unknown')) AS source,
+    multiIf(
+        position(user_unified, '\\') > 0, substring(user_unified, 1, position(user_unified, '\\') - 1),
+        position(src_host_unified, '.corp.') > 0, 'corp',
+        ''
+    ) AS domain,
+    multiIf(
+        match(`src_endpoint.ip`, '^10\\.'), 'private',
+        match(`src_endpoint.ip`, '^192\\.168\\.'), 'private',
+        match(`src_endpoint.ip`, '^172\\.(1[6-9]|2[0-9]|3[01])\\.'), 'private',
+        match(`src_endpoint.ip`, '^100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.'), 'vpn',
+        match(`src_endpoint.ip`, '^127\\.'), 'loopback',
+        'public'
+    ) AS ip_type
+FROM nanosiem.ocsf_logs
+WHERE
+    `src_endpoint.ip` != ''
+    AND src_host_unified != ''
+    AND (
+        match(`src_endpoint.ip`, '^10\\.') OR
+        match(`src_endpoint.ip`, '^192\\.168\\.') OR
+        match(`src_endpoint.ip`, '^172\\.(1[6-9]|2[0-9]|3[01])\\.')
+    )
+    AND `src_endpoint.ip` NOT IN ('127.0.0.1', '::1', '0.0.0.0')
+    AND src_host_unified NOT IN ('localhost', '-', 'unknown', '');
+
+-- Cloud Users activity (cloud investigation Users tab). The agg's `user` join
+-- key must carry the SAME values the cloud surface's profile-resolved user
+-- column (user_unified, lower()'d at ingest) produces, so it is written
+-- as-is with no extra transform. fail = OCSF-native
+-- status_id 2 (Failure) OR http_response.code >= 400 (HTTP-shaped classes).
+-- delete_count mirrors the query layer's lossy change_type mapping
+-- (SearchService::change_type_activity_id: delete -> activity_id 4) scoped to
+-- API Activity 6003, where the change semantics live; UDM 'permission_change'
+-- is unrepresentable in OCSF -> permission_change_count is 0 on this lane.
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_cloud_user_activity_mv
+TO nanosiem.cloud_user_activity_agg
+(
+    `user` String,
+    `time_bucket` DateTime,
+    `event_count` UInt64,
+    `fail_count` UInt64,
+    `permission_change_count` UInt64,
+    `delete_count` UInt64,
+    `mfa_count` UInt64,
+    `no_mfa_count` UInt64,
+    `distinct_services` AggregateFunction(uniq, String),
+    `distinct_regions` AggregateFunction(uniq, String),
+    `distinct_ips` AggregateFunction(uniq, String)
+)
+AS SELECT
+    user_unified AS user,
+    toStartOfHour(timestamp) AS time_bucket,
+    count() AS event_count,
+    countIf(`http_response.code` >= 400 OR status_id = 2) AS fail_count,
+    toUInt64(0) AS permission_change_count,
+    countIf(class_uid = 6003 AND activity_id = 4) AS delete_count,
+    countIf(is_mfa = 1) AS mfa_count,
+    countIf(is_mfa = 0) AS no_mfa_count,
+    uniqState(toString(`api.service.name`)) AS distinct_services,
+    uniqState(toString(`cloud.region`)) AS distinct_regions,
+    uniqState(`src_endpoint.ip`) AS distinct_ips
+FROM nanosiem.ocsf_logs
+WHERE `cloud.provider` != '' AND user_unified != ''
+GROUP BY user, time_bucket;
+
+-- Per-source 5-minute telemetry rollup (source health / EPS / GB-day).
+-- Direct writers that omit source_type land as their OCSF source identifier
+-- (metadata.product.name) instead of a single opaque 'unknown' bucket. bytes
+-- sums the materialized event_bytes (see the TELEMETRY column above).
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_logs_per_source_5m_mv
+TO nanosiem.logs_per_source_5m
+(
+    `source_type` LowCardinality(String),
+    `bucket_start` DateTime,
+    `events` UInt64,
+    `bytes` UInt64,
+    `last_event_at` DateTime64(6, 'UTC'),
+    `first_event_at` DateTime64(6, 'UTC')
+)
+AS SELECT
+    if(source_type != '' AND source_type != 'unknown', lower(source_type),
+       if(`metadata.product.name` != '', lower(`metadata.product.name`), 'unknown')) AS source_type,
+    toStartOfFiveMinute(timestamp) AS bucket_start,
+    count() AS events,
+    sum(event_bytes) AS bytes,
+    max(timestamp) AS last_event_at,
+    min(timestamp) AS first_event_at
+FROM nanosiem.ocsf_logs
+GROUP BY source_type, bucket_start;
+
 -- =============================================================================
 -- CLASS-SPLIT UNIFIED COLUMNS — EXISTING-TENANT OVERLAY  (NAN-1333)
 -- =============================================================================
@@ -1301,6 +1600,10 @@ ALTER TABLE nanosiem.ocsf_logs ADD COLUMN IF NOT EXISTS `user_unified` String MA
 ALTER TABLE nanosiem.ocsf_logs ADD COLUMN IF NOT EXISTS `url_domain_unified` String MATERIALIZED if(`http_request.url.hostname` != '', `http_request.url.hostname`, `url.hostname`) CODEC(ZSTD(1));
 ALTER TABLE nanosiem.ocsf_logs ADD COLUMN IF NOT EXISTS `url_unified` String MATERIALIZED if(`http_request.url.url_string` != '', `http_request.url.url_string`, `url.url_string`) CODEC(ZSTD(1));
 ALTER TABLE nanosiem.ocsf_logs ADD COLUMN IF NOT EXISTS `src_host_unified` LowCardinality(String) MATERIALIZED if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, `device.hostname`) CODEC(ZSTD(1));
+-- NAN-1385: telemetry payload-size column (see the TELEMETRY section above).
+-- No MATERIALIZE COLUMN: only rows inserted after the rollup MV exists matter
+-- to it, and unmaterialized parts compute the expression on read anyway.
+ALTER TABLE nanosiem.ocsf_logs ADD COLUMN IF NOT EXISTS `event_bytes` UInt64 MATERIALIZED length(toString(event)) CODEC(T64, LZ4);
 
 ALTER TABLE nanosiem.ocsf_logs MATERIALIZE COLUMN `process_name_unified`;
 ALTER TABLE nanosiem.ocsf_logs MATERIALIZE COLUMN `process_path_unified`;

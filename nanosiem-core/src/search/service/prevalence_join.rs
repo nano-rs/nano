@@ -97,18 +97,25 @@ impl SearchService {
                     .await?;
         }
 
-        // Apply inputlookup enrichment if there are inputlookup commands
+        // Apply inputlookup enrichment if there are inputlookup commands.
+        // Partial-failure warnings are logged but not surfaced here, matching
+        // how this path treats post-processing warnings (detection path).
         if !inputlookup_commands.is_empty() {
             tracing::debug!(
                 "Applying {} inputlookup commands",
                 inputlookup_commands.len()
             );
+            let mut enrichment_warnings: Vec<String> = Vec::new();
             results = apply_inputlookup_enrichment(
                 results,
                 inputlookup_commands,
                 self.inputlookup_service.as_ref(),
+                &mut enrichment_warnings,
             )
             .await?;
+            for w in &enrichment_warnings {
+                tracing::warn!("InputLookup enrichment degraded: {}", w);
+            }
             tracing::debug!("After inputlookup enrichment: {} results", results.len());
         }
 

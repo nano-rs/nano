@@ -211,8 +211,26 @@ impl ClickHouseMigrator {
                 || sql_upper.starts_with("CREATE OR REPLACE DICTIONARY")
                 || sql_upper.starts_with("GRANT ");
 
+            // NAN-1384: profile-gated tables (e.g. nanosiem.ocsf_logs, which
+            // only exists on NANO_SCHEMA_PROFILE=ocsf deployments) cannot be
+            // guarded in SQL — ClickHouse has no `ALTER TABLE IF EXISTS`. A
+            // statement carrying the `nano:skip-if-unknown-table` block-comment
+            // marker is skipped when its target table does not exist, instead
+            // of failing the whole migration run. Any OTHER error on the same
+            // statement still aborts (the marker only tolerates absence).
+            let skip_if_unknown_table = Self::has_skip_if_unknown_table_marker(&sql);
+
             match self.client.query(&full_sql).execute().await {
                 Ok(_) => {}
+                Err(e) if skip_if_unknown_table && Self::is_unknown_table_error(&e.to_string()) => {
+                    tracing::warn!(
+                        "Migration statement skipped (target table absent on this \
+                         deployment profile): {} - {}",
+                        migration.filename,
+                        e
+                    );
+                    continue;
+                }
                 Err(e) if is_soft_fail => {
                     tracing::warn!(
                         "Migration statement failed (non-fatal, skipping): {} - {}",

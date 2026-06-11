@@ -74,6 +74,15 @@ pub struct SsrfConfig {
     /// indefinitely. `None` means use the platform default
     /// (`DEFAULT_DNS_TIMEOUT_SECS`).
     pub dns_timeout: Option<Duration>,
+    /// Allow loopback / RFC1918-private / link-local / IPv6-ULA targets.
+    ///
+    /// Default `false` (secure). Set this ONLY for endpoints an operator
+    /// deliberately points at internal infrastructure (e.g. an on-prem /
+    /// air-gapped LLM at a private address). Cloud-metadata endpoints
+    /// (169.254.169.254 and metadata hostnames) and the unspecified/broadcast
+    /// addresses stay blocked even when this is `true`, since they are never a
+    /// legitimate target and are the highest-value SSRF objective.
+    pub allow_private_networks: bool,
 }
 
 impl Default for SsrfConfig {
@@ -83,6 +92,7 @@ impl Default for SsrfConfig {
             blocked_domains: Vec::new(),
             max_redirects: 5,
             dns_timeout: None,
+            allow_private_networks: false,
         }
     }
 }
@@ -258,12 +268,35 @@ impl SsrfValidator {
     fn validate_ipv4(&self, ip: Ipv4Addr) -> Result<(), SsrfError> {
         let octets = ip.octets();
 
+        // Cloud metadata endpoint — ALWAYS blocked, even with allow_private_networks.
+        // (169.254.169.254 is a subset of link-local but is never a legitimate target.)
+        if octets == [169, 254, 169, 254] {
+            return Err(SsrfError::MetadataEndpointBlocked(ip.to_string()));
+        }
+
+        // Unspecified (0.0.0.0) / broadcast — never a valid target, blocked always.
+        if ip == Ipv4Addr::UNSPECIFIED || ip == Ipv4Addr::BROADCAST {
+            return Err(SsrfError::PrivateIpBlocked(IpAddr::V4(ip)));
+        }
+
+        // Multicast (224.0.0.0/4) and documentation / TEST-NET ranges
+        // (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) — never a valid
+        // outbound target, blocked always (even under allow_private_networks).
+        if ip.is_multicast() || ip.is_documentation() {
+            return Err(SsrfError::PrivateIpBlocked(IpAddr::V4(ip)));
+        }
+
+        // The remaining loopback / private / link-local ranges are permitted
+        // only when an operator has explicitly opted in (e.g. on-prem LLM on a
+        // private network). Default is to block them.
+        if self.config.allow_private_networks {
+            return Ok(());
+        }
+
         // Localhost (127.0.0.0/8)
         if octets[0] == 127 {
             return Err(SsrfError::LocalhostBlocked);
         }
-
-        // Private ranges
         // 10.0.0.0/8
         if octets[0] == 10 {
             return Err(SsrfError::PrivateIpBlocked(IpAddr::V4(ip)));
@@ -276,24 +309,14 @@ impl SsrfValidator {
         if octets[0] == 192 && octets[1] == 168 {
             return Err(SsrfError::PrivateIpBlocked(IpAddr::V4(ip)));
         }
-
-        // Link-local (169.254.0.0/16)
+        // CGNAT / shared address space (100.64.0.0/10) — routes to carrier /
+        // internal infrastructure, treat like private.
+        if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
+            return Err(SsrfError::PrivateIpBlocked(IpAddr::V4(ip)));
+        }
+        // Link-local (169.254.0.0/16); metadata already handled above
         if octets[0] == 169 && octets[1] == 254 {
-            // Cloud metadata endpoints are a subset of link-local
-            if octets[2] == 169 && octets[3] == 254 {
-                return Err(SsrfError::MetadataEndpointBlocked(ip.to_string()));
-            }
             return Err(SsrfError::LinkLocalBlocked(IpAddr::V4(ip)));
-        }
-
-        // Broadcast
-        if ip == Ipv4Addr::BROADCAST {
-            return Err(SsrfError::PrivateIpBlocked(IpAddr::V4(ip)));
-        }
-
-        // Unspecified (0.0.0.0)
-        if ip == Ipv4Addr::UNSPECIFIED {
-            return Err(SsrfError::PrivateIpBlocked(IpAddr::V4(ip)));
         }
 
         Ok(())
@@ -301,27 +324,32 @@ impl SsrfValidator {
 
     /// Validate an IPv6 address
     fn validate_ipv6(&self, ip: Ipv6Addr) -> Result<(), SsrfError> {
+        // IPv4-mapped addresses (::ffff:x.x.x.x) — defer to the IPv4 rules so
+        // metadata + allow_private_networks are handled in one place.
+        if let Some(ipv4) = ip.to_ipv4_mapped() {
+            return self.validate_ipv4(ipv4);
+        }
+
+        // Unspecified (::) / multicast (ff00::/8) — never a valid target, blocked always.
+        if ip.is_unspecified() || ip.is_multicast() {
+            return Err(SsrfError::PrivateIpBlocked(IpAddr::V6(ip)));
+        }
+
+        // Loopback / link-local / ULA permitted only with explicit opt-in.
+        if self.config.allow_private_networks {
+            return Ok(());
+        }
+
         // Loopback (::1)
         if ip.is_loopback() {
             return Err(SsrfError::LocalhostBlocked);
         }
 
-        // Unspecified (::)
-        if ip.is_unspecified() {
-            return Err(SsrfError::PrivateIpBlocked(IpAddr::V6(ip)));
-        }
-
-        // IPv4-mapped addresses (::ffff:x.x.x.x)
-        if let Some(ipv4) = ip.to_ipv4_mapped() {
-            return self.validate_ipv4(ipv4);
-        }
-
-        // Link-local (fe80::/10)
         let segments = ip.segments();
+        // Link-local (fe80::/10)
         if (segments[0] & 0xffc0) == 0xfe80 {
             return Err(SsrfError::LinkLocalBlocked(IpAddr::V6(ip)));
         }
-
         // Unique local addresses (fc00::/7) - similar to private IPv4
         if (segments[0] & 0xfe00) == 0xfc00 {
             return Err(SsrfError::PrivateIpBlocked(IpAddr::V6(ip)));
@@ -354,8 +382,13 @@ impl SsrfValidator {
             return Err(SsrfError::MetadataEndpointBlocked(host.to_string()));
         }
 
-        // GCP metadata endpoint
-        if host_lower == "metadata.google.internal" {
+        // GCP metadata endpoint (and its short alias)
+        if host_lower == "metadata.google.internal" || host_lower == "metadata.goog" {
+            return Err(SsrfError::MetadataEndpointBlocked(host.to_string()));
+        }
+
+        // DNS-name aliases that resolve to the metadata IP (e.g. nip.io wildcard)
+        if host_lower == "169.254.169.254.nip.io" {
             return Err(SsrfError::MetadataEndpointBlocked(host.to_string()));
         }
 
@@ -379,6 +412,69 @@ impl SsrfValidator {
     }
 }
 
+/// Env var that opts an operator into private/loopback AI provider endpoints.
+pub const ALLOW_PRIVATE_AI_ENDPOINTS_ENV: &str = "NANOSIEM_ALLOW_PRIVATE_AI_ENDPOINTS";
+
+/// Whether the operator has opted into letting AI provider `base_url`s point at
+/// private/loopback/internal addresses (on-prem / air-gapped LLM deployments,
+/// NAN-1207). Off by default. Cloud-metadata endpoints stay blocked regardless.
+///
+/// This is read from the environment — deliberately NOT from per-provider config
+/// — so that an admin who can set `base_url` through the API cannot also flip the
+/// allowance and reach internal services.
+pub fn private_ai_endpoints_allowed() -> bool {
+    matches!(
+        std::env::var(ALLOW_PRIVATE_AI_ENDPOINTS_ENV)
+            .map(|v| v.to_ascii_lowercase())
+            .as_deref(),
+        Ok("1" | "true" | "on" | "yes")
+    )
+}
+
+/// SSRF validator for an admin-configured AI provider `base_url`.
+///
+/// Secure by default: blocks loopback/private/link-local/metadata and non-http(s)
+/// schemes. `allow_http` is on because on-prem LLM endpoints are commonly plain
+/// HTTP behind a network boundary. Private targets are permitted only when
+/// [`private_ai_endpoints_allowed`] is set; metadata endpoints are never allowed.
+pub fn ai_base_url_validator() -> SsrfValidator {
+    SsrfValidator::new(SsrfConfig {
+        allow_http: true,
+        allow_private_networks: private_ai_endpoints_allowed(),
+        ..Default::default()
+    })
+}
+
+/// Shared redirect policy for outbound clients (NAN-1369): follow at most a few
+/// hops, and refuse to follow a redirect to a non-https target or to a
+/// private/metadata IP literal — the common SSRF-via-redirect bypass of a
+/// pre-request URL check. Hostname redirects are still followed (not re-resolved
+/// here; documented residual). IP-literal checks reuse `SsrfValidator`. Used by
+/// identity-sync and OIDC discovery/JWKS clients, which legitimately redirect by
+/// hostname (so `Policy::none` would be too strict).
+pub fn restricted_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 4 {
+            return attempt.stop();
+        }
+        let url = attempt.url();
+        if url.scheme() != "https" {
+            return attempt.error("SSRF guard: refusing redirect to non-https target");
+        }
+        if let Some(host) = url.host_str() {
+            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                if SsrfValidator::default_secure()
+                    .validate_ip_address(ip)
+                    .is_err()
+                {
+                    return attempt.error("SSRF guard: refusing redirect to disallowed IP literal");
+                }
+            }
+        }
+        attempt.follow()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +488,110 @@ mod tests {
             allow_http: true,
             ..Default::default()
         })
+    }
+
+    fn validator_allow_private() -> SsrfValidator {
+        SsrfValidator::new(SsrfConfig {
+            allow_http: true,
+            allow_private_networks: true,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn test_allow_private_permits_loopback_and_rfc1918() {
+        // The on-prem / air-gapped opt-in (NAN-1207): private LLM endpoints are
+        // reachable when an operator has explicitly allowed it.
+        let v = validator_allow_private();
+        assert!(v.validate_url("http://127.0.0.1:39999/v1").is_ok());
+        assert!(v.validate_url("http://10.0.0.5:8000/v1").is_ok());
+        assert!(v.validate_url("http://192.168.1.10/v1").is_ok());
+    }
+
+    #[test]
+    fn test_allow_private_still_blocks_metadata() {
+        // Cloud metadata is never a legitimate AI endpoint and stays blocked
+        // even with the private-network opt-in — it's the highest-value target.
+        let v = validator_allow_private();
+        assert!(matches!(
+            v.validate_url("http://169.254.169.254/latest/meta-data/"),
+            Err(SsrfError::MetadataEndpointBlocked(_))
+        ));
+        assert!(matches!(
+            v.validate_url("http://metadata.google.internal/"),
+            Err(SsrfError::MetadataEndpointBlocked(_))
+        ));
+        // A non-metadata link-local address is allowed under the opt-in.
+        assert!(v.validate_url("http://169.254.10.10/").is_ok());
+    }
+
+    #[test]
+    fn test_default_still_blocks_private_after_restructure() {
+        // Guard against regressions from the allow_private restructure: the
+        // secure default must still reject loopback / private / link-local.
+        let v = validator_with_http();
+        assert!(matches!(
+            v.validate_url("http://127.0.0.1/"),
+            Err(SsrfError::LocalhostBlocked)
+        ));
+        assert!(matches!(
+            v.validate_url("http://10.0.0.1/"),
+            Err(SsrfError::PrivateIpBlocked(_))
+        ));
+        assert!(matches!(
+            v.validate_url("http://169.254.10.10/"),
+            Err(SsrfError::LinkLocalBlocked(_))
+        ));
+        assert!(matches!(
+            v.validate_url("http://169.254.169.254/"),
+            Err(SsrfError::MetadataEndpointBlocked(_))
+        ));
+    }
+
+    #[test]
+    fn test_cgnat_blocked_by_default_allowed_on_optin() {
+        // 100.64.0.0/10 is shared/CGNAT space that routes to carrier/internal
+        // infra — blocked like private by default (NAN-1369), allowed under opt-in.
+        let v = validator_with_http();
+        assert!(matches!(
+            v.validate_url("http://100.64.0.1/"),
+            Err(SsrfError::PrivateIpBlocked(_))
+        ));
+        assert!(matches!(
+            v.validate_url("http://100.127.255.254/"),
+            Err(SsrfError::PrivateIpBlocked(_))
+        ));
+        // 100.63.x and 100.128.x are public (outside /10) — not blocked.
+        assert!(v.validate_url("http://100.63.0.1/").is_ok());
+        assert!(v.validate_url("http://100.128.0.1/").is_ok());
+        // Allowed under the on-prem opt-in.
+        assert!(validator_allow_private()
+            .validate_url("http://100.64.0.1/")
+            .is_ok());
+    }
+
+    #[test]
+    fn test_extra_metadata_hostnames_blocked() {
+        let v = validator_with_http();
+        for h in ["metadata.goog", "169.254.169.254.nip.io"] {
+            assert!(
+                matches!(
+                    v.validate_url(&format!("http://{h}/")),
+                    Err(SsrfError::MetadataEndpointBlocked(_))
+                ),
+                "expected {h} blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ai_base_url_validator_blocks_loopback_by_default() {
+        // With the opt-in env unset, the shared AI validator is secure: a
+        // loopback base_url is rejected (this is the reported SSRF, NAN-1368).
+        let v = ai_base_url_validator();
+        assert!(v.validate_url("http://127.0.0.1:39999/v1").is_err());
+        // A public endpoint is still fine.
+        assert!(v.validate_url("https://api.openai.com/v1").is_ok());
     }
 
     #[test]
@@ -656,6 +856,7 @@ mod tests {
             blocked_domains: Vec::new(),
             max_redirects: 0,
             dns_timeout: Some(Duration::from_millis(50)),
+            allow_private_networks: false,
         });
 
         let start = std::time::Instant::now();

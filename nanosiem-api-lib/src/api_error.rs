@@ -396,6 +396,9 @@ impl From<nanosiem_core::LogSourceServiceError> for ApiError {
             nanosiem_core::LogSourceServiceError::InvalidSourceType(t) => {
                 ApiError::ValidationError(format!("Invalid source type: {}", t))
             }
+            nanosiem_core::LogSourceServiceError::InvalidSourceConfig(msg) => {
+                ApiError::ValidationError(format!("Invalid source config: {}", msg))
+            }
             nanosiem_core::LogSourceServiceError::NotValidated => ApiError::ValidationError(
                 "Log source must be validated before enabling".to_string(),
             ),

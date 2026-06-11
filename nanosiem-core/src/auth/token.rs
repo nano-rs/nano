@@ -80,7 +80,7 @@ impl Default for TokenConfig {
     /// Creates a TokenConfig from environment variables.
     ///
     /// # Panics
-    /// Panics if JWT_SECRET is not set (unless NANOSIEM_DEV_MODE=true)
+    /// Panics if JWT_SECRET is not set (unless NANOSIEM_ALLOW_DEFAULT_KEYS=true)
     /// or is shorter than 32 characters.
     fn default() -> Self {
         let secret = match std::env::var("JWT_SECRET") {
@@ -94,21 +94,29 @@ impl Default for TokenConfig {
                 secret
             }
             Err(_) => {
-                let dev_mode = std::env::var("NANOSIEM_DEV_MODE")
+                // NAN-1355: the public-key fallback is gated by its OWN flag,
+                // NANOSIEM_ALLOW_DEFAULT_KEYS — deliberately NOT NANOSIEM_DEV_MODE.
+                // NANOSIEM_DEV_MODE only relaxes the cookie Secure flag for plain-HTTP
+                // deployments (nanosiem-api-lib/src/cookies.rs); it must not also unlock
+                // built-in public keys, or an http:// deploy that enables dev-mode for
+                // cookies would silently run on a publicly-known JWT secret.
+                let allow_default_keys = std::env::var("NANOSIEM_ALLOW_DEFAULT_KEYS")
                     .map(|v| v.eq_ignore_ascii_case("true"))
                     .unwrap_or(false);
 
-                if dev_mode {
+                if allow_default_keys {
                     tracing::warn!(
-                        "SECURITY WARNING: Using default development JWT secret. \
-                         This is only acceptable in development environments!"
+                        "SECURITY WARNING: Using the built-in public development JWT secret \
+                         (NANOSIEM_ALLOW_DEFAULT_KEYS=true). Only acceptable in development — \
+                         never set this in production!"
                     );
                     "default-dev-jwt-secret-32chars!!".to_string()
                 } else {
                     panic!(
                         "SECURITY ERROR: JWT_SECRET not configured. \
                          Set JWT_SECRET environment variable to a secure random value (32+ characters). \
-                         If this is a development environment, set NANOSIEM_DEV_MODE=true to use default keys."
+                         For local development only, set NANOSIEM_ALLOW_DEFAULT_KEYS=true to use the \
+                         insecure built-in default secret."
                     );
                 }
             }

@@ -107,6 +107,8 @@ pub enum AuditSource {
     Lookup,
     /// GDPR data subject anonymization events
     Gdpr,
+    /// Audit subsystem events (export/read of the audit trail itself)
+    Audit,
 }
 
 impl std::fmt::Display for AuditSource {
@@ -144,6 +146,7 @@ impl std::fmt::Display for AuditSource {
             Self::Risk => write!(f, "risk"),
             Self::Lookup => write!(f, "lookup"),
             Self::Gdpr => write!(f, "gdpr"),
+            Self::Audit => write!(f, "audit"),
         }
     }
 }
@@ -199,11 +202,10 @@ impl AuditEvent {
         }
     }
 
-    /// Convert this audit event into a ParsedLog for storage
-    pub fn to_parsed_log(&self) -> ParsedLog {
-        let now = Utc::now();
-
-        // Build the message for full-text search
+    /// Build the human-readable message line for full-text search. Shared by
+    /// the UDM (`to_parsed_log`) and OCSF (`to_ocsf_event`) storage shapes so
+    /// both rows carry the identical hunt-able summary.
+    fn build_message(&self) -> String {
         let resource_desc = match (&self.resource_type, &self.resource_name) {
             (Some(rt), Some(rn)) => format!("{} '{}'", rt, rn),
             (Some(rt), None) => rt.clone(),
@@ -222,10 +224,18 @@ impl AuditEvent {
             (None, None, None) => "system".to_string(),
         };
 
-        let message = format!(
+        format!(
             "[{}] {} on {} by {}",
             self.source, self.action, resource_desc, actor_desc
-        );
+        )
+    }
+
+    /// Convert this audit event into a ParsedLog for storage
+    pub fn to_parsed_log(&self) -> ParsedLog {
+        let now = Utc::now();
+
+        // Build the message for full-text search
+        let message = self.build_message();
 
         // Build metadata JSON for audit-specific fields not in UDM schema
         // (source, action, src_ip, user_agent, status are already top-level columns)
@@ -283,6 +293,111 @@ impl AuditEvent {
             bytes_in: None,
             bytes_out: None,
         }
+    }
+
+    /// Map the nano audit `action` verb onto the OCSF API Activity
+    /// `activity_id` enum: 1=Create, 2=Read, 3=Update, 4=Delete, 99=Other.
+    /// Heuristic on the underscore-convention action string ("rule_created",
+    /// "user_deleted", "audit_exported"); anything unrecognized is Other — the
+    /// exact nano verb is always preserved verbatim in `api.operation`.
+    fn ocsf_activity(&self) -> (i64, &'static str) {
+        let action = self.action.to_lowercase();
+        if action.contains("creat") || action.contains("import") || action.contains("install") {
+            (1, "Create")
+        } else if action.contains("read") || action.contains("export") || action.contains("view") || action.contains("download") {
+            (2, "Read")
+        } else if action.contains("updat")
+            || action.contains("enabl")
+            || action.contains("disabl")
+            || action.contains("chang")
+            || action.contains("edit")
+        {
+            (3, "Update")
+        } else if action.contains("delet") || action.contains("remov") || action.contains("uninstall") {
+            (4, "Delete")
+        } else {
+            (99, "Other")
+        }
+    }
+
+    /// Convert this audit event into an OCSF API Activity (`class_uid` 6003)
+    /// `event` JSON for `ocsf_logs` storage (NAN-1390).
+    ///
+    /// Platform audit records are actor-performs-operation-on-resource shaped,
+    /// which is exactly the OCSF API Activity model (the same class CloudTrail
+    /// maps to): `actor.user` carries who, `api.operation`/`api.service.name`
+    /// carry the nano action + subsystem, `resources[]` carries what was acted
+    /// on, and `src_endpoint.ip`/`http_request.user_agent` carry the client.
+    /// The full nano-native payload mirrors `to_parsed_log`'s metadata under
+    /// `unmapped` — the sanctioned vendor-extension object (same pattern as the
+    /// NAN-1254 Detection Finding 2004 writer in `detection/findings.rs`) — so
+    /// no information is lost relative to the UDM row.
+    ///
+    /// `time` is epoch milliseconds per the OCSF `timestamp_t` spec; the caller
+    /// passes the same instant it binds into the explicit `timestamp` column so
+    /// the two never drift.
+    pub fn to_ocsf_event(&self, time: chrono::DateTime<Utc>) -> serde_json::Value {
+        let (activity_id, activity_name) = self.ocsf_activity();
+        const CLASS_UID: i64 = 6003; // API Activity
+
+        let (status_id, status) = if self.success {
+            (1, "Success")
+        } else {
+            (2, "Failure")
+        };
+
+        json!({
+            "class_uid": CLASS_UID,
+            "class_name": "API Activity",
+            "category_uid": 6,
+            "category_name": "Application Activity",
+            "activity_id": activity_id,
+            "activity_name": activity_name,
+            "type_uid": CLASS_UID * 100 + activity_id,
+            // OCSF `time` is epoch milliseconds.
+            "time": time.timestamp_millis(),
+            "message": self.build_message(),
+            "severity_id": 1,
+            "severity": "Informational",
+            "status_id": status_id,
+            "status": status,
+            "metadata": {
+                "product": { "name": "nano", "vendor_name": "nano" },
+                "log_name": "audit",
+            },
+            "actor": {
+                "user": {
+                    "name": self.actor_name,
+                    "uid": self.actor_id.map(|id| id.to_string()),
+                },
+            },
+            "api": {
+                "operation": self.action,
+                "service": { "name": self.source.to_string() },
+            },
+            "src_endpoint": { "ip": self.ip_address },
+            "http_request": { "user_agent": self.user_agent },
+            "resources": [{
+                "type": self.resource_type,
+                "uid": self.resource_id.map(|id| id.to_string()),
+                "name": self.resource_name,
+            }],
+            // nano vendor extension — byte-parity with the UDM row's metadata
+            // JSON (plus source/action, which UDM stores as top-level columns).
+            "unmapped": {
+                "source": self.source.to_string(),
+                "action": self.action,
+                "actor_id": self.actor_id.map(|id| id.to_string()),
+                "actor_name": self.actor_name,
+                "api_key_id": self.api_key_id.map(|id| id.to_string()),
+                "api_key_name": self.api_key_name,
+                "resource_type": self.resource_type,
+                "resource_id": self.resource_id.map(|id| id.to_string()),
+                "resource_name": self.resource_name,
+                "success": self.success,
+                "details": self.details,
+            },
+        })
     }
 }
 
@@ -405,6 +520,27 @@ mod tests {
         assert_eq!(AuditSource::Auth.to_string(), "auth");
         assert_eq!(AuditSource::Detection.to_string(), "detection");
         assert_eq!(AuditSource::User.to_string(), "user");
+        // Defenders filter exports by `source=audit`; lock the wire form (NAN-1365).
+        assert_eq!(AuditSource::Audit.to_string(), "audit");
+    }
+
+    #[test]
+    fn test_export_action_constants_are_stable() {
+        // Saved searches / dashboards key on these exact strings.
+        assert_eq!(crate::audit::AUDIT_LOGS_EXPORTED, "audit_logs_exported");
+        assert_eq!(crate::audit::RULES_EXPORTED, "rules_exported");
+    }
+
+    #[test]
+    fn test_search_history_action_constants_are_stable() {
+        // Anti-forensics hunts filter on these exact strings (NAN-1366).
+        assert_eq!(crate::audit::SEARCH_HISTORY_DELETED, "search_history_deleted");
+        assert_eq!(crate::audit::SEARCH_HISTORY_CLEARED, "search_history_cleared");
+        assert_eq!(crate::audit::SEARCH_HISTORY_ENABLED, "search_history_enabled");
+        assert_eq!(
+            crate::audit::SEARCH_HISTORY_DISABLED,
+            "search_history_disabled"
+        );
     }
 
     #[test]
@@ -468,5 +604,91 @@ mod tests {
 
         assert_eq!(log.status, Some("failure".to_string()));
         assert_eq!(log.auth_result, Some("failure".to_string()));
+    }
+
+    /// NAN-1390: the OCSF API Activity (6003) mirror-write contract. The event
+    /// must be spec-shaped (class/category/type_uid/time-in-ms) and carry the
+    /// full nano-native payload under `unmapped` with the same keys as the UDM
+    /// row's metadata JSON, so no information is lost relative to `logs`.
+    #[test]
+    fn test_audit_event_to_ocsf_event() {
+        let actor_id = Uuid::now_v7();
+        let resource_id = Uuid::now_v7();
+        let event = AuditEvent::builder(AuditSource::Detection, "rule_created")
+            .actor(Some(actor_id), Some("admin@example.com".to_string()))
+            .resource(
+                "detection_rule",
+                Some(resource_id),
+                Some("Suspicious Login".to_string()),
+            )
+            .client(Some("10.1.2.3".to_string()), Some("curl/8".to_string()))
+            .success(true)
+            .build();
+
+        let time = Utc::now();
+        let ocsf = event.to_ocsf_event(time);
+
+        assert_eq!(ocsf["class_uid"], 6003);
+        assert_eq!(ocsf["category_uid"], 6);
+        assert_eq!(ocsf["activity_id"], 1); // "rule_created" -> Create
+        assert_eq!(ocsf["type_uid"], 600301);
+        assert_eq!(ocsf["time"], time.timestamp_millis());
+        assert_eq!(ocsf["status_id"], 1);
+        assert_eq!(ocsf["status"], "Success");
+        // Identical hunt-able message in both storage shapes.
+        assert_eq!(ocsf["message"], event.to_parsed_log().message);
+        assert_eq!(ocsf["actor"]["user"]["name"], "admin@example.com");
+        assert_eq!(ocsf["actor"]["user"]["uid"], actor_id.to_string());
+        assert_eq!(ocsf["api"]["operation"], "rule_created");
+        assert_eq!(ocsf["api"]["service"]["name"], "detection");
+        assert_eq!(ocsf["src_endpoint"]["ip"], "10.1.2.3");
+        assert_eq!(ocsf["http_request"]["user_agent"], "curl/8");
+        assert_eq!(ocsf["resources"][0]["type"], "detection_rule");
+        assert_eq!(ocsf["resources"][0]["uid"], resource_id.to_string());
+        assert_eq!(ocsf["resources"][0]["name"], "Suspicious Login");
+        assert_eq!(ocsf["metadata"]["product"]["name"], "nano");
+
+        // `unmapped` carries every key the UDM row's metadata JSON carries,
+        // plus source/action (top-level columns on the UDM side).
+        let udm_metadata = event.to_parsed_log().metadata;
+        let unmapped = &ocsf["unmapped"];
+        for key in udm_metadata.as_object().unwrap().keys() {
+            assert!(
+                unmapped.get(key).is_some(),
+                "unmapped missing UDM metadata key '{key}'"
+            );
+            assert_eq!(&unmapped[key], &udm_metadata[key], "unmapped['{key}'] drifted");
+        }
+        assert_eq!(unmapped["source"], "detection");
+        assert_eq!(unmapped["action"], "rule_created");
+    }
+
+    #[test]
+    fn test_to_ocsf_event_failure_status() {
+        let event = AuditEvent::builder(AuditSource::Auth, "login_failed")
+            .success(false)
+            .build();
+        let ocsf = event.to_ocsf_event(Utc::now());
+        assert_eq!(ocsf["status_id"], 2);
+        assert_eq!(ocsf["status"], "Failure");
+        // No actor: nulls, not fabricated values.
+        assert!(ocsf["actor"]["user"]["name"].is_null());
+    }
+
+    #[test]
+    fn test_ocsf_activity_mapping() {
+        let activity = |action: &str| {
+            AuditEvent::builder(AuditSource::Settings, action)
+                .build()
+                .ocsf_activity()
+                .0
+        };
+        assert_eq!(activity("rule_created"), 1);
+        assert_eq!(activity("audit_exported"), 2);
+        assert_eq!(activity("settings_updated"), 3);
+        assert_eq!(activity("rule_enabled"), 3);
+        assert_eq!(activity("user_deleted"), 4);
+        assert_eq!(activity("member_removed"), 4);
+        assert_eq!(activity("login_success"), 99);
     }
 }

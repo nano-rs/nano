@@ -246,11 +246,9 @@ pub async fn create_lookup_table(
     let (table, records_inserted) = if table_exists {
         match mode {
             LookupMode::Replace => {
-                // Drop and recreate
-                lookup_service.drop_table(&config.name).await.map_err(|e| {
-                    ApiError::InternalError(format!("Failed to drop existing table: {}", e))
-                })?;
-
+                // NAN-1362: atomic staging + swap. A failed/malformed insert
+                // leaves the existing table and its data intact, instead of the
+                // old drop-then-recreate-then-insert that wiped data on failure.
                 let new_table = NewLookupTable {
                     name: config.name.clone(),
                     description: config.description.clone(),
@@ -258,17 +256,13 @@ pub async fn create_lookup_table(
                     primary_key: primary_key_sanitized.clone(),
                 };
 
+                let record_count = records.len();
                 let table = lookup_service
-                    .create_table(new_table, Some(auth.user_id()))
+                    .replace_table(new_table, records)
                     .await
                     .map_err(lookup_error_to_api)?;
 
-                let inserted = lookup_service
-                    .insert_records(&config.name, records)
-                    .await
-                    .map_err(lookup_error_to_api)?;
-
-                (table, inserted)
+                (table, record_count)
             }
             LookupMode::Append => {
                 // Append to existing table

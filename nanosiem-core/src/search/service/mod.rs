@@ -34,7 +34,7 @@ use super::execution::{
 };
 use super::processing::{
     apply_inputlookup_enrichment, apply_lookup_enrichment, apply_post_prevalence_commands,
-    apply_post_prevalence_commands_with_limit,
+    apply_post_prevalence_commands_with_limit, validate_lookup_tables,
 };
 use super::query_processing::{
     apply_auto_sort, detect_oom_risk, extract_ai_command, extract_asset_command,
@@ -114,6 +114,40 @@ fn determine_display_type(query: &Query) -> DisplayType {
             }
         }
     }
+}
+
+/// Input-side field-name validation for the nPL request path (NAN-1354).
+///
+/// Runs after parse and before SQL generation so a malformed or typo'd field
+/// reference is rejected with guidance instead of reaching codegen (which escapes
+/// it anyway) or ClickHouse (which fails opaquely). This is the second line of
+/// defense behind the generators' escaping — a defense-in-depth gate, not the
+/// sole protection.
+///
+/// Permissive by design: unknown ext-JSON fields and OCSF-dotted names pass;
+/// only names that closely resemble a UDM field (likely typos) or that fail the
+/// safe-format check are rejected. Output aliases (eval/rename/spath targets) are
+/// not format-checked here — codegen escaping owns their safety.
+///
+/// Profile-aware (NAN-1380): the active schema profile is consulted so a real
+/// column of the active schema (e.g. a promoted OCSF dotted column one edit
+/// away from a UDM name, `user.name` vs `user_name`) is never flagged as a typo.
+pub(crate) fn validate_query_field_names(
+    query: &Query,
+    profile: &dyn crate::schema::SchemaProfile,
+) -> Result<(), SearchError> {
+    if let Some(err) =
+        crate::query::validation::validate_query_fields_with_profile(query, Some(profile))
+            .into_iter()
+            .next()
+    {
+        return Err(SearchError::FieldNotFound {
+            field: err.field_name,
+            suggestions: err.suggestions,
+            message: err.message,
+        });
+    }
+    Ok(())
 }
 
 /// Get the semantic terminal command, skipping formatting commands like sort/head/tail

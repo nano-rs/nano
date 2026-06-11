@@ -40,6 +40,10 @@ if [ -z "$JWT_SECRET" ]; then
     echo -e "${YELLOW}⚠️  Using generated development JWT_SECRET${NC}"
     echo -e "${YELLOW}   For production, set JWT_SECRET environment variable${NC}"
 fi
+# NAN-1355: allow the built-in public dev encryption key when none is set, so local
+# dev boots even if a credential-encryption path initializes. Production never sets
+# this (real secrets are required and the boot fails closed without them).
+export NANOSIEM_ALLOW_DEFAULT_KEYS="${NANOSIEM_ALLOW_DEFAULT_KEYS:-true}"
 # Set AUTH_ENABLED=false to disable authentication (development only)
 export AUTH_ENABLED="${AUTH_ENABLED:-true}"
 

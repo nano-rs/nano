@@ -80,7 +80,7 @@ export interface RepositoryRule {
   tags: string[] | null;
   requires_fields: string[] | null;
   requires_source_types: string[] | null;
-  conversion_status: 'pending' | 'success' | 'failed' | 'manual';
+  conversion_status: 'pending' | 'success' | 'failed' | 'manual' | 'untranslated';
   converted_npl: string | null;
   conversion_confidence: number | null;
   conversion_warnings: string[] | null;

@@ -37,7 +37,11 @@ impl ClickHouseSqlGenerator {
             .filter_map(|agg| {
                 let alias_name = agg.output_alias();
                 if let Some(field) = &agg.field {
-                    if normalize_field_name(field) == alias_name {
+                    // by_field_output_name: an upstream-computed input keeps its
+                    // raw name (`max(method) AS method` after a rex capture is a
+                    // shadow too), everything else compares the normalized name
+                    // exactly as before (NAN-1341).
+                    if by_field_output_name(field, self) == alias_name {
                         return Some(alias_name);
                     }
                 }
@@ -146,7 +150,7 @@ impl ClickHouseSqlGenerator {
                 // ILLEGAL_AGGREGATION in GROUP BY/WHERE contexts.
                 // Use a temp `_agg_` prefix; the outer subquery renames it back.
                 let shadows_field = agg.field.as_ref()
-                    .map(|f| normalize_field_name(f) == alias_name)
+                    .map(|f| by_field_output_name(f, self) == alias_name)
                     .unwrap_or(false);
                 let sql_alias = if shadows_field {
                     format!("_agg_{}", alias_name)
@@ -165,9 +169,12 @@ impl ClickHouseSqlGenerator {
                     .iter()
                     .map(|f| {
                         let (expr, needs_cast) = field_to_sql_expr(f, self);
-                        // Use the normalized field name as alias so subsequent commands
-                        // can reference it consistently (e.g., _time -> timestamp)
-                        let normalized = normalize_field_name(f);
+                        // Output alias: the normalized field name so subsequent
+                        // commands can reference it consistently (e.g., _time ->
+                        // timestamp) — except an upstream value-computed by-field,
+                        // which keeps its raw name to match the shadowed expr
+                        // `field_to_sql_expr` just emitted (NAN-1341).
+                        let normalized = by_field_output_name(f, self);
                         // Wrap dynamic/JSON fields with toString() to match GROUP BY clause
                         // Always add explicit alias to ensure column name appears in output
                         if needs_cast {

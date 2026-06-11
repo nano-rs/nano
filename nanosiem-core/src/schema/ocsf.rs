@@ -34,8 +34,8 @@ use serde::Deserialize;
 
 use super::profile::SchemaProfile;
 use super::types::{
-    EnrichmentKind, EnrichmentMode, EntityRole, EntityType, FieldCategory, FieldDef,
-    FieldResolution, FieldType, SchemaId,
+    EnrichmentKind, EnrichmentMode, EntityRole, EntityType, EnumIntMapping, FieldCategory,
+    FieldDef, FieldResolution, FieldType, SchemaId,
 };
 
 /// Fully-qualified canonical OCSF table (`clickhouse/ocsf/init.sql`).
@@ -96,6 +96,17 @@ struct ManifestEntry {
     entity_type: Option<String>,
     #[serde(default)]
     category: Option<String>,
+    /// Fixed `lowercase label → integer id` table for an enum-int column whose
+    /// values are class-INDEPENDENT (`status_id`, `auth_protocol_id`,
+    /// `severity_id`). Drives [`EnumIntMapping::Values`] so string verbs compare
+    /// against the indexed int (NAN-1382).
+    #[serde(default)]
+    enum_values: Option<std::collections::HashMap<String, i64>>,
+    /// Sibling STRING column carrying the human label for a CLASS-SCOPED
+    /// enum-int column (`activity_id` → `activity`), where no fixed table can
+    /// exist. Drives [`EnumIntMapping::LabelColumn`] (NAN-1382).
+    #[serde(default)]
+    enum_label_column: Option<String>,
 }
 
 /// Default table-view summary fields for OCSF (the dotted analog of UDM's
@@ -198,6 +209,13 @@ struct OcsfRegistry {
     /// First mapping wins. Powers [`OcsfProfile::udm_column_sql`] so UDM-semantic
     /// raw-SQL builders resolve to the right OCSF column (NAN-1241).
     udm_to_column: std::collections::HashMap<String, String>,
+    /// Enum-int column → fixed `lowercase label → id` table (manifest
+    /// `enum_values`, NAN-1382). Keys are column names (`status_id`); labels are
+    /// stored lowercased so lookup is case-insensitive.
+    enum_values: std::collections::HashMap<String, std::collections::HashMap<String, i64>>,
+    /// Class-scoped enum-int column → sibling label String column (manifest
+    /// `enum_label_column`, NAN-1382), e.g. `activity_id` → `activity`.
+    enum_label_columns: std::collections::HashMap<String, String>,
 }
 
 fn registry() -> &'static OcsfRegistry {
@@ -213,6 +231,12 @@ fn registry() -> &'static OcsfRegistry {
         let mut fields: Vec<FieldDef> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         let mut udm_to_column: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut enum_values: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, i64>,
+        > = std::collections::HashMap::new();
+        let mut enum_label_columns: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
 
         for e in &entries {
@@ -233,6 +257,21 @@ fn registry() -> &'static OcsfRegistry {
             }
             if e.is_search_col {
                 search_stems.insert(e.ch_column_name.clone());
+            }
+            // Enum metadata (NAN-1382). Labels are lowercased defensively so a
+            // capitalized manifest label still matches the lowercase lookup. A
+            // column appearing in multiple entries (activity_id ×3) merges; the
+            // metadata is identical across its rows by construction.
+            if let Some(values) = &e.enum_values {
+                let m = enum_values.entry(e.ch_column_name.clone()).or_default();
+                for (label, id) in values {
+                    m.insert(label.to_lowercase(), *id);
+                }
+            }
+            if let Some(sibling) = &e.enum_label_column {
+                enum_label_columns
+                    .entry(e.ch_column_name.clone())
+                    .or_insert_with(|| sibling.clone());
             }
             if seen.insert(e.ch_column_name.clone()) {
                 fields.push(FieldDef {
@@ -276,6 +315,8 @@ fn registry() -> &'static OcsfRegistry {
             search_stems,
             lowercased,
             udm_to_column,
+            enum_values,
+            enum_label_columns,
         }
     })
 }
@@ -343,6 +384,47 @@ const OCSF_UNIFIED_COLUMNS: &[&str] = &[
     "url_domain_unified",
     "url_unified",
     "src_host_unified",
+];
+
+/// Columns the OCSF DDL owns for bookkeeping/ingest that legitimately have no
+/// manifest promotion entry. `source_type` is the operational provenance/routing
+/// key — ingest-written from the `X-Source-Type` header (not derived from the
+/// OCSF `event`), so like `event`/`timestamp`/`_inserted_at` it must NOT be
+/// required as a manifest promotion (NAN-1241).
+///
+/// NAN-1333: the `*_unified` columns are DERIVED — a class-spanning
+/// `if(primary != s, primary, fallback)` union of two ALREADY-promoted manifest
+/// columns, not a new OCSF source field. They exist only to give the codegen a
+/// single indexed column to filter/group on. Each one's two source columns ARE in
+/// the manifest; the union itself is bookkeeping, like the prevalence_* derivations.
+///
+/// NAN-1385: `event_bytes` is the stored-payload size feeding the
+/// ocsf_logs_per_source_5m_mv telemetry rollup — pure operational bookkeeping,
+/// never a queryable OCSF field.
+///
+/// Consumed by the `ocsf_manifest_ddl_consistency` DDL↔manifest gate AND by the
+/// field-stats inventory regression tests (NAN-1397): a bookkeeping column that
+/// is MATERIALIZED and not in [`SchemaProfile::materialized_columns`]'s re-add
+/// list (i.e. invisible inside the companion's CTE wrap) must be excluded from
+/// the analyst-facing field-stats inventory, or every wrapped OCSF search fails
+/// with Code 47 and degrades to client-side stats. Register any future
+/// metering/bookkeeping column here.
+pub const OCSF_BOOKKEEPING_COLUMNS: &[&str] = &[
+    "event",
+    "timestamp",
+    "_inserted_at",
+    "source_type",
+    "process_name_unified",
+    "process_path_unified",
+    "command_line_unified",
+    "process_id_unified",
+    "process_guid_unified",
+    "process_hash_unified",
+    "user_unified",
+    "url_domain_unified",
+    "url_unified",
+    "src_host_unified",
+    "event_bytes",
 ];
 
 /// NAN-1333: the INDEXED unified physical column that materializes the exact
@@ -552,6 +634,36 @@ impl SchemaProfile for OcsfProfile {
         if let Some(col) = registry().udm_to_column.get(npl_field) {
             return FieldResolution::ExplicitColumn(col.clone());
         }
+        // UDM-muscle-memory tail prefixes (NAN-1388, G14). Under UDM the JSON
+        // spill column is `ext`, so saved searches write `ext.error_code=…`.
+        // OCSF carries no top-level `ext` key — its spill location is
+        // `unmapped.*` inside `event` — so without remapping these terms
+        // JSONExtract a key that never exists and return silently empty.
+        // Strip-and-remap: `ext.foo` resolves as `unmapped.foo`, and
+        // `event.foo` (the tail column named explicitly) strips the prefix and
+        // resolves the rest — landing on the promoted column when one exists,
+        // else the `event` tail below. No manifest column or UDM alias starts
+        // with `ext.`/`event.` (verified), so nothing real is shadowed; bare
+        // `ext`/`event` (no dot) are untouched, keeping the `spath input=ext`
+        // tail fallback (#2043) intact. Aligns bare `ext.*` terms with the
+        // already-remapped `spath input=ext` surface. UDM is unaffected (this
+        // is OcsfProfile::resolve; `ext.*` is native there).
+        if let Some(rest) = npl_field.strip_prefix("ext.") {
+            // Re-resolve so a (hypothetical future) promoted `unmapped.*`
+            // column would win. Depth is bounded: `unmapped.…` matches neither
+            // prefix arm, so this recurses at most once more.
+            return self.resolve(&format!("unmapped.{rest}"));
+        }
+        if npl_field.starts_with("event.") {
+            // Strip ALL leading `event.` segments iteratively (not one per
+            // recursive call) so an adversarial `event.event.…` chain cannot
+            // grow the stack with the input length.
+            let mut rest = npl_field;
+            while let Some(r) = rest.strip_prefix("event.") {
+                rest = r;
+            }
+            return self.resolve(rest);
+        }
         // Everything else is the unpromoted `event` tail → N-level JSONExtract.
         FieldResolution::JsonPath {
             col: OCSF_EVENT_COLUMN.to_string(),
@@ -585,10 +697,16 @@ impl SchemaProfile for OcsfProfile {
     }
 
     fn is_lowercased_at_ingest(&self, field: &str) -> bool {
-        // `source_type` is lowercased by ingestion (downcase of X-Source-Type),
-        // mirroring UDM — so the generator skips the redundant lower() wrapper and
-        // the set index applies directly on equality.
-        field == OCSF_SOURCE_TYPE_COLUMN || registry().lowercased.contains(field)
+        // `source_type` is deliberately NOT in this set (NAN-1384, G18). The
+        // Vector lane lowercases it (downcase of X-Source-Type), but ocsf_logs
+        // also accepts DIRECT client INSERTs and a client-written DEFAULT column
+        // cannot be normalized server-side — a MixedCase direct write used to
+        // produce rows the `source_type = '<lowered>'` fast-path could never
+        // match (silently filter-invisible). Queries now emit
+        // `lower(source_type) = '...'`; on a LowCardinality column lower() is
+        // evaluated per dictionary entry, so the cost is negligible. UDM keeps
+        // its fast-path: `logs` ingestion is exclusively Vector-owned.
+        registry().lowercased.contains(field)
     }
 
     fn is_numeric_field(&self, field: &str) -> bool {
@@ -728,6 +846,24 @@ impl SchemaProfile for OcsfProfile {
         registry().udm_to_column.get(udm_field).cloned()
     }
 
+    fn enum_int_mapping(&self, field: &str) -> Option<EnumIntMapping<'_>> {
+        // Resolve the nPL token first so BOTH spellings work: the UDM-semantic
+        // alias (`auth_result` → `status_id` via the manifest correspondence)
+        // and the native column name (`status_id` itself). Anything that does
+        // not land on a single physical column has no enum semantics.
+        let col = match self.resolve(field) {
+            FieldResolution::ExplicitColumn(col) => col,
+            _ => return None,
+        };
+        let reg = registry();
+        if let Some(values) = reg.enum_values.get(&col) {
+            return Some(EnumIntMapping::Values(values));
+        }
+        reg.enum_label_columns
+            .get(&col)
+            .map(|sibling| EnumIntMapping::LabelColumn(sibling.as_str()))
+    }
+
     fn enrichment_field(&self, semantic: EnrichmentKind) -> Option<FieldResolution> {
         let col = match semantic {
             EnrichmentKind::SrcCountry => "src_endpoint.location.country",
@@ -803,8 +939,14 @@ mod tests {
             p.display_field_name("src_host").as_deref(),
             Some("src_endpoint.hostname")
         );
+        // NAN-1383: `prevalence_min` is a real promoted column now (least() of
+        // the four prevalence_* columns) — displays under its own name.
+        assert_eq!(
+            p.display_field_name("prevalence_min").as_deref(),
+            Some("prevalence_min")
+        );
         // Concept OCSF doesn't map → None (caller falls back).
-        assert_eq!(p.display_field_name("prevalence_min"), None);
+        assert_eq!(p.display_field_name("parent_process_name"), None);
     }
 
     /// NAN-1302: `device.hostname` must be in the entity-extraction order so
@@ -875,6 +1017,68 @@ mod tests {
             },
         );
         assert!(!p.is_known_field("actor.process.parent_process.name"));
+    }
+
+    /// NAN-1388 (G14): UDM-muscle-memory `ext.foo` strips to the OCSF spill
+    /// location `unmapped.foo`, and `event.foo` strips the explicit tail-column
+    /// prefix and resolves the rest. Before the fix both JSONExtract'd a
+    /// top-level `ext`/`event` key that never exists → silently 0 rows
+    /// (ext.error_code = 0 vs unmapped.error_code = 23,117 on demo data).
+    #[test]
+    fn ext_and_event_prefixes_strip_and_remap() {
+        let p = OcsfProfile::new();
+        // ext.foo → unmapped.foo in the event tail.
+        assert_eq!(
+            p.resolve("ext.error_code"),
+            FieldResolution::JsonPath {
+                col: "event".into(),
+                path: vec!["unmapped".into(), "error_code".into()],
+            },
+        );
+        // Nested ext path keeps the rest of the path intact.
+        assert_eq!(
+            p.resolve("ext.request.method"),
+            FieldResolution::JsonPath {
+                col: "event".into(),
+                path: vec!["unmapped".into(), "request".into(), "method".into()],
+            },
+        );
+        // event.<unpromoted> → the stripped path in the event tail (no
+        // top-level 'event' key).
+        assert_eq!(
+            p.resolve("event.actor.process.parent_process.name"),
+            FieldResolution::JsonPath {
+                col: "event".into(),
+                path: vec![
+                    "actor".into(),
+                    "process".into(),
+                    "parent_process".into(),
+                    "name".into(),
+                ],
+            },
+        );
+        // event.<promoted> lands on the promoted column (same value, indexed).
+        assert_eq!(
+            p.resolve("event.src_endpoint.ip"),
+            FieldResolution::ExplicitColumn("src_endpoint.ip".to_string()),
+        );
+        // Bare `ext` / `event` (no dot) are untouched — `spath input=ext`'s
+        // tail fallback (#2043) keys off the unresolved form.
+        assert_eq!(
+            p.resolve("ext"),
+            FieldResolution::JsonPath {
+                col: "event".into(),
+                path: vec!["ext".into()],
+            },
+        );
+        // ext.unmapped.foo composes (strip once, no double-prefix).
+        assert_eq!(
+            p.resolve("ext.unmapped.foo"),
+            FieldResolution::JsonPath {
+                col: "event".into(),
+                path: vec!["unmapped".into(), "unmapped".into(), "foo".into()],
+            },
+        );
     }
 
     #[test]
@@ -998,10 +1202,13 @@ mod tests {
     #[test]
     fn source_type_speed_path_matches_udm() {
         let p = OcsfProfile::new();
-        // PREWHERE-eligible (high-frequency first-filter) and lowercased-at-ingest
-        // (generator skips lower() and the set index applies) — exactly like UDM.
+        // PREWHERE-eligible (high-frequency first-filter), exactly like UDM.
         assert!(p.prewhere_fields().contains(&"source_type"));
-        assert!(p.is_lowercased_at_ingest("source_type"));
+        // NAN-1384 (G18): NOT lowercased-at-ingest under OCSF. ocsf_logs accepts
+        // direct client INSERTs that may carry MixedCase source_type values; the
+        // generator must emit lower(source_type) or those rows are silently
+        // filter-invisible. (UDM keeps the fast-path — Vector owns its ingest.)
+        assert!(!p.is_lowercased_at_ingest("source_type"));
     }
 
     #[test]
@@ -1058,6 +1265,12 @@ mod tests {
         assert_eq!(
             p.udm_column_sql("prevalence_dest_ip").as_deref(),
             Some("prevalence_dest_ip")
+        );
+        // NAN-1383: prevalence_min is promoted too (least() of the four columns,
+        // materialized in the DDL) so prevalence-gated saved content resolves it.
+        assert_eq!(
+            p.udm_column_sql("prevalence_min").as_deref(),
+            Some("prevalence_min")
         );
         // Concepts OCSF still has no column for → None so callers skip the field.
         assert_eq!(p.udm_column_sql("parent_process_name"), None);
@@ -1144,6 +1357,51 @@ mod tests {
         );
         // No inline `if(` in the emitted raw-SQL reference for a split concept.
         assert!(!ocsf.udm_column_sql("src_host").unwrap().contains("if("));
+    }
+
+    /// NAN-1382 (G6): manifest-driven enum label→int metadata. Fixed-table enum
+    /// columns (status_id / auth_protocol_id / severity_id) expose `Values`;
+    /// the class-scoped activity_id exposes its sibling label column; both the
+    /// UDM alias and the native column spelling resolve; string columns and
+    /// plain numerics expose nothing.
+    #[test]
+    fn enum_int_mapping_resolves_aliases_and_native_columns() {
+        let p = OcsfProfile::new();
+        // UDM alias → fixed table on the resolved int column.
+        match p.enum_int_mapping("auth_result") {
+            Some(EnumIntMapping::Values(m)) => {
+                assert_eq!(m.get("failure"), Some(&2));
+                assert_eq!(m.get("success"), Some(&1));
+                assert_eq!(m.get("unknown"), Some(&0));
+                assert_eq!(m.get("other"), Some(&99));
+            }
+            other => panic!("auth_result must map to a fixed enum table, got {other:?}"),
+        }
+        // Native column spelling resolves to the same table.
+        assert_eq!(p.enum_int_mapping("status_id"), p.enum_int_mapping("auth_result"));
+        match p.enum_int_mapping("auth_type") {
+            Some(EnumIntMapping::Values(m)) => {
+                assert_eq!(m.get("kerberos"), Some(&2));
+                assert_eq!(m.get("ntlm"), Some(&1));
+            }
+            other => panic!("auth_type must map to a fixed enum table, got {other:?}"),
+        }
+        match p.enum_int_mapping("severity_id") {
+            Some(EnumIntMapping::Values(m)) => assert_eq!(m.get("high"), Some(&4)),
+            other => panic!("severity_id must map to a fixed enum table, got {other:?}"),
+        }
+        // Class-scoped activity_id (and its UDM aliases) → sibling label column.
+        for f in ["event_type", "file_action", "change_type", "activity_id"] {
+            assert_eq!(
+                p.enum_int_mapping(f),
+                Some(EnumIntMapping::LabelColumn("activity")),
+                "{f} must redirect string verbs to the sibling `activity` column"
+            );
+        }
+        // String columns / plain numerics / unknowns expose nothing.
+        for f in ["status", "severity", "action", "src_ip", "src_endpoint.port", "nonexistent"] {
+            assert!(p.enum_int_mapping(f).is_none(), "{f} must have no enum mapping");
+        }
     }
 
     #[test]

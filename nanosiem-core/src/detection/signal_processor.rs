@@ -694,6 +694,76 @@ impl SignalProcessor {
         Ok(())
     }
 
+    /// Build the matched-log fetch SQL for the active schema profile (NAN-1377).
+    ///
+    /// Every identifier is profile-resolved so the query is valid against both
+    /// physical schemas:
+    /// - `metadata` (the full-context JSON blob): UDM has a literal `metadata`
+    ///   String column; OCSF has no such column — its full event lives in the
+    ///   `event` JSON column (the profile's `json_tail_column`), so it is read
+    ///   as `toString(event) AS metadata`. Selecting the literal under OCSF was
+    ///   CH Code 47 → every real-time signal warn-skipped (zero alerts, G1).
+    /// - `ts`: `toUnixTimestamp64Micro(timestamp)` is precision-independent —
+    ///   it yields µs ticks for both UDM's DateTime64(6) (byte-identical to the
+    ///   old `reinterpretAsInt64`) and OCSF's DateTime64(3), where the raw
+    ///   reinterpret returned ms ticks that `from_timestamp_micros` silently
+    ///   decoded to 1970 dates (G10).
+    fn build_fetch_matched_log_query(
+        profile: &dyn crate::schema::SchemaProfile,
+        logs_table: &str,
+        log_id: Uuid,
+    ) -> String {
+        // Resolve a UDM-semantic entity field to a SELECT clause aliased back to
+        // the canonical name. When the active schema has no column for that
+        // concept, emit `'' AS <field>` so the typed row keeps its shape.
+        let entity_col = |udm_field: &str| -> String {
+            match profile.udm_column_sql(udm_field) {
+                Some(sql) => format!("{sql} AS {udm_field}"),
+                None => format!("'' AS {udm_field}"),
+            }
+        };
+
+        // UDM carries the full original log in its `metadata` String column;
+        // OCSF carries the full event in the JSON tail column (`event`).
+        let metadata_expr = match profile.id() {
+            crate::schema::SchemaId::Udm => "metadata".to_string(),
+            crate::schema::SchemaId::Ocsf => {
+                format!("toString({}) AS metadata", profile.json_tail_column())
+            }
+        };
+
+        // Only fetch key fields for alert context - metadata contains the full original log
+        format!(
+            r#"
+            SELECT
+                toString(id) as log_id,
+                toUnixTimestamp64Micro(timestamp) as ts,
+                message,
+                {metadata},
+                source_type,
+                {src_ip},
+                {dest_ip},
+                {src_host},
+                {dest_host},
+                {src_user},
+                {dest_user},
+                {risk_entity}
+            FROM {logs_table}
+            WHERE id = '{}'
+            LIMIT 1
+            "#,
+            log_id,
+            metadata = metadata_expr,
+            src_ip = entity_col("src_ip"),
+            dest_ip = entity_col("dest_ip"),
+            src_host = entity_col("src_host"),
+            dest_host = entity_col("dest_host"),
+            src_user = entity_col("src_user"),
+            dest_user = entity_col("dest_user"),
+            risk_entity = entity_col("risk_entity"),
+        )
+    }
+
     /// Fetch a matched log from ClickHouse by ID
     /// Returns key identifying fields plus the metadata JSON blob for full context
     async fn fetch_matched_log(
@@ -715,45 +785,7 @@ impl SignalProcessor {
         };
         let logs_table = dual_pool.table_names().read(logs_table_key);
 
-        // Resolve a UDM-semantic entity field to a SELECT clause aliased back to
-        // the canonical name. When the active schema has no column for that
-        // concept, emit `'' AS <field>` so the typed row keeps its shape.
-        let entity_col = |udm_field: &str| -> String {
-            match profile.udm_column_sql(udm_field) {
-                Some(sql) => format!("{sql} AS {udm_field}"),
-                None => format!("'' AS {udm_field}"),
-            }
-        };
-
-        // Only fetch key fields for alert context - metadata contains the full original log
-        let query = format!(
-            r#"
-            SELECT
-                toString(id) as log_id,
-                reinterpretAsInt64(timestamp) as ts,
-                message,
-                metadata,
-                source_type,
-                {src_ip},
-                {dest_ip},
-                {src_host},
-                {dest_host},
-                {src_user},
-                {dest_user},
-                {risk_entity}
-            FROM {logs_table}
-            WHERE id = '{}'
-            LIMIT 1
-            "#,
-            log_id,
-            src_ip = entity_col("src_ip"),
-            dest_ip = entity_col("dest_ip"),
-            src_host = entity_col("src_host"),
-            dest_host = entity_col("dest_host"),
-            src_user = entity_col("src_user"),
-            dest_user = entity_col("dest_user"),
-            risk_entity = entity_col("risk_entity"),
-        );
+        let query = Self::build_fetch_matched_log_query(profile.as_ref(), &logs_table, log_id);
 
         let ch_client = dual_pool.clickhouse();
 
@@ -864,5 +896,78 @@ mod tests {
         let dt = Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 45).unwrap();
         let formatted = SignalProcessor::format_datetime_for_ch(&dt);
         assert_eq!(formatted, "2024-01-15 10:30:45.000000");
+    }
+
+    // NAN-1377 (G1+G10): the matched-log fetch SQL must be valid against the
+    // active profile's physical schema. Under OCSF the old query selected the
+    // nonexistent literal `metadata` column (CH Code 47 → every real-time
+    // signal warn-skipped → zero alerts) and decoded DateTime64(3) ms ticks as
+    // µs (1970 timestamps).
+
+    #[test]
+    fn test_fetch_matched_log_query_udm() {
+        let profile = crate::schema::UdmProfile::new();
+        let log_id = Uuid::parse_str("019e3bf3-ff47-7273-936a-8d426d333343").unwrap();
+        let query =
+            SignalProcessor::build_fetch_matched_log_query(&profile, "nanosiem.logs", log_id);
+
+        // UDM keeps the literal `metadata` column and identity entity aliases.
+        // `toUnixTimestamp64Micro(timestamp)` on DateTime64(6) yields the same
+        // µs ticks as the old `reinterpretAsInt64` (verified against CH), so
+        // UDM decode behavior is unchanged.
+        let expected = r#"
+            SELECT
+                toString(id) as log_id,
+                toUnixTimestamp64Micro(timestamp) as ts,
+                message,
+                metadata,
+                source_type,
+                src_ip AS src_ip,
+                dest_ip AS dest_ip,
+                src_host AS src_host,
+                dest_host AS dest_host,
+                src_user AS src_user,
+                dest_user AS dest_user,
+                risk_entity AS risk_entity
+            FROM nanosiem.logs
+            WHERE id = '019e3bf3-ff47-7273-936a-8d426d333343'
+            LIMIT 1
+            "#;
+        assert_eq!(query, expected);
+    }
+
+    #[test]
+    fn test_fetch_matched_log_query_ocsf() {
+        let profile = crate::schema::OcsfProfile::new();
+        let log_id = Uuid::parse_str("019ea2f0-9453-7db5-aec0-12fb99f7b373").unwrap();
+        let query =
+            SignalProcessor::build_fetch_matched_log_query(&profile, "nanosiem.ocsf_logs", log_id);
+
+        // The full-context blob comes from the OCSF JSON tail column — never
+        // the bare `metadata` identifier, which does not exist on ocsf_logs.
+        assert!(
+            query.contains("toString(event) AS metadata"),
+            "OCSF metadata must read the event JSON column: {query}"
+        );
+        assert!(
+            !query.contains("\n                metadata,"),
+            "OCSF query must not select the bare `metadata` column: {query}"
+        );
+        // Precision-independent µs decode (DateTime64(3) on ocsf_logs).
+        assert!(
+            query.contains("toUnixTimestamp64Micro(timestamp) as ts"),
+            "timestamp must decode via toUnixTimestamp64Micro: {query}"
+        );
+        assert!(
+            !query.contains("reinterpretAsInt64"),
+            "raw reinterpret reads DateTime64(3) as ms ticks: {query}"
+        );
+        // Entity concepts resolve to promoted OCSF columns, aliased back to the
+        // UDM-semantic names the typed row deserializes by.
+        assert!(query.contains(r#""src_endpoint.ip" AS src_ip"#), "{query}");
+        assert!(query.contains(r#""dst_endpoint.ip" AS dest_ip"#), "{query}");
+        // Concepts OCSF does not carry keep the row shape via '' fallbacks.
+        assert!(query.contains("'' AS risk_entity"), "{query}");
+        assert!(query.contains("FROM nanosiem.ocsf_logs"), "{query}");
     }
 }

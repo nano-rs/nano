@@ -20,11 +20,11 @@ mod types;
 mod udm;
 
 pub use boot_validation::{validate_active_schema_table, SchemaValidationError};
-pub use ocsf::OcsfProfile;
+pub use ocsf::{OcsfProfile, OCSF_BOOKKEEPING_COLUMNS};
 pub use profile::SchemaProfile;
 pub use types::{
-    EnrichmentKind, EnrichmentMode, EntityRole, EntityType, FieldCategory, FieldDef,
-    FieldResolution, FieldType, SchemaId,
+    EnrichmentKind, EnrichmentMode, EntityRole, EntityType, EnumIntMapping, FieldCategory,
+    FieldDef, FieldResolution, FieldType, SchemaId,
 };
 pub use udm::UdmProfile;
 
@@ -113,6 +113,60 @@ pub fn active_repo_path(stored: &str) -> String {
         .unwrap_or_else(|_| stored.to_string())
 }
 
+/// Remap a folder-picker selected path to its `-ocsf` sibling for a given
+/// schema id. Folder-picker paths are built as `<rules_path>/<folder>`, so the
+/// sibling lives at `<rules_path>-ocsf/<folder>` when the repository has a
+/// non-empty configured base ("rules/credential_access" →
+/// "rules-ocsf/credential_access"). When the base is empty (trees at the repo
+/// root — the nano-rs/rules layout) or the selected path lies outside the
+/// base, the sibling convention applies to the path's first segment instead
+/// ("demo" → "demo-ocsf"). Idempotent — a segment already ending in `-ocsf`
+/// is returned as-is — and byte-identical under UDM. Pure (env-free) so it is
+/// unit-testable; `active_selected_repo_path` is the env-resolving wrapper.
+/// NAN-1387.
+pub fn selected_repo_path_for(id: SchemaId, stored_base: &str, selected: &str) -> String {
+    match id {
+        SchemaId::Udm => selected.to_string(),
+        SchemaId::Ocsf => {
+            let base = stored_base.trim_start_matches('/').trim_end_matches('/');
+            let sel = selected.trim_start_matches('/').trim_end_matches('/');
+            if !base.is_empty() {
+                let remapped_base = repo_path_for(SchemaId::Ocsf, base);
+                let remapped_base = remapped_base.trim_end_matches('/');
+                if sel == base {
+                    return remapped_base.to_string();
+                }
+                if let Some(rest) = sel.strip_prefix(&format!("{base}/")) {
+                    return format!("{remapped_base}/{rest}");
+                }
+            }
+            // Empty base (repo-root trees) or a path outside the configured
+            // base: remap the first segment to its `-ocsf` sibling.
+            let (first, rest) = match sel.split_once('/') {
+                Some((first, rest)) => (first, Some(rest)),
+                None => (sel, None),
+            };
+            if first.is_empty() || first.ends_with("-ocsf") {
+                return selected.to_string();
+            }
+            match rest {
+                Some(rest) => format!("{first}-ocsf/{rest}"),
+                None => format!("{first}-ocsf"),
+            }
+        }
+    }
+}
+
+/// The `-ocsf` sibling of a folder-picker selected path for the
+/// env-configured schema profile. Env-resolving wrapper over
+/// [`selected_repo_path_for`]; on any resolution error the selected path is
+/// returned unchanged so a malformed env never breaks sync. NAN-1387.
+pub fn active_selected_repo_path(stored_base: &str, selected: &str) -> String {
+    active_profile_from_env()
+        .map(|p| selected_repo_path_for(p.id(), stored_base, selected))
+        .unwrap_or_else(|_| selected.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +197,61 @@ mod tests {
         assert_eq!(repo_path_for(SchemaId::Ocsf, "parsers"), "parsers-ocsf/");
         // OCSF: idempotent — an already-OCSF path is left as-is
         assert_eq!(repo_path_for(SchemaId::Ocsf, "parsers-ocsf/"), "parsers-ocsf/");
+    }
+
+    // NAN-1387: folder-picker selected-path dispatch. UDM returns the selected
+    // path unchanged (byte-identical); OCSF walks the `-ocsf` sibling tree.
+    #[test]
+    fn selected_repo_path_for_dispatches_by_profile() {
+        // UDM: unchanged, regardless of base
+        assert_eq!(
+            selected_repo_path_for(SchemaId::Udm, "rules/", "rules/credential_access"),
+            "rules/credential_access"
+        );
+        assert_eq!(selected_repo_path_for(SchemaId::Udm, "", "demo"), "demo");
+
+        // OCSF + non-empty base: sibling of the configured base
+        assert_eq!(
+            selected_repo_path_for(SchemaId::Ocsf, "rules/", "rules/credential_access"),
+            "rules-ocsf/credential_access"
+        );
+        assert_eq!(
+            selected_repo_path_for(SchemaId::Ocsf, "rules", "rules/demo/sub"),
+            "rules-ocsf/demo/sub"
+        );
+        // Selecting the base itself
+        assert_eq!(
+            selected_repo_path_for(SchemaId::Ocsf, "rules/", "rules"),
+            "rules-ocsf"
+        );
+        // Nested base swaps the whole base, not its first segment
+        assert_eq!(
+            selected_repo_path_for(SchemaId::Ocsf, "detections/rules/", "detections/rules/impact"),
+            "detections/rules-ocsf/impact"
+        );
+
+        // OCSF + empty base (repo-root trees, the nano-rs/rules layout):
+        // first-segment sibling
+        assert_eq!(selected_repo_path_for(SchemaId::Ocsf, "", "demo"), "demo-ocsf");
+        assert_eq!(
+            selected_repo_path_for(SchemaId::Ocsf, "", "credential_access/sub"),
+            "credential_access-ocsf/sub"
+        );
+        // Path outside the configured base falls back to first-segment sibling
+        assert_eq!(
+            selected_repo_path_for(SchemaId::Ocsf, "rules/", "demo"),
+            "demo-ocsf"
+        );
+
+        // OCSF: idempotent — an already-OCSF selection is left as-is
+        assert_eq!(
+            selected_repo_path_for(SchemaId::Ocsf, "", "demo-ocsf"),
+            "demo-ocsf"
+        );
+        assert_eq!(
+            selected_repo_path_for(SchemaId::Ocsf, "rules-ocsf/", "rules-ocsf/impact"),
+            "rules-ocsf/impact"
+        );
     }
 
     // --- Anti-drift gate: UdmProfile must reproduce every const array exactly ---

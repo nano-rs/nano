@@ -359,6 +359,69 @@ impl LookupRepository {
         Ok(())
     }
 
+    /// Atomically swap a freshly-built staging table in for the live one
+    /// (NAN-1362). In a single transaction: drop the old physical table, rename
+    /// the staging table to the old physical name, and update the registry
+    /// schema/stats. Postgres has transactional DDL, so if anything here fails
+    /// the old table is left fully intact. The caller is responsible for having
+    /// already created + populated `staging_physical`.
+    #[instrument(skip(self, columns))]
+    pub async fn swap_staged_table(
+        &self,
+        old_physical: &str,
+        staging_physical: &str,
+        registry_name: &str,
+        columns: &[LookupColumn],
+        primary_key: Option<&str>,
+        row_count: i64,
+    ) -> Result<(), LookupRepositoryError> {
+        if !Self::is_valid_identifier(old_physical) {
+            return Err(LookupRepositoryError::InvalidTableName(
+                old_physical.to_string(),
+            ));
+        }
+        if !Self::is_valid_identifier(staging_physical) {
+            return Err(LookupRepositoryError::InvalidTableName(
+                staging_physical.to_string(),
+            ));
+        }
+
+        let columns_json = serde_json::to_value(columns).map_err(|e| {
+            LookupRepositoryError::DatabaseError(sqlx::Error::Protocol(e.to_string()))
+        })?;
+
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query(&format!("DROP TABLE IF EXISTS \"{}\" CASCADE", old_physical))
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query(&format!(
+            "ALTER TABLE \"{}\" RENAME TO \"{}\"",
+            staging_physical, old_physical
+        ))
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            UPDATE lookup_tables_registry
+            SET columns = $2, primary_key = $3, row_count = $4,
+                size_bytes = 0, updated_at = NOW()
+            WHERE name = $1
+            "#,
+        )
+        .bind(registry_name)
+        .bind(columns_json)
+        .bind(primary_key)
+        .bind(row_count)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Insert records into a dynamic lookup table
     #[instrument(skip(self, records))]
     pub async fn insert_records(
@@ -968,7 +1031,18 @@ impl LookupRepository {
         col_type: &ColumnType,
     ) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
         match value {
-            None | Some(serde_json::Value::Null) => query.bind(None::<String>),
+            // NAN-1361: bind a type-correct NULL per column. Binding `None::<String>`
+            // for a non-text column (e.g. a bigint column missing from a ragged row)
+            // sends a text parameter into that column -> SQLSTATE 42804 datatype_mismatch
+            // -> 500. A typed NULL inserts cleanly.
+            None | Some(serde_json::Value::Null) => match col_type {
+                ColumnType::Text => query.bind(None::<String>),
+                ColumnType::Integer => query.bind(None::<i64>),
+                ColumnType::Float => query.bind(None::<f64>),
+                ColumnType::Boolean => query.bind(None::<bool>),
+                ColumnType::Timestamp => query.bind(None::<DateTime<Utc>>),
+                ColumnType::Json => query.bind(None::<serde_json::Value>),
+            },
             Some(v) => match col_type {
                 ColumnType::Text => query.bind(Self::json_value_to_string(v)),
                 ColumnType::Integer => {
@@ -999,7 +1073,18 @@ impl LookupRepository {
         col_type: &ColumnType,
     ) -> sqlx::query::QueryScalar<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments> {
         match value {
-            None | Some(serde_json::Value::Null) => query.bind(None::<String>),
+            // NAN-1361: bind a type-correct NULL per column. Binding `None::<String>`
+            // for a non-text column (e.g. a bigint column missing from a ragged row)
+            // sends a text parameter into that column -> SQLSTATE 42804 datatype_mismatch
+            // -> 500. A typed NULL inserts cleanly.
+            None | Some(serde_json::Value::Null) => match col_type {
+                ColumnType::Text => query.bind(None::<String>),
+                ColumnType::Integer => query.bind(None::<i64>),
+                ColumnType::Float => query.bind(None::<f64>),
+                ColumnType::Boolean => query.bind(None::<bool>),
+                ColumnType::Timestamp => query.bind(None::<DateTime<Utc>>),
+                ColumnType::Json => query.bind(None::<serde_json::Value>),
+            },
             Some(v) => match col_type {
                 ColumnType::Text => query.bind(Self::json_value_to_string(v)),
                 ColumnType::Integer => query.bind(v.as_i64()),

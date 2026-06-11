@@ -213,7 +213,7 @@ impl ParsedRecord {
 }
 
 /// Error information for a failed record
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RecordError {
     /// Line number where the error occurred
     pub line_number: usize,

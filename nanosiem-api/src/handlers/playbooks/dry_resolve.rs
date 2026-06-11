@@ -183,7 +183,12 @@ pub async fn dry_resolve(
 
         let sev_str = severity_str(&alert.severity);
         let alert_tid = nanosiem_core::typeid::encode("alert", &alert.id);
-        let rule_tid = nanosiem_core::typeid::encode("rule", &alert.rule_id);
+        // rule_id is None when the source rule was deleted (NAN-1356); the
+        // snapshot tolerates an empty rule tid like it does a missing case.
+        let rule_tid = alert
+            .rule_id
+            .map(|r| nanosiem_core::typeid::encode("rule", &r))
+            .unwrap_or_default();
 
         // No case context in dry-resolve (this is pre-attach by definition).
         // The runtime tolerates a missing case block — `{{case.*}}` tokens

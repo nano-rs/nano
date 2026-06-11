@@ -9,12 +9,17 @@ use axum::{
     Extension, Json,
 };
 use chrono::{DateTime, Utc};
+use nanosiem_core::audit::{
+    AuditEvent, AuditSource, ClientContext, SEARCH_HISTORY_CLEARED, SEARCH_HISTORY_DELETED,
+    SEARCH_HISTORY_DISABLED, SEARCH_HISTORY_ENABLED,
+};
 use nanosiem_core::auth::permissions;
 use nanosiem_core::db::repository::{NewSearchHistoryEntry, SearchHistoryRepository};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
+use crate::handlers::AuditExt;
 use crate::middleware::{check_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 use nanosiem_core::typeid::TypeIdParam;
@@ -207,10 +212,13 @@ pub async fn add_history(
 pub async fn delete_history_entry(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
+    Extension(client): Extension<ClientContext>,
     Path(entry_id): Path<TypeIdParam>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::SEARCH_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:view".to_string()))?;
+    // Mutating your history requires execute (the permission that creates it),
+    // not just view — a view-only identity has no history to erase (NAN-1366).
+    check_permission(&auth, permissions::SEARCH_EXECUTE)
+        .map_err(|_| ApiError::Forbidden("Missing permission: search:execute".to_string()))?;
 
     let user_id = auth.user_id();
     let repo = SearchHistoryRepository::new(state.pool.clone());
@@ -223,6 +231,16 @@ pub async fn delete_history_entry(
     if !deleted {
         return Err(ApiError::NotFound("History entry not found".to_string()));
     }
+
+    // Erasing search history is anti-forensics relevant — record it (NAN-1366).
+    state.emit_audit(
+        AuditEvent::builder(AuditSource::Search, SEARCH_HISTORY_DELETED)
+            .actor(Some(user_id), None)
+            .api_key(auth.api_key_id, auth.api_key_name.clone())
+            .resource("search_history_entry", Some(*entry_id), None)
+            .client_context(&client)
+            .build(),
+    );
 
     Ok(Json(serde_json::json!({"deleted": true})))
 }
@@ -240,9 +258,12 @@ pub async fn delete_history_entry(
 pub async fn clear_history(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
+    Extension(client): Extension<ClientContext>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::SEARCH_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:view".to_string()))?;
+    // Mutating your history requires execute (the permission that creates it),
+    // not just view — a view-only identity has no history to erase (NAN-1366).
+    check_permission(&auth, permissions::SEARCH_EXECUTE)
+        .map_err(|_| ApiError::Forbidden("Missing permission: search:execute".to_string()))?;
 
     let user_id = auth.user_id();
     let repo = SearchHistoryRepository::new(state.pool.clone());
@@ -251,6 +272,17 @@ pub async fn clear_history(
         .clear_all(user_id)
         .await
         .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+
+    // Wiping the whole history is the broadest erase — record how much went
+    // (NAN-1366).
+    state.emit_audit(
+        AuditEvent::builder(AuditSource::Search, SEARCH_HISTORY_CLEARED)
+            .actor(Some(user_id), None)
+            .api_key(auth.api_key_id, auth.api_key_name.clone())
+            .client_context(&client)
+            .details(serde_json::json!({ "cleared": count }))
+            .build(),
+    );
 
     Ok(Json(serde_json::json!({"cleared": count})))
 }
@@ -269,10 +301,13 @@ pub async fn clear_history(
 pub async fn set_history_enabled(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
+    Extension(client): Extension<ClientContext>,
     Json(request): Json<SetHistoryEnabledRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::SEARCH_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:view".to_string()))?;
+    // Toggling tracking requires execute (the permission that creates history),
+    // not just view — disabling it is the primary evasion lever (NAN-1366).
+    check_permission(&auth, permissions::SEARCH_EXECUTE)
+        .map_err(|_| ApiError::Forbidden("Missing permission: search:execute".to_string()))?;
 
     let user_id = auth.user_id();
     let repo = SearchHistoryRepository::new(state.pool.clone());
@@ -280,6 +315,21 @@ pub async fn set_history_enabled(
     repo.set_history_enabled(user_id, request.enabled)
         .await
         .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
+
+    // Disabling tracking is the primary evasion lever; record the toggle as a
+    // distinct action so it's a single-filter hunt (NAN-1366).
+    let action = if request.enabled {
+        SEARCH_HISTORY_ENABLED
+    } else {
+        SEARCH_HISTORY_DISABLED
+    };
+    state.emit_audit(
+        AuditEvent::builder(AuditSource::Search, action)
+            .actor(Some(user_id), None)
+            .api_key(auth.api_key_id, auth.api_key_name.clone())
+            .client_context(&client)
+            .build(),
+    );
 
     Ok(Json(serde_json::json!({"enabled": request.enabled})))
 }
