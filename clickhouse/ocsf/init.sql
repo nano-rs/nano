@@ -1141,7 +1141,7 @@ SOURCE(CLICKHOUSE(
            FROM nanosiem.hash_prevalence_summary
            GROUP BY file_hash
            HAVING host_count < 1000
-           SETTINGS max_memory_usage = 536870912'
+           SETTINGS max_memory_usage = 536870912, max_bytes_before_external_group_by = 268435456, max_threads = 2'
 ))
 LIFETIME(MIN 900 MAX 1800)
 LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 1000000));
@@ -1169,7 +1169,7 @@ SOURCE(CLICKHOUSE(
            FROM nanosiem.domain_prevalence_summary
            GROUP BY domain
            HAVING host_count < 1000
-           SETTINGS max_memory_usage = 536870912'
+           SETTINGS max_memory_usage = 536870912, max_bytes_before_external_group_by = 268435456, max_threads = 2'
 ))
 LIFETIME(MIN 900 MAX 1800)
 LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 1000000));
@@ -1198,7 +1198,7 @@ SOURCE(CLICKHOUSE(
            WHERE is_private = 0
            GROUP BY ip
            HAVING host_count < 1000
-           SETTINGS max_memory_usage = 536870912'
+           SETTINGS max_memory_usage = 536870912, max_bytes_before_external_group_by = 268435456, max_threads = 2'
 ))
 LIFETIME(MIN 900 MAX 1800)
 LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 5000000));
@@ -1223,8 +1223,15 @@ LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 5000000));
 -- start failing with ACCESS_DENIED (loud, but an outage).
 -- -----------------------------------------------------------------------------
 
+-- ONE MV PER ENTITY BRANCH, never a UNION ALL body: ClickHouse only attaches
+-- the insert trigger to the FIRST SELECT of a UNION ALL (NAN-1393; same
+-- mechanism as NAN-1386). Branch bodies (validity/TLD filters, cross-branch
+-- dedup) mirror the UDM per-branch prevalence MVs in init.sql. Keep in
+-- lockstep with clickhouse/129_prevalence_mv_split.sql —
+-- nanosiem-core/tests/aggregation_mv_schema_guard.rs enforces equivalence.
+
 -- Hash prevalence (file + process hashes), OCSF columns -> hash_prevalence_summary.
-CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_hash_prevalence_summary_mv
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_hash_prevalence_summary_file_hash_mv
 TO nanosiem.hash_prevalence_summary
 (
     `file_hash` String,
@@ -1243,9 +1250,19 @@ AS SELECT
     count() AS total_count
 FROM nanosiem.ocsf_logs
 WHERE (`file.hashes.sha256` != '') AND ((length(`file.hashes.sha256`) = 32) OR (length(`file.hashes.sha256`) = 40) OR (length(`file.hashes.sha256`) = 64)) AND match(`file.hashes.sha256`, '^[a-fA-F0-9]+$')
-GROUP BY file_hash, hash_type
-UNION ALL
-SELECT
+GROUP BY file_hash, hash_type;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_hash_prevalence_summary_process_hash_mv
+TO nanosiem.hash_prevalence_summary
+(
+    `file_hash` String,
+    `hash_type` String,
+    `host_count` AggregateFunction(uniq, String),
+    `first_seen` DateTime64(6),
+    `last_seen` DateTime64(6),
+    `total_count` UInt64
+)
+AS SELECT
     `process.file.hashes.sha256` AS file_hash,
     multiIf(length(`process.file.hashes.sha256`) = 32, 'md5', length(`process.file.hashes.sha256`) = 40, 'sha1', length(`process.file.hashes.sha256`) = 64, 'sha256', 'unknown') AS hash_type,
     uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown'))) AS host_count,
@@ -1256,9 +1273,9 @@ FROM nanosiem.ocsf_logs
 WHERE (`process.file.hashes.sha256` != '') AND ((length(`process.file.hashes.sha256`) = 32) OR (length(`process.file.hashes.sha256`) = 40) OR (length(`process.file.hashes.sha256`) = 64)) AND match(`process.file.hashes.sha256`, '^[a-fA-F0-9]+$') AND ((`file.hashes.sha256` = '') OR (`file.hashes.sha256` != `process.file.hashes.sha256`))
 GROUP BY file_hash, hash_type;
 
--- Domain prevalence (dst_endpoint.hostname + query.hostname + url.hostname),
+-- Domain prevalence (dst_endpoint.hostname / query.hostname / url.hostname),
 -- OCSF columns -> domain_prevalence_summary. Validity/TLD filters mirror UDM.
-CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_domain_prevalence_summary_mv
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_domain_prevalence_summary_dest_host_mv
 TO nanosiem.domain_prevalence_summary
 (
     `domain` String,
@@ -1278,9 +1295,19 @@ AS SELECT
 FROM nanosiem.ocsf_logs
 WHERE (`dst_endpoint.hostname` != '') AND (position(`dst_endpoint.hostname`, '.') > 0) AND (NOT match(`dst_endpoint.hostname`, '^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$')) AND (NOT (position(`dst_endpoint.hostname`, ':') > 0)) AND match(`dst_endpoint.hostname`, '^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$') AND (length(splitByChar('.', `dst_endpoint.hostname`)[-1]) >= 2) AND (NOT match(splitByChar('.', `dst_endpoint.hostname`)[-1], '^[0-9]+$')) AND (length(`dst_endpoint.hostname`) <= 253)
     AND (lower(splitByChar('.', `dst_endpoint.hostname`)[-1]) NOT IN ('local', 'corp', 'internal', 'lan', 'home', 'localdomain', 'intranet', 'private', 'arpa'))
-GROUP BY domain, is_subdomain
-UNION ALL
-SELECT
+GROUP BY domain, is_subdomain;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_domain_prevalence_summary_query_mv
+TO nanosiem.domain_prevalence_summary
+(
+    `domain` String,
+    `is_subdomain` UInt8,
+    `source_host_count` AggregateFunction(uniq, String),
+    `first_seen` DateTime64(6),
+    `last_seen` DateTime64(6),
+    `total_count` UInt64
+)
+AS SELECT
     lower(`query.hostname`) AS domain,
     if(length(splitByChar('.', `query.hostname`)) > 2, 1, 0) AS is_subdomain,
     uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown'))) AS source_host_count,
@@ -1290,9 +1317,19 @@ SELECT
 FROM nanosiem.ocsf_logs
 WHERE (`query.hostname` != '') AND (position(`query.hostname`, '.') > 0) AND (NOT match(`query.hostname`, '^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$')) AND (NOT (position(`query.hostname`, ':') > 0)) AND match(`query.hostname`, '^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$') AND (length(splitByChar('.', `query.hostname`)[-1]) >= 2) AND (NOT match(splitByChar('.', `query.hostname`)[-1], '^[0-9]+$')) AND (length(`query.hostname`) <= 253) AND ((`dst_endpoint.hostname` = '') OR (lower(`dst_endpoint.hostname`) != lower(`query.hostname`)))
     AND (lower(splitByChar('.', `query.hostname`)[-1]) NOT IN ('local', 'corp', 'internal', 'lan', 'home', 'localdomain', 'intranet', 'private', 'arpa'))
-GROUP BY domain, is_subdomain
-UNION ALL
-SELECT
+GROUP BY domain, is_subdomain;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_domain_prevalence_summary_url_mv
+TO nanosiem.domain_prevalence_summary
+(
+    `domain` String,
+    `is_subdomain` UInt8,
+    `source_host_count` AggregateFunction(uniq, String),
+    `first_seen` DateTime64(6),
+    `last_seen` DateTime64(6),
+    `total_count` UInt64
+)
+AS SELECT
     lower(`url.hostname`) AS domain,
     if(length(splitByChar('.', `url.hostname`)) > 2, 1, 0) AS is_subdomain,
     uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown'))) AS source_host_count,
@@ -1304,9 +1341,9 @@ WHERE (`url.hostname` != '') AND (position(`url.hostname`, '.') > 0) AND (NOT ma
     AND (lower(splitByChar('.', `url.hostname`)[-1]) NOT IN ('local', 'corp', 'internal', 'lan', 'home', 'localdomain', 'intranet', 'private', 'arpa'))
 GROUP BY domain, is_subdomain;
 
--- IP prevalence (dst_endpoint.ip + src_endpoint.ip), OCSF columns ->
--- ip_prevalence_summary. is_private classification mirrors UDM ip_prevalence_mv.
-CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_ip_prevalence_summary_mv
+-- IP prevalence (dst_endpoint.ip / src_endpoint.ip), OCSF columns ->
+-- ip_prevalence_summary. is_private classification mirrors UDM.
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_ip_prevalence_summary_dest_ip_mv
 TO nanosiem.ip_prevalence_summary
 (
     `ip` String,
@@ -1335,9 +1372,19 @@ WHERE `dst_endpoint.ip` != ''
   AND match(`dst_endpoint.ip`, '^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$')
   AND NOT match(`dst_endpoint.ip`, '^127\\.')
   AND NOT match(`dst_endpoint.ip`, '^169\\.254\\.')
-GROUP BY ip, is_private
-UNION ALL
-SELECT
+GROUP BY ip, is_private;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_ip_prevalence_summary_src_ip_mv
+TO nanosiem.ip_prevalence_summary
+(
+    `ip` String,
+    `is_private` UInt8,
+    `source_host_count` AggregateFunction(uniq, String),
+    `first_seen` DateTime64(6, 'UTC'),
+    `last_seen` DateTime64(6, 'UTC'),
+    `total_count` UInt64
+)
+AS SELECT
     `src_endpoint.ip` AS ip,
     if(
         match(`src_endpoint.ip`, '^10\\.') OR

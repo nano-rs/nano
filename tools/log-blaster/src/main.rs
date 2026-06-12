@@ -14,6 +14,8 @@
 //!     --spike-profile tools/log-blaster/profiles/spike_corporate.json          # Spike mode
 //!   log-blaster --hec --rate 30                                                # Splunk HEC (default :8088)
 //!   log-blaster --hec --vector http://hec.example:8088 --blast --eps 50000    # HEC at custom URL
+//!   log-blaster --tenzir --rate 30                                             # Tenzir raw-log lane (default :9095)
+//!   log-blaster --tenzir http://tenzir.example:9095 --blast --eps 5000        # Tenzir at custom URL
 
 mod spike;
 
@@ -58,6 +60,21 @@ struct Args {
     /// routing-rule UI and the hec_normalize transform end-to-end.
     #[arg(long)]
     hec: bool,
+
+    /// Ship RAW events to a Tenzir `accept_http` listener instead of
+    /// Vector/HEC (NAN-1402). Tenzir parses the raw payloads to OCSF 1.8.0
+    /// and writes directly into ClickHouse `nanosiem.ocsf_logs` — see
+    /// `tools/log-blaster/tenzir/` for the pipeline + runner. Takes the
+    /// listener URL; bare `--tenzir` targets the default local rig
+    /// (`http://localhost:9095`). Mutually exclusive with `--hec`/`--dev`;
+    /// `--vector` and `--token` are ignored (the listener has no auth).
+    #[arg(
+        long,
+        conflicts_with_all = ["hec", "dev"],
+        num_args = 0..=1,
+        default_missing_value = "http://localhost:9095"
+    )]
+    tenzir: Option<String>,
 
     /// Events per minute (normal mode)
     #[arg(long, default_value = "30")]
@@ -138,32 +155,45 @@ async fn main() -> Result<()> {
     }
 
     // Resolve the wire-format-specific path suffix. Idempotent — bails if
-    // the user already passed a fully-qualified URL.
-    let trimmed = args.vector.trim_end_matches('/').to_string();
-    args.vector = if args.hec {
-        if trimmed.ends_with("/services/collector/event")
-            || trimmed.ends_with("/services/collector/raw")
-        {
-            trimmed
-        } else {
-            format!("{trimmed}/services/collector/event")
-        }
-    } else if args.dev && !trimmed.ends_with("/ingest") {
-        format!("{trimmed}/ingest")
+    // the user already passed a fully-qualified URL. Tenzir replaces the
+    // Vector/HEC target wholesale: the raw NDJSON goes straight to the
+    // `accept_http` listener URL, no path suffix.
+    if let Some(t) = &args.tenzir {
+        args.vector = t.trim_end_matches('/').to_string();
     } else {
-        trimmed
-    };
+        let trimmed = args.vector.trim_end_matches('/').to_string();
+        args.vector = if args.hec {
+            if trimmed.ends_with("/services/collector/event")
+                || trimmed.ends_with("/services/collector/raw")
+            {
+                trimmed
+            } else {
+                format!("{trimmed}/services/collector/event")
+            }
+        } else if args.dev && !trimmed.ends_with("/ingest") {
+            format!("{trimmed}/ingest")
+        } else {
+            trimmed
+        };
+    }
     info!(
         "Transport: {} → {}",
-        if args.hec { "HEC" } else { "Vector" },
+        if args.tenzir.is_some() {
+            "Tenzir"
+        } else if args.hec {
+            "HEC"
+        } else {
+            "Vector"
+        },
         args.vector
     );
 
     // Auth token resolution (matches scripts/generate-*.py convention):
     //   --token flag  >  VECTOR_AUTH_TOKEN env  >  "nanosiem-default-token"
-    // The token field is shared across both transports — the OOTB HEC
-    // listener also reads `VECTOR_AUTH_TOKEN` (one token to rotate).
-    if args.token.is_none() {
+    // The token field is shared across the Vector and HEC transports — the
+    // OOTB HEC listener also reads `VECTOR_AUTH_TOKEN` (one token to
+    // rotate). The Tenzir listener has no auth, so skip resolution there.
+    if args.token.is_none() && args.tenzir.is_none() {
         let resolved = std::env::var("VECTOR_AUTH_TOKEN")
             .unwrap_or_else(|_| "nanosiem-default-token".to_string());
         info!(
@@ -186,7 +216,11 @@ async fn main() -> Result<()> {
     // Build the wire-format-specific transport once. Cheap-to-clone
     // (`Clone`) so each spawned worker carries its own copy without
     // sharing locks.
-    let transport = if args.hec {
+    let transport = if args.tenzir.is_some() {
+        Transport::Tenzir {
+            url: args.vector.clone(),
+        }
+    } else if args.hec {
         // NAN-919: HEC requires the X-Splunk-Request-Channel header when
         // the receiving source has ACK enabled (nano's OOTB config does).
         // `new_hec` generates a fresh per-process UUID for it.

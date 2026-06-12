@@ -94,7 +94,7 @@ SOURCE(CLICKHOUSE(
     USER '{clickhouse_self_user}'
     PASSWORD '{clickhouse_self_password}'
     DB 'nanosiem'
-    QUERY 'SELECT network, argMax(country, updated_at) AS country, argMax(country_code, updated_at) AS country_code, argMax(continent, updated_at) AS continent, argMax(continent_code, updated_at) AS continent_code, argMax(asn, updated_at) AS asn, argMax(as_name, updated_at) AS as_name, argMax(as_domain, updated_at) AS as_domain FROM nanosiem.ip_enrichments GROUP BY network HAVING argMax(deleted, updated_at) = 0'
+    QUERY 'SELECT network, argMax(country, updated_at) AS country, argMax(country_code, updated_at) AS country_code, argMax(continent, updated_at) AS continent, argMax(continent_code, updated_at) AS continent_code, argMax(asn, updated_at) AS asn, argMax(as_name, updated_at) AS as_name, argMax(as_domain, updated_at) AS as_domain FROM nanosiem.ip_enrichments GROUP BY network HAVING argMax(deleted, updated_at) = 0 SETTINGS max_bytes_before_external_group_by = 1000000000, max_memory_usage = 2500000000, max_threads = 2'
 ))
 LIFETIME(MIN 300 MAX 600)
 LAYOUT(IP_TRIE())
@@ -104,6 +104,10 @@ LAYOUT(IP_TRIE())
 -- Code 396 -> dict FAILED -> dictGetOrDefault in the logs enriched_* columns THROWs
 -- on every INSERT -> total silent ingestion halt (same blast radius NAN-1117 warned of,
 -- new trigger). Lift the result caps for the load query ONLY; the analyst profile is untouched.
+-- The QUERY-level SETTINGS (NAN-1404 / migration 130) memory-bound the load's argMax
+-- dedup aggregation: it spills to disk at 1GB (max_bytes_before_external_group_by)
+-- instead of ballooning to the node memory cap, which OOMed the dict FAILED on
+-- Saturn's 8GiB spec node and silently killed all ingestion for 36h.
 SETTINGS(max_result_rows = 0, max_result_bytes = 0);
 
 -- IOC Enrichment Dictionary
@@ -144,7 +148,8 @@ SOURCE(CLICKHOUSE(
         WHERE expires_at > now() AND is_ioc = 1 AND is_marketplace = 1
         ORDER BY confidence DESC
     )
-    GROUP BY key_value'
+    GROUP BY key_value
+    SETTINGS max_bytes_before_external_group_by = 1000000000, max_memory_usage = 2500000000, max_threads = 2'
 ))
 LIFETIME(MIN 60 MAX 300)
 LAYOUT(HASHED());
@@ -311,7 +316,8 @@ SOURCE(CLICKHOUSE(
         groupUniqArray(enrichment_name) as enrichment_names
     FROM nanosiem.custom_enrichment_results
     WHERE expires_at > now() AND is_ioc = 0
-    GROUP BY key_type, key_value'
+    GROUP BY key_type, key_value
+    SETTINGS max_bytes_before_external_group_by = 1000000000, max_memory_usage = 2500000000, max_threads = 2'
 ))
 LAYOUT(COMPLEX_KEY_HASHED())
 LIFETIME(MIN 60 MAX 300);
@@ -348,7 +354,8 @@ SOURCE(CLICKHOUSE(
         WHERE expires_at > now() AND is_ioc = 1 AND is_marketplace = 0
         ORDER BY confidence DESC
     )
-    GROUP BY key_type, key_value'
+    GROUP BY key_type, key_value
+    SETTINGS max_bytes_before_external_group_by = 1000000000, max_memory_usage = 2500000000, max_threads = 2'
 ))
 LAYOUT(COMPLEX_KEY_HASHED())
 LIFETIME(MIN 60 MAX 300);
@@ -364,7 +371,9 @@ LIFETIME(MIN 60 MAX 300);
 -- unbounded and tripped the 6 GiB Team-tier max_server_memory_usage on
 -- non-trivial tenants; see migration 112 for the full incident write-up.
 -- Per-source-query max_memory_usage = 512 MiB is a belt-and-suspenders cap
--- in case the legacy analyzer is ever forced on and pushdown is lost.
+-- in case the legacy analyzer is ever forced on and pushdown is lost;
+-- max_bytes_before_external_group_by spills the aggregation to disk at 256 MiB
+-- so a miss-storm degrades to disk instead of OOMing the node (NAN-1404).
 
 CREATE OR REPLACE DICTIONARY nanosiem.hash_prevalence_dict
 (
@@ -389,7 +398,7 @@ SOURCE(CLICKHOUSE(
            FROM nanosiem.hash_prevalence_summary
            GROUP BY file_hash
            HAVING host_count < 1000
-           SETTINGS max_memory_usage = 536870912'
+           SETTINGS max_memory_usage = 536870912, max_bytes_before_external_group_by = 268435456, max_threads = 2'
 ))
 LIFETIME(MIN 900 MAX 1800)
 LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 1000000));
@@ -417,7 +426,7 @@ SOURCE(CLICKHOUSE(
            FROM nanosiem.domain_prevalence_summary
            GROUP BY domain
            HAVING host_count < 1000
-           SETTINGS max_memory_usage = 536870912'
+           SETTINGS max_memory_usage = 536870912, max_bytes_before_external_group_by = 268435456, max_threads = 2'
 ))
 LIFETIME(MIN 900 MAX 1800)
 LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 1000000));
@@ -451,7 +460,7 @@ SOURCE(CLICKHOUSE(
            WHERE is_private = 0
            GROUP BY ip
            HAVING host_count < 1000
-           SETTINGS max_memory_usage = 536870912'
+           SETTINGS max_memory_usage = 536870912, max_bytes_before_external_group_by = 268435456, max_threads = 2'
 ))
 LIFETIME(MIN 900 MAX 1800)
 LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 5000000));
@@ -538,7 +547,7 @@ SOURCE(CLICKHOUSE(
     USER '{clickhouse_self_user}'
     PASSWORD '{clickhouse_self_password}'
     DB 'nanosiem'
-    QUERY 'SELECT * FROM (SELECT username_lc AS username, argMax(email, version) AS email, argMax(display_name, version) AS display_name, argMax(department, version) AS department, argMax(title, version) AS title, argMax(manager_upn, version) AS manager_upn, argMax(manager_display_name, version) AS manager_display_name, argMax(company, version) AS company, argMax(arrayStringConcat(groups, '',''), version) AS groups, argMax(account_enabled, version) AS account_enabled, argMax(account_status, version) AS account_status, argMax(mfa_enabled, version) AS mfa_enabled, argMax(employee_type, version) AS employee_type, argMax(country, version) AS country, argMax(office_location, version) AS office_location FROM nanosiem.user_registry WHERE username_lc != '''' GROUP BY username_lc) WHERE account_status != ''deleted'''
+    QUERY 'SELECT * FROM (SELECT username_lc AS username, argMax(email, version) AS email, argMax(display_name, version) AS display_name, argMax(department, version) AS department, argMax(title, version) AS title, argMax(manager_upn, version) AS manager_upn, argMax(manager_display_name, version) AS manager_display_name, argMax(company, version) AS company, argMax(arrayStringConcat(groups, '',''), version) AS groups, argMax(account_enabled, version) AS account_enabled, argMax(account_status, version) AS account_status, argMax(mfa_enabled, version) AS mfa_enabled, argMax(employee_type, version) AS employee_type, argMax(country, version) AS country, argMax(office_location, version) AS office_location FROM nanosiem.user_registry WHERE username_lc != '''' GROUP BY username_lc) WHERE account_status != ''deleted'' SETTINGS max_bytes_before_external_group_by = 1000000000, max_memory_usage = 2500000000, max_threads = 2'
 ))
 LIFETIME(MIN 300 MAX 600)
 LAYOUT(HASHED());
@@ -915,8 +924,17 @@ SETTINGS index_granularity = 8192
 -- MATERIALIZED VIEWS (must be created after base tables)
 -- =============================================================================
 
--- Materialized View: domain_prevalence_mv
-CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.domain_prevalence_mv TO nanosiem.domain_prevalence_agg
+-- Prevalence MVs — ONE MV PER ENTITY BRANCH, never a UNION ALL body:
+-- ClickHouse only attaches the insert trigger to the FIRST SELECT of a
+-- UNION ALL (NAN-1393; same mechanism as NAN-1386). All branches of a family
+-- write to the SAME AggregatingMergeTree target, which merges the states.
+-- process_hash_prevalence_mv (archived 055) was a workaround for the dead
+-- process-hash branch; hash_prevalence_process_hash_mv replaces it with the
+-- original branch semantics (lower(), sha1, dedup-vs-file_hash).
+-- Keep in lockstep with clickhouse/129_prevalence_mv_split.sql —
+-- nanosiem-core/tests/aggregation_mv_schema_guard.rs enforces equivalence.
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.domain_prevalence_dest_host_mv TO nanosiem.domain_prevalence_agg
 (
     `domain` String,
     `is_subdomain` UInt8,
@@ -938,14 +956,24 @@ AS SELECT
     count() AS total_count
 FROM nanosiem.logs
 WHERE (dest_host != '') AND (position(dest_host, '.') > 0) AND (NOT match(dest_host, '^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$')) AND (NOT (position(dest_host, ':') > 0)) AND match(dest_host, '^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$') AND (length(splitByChar('.', dest_host)[-1]) >= 2) AND (NOT match(splitByChar('.', dest_host)[-1], '^[0-9]+$')) AND (length(dest_host) <= 253)
-    -- NAN-366: drop internal/non-public TLDs (e.g. ws-support-041.corp.local) to keep domain_prevalence focused on real domains.
     AND (lower(splitByChar('.', dest_host)[-1]) NOT IN ('local', 'corp', 'internal', 'lan', 'home', 'localdomain', 'intranet', 'private', 'arpa'))
 GROUP BY
     domain,
     is_subdomain,
-    time_bucket
-UNION ALL
-SELECT
+    time_bucket;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.domain_prevalence_query_mv TO nanosiem.domain_prevalence_agg
+(
+    `domain` String,
+    `is_subdomain` UInt8,
+    `parent_domain` String,
+    `time_bucket` DateTime('UTC'),
+    `source_host_count` AggregateFunction(uniq, String),
+    `first_seen` DateTime64(6, 'UTC'),
+    `last_seen` DateTime64(6, 'UTC'),
+    `total_count` UInt64
+)
+AS SELECT
     lower(query) AS domain,
     if(length(splitByChar('.', query)) > 2, 1, 0) AS is_subdomain,
     '' AS parent_domain,
@@ -960,9 +988,20 @@ WHERE (query != '') AND (position(query, '.') > 0) AND (NOT match(query, '^[0-9]
 GROUP BY
     domain,
     is_subdomain,
-    time_bucket
-UNION ALL
-SELECT
+    time_bucket;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.domain_prevalence_url_domain_mv TO nanosiem.domain_prevalence_agg
+(
+    `domain` String,
+    `is_subdomain` UInt8,
+    `parent_domain` String,
+    `time_bucket` DateTime('UTC'),
+    `source_host_count` AggregateFunction(uniq, String),
+    `first_seen` DateTime64(6, 'UTC'),
+    `last_seen` DateTime64(6, 'UTC'),
+    `total_count` UInt64
+)
+AS SELECT
     lower(url_domain) AS domain,
     if(length(splitByChar('.', url_domain)) > 2, 1, 0) AS is_subdomain,
     '' AS parent_domain,
@@ -977,11 +1016,9 @@ WHERE (url_domain != '') AND (position(url_domain, '.') > 0) AND (NOT match(url_
 GROUP BY
     domain,
     is_subdomain,
-    time_bucket
-;
+    time_bucket;
 
--- Materialized View: hash_prevalence_mv
-CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.hash_prevalence_mv TO nanosiem.hash_prevalence_agg
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.hash_prevalence_file_hash_mv TO nanosiem.hash_prevalence_agg
 (
     `file_hash` String,
     `hash_type` String,
@@ -1004,26 +1041,9 @@ WHERE (file_hash != '') AND ((length(file_hash) = 32) OR (length(file_hash) = 40
 GROUP BY
     file_hash,
     hash_type,
-    time_bucket
-UNION ALL
-SELECT
-    lower(process_hash) AS file_hash,
-    multiIf(length(process_hash) = 32, 'md5', length(process_hash) = 40, 'sha1', length(process_hash) = 64, 'sha256', 'unknown') AS hash_type,
-    toStartOfHour(timestamp) AS time_bucket,
-    uniqState(if(src_host != '', src_host, if(src_ip != '', src_ip, 'unknown'))) AS host_count,
-    min(timestamp) AS first_seen,
-    max(timestamp) AS last_seen,
-    count() AS total_count
-FROM nanosiem.logs
-WHERE (process_hash != '') AND ((length(process_hash) = 32) OR (length(process_hash) = 40) OR (length(process_hash) = 64)) AND match(process_hash, '^[a-fA-F0-9]+$') AND ((file_hash = '') OR (lower(file_hash) != lower(process_hash)))
-GROUP BY
-    process_hash,
-    hash_type,
-    time_bucket
-;
+    time_bucket;
 
--- Materialized View: process_hash_prevalence_mv
-CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.process_hash_prevalence_mv TO nanosiem.hash_prevalence_agg
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.hash_prevalence_process_hash_mv TO nanosiem.hash_prevalence_agg
 (
     `file_hash` String,
     `hash_type` String,
@@ -1034,23 +1054,21 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.process_hash_prevalence_mv TO na
     `total_count` UInt64
 )
 AS SELECT
-    process_hash AS file_hash,
-    multiIf(length(process_hash) = 32, 'md5', length(process_hash) = 64, 'sha256', 'unknown') AS hash_type,
+    lower(process_hash) AS file_hash,
+    multiIf(length(process_hash) = 32, 'md5', length(process_hash) = 40, 'sha1', length(process_hash) = 64, 'sha256', 'unknown') AS hash_type,
     toStartOfHour(timestamp) AS time_bucket,
     uniqState(if(src_host != '', src_host, if(src_ip != '', src_ip, 'unknown'))) AS host_count,
     min(timestamp) AS first_seen,
     max(timestamp) AS last_seen,
     count() AS total_count
 FROM nanosiem.logs
-WHERE (process_hash != '') AND ((length(process_hash) = 32) OR (length(process_hash) = 64)) AND match(process_hash, '^[a-fA-F0-9]+$')
+WHERE (process_hash != '') AND ((length(process_hash) = 32) OR (length(process_hash) = 40) OR (length(process_hash) = 64)) AND match(process_hash, '^[a-fA-F0-9]+$') AND ((logs.file_hash = '') OR (lower(logs.file_hash) != lower(process_hash)))
 GROUP BY
     process_hash,
     hash_type,
-    time_bucket
-;
+    time_bucket;
 
--- Materialized View: ip_prevalence_mv
-CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ip_prevalence_mv TO nanosiem.ip_prevalence_agg AS
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ip_prevalence_dest_ip_mv TO nanosiem.ip_prevalence_agg AS
 SELECT
     dest_ip AS ip,
     'dest' AS direction,
@@ -1072,8 +1090,9 @@ WHERE dest_ip != ''
   AND match(dest_ip, '^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$')
   AND NOT match(dest_ip, '^127\\.')
   AND NOT match(dest_ip, '^169\\.254\\.')
-GROUP BY ip, direction, is_private, time_bucket
-UNION ALL
+GROUP BY ip, direction, is_private, time_bucket;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ip_prevalence_src_ip_mv TO nanosiem.ip_prevalence_agg AS
 SELECT
     src_ip AS ip,
     'src' AS direction,

@@ -1,6 +1,6 @@
 //! HTTP send functions for the ingestion transports log-blaster supports.
 //!
-//! Two wire formats:
+//! Three wire formats:
 //!
 //! - **Vector** (`Transport::Vector`) — Vector's `http` source: NDJSON body,
 //!   `X-Source-Type` header per group, Bearer auth. Events are grouped by
@@ -10,6 +10,12 @@
 //!   (`Authorization: Splunk <token>`). No grouping — each envelope carries
 //!   its own sourcetype, which the OOTB `hec_normalize` transform maps to
 //!   `source_type`.
+//! - **Tenzir** (`Transport::Tenzir`) — a Tenzir `accept_http` source: NDJSON
+//!   body of the raw `Event` shape (`{message, timestamp, source_type}`).
+//!   Source identity is in-band so there is no grouping, and the local-rig
+//!   listener carries no auth. The receiving TQL pipeline parses the raw
+//!   payloads to OCSF and writes directly into ClickHouse — see
+//!   `tools/log-blaster/tenzir/` (NAN-1402).
 
 use anyhow::Result;
 use chrono::DateTime;
@@ -61,6 +67,12 @@ pub enum Transport {
         token: Option<String>,
         channel: String,
     },
+    /// Tenzir `accept_http` source. The body is NDJSON of the raw `Event`
+    /// shape — `{message, timestamp, source_type}` — i.e. the pre-parse
+    /// payloads, with feed identity in-band. The TQL side routes on
+    /// `source_type`, parses `message`, and maps to OCSF (NAN-1402). The
+    /// listener is a local validation rig, so there is no auth token.
+    Tenzir { url: String },
 }
 
 impl Transport {
@@ -82,6 +94,7 @@ impl Transport {
         match self {
             Transport::Vector { url, .. } => url,
             Transport::Hec { url, .. } => url,
+            Transport::Tenzir { url } => url,
         }
     }
 
@@ -89,6 +102,7 @@ impl Transport {
         match self {
             Transport::Vector { token, .. } => token.as_deref(),
             Transport::Hec { token, .. } => token.as_deref(),
+            Transport::Tenzir { .. } => None,
         }
     }
 
@@ -97,6 +111,7 @@ impl Transport {
         match self {
             Transport::Vector { .. } => "vector",
             Transport::Hec { .. } => "hec",
+            Transport::Tenzir { .. } => "tenzir",
         }
     }
 }
@@ -106,11 +121,12 @@ pub async fn send_event(client: &Client, transport: &Transport, event: &Event) -
     match transport {
         Transport::Vector { .. } => send_event_vector(client, transport, event).await,
         Transport::Hec { .. } => send_event_hec(client, transport, event).await,
+        Transport::Tenzir { .. } => send_tenzir_batch(client, transport, &[event]).await,
     }
 }
 
-/// Send a batch with per-group retry. Vector groups by source_type; HEC
-/// sends a single line-delimited stream (sourcetype is in-band).
+/// Send a batch with per-group retry. Vector groups by source_type; HEC and
+/// Tenzir send a single line-delimited stream (source identity is in-band).
 pub async fn send_batch_with_retry(
     client: &Client,
     transport: &Transport,
@@ -123,6 +139,9 @@ pub async fn send_batch_with_retry(
         }
         Transport::Hec { .. } => {
             send_batch_hec_with_retry(client, transport, events, max_retries).await
+        }
+        Transport::Tenzir { .. } => {
+            send_batch_tenzir_with_retry(client, transport, events, max_retries).await
         }
     }
 }
@@ -272,6 +291,7 @@ fn hec_channel(transport: &Transport) -> &str {
     match transport {
         Transport::Hec { channel, .. } => channel,
         Transport::Vector { .. } => unreachable!("hec_channel called on Vector transport"),
+        Transport::Tenzir { .. } => unreachable!("hec_channel called on Tenzir transport"),
     }
 }
 
@@ -322,6 +342,63 @@ async fn send_batch_hec_with_retry(
             tokio::time::sleep(backoff).await;
         }
         match send_hec_batch(client, transport, &refs).await {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Tenzir transport (raw-Event NDJSON to an `accept_http` source, no auth)
+// ---------------------------------------------------------------------------
+
+/// Serialise events as NDJSON of the raw `Event` wire shape. Tenzir's
+/// `read_ndjson` parses one envelope per line; the TQL router reads
+/// `source_type` in-band, so unlike the Vector transport no per-source
+/// grouping is needed.
+fn tenzir_body(events: &[&Event]) -> String {
+    events
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+async fn send_tenzir_batch(
+    client: &Client,
+    transport: &Transport,
+    events: &[&Event],
+) -> Result<()> {
+    let body = tenzir_body(events);
+    client
+        .post(transport.url())
+        .header("Content-Type", "application/x-ndjson")
+        .body(body)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+async fn send_batch_tenzir_with_retry(
+    client: &Client,
+    transport: &Transport,
+    events: &[Event],
+    max_retries: u32,
+) -> Result<()> {
+    let refs: Vec<&Event> = events.iter().collect();
+    let mut last_err = None;
+    for attempt in 0..=max_retries {
+        if attempt > 0 {
+            let backoff = retry_backoff(attempt);
+            warn!(
+                "[tenzir] Retry {}/{} after {:?}",
+                attempt, max_retries, backoff
+            );
+            tokio::time::sleep(backoff).await;
+        }
+        match send_tenzir_batch(client, transport, &refs).await {
             Ok(()) => return Ok(()),
             Err(e) => last_err = Some(e),
         }
@@ -405,8 +482,43 @@ mod tests {
             token: None,
             channel: "00000000-0000-0000-0000-000000000000".into(),
         };
+        let t = Transport::Tenzir {
+            url: "http://x:9095".into(),
+        };
         assert_eq!(v.kind(), "vector");
         assert_eq!(h.kind(), "hec");
+        assert_eq!(t.kind(), "tenzir");
+    }
+
+    /// NAN-1402: the Tenzir body is NDJSON of the RAW Event shape — the TQL
+    /// router reads `.message` (pre-parse payload), `.timestamp`, and
+    /// `.source_type` in-band. No envelope rewrap, no JSON-array wrapping.
+    #[test]
+    fn tenzir_body_is_raw_event_ndjson() {
+        let a = fake_event(
+            "windows_sysmon",
+            r#"{"event_id":1}"#,
+            "2026-06-11T11:30:00Z",
+        );
+        let b = fake_event(
+            "apache_access",
+            r#"203.0.113.7 - - [11/Jun/2026:11:30:01 +0000] "GET / HTTP/1.1" 200 5 "-" "curl/8.5.0""#,
+            "2026-06-11T11:30:01Z",
+        );
+        let refs: Vec<&Event> = vec![&a, &b];
+        let body = tenzir_body(&refs);
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2, "expected 2 lines, got: {body}");
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(first["source_type"], "windows_sysmon");
+        assert_eq!(first["message"], r#"{"event_id":1}"#);
+        assert_eq!(second["source_type"], "apache_access");
+        assert!(
+            second["message"].as_str().unwrap().contains("GET / HTTP/1.1"),
+            "raw apache line must survive verbatim: {body}"
+        );
+        assert!(!body.starts_with('['), "body must not be wrapped in []: {body}");
     }
 
     /// NAN-919: HEC sources with `acknowledgements.enabled = true` (nano's

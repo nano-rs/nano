@@ -1,25 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Schema-shape guards for the aggregation materialized views
-//! (NAN-1385 / NAN-1386).
+//! (NAN-1385 / NAN-1386 / NAN-1393).
 //!
 //! ClickHouse attaches a materialized view's insert trigger ONLY to the FIRST
 //! SELECT of a `UNION ALL` body — every other branch silently never fires.
 //! `entity_time_range_mv` shipped as a UNION ALL and starved its src_host
 //! partition for months (and never had the `user` partition the asset reader
-//! queries). These tests pin the fixed shape:
+//! queries); the prevalence MV family had the same shape (NAN-1393), so
+//! src_ip / DNS-query-domain / url-domain / process-hash prevalence never
+//! accrued on either profile. These tests pin the fixed shape:
 //!
-//! 1. The aggregation MV family (entity time range, identity observations,
-//!    cloud user activity, per-source telemetry — UDM and OCSF sides) is one
-//!    MV per branch, with NO `UNION ALL` in any body.
-//! 2. Migration 128 and the two init.sql files define byte-equivalent MVs
-//!    (modulo comments/markers/whitespace), so migrated deployments and fresh
-//!    bootstraps converge on the same schema.
-//!
-//! NOTE: the *_prevalence_mv / ocsf_*_prevalence_summary_mv family still uses
-//! UNION ALL bodies and is therefore NOT covered here — its non-first branches
-//! are equally dead (same mechanism) and tracked as separate follow-up work.
-//! Do not add new UNION ALL MVs; split per branch instead.
+//! 1. The aggregation + prevalence MV families (entity time range, identity
+//!    observations, cloud user activity, per-source telemetry, ip/domain/hash
+//!    prevalence — UDM and OCSF sides) are one MV per branch, with NO
+//!    `UNION ALL` in any body. Do not add new UNION ALL MVs; split per branch.
+//! 2. Migrations 128/129 and the two init.sql files define byte-equivalent
+//!    MVs (modulo comments/markers/whitespace), so migrated deployments and
+//!    fresh bootstraps converge on the same schema.
 
 use std::collections::BTreeMap;
 
@@ -34,6 +32,10 @@ const OCSF_INIT: &str = include_str!(concat!(
 const MIGRATION_128: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../clickhouse/128_entity_mv_split_and_ocsf_aggregation_mvs.sql"
+));
+const MIGRATION_129: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../clickhouse/129_prevalence_mv_split.sql"
 ));
 
 /// The split-per-branch aggregation MV family this guard pins.
@@ -53,6 +55,41 @@ const OCSF_AGG_MVS: &[&str] = &[
     "nanosiem.ocsf_identity_observations_mv",
     "nanosiem.ocsf_cloud_user_activity_mv",
     "nanosiem.ocsf_logs_per_source_5m_mv",
+];
+
+/// The split-per-branch prevalence MV family (NAN-1393 / migration 129).
+const UDM_PREVALENCE_MVS: &[&str] = &[
+    "nanosiem.ip_prevalence_dest_ip_mv",
+    "nanosiem.ip_prevalence_src_ip_mv",
+    "nanosiem.domain_prevalence_dest_host_mv",
+    "nanosiem.domain_prevalence_query_mv",
+    "nanosiem.domain_prevalence_url_domain_mv",
+    "nanosiem.hash_prevalence_file_hash_mv",
+    "nanosiem.hash_prevalence_process_hash_mv",
+];
+const OCSF_PREVALENCE_MVS: &[&str] = &[
+    "nanosiem.ocsf_ip_prevalence_summary_dest_ip_mv",
+    "nanosiem.ocsf_ip_prevalence_summary_src_ip_mv",
+    "nanosiem.ocsf_domain_prevalence_summary_dest_host_mv",
+    "nanosiem.ocsf_domain_prevalence_summary_query_mv",
+    "nanosiem.ocsf_domain_prevalence_summary_url_mv",
+    "nanosiem.ocsf_hash_prevalence_summary_file_hash_mv",
+    "nanosiem.ocsf_hash_prevalence_summary_process_hash_mv",
+];
+
+/// Pre-split UNION ALL views (and the 055 process-hash workaround that
+/// hash_prevalence_process_hash_mv replaces) — none may resurface in an init
+/// file, or fresh bootstraps recreate the broken/double-counting shape next
+/// to the split MVs.
+const LEGACY_MV_NAMES: &[&str] = &[
+    "nanosiem.entity_time_range_mv",
+    "nanosiem.ip_prevalence_mv",
+    "nanosiem.domain_prevalence_mv",
+    "nanosiem.hash_prevalence_mv",
+    "nanosiem.process_hash_prevalence_mv",
+    "nanosiem.ocsf_ip_prevalence_summary_mv",
+    "nanosiem.ocsf_domain_prevalence_summary_mv",
+    "nanosiem.ocsf_hash_prevalence_summary_mv",
 ];
 
 /// Extract `CREATE MATERIALIZED VIEW` statements keyed by view name, with `--`
@@ -105,9 +142,8 @@ fn create_mv_statements(sql: &str) -> BTreeMap<String, String> {
 fn aggregation_mvs_have_no_union_all_bodies() {
     let udm = create_mv_statements(UDM_INIT);
     let ocsf = create_mv_statements(OCSF_INIT);
-    let mig = create_mv_statements(MIGRATION_128);
 
-    for name in UDM_AGG_MVS {
+    for name in UDM_AGG_MVS.iter().chain(UDM_PREVALENCE_MVS) {
         let stmt = udm
             .get(*name)
             .unwrap_or_else(|| panic!("{name} missing from clickhouse/init.sql"));
@@ -116,7 +152,7 @@ fn aggregation_mvs_have_no_union_all_bodies() {
             "{name} (init.sql) has a UNION ALL body — only its first SELECT would ever fire"
         );
     }
-    for name in OCSF_AGG_MVS {
+    for name in OCSF_AGG_MVS.iter().chain(OCSF_PREVALENCE_MVS) {
         let stmt = ocsf
             .get(*name)
             .unwrap_or_else(|| panic!("{name} missing from clickhouse/ocsf/init.sql"));
@@ -125,24 +161,29 @@ fn aggregation_mvs_have_no_union_all_bodies() {
             "{name} (ocsf/init.sql) has a UNION ALL body — only its first SELECT would ever fire"
         );
     }
-    for (name, stmt) in &mig {
-        assert!(
-            !stmt.to_uppercase().contains("UNION ALL"),
-            "{name} (migration 128) has a UNION ALL body — only its first SELECT would ever fire"
-        );
+    for (label, mig_sql) in [("migration 128", MIGRATION_128), ("migration 129", MIGRATION_129)] {
+        for (name, stmt) in &create_mv_statements(mig_sql) {
+            assert!(
+                !stmt.to_uppercase().contains("UNION ALL"),
+                "{name} ({label}) has a UNION ALL body — only its first SELECT would ever fire"
+            );
+        }
     }
 }
 
-/// The pre-split UNION ALL view must not resurface in either init file (fresh
-/// bootstraps would recreate the broken shape next to the split MVs).
+/// The pre-split UNION ALL views (and the superseded 055 process-hash
+/// workaround) must not resurface in either init file (fresh bootstraps would
+/// recreate the broken / double-counting shape next to the split MVs).
 #[test]
-fn legacy_union_all_entity_mv_is_gone() {
+fn legacy_union_all_mvs_are_gone() {
     for (label, sql) in [("init.sql", UDM_INIT), ("ocsf/init.sql", OCSF_INIT)] {
         let mvs = create_mv_statements(sql);
-        assert!(
-            !mvs.contains_key("nanosiem.entity_time_range_mv"),
-            "{label} still defines the UNION ALL nanosiem.entity_time_range_mv"
-        );
+        for legacy in LEGACY_MV_NAMES {
+            assert!(
+                !mvs.contains_key(*legacy),
+                "{label} still defines the legacy {legacy}"
+            );
+        }
     }
 }
 
@@ -172,6 +213,36 @@ fn migration_128_matches_init_definitions() {
             "{name} differs between migration 128 and clickhouse/ocsf/init.sql"
         );
     }
+}
+
+/// Migration 129 (existing deployments) and the init files (fresh bootstraps)
+/// must define byte-equivalent prevalence MVs, or the two paths diverge
+/// silently.
+#[test]
+fn migration_129_matches_init_definitions() {
+    let udm = create_mv_statements(UDM_INIT);
+    let ocsf = create_mv_statements(OCSF_INIT);
+    let mig = create_mv_statements(MIGRATION_129);
+
+    for name in UDM_PREVALENCE_MVS {
+        assert_eq!(
+            mig.get(*name),
+            udm.get(*name),
+            "{name} differs between migration 129 and clickhouse/init.sql"
+        );
+    }
+    for name in OCSF_PREVALENCE_MVS {
+        assert_eq!(
+            mig.get(*name),
+            ocsf.get(*name),
+            "{name} differs between migration 129 and clickhouse/ocsf/init.sql"
+        );
+    }
+    assert_eq!(
+        mig.len(),
+        UDM_PREVALENCE_MVS.len() + OCSF_PREVALENCE_MVS.len(),
+        "migration 129 defines MVs not covered by the prevalence guard lists"
+    );
 }
 
 /// The OCSF telemetry rollup depends on the materialized `event_bytes` column;

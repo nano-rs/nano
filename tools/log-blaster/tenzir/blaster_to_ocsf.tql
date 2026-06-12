@@ -1,0 +1,869 @@
+// log-blaster --tenzir → Tenzir → OCSF 1.8.0 → direct ClickHouse (NAN-1402).
+//
+// Receives the blaster's RAW NDJSON envelopes ({message, timestamp,
+// source_type}) on a single HTTP listener, routes on source_type, parses each
+// feed's raw payload (JSON or Apache combined-log text), maps it to OCSF
+// 1.8.0 with the same class_uid/activity_id/promoted-field coverage as the
+// native Vector OCSF parsers (parsers-ocsf/{apache,aws_cloudtrail,
+// conduit_proxy,sysmon_json,windows_event}/parser.yaml), wraps each record in
+// the wire shape {event, source_type}, and INSERTs into nanosiem.ocsf_logs
+// per the producer contract (docs/user-guide/direct-ocsf-ingestion.md).
+//
+// Run it (see tenzir/README.md for the full recipe):
+//
+//   docker run -d --name tenzir-blaster --network nanosiem_default \
+//     -p 9095:9095 -e NANO_CH_INGEST_PASSWORD=<CLICKHOUSE_INGEST_PASSWORD> \
+//     -v "$PWD/tools/log-blaster/tenzir/blaster_to_ocsf.tql:/pipeline.tql:ro" \
+//     tenzir/tenzir -f /pipeline.tql
+//
+// Parameters (environment — no secrets are committed in this file):
+//   NANO_CH_INGEST_PASSWORD  REQUIRED. The nanosiem_ingest password
+//                            (CLICKHOUSE_INGEST_PASSWORD; local dev default
+//                            is in docker-compose.yml).
+//   NANO_CH_URL              ClickHouse HTTP base. Default http://clickhouse:8123
+//   NANO_CH_INGEST_USER      INSERT-only user.     Default nanosiem_ingest
+//   NANO_TENZIR_LISTEN       Listener address.     Default 0.0.0.0:9095
+
+let $ch_url = env("NANO_CH_URL").otherwise("http://clickhouse:8123") + "/?query=INSERT%20INTO%20nanosiem.ocsf_logs%20(event,%20source_type)%20FORMAT%20JSONEachRow&wait_for_async_insert=1"
+let $ch_auth = "Basic " + (env("NANO_CH_INGEST_USER").otherwise("nanosiem_ingest") + ":" + env("NANO_CH_INGEST_PASSWORD")).encode_base64()
+let $listen = env("NANO_TENZIR_LISTEN").otherwise("0.0.0.0:9095")
+
+// max_connections raised above the default 10 so blast mode (threads ×
+// inflight sends) doesn't queue on the listener.
+accept_http $listen, max_connections=100 { read_ndjson }
+
+// ---- envelope ------------------------------------------------------------
+src = string(source_type?).otherwise("unknown")
+raw = string(message?).otherwise("")
+
+if src == "windows_sysmon" {
+  // ==== Microsoft Sysmon (JSON) → per-EventID OCSF classes ================
+  // Mirrors parsers-ocsf/sysmon_json/parser.yaml:
+  //   1 Launch / 5 Terminate / 10 Open  -> Process Activity 1007
+  //   7 Load                            -> Module Activity 1005
+  //   12 Create/Delete                  -> Registry Key Activity 201001
+  //   13 Set                            -> Registry Value Activity 201002
+  //   3 Open                            -> Network Activity 4001
+  //   11 Create / 23 Delete             -> File System Activity 1001
+  //   22 Query                          -> DNS Activity 4003
+  p = raw.parse_json()
+  if p == null {
+    ev = {
+      class_uid: 1007, category_uid: 1, activity_id: 99, type_uid: 100799,
+      severity_id: 1, status_id: 0, time: 0, message: raw,
+      metadata: {
+        version: "1.8.0", uid: uuid(), log_level: "error",
+        product: {name: "Sysmon", vendor_name: "Microsoft"},
+      },
+    }
+  } else {
+    ed = p.event_data?.otherwise({})
+    eid = int(p.event_id?).otherwise(0)
+    computer = string(p.computer?).otherwise(string(p.host?).otherwise("")).to_lower()
+    time_ms = int(time(string(p.timestamp?)).since_epoch().count_milliseconds()).otherwise(0)
+
+    // actor user "DOMAIN\user" -> name (strip domain)
+    actor_user = string(ed.User?).otherwise("").split("\\").last()
+    // acting/parent process basenames out of the Image paths
+    img = string(ed.Image?).otherwise("")
+    actor_proc_name = img.split("\\").last().split("/").last()
+    pimg = string(ed.ParentImage?).otherwise("")
+    parent_proc_name = pimg.split("\\").last().split("/").last()
+    // SHA-256 out of the "SHA256=.." Hashes string
+    sha = ""
+    hs = string(ed.Hashes?).otherwise("")
+    if hs != "" {
+      hm = hs.parse_grok("SHA256=%{BASE16NUM:h}")
+      if hm != null { sha = string(hm.h?).otherwise("").to_lower() }
+    }
+
+    // The Image-based (acting/subject) process. For 1007 process-family
+    // events this is the OCSF top-level `process` (the SUBJECT); for the
+    // network/file/dns classes it is the initiator (actor.process).
+    subject_process = {
+      name: actor_proc_name,
+      cmd_line: string(ed.CommandLine?).otherwise(""),
+      pid: int(ed.ProcessId?).otherwise(0),
+      uid: string(ed.ProcessGuid?).otherwise(""),
+      file: {name: actor_proc_name, path: img, type_id: 1},
+    }
+    if sha != "" {
+      subject_process.file.hashes = [{algorithm_id: 3, value: sha}]
+    }
+
+    // The PARENT process (initiator), present on Process Create (EID 1).
+    parent_process = {
+      name: parent_proc_name,
+      cmd_line: string(ed.ParentCommandLine?).otherwise(""),
+      pid: int(ed.ParentProcessId?).otherwise(0),
+    }
+    has_parent = pimg != "" or string(ed.ParentCommandLine?).otherwise("") != ""
+    actor_process = subject_process
+    if has_parent { actor_process.parent_process = parent_process }
+
+    class_uid = 1007
+    class_name = "Process Activity"
+    category_uid = 1
+    category_name = "System Activity"
+    activity_id = 99
+    activity_name = "Other"
+    ev = {}
+
+    if eid == 1 or eid == 5 {
+      if eid == 1 {
+        activity_id = 1
+        activity_name = "Launch"
+      }
+      if eid == 5 {
+        activity_id = 2
+        activity_name = "Terminate"
+      }
+      // OCSF 1007: top-level `process` (REQUIRED) = the SUBJECT process.
+      ev.process = subject_process
+      if eid == 1 {
+        ev.actor = {process: parent_process, user: {name: actor_user}}
+      } else {
+        ev.actor = {user: {name: actor_user}}
+      }
+      ev.device = {hostname: computer}
+    } else if eid == 12 {
+      class_uid = 201001
+      class_name = "Registry Key Activity"
+      reg_event = string(ed.EventType?).otherwise("")
+      if reg_event == "CreateKey" {
+        activity_id = 1
+        activity_name = "Create"
+      }
+      if reg_event == "DeleteKey" {
+        activity_id = 4
+        activity_name = "Delete"
+      }
+      ev.actor = {process: subject_process, user: {name: actor_user}}
+      ev.reg_key = {path: string(ed.TargetObject?).otherwise("")}
+      ev.device = {hostname: computer}
+    } else if eid == 13 {
+      class_uid = 201002
+      class_name = "Registry Value Activity"
+      activity_id = 2
+      activity_name = "Set"
+      ev.actor = {process: subject_process, user: {name: actor_user}}
+      // Sysmon TargetObject is the full key\value; split on the LAST
+      // backslash: tail -> reg_value.name, head -> reg_value.path.
+      tgt_parts = string(ed.TargetObject?).otherwise("").split("\\")
+      ev.reg_value = {
+        name: tgt_parts.last(),
+        path: tgt_parts.slice(end=-1).join("\\"),
+        data: string(ed.Details?).otherwise(""),
+      }
+      ev.device = {hostname: computer}
+    } else if eid == 7 {
+      // Image Loaded: the loading process is the ACTOR, the loaded image is
+      // the `module` (its own subject) — Module Activity, NOT Process.
+      class_uid = 1005
+      class_name = "Module Activity"
+      activity_id = 1
+      activity_name = "Load"
+      loaded = string(ed.ImageLoaded?).otherwise("")
+      mod_name = loaded.split("\\").last().split("/").last()
+      ev.actor = {process: subject_process, user: {name: actor_user}}
+      ev.module = {file: {path: loaded, name: mod_name, type_id: 1}}
+      ev.device = {hostname: computer}
+      ev.unmapped = {
+        sysmon_event_id: eid,
+        signed: ed.Signed?,
+        signature: string(ed.Signature?),
+        signature_status: string(ed.SignatureStatus?),
+      }
+    } else if eid == 10 {
+      // Process Access: Source = actor, Target = subject process.
+      activity_id = 3
+      activity_name = "Open"
+      simg = string(ed.SourceImage?).otherwise("")
+      src_proc_name = simg.split("\\").last().split("/").last()
+      timg = string(ed.TargetImage?).otherwise("")
+      tgt_proc_name = timg.split("\\").last().split("/").last()
+      ev.actor = {
+        process: {
+          name: src_proc_name,
+          uid: string(ed.SourceProcessGUID?).otherwise(""),
+          pid: int(ed.SourceProcessId?).otherwise(0),
+          file: {name: src_proc_name, path: simg, type_id: 1},
+        },
+        user: {name: actor_user},
+      }
+      ev.process = {
+        name: tgt_proc_name,
+        uid: string(ed.TargetProcessGUID?).otherwise(""),
+        pid: int(ed.TargetProcessId?).otherwise(0),
+        file: {name: tgt_proc_name, path: timg, type_id: 1},
+      }
+      ev.device = {hostname: computer}
+      ev.unmapped = {sysmon_event_id: eid, granted_access: string(ed.GrantedAccess?)}
+    } else if eid == 3 {
+      class_uid = 4001
+      class_name = "Network Activity"
+      category_uid = 4
+      category_name = "Network Activity"
+      activity_id = 1
+      activity_name = "Open"
+      ev.src_endpoint = {
+        ip: string(ed.SourceIp?).otherwise("").to_lower(),
+        port: int(ed.SourcePort?).otherwise(0),
+        hostname: string(ed.SourceHostname?).otherwise("").to_lower(),
+      }
+      ev.dst_endpoint = {
+        ip: string(ed.DestinationIp?).otherwise("").to_lower(),
+        port: int(ed.DestinationPort?).otherwise(0),
+        hostname: string(ed.DestinationHostname?).otherwise("").to_lower(),
+      }
+      // protocol_num is an IANA number; only emit it when known.
+      proto = string(ed.Protocol?).otherwise("").to_lower()
+      if proto == "tcp" { ev.connection_info = {protocol_num: 6} }
+      if proto == "udp" { ev.connection_info = {protocol_num: 17} }
+      ev.actor = {process: actor_process, user: {name: actor_user}}
+      ev.device = {hostname: computer}
+    } else if eid == 11 or eid == 23 {
+      class_uid = 1001
+      class_name = "File System Activity"
+      if eid == 11 {
+        activity_id = 1
+        activity_name = "Create"
+      }
+      if eid == 23 {
+        activity_id = 4
+        activity_name = "Delete"
+      }
+      tf = string(ed.TargetFilename?).otherwise("")
+      file_name = tf.split("\\").last().split("/").last()
+      ev.file = {name: file_name, path: tf, type_id: 1}
+      if sha != "" { ev.file.hashes = [{algorithm_id: 3, value: sha}] }
+      ev.actor = {process: actor_process, user: {name: actor_user}}
+      ev.device = {hostname: computer}
+    } else if eid == 22 {
+      class_uid = 4003
+      class_name = "DNS Activity"
+      category_uid = 4
+      category_name = "Network Activity"
+      activity_id = 1
+      activity_name = "Query"
+      ev.query = {hostname: string(ed.QueryName?).otherwise("").to_lower()}
+      qr = string(ed.QueryResults?).otherwise("")
+      if qr != "" { ev.answers = [{rdata: qr}] }
+      ev.actor = {process: actor_process, user: {name: actor_user}}
+      ev.device = {hostname: computer}
+    } else {
+      // unknown EventID -> Process Activity / Other, carry context
+      ev.actor = {process: actor_process, user: {name: actor_user}}
+      ev.device = {hostname: computer}
+      ev.unmapped = {sysmon_event_id: eid}
+    }
+
+    ev.class_uid = class_uid
+    ev.class_name = class_name
+    ev.category_uid = category_uid
+    ev.category_name = category_name
+    ev.activity_id = activity_id
+    ev.activity_name = activity_name
+    ev.type_uid = class_uid * 100 + activity_id
+    ev.severity_id = 1
+    ev.severity = "Informational"
+    ev.status_id = 1
+    ev.status = "Success"
+    ev.time = time_ms
+    ev.message = raw
+    ev.metadata = {
+      version: "1.8.0",
+      uid: string(p.record_id?).otherwise(uuid()),
+      log_name: string(p.channel?).otherwise("Microsoft-Windows-Sysmon/Operational"),
+      log_provider: string(p.provider_name?).otherwise("Microsoft-Windows-Sysmon"),
+      product: {name: "Sysmon", vendor_name: "Microsoft"},
+    }
+  }
+} else if src == "windows_event" {
+  // ==== Windows Security Event Log (JSON) =================================
+  // Mirrors parsers-ocsf/windows_event/parser.yaml:
+  //   4624/4625 Logon, 4634 Logoff -> Authentication 3002
+  //   4672 Assign Privileges       -> Authorize Session 3003
+  //   4688 Launch                  -> Process Activity 1007
+  p = raw.parse_json()
+  if p == null {
+    ev = {
+      class_uid: 3002, category_uid: 3, activity_id: 99, type_uid: 300299,
+      severity_id: 1, status_id: 0, time: 0, message: raw,
+      metadata: {
+        version: "1.8.0", uid: uuid(), log_level: "error",
+        product: {name: "Windows", vendor_name: "Microsoft"},
+      },
+    }
+  } else {
+    ed = p.event_data?.otherwise({})
+    eid = int(p.event_id?).otherwise(0)
+    computer = string(p.computer?).otherwise(string(p.host?).otherwise("")).to_lower()
+    time_ms = int(time(string(p.timestamp?)).since_epoch().count_milliseconds()).otherwise(0)
+    // human-readable Windows message if present, else the raw JSON
+    msg = string(p.message?).otherwise("")
+    if msg == "" { msg = raw }
+
+    ev = {}
+    if eid == 4688 {
+      npn = string(ed.NewProcessName?).otherwise("")
+      proc_name = npn.split("\\").last().split("/").last()
+      ppn = string(ed.ParentProcessName?).otherwise("")
+      parent_name = ppn.split("\\").last().split("/").last()
+      ev.class_uid = 1007
+      ev.class_name = "Process Activity"
+      ev.category_uid = 1
+      ev.category_name = "System Activity"
+      ev.activity_id = 1
+      ev.activity_name = "Launch"
+      // OCSF 1007: `process` = the SUBJECT (new process); actor = parent.
+      // NewProcessId is hex ("0x..."); TQL int() can't parse the 0x prefix
+      // (unlike the Vector lane's VRL parse_int), so strip it + base=16.
+      ev.process = {
+        name: proc_name,
+        cmd_line: string(ed.CommandLine?).otherwise(""),
+        pid: string(ed.NewProcessId?).otherwise("0x0").trim_start("0x").int(base=16).otherwise(0),
+        file: {name: proc_name, path: npn, type_id: 1},
+      }
+      ev.actor = {
+        process: {name: parent_name, file: {name: parent_name, path: ppn, type_id: 1}},
+        user: {name: string(ed.SubjectUserName?).otherwise("").to_lower()},
+      }
+      ev.user = {
+        name: string(ed.SubjectUserName?).otherwise("").to_lower(),
+        domain: string(ed.SubjectDomainName?).otherwise("").to_lower(),
+        uid: string(ed.SubjectUserSid?).otherwise(""),
+      }
+      ev.device = {hostname: computer}
+      ev.status_id = 1
+      ev.status = "Success"
+      ev.severity_id = 1
+      ev.severity = "Informational"
+    } else if eid == 4672 {
+      // Authorize Session 3003, activity 1 (Assign Privileges); privileges
+      // split out of PrivilegeList.
+      ev.class_uid = 3003
+      ev.class_name = "Authorize Session"
+      ev.category_uid = 3
+      ev.category_name = "Identity & Access Management"
+      ev.activity_id = 1
+      ev.activity_name = "Assign Privileges"
+      ev.status_id = 1
+      ev.status = "Success"
+      ev.severity_id = 1
+      ev.severity = "Informational"
+      ev.user = {
+        name: string(ed.SubjectUserName?).otherwise("").to_lower(),
+        domain: string(ed.SubjectDomainName?).otherwise("").to_lower(),
+        uid: string(ed.SubjectUserSid?).otherwise(""),
+      }
+      priv_raw = string(ed.PrivilegeList?).otherwise("").trim()
+      if priv_raw != "" {
+        ev.privileges = priv_raw.split_regex(r"\s+")
+      } else {
+        ev.privileges = []
+      }
+      ev.device = {hostname: computer}
+      ev.session = {uid: string(ed.SubjectLogonId?).otherwise("")}
+      ev.unmapped = {windows_event_id: eid}
+    } else {
+      // Authentication family -> 3002
+      ev.class_uid = 3002
+      ev.class_name = "Authentication"
+      ev.category_uid = 3
+      ev.category_name = "Identity & Access Management"
+      activity_id = 99
+      activity_name = "Other"
+      status_id = 1
+      status_str = "Success"
+      severity_id = 1
+      severity = "Informational"
+      if eid == 4624 {
+        activity_id = 1
+        activity_name = "Logon"
+      }
+      if eid == 4625 {
+        activity_id = 1
+        activity_name = "Logon"
+        status_id = 2
+        status_str = "Failure"
+        severity_id = 2
+        severity = "Low"
+      }
+      if eid == 4634 {
+        activity_id = 2
+        activity_name = "Logoff"
+      }
+
+      // logon events carry the principal in Target*
+      pkg = string(ed.AuthenticationPackageName?).otherwise("")
+      auth_protocol_id = 0
+      if pkg.to_lower() == "ntlm" { auth_protocol_id = 1 }
+      if pkg.to_lower() == "kerberos" { auth_protocol_id = 2 }
+      if pkg != "" and auth_protocol_id == 0 { auth_protocol_id = 99 }
+
+      ev.activity_id = activity_id
+      ev.activity_name = activity_name
+      ev.status_id = status_id
+      ev.status = status_str
+      ev.severity_id = severity_id
+      ev.severity = severity
+      ev.user = {
+        name: string(ed.TargetUserName?).otherwise("").to_lower(),
+        domain: string(ed.TargetDomainName?).otherwise("").to_lower(),
+        uid: string(ed.TargetUserSid?).otherwise(""),
+      }
+      ev.is_mfa = false
+      logon_id = string(ed.TargetLogonId?).otherwise(string(ed.SubjectLogonId?).otherwise(""))
+      if logon_id != "" { ev.session = {uid: logon_id} }
+      if auth_protocol_id != 0 {
+        ev.auth_protocol_id = auth_protocol_id
+        ev.auth_protocol = pkg
+      }
+      // source endpoint (network logons carry IpAddress/IpPort/Workstation)
+      ip = string(ed.IpAddress?).otherwise("")
+      ws = string(ed.WorkstationName?).otherwise("")
+      if ip != "" or ws != "" {
+        ev.src_endpoint = {
+          ip: ip.to_lower(),
+          port: int(ed.IpPort?).otherwise(0),
+          hostname: ws.to_lower(),
+        }
+      }
+      // Authentication 3002 requires at_least_one(service, dst_endpoint):
+      // the logon TARGET is the reporting machine.
+      ev.dst_endpoint = {hostname: computer}
+      ev.device = {hostname: computer}
+      ev.unmapped = {windows_event_id: eid, logon_type: string(ed.LogonType?)}
+      if eid == 4625 {
+        ev.unmapped.failure_reason = string(ed.FailureReason?)
+        ev.unmapped.status = string(ed.Status?)
+        ev.unmapped.sub_status = string(ed.SubStatus?)
+      }
+    }
+
+    ev.type_uid = int(ev.class_uid) * 100 + int(ev.activity_id)
+    ev.time = time_ms
+    ev.message = msg
+    ev.metadata = {
+      version: "1.8.0",
+      uid: string(p.record_id?).otherwise(uuid()),
+      log_name: string(p.channel?).otherwise("Security"),
+      log_provider: string(p.provider_name?).otherwise("Microsoft-Windows-Security-Auditing"),
+      product: {name: "Windows", vendor_name: "Microsoft"},
+    }
+  }
+} else if src == "conduit_proxy" {
+  // ==== Conduit MITM proxy (JSON) -> HTTP Activity 4002 ====================
+  // Mirrors parsers-ocsf/conduit_proxy/parser.yaml. Proxy-specific signals
+  // (threat scoring, DLP action, cache status) ride in `unmapped`.
+  p = raw.parse_json()
+  if p == null {
+    ev = {
+      class_uid: 4002, category_uid: 4, activity_id: 99, type_uid: 400299,
+      severity_id: 1, status_id: 0, time: 0, message: raw,
+      metadata: {
+        version: "1.8.0", uid: uuid(), log_level: "error",
+        product: {name: "Conduit Proxy", vendor_name: "Conduit"},
+      },
+    }
+  } else {
+    method = string(p.method?).otherwise("").to_upper()
+    activity_id = 99
+    activity_name = "Other"
+    if method == "CONNECT" {
+      activity_id = 1
+      activity_name = "Connect"
+    }
+    if method == "DELETE" {
+      activity_id = 2
+      activity_name = "Delete"
+    }
+    if method == "GET" {
+      activity_id = 3
+      activity_name = "Get"
+    }
+    if method == "HEAD" {
+      activity_id = 4
+      activity_name = "Head"
+    }
+    if method == "OPTIONS" {
+      activity_id = 5
+      activity_name = "Options"
+    }
+    if method == "POST" {
+      activity_id = 6
+      activity_name = "Post"
+    }
+    if method == "PUT" {
+      activity_id = 7
+      activity_name = "Put"
+    }
+    if method == "TRACE" {
+      activity_id = 8
+      activity_name = "Trace"
+    }
+    if method == "PATCH" {
+      activity_id = 9
+      activity_name = "Patch"
+    }
+
+    code = int(p.status_code?).otherwise(0)
+    status_id = 2
+    status_str = "Failure"
+    if code >= 200 and code < 400 {
+      status_id = 1
+      status_str = "Success"
+    }
+
+    // elevate severity when the proxy blocked the request
+    severity_id = 1
+    severity = "Informational"
+    blocked = p.threat_blocked?.otherwise(false) == true
+    if blocked {
+      severity_id = 4
+      severity = "High"
+    }
+
+    time_ms = int(time(string(p.timestamp?)).since_epoch().count_milliseconds()).otherwise(0)
+
+    // upstream_addr "ip:port" -> dst_endpoint ip/port
+    host = string(p.host?).otherwise("").to_lower()
+    dst_endpoint = {}
+    if host != "" { dst_endpoint.hostname = host }
+    upstream = string(p.upstream_addr?).otherwise("")
+    if upstream != "" {
+      ua_parts = upstream.split(":")
+      dst_endpoint.ip = ua_parts.first().to_lower()
+      if ua_parts.length() >= 2 { dst_endpoint.port = int(ua_parts.last()).otherwise(0) }
+    }
+    if dst_endpoint.port? == null {
+      dport = int(p.port?).otherwise(0)
+      if dport != 0 { dst_endpoint.port = dport }
+    }
+
+    ev = {
+      class_uid: 4002,
+      class_name: "HTTP Activity",
+      category_uid: 4,
+      category_name: "Network Activity",
+      activity_id: activity_id,
+      activity_name: activity_name,
+      type_uid: 4002 * 100 + activity_id,
+      severity_id: severity_id,
+      severity: severity,
+      status_id: status_id,
+      status: status_str,
+      time: time_ms,
+      message: raw,
+      metadata: {
+        version: "1.8.0",
+        uid: string(p.id?).otherwise(uuid()),
+        log_name: "conduit-proxy",
+        product: {name: "Conduit Proxy", vendor_name: "Conduit"},
+      },
+      src_endpoint: {ip: string(p.client_ip?).otherwise("").to_lower()},
+      dst_endpoint: dst_endpoint,
+      http_request: {
+        http_method: method,
+        url: {
+          path: string(p.path?).otherwise(""),
+          url_string: string(p.full_url?).otherwise(""),
+          hostname: host,
+        },
+      },
+      http_response: {
+        code: code,
+        length: int(p.response_bytes?).otherwise(0),
+        status: status_str,
+      },
+      // OCSF: bytes_in = client->destination, bytes_out = destination->client.
+      traffic: {
+        bytes_in: int(p.request_bytes?).otherwise(0),
+        bytes_out: int(p.response_bytes?).otherwise(0),
+      },
+      // Proxy-specific signals with no native OCSF home -> standard `unmapped`.
+      unmapped: {
+        category: string(p.category?),
+        action: string(p.action?),
+        cache_status: string(p.cache_status?),
+        content_type: string(p.content_type?),
+        tls_intercepted: p.tls_intercepted?,
+        threat_score: p.threat_score?,
+        threat_tier: string(p.threat_tier?),
+        threat_blocked: p.threat_blocked?,
+        threat_signals: p.threat_signals?,
+        rule_id: p.rule_id?,
+        duration_ms: p.duration_ms?,
+      },
+    }
+
+    // authenticated proxy user -> actor.user.name (+ top-level user.name)
+    auth_user = string(p.username?).otherwise("")
+    if auth_user != "" {
+      ev.actor = {user: {name: auth_user.to_lower()}}
+      ev.user = {name: auth_user.to_lower()}
+    }
+  }
+} else if src == "apache_access" or src == "apache" {
+  // ==== Apache combined log (TEXT) -> HTTP Activity 4002 ===================
+  // Mirrors parsers-ocsf/apache/parser.yaml. Combined logs carry only a
+  // request path (no scheme/host), so the OCSF url is path-only.
+  g = raw.parse_grok("%{HTTPD_COMBINEDLOG}")
+  if g == null {
+    // On parse failure, land a minimal debuggable record instead of dropping.
+    ev = {
+      class_uid: 4002, category_uid: 4, activity_id: 99, type_uid: 400299,
+      severity_id: 1, status_id: 0, time: 0, message: raw,
+      metadata: {
+        version: "1.8.0", uid: uuid(), log_level: "error",
+        product: {name: "Apache HTTP Server", vendor_name: "Apache Software Foundation"},
+      },
+    }
+  } else {
+    method = string(g["http.request.method"]?).otherwise("").to_upper()
+    activity_id = 99
+    activity_name = "Other"
+    if method == "CONNECT" {
+      activity_id = 1
+      activity_name = "Connect"
+    }
+    if method == "DELETE" {
+      activity_id = 2
+      activity_name = "Delete"
+    }
+    if method == "GET" {
+      activity_id = 3
+      activity_name = "Get"
+    }
+    if method == "HEAD" {
+      activity_id = 4
+      activity_name = "Head"
+    }
+    if method == "OPTIONS" {
+      activity_id = 5
+      activity_name = "Options"
+    }
+    if method == "POST" {
+      activity_id = 6
+      activity_name = "Post"
+    }
+    if method == "PUT" {
+      activity_id = 7
+      activity_name = "Put"
+    }
+    if method == "TRACE" {
+      activity_id = 8
+      activity_name = "Trace"
+    }
+    if method == "PATCH" {
+      activity_id = 9
+      activity_name = "Patch"
+    }
+
+    code = int(g["http.response.status_code"]?).otherwise(0)
+    status_id = 2
+    status_str = "Failure"
+    if code >= 200 and code < 400 {
+      status_id = 1
+      status_str = "Success"
+    }
+
+    time_ms = int(
+      string(g.timestamp?).otherwise("")
+        .parse_time("%d/%b/%Y:%H:%M:%S %z")
+        .since_epoch().count_milliseconds()
+    ).otherwise(0)
+
+    // %b is "-" on bodyless responses -> grok yields null -> 0
+    size = int(g["http.response.body.bytes"]?).otherwise(0)
+
+    ev = {
+      class_uid: 4002,
+      class_name: "HTTP Activity",
+      category_uid: 4,
+      category_name: "Network Activity",
+      activity_id: activity_id,
+      activity_name: activity_name,
+      type_uid: 4002 * 100 + activity_id,
+      severity_id: 1,
+      severity: "Informational",
+      status_id: status_id,
+      status: status_str,
+      time: time_ms,
+      message: raw,
+      metadata: {
+        version: "1.8.0",
+        uid: uuid(),
+        product: {name: "Apache HTTP Server", vendor_name: "Apache Software Foundation"},
+      },
+      src_endpoint: {ip: string(g["source.address"]?).otherwise("")},
+      http_request: {
+        http_method: method,
+        user_agent: string(g["user_agent.original"]?).otherwise(""),
+        url: {path: string(g["url.original"]?).otherwise("")},
+      },
+      http_response: {code: code, length: size, status: status_str},
+      // traffic.bytes_out exercises the promoted `traffic.bytes_out` column.
+      traffic: {bytes_out: size},
+    }
+
+    // referrer: grok maps "-" to null; only emit when real
+    ref = string(g["http.request.referrer"]?).otherwise("")
+    if ref != "" { ev.http_request.referrer = ref }
+    // authenticated user (Apache %u) -> actor.user.name, "-" comes back null
+    auth_user = string(g["user.name"]?).otherwise("")
+    if auth_user != "" { ev.actor = {user: {name: auth_user}} }
+  }
+} else if src == "aws_cloudtrail" {
+  // ==== AWS CloudTrail (JSON) -> API Activity 6003 =========================
+  // Mirrors parsers-ocsf/aws_cloudtrail/parser.yaml.
+  p = raw.parse_json()
+  if p == null {
+    ev = {
+      class_uid: 6003, category_uid: 6, activity_id: 99, type_uid: 600399,
+      severity_id: 1, status_id: 0, time: 0, message: raw,
+      metadata: {
+        version: "1.8.0", uid: uuid(), log_level: "error",
+        product: {name: "AWS CloudTrail", vendor_name: "Amazon"},
+      },
+    }
+  } else {
+    ui = p.userIdentity?.otherwise({})
+    nano = p._nanosiem?.otherwise({})
+
+    // activity_id: CRUD from changeType / readOnly
+    change = string(nano.changeType?).otherwise("").to_lower()
+    read_only = p.readOnly?.otherwise(false) == true
+    activity_id = 99
+    activity_name = "Other"
+    if change == "create" {
+      activity_id = 1
+      activity_name = "Create"
+    }
+    if change == "read" {
+      activity_id = 2
+      activity_name = "Read"
+    }
+    if change == "update" {
+      activity_id = 3
+      activity_name = "Update"
+    }
+    if change == "delete" {
+      activity_id = 4
+      activity_name = "Delete"
+    }
+    if activity_id == 99 and read_only {
+      activity_id = 2
+      activity_name = "Read"
+    }
+
+    // AWS service token out of eventSource ("ec2.amazonaws.com" -> "ec2")
+    svc = string(p.eventSource?).otherwise("").split(".").first()
+    if svc == "" { svc = string(nano.cloudService?).otherwise("") }
+
+    // outcome: errorCode present -> Failure
+    error_code = string(p.errorCode?).otherwise("")
+    status_id = 1
+    status_str = string(nano.status?).otherwise("Success")
+    severity_id = 1
+    severity = "Informational"
+    if error_code != "" {
+      status_id = 2
+      status_str = "Failure"
+      severity_id = 2
+      severity = "Low"
+    }
+
+    time_ms = int(time(string(p.eventTime?)).since_epoch().count_milliseconds()).otherwise(0)
+
+    // resources[]: CloudTrail {type, ARN} -> OCSF {type, uid, name}
+    resources = p.resources?.otherwise([]).map(r => {
+      type: string(r.type?).otherwise(""),
+      uid: string(r.ARN?).otherwise(""),
+      // resource name = trailing token of the ARN (after the last : or /)
+      name: string(r.ARN?).otherwise("").split(":").last().split("/").last(),
+    })
+
+    caller = string(nano.callerName?).otherwise(string(ui.userName?).otherwise(""))
+    caller_uid = string(ui.arn?).otherwise(string(ui.principalId?).otherwise(""))
+
+    ev = {
+      class_uid: 6003,
+      class_name: "API Activity",
+      category_uid: 6,
+      category_name: "Application Activity",
+      activity_id: activity_id,
+      activity_name: activity_name,
+      type_uid: 6003 * 100 + activity_id,
+      severity_id: severity_id,
+      severity: severity,
+      status_id: status_id,
+      status: status_str,
+      time: time_ms,
+      message: raw,
+      metadata: {
+        version: "1.8.0",
+        uid: string(p.eventID?).otherwise(uuid()),
+        log_name: "CloudTrail",
+        log_provider: "AWS CloudTrail",
+        correlation_uid: string(p.requestID?).otherwise(""),
+        product: {name: "AWS CloudTrail", vendor_name: "Amazon"},
+      },
+      api: {
+        operation: string(p.eventName?).otherwise(""),
+        service: {name: svc},
+      },
+      cloud: {
+        provider: "AWS",
+        region: string(p.awsRegion?).otherwise(""),
+        account: {
+          uid: string(p.recipientAccountId?).otherwise(string(ui.accountId?).otherwise("")),
+          name: string(nano.accountAlias?).otherwise(""),
+        },
+      },
+      actor: {
+        user: {
+          name: caller,
+          uid: caller_uid,
+          type: string(ui.type?).otherwise(""),
+        },
+      },
+      // src_endpoint is REQUIRED on API Activity 6003 — always emit it.
+      src_endpoint: {ip: string(p.sourceIPAddress?).otherwise("").to_lower()},
+    }
+
+    ua = string(p.userAgent?).otherwise("")
+    if ua != "" { ev.http_request = {user_agent: ua} }
+    if resources.length() > 0 { ev.resources = resources }
+
+    // is_mfa is auth-specific, not an API Activity attribute -> unmapped.
+    ev.unmapped = {mfa_authenticated: nano.mfaAuthenticated?.otherwise(false) == true}
+    if error_code != "" {
+      ev.unmapped.error_code = error_code
+      ev.unmapped.error_message = string(p.errorMessage?)
+    }
+  }
+} else {
+  // Unknown feed: land a minimal, debuggable Process Activity/Other record
+  // rather than dropping — same posture as the Vector-lane parsers.
+  ev = {
+    class_uid: 1007, category_uid: 1, activity_id: 99, type_uid: 100799,
+    severity_id: 1, status_id: 0, time: 0, message: raw,
+    metadata: {
+      version: "1.8.0", uid: uuid(), log_level: "error",
+      product: {name: "log-blaster", vendor_name: "nano"},
+    },
+    unmapped: {unrouted_source_type: src},
+  }
+}
+
+// ---- producer-contract wire shape + sink ----------------------------------
+this = {event: ev, source_type: src}
+// `to_http` collects its whole input into a single request, which never
+// completes in a continuously-serving pipeline — `every 1s` closes the
+// request each second, turning the stream into 1 ClickHouse INSERT/s
+// micro-batches (async_insert coalesces them server-side anyway).
+every 1s {
+  to_http $ch_url, method="POST", headers={"Authorization": $ch_auth} { write_ndjson }
+}
