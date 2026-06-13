@@ -1890,6 +1890,17 @@ impl SourceConfigService {
         let mut source_type_extract_covered = false;
         let mut hec_normalize_covered = false;
         let mut source_config_routes: Vec<String> = Vec::new();
+        // NAN-1442: at most ONE route per shared always-on channel may feed
+        // `source_router`. `http` and `vector` BOTH intermediate
+        // `source_type_extract` (see `system_intermediary_source`), so wiring a
+        // route for each duplicates the entire post-extract stream into
+        // `source_router` — every event then lands in ClickHouse twice (the
+        // Saturn 2× bug). These system routes are passthrough source_type
+        // normalizers; the authoritative routing is `source_router`'s
+        // match_values, so collapsing duplicate-channel routes to a single
+        // carrier drops no events.
+        let mut covered_channels: std::collections::HashSet<&'static str> =
+            std::collections::HashSet::new();
 
         for config in deployed_configs {
             // System-level configs only contribute a route to source_router
@@ -1898,6 +1909,13 @@ impl SourceConfigService {
             // reference a transform that doesn't exist and abort Vector reload.
             if let Some(intermediary) = Self::system_intermediary_source(&config.config_type) {
                 if !is_system_route_deployed_on_disk(config) {
+                    continue;
+                }
+                // A route for this always-on channel is already wired — skip
+                // this duplicate so the channel reaches `source_router` exactly
+                // once (NAN-1442). Without this, two system configs sharing a
+                // channel (e.g. http + vector) each feed source_router → 2×.
+                if !covered_channels.insert(intermediary) {
                     continue;
                 }
                 // The per-config route intermediates this always-on channel
@@ -4033,6 +4051,57 @@ mod tests {
         let configs = vec![bare_config("http_main", "http")];
         let inputs = SourceConfigService::compute_router_inputs(&configs, |_| false, true);
         assert_eq!(inputs, vec!["source_type_extract", "vector_merge", "hec_normalize"]);
+    }
+
+    /// NAN-1442 (Saturn 2× ingestion): `http` and `vector` configs BOTH
+    /// intermediate `source_type_extract`. Deploying both must wire exactly
+    /// ONE route into `source_router`, or the post-extract stream reaches it
+    /// twice and every event is inserted into ClickHouse twice.
+    #[test]
+    fn compute_router_inputs_dedupes_http_and_vector_sharing_source_type_extract() {
+        let configs = vec![
+            bare_config("http_ingestion", "http"),
+            bare_config("vector_ingestion", "vector"),
+        ];
+        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| true, true);
+        let routes: Vec<&String> = inputs.iter().filter(|s| s.ends_with("_route")).collect();
+        assert_eq!(
+            routes.len(),
+            1,
+            "exactly one source_type_extract route must feed source_router, got {inputs:?}"
+        );
+        // Channel covered → direct source_type_extract dropped; vector_merge stays.
+        assert!(!inputs.iter().any(|s| s == "source_type_extract"), "{inputs:?}");
+        assert!(inputs.iter().any(|s| s == "vector_merge"), "{inputs:?}");
+    }
+
+    /// NAN-1442 guard: distinct channels must NOT be collapsed. `http`
+    /// (source_type_extract) + `splunk_hec` (hec_normalize) read different
+    /// always-on channels, so both routes stay and neither method is dropped.
+    #[test]
+    fn compute_router_inputs_keeps_routes_for_distinct_channels() {
+        let configs = vec![
+            bare_config("http_ingestion", "http"),
+            bare_config("splunk_main", "splunk_hec"),
+        ];
+        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| true, true);
+        let routes: Vec<&String> = inputs.iter().filter(|s| s.ends_with("_route")).collect();
+        assert_eq!(routes.len(), 2, "both distinct-channel routes must stay, got {inputs:?}");
+        assert!(!inputs.iter().any(|s| s == "source_type_extract"), "{inputs:?}");
+        assert!(!inputs.iter().any(|s| s == "hec_normalize"), "{inputs:?}");
+    }
+
+    /// NAN-1442 guard: non-system fetch sources (kafka/s3/...) own distinct
+    /// upstreams and must never be deduped against each other.
+    #[test]
+    fn compute_router_inputs_keeps_all_non_system_routes() {
+        let configs = vec![
+            bare_config("kafka_a", "kafka"),
+            bare_config("kafka_b", "kafka"),
+        ];
+        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| true, true);
+        let routes: Vec<&String> = inputs.iter().filter(|s| s.ends_with("_route")).collect();
+        assert_eq!(routes.len(), 2, "non-system routes must not be deduped, got {inputs:?}");
     }
 
     #[test]

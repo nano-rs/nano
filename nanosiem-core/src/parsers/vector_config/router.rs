@@ -94,6 +94,65 @@ pub(super) fn file_declares_route_transform(content: &str, route_name: &str) -> 
         .any(|line| !line.trim_start().starts_with('#') && line.contains(&needle))
 }
 
+/// NAN-1442: parse the `inputs = [...]` of a source-config route transform,
+/// returning the normalized upstream-list string (e.g. `["source_type_extract"]`).
+/// Used to detect routes that read the SAME upstream so only one is wired into
+/// `source_router`. Returns `None` when the block has no parseable `inputs`.
+pub(super) fn route_transform_upstream(content: &str, route_name: &str) -> Option<String> {
+    let header = format!("[transforms.{}]", route_name);
+    let mut in_block = false;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if !in_block {
+            if trimmed.contains(&header) {
+                in_block = true;
+            }
+            continue;
+        }
+        // Next section header ends the block before any inputs line.
+        if trimmed.starts_with('[') {
+            break;
+        }
+        if let Some(rest) = trimmed.strip_prefix("inputs") {
+            if let Some(rhs) = rest.trim_start().strip_prefix('=') {
+                // Strip ALL whitespace so `["a"]`, `[ "a" ]`, and `["a", "b"]`
+                // vs `["a","b"]` produce the same dedupe key (component ids
+                // never contain spaces).
+                return Some(rhs.split_whitespace().collect::<Vec<_>>().join(""));
+            }
+        }
+    }
+    None
+}
+
+/// NAN-1442: keep at most one source-config route per distinct upstream.
+/// Two routes reading the same upstream (e.g. `http`/`vector` configs both
+/// reading `source_type_extract`) would each feed `source_router`, duplicating
+/// the entire stream into ClickHouse (the Saturn 2× bug). Deterministic: the
+/// alphabetically-first route name wins per upstream. Routes whose upstream
+/// could not be parsed are kept (fail-open — never silently drop a route we
+/// don't understand). Distinct upstreams (pub/sub, HEC, owned fetch sources)
+/// are all preserved, so no ingest method is dropped.
+pub(super) fn dedupe_routes_by_upstream(mut routes: Vec<(String, Option<String>)>) -> Vec<String> {
+    routes.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut seen_upstreams: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for (name, upstream) in routes {
+        match upstream {
+            Some(up) => {
+                if seen_upstreams.insert(up) {
+                    out.push(name);
+                }
+            }
+            None => out.push(name),
+        }
+    }
+    out
+}
+
 /// NAN-930: which route does this parser pull events from? The router needs
 /// this so that source-config routes claimed by a fetch-source parser (Kafka
 /// / S3 / GCP) or by an HEC parser don't ALSO flow into `source_router` —
@@ -330,10 +389,11 @@ impl VectorConfigManager {
     /// doesn't match any components."
     pub(super) async fn get_source_config_routes(&self) -> Vec<String> {
         let configs_dir = self.source_configs_dir();
-        let mut routes = Vec::new();
+        // (route_name, upstream-inputs) so we can dedupe by upstream below.
+        let mut routes: Vec<(String, Option<String>)> = Vec::new();
 
         if !configs_dir.exists() {
-            return routes;
+            return Vec::new();
         }
 
         if let Ok(mut entries) = fs::read_dir(&configs_dir).await {
@@ -346,7 +406,8 @@ impl VectorConfigManager {
                         // before adding it to source_router inputs.
                         if let Ok(content) = fs::read_to_string(&path).await {
                             if file_declares_route_transform(&content, &route_name) {
-                                routes.push(route_name);
+                                let upstream = route_transform_upstream(&content, &route_name);
+                                routes.push((route_name, upstream));
                             }
                         }
                     }
@@ -354,8 +415,11 @@ impl VectorConfigManager {
             }
         }
 
-        routes.sort();
-        routes
+        // NAN-1442: collapse routes that read the same upstream so the shared
+        // channel (e.g. source_type_extract) reaches source_router once. The
+        // parser-deploy writer rebuilds _router.toml too, so without this the
+        // next parser deploy would re-introduce the double-write.
+        dedupe_routes_by_upstream(routes)
     }
 
     /// Detect which always-on intermediary channels are covered by a
@@ -691,6 +755,71 @@ impl VectorConfigManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NAN-1442: parse the upstream `inputs` of a route block.
+    #[test]
+    fn route_transform_upstream_parses_inputs_line() {
+        let content = r##"
+[transforms.http_ingestion_route]
+inputs = ["source_type_extract"]
+type = "remap"
+source = "# passthrough"
+"##;
+        assert_eq!(
+            route_transform_upstream(content, "http_ingestion_route").as_deref(),
+            Some("[\"source_type_extract\"]")
+        );
+        // Different layout / spacing normalizes to the same key.
+        let spaced = "[transforms.vector_ingestion_route]\ntype = \"remap\"\ninputs = [ \"source_type_extract\" ]\n";
+        assert_eq!(
+            route_transform_upstream(spaced, "vector_ingestion_route").as_deref(),
+            Some("[\"source_type_extract\"]")
+        );
+        // No inputs in block → None.
+        assert_eq!(route_transform_upstream("[transforms.x_route]\ntype=\"remap\"\n", "x_route"), None);
+    }
+
+    /// NAN-1442 (Saturn 2× ingestion): http + vector routes both read
+    /// `source_type_extract`; only one may feed `source_router`. Distinct
+    /// upstreams (pub/sub) are preserved.
+    #[test]
+    fn dedupe_routes_by_upstream_collapses_shared_channel_keeps_distinct() {
+        let routes = vec![
+            (
+                "vector_ingestion_route".to_string(),
+                Some("[\"source_type_extract\"]".to_string()),
+            ),
+            (
+                "http_ingestion_route".to_string(),
+                Some("[\"source_type_extract\"]".to_string()),
+            ),
+            (
+                "gcp_pub_sub_route".to_string(),
+                Some("[\"gcp_pub_sub_source\"]".to_string()),
+            ),
+        ];
+        // Alphabetically-first per upstream wins: http_ingestion_route (not
+        // vector_ingestion_route) carries source_type_extract; pub/sub kept.
+        assert_eq!(
+            dedupe_routes_by_upstream(routes),
+            vec!["gcp_pub_sub_route", "http_ingestion_route"]
+        );
+    }
+
+    /// NAN-1442 fail-open: routes whose upstream couldn't be parsed are kept
+    /// (we never silently drop a route we don't understand).
+    #[test]
+    fn dedupe_routes_by_upstream_keeps_unparseable() {
+        let routes = vec![
+            ("a_route".to_string(), None),
+            ("b_route".to_string(), None),
+            ("c_route".to_string(), Some("[\"x\"]".to_string())),
+        ];
+        assert_eq!(
+            dedupe_routes_by_upstream(routes),
+            vec!["a_route", "b_route", "c_route"]
+        );
+    }
 
     /// NAN-923: a file with a real `[transforms.foo_route]` block is
     /// recognized — gets added to source_router.inputs.
