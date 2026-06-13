@@ -40,6 +40,19 @@
         <ttl>event_date + INTERVAL 3 DAY</ttl>
     </part_log>
 
+    <!-- Asynchronous insert log - flush-time outcomes for async inserts (NAN-1405).
+         With wait_for_async_insert=0 the insert is ACKed at buffer time; when the
+         flush later fails (NAN-1404: FAILED enrichment dict -> MATERIALIZED
+         dictGetOrDefault throw) the batch is discarded with no queryable trace.
+         This log records per-entry flush status/exception/flush_query_id so
+         siem-health and operators can see silent ingestion loss. -->
+    <asynchronous_insert_log>
+        <database>system</database>
+        <table>asynchronous_insert_log</table>
+        <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        <ttl>event_date + INTERVAL 3 DAY</ttl>
+    </asynchronous_insert_log>
+
     <!-- Metric log - internal metrics at 1s intervals -->
     <metric_log>
         <database>system</database>

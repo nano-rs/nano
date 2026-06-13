@@ -128,6 +128,31 @@ pub async fn create_lookup_table(
         .parse(&content, &parser_config)
         .map_err(|e| ApiError::BadRequest(format!("Failed to parse file: {}", e)))?;
 
+    // Lookup tables feed detections and enrichment — a partially imported
+    // file means silently wrong reference data. Reject the whole upload if
+    // any row failed to parse, with per-row diagnostics (NAN-1363).
+    if !parse_result.errors.is_empty() {
+        const MAX_REPORTED: usize = 10;
+        let total = parse_result.errors.len();
+        let detail: Vec<String> = parse_result
+            .errors
+            .iter()
+            .take(MAX_REPORTED)
+            .map(|e| format!("line {}: {}", e.line_number, e.error_message))
+            .collect();
+        let suffix = if total > MAX_REPORTED {
+            format!("; and {} more", total - MAX_REPORTED)
+        } else {
+            String::new()
+        };
+        return Err(ApiError::BadRequest(format!(
+            "File contains {} malformed record(s) — {}{}",
+            total,
+            detail.join("; "),
+            suffix
+        )));
+    }
+
     if parse_result.records.is_empty() {
         return Err(ApiError::BadRequest(
             "No valid records found in file".to_string(),

@@ -168,7 +168,7 @@ impl SearchService {
 
                 let events = self
                     .execute_lateral_query(clickhouse, &auth_sql, &base_binds)
-                    .await;
+                    .await?;
                 for event in events {
                     if let Some(edge) = extract_edge(&event, hop, "auth") {
                         hop_edges.push(edge);
@@ -223,7 +223,7 @@ impl SearchService {
 
                 let events = self
                     .execute_lateral_query(clickhouse, &network_sql, &network_binds)
-                    .await;
+                    .await?;
                 for event in events {
                     if let Some(edge) = extract_edge(&event, hop, "network") {
                         hop_edges.push(edge);
@@ -251,7 +251,7 @@ impl SearchService {
 
                     let events = self
                         .execute_lateral_query(clickhouse, &process_sql, &base_binds)
-                        .await;
+                        .await?;
                     for event in events {
                         if let Some(edge) = extract_edge(&event, hop, "process") {
                             hop_edges.push(edge);
@@ -463,38 +463,48 @@ impl SearchService {
     }
 
     /// Execute a ClickHouse query with bind parameters and return parsed JSON rows
+    ///
+    /// NAN-1429 sweep: errors propagate — the old version treated a mid-stream
+    /// ClickHouse error as EOF, silently truncating the edge set and producing
+    /// an incomplete movement graph with no warning.
     async fn execute_lateral_query(
         &self,
         clickhouse: &clickhouse::Client,
         sql: &str,
         bind_values: &[String],
-    ) -> Vec<serde_json::Value> {
-        let mut events: Vec<serde_json::Value> = Vec::new();
+    ) -> Result<Vec<serde_json::Value>, SearchError> {
         let mut query = clickhouse.query(sql);
         for val in bind_values {
             query = query.bind(val);
         }
-        let mut cursor = match query.fetch_bytes("JSONEachRow") {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!("Lateral query failed to start: {}", e);
-                return events;
-            }
-        };
+        let mut cursor = query.fetch_bytes("JSONEachRow").map_err(|e| {
+            tracing::warn!("Lateral query failed to start: {}", e);
+            parse_clickhouse_error(&e.to_string())
+        })?;
 
         let mut response_bytes = Vec::new();
-        while let Ok(Some(chunk)) = cursor.next().await {
-            response_bytes.extend_from_slice(&chunk);
+        loop {
+            match cursor.next().await {
+                Ok(Some(chunk)) => response_bytes.extend_from_slice(&chunk),
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!("Lateral query failed mid-stream: {}", e);
+                    return Err(parse_clickhouse_error(&e.to_string()));
+                }
+            }
         }
 
-        if let Ok(response_str) = String::from_utf8(response_bytes) {
-            events = response_str
-                .lines()
-                .filter(|line| !line.is_empty())
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect();
-        }
-        events
+        let response_str = String::from_utf8(response_bytes).map_err(|e| {
+            SearchError::DatabaseError(sqlx::Error::Protocol(format!(
+                "Invalid UTF-8 in lateral query response: {}",
+                e
+            )))
+        })?;
+        Ok(response_str
+            .lines()
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect())
     }
 
     /// Batch-resolve IP addresses to hostnames using identity_observations.
@@ -536,7 +546,12 @@ impl SearchService {
         );
 
         let mut ip_to_hostname: HashMap<String, String> = HashMap::new();
-        let rows = self.execute_lateral_query(clickhouse, &sql, &ip_vec).await;
+        // Hostname resolution is best-effort enrichment — degrade gracefully
+        // on error (already logged inside execute_lateral_query).
+        let rows = self
+            .execute_lateral_query(clickhouse, &sql, &ip_vec)
+            .await
+            .unwrap_or_default();
         for row in rows {
             let ip = get_str(&row, "ip");
             let hostname = get_str(&row, "hostname");

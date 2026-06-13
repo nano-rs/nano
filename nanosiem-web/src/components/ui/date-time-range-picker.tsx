@@ -3,14 +3,16 @@
 import * as React from 'react';
 import { format } from 'date-fns';
 import { formatInTimeZone } from 'date-fns-tz';
-import { ArrowRight, ChevronDown, Clock } from 'lucide-react';
+import { ArrowRight, CalendarDays, ChevronDown, Clock } from 'lucide-react';
 import { DayFlag, SelectionState, UI } from 'react-day-picker';
 import { Calendar } from '@/components/ui/calendar';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
+import { TimelineRangeSlider } from '@/components/ui/timeline-range-slider';
 import { cn } from '@/lib/utils';
 import { useIsMobile } from '@/hooks/use-mobile';
+import { useViewPreference } from '@/hooks/use-view-preference';
 import { toApiTimeRange, type TimeRangeValue } from '@/hooks/use-api';
 
 interface DateTimeRangePickerProps {
@@ -41,30 +43,31 @@ interface DateTimeRangePickerProps {
 // (Relative = duration-from-now, Absolute = calendar-boundaried). Preset
 // labels preserved from the pre-redesign impl so the parser in time-range.ts
 // and saved searches keep working.
+// `short` is the desktop chip-row label; mobile keeps the long form.
 const presetCategories = [
   {
     label: 'Relative',
     presets: [
-      { label: 'Last 5 minutes', value: 'Last 5 minutes' },
-      { label: 'Last 15 minutes', value: 'Last 15 minutes' },
-      { label: 'Last 30 minutes', value: 'Last 30 minutes' },
-      { label: 'Last hour', value: 'Last hour' },
-      { label: 'Last 4 hours', value: 'Last 4 hours' },
-      { label: 'Last 12 hours', value: 'Last 12 hours' },
-      { label: 'Last 24 hours', value: 'Last 24 hours' },
-      { label: 'Last 7 days', value: 'Last 7 days' },
-      { label: 'Last 30 days', value: 'Last 30 days' },
-      { label: 'Last 90 days', value: 'Last 90 days' },
+      { label: 'Last 5 minutes', short: '5m', value: 'Last 5 minutes' },
+      { label: 'Last 15 minutes', short: '15m', value: 'Last 15 minutes' },
+      { label: 'Last 30 minutes', short: '30m', value: 'Last 30 minutes' },
+      { label: 'Last hour', short: '1h', value: 'Last hour' },
+      { label: 'Last 4 hours', short: '4h', value: 'Last 4 hours' },
+      { label: 'Last 12 hours', short: '12h', value: 'Last 12 hours' },
+      { label: 'Last 24 hours', short: '24h', value: 'Last 24 hours' },
+      { label: 'Last 7 days', short: '7d', value: 'Last 7 days' },
+      { label: 'Last 30 days', short: '30d', value: 'Last 30 days' },
+      { label: 'Last 90 days', short: '90d', value: 'Last 90 days' },
     ],
   },
   {
     label: 'Absolute',
     presets: [
-      { label: 'Today', value: 'Today' },
-      { label: 'Yesterday', value: 'Yesterday' },
-      { label: 'This week', value: 'This week' },
-      { label: 'Previous week', value: 'Previous week' },
-      { label: 'All time', value: 'All time' },
+      { label: 'Today', short: 'Today', value: 'Today' },
+      { label: 'Yesterday', short: 'Yesterday', value: 'Yesterday' },
+      { label: 'This week', short: 'This week', value: 'This week' },
+      { label: 'Previous week', short: 'Prev week', value: 'Previous week' },
+      { label: 'All time', short: 'All time', value: 'All time' },
     ],
   },
 ];
@@ -95,6 +98,18 @@ export function DateTimeRangePicker({ value, onChange, className, variant = 'def
   const [endDate, setEndDate] = React.useState<Date | undefined>(value.end);
   const [startTime, setStartTime] = React.useState(value.start ? format(value.start, 'HH:mm:ss') : '00:00:00');
   const [endTime, setEndTime] = React.useState(value.end ? format(value.end, 'HH:mm:ss') : '23:59:59');
+  // Desktop: the 2-month calendar grid is collapsed behind a toggle — the
+  // timeline slider is the primary custom-range surface (design spike).
+  // Persisted: analysts who prefer the grid get it back on every open.
+  const [calendarPref, setCalendarPref] = useViewPreference<'shown' | 'hidden'>(
+    'time-picker-calendar',
+    'hidden',
+  );
+  const showCalendar = calendarPref === 'shown';
+  // True once the user has staged an edit (slider/calendar/date inputs)
+  // this open — suppresses the sidebar's active-preset highlight so a
+  // stale preset doesn't stay lit next to a diverged staged range.
+  const [staged, setStaged] = React.useState(false);
 
   // Transient warning shown when a range click exceeds `maxRangeDays`. We
   // reject the click in `onSelect` (keeping the previous valid selection)
@@ -143,14 +158,31 @@ export function DateTimeRangePicker({ value, onChange, className, variant = 'def
     }
   }, [open, isMobile]);
 
-  // Initialize dates when opening if not set
+  // On open, reflect the active value — preset or custom — into the staged
+  // dates so the timeline slider and calendar show the current range rather
+  // than a stale/default one. Presets resolve through the same parser the
+  // search path uses. Unbounded presets ("All time") are left unstaged: no
+  // pill, Apply disabled until the user picks something concrete.
   React.useEffect(() => {
-    if (open && !startDate) {
-      const now = new Date();
-      setStartDate(new Date(now.getTime() - 24 * 60 * 60 * 1000));
-      setEndDate(now);
+    if (!open) return;
+    setStaged(false);
+    const resolved = toApiTimeRange(value);
+    const start = new Date(resolved.start);
+    const end = new Date(resolved.end);
+    if ((end.getTime() - start.getTime()) / 86_400_000 > 366) {
+      setStartDate(undefined);
+      setEndDate(undefined);
+      return;
     }
-  }, [open, startDate]);
+    // Stage calendar-day Dates built from the UTC components: Apply reads
+    // the staged Dates' *local* y/m/d as the UTC day, so staging the raw
+    // parsed Date would shift presets by a day for users west of UTC.
+    setStartDate(new Date(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate()));
+    setEndDate(new Date(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate()));
+    setStartTime(formatInTimeZone(start, 'UTC', 'HH:mm:ss'));
+    setEndTime(formatInTimeZone(end, 'UTC', 'HH:mm:ss'));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
 
   const displayValue = React.useMemo(() => {
     if (value.type === 'preset' && value.preset) {
@@ -206,14 +238,17 @@ export function DateTimeRangePicker({ value, onChange, className, variant = 'def
         999
       ));
       
-      onChange({ type: 'custom', start, end });
+      // refreshedAt mirrors the preset path: Apply should always re-run the
+      // consumer's search, even when the staged range equals the applied one
+      // (Search.tsx diffs timeRange by JSON to decide whether to re-query).
+      onChange({ type: 'custom', start, end, refreshedAt: Date.now() });
       setOpen(false);
     }
   };
 
   const isPresetSelected = (preset: string) => {
-    // Only show preset as selected if we're NOT in custom mode
-    return mode !== 'custom' && value.type === 'preset' && value.preset === preset;
+    // Highlight the applied preset until the user stages a divergent edit
+    return !staged && value.type === 'preset' && value.preset === preset;
   };
 
   return (
@@ -246,7 +281,7 @@ export function DateTimeRangePicker({ value, onChange, className, variant = 'def
       <PopoverContent
         className={cn(
           "p-0 bg-popover border-border-2 rounded-xl shadow-[0_40px_100px_rgba(0,0,0,0.6)] overflow-hidden",
-          isMobile ? "w-[calc(100vw-2rem)]" : "w-[640px] max-w-[calc(100vw-16px)]"
+          isMobile ? "w-[calc(100vw-2rem)]" : "w-[560px] max-w-[calc(100vw-16px)]"
         )}
         align={align || (isMobile ? "center" : "end")}
         sideOffset={8}
@@ -438,40 +473,68 @@ export function DateTimeRangePicker({ value, onChange, className, variant = 'def
             )}
           </div>
         ) : (
-          /* ── Desktop layout: mockup CalendarPopover — 170px sidebar + 2-month range calendar ── */
-          <div className="grid grid-cols-[170px_1fr] overflow-hidden">
-            <div
-              className="border-r border-border p-1.5 flex flex-col gap-px max-h-[480px] overflow-y-auto"
-              style={{ background: 'var(--panel)' }}
-            >
-              {visiblePresetCategories.map((category) => (
-                <React.Fragment key={category.label}>
-                  <div className="font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground/60 px-2.5 pt-2 pb-1 font-semibold">
-                    {category.label}
-                  </div>
-                  {category.presets.map((preset) => {
-                    const active = isPresetSelected(preset.value);
-                    return (
-                      <button
-                        key={preset.value}
-                        onClick={() => handlePresetSelect(preset.value)}
-                        className={cn(
-                          'px-2.5 py-1.5 text-[12px] rounded-sm flex items-center justify-between transition-colors',
-                          active
-                            ? 'bg-primary/10 text-primary'
-                            : 'text-foreground hover:bg-foreground/5'
-                        )}
-                      >
-                        <span>{preset.label}</span>
-                        {active && <span className="w-1 h-1 rounded-full bg-primary" />}
-                      </button>
-                    );
-                  })}
-                </React.Fragment>
-              ))}
-            </div>
+          /* ── Desktop layout: slider-first single column — timeline slider,
+                preset chip row, collapsible calendar, From/To inputs ── */
+          <div className="px-3 py-2.5 min-w-0 flex flex-col">
+              {/* Experimental timeline slider (design spike) — the primary
+                  custom-range surface, day-granular. Slider picks reset
+                  times to whole-day bounds; fine-tune via inputs or the
+                  collapsible calendar below. */}
+              <TimelineRangeSlider
+                startDate={startDate}
+                endDate={endDate}
+                maxRangeDays={maxRangeDays}
+                onChange={(s, e) => {
+                  setCapWarning(null);
+                  setStaged(true);
+                  setStartDate(s);
+                  setEndDate(e);
+                  setStartTime('00:00:00');
+                  setEndTime('23:59:59');
+                }}
+                className="pb-0.5 mb-2"
+              />
 
-            <div className="px-3 py-2 min-w-0 flex flex-col">
+              {/* preset chips — same values the old sidebar applied, in one
+                  dense mono row; category groups separated by a hairline */}
+              <div className="border-t border-border pt-2 flex flex-wrap items-center gap-1">
+                {visiblePresetCategories.map((category, ci) => (
+                  <React.Fragment key={category.label}>
+                    {ci > 0 && <span className="w-px h-4 bg-border mx-1 shrink-0" />}
+                    {category.presets.map((preset) => {
+                      const active = isPresetSelected(preset.value);
+                      return (
+                        <button
+                          key={preset.value}
+                          onClick={() => handlePresetSelect(preset.value)}
+                          title={preset.label}
+                          className={cn(
+                            'h-6 px-2 rounded-md font-mono text-[11px] whitespace-nowrap transition-colors',
+                            active
+                              ? 'bg-primary/10 text-primary'
+                              : 'text-muted-foreground hover:text-foreground hover:bg-foreground/5',
+                          )}
+                        >
+                          {preset.short}
+                        </button>
+                      );
+                    })}
+                  </React.Fragment>
+                ))}
+              </div>
+
+              {/* Collapsible calendar — stays mounted so the grid-rows
+                  0fr→1fr transition animates the reveal; `inert` keeps the
+                  collapsed grid out of the tab order. */}
+              <div
+                inert={!showCalendar}
+                className={cn(
+                  'grid transition-[grid-template-rows,opacity] duration-200 ease-out',
+                  showCalendar ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0',
+                )}
+              >
+                <div className="overflow-hidden min-h-0">
+                  <div className="border-t border-border pt-2 mt-2 flex justify-center">
               <Calendar
                 mode="range"
                 numberOfMonths={2}
@@ -501,6 +564,7 @@ export function DateTimeRangePicker({ value, onChange, className, variant = 'def
                     }
                   }
                   setCapWarning(null);
+                  setStaged(true);
                   setStartDate(range?.from);
                   setEndDate(range?.to);
                 }}
@@ -563,9 +627,12 @@ export function DateTimeRangePicker({ value, onChange, className, variant = 'def
                   [DayFlag.hidden]: 'invisible',
                 }}
               />
+                  </div>
+                </div>
+              </div>
 
-              {/* inputs row — From / To / timezone */}
-              <div className="border-t border-border mt-2 pt-2 grid grid-cols-[1fr_auto_1fr] items-end gap-2">
+              {/* inputs row — From / To / calendar toggle */}
+              <div className="border-t border-border mt-2 pt-2 grid grid-cols-[1fr_auto_1fr_auto] items-end gap-2">
                 <DateTimeField
                   label="From"
                   date={startDate}
@@ -583,6 +650,7 @@ export function DateTimeRangePicker({ value, onChange, className, variant = 'def
                       return;
                     }
                     setCapWarning(null);
+                    setStaged(true);
                     setStartDate(d);
                   }}
                   onTimeChange={setStartTime}
@@ -612,10 +680,24 @@ export function DateTimeRangePicker({ value, onChange, className, variant = 'def
                       return;
                     }
                     setCapWarning(null);
+                    setStaged(true);
                     setEndDate(d);
                   }}
                   onTimeChange={setEndTime}
                 />
+                <button
+                  onClick={() => setCalendarPref(showCalendar ? 'hidden' : 'shown')}
+                  title={showCalendar ? 'Hide calendar' : 'Show calendar'}
+                  aria-pressed={showCalendar}
+                  className={cn(
+                    'h-7 w-7 shrink-0 inline-flex items-center justify-center rounded-md border transition-colors',
+                    showCalendar
+                      ? 'border-border-2 bg-foreground/5 text-foreground'
+                      : 'border-transparent text-muted-foreground hover:text-foreground hover:bg-foreground/5',
+                  )}
+                >
+                  <CalendarDays className="w-3.5 h-3.5" strokeWidth={1.5} />
+                </button>
               </div>
 
               {capWarning && (
@@ -650,7 +732,6 @@ export function DateTimeRangePicker({ value, onChange, className, variant = 'def
                   </button>
                 </div>
               </div>
-            </div>
           </div>
         )}
       </PopoverContent>

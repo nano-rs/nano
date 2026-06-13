@@ -184,14 +184,29 @@ impl ClickHouseExecutor {
     /// Execute a COUNT query and return the count
     /// Used for getting total count in parallel with data queries
     pub(crate) async fn execute_count_query(&self, sql: &str) -> Result<u64, SearchError> {
-        debug!("Executing ClickHouse count query: {}", sql);
+        self.execute_count_query_with_options(sql, None, None).await
+    }
+
+    /// Count-companion variant carrying a derived query_id and the resolved
+    /// per-priority settings (NAN-1428). The id makes the companion killable
+    /// by `KILL QUERY` alongside the data query; the settings bound it by the
+    /// same per-priority limits. Neither changes the returned count.
+    pub(crate) async fn execute_count_query_with_options(
+        &self,
+        sql: &str,
+        query_id: Option<&str>,
+        settings: Option<&crate::search::admission::ClickHouseQuerySettings>,
+    ) -> Result<u64, SearchError> {
+        debug!(
+            "Executing ClickHouse count query (query_id={:?}): {}",
+            query_id, sql
+        );
 
         let escaped_sql = escape_question_marks_in_strings(sql);
-        let mut cursor = self
-            .client
-            .query(&escaped_sql)
-            .fetch_bytes("JSONEachRow")
-            .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
+        let mut cursor =
+            super::types::with_query_options(self.client.query(&escaped_sql), query_id, settings)
+                .fetch_bytes("JSONEachRow")
+                .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
 
         // Count queries should be small, but add limit as safeguard
         const MAX_COUNT_RESPONSE_SIZE: usize = 1024 * 1024; // 1MB

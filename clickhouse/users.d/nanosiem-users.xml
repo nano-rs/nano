@@ -40,6 +40,30 @@
         <query>GRANT SYSTEM RELOAD DICTIONARY ON *.*</query>
         <query>GRANT SELECT(bytes_on_disk, rows, data_uncompressed_bytes, partition, database, table, active) ON system.parts</query>
         <query>GRANT SELECT(total_space, free_space, type) ON system.disks</query>
+        <!-- NAN-1405: siem-health insert-integrity probes — detect the
+             NAN-1404 silent-loss class (async-insert flushes discarding
+             batches while every ACK stays green). Column-scoped reads only. -->
+        <query>GRANT SELECT(type, query_kind, event_time, tables) ON system.query_log</query>
+        <query>GRANT SELECT(event_type, event_time, database, table) ON system.part_log</query>
+        <query>GRANT SELECT(name, value, last_error_time) ON system.errors</query>
+        <query>GRANT SELECT(database, name, status, last_exception) ON system.dictionaries</query>
+        <!-- NAN-1437: system.dictionaries rows are filtered by SHOW DICTIONARIES
+             visibility, and only the GLOBAL scope works (db-scoped showed 0 rows
+             on CH 26.4) — without this the FAILED-dict probe above runs without
+             error but sees ZERO dictionaries. Metadata visibility only. -->
+        <query>GRANT SHOW DICTIONARIES ON *.*</query>
+        <query>GRANT SELECT(event_time, database, table, status, exception) ON system.asynchronous_insert_log</query>
+        <!-- NAN-1407: siem-health staleness probe for the dictionary-staging
+             refresh MVs (*_dict_refresh). A failing refresh keeps ingestion
+             alive on the last good staging snapshot; this read is how the
+             staleness surfaces. Column-scoped. -->
+        <query>GRANT SELECT(database, view, exception, retry, last_success_time) ON system.view_refreshes</query>
+        <!-- NAN-1435: search cancel (KILL QUERY WHERE query_id IN …) and the
+             query-progress endpoint read system.processes. Table-level on
+             purpose: ClickHouse's KILL rejects column-scoped SELECT on
+             system.processes (verified on 26.4) — without this grant, cancel
+             has silently failed with ACCESS_DENIED since inception. -->
+        <query>GRANT SELECT ON system.processes</query>
       </grants>
     </nanosiem>
 

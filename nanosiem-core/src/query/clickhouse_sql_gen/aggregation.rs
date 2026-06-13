@@ -110,7 +110,12 @@ impl ClickHouseSqlGenerator {
                                 format!("count({})", field_expr)
                             }
                         }
+                    // dc() is intentionally exact (uniqExact): detection thresholds
+                    // (`where dc > N`) and Splunk parity depend on exact counts.
+                    // Memory grows linearly with cardinality (~190 B/distinct string);
+                    // estdc() is the bounded-memory alternative (~0.9% error).
                     AggFunc::Dc => format!("uniqExact({})", field_expr),
+                    AggFunc::EstDc => format!("uniqCombined64({})", field_expr),
                     AggFunc::Sum => format!("sum({})", field_expr),
                     AggFunc::Avg => format!("avg({})", field_expr),
                     AggFunc::Min => format!("min({})", field_expr),
@@ -247,16 +252,15 @@ impl ClickHouseSqlGenerator {
     ) -> Result<String, SqlGenError> {
         let time_bucket_expr = self.generate_time_bucket(span);
 
-        let agg_exprs: Vec<String> = aggregations.iter()
+        // (aggregate expression, output column name) per aggregation. The name is
+        // None only for field-less non-count aggregations (no alias to derive) —
+        // those columns keep ClickHouse's expression-derived name.
+        let agg_cols: Vec<(String, Option<String>)> = aggregations.iter()
             .map(|agg| {
                 let field_expr = agg.field.as_ref()
                     .map(|f| {
                         let (expr, _) = field_to_sql_expr(f, self);
-                        if agg.func == AggFunc::Dc {
-                            expr // uniq() handles distinct internally
-                        } else {
-                            expr
-                        }
+                        expr
                     })
                     .unwrap_or_else(|| "*".to_string());
 
@@ -270,6 +274,7 @@ impl ClickHouseSqlGenerator {
                         }
                     }
                     AggFunc::Dc => format!("uniqExact({})", field_expr),
+                    AggFunc::EstDc => format!("uniqCombined64({})", field_expr),
                     AggFunc::Sum => format!("sum({})", field_expr),
                     AggFunc::Avg => format!("avg({})", field_expr),
                     AggFunc::Min => format!("min({})", field_expr),
@@ -297,36 +302,43 @@ impl ClickHouseSqlGenerator {
                     }
                 };
 
-                let alias = agg.alias.as_ref()
-                    .or(agg.field.as_ref())
-                    .map(|a| format!(" AS {}", escape_identifier(a)))
-                    .unwrap_or_else(|| {
-                        if agg.field.is_none() && agg.func == AggFunc::Count {
-                            " AS count".to_string()
-                        } else {
-                            String::new()
-                        }
+                let name = agg
+                    .alias
+                    .clone()
+                    .or_else(|| agg.field.clone())
+                    .or_else(|| {
+                        (agg.field.is_none() && agg.func == AggFunc::Count)
+                            .then(|| "count".to_string())
                     });
-                format!("{}{}", agg_expr, alias)
+                (agg_expr, name)
+            })
+            .collect();
+
+        let agg_exprs: Vec<String> = agg_cols
+            .iter()
+            .map(|(expr, name)| match name {
+                Some(n) => format!("{} AS {}", expr, escape_identifier(n)),
+                None => expr.clone(),
             })
             .collect();
 
         let time_bucket = format!("{} AS time_bucket", time_bucket_expr);
 
+        let split_selects: Vec<String> = split_by
+            .iter()
+            .map(|field| {
+                let (field_expr, needs_cast) = field_to_sql_expr(field, self);
+                if needs_cast {
+                    format!("toString({}) AS {}", field_expr, escape_identifier(field))
+                } else {
+                    format!("{} AS {}", field_expr, escape_identifier(field))
+                }
+            })
+            .collect();
+
         let select_clause = if split_by.is_empty() {
             format!("{}, {}", time_bucket, agg_exprs.join(", "))
         } else {
-            let split_selects: Vec<String> = split_by
-                .iter()
-                .map(|field| {
-                    let (field_expr, needs_cast) = field_to_sql_expr(field, self);
-                    if needs_cast {
-                        format!("toString({}) AS {}", field_expr, escape_identifier(field))
-                    } else {
-                        format!("{} AS {}", field_expr, escape_identifier(field))
-                    }
-                })
-                .collect();
             format!(
                 "{}, {}, {}",
                 time_bucket,
@@ -334,55 +346,6 @@ impl ClickHouseSqlGenerator {
                 agg_exprs.join(", ")
             )
         };
-
-        let mut sql = format!("  SELECT {}\n  FROM {}", select_clause, source);
-
-        // Apply limit filter: only include top N split-by values by first aggregation
-        if let (Some(field), Some(n)) = (split_by.first(), limit) {
-            let (field_expr, needs_cast) = field_to_sql_expr(field, self);
-            let field_in_subq = if needs_cast {
-                format!("toString({})", field_expr)
-            } else {
-                field_expr.clone()
-            };
-            // Determine aggregate for ranking (use first aggregation)
-            let rank_agg = if let Some(first_agg) = aggregations.first() {
-                let agg_field = first_agg
-                    .field
-                    .as_ref()
-                    .map(|f| {
-                        let (e, _) = field_to_sql_expr(f, self);
-                        e
-                    })
-                    .unwrap_or_else(|| "*".to_string());
-                match first_agg.func {
-                    AggFunc::Count => {
-                        if agg_field == "*" {
-                            "count()".to_string()
-                        } else {
-                            format!("count({})", agg_field)
-                        }
-                    }
-                    AggFunc::Sum => format!("sum({})", agg_field),
-                    AggFunc::Avg => format!("avg({})", agg_field),
-                    AggFunc::Dc => format!("uniqExact({})", agg_field),
-                    _ => "count()".to_string(),
-                }
-            } else {
-                "count()".to_string()
-            };
-            write!(
-                sql,
-                "\n  WHERE {} IN (SELECT {} FROM {} GROUP BY {} ORDER BY {} DESC LIMIT {})",
-                escape_identifier(field),
-                field_in_subq,
-                source,
-                field_in_subq,
-                rank_agg,
-                n
-            )
-            .unwrap();
-        }
 
         let group_clause = if split_by.is_empty() {
             "time_bucket".to_string()
@@ -400,7 +363,192 @@ impl ClickHouseSqlGenerator {
                 .collect();
             format!("time_bucket, {}", split_group_bys.join(", "))
         };
-        write!(sql, "\n  GROUP BY {}\n  ORDER BY time_bucket", group_clause).unwrap();
+
+        let mut sql = format!("  SELECT {}\n  FROM {}", select_clause, source);
+
+        // Apply limit filter: only include top N split-by values by first aggregation
+        match (split_by.first(), limit) {
+            (Some(field), Some(n)) => {
+                let first_func = aggregations.first().map(|a| a.func);
+                let rank_field = aggregations.first().and_then(|a| a.field.as_ref());
+                let rank_field_expr = rank_field.map(|f| {
+                    let (e, _) = field_to_sql_expr(f, self);
+                    e
+                });
+                // Two-pass form is kept when:
+                //  - the rank aggregation is dc()/estdc(): distinct counts are NOT
+                //    per-bucket decomposable (the union of per-bucket distinct sets
+                //    isn't the sum of their sizes), or
+                //  - any aggregation column has no derivable output name (field-less
+                //    non-count aggregations keep ClickHouse's expression-derived
+                //    name, which the single-scan outer projection can't reference).
+                // Everything else uses the single-scan windowed form (NAN-1430 / D1).
+                let any_unnamed = agg_cols.iter().any(|(_, name)| name.is_none());
+                if matches!(first_func, Some(AggFunc::Dc) | Some(AggFunc::EstDc)) || any_unnamed
+                {
+                    let (field_expr, needs_cast) = field_to_sql_expr(field, self);
+                    let field_in_subq = if needs_cast {
+                        format!("toString({})", field_expr)
+                    } else {
+                        field_expr.clone()
+                    };
+                    let agg_field = rank_field_expr.unwrap_or_else(|| "*".to_string());
+                    let rank_agg = match first_func {
+                        Some(AggFunc::Count) => {
+                            if agg_field == "*" {
+                                "count()".to_string()
+                            } else {
+                                format!("count({})", agg_field)
+                            }
+                        }
+                        Some(AggFunc::Sum) => format!("sum({})", agg_field),
+                        Some(AggFunc::Avg) => format!("avg({})", agg_field),
+                        Some(AggFunc::Dc) => format!("uniqExact({})", agg_field),
+                        Some(AggFunc::EstDc) => format!("uniqCombined64({})", agg_field),
+                        _ => "count()".to_string(),
+                    };
+                    write!(
+                        sql,
+                        "\n  WHERE {} IN (SELECT {} FROM {} GROUP BY {} ORDER BY {} DESC LIMIT {})",
+                        escape_identifier(field),
+                        field_in_subq,
+                        source,
+                        field_in_subq,
+                        rank_agg,
+                        n
+                    )
+                    .unwrap();
+                    write!(sql, "\n  GROUP BY {}\n  ORDER BY time_bucket", group_clause)
+                        .unwrap();
+                } else {
+                    // Single-scan top-N (NAN-1430 / audit D1): the old form's rank
+                    // subquery (`WHERE x IN (SELECT … FROM stage_0 … LIMIT n)`)
+                    // re-read the raw-scan CTE — physical read_rows was exactly 2x.
+                    // Instead: aggregate ONCE per (bucket, split), then rank split
+                    // values with window functions over the (small) aggregated
+                    // stage and keep the top N. Chained derived tables, not nested
+                    // windows in one SELECT — the latter fails on CH 26.4 with
+                    // NOT_FOUND_COLUMN_IN_BLOCK.
+                    //
+                    // Rank value decomposition (helper columns carried through the
+                    // aggregated stage; exact for count/sum, avg carries sum+count
+                    // and divides at the end):
+                    //   count → sum(per-bucket count)  sum → sum(per-bucket sum)
+                    //   avg   → sum(per-bucket sum) / sum(per-bucket count)
+                    //   other → row count (matches the old form's count() fallback)
+                    let (helper_cols, total_expr) = match (first_func, &rank_field_expr) {
+                        (Some(AggFunc::Count), Some(f)) => (
+                            format!("count({}) AS __rank_val", f),
+                            "sum(__rank_val) OVER (PARTITION BY __rank_key)".to_string(),
+                        ),
+                        (Some(AggFunc::Sum), Some(f)) => (
+                            format!("sum({}) AS __rank_val", f),
+                            "sum(__rank_val) OVER (PARTITION BY __rank_key)".to_string(),
+                        ),
+                        (Some(AggFunc::Avg), Some(f)) => (
+                            format!("sum({0}) AS __rank_sum, count({0}) AS __rank_cnt", f),
+                            "(sum(__rank_sum) OVER (PARTITION BY __rank_key) / sum(__rank_cnt) OVER (PARTITION BY __rank_key))".to_string(),
+                        ),
+                        // count() without a field, and every other rank function
+                        // (the old form also fell back to count() for those).
+                        _ => (
+                            "count() AS __rank_val".to_string(),
+                            "sum(__rank_val) OVER (PARTITION BY __rank_key)".to_string(),
+                        ),
+                    };
+                    // The split column is re-selected under a reserved alias
+                    // (__rank_key) so the window stages reference a name no user
+                    // alias can collide with.
+                    let (split_expr, needs_cast) = field_to_sql_expr(field, self);
+                    let split_key = if needs_cast {
+                        format!("toString({})", split_expr)
+                    } else {
+                        split_expr
+                    };
+                    // ClickHouse substitutes a SELECT-level alias into sibling
+                    // expressions: `sum(bytes_in) AS bytes_in` makes the helper's
+                    // `bytes_in` expand to the aggregate (ILLEGAL_AGGREGATION) —
+                    // and timechart's DEFAULT alias is the input field name, so
+                    // this is the common case, not the edge. Emit any aggregation
+                    // whose output name collides with an identifier the helpers /
+                    // rank key reference under a positional temp name and rename
+                    // it back in the outer projection (same scheme stats uses for
+                    // its `_agg_` shadow guard).
+                    // The trailing reserved names guard against a user alias
+                    // colliding with the rank machinery's own columns
+                    // (MULTIPLE_EXPRESSIONS_FOR_ALIAS otherwise).
+                    let shadow_sources: Vec<&str> = [
+                        rank_field.map(|f| f.as_str()),
+                        rank_field_expr.as_deref(),
+                        Some(field.as_str()),
+                        Some(split_key.as_str()),
+                        Some("__rank_key"),
+                        Some("__rank_val"),
+                        Some("__rank_sum"),
+                        Some("__rank_cnt"),
+                        Some("__rank_total"),
+                        Some("__rank"),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    let mut inner_aggs = Vec::with_capacity(agg_cols.len());
+                    let mut outer_aggs = Vec::with_capacity(agg_cols.len());
+                    for (i, (expr, name)) in agg_cols.iter().enumerate() {
+                        // any_unnamed was handled by the two-pass branch above
+                        let name = name.as_deref().unwrap_or_default();
+                        if shadow_sources.contains(&name) {
+                            inner_aggs.push(format!("{} AS _agg_topn_{}", expr, i));
+                            outer_aggs.push(format!(
+                                "_agg_topn_{} AS {}",
+                                i,
+                                escape_identifier(name)
+                            ));
+                        } else {
+                            inner_aggs.push(format!("{} AS {}", expr, escape_identifier(name)));
+                            outer_aggs.push(escape_identifier(name));
+                        }
+                    }
+                    let inner_select = if split_selects.is_empty() {
+                        format!("{}, {}", time_bucket, inner_aggs.join(", "))
+                    } else {
+                        format!(
+                            "{}, {}, {}",
+                            time_bucket,
+                            split_selects.join(", "),
+                            inner_aggs.join(", ")
+                        )
+                    };
+                    let outer_select = {
+                        let split_names: Vec<String> =
+                            split_by.iter().map(|f| escape_identifier(f)).collect();
+                        format!(
+                            "time_bucket, {}, {}",
+                            split_names.join(", "),
+                            outer_aggs.join(", ")
+                        )
+                    };
+                    sql = format!(
+                        "  SELECT {outer_select}\n  \
+                         FROM (\n    \
+                         SELECT *, dense_rank() OVER (ORDER BY __rank_total DESC, __rank_key ASC) AS __rank\n    \
+                         FROM (\n      \
+                         SELECT *, {total_expr} AS __rank_total\n      \
+                         FROM (\n  \
+                         SELECT {inner_select}, {split_key} AS __rank_key, {helper_cols}\n  \
+                         FROM {source}\n  \
+                         GROUP BY {group_clause}\n      \
+                         )\n    \
+                         )\n  \
+                         )\n  \
+                         WHERE __rank <= {n}\n  ORDER BY time_bucket"
+                    );
+                }
+            }
+            _ => {
+                write!(sql, "\n  GROUP BY {}\n  ORDER BY time_bucket", group_clause).unwrap();
+            }
+        }
 
         // cont=true: fill gaps in time axis with zeros using WITH FILL STEP
         if cont {

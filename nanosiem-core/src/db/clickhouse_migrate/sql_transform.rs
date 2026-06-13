@@ -49,6 +49,25 @@ impl ClickHouseMigrator {
         message.contains("UNKNOWN_TABLE")
     }
 
+    /// NAN-1407: detect the `nano:keep-local-engine` block-comment marker.
+    ///
+    /// The dictionary staging tables (`*_dict_staging`) must stay PLAIN
+    /// MergeTree on every topology: each replica keeps its own local copy,
+    /// refreshed by its own refreshable MV. `transform_for_cluster` normally
+    /// rewrites `MergeTree` → `ReplicatedMergeTree` for cluster deployments,
+    /// but a replicated staging table is not just wrong — ClickHouse REFUSES
+    /// to create a full-replace (non-APPEND) refreshable MV targeting a
+    /// replicated table in a non-Replicated database ("Each refresh would
+    /// replace the replicated table locally, but other replicas wouldn't see
+    /// it"), so the conversion would abort the migration on exactly the
+    /// clustered tenants this pattern protects. A statement carrying this
+    /// marker still gets `ON CLUSTER` fan-out (the DDL runs on every node)
+    /// but keeps its engine as written. Must be a `/* */` block comment —
+    /// `--` line comments are stripped before statement splitting.
+    pub(super) fn has_keep_local_engine_marker(sql: &str) -> bool {
+        sql.contains("nano:keep-local-engine")
+    }
+
     /// Escape a value for use inside a single-quoted ClickHouse string literal.
     ///
     /// CH treats `\` as an escape character inside `'...'` strings, so a
@@ -353,6 +372,18 @@ impl ClickHouseMigrator {
                     format!("{}{}{}", &caps[1], &caps[2], on_cluster_clause)
                 })
                 .to_string();
+
+            // NAN-1407: per-replica local tables (dictionary staging) keep
+            // their engine as written — ON CLUSTER fans the DDL out, but each
+            // node gets an independent plain MergeTree. Converting these to
+            // Replicated* would make ClickHouse REFUSE the full-replace
+            // refreshable MV that repopulates them (see
+            // has_keep_local_engine_marker). On CH Cloud plain MergeTree
+            // auto-converts to SharedMergeTree, which is the coordinated-
+            // refresh shape Cloud expects.
+            if Self::has_keep_local_engine_marker(&s) {
+                return s;
+            }
 
             // Convert engine: MergeTree -> ReplicatedMergeTree
             //

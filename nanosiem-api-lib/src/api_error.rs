@@ -218,6 +218,13 @@ impl From<nanosiem_core::SearchError> for ApiError {
                 ))
             }
             nanosiem_core::SearchError::AdmissionDenied(msg) => ApiError::TooManyRequests(msg),
+            // NAN-1436: a deliberately killed query (CH 394 via search cancel)
+            // is not a server fault — surface 409 instead of a generic 500.
+            // (nanosiem-search has its own dedicated QUERY_CANCELLED code; the
+            // api crate reuses its existing Conflict envelope.)
+            nanosiem_core::SearchError::Cancelled => {
+                ApiError::Conflict("Query was cancelled".to_string())
+            }
         }
     }
 }

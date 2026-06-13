@@ -233,22 +233,32 @@ pub trait SchemaProfile: Send + Sync {
         match self.resolve(field) {
             FieldResolution::ExplicitColumn(c) => crate::query::escape_identifier(&c),
             FieldResolution::JsonPath { col, path } => {
-                // Use the canonical `escape_string` (matches `field_access_expr`)
-                // so path segments are escaped identically — backslashes included,
-                // not just single quotes.
-                let args: Vec<String> = path
-                    .iter()
-                    .map(|p| format!("'{}'", crate::query::escape_string(p)))
-                    .collect();
-                format!("JSONExtractString({}, {})", col, args.join(", "))
+                // Delegate to the SAME emission as `field_access_expr`'s JsonPath
+                // arm (NAN-1426): native subcolumn access instead of
+                // `JSONExtractString(event, …)`, which re-serialized the whole
+                // `event` object per row. Keeping this seam in lockstep is what
+                // the raw-SQL builders (asset dossier, lateral movement, signal
+                // matched-log fetch — NAN-1241) rely on.
+                crate::query::json_tail_access_sql(&col, &path, "String")
             }
             FieldResolution::ArrayElement { .. }
             | FieldResolution::Alias(_)
             | FieldResolution::Unknown => {
-                let safe: String = field
-                    .chars()
-                    .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .collect();
+                // NAN-1411: a typed `ext.foo` must address the same spill key as
+                // bare `foo` — the alnum filter below deletes the dot, so without
+                // stripping the prefix first this emitted `ext.extfoo` (a key that
+                // never exists). No live caller passes prefixed names here today
+                // (callers use known UDM field names), but this default must stay
+                // in lockstep with `field_access_expr`'s Unknown arm.
+                let sanitize = |s: &str| -> String {
+                    s.chars()
+                        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect()
+                };
+                let safe = match field.strip_prefix("ext.").map(sanitize) {
+                    Some(key) if !key.is_empty() => key,
+                    _ => sanitize(field),
+                };
                 format!("ext.{}", safe)
             }
         }

@@ -978,3 +978,176 @@ fn eval_reserved_word_alias_is_quoted() {
         "reserved-word eval alias must be quoted; got: {sql}"
     );
 }
+
+// ============================================================================
+// NAN-1430: single-scan top-N timechart (audit D1) + estdc() (audit D2)
+// ============================================================================
+
+/// `timechart … by X limit=N` with a count rank must use the single-scan
+/// windowed form — the old rank subquery re-read the raw-scan CTE (read_rows 2x).
+#[test]
+fn timechart_limit_count_is_single_scan() {
+    let sql = npl("* | timechart span=1h count by source_type limit=3");
+    assert!(
+        sql.contains("dense_rank() OVER (ORDER BY __rank_total DESC, __rank_key ASC)"),
+        "expected windowed single-scan rank; got: {sql}"
+    );
+    assert!(
+        sql.contains("sum(__rank_val) OVER (PARTITION BY __rank_key)"),
+        "expected decomposed rank total; got: {sql}"
+    );
+    assert!(
+        !sql.contains("IN (SELECT"),
+        "single-scan form must not re-read the source via a rank subquery; got: {sql}"
+    );
+}
+
+#[test]
+fn timechart_limit_sum_is_single_scan() {
+    let sql = npl("* | timechart span=1h sum(bytes_in) by source_type limit=3");
+    assert!(
+        sql.contains("sum(bytes_in) AS __rank_val"),
+        "sum rank should carry the per-bucket sum; got: {sql}"
+    );
+    assert!(!sql.contains("IN (SELECT"), "got: {sql}");
+}
+
+/// avg is not directly decomposable: the aggregated stage carries sum+count and
+/// the rank total divides at the end. The avg output column shadows its input
+/// field name (timechart default alias), so it is emitted under a temp name and
+/// renamed back in the outer projection.
+#[test]
+fn timechart_limit_avg_carries_sum_and_count() {
+    let sql = npl("* | timechart span=1h avg(bytes_in) by source_type limit=3");
+    assert!(
+        sql.contains("sum(bytes_in) AS __rank_sum") && sql.contains("count(bytes_in) AS __rank_cnt"),
+        "avg rank must carry sum+count; got: {sql}"
+    );
+    assert!(
+        sql.contains("sum(__rank_sum) OVER (PARTITION BY __rank_key) / sum(__rank_cnt) OVER (PARTITION BY __rank_key)"),
+        "avg rank total must divide carried sums; got: {sql}"
+    );
+    assert!(
+        sql.contains("avg(bytes_in) AS _agg_topn_0") && sql.contains("_agg_topn_0 AS bytes_in"),
+        "shadowing avg output must be temp-named and renamed back; got: {sql}"
+    );
+    assert!(!sql.contains("IN (SELECT"), "got: {sql}");
+}
+
+/// dc() rank values are NOT per-bucket decomposable — the two-pass rank-subquery
+/// form is intentional and must stay (NAN-1430 verifier mandate). Pin the shape.
+#[test]
+fn timechart_limit_dc_keeps_two_pass_form() {
+    let sql = npl("* | timechart span=1h dc(src_ip) by source_type limit=3");
+    assert!(
+        sql.contains(
+            "WHERE source_type IN (SELECT source_type FROM stage_0 GROUP BY source_type ORDER BY uniqExact(src_ip) DESC LIMIT 3)"
+        ),
+        "dc rank must keep the exact two-pass subquery form; got: {sql}"
+    );
+    assert!(
+        !sql.contains("dense_rank"),
+        "dc must not use the windowed form; got: {sql}"
+    );
+}
+
+/// estdc() is likewise not decomposable; it keeps the two-pass form but ranks
+/// with uniqCombined64.
+#[test]
+fn timechart_limit_estdc_two_pass_uniq_combined() {
+    let sql = npl("* | timechart span=1h estdc(src_ip) by source_type limit=3");
+    assert!(
+        sql.contains("ORDER BY uniqCombined64(src_ip) DESC LIMIT 3"),
+        "estdc rank must use uniqCombined64 in the two-pass form; got: {sql}"
+    );
+    assert!(!sql.contains("dense_rank"), "got: {sql}");
+}
+
+/// A field-less non-count aggregation (sparkline) has no derivable output name,
+/// so the single-scan outer projection can't reference it — fall back to the
+/// two-pass form rather than renaming user-visible columns.
+#[test]
+fn timechart_limit_unnamed_agg_falls_back_to_two_pass() {
+    let sql = npl("* | timechart span=1h sum(bytes_in), sparkline by source_type limit=3");
+    assert!(
+        sql.contains("IN (SELECT source_type FROM stage_0"),
+        "unnamed agg columns must keep the two-pass form; got: {sql}"
+    );
+    assert!(!sql.contains("dense_rank"), "got: {sql}");
+}
+
+/// timechart without limit= keeps the plain GROUP BY shape — no window stages.
+#[test]
+fn timechart_split_without_limit_unchanged() {
+    let sql = npl("* | timechart span=1h count by source_type");
+    assert!(!sql.contains("__rank"), "no rank machinery without limit=; got: {sql}");
+    assert!(sql.contains("GROUP BY time_bucket, source_type"), "got: {sql}");
+}
+
+// ---------------------------------------------------------------------------
+// estdc(): approximate distinct count → uniqCombined64 (D2). dc() stays
+// uniqExact — detection thresholds and Splunk parity depend on exact counts.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stats_estdc_uses_uniq_combined64() {
+    let sql = npl("* | stats estdc(src_ip) by source_type");
+    assert!(
+        sql.contains("uniqCombined64(src_ip) AS estdc"),
+        "estdc should map to uniqCombined64; got: {sql}"
+    );
+}
+
+#[test]
+fn timechart_estdc_uses_uniq_combined64() {
+    let sql = npl("* | timechart span=1h estdc(src_ip)");
+    assert!(sql.contains("uniqCombined64(src_ip)"), "got: {sql}");
+}
+
+#[test]
+fn eventstats_estdc_uses_uniq_combined64() {
+    let sql = npl("* | eventstats estdc(src_ip) by source_type");
+    assert!(
+        sql.contains("uniqCombined64(src_ip) OVER (PARTITION BY"),
+        "eventstats estdc should be a uniqCombined64 window; got: {sql}"
+    );
+    // Whole-set form uses a scalar subquery, mirroring dc().
+    let sql2 = npl("* | eventstats estdc(src_ip)");
+    assert!(
+        sql2.contains("(SELECT uniqCombined64(src_ip) FROM"),
+        "whole-set eventstats estdc should use a scalar subquery; got: {sql2}"
+    );
+}
+
+#[test]
+fn streamstats_estdc_uses_uniq_combined64() {
+    let sql = npl("* | streamstats estdc(src_ip) by source_type");
+    assert!(
+        sql.contains("uniqCombined64(src_ip) OVER ("),
+        "streamstats estdc should be a uniqCombined64 window; got: {sql}"
+    );
+}
+
+#[test]
+fn estdc_distinct_count_alias_unaffected() {
+    // distinct_count remains an alias for exact dc(), not estdc().
+    let sql = npl("* | stats distinct_count(src_ip) by source_type");
+    assert!(sql.contains("uniqExact(src_ip)"), "got: {sql}");
+}
+
+/// dc() emission pins: byte-identical uniqExact forms in every surface.
+#[test]
+fn dc_emission_stays_uniq_exact_everywhere() {
+    let stats = npl("* | stats dc(src_ip) by source_type");
+    assert!(stats.contains("uniqExact(src_ip) AS dc"), "got: {stats}");
+
+    let timechart = npl("* | timechart span=1h dc(src_ip)");
+    assert!(timechart.contains("uniqExact(src_ip)"), "got: {timechart}");
+    assert!(!timechart.contains("uniqCombined64"), "got: {timechart}");
+
+    let eventstats = npl("* | eventstats dc(src_ip) by source_type");
+    assert!(eventstats.contains("uniqExact(src_ip) OVER (PARTITION BY"), "got: {eventstats}");
+
+    let streamstats = npl("* | streamstats dc(src_ip) by source_type");
+    assert!(streamstats.contains("uniqExact(src_ip) OVER ("), "got: {streamstats}");
+}

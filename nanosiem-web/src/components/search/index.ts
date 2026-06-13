@@ -2,7 +2,7 @@
 
 export { SearchHistory } from './SearchHistory';
 export { TimelineVisualization } from './TimelineVisualization';
-export { FieldsPanel, type FieldStat } from './FieldsPanel';
+export { FieldsPanel, FIELD_STATS_PINNED_COLUMNS, type FieldStat } from './FieldsPanel';
 export { SearchResults } from './SearchResults';
 export { SearchQueryInput } from './SearchQueryInput';
 // AnalyzeView lifted to @/enterprise/components/search/AnalyzeView (NAN-745).

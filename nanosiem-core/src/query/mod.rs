@@ -19,7 +19,11 @@ pub mod validation;
 
 pub use ast::*;
 pub(crate) use clickhouse_sql_gen::escape_identifier;
-pub(crate) use clickhouse_sql_gen::escape_string;
+// Re-exported so `SchemaProfile::column_sql`'s JsonPath arm emits the SAME
+// native-subcolumn access as `field_access_expr` (NAN-1426 lockstep). This
+// replaced the `escape_string` re-export, whose only external consumer was
+// that arm's hand-rolled JSONExtractString emission.
+pub(crate) use clickhouse_sql_gen::json_tail_access_sql;
 pub(crate) use clickhouse_sql_gen::MATERIALIZED_COLUMNS;
 // Re-exported so `crate::schema::udm::UdmProfile::canonicalize` delegates to the
 // canonical alias map rather than duplicating it (OCSF Phase 2, NAN-1241).

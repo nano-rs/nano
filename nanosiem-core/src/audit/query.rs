@@ -195,11 +195,23 @@ fn row_to_entry(row: AuditRow) -> ClickHouseAuditEntry {
     ClickHouseAuditEntry {
         event_id: row.id,
         timestamp,
-        user: if row.user_val.is_empty() {
-            None
-        } else {
-            Some(row.user_val)
-        },
+        // Prefer the display-case actor name preserved in metadata: the `user`
+        // column is lowercased at write time (LOWERCASE_NORMALIZED_FIELDS
+        // contract, NAN-1432) so the search-bar raw-equality fast path finds
+        // audit rows. `actor_name` is present on both pre- and post-fix rows;
+        // the column is the fallback for rows without it.
+        user: metadata
+            .get("actor_name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .or_else(|| {
+                if row.user_val.is_empty() {
+                    None
+                } else {
+                    Some(row.user_val)
+                }
+            }),
         action: if row.action.is_empty() {
             None
         } else {
@@ -371,5 +383,48 @@ impl AuditQueryService {
             .map_err(|e| AuditQueryError::QueryError(e.to_string()))?;
 
         Ok(rows.into_iter().map(|r| r.value).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(user_val: &str, metadata: &str) -> AuditRow {
+        AuditRow {
+            id: "evt-1".to_string(),
+            timestamp_str: "2026-06-12 12:00:00.000000".to_string(),
+            user_val: user_val.to_string(),
+            action: "rule_created".to_string(),
+            source: "detection".to_string(),
+            src_ip: "10.0.0.1".to_string(),
+            user_agent: String::new(),
+            status: "success".to_string(),
+            message: "[detection] rule_created by Dan Lussier".to_string(),
+            metadata: metadata.to_string(),
+        }
+    }
+
+    /// NAN-1432: the `user` column is lowercased at write time so the
+    /// search-bar raw-equality fast path finds audit rows; the audit page must
+    /// keep rendering the display-case name, which lives in metadata.
+    #[test]
+    fn entry_user_prefers_display_case_actor_name_from_metadata() {
+        let entry = row_to_entry(row("dan lussier", r#"{"actor_name":"Dan Lussier"}"#));
+        assert_eq!(entry.user.as_deref(), Some("Dan Lussier"));
+    }
+
+    /// Rows without a metadata actor_name (system/API-key events, or legacy
+    /// metadata shapes) fall back to the `user` column verbatim.
+    #[test]
+    fn entry_user_falls_back_to_column_without_actor_name() {
+        let entry = row_to_entry(row("dan lussier", "{}"));
+        assert_eq!(entry.user.as_deref(), Some("dan lussier"));
+
+        let entry = row_to_entry(row("dan lussier", r#"{"actor_name":null}"#));
+        assert_eq!(entry.user.as_deref(), Some("dan lussier"));
+
+        let entry = row_to_entry(row("", "{}"));
+        assert_eq!(entry.user, None);
     }
 }

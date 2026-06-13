@@ -165,29 +165,35 @@ fn spath_input_ext_targets_ocsf_event_tail() {
 /// `spath input=ext` WAS remapped (#2043) — a half-fixed inconsistency.
 #[test]
 fn ext_prefix_remaps_to_unmapped_under_ocsf() {
-    // String compare → JSONExtractString against unmapped.*.
+    // String compare → native subcolumn access against unmapped.* (NAN-1426;
+    // previously JSONExtractString, which re-serialized the whole event per row).
     let sql = ocsf_sql(r#"ext.cache_status="hit""#, "nanosiem");
     assert!(
-        sql.contains("JSONExtractString(event, 'unmapped', 'cache_status')"),
-        "ext.* must remap to the unmapped.* spill (NAN-1388); SQL:\n{sql}"
+        sql.contains(r#"multiIf(isNotNull(event."unmapped"."cache_status")"#),
+        "ext.* must remap to the unmapped.* spill (NAN-1388) via subcolumn access (NAN-1426); SQL:\n{sql}"
     );
     assert!(
         !sql.contains("'ext'"),
         "no top-level 'ext' key exists in an OCSF event (NAN-1388); SQL:\n{sql}"
     );
-    // Numeric compare → typed extractor, same remap (NAN-1383 form).
+    // Numeric compare → coalesced subcolumn cast, same remap (NAN-1426; the
+    // coalesce preserves JSONExtractFloat's missing-key→0 semantics).
     let sql = ocsf_sql("ext.sysmon_event_id=7", "nanosiem");
     assert!(
-        sql.contains("JSONExtractFloat(event, 'unmapped', 'sysmon_event_id') = 7"),
-        "numeric ext.* compare must remap + use JSONExtractFloat; SQL:\n{sql}"
+        sql.contains(
+            r#"coalesce(accurateCastOrNull(event."unmapped"."sysmon_event_id", 'Float64'), 0.) = 7"#
+        ),
+        "numeric ext.* compare must remap + use the coalesced subcolumn cast; SQL:\n{sql}"
     );
-    // NEGATED compare: the extractor returns '' (not NULL) for rows missing the
-    // key, so `!= 'hit'` keeps them — negation must not silently drop the
-    // no-key rows (the toString-NULL trap from NAN-1161 does not apply here).
+    // NEGATED compare: the multiIf subcolumn form returns '' (not NULL) for
+    // rows missing the key, so `!= 'hit'` keeps them — negation must not
+    // silently drop the no-key rows (the toString-NULL trap from NAN-1161
+    // does not apply here; parity verified vs the old extractor on local CH).
     let sql = ocsf_sql(r#"ext.cache_status!="hit""#, "nanosiem");
     assert!(
-        sql.contains("lower(toString(JSONExtractString(event, 'unmapped', 'cache_status'))) != 'hit'"),
-        "negated ext.* compare must use the ''-returning extractor form; SQL:\n{sql}"
+        sql.contains(r#"lower(toString(multiIf(isNotNull(event."unmapped"."cache_status")"#)
+            && sql.contains("!= 'hit'"),
+        "negated ext.* compare must use the ''-returning subcolumn form; SQL:\n{sql}"
     );
 }
 
@@ -203,25 +209,33 @@ fn event_prefix_strips_to_event_tail_under_ocsf() {
         "nanosiem",
     );
     assert!(
-        sql.contains("JSONExtractString(event, 'actor', 'process', 'parent_process', 'name')"),
-        "event.* must strip to the event tail (NAN-1388); SQL:\n{sql}"
+        sql.contains(
+            r#"multiIf(isNotNull(event."actor"."process"."parent_process"."name")"#
+        ),
+        "event.* must strip to the event tail (NAN-1388) via subcolumn access (NAN-1426); SQL:\n{sql}"
     );
     assert!(
         !sql.contains("'event'"),
         "no top-level 'event' key exists in an OCSF event (NAN-1388); SQL:\n{sql}"
     );
     // Promoted attribute → the indexed promoted column (same value, faster).
+    // Raw equality, not lower()-wrapped: src_endpoint.ip is lowercased at
+    // ingest, and the raw form is what engages its bloom index (NAN-1412).
     let sql = ocsf_sql(r#"event.src_endpoint.ip="10.20.30.40""#, "nanosiem");
     assert!(
-        sql.contains(r#"lower("src_endpoint.ip") = '10.20.30.40'"#),
-        "event.<promoted> must land on the promoted column (NAN-1388); SQL:\n{sql}"
+        sql.contains(r#""src_endpoint.ip" = '10.20.30.40'"#)
+            && !sql.contains(r#"lower("src_endpoint.ip")"#),
+        "event.<promoted> must land on the promoted column, raw-compared (NAN-1388/NAN-1412); SQL:\n{sql}"
     );
 }
 
 /// NAN-1388 UDM-unchanged proof (pure SQL-gen, no DB): the remap lives in
-/// `OcsfProfile::resolve` only — under UDM the `ext.foo` emission is pinned
-/// byte-for-byte to its pre-fix form (`ext.{sanitized}` spill access; `ext.*` is
-/// native there and explicitly out of scope for the remap).
+/// `OcsfProfile::resolve` only — under UDM `ext.*` never resolves to OCSF's
+/// `unmapped.*` spill. NAN-1411 updated the pinned emission: the explicit
+/// `ext.foo` spelling now strips its prefix and probes the same `ext.foo`
+/// access as the unprefixed fallthrough (it used to be mangled into
+/// `ext.extfoo` — dot deleted by `sanitize_json_path` — silently 0 rows).
+/// `event.*` carries no special meaning under UDM and keeps the old emission.
 #[test]
 fn ext_prefix_udm_sql_unchanged() {
     use nanosiem_core::schema::UdmProfile;
@@ -232,12 +246,10 @@ fn ext_prefix_udm_sql_unchanged() {
             .generate(&query, &fixture_time_range())
             .unwrap()
     };
-    // Exact pre-fix emission (captured at a2379b09): the Unknown-resolution
-    // spill access `ext.{sanitize_json_path(field)}`.
     let sql = udm_sql(r#"ext.cache_status="hit""#);
     assert!(
-        sql.contains("(lower(toString(ext.extcache_status)) = 'hit')"),
-        "UDM ext.* emission must stay byte-identical (NAN-1388); SQL:\n{sql}"
+        sql.contains("(lower(toString(ext.cache_status)) = 'hit')"),
+        "UDM ext.* must probe the real ext key (NAN-1411); SQL:\n{sql}"
     );
     assert!(
         !sql.contains("unmapped"),
@@ -292,7 +304,7 @@ fn enum_verb_predicates_translate_to_enum_ints_under_ocsf() {
         sql.contains("auth_protocol_id = 2"),
         "auth_type=\"kerberos\" must compare auth_protocol_id = 2 (NAN-1382); SQL:\n{sql}"
     );
-    // Native column spelling translates too, and the PREWHERE no longer emits the
+    // Native column spelling translates too, and the filter never emits the
     // type-error form `lower(severity_id) = 'high'` (CH Code 43 pre-fix).
     let sql = ocsf_sql(r#"severity_id="high""#, "nanosiem");
     assert!(
@@ -301,7 +313,7 @@ fn enum_verb_predicates_translate_to_enum_ints_under_ocsf() {
     );
     assert!(
         !sql.contains("lower(severity_id)"),
-        "PREWHERE must not lower() the enum int column (CH Code 43, NAN-1382); SQL:\n{sql}"
+        "must not lower() the enum int column (CH Code 43, NAN-1382); SQL:\n{sql}"
     );
     // Numeric string (UI drilldown) passes through as the id.
     let sql = ocsf_sql(r#"auth_result="2""#, "nanosiem");
@@ -372,7 +384,7 @@ fn enum_verb_predicates_leave_udm_sql_unchanged() {
     };
     let sql = udm_sql(r#"auth_result="failure""#);
     assert!(
-        sql.contains("WHERE (lower(auth_result) = 'failure')"),
+        sql.contains("AND (lower(auth_result) = 'failure')"),
         "UDM auth_result compare must stay the string form (NAN-1382); SQL:\n{sql}"
     );
     assert!(!sql.contains("status_id"), "no OCSF leakage into UDM; SQL:\n{sql}");
@@ -406,8 +418,11 @@ fn enum_verb_predicates_leave_udm_sql_unchanged() {
 fn numeric_tail_comparison_emits_real_extractor_under_ocsf() {
     let sql = ocsf_sql("unmapped.some_num>3", "nanosiem");
     assert!(
-        sql.contains("JSONExtractFloat(event, 'unmapped', 'some_num') > 3"),
-        "numeric tail comparison must use JSONExtractFloat; SQL:\n{sql}"
+        sql.contains(
+            r#"coalesce(accurateCastOrNull(event."unmapped"."some_num", 'Float64'), 0.) > 3"#
+        ),
+        "numeric tail comparison must use the coalesced subcolumn cast (NAN-1426; \
+         the coalesce keeps JSONExtractFloat's missing-key→0 semantics); SQL:\n{sql}"
     );
     assert!(
         !sql.contains("JSONExtractFloat64"),
@@ -463,7 +478,7 @@ fn prevalence_min_udm_sql_unchanged() {
     };
     let sql = udm_sql("prevalence_min<5");
     assert!(
-        sql.contains("WHERE (prevalence_min < 5)"),
+        sql.contains("AND (prevalence_min < 5)"),
         "UDM search filter unchanged; SQL:\n{sql}"
     );
     assert!(!sql.contains("least("), "no OCSF least() leakage into UDM; SQL:\n{sql}");
@@ -710,27 +725,25 @@ fn append_null_padding_applies_under_udm_profile() {
 /// NAN-1379 regression (pure SQL-gen, no DB): `enforce_non_audit_query` wraps
 /// the user expression in `SearchExpr::Group` before AND-ing on the
 /// `source_type != "audit"` exclusion — the shape every non-AUDIT_VIEW
-/// principal's query takes on the standard API path. `collect_prewhere` /
-/// `has_selective_prewhere` previously fell through `Group` into their
-/// `_ => {}` arms, so entity-Eq equalities never reached PREWHERE there
-/// (full scan, ~8x I/O; the NAN-1299 rescue was dead code). Assert the
-/// audit-wrapped query produces the SAME PREWHERE clause as the bare query
-/// under BOTH profiles — which simultaneously pins the bare (already-working)
-/// shape so UDM behavior is provably unchanged.
+/// principal's query takes on the standard API path. The selectivity check
+/// (`has_selective_indexed_eq`, formerly `has_selective_prewhere`) previously
+/// fell through `Group` into its `_ => false` arm, so entity-Eq equalities
+/// were invisible there. Since NAN-1412 the generator emits a single WHERE
+/// (no explicit PREWHERE); the Group-recursion now governs the
+/// `optimize_read_in_order` toggle — assert the audit-wrapped query gets the
+/// SAME settings as the bare query (read-in-order disabled for the selective
+/// entity equality) under BOTH profiles, and that the entity filter itself
+/// survives the wrap in the WHERE clause.
 #[test]
-fn audit_group_wrap_preserves_entity_prewhere_both_profiles() {
+fn audit_group_wrap_preserves_entity_selectivity_both_profiles() {
     use nanosiem_core::schema::UdmProfile;
     use nanosiem_core::search::query_processing::enforce_non_audit_query;
 
-    fn prewhere_clause(sql: &str) -> &str {
+    fn settings_clause(sql: &str) -> &str {
         let start = sql
-            .find("PREWHERE")
-            .unwrap_or_else(|| panic!("no PREWHERE in SQL:\n{sql}"));
-        let rest = &sql[start..];
-        // ` WHERE ` (space-delimited) so the match can't land inside the
-        // `PREWHERE` keyword itself.
-        let end = rest.find(" WHERE ").unwrap_or(rest.len());
-        rest[..end].trim_end()
+            .find("SETTINGS")
+            .unwrap_or_else(|| panic!("no SETTINGS in SQL:\n{sql}"));
+        &sql[start..]
     }
 
     let bare = r#"src_ip="10.0.0.5""#;
@@ -740,17 +753,22 @@ fn audit_group_wrap_preserves_entity_prewhere_both_profiles() {
         "enforcement should inject the audit exclusion (got `{wrapped}`)"
     );
 
-    // OCSF: the UDM alias must surface as the promoted dotted column.
+    // OCSF: the UDM alias must surface as the promoted dotted column in WHERE,
+    // and the selective-entity read-in-order toggle must survive the wrap.
     let ocsf_bare = ocsf_sql(bare, "nanosiem");
     let ocsf_wrapped = ocsf_sql(&wrapped, "nanosiem");
     assert!(
-        prewhere_clause(&ocsf_wrapped).contains("src_endpoint.ip"),
-        "OCSF audit-wrapped PREWHERE must keep the entity equality; SQL:\n{ocsf_wrapped}"
+        ocsf_wrapped.contains("\"src_endpoint.ip\" = '10.0.0.5'"),
+        "OCSF audit-wrapped WHERE must keep the entity equality; SQL:\n{ocsf_wrapped}"
+    );
+    assert!(
+        settings_clause(&ocsf_wrapped).contains("optimize_read_in_order=0"),
+        "OCSF audit-wrapped selective equality must disable read-in-order; SQL:\n{ocsf_wrapped}"
     );
     assert_eq!(
-        prewhere_clause(&ocsf_bare),
-        prewhere_clause(&ocsf_wrapped),
-        "Group-wrapped query must produce the same OCSF PREWHERE as unwrapped"
+        settings_clause(&ocsf_bare),
+        settings_clause(&ocsf_wrapped),
+        "Group-wrapped query must produce the same OCSF settings as unwrapped"
     );
 
     // UDM: identity resolution — same parity through the audit wrap.
@@ -764,13 +782,17 @@ fn audit_group_wrap_preserves_entity_prewhere_both_profiles() {
     let udm_bare = udm_sql(bare);
     let udm_wrapped = udm_sql(&wrapped);
     assert!(
-        prewhere_clause(&udm_wrapped).contains("src_ip"),
-        "UDM audit-wrapped PREWHERE must keep the entity equality; SQL:\n{udm_wrapped}"
+        udm_wrapped.contains("src_ip = '10.0.0.5'"),
+        "UDM audit-wrapped WHERE must keep the entity equality; SQL:\n{udm_wrapped}"
+    );
+    assert!(
+        settings_clause(&udm_wrapped).contains("optimize_read_in_order=0"),
+        "UDM audit-wrapped selective equality must disable read-in-order; SQL:\n{udm_wrapped}"
     );
     assert_eq!(
-        prewhere_clause(&udm_bare),
-        prewhere_clause(&udm_wrapped),
-        "Group-wrapped query must produce the same UDM PREWHERE as unwrapped"
+        settings_clause(&udm_bare),
+        settings_clause(&udm_wrapped),
+        "Group-wrapped query must produce the same UDM settings as unwrapped"
     );
 }
 

@@ -48,6 +48,13 @@ pub enum SearchError {
 
     #[error("Admission denied: {0}")]
     AdmissionDenied(String),
+
+    /// The query was killed mid-flight (`DELETE /api/search/{request_id}` or
+    /// an admin job cancel). Distinct from `InternalError` so the original
+    /// caller of a cancelled search sees a deliberate 409/QUERY_CANCELLED
+    /// instead of a misleading 500 (NAN-1436, follow-up to NAN-1435).
+    #[error("Query was cancelled")]
+    Cancelled,
 }
 
 /// A suggested fix for a parse error
@@ -105,6 +112,7 @@ impl SearchError {
             SearchError::InternalError(_) => "INTERNAL_ERROR",
             SearchError::ServiceUnavailable(_) => "SERVICE_UNAVAILABLE",
             SearchError::AdmissionDenied(_) => "ADMISSION_DENIED",
+            SearchError::Cancelled => "QUERY_CANCELLED",
         }
     }
 
@@ -120,6 +128,11 @@ impl SearchError {
             SearchError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             SearchError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             SearchError::AdmissionDenied(_) => StatusCode::TOO_MANY_REQUESTS,
+            // 409: the request didn't fail — its lifecycle conflicted with a
+            // deliberate cancel issued against it. Not 4xx-client-mistake, not
+            // 5xx-server-fault; mirrors AdmissionDenied's "non-error outcome
+            // gets a distinct, stable status" convention (429 there).
+            SearchError::Cancelled => StatusCode::CONFLICT,
         }
     }
 }
@@ -237,6 +250,9 @@ impl From<nanosiem_core::SearchError> for SearchError {
                 SearchError::InternalError("A database error occurred".to_string())
             }
             nanosiem_core::SearchError::AdmissionDenied(msg) => SearchError::AdmissionDenied(msg),
+            // NAN-1436: a killed query (CH Code 394 via the cancel endpoint)
+            // surfaces as a deliberate 409/QUERY_CANCELLED, not a 500.
+            nanosiem_core::SearchError::Cancelled => SearchError::Cancelled,
             _ => {
                 tracing::error!(error = %err, "Unhandled search error");
                 SearchError::InternalError("An internal error occurred".to_string())
@@ -285,5 +301,30 @@ mod tests {
             ),
             other => panic!("expected QueryError, got {other:?}"),
         }
+    }
+
+    /// NAN-1436: a cancelled query (CH Code 394 → core `Cancelled`) must reach
+    /// the client as 409/QUERY_CANCELLED, not the generic 500/INTERNAL_ERROR
+    /// it used to fall into via the DatabaseError mapping.
+    #[test]
+    fn cancelled_query_maps_to_409_query_cancelled() {
+        let mapped = SearchError::from(nanosiem_core::SearchError::Cancelled);
+        assert!(matches!(mapped, SearchError::Cancelled));
+        assert_eq!(mapped.status_code(), StatusCode::CONFLICT);
+        assert_eq!(mapped.code(), "QUERY_CANCELLED");
+
+        // End-to-end: the raw CH 394 string through the shared parser lands on
+        // the same 409, while an unrecognized DB failure keeps the generic 500.
+        let killed = SearchError::from(nanosiem_core::search::parse_clickhouse_error(
+            "Code: 394. DB::Exception: Query was cancelled (QUERY_WAS_CANCELLED)",
+        ));
+        assert_eq!(killed.status_code(), StatusCode::CONFLICT);
+        assert_eq!(killed.code(), "QUERY_CANCELLED");
+
+        let db = SearchError::from(nanosiem_core::search::parse_clickhouse_error(
+            "Code: 999. DB::Exception: something else entirely",
+        ));
+        assert_eq!(db.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(db.code(), "INTERNAL_ERROR");
     }
 }

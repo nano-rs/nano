@@ -426,6 +426,176 @@ mod tests {
         assert!(!p.is_known_field("definitely_not_a_field_xyz"));
     }
 
+    // --- NAN-1425: gated alias authority (mirrors NAN-1422 on the OCSF side) ---
+
+    /// Every `normalize_field_name` alias whose target is an explicit `logs`
+    /// column, alias-by-alias. `source_ip` is deliberately absent — pinned typo
+    /// case, gate precedence (see `udm_pinned_typo_alias_not_claimed`).
+    /// `service_name` is also absent here: its RAW spelling is a generated
+    /// `UdmField`, so the profile never re-aliases it (see
+    /// `udm_known_raw_spelling_never_realiased`).
+    const UDM_ACCEPTED_ALIASES: &[(&str, &str)] = &[
+        ("_time", "timestamp"),
+        ("sourcetype", "source_type"),
+        ("dest_hostname", "dest_host"),
+        ("src_hostname", "src_host"),
+        ("username", "user"),
+        ("destination_ip", "dest_ip"),
+        ("src_address", "src_ip"),
+        ("dest_address", "dest_ip"),
+        ("source_port", "src_port"),
+        ("destination_port", "dest_port"),
+        ("source_mac", "src_mac"),
+        ("destination_mac", "dest_mac"),
+        ("process", "command_line"),
+        ("parent_process", "parent_command_line"),
+        ("uri", "url"),
+        ("referer", "http_referrer"),
+        ("referrer", "http_referrer"),
+        ("useragent", "http_user_agent"),
+        ("filename", "file_name"),
+        ("filepath", "file_path"),
+        ("outcome", "status"),
+        ("response_code", "http_status_code"),
+        ("http_status", "http_status_code"),
+        ("http_response_code", "http_status_code"),
+        ("resp_code", "http_status_code"),
+        ("request_method", "http_method"),
+        ("method", "http_method"),
+        ("dns_query", "query"),
+        ("dns_response", "answer"),
+        ("dns_answer", "answer"),
+        ("cloud.provider", "cloud_provider"),
+        ("cloud.account.id", "cloud_account_id"),
+        ("cloud.account.name", "cloud_account_name"),
+        ("cloud.region", "cloud_region"),
+        ("cloud.service.name", "cloud_service"),
+        ("event_id", "signature_id"),
+        ("eventid", "signature_id"),
+    ];
+
+    #[test]
+    fn udm_accepted_aliases_are_known_and_resolve_to_canonical_column() {
+        let p = UdmProfile::new();
+        for (alias, target) in UDM_ACCEPTED_ALIASES {
+            assert!(
+                p.is_known_field(alias),
+                "alias {alias} must be a known field (NAN-1425)"
+            );
+            assert_eq!(
+                p.resolve(alias),
+                FieldResolution::ExplicitColumn((*target).to_string()),
+                "alias {alias} must resolve to its canonical column {target}",
+            );
+            // …and identically to the canonical spelling, so codegen seams
+            // that pass the RAW name (IN-list) land on the same column.
+            assert_eq!(
+                p.resolve(alias),
+                p.resolve(target),
+                "alias {alias} and canonical {target} must resolve identically",
+            );
+        }
+    }
+
+    #[test]
+    fn udm_pinned_typo_alias_not_claimed() {
+        // COLLISION (recorded on NAN-1425): normalize_field_name maps
+        // `source_ip` → `src_ip`, but the NAN-1380 G5 typo gate pins
+        // `source_ip` as a rejected near-miss ("did you mean src_ip") and that
+        // takes precedence — the profile must not claim it as known, and it
+        // must keep resolving Unknown.
+        let p = UdmProfile::new();
+        assert!(!p.is_known_field("source_ip"));
+        assert_eq!(p.resolve("source_ip"), FieldResolution::Unknown);
+    }
+
+    #[test]
+    fn udm_alias_without_explicit_target_does_not_rewrite() {
+        // `hostname` → `host` and `destination` → `dest`: targets are not
+        // explicit `logs` columns, so the gated alias authority refuses the
+        // rewrite (mirrors NAN-1422's `hostname` pin on OCSF) — these names
+        // stay exactly as unknown as before and spill to ext raw.
+        let p = UdmProfile::new();
+        for alias in ["hostname", "destination"] {
+            assert!(!p.is_known_field(alias), "{alias} must stay unknown");
+            assert_eq!(p.resolve(alias), FieldResolution::Unknown);
+        }
+    }
+
+    #[test]
+    fn udm_known_raw_spelling_never_realiased() {
+        // `service_name` is a generated UdmField whose spelling the codegen
+        // map rewrites to `cloud_service` — but a real field never re-aliases
+        // through the profile: it stays known via its RAW spelling and keeps
+        // resolving Unknown (ext spill), exactly the pre-NAN-1425 behavior the
+        // anti-drift gates above pin.
+        let p = UdmProfile::new();
+        assert!(p.is_known_field("service_name"));
+        assert_eq!(p.resolve("service_name"), FieldResolution::Unknown);
+    }
+
+    #[test]
+    fn udm_alias_type_predicates_judge_canonical_target() {
+        // The IN-list seam consults is_numeric_field/is_uuid_field with the
+        // RAW name; an accepted alias must type like its target or
+        // `response_code IN ("200")` would emit `lower(<UInt16 col>)` (CH type
+        // error) while the canonical form takes the numeric branch.
+        let p = UdmProfile::new();
+        for alias in ["response_code", "http_status", "source_port", "destination_port"] {
+            assert!(
+                p.is_numeric_field(alias),
+                "{alias} must inherit its numeric target type"
+            );
+        }
+        // String-targeted aliases stay non-numeric…
+        assert!(!p.is_numeric_field("sourcetype"));
+        // …pinned/refused aliases keep raw-spelling lookups only.
+        assert!(!p.is_numeric_field("source_ip"));
+        // No alias targets a UUID column today; the predicate must agree.
+        for (alias, _) in UDM_ACCEPTED_ALIASES {
+            assert!(!p.is_uuid_field(alias));
+        }
+    }
+
+    #[test]
+    fn udm_alias_sql_is_byte_identical_to_canonical() {
+        // End-to-end codegen: the alias form and the canonical form must
+        // generate byte-identical SQL under UDM — Eq, IN-list (the seam that
+        // passes RAW names to the profile), stats and table positions.
+        use crate::query::{parse_query, ClickHouseSqlGenerator, TimeRange};
+        let time_range = TimeRange {
+            start: "2024-01-01T00:00:00Z".parse().unwrap(),
+            end: "2024-01-02T00:00:00Z".parse().unwrap(),
+        };
+        let generator = ClickHouseSqlGenerator::new();
+        let sql_for = |q: &str| -> String {
+            let query = parse_query(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+            generator
+                .generate(&query, &time_range)
+                .unwrap_or_else(|e| panic!("generate {q}: {e}"))
+        };
+        for (alias, target) in UDM_ACCEPTED_ALIASES {
+            for (alias_q, canonical_q) in [
+                (format!(r#"{alias}="x""#), format!(r#"{target}="x""#)),
+                (
+                    format!(r#"{alias} IN ("x", "y")"#),
+                    format!(r#"{target} IN ("x", "y")"#),
+                ),
+                (
+                    format!("* | stats count() by {alias}"),
+                    format!("* | stats count() by {target}"),
+                ),
+            ] {
+                let alias_sql = sql_for(&alias_q);
+                let canonical_sql = sql_for(&canonical_q);
+                assert_eq!(
+                    alias_sql, canonical_sql,
+                    "alias {alias} must generate byte-identical SQL to {target} ({alias_q})",
+                );
+            }
+        }
+    }
+
     #[test]
     fn storage_binding_is_udm() {
         let p = UdmProfile::new();
@@ -513,3 +683,4 @@ mod tests {
         );
     }
 }
+

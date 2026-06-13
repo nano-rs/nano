@@ -171,14 +171,27 @@ impl ClickHouseExecutor {
         // Schema queries should be small, but add limit as safeguard
         const MAX_SCHEMA_RESPONSE_SIZE: usize = 10 * 1024 * 1024; // 10MB
         let mut response_bytes = Vec::new();
-        while let Ok(Some(chunk)) = cursor.next().await {
-            if response_bytes.len() + chunk.len() > MAX_SCHEMA_RESPONSE_SIZE {
-                return Err(SearchError::ResponseTooLarge(
-                    response_bytes.len() + chunk.len(),
-                    MAX_SCHEMA_RESPONSE_SIZE,
-                ));
+        // NAN-1429 sweep: distinguish a stream Err from end-of-stream. The old
+        // `while let Ok(Some(chunk))` treated a mid-stream ClickHouse error as
+        // EOF, silently truncating the column inventory (callers would then
+        // compute field stats over a partial column set with no warning).
+        loop {
+            match cursor.next().await {
+                Ok(Some(chunk)) => {
+                    if response_bytes.len() + chunk.len() > MAX_SCHEMA_RESPONSE_SIZE {
+                        return Err(SearchError::ResponseTooLarge(
+                            response_bytes.len() + chunk.len(),
+                            MAX_SCHEMA_RESPONSE_SIZE,
+                        ));
+                    }
+                    response_bytes.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    warn!("ClickHouse columns query failed mid-stream: {}", e);
+                    return Err(parse_clickhouse_error(&e.to_string()));
+                }
             }
-            response_bytes.extend_from_slice(&chunk);
         }
 
         let response_str = String::from_utf8(response_bytes).map_err(|e| {
@@ -292,14 +305,23 @@ impl ClickHouseExecutor {
 
     /// Execute a field stats query and parse the results into FieldInfo structs
     /// Returns a Vec of FieldInfo with top_values and cardinality populated
+    ///
+    /// NAN-1428: `query_id` should be the derived `{request_id}-fstats` id so
+    /// cancellation kills the companion together with the data query, and
+    /// `settings` the resolved per-priority `ClickHouseQuerySettings` so the
+    /// heaviest companion is bounded by admission limits, not just the CH
+    /// profile. Both are optional and change no result rows.
     pub async fn execute_field_stats_query(
         &self,
         sql: &str,
         field_names: &[String],
+        query_id: Option<&str>,
+        settings: Option<&crate::search::admission::ClickHouseQuerySettings>,
     ) -> Result<Vec<FieldInfo>, SearchError> {
         info!(
-            "Executing field stats query for {} fields",
-            field_names.len()
+            "Executing field stats query for {} fields (query_id={:?})",
+            field_names.len(),
+            query_id
         );
         info!(
             "Field stats SQL (first 500 chars): {}",
@@ -307,14 +329,13 @@ impl ClickHouseExecutor {
         );
 
         let escaped_sql = escape_question_marks_in_strings(sql);
-        let mut cursor = self
-            .client
-            .query(&escaped_sql)
-            .fetch_bytes("JSONEachRow")
-            .map_err(|e| {
-                warn!("ClickHouse field stats query failed to start: {}", e);
-                parse_clickhouse_error(&e.to_string())
-            })?;
+        let mut cursor =
+            super::types::with_query_options(self.client.query(&escaped_sql), query_id, settings)
+                .fetch_bytes("JSONEachRow")
+                .map_err(|e| {
+                    warn!("ClickHouse field stats query failed to start: {}", e);
+                    parse_clickhouse_error(&e.to_string())
+                })?;
 
         // Limit response size to prevent OOM on large field stats
         const MAX_FIELD_STATS_SIZE: usize = 50 * 1024 * 1024; // 50MB
@@ -519,7 +540,8 @@ impl ClickHouseExecutor {
     /// `field_expr` is the ALREADY-RESOLVED physical access expression for the
     /// field, computed by the caller via the active schema profile's
     /// `field_access_expr` (UDM → escaped column or `ext.{field}`; OCSF → promoted
-    /// dotted column or `JSONExtract(event, …)`). Resolving here with a UDM-only
+    /// dotted column or the native `event` subcolumn access, NAN-1426).
+    /// Resolving here with a UDM-only
     /// `is_explicit_column` check broke OCSF: `traffic.bytes_out` collapsed to
     /// `ext.trafficbytes_out` and `activity` to `ext.activity` (NAN-1241).
     pub fn build_field_values_sql(&self, base_sql: &str, field_expr: &str, limit: usize) -> String {

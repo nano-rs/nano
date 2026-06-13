@@ -105,6 +105,32 @@ impl ClickHouseExecutor {
     }
 }
 
+/// Apply an optional query_id and optional per-priority settings to a query
+/// builder (NAN-1428).
+///
+/// Companion queries (count / histogram / field-stats) carry a query_id
+/// derived from the data query's id so `KILL QUERY` can terminate the whole
+/// fan-out, and the same resolved `ClickHouseQuerySettings` so they are
+/// bounded by per-priority admission limits instead of only the CH profile.
+pub(crate) fn with_query_options(
+    mut query: clickhouse::query::Query,
+    query_id: Option<&str>,
+    settings: Option<&crate::search::admission::ClickHouseQuerySettings>,
+) -> clickhouse::query::Query {
+    if let Some(id) = query_id {
+        query = query.with_option("query_id", id);
+    }
+    if let Some(s) = settings {
+        query = query
+            .with_option("max_execution_time", &s.max_execution_time.to_string())
+            .with_option("max_memory_usage", &s.max_memory_usage_bytes.to_string())
+            .with_option("max_threads", &s.max_threads.to_string())
+            .with_option("priority", &s.priority.to_string())
+            .with_option("queue_max_wait_ms", &s.queue_max_wait_ms.to_string());
+    }
+    query
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

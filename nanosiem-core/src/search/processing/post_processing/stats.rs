@@ -229,7 +229,9 @@ pub fn compute_aggregation(rows: &[&serde_json::Value], agg: &Aggregation) -> se
             .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(|v| serde_json::json!(v))
             .unwrap_or(serde_json::Value::Null),
-        AggFunc::Dc => {
+        // estdc() is approximate at the SQL layer only; client-side
+        // post-processing over already-fetched rows counts exactly.
+        AggFunc::Dc | AggFunc::EstDc => {
             let unique: std::collections::HashSet<String> = rows
                 .iter()
                 .filter_map(|r| agg.field.as_ref().and_then(|f| r.get(f)))

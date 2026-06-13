@@ -244,8 +244,10 @@ impl SearchService {
             None
         } else {
             let histogram_start = Instant::now();
+            // NAN-1428: derived companion id so cancel kills the histogram too.
+            let hist_qid = request.request_id.as_ref().map(|r| format!("{r}-hist"));
             let histogram = self
-                .generate_histogram(cleaned_query, adjusted_time_range)
+                .generate_histogram(cleaned_query, adjusted_time_range, hist_qid.as_deref())
                 .await?;
             tracing::info!(
                 duration_ms = histogram_start.elapsed().as_millis() as u64,

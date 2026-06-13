@@ -63,17 +63,39 @@ impl FileParser {
                         result.headers = Some(headers.clone());
                     }
 
-                    let mut fields = HashMap::new();
-                    for (i, value) in record.iter().enumerate() {
-                        let key = headers
-                            .get(i)
-                            .cloned()
-                            .unwrap_or_else(|| format!("col_{}", i));
-                        let json_value = Self::infer_json_value(value);
-                        fields.insert(key, json_value);
-                    }
+                    // A row that doesn't match the header width is malformed
+                    // input (wrong delimiter, unescaped quote, truncated
+                    // export). Reject it — fabricating col_N keys for the
+                    // overflow or silently dropping missing fields produces
+                    // column-shifted records that poison lookup/enrichment
+                    // data downstream (NAN-1363).
+                    if record.len() != headers.len() {
+                        let msg = format!(
+                            "expected {} fields, found {}",
+                            headers.len(),
+                            record.len()
+                        );
+                        if config.skip_invalid {
+                            result.add_error(RecordError::new(line_number, msg));
+                        } else {
+                            return Err(ParseError::CsvError(format!(
+                                "Line {}: {}",
+                                line_number, msg
+                            )));
+                        }
+                    } else {
+                        let mut fields = HashMap::new();
+                        for (i, value) in record.iter().enumerate() {
+                            let key = headers
+                                .get(i)
+                                .cloned()
+                                .unwrap_or_else(|| format!("col_{}", i));
+                            let json_value = Self::infer_json_value(value);
+                            fields.insert(key, json_value);
+                        }
 
-                    result.add_record(ParsedRecord::new(fields, line_number));
+                        result.add_record(ParsedRecord::new(fields, line_number));
+                    }
                 }
                 Err(e) => {
                     if config.skip_invalid {

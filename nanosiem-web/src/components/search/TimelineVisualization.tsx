@@ -942,6 +942,9 @@ export function TimelineVisualization({
                     <AlertTriangle className="w-3 h-3" />Stream sees {eventCount.toLocaleString()} hits; table returned {resultCount.toLocaleString()} rows
                   </p>
                 )}
+                {/* hl-chart: scoped target for the search-complete reveal
+                    sweep (index.css, gated by .hl-wipe on the page root) */}
+                <div className="hl-chart relative">
                 <ResponsiveContainer width="100%" height={180}>
                   {chartType === 'bar' ? (
                     <BarChart
@@ -999,6 +1002,7 @@ export function TimelineVisualization({
                     </AreaChart>
                   )}
                 </ResponsiveContainer>
+                </div>
               </div>
             ) : (
               <div>

@@ -68,11 +68,53 @@ CREATE TABLE IF NOT EXISTS nanosiem.ip_enrichments
 ENGINE = ReplacingMergeTree(updated_at)
 ORDER BY (source_id, network);
 
+-- IP enrichment staging (NAN-1407 — staging-table indirection). All
+-- logs-referenced dictionaries load from a plain staging table instead of a
+-- complex aggregation query: every historical FAILED-dict ingestion halt
+-- (NAN-1114 / NAN-1117 / NAN-1120 / NAN-1404) was a SOURCE-QUERY failure, and
+-- a FAILED dict makes the logs MATERIALIZED dictGetOrDefault columns THROW on
+-- every insert. The refreshable MV below re-runs the old complex query on a
+-- cadence; a FAILING refresh keeps the last good staging data and surfaces in
+-- system.view_refreshes (the siem-health staleness probe) instead of killing
+-- ingestion. Staleness budget = refresh cadence + dict LIFETIME.
+-- PLAIN MergeTree on purpose: each replica keeps its own copy (the
+-- nano:keep-local-engine marker stops the cluster transform from making it
+-- Replicated — CH refuses a full-replace refreshable MV onto a replicated
+-- table in a non-Replicated database). See migration 133.
+CREATE TABLE IF NOT EXISTS nanosiem.ip_enrichment_dict_staging
+(
+    network String,
+    country String,
+    country_code String,
+    continent String,
+    continent_code String,
+    asn String,
+    as_name String,
+    as_domain String
+)
+ENGINE = MergeTree /* nano:keep-local-engine */
+ORDER BY network;
+
+-- Refresh: the old dict source query verbatim, incl. the NAN-1404 /
+-- migration-130 memory bounds (the aggregation cost didn't move, only its
+-- blast radius). Full-replace (non-APPEND): atomic swap, keeps last good
+-- data on failure. Runs an initial refresh at CREATE, so fresh installs
+-- populate without a seed.
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ip_enrichment_dict_refresh
+REFRESH EVERY 5 MINUTE TO nanosiem.ip_enrichment_dict_staging AS
+SELECT network, argMax(country, updated_at) AS country, argMax(country_code, updated_at) AS country_code, argMax(continent, updated_at) AS continent, argMax(continent_code, updated_at) AS continent_code, argMax(asn, updated_at) AS asn, argMax(as_name, updated_at) AS as_name, argMax(as_domain, updated_at) AS as_domain
+FROM nanosiem.ip_enrichments
+GROUP BY network
+HAVING argMax(deleted, updated_at) = 0
+SETTINGS max_bytes_before_external_group_by = 1000000000, max_memory_usage = 2500000000, max_threads = 2;
+
 -- IP Enrichment Dictionary
--- Loads GeoIP/ASN data from the ClickHouse ip_enrichments table (NAN-1117;
--- was PostgreSQL-sourced — moved to CH for the same ingestion-halt reason as
--- the IOC dict in migration 122 / NAN-1114). The 14 nanosiem.logs enriched_*
--- MATERIALIZED columns call dictGetOrDefault on this dict on every insert.
+-- Loads GeoIP/ASN data from the staging table above (NAN-1407; was a direct
+-- aggregation over ip_enrichments — moved behind staging so the load query
+-- can never fail; previously PostgreSQL-sourced, moved to CH in NAN-1117 for
+-- the same ingestion-halt reason as the IOC dict in migration 122/NAN-1114).
+-- The 14 nanosiem.logs enriched_* MATERIALIZED columns call dictGetOrDefault
+-- on this dict on every insert.
 -- Works with empty data - returns empty strings until enrichment is synced.
 -- Disabling the source blanks the dict by deleting its CH rows (the old PG
 -- `WHERE enabled = true` gate is preserved write-side, EnrichmentService).
@@ -94,7 +136,7 @@ SOURCE(CLICKHOUSE(
     USER '{clickhouse_self_user}'
     PASSWORD '{clickhouse_self_password}'
     DB 'nanosiem'
-    QUERY 'SELECT network, argMax(country, updated_at) AS country, argMax(country_code, updated_at) AS country_code, argMax(continent, updated_at) AS continent, argMax(continent_code, updated_at) AS continent_code, argMax(asn, updated_at) AS asn, argMax(as_name, updated_at) AS as_name, argMax(as_domain, updated_at) AS as_domain FROM nanosiem.ip_enrichments GROUP BY network HAVING argMax(deleted, updated_at) = 0 SETTINGS max_bytes_before_external_group_by = 1000000000, max_memory_usage = 2500000000, max_threads = 2'
+    QUERY 'SELECT network, country, country_code, continent, continent_code, asn, as_name, as_domain FROM nanosiem.ip_enrichment_dict_staging'
 ))
 LIFETIME(MIN 300 MAX 600)
 LAYOUT(IP_TRIE())
@@ -104,19 +146,51 @@ LAYOUT(IP_TRIE())
 -- Code 396 -> dict FAILED -> dictGetOrDefault in the logs enriched_* columns THROWs
 -- on every INSERT -> total silent ingestion halt (same blast radius NAN-1117 warned of,
 -- new trigger). Lift the result caps for the load query ONLY; the analyst profile is untouched.
--- The QUERY-level SETTINGS (NAN-1404 / migration 130) memory-bound the load's argMax
--- dedup aggregation: it spills to disk at 1GB (max_bytes_before_external_group_by)
--- instead of ballooning to the node memory cap, which OOMed the dict FAILED on
--- Saturn's 8GiB spec node and silently killed all ingestion for 36h.
+-- (The staging read still streams the full row set to the dict loader, so the
+-- caps stay lifted post-NAN-1407.)
 SETTINGS(max_result_rows = 0, max_result_bytes = 0);
+
+-- IOC enrichment staging + refresh (NAN-1407 — see ip_enrichment_dict_staging
+-- for the full rationale; migration 133).
+CREATE TABLE IF NOT EXISTS nanosiem.ioc_enrichment_dict_staging
+(
+    ioc_value String,
+    ioc_type String,
+    source_id String,
+    threat_type String,
+    malware String,
+    confidence_level Int32,
+    tags String
+)
+ENGINE = MergeTree /* nano:keep-local-engine */
+ORDER BY ioc_value;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ioc_enrichment_dict_refresh
+REFRESH EVERY 5 MINUTE TO nanosiem.ioc_enrichment_dict_staging AS
+SELECT
+    key_value AS ioc_value,
+    anyLast(key_type) AS ioc_type,
+    anyLast(enrichment_name) AS source_id,
+    anyLast(threat_type) AS threat_type,
+    anyLast(malware) AS malware,
+    toInt32(anyLast(confidence)) AS confidence_level,
+    arrayStringConcat(groupUniqArrayArray(tags), ',') AS tags
+FROM (
+    SELECT * FROM nanosiem.custom_enrichment_results
+    WHERE expires_at > now() AND is_ioc = 1 AND is_marketplace = 1
+    ORDER BY confidence DESC
+)
+GROUP BY key_value
+SETTINGS max_bytes_before_external_group_by = 1000000000, max_memory_usage = 2500000000, max_threads = 2;
 
 -- IOC Enrichment Dictionary
 -- OOTB marketplace IOC feeds (e.g. ThreatFox) populate nanosiem.logs `ioc_*`
--- columns via this dictionary. Sourced from ClickHouse custom_enrichment_results
--- filtered to marketplace-provided rows (is_marketplace = 1). The legacy
--- PostgreSQL source (ioc_enrichments table) was removed in NAN-1112; see
--- migration 122 (NAN-1114) for the repoint + incident write-up. User-created
--- IOC enrichments route through custom_ioc_enrichment_dict (is_marketplace = 0).
+-- columns via this dictionary. Sourced from the staging table above
+-- (NAN-1407), refreshed from ClickHouse custom_enrichment_results filtered to
+-- marketplace-provided rows (is_marketplace = 1). The legacy PostgreSQL
+-- source (ioc_enrichments table) was removed in NAN-1112; see migration 122
+-- (NAN-1114) for the repoint + incident write-up. User-created IOC
+-- enrichments route through custom_ioc_enrichment_dict (is_marketplace = 0).
 -- Works with empty data - returns empty values until a marketplace IOC feed syncs.
 CREATE DICTIONARY IF NOT EXISTS nanosiem.ioc_enrichment_dict
 (
@@ -135,21 +209,7 @@ SOURCE(CLICKHOUSE(
     USER '{clickhouse_self_user}'
     PASSWORD '{clickhouse_self_password}'
     DB 'nanosiem'
-    QUERY 'SELECT
-        key_value AS ioc_value,
-        anyLast(key_type) AS ioc_type,
-        anyLast(enrichment_name) AS source_id,
-        anyLast(threat_type) AS threat_type,
-        anyLast(malware) AS malware,
-        toInt32(anyLast(confidence)) AS confidence_level,
-        arrayStringConcat(groupUniqArrayArray(tags), '','') AS tags
-    FROM (
-        SELECT * FROM nanosiem.custom_enrichment_results
-        WHERE expires_at > now() AND is_ioc = 1 AND is_marketplace = 1
-        ORDER BY confidence DESC
-    )
-    GROUP BY key_value
-    SETTINGS max_bytes_before_external_group_by = 1000000000, max_memory_usage = 2500000000, max_threads = 2'
+    QUERY 'SELECT ioc_value, ioc_type, source_id, threat_type, malware, confidence_level, tags FROM nanosiem.ioc_enrichment_dict_staging'
 ))
 LIFETIME(MIN 60 MAX 300)
 LAYOUT(HASHED());
@@ -291,8 +351,35 @@ ORDER BY (source_type, bucket_start)
 TTL bucket_start + INTERVAL 7 DAY
 SETTINGS index_granularity = 8192;
 
+-- Custom enrichment staging + refresh (NAN-1407 — see
+-- ip_enrichment_dict_staging for the full rationale; migration 133).
+CREATE TABLE IF NOT EXISTS nanosiem.custom_enrichment_dict_staging
+(
+    key_type String,
+    key_value String,
+    tags Array(String),
+    risk_score UInt8,
+    enrichment_names Array(String)
+)
+ENGINE = MergeTree /* nano:keep-local-engine */
+ORDER BY (key_type, key_value);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.custom_enrichment_dict_refresh
+REFRESH EVERY 10 MINUTE TO nanosiem.custom_enrichment_dict_staging AS
+SELECT
+    key_type,
+    key_value,
+    groupUniqArrayArray(tags) as tags,
+    max(coalesce(risk_score, 0)) as risk_score,
+    groupUniqArray(enrichment_name) as enrichment_names
+FROM nanosiem.custom_enrichment_results
+WHERE expires_at > now() AND is_ioc = 0
+GROUP BY key_type, key_value
+SETTINGS max_bytes_before_external_group_by = 1000000000, max_memory_usage = 2500000000, max_threads = 2;
+
 -- Custom Enrichment Dictionary (non-IOC)
 -- Aggregates tags and risk scores from user-defined TypeScript enrichments
+-- (via the staging table above, NAN-1407)
 CREATE DICTIONARY IF NOT EXISTS nanosiem.custom_enrichment_dict
 (
     key_type String,
@@ -308,22 +395,47 @@ SOURCE(CLICKHOUSE(
     USER '{clickhouse_self_user}'
     PASSWORD '{clickhouse_self_password}'
     DB 'nanosiem'
-    QUERY 'SELECT
-        key_type,
-        key_value,
-        groupUniqArrayArray(tags) as tags,
-        max(coalesce(risk_score, 0)) as risk_score,
-        groupUniqArray(enrichment_name) as enrichment_names
-    FROM nanosiem.custom_enrichment_results
-    WHERE expires_at > now() AND is_ioc = 0
-    GROUP BY key_type, key_value
-    SETTINGS max_bytes_before_external_group_by = 1000000000, max_memory_usage = 2500000000, max_threads = 2'
+    QUERY 'SELECT key_type, key_value, tags, risk_score, enrichment_names FROM nanosiem.custom_enrichment_dict_staging'
 ))
 LAYOUT(COMPLEX_KEY_HASHED())
 LIFETIME(MIN 60 MAX 300);
 
+-- Custom IOC enrichment staging + refresh (NAN-1407 — see
+-- ip_enrichment_dict_staging for the full rationale; migration 133).
+CREATE TABLE IF NOT EXISTS nanosiem.custom_ioc_enrichment_dict_staging
+(
+    key_type String,
+    key_value String,
+    threat_type String,
+    malware String,
+    confidence UInt8,
+    tags Array(String),
+    enrichment_names Array(String)
+)
+ENGINE = MergeTree /* nano:keep-local-engine */
+ORDER BY (key_type, key_value);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.custom_ioc_enrichment_dict_refresh
+REFRESH EVERY 5 MINUTE TO nanosiem.custom_ioc_enrichment_dict_staging AS
+SELECT
+    key_type,
+    key_value,
+    anyLast(threat_type) as threat_type,
+    anyLast(malware) as malware,
+    anyLast(confidence) as confidence,
+    groupUniqArrayArray(tags) as tags,
+    groupUniqArray(enrichment_name) as enrichment_names
+FROM (
+    SELECT * FROM nanosiem.custom_enrichment_results
+    WHERE expires_at > now() AND is_ioc = 1 AND is_marketplace = 0
+    ORDER BY confidence DESC
+)
+GROUP BY key_type, key_value
+SETTINGS max_bytes_before_external_group_by = 1000000000, max_memory_usage = 2500000000, max_threads = 2;
+
 -- Custom IOC Enrichment Dictionary
 -- Aggregates IOC threat intel from user-defined TypeScript enrichments
+-- (via the staging table above, NAN-1407)
 CREATE DICTIONARY IF NOT EXISTS nanosiem.custom_ioc_enrichment_dict
 (
     key_type String,
@@ -341,21 +453,7 @@ SOURCE(CLICKHOUSE(
     USER '{clickhouse_self_user}'
     PASSWORD '{clickhouse_self_password}'
     DB 'nanosiem'
-    QUERY 'SELECT
-        key_type,
-        key_value,
-        anyLast(threat_type) as threat_type,
-        anyLast(malware) as malware,
-        anyLast(confidence) as confidence,
-        groupUniqArrayArray(tags) as tags,
-        groupUniqArray(enrichment_name) as enrichment_names
-    FROM (
-        SELECT * FROM nanosiem.custom_enrichment_results
-        WHERE expires_at > now() AND is_ioc = 1 AND is_marketplace = 0
-        ORDER BY confidence DESC
-    )
-    GROUP BY key_type, key_value
-    SETTINGS max_bytes_before_external_group_by = 1000000000, max_memory_usage = 2500000000, max_threads = 2'
+    QUERY 'SELECT key_type, key_value, threat_type, malware, confidence, tags, enrichment_names FROM nanosiem.custom_ioc_enrichment_dict_staging'
 ))
 LAYOUT(COMPLEX_KEY_HASHED())
 LIFETIME(MIN 60 MAX 300);
@@ -365,15 +463,29 @@ LIFETIME(MIN 60 MAX 300);
 -- Returns host_count: number of unique hosts that have seen this artifact
 -- Values: 1-9998 = actual count, 9999 = common (>1000 hosts or not tracked)
 --
--- LAYOUT(COMPLEX_KEY_CACHE): bounded ~80 MiB cache. On a miss CH pushes the key
--- predicate into the source query so the GROUP BY runs over just the missed-key
--- rows rather than the full *_prevalence_summary table. SPARSE_HASHED was
+-- LAYOUT(COMPLEX_KEY_CACHE): bounded ~80 MiB cache. SPARSE_HASHED was
 -- unbounded and tripped the 6 GiB Team-tier max_server_memory_usage on
 -- non-trivial tenants; see migration 112 for the full incident write-up.
--- Per-source-query max_memory_usage = 512 MiB is a belt-and-suspenders cap
--- in case the legacy analyzer is ever forced on and pushdown is lost;
--- max_bytes_before_external_group_by spills the aggregation to disk at 256 MiB
--- so a miss-storm degrades to disk instead of OOMing the node (NAN-1404).
+--
+-- The prevalence CACHE dicts deliberately keep KEY-PUSHDOWN sources — they
+-- are NOT staged (NAN-1440 reverted NAN-1407's staging for this family).
+-- CACHE layouts push the missed keys into the source QUERY, so each miss
+-- runs a small, memory-bounded (512 MiB cap, 256 MiB spill, 2 threads —
+-- migrations 112/130) aggregation over a handful of keys. The staging model
+-- instead full-rewrote the ENTIRE aggregated keyspace every 10 minutes,
+-- which does not scale: measured on Saturn (NAN-1440),
+-- ip_prevalence_summary is 83.8M rows; the full aggregation OOMs at the
+-- 512 MiB bound (Code 241 in the external-GROUP-BY merge phase, so the
+-- migration-133 seed crashloops the boot-gating migrator), and at workable
+-- bounds (2.5 GB) still produces an 83.39M-row staging table — a ~1.6 GiB
+-- full-replace 144x/day on nodes that share 8-15 GiB with ingestion. Rule:
+-- full-reload dicts (HASHED/IP_TRIE) get staging indirection; CACHE dicts
+-- keep pushdown. Accepted residual risk: a failing miss query still THROWs
+-- at insert (CACHE_DICTIONARY_UPDATE_FAIL) instead of degrading to stale
+-- data — but the miss query is a bounded local-table read, and the
+-- NAN-1405/1437 alarms + wait_for_async_insert=1 make any recurrence loud
+-- instead of silent. The HAVING host_count < 1000 filter keeps noisy
+-- artifacts out of the cache: lookups miss and return the default 9999.
 
 CREATE OR REPLACE DICTIONARY nanosiem.hash_prevalence_dict
 (
@@ -513,15 +625,47 @@ CREATE TABLE IF NOT EXISTS nanosiem.user_registry
 ENGINE = ReplacingMergeTree(version)
 ORDER BY (provider_id, external_id);
 
+-- Identity enrichment staging + refresh (NAN-1407 — see
+-- ip_enrichment_dict_staging for the full rationale; migration 133). The
+-- refresh runs the old dict source query verbatim: argMax(..., version)
+-- GROUP BY username_lc dedups ReplacingMergeTree rows (merges are async);
+-- the outer WHERE account_status != 'deleted' + the username_lc != '' inner
+-- WHERE reproduce the old PG dict filter (NAN-1120: the filter must live in
+-- an outer WHERE, not HAVING — alias re-resolution makes a HAVING on the
+-- aggregate ILLEGAL_AGGREGATION). groups is comma-joined to keep
+-- user_identity_groups a String (matching PG array_to_string(groups, ',')).
+CREATE TABLE IF NOT EXISTS nanosiem.user_registry_dict_staging
+(
+    username String,
+    email String,
+    display_name String,
+    department String,
+    title String,
+    manager_upn String,
+    manager_display_name String,
+    company String,
+    groups String,
+    account_enabled UInt8,
+    account_status String,
+    mfa_enabled UInt8,
+    employee_type String,
+    country String,
+    office_location String
+)
+ENGINE = MergeTree /* nano:keep-local-engine */
+ORDER BY username;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.user_registry_dict_refresh
+REFRESH EVERY 5 MINUTE TO nanosiem.user_registry_dict_staging AS
+SELECT * FROM (SELECT username_lc AS username, argMax(email, version) AS email, argMax(display_name, version) AS display_name, argMax(department, version) AS department, argMax(title, version) AS title, argMax(manager_upn, version) AS manager_upn, argMax(manager_display_name, version) AS manager_display_name, argMax(company, version) AS company, argMax(arrayStringConcat(groups, ','), version) AS groups, argMax(account_enabled, version) AS account_enabled, argMax(account_status, version) AS account_status, argMax(mfa_enabled, version) AS mfa_enabled, argMax(employee_type, version) AS employee_type, argMax(country, version) AS country, argMax(office_location, version) AS office_location FROM nanosiem.user_registry WHERE username_lc != '' GROUP BY username_lc) WHERE account_status != 'deleted'
+SETTINGS max_bytes_before_external_group_by = 1000000000, max_memory_usage = 2500000000, max_threads = 2;
+
 -- Dictionary: user_registry_dict (keyed by lowercased username, sources from
--- the ClickHouse user_registry table — NAN-1117; was PostgreSQL-sourced).
--- Attributes/key/LAYOUT(HASHED()) are byte-identical to the prior PG dict so
--- the 24 nanosiem.logs user_identity_* columns keep resolving unchanged.
--- argMax(..., version) GROUP BY username_lc dedups ReplacingMergeTree rows at
--- load time (merges are async); HAVING account_status != 'deleted' + the
--- username_lc != '' WHERE reproduce the old PG dict filter. groups is
--- comma-joined to keep user_identity_groups a String (matching PG
--- array_to_string(groups, ',')).
+-- the staging table above — NAN-1407; previously a direct aggregation over
+-- the ClickHouse user_registry table per NAN-1117, and PG-sourced before
+-- that). Attributes/key/LAYOUT(HASHED()) are byte-identical to the prior
+-- dict so the 24 nanosiem.logs user_identity_* columns keep resolving
+-- unchanged.
 CREATE DICTIONARY IF NOT EXISTS nanosiem.user_registry_dict
 (
     username String,
@@ -547,7 +691,7 @@ SOURCE(CLICKHOUSE(
     USER '{clickhouse_self_user}'
     PASSWORD '{clickhouse_self_password}'
     DB 'nanosiem'
-    QUERY 'SELECT * FROM (SELECT username_lc AS username, argMax(email, version) AS email, argMax(display_name, version) AS display_name, argMax(department, version) AS department, argMax(title, version) AS title, argMax(manager_upn, version) AS manager_upn, argMax(manager_display_name, version) AS manager_display_name, argMax(company, version) AS company, argMax(arrayStringConcat(groups, '',''), version) AS groups, argMax(account_enabled, version) AS account_enabled, argMax(account_status, version) AS account_status, argMax(mfa_enabled, version) AS mfa_enabled, argMax(employee_type, version) AS employee_type, argMax(country, version) AS country, argMax(office_location, version) AS office_location FROM nanosiem.user_registry WHERE username_lc != '''' GROUP BY username_lc) WHERE account_status != ''deleted'' SETTINGS max_bytes_before_external_group_by = 1000000000, max_memory_usage = 2500000000, max_threads = 2'
+    QUERY 'SELECT username, email, display_name, department, title, manager_upn, manager_display_name, company, groups, account_enabled, account_status, mfa_enabled, employee_type, country, office_location FROM nanosiem.user_registry_dict_staging'
 ))
 LIFETIME(MIN 300 MAX 600)
 LAYOUT(HASHED());
@@ -785,19 +929,29 @@ CREATE TABLE IF NOT EXISTS nanosiem.logs
     INDEX idx_dest_user dest_user TYPE bloom_filter GRANULARITY 4,
     INDEX idx_dest_user_words lower(dest_user) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_user_id user_id TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_session_id_lower lower(session_id) TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_user_id_lower lower(user_id) TYPE bloom_filter GRANULARITY 4,
     INDEX idx_process_name process_name TYPE bloom_filter GRANULARITY 4,
     INDEX idx_process_name_words lower(process_name) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_process_hash process_hash TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_process_hash_lower lower(process_hash) TYPE bloom_filter GRANULARITY 4,
     INDEX idx_process_guid process_guid TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_process_guid_lower lower(process_guid) TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_process_path_words lower(process_path) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_command_line command_line TYPE bloom_filter GRANULARITY 4,
     INDEX idx_command_line_words lower(command_line) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_parent_command_line parent_command_line TYPE bloom_filter GRANULARITY 4,
     INDEX idx_parent_command_line_words lower(parent_command_line) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_file_path_words lower(file_path) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_file_hash file_hash TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_file_hash_lower lower(file_hash) TYPE bloom_filter GRANULARITY 4,
     INDEX idx_file_name file_name TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_file_name_lower lower(file_name) TYPE bloom_filter GRANULARITY 4,
     INDEX idx_registry_path_words lower(registry_path) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_url_domain url_domain TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_url_domain_lower lower(url_domain) TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_url_words lower(url) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
+    INDEX idx_uri_path_words lower(uri_path) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_http_method http_method TYPE set(20) GRANULARITY 4,
     INDEX idx_http_user_agent_words lower(http_user_agent) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_query_words lower(query) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
@@ -810,9 +964,11 @@ CREATE TABLE IF NOT EXISTS nanosiem.logs
     INDEX idx_message_id message_id TYPE bloom_filter GRANULARITY 4,
     INDEX idx_signature signature TYPE bloom_filter GRANULARITY 4,
     INDEX idx_signature_id signature_id TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_signature_id_lower lower(signature_id) TYPE bloom_filter GRANULARITY 4,
     INDEX idx_cve cve TYPE bloom_filter GRANULARITY 4,
     INDEX idx_mitre_technique mitre_technique_id TYPE bloom_filter GRANULARITY 4,
     INDEX idx_rule_id rule_id TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_rule_id_lower lower(rule_id) TYPE bloom_filter GRANULARITY 4,
     INDEX idx_action action TYPE set(100) GRANULARITY 4,
     INDEX idx_status status TYPE set(100) GRANULARITY 4,
     INDEX idx_source_type source_type TYPE set(100) GRANULARITY 4,

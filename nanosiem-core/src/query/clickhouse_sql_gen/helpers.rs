@@ -11,7 +11,7 @@ use super::EXPLICIT_COLUMNS_SET;
 /// Generate SETTINGS clause based on context options
 /// Includes max_execution_time=300 (5 minutes) for server-side query timeout
 ///
-/// When `has_selective_prewhere` is true, `optimize_read_in_order` is disabled
+/// When `has_selective_indexed_eq` is true, `optimize_read_in_order` is disabled
 /// so ClickHouse can parallelize granule reads instead of scanning sequentially
 /// in timestamp order. This is critical for selective filters (e.g. src_host)
 /// where most granules are empty — sequential scanning wastes I/O.
@@ -22,10 +22,10 @@ use super::EXPLICIT_COLUMNS_SET;
 /// Timechart keeps both enabled because temporal bucket ordering matters.
 pub(crate) fn generate_settings(
     use_cache: bool,
-    has_selective_prewhere: bool,
+    has_selective_indexed_eq: bool,
     is_non_timechart_aggregation: bool,
 ) -> String {
-    let read_in_order = if has_selective_prewhere || is_non_timechart_aggregation { 0 } else { 1 };
+    let read_in_order = if has_selective_indexed_eq || is_non_timechart_aggregation { 0 } else { 1 };
     let agg_in_order = if is_non_timechart_aggregation { 0 } else { 1 };
     if use_cache {
         format!(
@@ -236,8 +236,8 @@ pub(crate) fn field_to_sql_expr(field: &str, gen: &ClickHouseSqlGenerator) -> (S
     }
 
     // Unknown bare field. Under OCSF an unmapped/unpromoted name is part of the
-    // `event` tail → JSONExtract (returns '' when absent) rather than a bare column
-    // reference that 500s with "Unknown identifier". Under UDM `resolve` never
+    // `event` tail → native subcolumn access ('' when absent, NAN-1426) rather
+    // than a bare column reference that 500s with "Unknown identifier". Under UDM `resolve` never
     // yields JsonPath, so this is skipped and the bare reference (a computed /
     // renamed / previous-stage column) is preserved byte-identically. Computed
     // pipeline fields were already returned above (is_computed_field). (NAN-1248)
@@ -287,8 +287,9 @@ pub(crate) fn by_field_sql(field: &str, gen: &ClickHouseSqlGenerator) -> String 
         }
         gen.field_access_expr(field, "String")
     } else if !gen.is_computed_field(field) && gen.resolves_to_json_path(field) {
-        // OCSF unmapped/tail field → JSONExtract from `event` (empty if absent),
-        // not a bare reference that 500s in GROUP BY / PARTITION BY. Computed
+        // OCSF unmapped/tail field → native `event` subcolumn access (empty if
+        // absent, NAN-1426), not a bare reference that 500s in GROUP BY /
+        // PARTITION BY. Computed
         // pipeline fields are excluded — they are real in-scope columns and stay
         // bare. UDM never hits this (resolve never yields JsonPath). (NAN-1248)
         gen.field_access_expr(field, "String")
@@ -535,6 +536,160 @@ pub(crate) fn escape_string(s: &str) -> String {
 /// Escaping `?` here would double-escape and break regex inline flags like `(?i)`.
 pub(crate) fn escape_regex_pattern(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "''")
+}
+
+/// NAN-1426: native JSON **subcolumn** access expression for an OCSF tail path
+/// (`FieldResolution::JsonPath`), replacing the `JSONExtract<T>(event, 'a', 'b')`
+/// emission. `event` is a native `JSON` column, and `JSONExtract*` on it
+/// re-serializes the ENTIRE event object per row — the largest column read in
+/// full for every unpromoted-field filter/projection — while subcolumn access
+/// (`event."a"."b"`) reads only that path's columnar substream. Measured on
+/// local CH 26.4 (3M-row `ocsf_logs`): 8.06 GiB → 64 MiB (~125x read_bytes) on
+/// the headline string-equality probe, identical row counts.
+///
+/// The naive rewrite alone CHANGES results; each typed form below carries a
+/// verifier-mandated parity carve-out (all empirically validated, see NAN-1426):
+///
+/// - `"String"` → a `multiIf` over the subcolumn that is byte-identical to
+///   `JSONExtractString(event, …)` on every value shape:
+///   - **scalar / array leaf** (`isNotNull(sub)`): `toString(sub)` — numbers,
+///     bools, and arrays format identically to JSONExtractString-over-the-JSON-
+///     column because that function operates on the column's own CH
+///     serialization (e.g. `['a','b']` with single quotes for string arrays —
+///     verified equal on all 13,899 local array rows).
+///   - **object-valued path** (subcolumn is NULL but subpaths exist):
+///     `toJSONString(event.^"a"."b")` — the `^` prefix reads only the subtree's
+///     substreams and serializes byte-identically to the old raw-JSON return
+///     (verified equal on every object row locally). `toString(event.a.b)`
+///     alone would return `''` here and silently break raw-JSON hunts
+///     (`unmapped CONTAINS '"key":"val"'`) and `field=""` semantics.
+///   - **missing key / JSON null**: `''` — same as JSONExtractString, which is
+///     what keeps the NAN-1161 negation guarantee (`field != "x"` keeps
+///     absent-key rows; the expression is never NULL).
+/// - `"Float"` → `coalesce(accurateCastOrNull(sub, 'Float64'), 0.)`.
+///   `JSONExtractFloat` returns **0** for missing keys; a bare cast returns
+///   NULL — without the coalesce, `field=0` flips 2.7M→0 and `field!=7` drops
+///   every absent-key row on local data. `accurateCastOrNull` matches
+///   JSONExtractFloat on every edge probed: numeric strings ("42.5"→42.5),
+///   non-numeric strings (→NULL→0), bools (true→1), objects/arrays (→NULL→0).
+///   (Suffix nomenclature: the extractor is `Float`, NOT `Float64` — NAN-1383.)
+/// - anything else (`"Bool"`, raw forms) → the legacy `JSONExtract{T}` form.
+///   `Bool` is deliberately NOT converted: `accurateCastOrNull('true','Bool')`
+///   is `true` where `JSONExtractBool` returns `false` for string-typed values,
+///   so the cast form is not parity-safe. Array access keeps its
+///   `JSONExtractArrayRaw` forms untouched (emitted elsewhere).
+///
+/// Path segments are embedded as double-quoted identifiers, valid for CH
+/// subcolumn access including reserved words and spaces (verified). CH
+/// processes BOTH backslash escapes and `""`-doubling inside double-quoted
+/// identifiers (verified on 26.4: `"a\\b"` addresses the key `a\b`,
+/// `"se""lect"` addresses `se"lect`), so backslashes must be escaped first —
+/// a raw `\` would silently escape the following character and address the
+/// wrong key (or break out of the identifier on a trailing `\`). `col` is a
+/// resolver-owned column name (`event` / `metadata`), embedded as-is like the
+/// old emission.
+///
+/// Saturn note: tenants exceeding `max_dynamic_paths=1024` push overflow paths
+/// into shared data, which subcolumn reads must scan — less surgical, but never
+/// worse than the full-event decode this replaces.
+pub(crate) fn json_tail_access_sql(col: &str, path: &[String], json_type: &str) -> String {
+    let segments: Vec<String> = path
+        .iter()
+        .map(|p| format!("\"{}\"", p.replace('\\', "\\\\").replace('"', "\"\"")))
+        .collect();
+    let sub = format!("{}.{}", col, segments.join("."));
+    match json_type {
+        "String" => {
+            let subtree = format!("toJSONString({}.^{})", col, segments.join("."));
+            format!(
+                "multiIf(isNotNull({sub}), toString({sub}), {subtree} != '{{}}', {subtree}, '')"
+            )
+        }
+        "Float" => format!("coalesce(accurateCastOrNull({sub}, 'Float64'), 0.)"),
+        _ => {
+            let path_args: Vec<String> = path
+                .iter()
+                .map(|p| format!("'{}'", escape_string(p)))
+                .collect();
+            format!("JSONExtract{}({}, {})", json_type, col, path_args.join(", "))
+        }
+    }
+}
+
+/// NAN-1416: minimum length for an index-guard token (which must also contain
+/// at least one ASCII letter). Empirical (local CH 26.4, 2M-row `logs`,
+/// medians of 4 runs, query-condition-cache off):
+///
+/// - short tokens are catastrophic when they don't prune — the per-row
+///   substring scan for a short common needle costs more than the full-needle
+///   scan it guards (`%cmd%` +153% CPU, `%192%` +159% CPU, zero granules
+///   pruned);
+/// - 5-char tokens are coin-flips (`%query%` −22% CPU on a sparse phrase, but
+///   `%event%` +26% CPU on a dense one);
+/// - numeric-only tokens (IP octets, ports, build numbers) are ubiquitous in
+///   log text and never pruned meaningfully (`%22621%` +15% CPU);
+/// - ≥6-char lettered tokens stayed within noise on every dense probe
+///   (`%svchost%` +7%, `%provider%` +8%) and won big when selective
+///   (`%failed%` −47% CPU / 3.0x fewer bytes, `%ycombinator%` −55% / 3.7x).
+///
+/// The audit (QUERY_PERF_AUDIT.md B2) proposed ≥3; measurement moved it to
+/// ≥6 + letter. Needles whose tokens all fail the bar emit NO guard — the
+/// safe failure mode is the unchanged pre-NAN-1416 shape, never a wrong or
+/// costly guard.
+pub(crate) const GUARD_TOKEN_MIN_LEN: usize = 6;
+
+/// NAN-1416: longest index-servable token of a multi-token search needle.
+///
+/// CH 26.4's `text(tokenizer = splitByNonAlpha)` index serves
+/// `lower(col) iLike '%needle%'` via a dictionary-substring scan ONLY when the
+/// needle is a single token: any non-alphanumeric char in the needle (space,
+/// `.`, `-`, `_`, `/`, …) makes the index bail and the column full-scans —
+/// measured up to 307x read_bytes on `%failed login%` vs `%failed%`. The fix:
+/// AND an index-servable guard `... iLike '%<longest token>%'` after the
+/// full-needle predicate (full-needle first — see the Keyword arm for the
+/// ordering rationale). Every token is a contiguous substring of the needle,
+/// so `full ∧ guard ≡ full` — byte-identical results by construction.
+///
+/// Returns `Some(token)` only when the (already-lowercased) needle splits into
+/// **more than one** token and at least one token passes the
+/// [`GUARD_TOKEN_MIN_LEN`]+letter bar; picks the longest qualifying token,
+/// ties resolving to the first occurrence (deterministic SQL). Single-token
+/// needles return `None` so their emission shape is untouched (the
+/// single-token iLike is already index-served with DIRECT READ — do not
+/// disturb it). Longest-token-only is deliberate: ANDing *all* tokens was
+/// measured to regress dense matches (CPU 0.90M→1.63M µs) for marginal I/O
+/// gain.
+///
+/// Tokens are maximal runs of **ASCII** alphanumerics — a conservative subset
+/// of ClickHouse's `splitByNonAlpha` (which keeps non-ASCII bytes inside
+/// tokens, e.g. `splitByNonAlpha('caféteria') = ['caféteria']`). An ASCII-alnum
+/// run is always a substring of whatever larger token CH indexes around it, so
+/// the dictionary-substring scan still serves the guard; when a needle yields
+/// no qualifying run we emit no guard (the safe failure mode). By construction
+/// the token contains no LIKE metachars (`%`, `_`, `\`) and no quotes, so it
+/// needs no escaping.
+pub(crate) fn longest_guard_token(needle_lower: &str) -> Option<&str> {
+    let mut token_count = 0usize;
+    let mut best: Option<&str> = None;
+    for t in needle_lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+    {
+        token_count += 1;
+        if t.len() >= GUARD_TOKEN_MIN_LEN
+            && t.chars().any(|c| c.is_ascii_alphabetic())
+            // Strictly-greater keeps the FIRST longest qualifying token on ties.
+            && best.is_none_or(|b| t.len() > b.len())
+        {
+            debug_assert!(t.chars().all(|c| c.is_ascii_alphanumeric()));
+            best = Some(t);
+        }
+    }
+    if token_count >= 2 {
+        best
+    } else {
+        None
+    }
 }
 
 /// Add LIKE-pattern escaping on top of an already SQL-escaped string (single
@@ -810,8 +965,26 @@ fn extract_literal_alternation(pat: &str) -> Option<Vec<String>> {
     Some(literals)
 }
 
-/// Extract the longest contiguous literal substring from a regex pattern.
-/// Splits on metacharacters and returns the longest piece.
+/// Extract the longest contiguous literal substring from a regex pattern,
+/// reduced to its longest index-servable token when one qualifies.
+/// Splits on metacharacters and takes the longest piece; within that piece,
+/// prefers the longest [`GUARD_TOKEN_MIN_LEN`]+letter run of ASCII
+/// alphanumerics (ties → first occurrence), falling back to the raw piece.
+///
+/// NAN-1416: the per-piece tokenization matters because a literal piece can
+/// itself be multi-token (`/svchost\.exe (started|stopped)/` has the piece
+/// `svchost.exe `) and the splitByNonAlpha text index cannot serve an iLike
+/// guard containing non-alphanumeric chars — the old `'%svchost.exe %'` guard
+/// was index-useless (measured: `'%svchost%'` guard 1.53 GiB / 0.88s CPU vs
+/// `'%svchost.exe%'` 1.84 GiB / 1.08s vs unguarded match() 1.84 GiB / 3.26s).
+/// When no token qualifies the RAW piece is kept: unlike the iLike arms, the
+/// regex guard also pays for itself as a cheap row-level pre-filter ahead of
+/// the expensive `match()`, so dropping it would regress the pre-NAN-1416
+/// behavior. Tokenizing only the WINNING piece (rather than picking the
+/// globally longest token across all pieces) is deliberate: a token of the
+/// winning piece is a substring of it, so the new guard is implied by the old
+/// one — the soundness profile is exactly the pre-existing behavior, never
+/// worse.
 fn extract_longest_literal(pat: &str) -> Option<String> {
     let mut best = String::new();
     let mut current = String::new();
@@ -837,9 +1010,22 @@ fn extract_longest_literal(pat: &str) -> Option<String> {
     }
 
     if best.is_empty() {
-        None
-    } else {
+        return None;
+    }
+
+    // Longest qualifying ASCII-alnum token within the winning piece
+    // (strictly-greater comparison keeps the first occurrence on ties). For a
+    // piece that is already a single pure-alphanumeric qualifying token this
+    // is the identity — the pre-NAN-1416 shape is preserved.
+    let token = best
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| t.len() >= GUARD_TOKEN_MIN_LEN && t.chars().any(|c| c.is_ascii_alphabetic()))
+        .fold("", |acc, t| if t.len() > acc.len() { t } else { acc });
+
+    if token.is_empty() {
         Some(best)
+    } else {
+        Some(token.to_string())
     }
 }
 
@@ -1157,10 +1343,119 @@ mod inline_tests {
             Some("powershell".to_string())
         );
         assert_eq!(extract_longest_literal(".*"), None);
-        // Escaped dot is treated as literal, so foo.bar is one contiguous string
+        // Escaped dot is treated as literal, so foo.bar is one contiguous
+        // string; neither `foo` nor `bar` passes the GUARD_TOKEN_MIN_LEN bar,
+        // so the raw piece is kept (pre-NAN-1416 row-prefilter behavior).
         assert_eq!(
             extract_longest_literal(r"foo\.bar"),
             Some("foo.bar".to_string())
         );
+    }
+
+    /// NAN-1416: when a multi-token literal piece contains a qualifying
+    /// (≥GUARD_TOKEN_MIN_LEN, lettered) token, the guard becomes that single
+    /// token so the splitByNonAlpha text index can serve it.
+    #[test]
+    fn test_extract_longest_literal_tokenizes_winning_piece() {
+        // Winning piece is `svchost.exe ` (escaped dot + trailing space);
+        // `svchost` (7) qualifies → index-servable single-token guard.
+        assert_eq!(
+            extract_longest_literal(r"svchost\.exe (started|stopped)"),
+            Some("svchost".to_string())
+        );
+        // Pure-alnum winning piece is the identity (pre-NAN-1416 shape).
+        assert_eq!(
+            extract_longest_literal(r"mimikatz.*sekurlsa"),
+            Some("mimikatz".to_string())
+        );
+        // No qualifying token → raw piece kept (regex row-prefilter intact).
+        assert_eq!(
+            extract_longest_literal(r"cmd\.exe (started|stopped)"),
+            Some("cmd.exe ".to_string())
+        );
+    }
+
+    /// NAN-1416: the regex bloom guard rides analyze_regex_for_optimization —
+    /// a multi-token literal with a qualifying token yields a single-token
+    /// BloomGuard; without one the old raw-piece guard survives.
+    #[test]
+    fn test_regex_opt_bloom_guard_single_token() {
+        assert_eq!(
+            analyze_regex_for_optimization(r"svchost\.exe (started|stopped)"),
+            Some(RegexOptimization::BloomGuard("svchost".to_string()))
+        );
+        // `a.b ` has no qualifying token; the raw piece (≥3 chars) stays the
+        // pre-filter exactly as before NAN-1416.
+        assert_eq!(
+            analyze_regex_for_optimization(r"a\.b (x|y)"),
+            Some(RegexOptimization::BloomGuard("a.b ".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_longest_guard_token() {
+        // Multi-token needles → longest qualifying token; ties → first.
+        assert_eq!(longest_guard_token("failed login"), Some("failed"));
+        assert_eq!(longest_guard_token("svchost.exe"), Some("svchost"));
+        assert_eq!(
+            longest_guard_token("failed_login_attempt"),
+            Some("attempt")
+        );
+        assert_eq!(
+            longest_guard_token("news.ycombinator.com"),
+            Some("ycombinator")
+        );
+        // Tokens below GUARD_TOKEN_MIN_LEN never become guards — measured
+        // catastrophic when unselective (`%cmd%` +153% CPU, `%192%` +159%).
+        assert_eq!(longest_guard_token("cmd.exe"), None);
+        assert_eq!(longest_guard_token("a.b.c"), None);
+        // 5-char tokens are coin-flips (`%event%` +26% on dense) → excluded.
+        assert_eq!(longest_guard_token("event_data"), None);
+        // Numeric-only tokens (octets, ports, builds) are ubiquitous in log
+        // text and never guard, regardless of length.
+        assert_eq!(longest_guard_token("192.168.1.100"), None);
+        assert_eq!(longest_guard_token("10.0.22621.1"), None);
+        assert_eq!(longest_guard_token("10.0.0.52"), None);
+        // …but a long lettered token qualifies even next to numerics.
+        assert_eq!(
+            longest_guard_token("update.20250612.payload"),
+            Some("payload")
+        );
+        // Single-token needles → None (shape must stay untouched).
+        assert_eq!(longest_guard_token("error"), None);
+        assert_eq!(longest_guard_token("mimikatz"), None);
+        // Leading/trailing separators around ONE token is still single-token.
+        assert_eq!(longest_guard_token(" error "), None);
+        // No alphanumeric content at all → no guard.
+        assert_eq!(longest_guard_token("***"), None);
+        assert_eq!(longest_guard_token("   "), None);
+        assert_eq!(longest_guard_token(""), None);
+        // LIKE metachars are separators, never part of a token.
+        assert_eq!(
+            longest_guard_token("100%_download\\complete"),
+            Some("download")
+        );
+        // Non-ASCII chars are conservative separators (CH's splitByNonAlpha
+        // keeps them inside tokens; an ASCII-alnum run is a substring of the
+        // bigger CH token, so the guard stays index-servable either way).
+        assert_eq!(longest_guard_token("café attachment"), Some("attachment"));
+        // A needle that is one CH token but splits for us only guards when a
+        // qualifying ASCII run remains — `teria` (5) does not.
+        assert_eq!(longest_guard_token("caféteria"), None);
+        // Tokens returned are alnum-only by construction.
+        for needle in [
+            "failed login!",
+            "x%y_z\\w 100%_download",
+            "a'b''c quoted_string",
+        ] {
+            if let Some(t) = longest_guard_token(needle) {
+                assert!(
+                    t.chars().all(|c| c.is_ascii_alphanumeric()),
+                    "guard token {:?} from {:?} must be pure ASCII-alnum",
+                    t,
+                    needle
+                );
+            }
+        }
     }
 }

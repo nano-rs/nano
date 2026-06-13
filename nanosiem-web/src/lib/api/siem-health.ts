@@ -12,11 +12,42 @@ export interface SourceVolumeMetric {
   change_pct: number;
 }
 
+export interface FailedDictionary {
+  name: string;
+  last_exception: string;
+}
+
+/** A failing/stale dictionary-staging refresh MV (NAN-1407): stale
+ * enrichment, NOT data loss — rows keep landing with the last good
+ * snapshot. */
+export interface StaleDictRefresh {
+  view: string;
+  exception: string;
+  /** Seconds since the last successful refresh; 0 = never succeeded. */
+  last_success_age_secs: number;
+}
+
+/** Insert-path integrity signals (NAN-1405) — NAN-1404 silent-loss probes.
+ * Optional: reports stored before NAN-1405 lack the block entirely. */
+export interface InsertIntegrityMetrics {
+  probes_available: boolean;
+  logs_inserts_1h: number;
+  new_parts_1h: number;
+  memory_limit_errors: number;
+  cache_dictionary_update_fails: number;
+  failed_logs_dictionaries: FailedDictionary[];
+  async_insert_failures_1h: number | null;
+  last_async_insert_error: string | null;
+  /** Optional: reports stored before NAN-1407 lack this field. */
+  stale_dict_refreshes?: StaleDictRefresh[];
+}
+
 export interface IngestionMetrics {
   source_volumes: SourceVolumeMetric[];
   total_events_24h: number;
   total_events_prior_24h: number;
   silent_sources: string[];
+  insert_integrity?: InsertIntegrityMetrics;
 }
 
 export interface FieldCoverageMetric {

@@ -257,12 +257,20 @@ impl AuditEvent {
             metadata,
             source_type: "audit".to_string(),
             source: Some(self.source.to_string()),
-            // Use standard UDM fields where appropriate
-            user: self.actor_name.clone(),
-            action: Some(self.action.clone()),
+            // Use standard UDM fields where appropriate.
+            //
+            // LOWERCASE_NORMALIZED_FIELDS contract (NAN-1432): `user`, `action`
+            // and `src_ip` are raw-equality compared by the SQL generator (no
+            // `lower()` wrapper, so the raw-column indexes prune), which is only
+            // correct if every writer stores them lowercase. The display-case
+            // actor name is preserved in `metadata.actor_name` (above) and in
+            // `message`; the audit page renders from metadata
+            // (`audit/query.rs::row_to_entry`).
+            user: self.actor_name.as_ref().map(|n| n.to_lowercase()),
+            action: Some(self.action.to_lowercase()),
             status: Some(if self.success { "success" } else { "failure" }.to_string()),
             severity: None, // Audit events don't have severity
-            src_ip: self.ip_address.clone(),
+            src_ip: self.ip_address.as_ref().map(|ip| ip.to_lowercase()),
             user_agent: self.user_agent.clone(),
             ext: None, // Audit events don't have extended fields beyond UDM
             // Session ID stores the resource ID for correlation
@@ -590,6 +598,75 @@ mod tests {
         assert!(log.message.ends_with("by Dan Lussier"), "got: {}", log.message);
         assert!(log.metadata.get("api_key_id").is_some_and(|v| v.is_null()));
         assert!(log.metadata.get("api_key_name").is_some_and(|v| v.is_null()));
+    }
+
+    /// NAN-1432: every field in `LOWERCASE_NORMALIZED_FIELDS` is compared with
+    /// raw equality by the SQL generator (no `lower()` wrapper, so the
+    /// raw-column indexes prune) — sound only if every writer stores those
+    /// columns lowercase. The audit emitter is the one in-process writer to
+    /// `logs` (Vector's VRL handles everything else), so it must uphold the
+    /// contract: pre-fix it stored display-case actor names and
+    /// `user="dan lussier"` found 0 audit rows.
+    ///
+    /// The list is consumed dynamically: a field added to
+    /// `LOWERCASE_NORMALIZED_FIELDS` without a mapping here fails the test
+    /// with instructions instead of silently going unchecked.
+    #[test]
+    fn test_audit_writer_upholds_lowercase_normalized_fields_contract() {
+        use crate::ingestion::ClickHouseLogRow;
+        use crate::query::LOWERCASE_NORMALIZED_FIELDS;
+
+        // Mixed-case inputs in every contract field the builder can populate.
+        let event = AuditEvent::builder(AuditSource::Auth, "Login_Failed")
+            .actor(Some(Uuid::now_v7()), Some("Dan Lussier".to_string()))
+            .client(
+                Some("FE80::1ABC:2DEF".to_string()), // IPv6 with uppercase hex
+                Some("Mozilla/5.0".to_string()),
+            )
+            .build();
+
+        let row = ClickHouseLogRow::from_parsed_log(&event.to_parsed_log(), Utc::now());
+
+        for field in LOWERCASE_NORMALIZED_FIELDS {
+            // Map the queryable field name onto the column the audit writer
+            // produces. `sourcetype` is a query-layer alias of `source_type`;
+            // `event_type` is a ClickHouse ALIAS of `action`.
+            let value: &str = match *field {
+                "source_type" | "sourcetype" => &row.source_type,
+                "event_type" | "action" => &row.action,
+                "user" => &row.user,
+                "src_ip" => &row.src_ip,
+                "dest_ip" => &row.dest_ip,
+                "src_host" => &row.src_host,
+                "dest_host" => &row.dest_host,
+                "protocol" => &row.protocol,
+                // Not columns of ClickHouseLogRow: the audit writer cannot
+                // write them, so the contract holds vacuously for audit rows
+                // (ClickHouse defaults them to '').
+                "user_domain" | "src_mac" | "dest_mac" | "src_user" => continue,
+                other => panic!(
+                    "`{other}` joined LOWERCASE_NORMALIZED_FIELDS — teach this \
+                     contract test where the audit writer surfaces it (or record \
+                     here that the writer never populates it)"
+                ),
+            };
+            assert_eq!(
+                value,
+                value.to_lowercase(),
+                "audit writer must store `{field}` lowercase (raw-equality \
+                 fast-path precondition), got: {value:?}"
+            );
+        }
+
+        // The lowercase contract must not cost the display name: it is
+        // preserved for the audit page in metadata.actor_name and the message.
+        let log = event.to_parsed_log();
+        assert_eq!(log.user.as_deref(), Some("dan lussier"));
+        assert_eq!(
+            log.metadata.get("actor_name").and_then(|v| v.as_str()),
+            Some("Dan Lussier")
+        );
+        assert!(log.message.contains("Dan Lussier"), "got: {}", log.message);
     }
 
     #[test]

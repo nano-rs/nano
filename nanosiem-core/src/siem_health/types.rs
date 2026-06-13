@@ -104,6 +104,85 @@ pub struct IngestionMetrics {
     pub total_events_prior_24h: u64,
     /// Source types that had events in prior 24h but zero in last 24h
     pub silent_sources: Vec<String>,
+    /// Insert-path integrity signals (NAN-1405). `default` so reports stored
+    /// before this field existed still deserialize.
+    #[serde(default)]
+    pub insert_integrity: InsertIntegrityMetrics,
+}
+
+/// Insert-path integrity signals (NAN-1405) — the NAN-1404 silent-loss kill
+/// chain. With `wait_for_async_insert=0` every ACK in the ingest chain fires
+/// before the flush, so a failing flush discards batches while Vector, HTTP
+/// 200s, and `QueryFinish` entries all look healthy. These probes watch the
+/// storage-layer tells instead of the ACK layer. Each probe degrades to its
+/// default when the app user lacks the system-table grant (pre-NAN-1405
+/// deployments) — `probes_available` records whether ANY probe answered.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InsertIntegrityMetrics {
+    /// Whether the system-table probes could run at all (grants present).
+    pub probes_available: bool,
+    /// Finished INSERTs into the logs table over the last hour (query_log) —
+    /// the ACK-layer count. NOTE: per-query async-insert entries report
+    /// written_rows=0 even when healthy (the rows are written by the flush),
+    /// so written_rows is NOT a loss signal — verified live during NAN-1405
+    /// (791/795 healthy inserts read 0). The loss test pairs this with
+    /// `new_parts_1h` below.
+    pub logs_inserts_1h: u64,
+    /// New parts created for the logs table over the last hour (part_log) —
+    /// the storage-layer count. `logs_inserts_1h > 0` with `new_parts_1h == 0`
+    /// is the NAN-1404 fingerprint: inserts ACKing while nothing reaches disk
+    /// (the exact correlation that diagnosed Saturn).
+    pub new_parts_1h: u64,
+    /// system.errors counter for MEMORY_LIMIT_EXCEEDED (code 241), only when
+    /// its last occurrence is within 24h (the counter never resets).
+    pub memory_limit_errors: u64,
+    /// system.errors counter for CACHE_DICTIONARY_UPDATE_FAIL (code 510),
+    /// 24h-recency-gated — the hash_prevalence_dict collateral signature.
+    pub cache_dictionary_update_fails: u64,
+    /// Dictionaries referenced by the logs table's MATERIALIZED columns that
+    /// are currently FAILED. Any entry here is a guaranteed ingestion halt
+    /// today (dictGetOrDefault THROWS at flush when the dict is FAILED).
+    pub failed_logs_dictionaries: Vec<FailedDictionary>,
+    /// Flush failures from system.asynchronous_insert_log over the last hour.
+    /// None when the log is not enabled (pre-NAN-1405 server config).
+    pub async_insert_failures_1h: Option<u64>,
+    /// Most recent flush exception (truncated), if any.
+    pub last_async_insert_error: Option<String>,
+    /// Dictionary-staging refresh MVs (`*_dict_refresh`, NAN-1407) that are
+    /// failing or stale. Stale enrichment, NOT data loss — that distinction
+    /// is the whole point of the staging indirection: rows keep landing with
+    /// the last good snapshot while the refresh is broken. `serde(default)`
+    /// so reports stored before NAN-1407 still deserialize.
+    #[serde(default)]
+    pub stale_dict_refreshes: Vec<StaleDictRefresh>,
+}
+
+/// A FAILED ClickHouse dictionary referenced by the logs table DDL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailedDictionary {
+    /// Fully qualified name (`nanosiem.ip_enrichment_dict`).
+    pub name: String,
+    /// Truncated last_exception from system.dictionaries.
+    pub last_exception: String,
+}
+
+/// A failing/stale dictionary-staging refresh MV from system.view_refreshes
+/// (NAN-1407). Flagged when `exception != ''` (the refresher keeps retrying
+/// on schedule and keeps last good data — visible failure, no loss) or when
+/// the last successful refresh is over an hour old (covers a silently
+/// stuck/disabled refresher; the longest refresh cadence is 10 minutes, so
+/// 1h ≈ 6 missed cycles — generous enough to never flap on a slow refresh,
+/// tight enough to catch a wedged one the same day).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaleDictRefresh {
+    /// View name (`ip_enrichment_dict_refresh`).
+    pub view: String,
+    /// Truncated exception from system.view_refreshes ('' when the refresh
+    /// succeeds but is stale).
+    pub exception: String,
+    /// Seconds since the last successful refresh; 0 when the view has never
+    /// succeeded (NULL last_success_time).
+    pub last_success_age_secs: u64,
 }
 
 /// Volume metric for a single source type

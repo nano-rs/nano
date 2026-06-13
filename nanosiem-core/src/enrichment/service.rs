@@ -108,11 +108,24 @@ impl DownloadConfig {
 }
 
 /// Row written to `nanosiem.ip_enrichments` by the IPinfo bulk loader
-/// (NAN-1286). Only the 8 feed columns are listed, so the native RowBinary
-/// insert (validation disabled) emits exactly these and the remaining columns
-/// — `source_id` (LowCardinality), `updated_at` (DateTime64), `deleted` (UInt8)
-/// — fall back to their table DEFAULTs (`'ipinfo_lite'`, `now64(3)`, `0`).
-/// Owned `String`s so rows can be moved straight out of the parsed CSV record.
+/// (NAN-1286). `source_id`, `updated_at`, and `deleted` are stamped
+/// EXPLICITLY — never left to the table DEFAULTs (NAN-1441). Relying on
+/// DEFAULTs made every retry's RowBinary blocks byte-identical to the
+/// previous (failed) attempt's, so ClickHouse's Replicated insert
+/// deduplication silently skipped them: the rows kept the FAILED attempt's
+/// `now64()` stamp, and the post-success purge (`updated_at < run_ms`) then
+/// deleted the generation the sync had just "inserted" — Saturn's
+/// ip_enrichments sat at 0 rows for 15 days. Stamping `updated_at = run_ms`
+/// makes each attempt's blocks content-distinct (dedup can't resurrect
+/// stale stamps) and makes the purge cutoff exact by construction: this
+/// generation `= run_ms`, prior generations `< run_ms` — no server-clock or
+/// DEFAULT-evaluation assumptions.
+///
+/// `updated_at` is `i64` epoch-MILLISECONDS: the RowBinary wire format of
+/// the column's `DateTime64(3)` is exactly Int64 ticks at scale 3 (the
+/// crate's validation is off for this writer, so the bytes must match).
+/// Owned `String`s so rows can be moved straight out of the parsed CSV
+/// record.
 #[derive(clickhouse::Row, serde::Serialize)]
 struct IpEnrichRow {
     network: String,
@@ -123,6 +136,9 @@ struct IpEnrichRow {
     asn: String,
     as_name: String,
     as_domain: String,
+    source_id: String,
+    updated_at: i64,
+    deleted: u8,
 }
 
 /// Enrichment service for managing and applying IP enrichments
@@ -527,30 +543,30 @@ impl EnrichmentService {
     /// (1) drain the ~24 MB gzip to memory so the connection lives only for the
     /// transfer, then (2) bulk-insert via native RowBinary in a single request.
     ///
-    /// This function is IPinfo-specific: rows are inserted with only the 8 feed
-    /// columns, so `source_id` (LowCardinality), `updated_at` (DateTime64), and
-    /// `deleted` take their table DEFAULTs (`'ipinfo_lite'`, `now64(3)`, `0`).
-    /// The caller always passes `source_id = "ipinfo_lite"`, matching the
-    /// default; the trailing purge is scoped to that same `source_id`.
+    /// This function is IPinfo-specific: every row is stamped explicitly with
+    /// `source_id`, `updated_at = run_ms`, and `deleted = 0` (NAN-1441 — see
+    /// `IpEnrichRow`); the trailing purge is scoped to the same `source_id`.
     async fn stream_and_insert_ipinfo(
         &self,
         url: &str,
         config: &DownloadConfig,
         source_id: &str,
     ) -> Result<u64, EnrichmentError> {
-        debug_assert_eq!(
-            source_id, "ipinfo_lite",
-            "loader relies on the ip_enrichments source_id DEFAULT 'ipinfo_lite'"
-        );
-
         let ch = self.ch()?;
 
-        // One run timestamp marks this ReplacingMergeTree generation. Rows get
-        // `updated_at = now64(3)` (the DEFAULT), all > `run_ms` since it's
-        // captured before the insert; after a successful, non-empty load we
-        // lightweight-DELETE this source's rows older than `run_ms` — the prior
-        // generation. The dict's argMax(updated_at) resolves a CIDR present in
-        // both generations to the newest row.
+        // One run timestamp marks this ReplacingMergeTree generation: every
+        // row of this attempt is stamped `updated_at = run_ms` EXPLICITLY.
+        // Because run_ms differs per attempt, a retry's insert blocks are
+        // content-distinct from a previous failed attempt's — ClickHouse's
+        // Replicated insert deduplication can no longer silently keep the old
+        // attempt's rows (with their OLDER stamp) in place of ours (NAN-1441:
+        // that was how the sync wiped itself — the post-success purge below
+        // deleted the dedup-resurrected generation it thought it had just
+        // written). After a successful, non-empty load we lightweight-DELETE
+        // this source's rows STRICTLY older than `run_ms` — prior
+        // generations, including partial rows persisted by failed attempts.
+        // The dict's argMax(updated_at) resolves a CIDR present in both
+        // generations to the newest row until the purge mutation lands.
         let run_ms = chrono::Utc::now().timestamp_millis() as u64;
 
         // SSRF defense-in-depth: every hop (initial + each redirect) is
@@ -570,10 +586,11 @@ impl EnrichmentService {
             "Downloaded IPinfo Lite payload; connection closed, starting bulk load"
         );
 
-        // Bulk insert via native RowBinary in a single request. Validation off so
-        // the client emits just our column list (omitted columns use the table
-        // DEFAULTs); async_insert off + wait_end_of_query so the rows are durable
-        // and queryable by the time we return (the caller reloads the dict on
+        // Bulk insert via native RowBinary in a single request. Validation off
+        // so the client emits exactly IpEnrichRow's column list (with the
+        // explicit source_id / updated_at / deleted stamps — NAN-1441);
+        // async_insert off + wait_end_of_query so the rows are durable and
+        // queryable by the time we return (the caller reloads the dict on
         // success).
         let writer = ch
             .clone()
@@ -613,7 +630,9 @@ impl EnrichmentService {
                 .from_reader(line.as_bytes());
             match reader.deserialize::<IpInfoLiteRecord>().next() {
                 Some(Ok(rec)) => {
-                    // Move the parsed Strings into the row — no extra allocation.
+                    // Move the parsed Strings into the row — no extra
+                    // allocation for the feed fields; source_id is one small
+                    // clone per row.
                     insert
                         .write(&IpEnrichRow {
                             network: rec.network,
@@ -624,6 +643,9 @@ impl EnrichmentService {
                             asn: rec.asn,
                             as_name: rec.as_name,
                             as_domain: rec.as_domain,
+                            source_id: source_id.to_string(),
+                            updated_at: run_ms as i64,
+                            deleted: 0,
                         })
                         .await?;
                     total_inserted += 1;
@@ -656,11 +678,20 @@ impl EnrichmentService {
         // only ran after a successful, non-empty stream.
         if total_inserted > 0 {
             // Lightweight delete of the prior generation (CIDRs older than this
-            // run). NAN-1123: `updated_at` is DateTime64(3); a raw integer in a
-            // `updated_at < ?` comparison is coerced by ClickHouse as SECONDS
-            // (far-future), so `< run_ms` matched every row just inserted and the
-            // purge wiped the whole generation. fromUnixTimestamp64Milli makes the
-            // ms scale explicit (matches the inserted DEFAULT now64(3) > run_ms).
+            // run). The cutoff is exact by construction: this attempt's rows
+            // carry `updated_at = run_ms` verbatim (NAN-1441), so STRICTLY-less
+            // keeps them and removes everything older — prior generations and
+            // partial rows from failed attempts. Two self-wipe bugs live here;
+            // both have regression coverage:
+            //   * NAN-1123: `updated_at` is DateTime64(3); a RAW integer in a
+            //     `updated_at < ?` comparison is coerced by ClickHouse as
+            //     SECONDS (far-future), matching every row just inserted —
+            //     fromUnixTimestamp64Milli keeps the ms scale explicit.
+            //   * NAN-1441: when rows relied on the `now64(3)` DEFAULT, a
+            //     retry's blocks were byte-identical to a failed attempt's, so
+            //     Replicated insert dedup kept the OLD (pre-run_ms-stamped)
+            //     rows — which this delete then removed. Explicit stamps make
+            //     retry blocks distinct; dedup can't resurrect stale stamps.
             ch.query(
                 "ALTER TABLE nanosiem.ip_enrichments \
                  DELETE WHERE source_id = ? AND updated_at < fromUnixTimestamp64Milli(toInt64(?))",
@@ -1026,5 +1057,32 @@ mod ssrf_tests {
             matches!(res, Err(EnrichmentError::DownloadError(_))),
             "expected loopback hostname rejection, got {res:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ipinfo_row_shape_tests {
+    //! NAN-1441 regression coverage: the IPinfo bulk loader must stamp
+    //! `source_id` / `updated_at` / `deleted` EXPLICITLY in its insert column
+    //! list. If any of them ever falls back to a table DEFAULT again, a
+    //! retry's RowBinary blocks become byte-identical to a previous failed
+    //! attempt's, Replicated insert dedup silently keeps the old
+    //! (stale-stamped) rows, and the post-success purge deletes the
+    //! generation the sync just "inserted" (Saturn sat at 0 enrichment rows
+    //! for 15 days). The end-to-end property is exercised against a real
+    //! ClickHouse in tests/ipinfo_generation_purge.rs; this guard pins the
+    //! struct shape so the property can't silently regress at the source.
+    use super::IpEnrichRow;
+    use clickhouse::Row;
+
+    #[test]
+    fn loader_row_stamps_generation_columns_explicitly() {
+        for required in ["source_id", "updated_at", "deleted"] {
+            assert!(
+                IpEnrichRow::COLUMN_NAMES.contains(&required),
+                "IpEnrichRow no longer writes `{required}` explicitly — reverting to the \
+                 table DEFAULT re-opens the NAN-1441 dedup self-wipe"
+            );
+        }
     }
 }

@@ -76,9 +76,16 @@
             <partial_merge_join_optimizations>1</partial_merge_join_optimizations>
             <join_overflow_mode>throw</join_overflow_mode>
 
-            <!-- Async Insert (for application inserts) -->
+            <!-- Async Insert (for application inserts) — durability ACK
+                 (NAN-1406): wait_for_async_insert=1 makes the insert response
+                 wait for the flush result, so a flush failure (FAILED dict ->
+                 MATERIALIZED dictGet throw, NAN-1404) is a visible, retryable
+                 error instead of a silently discarded pre-ACKed batch.
+                 Measured: zero throughput cost at 5k eps; sustained-overload
+                 shedding unchanged (Vector's drop_newest sheds either way,
+                 now visibly). -->
             <async_insert>1</async_insert>
-            <wait_for_async_insert>0</wait_for_async_insert>
+            <wait_for_async_insert>1</wait_for_async_insert>
             <async_insert_max_data_size>104857600</async_insert_max_data_size>
 
             <!-- Result Formatting -->
@@ -209,9 +216,10 @@
             <max_insert_threads>16</max_insert_threads>
             <max_insert_block_size>1048576</max_insert_block_size> <!-- 1M rows -->
 
-            <!-- Async insert optimization -->
+            <!-- Async insert optimization — durability ACK (NAN-1406), see the
+                 default profile's note. -->
             <async_insert>1</async_insert>
-            <wait_for_async_insert>0</wait_for_async_insert>
+            <wait_for_async_insert>1</wait_for_async_insert>
             <async_insert_max_data_size>104857600</async_insert_max_data_size> <!-- 100MB -->
             <async_insert_busy_timeout_ms>1000</async_insert_busy_timeout_ms>
             <async_insert_stale_timeout_ms>5000</async_insert_stale_timeout_ms>

@@ -48,6 +48,7 @@ fn enforce_non_audit_query(query: &str) -> Result<String, SearchError> {
         (status = 200, description = "Search results (sync or async job id)", body = SearchResultResponse),
         (status = 400, description = "Invalid query", body = ErrorResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 409, description = "Query was cancelled (request_id was killed via DELETE /api/search/{request_id} or an admin cancel)", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse),
     )
 )]
@@ -455,6 +456,8 @@ pub async fn field_stats_for_query(
     axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
     Json(request): Json<FieldStatsRequest>,
 ) -> Result<Json<FieldStatsResponse>, SearchError> {
+    use nanosiem_core::search::QueryPriority;
+
     let query = if !auth.claims.has_permission(permissions::AUDIT_VIEW) {
         enforce_non_audit_query(&request.query)?
     } else {
@@ -466,9 +469,29 @@ pub async fn field_stats_for_query(
         end: request.end,
     };
 
+    // NAN-1428: reserve ownership of the request_id so the cancel endpoint
+    // can authorize killing the derived `{request_id}-fstats` query even
+    // after the main search has completed and unregistered the id.
+    if let Some(rid) = request.request_id.clone() {
+        state
+            .search
+            .query_tracker()
+            .reserve_request(rid, auth.claims.sub);
+    }
+
+    // NAN-1427: admission-gated, with the derived companion query_id and
+    // per-priority CH settings. `columns` (when sent by the UI) reduces the
+    // stat'd column set to what the field panel actually renders.
     let fields = state
         .search
-        .get_field_stats_for_query(&query, &time_range)
+        .get_field_stats_with_admission(
+            &query,
+            &time_range,
+            request.columns.as_deref(),
+            request.request_id.as_deref(),
+            auth.claims.sub,
+            QueryPriority::Interactive,
+        )
         .await?;
     let total_events = fields.iter().map(|f| f.count).max().unwrap_or(0);
 
@@ -569,6 +592,19 @@ pub struct FieldStatsRequest {
     pub start: chrono::DateTime<chrono::Utc>,
     /// End of time range
     pub end: chrono::DateTime<chrono::Utc>,
+    /// Client request id of the originating search (NAN-1428). When set, the
+    /// field-stats query runs under the derived ClickHouse query_id
+    /// `{request_id}-fstats`, so `DELETE /api/search/{request_id}` cancels it
+    /// together with the data query.
+    #[serde(default)]
+    pub request_id: Option<String>,
+    /// Optional column subset to compute stats for (NAN-1427). The stats
+    /// query's I/O scales with the number of columns aggregated, so callers
+    /// should send only the columns they render. Names are intersected with
+    /// the live table inventory (unknown names dropped; an empty intersection
+    /// falls back to the full set). Omit for the full column inventory.
+    #[serde(default)]
+    pub columns: Option<Vec<String>>,
 }
 
 /// Response for field stats

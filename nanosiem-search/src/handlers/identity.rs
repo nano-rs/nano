@@ -140,8 +140,20 @@ LIMIT 1"#,
         })?;
 
     let mut response_bytes = Vec::new();
-    while let Ok(Some(chunk)) = cursor.next().await {
-        response_bytes.extend_from_slice(&chunk);
+    // NAN-1429 sweep: propagate a mid-stream ClickHouse error instead of
+    // treating it as EOF — the old loop silently degraded a failed lookup
+    // into a "no identity found" 200 response.
+    loop {
+        match cursor.next().await {
+            Ok(Some(chunk)) => response_bytes.extend_from_slice(&chunk),
+            Ok(None) => break,
+            Err(e) => {
+                tracing::error!(error = %e, ip = %ip, "Identity resolution query failed mid-stream");
+                return Err(SearchError::InternalError(
+                    "Failed to query identity data".to_string(),
+                ));
+            }
+        }
     }
 
     let response_str = String::from_utf8(response_bytes).map_err(|e| {

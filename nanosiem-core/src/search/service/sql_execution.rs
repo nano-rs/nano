@@ -35,10 +35,19 @@ impl SearchService {
         }
         let fields = stats.get_field_info(self.config.top_values_count);
 
-        // Generate histogram for raw SQL - use the full time range
-        let histogram = self
+        // Generate histogram for raw SQL - use the full time range.
+        // NAN-1429: degrade to histogram:null on failure instead of failing
+        // the whole search (matches the piped-query path's behavior).
+        let histogram = match self
             .generate_histogram_for_time_range(&request.time_range)
-            .await?;
+            .await
+        {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::warn!("Raw SQL histogram query failed: {}", e);
+                None
+            }
+        };
 
         let execution_time_ms = start_time.elapsed().as_millis() as u64;
 
@@ -49,7 +58,7 @@ impl SearchService {
             execution_time_ms,
             fields,
             generated_sql: Some(sql.to_string()),
-            histogram: Some(histogram),
+            histogram,
             warnings: None,
             cost_score: None,
             display_type: None, // Raw SQL - let frontend determine

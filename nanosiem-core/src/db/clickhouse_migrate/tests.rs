@@ -248,6 +248,53 @@ mod tests {
     }
 
     #[test]
+    fn test_keep_local_engine_marker_skips_engine_conversion() {
+        // NAN-1407: dictionary staging tables stay PLAIN MergeTree per node —
+        // converting them to Replicated* would make ClickHouse refuse the
+        // full-replace refreshable MV that repopulates them ("no APPEND,
+        // non-replicated database, replicated table"). The marker keeps the
+        // engine as written while still fanning the DDL out ON CLUSTER.
+        let sql = "CREATE TABLE IF NOT EXISTS nanosiem.ip_enrichment_dict_staging (network String) ENGINE = MergeTree /* nano:keep-local-engine */ ORDER BY network";
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        assert!(
+            result.contains("ON CLUSTER 'nanosiem_cluster'"),
+            "Should still add ON CLUSTER: {}",
+            result
+        );
+        assert!(
+            !result.contains("Replicated"),
+            "Marker must keep the engine plain: {}",
+            result
+        );
+        assert!(
+            result.contains("ENGINE = MergeTree"),
+            "Engine should be untouched: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_keep_local_engine_marker_replicated_db_mode() {
+        // Replicated-database mode (cluster == db, e.g. CH Cloud): no ON
+        // CLUSTER, and the marker still keeps the engine plain (Cloud
+        // auto-converts plain MergeTree to SharedMergeTree, the coordinated-
+        // refresh shape refreshable MVs expect there).
+        let sql = "CREATE TABLE IF NOT EXISTS nanosiem.ip_enrichment_dict_staging (network String) ENGINE = MergeTree /* nano:keep-local-engine */ ORDER BY network";
+        let result = ClickHouseMigrator::transform_for_cluster(sql, "nanosiem", "nanosiem", false);
+        assert!(
+            !result.contains("Replicated"),
+            "Marker must keep the engine plain in Replicated-DB mode: {}",
+            result
+        );
+        assert!(
+            !result.contains("ON CLUSTER"),
+            "Replicated-DB mode never adds ON CLUSTER: {}",
+            result
+        );
+    }
+
+    #[test]
     fn test_replicated_db_empty_args() {
         // When cluster name == database name (Replicated database auto-cluster),
         // use empty args — CH manages ZooKeeper paths automatically

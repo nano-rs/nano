@@ -128,6 +128,13 @@ struct Args {
     #[arg(long)]
     dev: bool,
 
+    /// Seed user_registry with identities matching the fleet's users (push
+    /// nano_enrich kind=identity source=ad records through the lane), then exit.
+    /// Run once before a blast so generated logs enrich via user_registry_dict.
+    /// Requires the enrichments/identity/ad parser imported + deployed.
+    #[arg(long)]
+    seed_identities: bool,
+
     /// Quiet mode (suppress per-event logs)
     #[arg(short, long)]
     quiet: bool,
@@ -250,6 +257,31 @@ async fn main() -> Result<()> {
             "  Source types:  windows_sysmon, windows_event, conduit_proxy, aws_cloudtrail"
         );
         println!("--------------------------------------\n");
+    }
+
+    // NAN-1154: seed user_registry with identities matching the fleet's users,
+    // then exit. Push nano_enrich kind=identity source=ad records through the
+    // lane so a subsequent blast produces logs whose `.user` matches the
+    // user_registry_dict key (lower(gen_user(i))) and enriches.
+    if args.seed_identities {
+        let roster = world.read().identity_roster();
+        let client = Client::builder()
+            .timeout(TokioDuration::from_secs(30))
+            .build()?;
+        info!(
+            "Seeding {} identities to user_registry via the nano_enrich lane (source=ad)...",
+            roster.len()
+        );
+        let mut sent = 0usize;
+        for chunk in roster.chunks(500) {
+            event_core::http::send_json_records(&client, &transport, "nano_enrich", chunk).await?;
+            sent += chunk.len();
+        }
+        println!(
+            "✓ Seeded {sent} identities (source=ad). Deploy the enrichments/identity/ad parser, \
+             then run a blast — logs for those users will enrich via user_registry_dict."
+        );
+        return Ok(());
     }
 
     // Spawn a background lateral-movement chain emitter. One task shared

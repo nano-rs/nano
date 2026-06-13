@@ -163,10 +163,14 @@
 --   * `event` is declared `JSON(max_dynamic_paths = 1024)` mirroring the UDM
 --     `ext JSON(max_dynamic_paths=512)` idiom — wider because a full OCSF record
 --     has far more paths than the UDM `ext` overflow blob.
---   * JSONExtract* over a `JSON`-typed column reads dynamic subpaths; we use the
---     string-path form `JSONExtractString(event, 'a', 'b', ...)` for nesting and
---     `JSONExtract(event, 'path', 'Type')` for typed scalars. Arrays are pulled
---     with JSONExtractArrayRaw(JSONExtractRaw(...)) then filtered.
+--   * JSONExtract* over a `JSON`-typed column does NOT read dynamic subpaths —
+--     it re-serializes the ENTIRE event object per row (empirically confirmed on
+--     CH 26.4: 87–300x more read_bytes than subcolumn access, NAN-1426). Query
+--     codegen therefore emits native subcolumn access (`event."a"."b"`, with
+--     `event.^"a"."b"` for object subtrees) for scalar/leaf reads; this DDL's
+--     MATERIALIZED expressions still use JSONExtract forms (one-time ingest
+--     cost, not per-query). Arrays are pulled with
+--     JSONExtractArrayRaw(JSONExtractRaw(...)) then filtered.
 --   * `time` precision is ms → DateTime64(**3**) (UDM `logs` uses (6) for micros;
 --     OCSF only carries ms, so (3) is correct and avoids fake precision).
 -- =============================================================================
@@ -1113,10 +1117,19 @@ TTL toDateTime(last_seen) + toIntervalDay(30)
 SETTINGS index_granularity = 8192;
 
 -- -----------------------------------------------------------------------------
--- Dictionaries (CREATE OR REPLACE — atomic, idempotent). Copied from
--- clickhouse/init.sql (FRO-243 / NAN-606 / NAN-706 layout). HOST/PORT/USER/
--- PASSWORD use the runner-substituted {clickhouse_self_*} placeholders, same as
--- UDM init.sql (never hardcode creds in a numbered/bootstrap file).
+-- Prevalence dictionaries. Copied from clickhouse/init.sql (FRO-243 /
+-- NAN-606 / NAN-706 layout). These CACHE dicts deliberately keep
+-- KEY-PUSHDOWN sources — they are NOT staged (NAN-1440 reverted NAN-1407's
+-- staging for this family): CACHE layouts push the missed keys into the
+-- source QUERY, so each miss runs a small, memory-bounded (512 MiB cap,
+-- 256 MiB spill, 2 threads — migrations 112/130) aggregation over a handful
+-- of keys, while the staging model full-rewrote the entire aggregated
+-- keyspace every 10 minutes (83.39M rows / ~1.6 GiB per cycle measured on
+-- Saturn — and its seed OOMed the boot-gating migrator at the 512 MiB
+-- bound). Rule: full-reload dicts (HASHED/IP_TRIE) get staging indirection;
+-- CACHE dicts keep pushdown. HOST/PORT/USER/PASSWORD use the
+-- runner-substituted {clickhouse_self_*} placeholders, same as UDM init.sql
+-- (never hardcode creds in a numbered/bootstrap file).
 -- -----------------------------------------------------------------------------
 CREATE OR REPLACE DICTIONARY nanosiem.hash_prevalence_dict
 (

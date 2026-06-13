@@ -93,11 +93,14 @@ async fn collect_ingestion_metrics(
         }
     }
 
+    let insert_integrity = collect_insert_integrity(ch).await;
+
     info!(
-        "Collected ingestion metrics: {} source types, {} events (24h), {} silent sources",
+        "Collected ingestion metrics: {} source types, {} events (24h), {} silent sources, {} FAILED logs dicts",
         source_volumes.len(),
         total_24h,
-        silent_sources.len()
+        silent_sources.len(),
+        insert_integrity.failed_logs_dictionaries.len()
     );
 
     IngestionMetrics {
@@ -105,7 +108,230 @@ async fn collect_ingestion_metrics(
         total_events_24h: total_24h,
         total_events_prior_24h: total_prior_24h,
         silent_sources,
+        insert_integrity,
     }
+}
+
+/// Collect insert-path integrity signals (NAN-1405) — the storage-layer tells
+/// of the NAN-1404 silent-loss class. Every probe is best-effort: on a
+/// pre-NAN-1405 deployment the app user lacks the system-table grants and the
+/// probe degrades to its default (`probes_available` stays false), matching
+/// the warn-and-continue posture of the other collectors. Probes read the
+/// node the client is connected to; in cluster mode that is one replica's
+/// system tables — a sustained failure on the monitored replica still fires.
+async fn collect_insert_integrity(ch: &ClickHouseClient) -> InsertIntegrityMetrics {
+    let logs_base = crate::schema::active_logs_table();
+    let local_table = format!("nanosiem.{logs_base}");
+    let mut m = InsertIntegrityMetrics::default();
+
+    // 1) ACK-layer vs storage-layer pairing — the exact NAN-1404 correlation:
+    // INSERT queries keep "finishing" (Vector ACKed, HTTP 200) while ZERO new
+    // parts reach disk because every async-insert flush throws and discards
+    // its batch. NOTE: written_rows on the per-query async entries is 0 even
+    // when healthy (verified live, 791/795 on a healthy node) — the rows are
+    // attributed to the flush, so parts created is the trustworthy signal.
+    // Inserts target the local table even in cluster mode, but match the
+    // distributed name too in case a writer routes through it.
+    let sql = format!(
+        "SELECT count() AS inserts \
+         FROM system.query_log \
+         WHERE type = 'QueryFinish' AND query_kind = 'Insert' \
+           AND event_time >= now() - INTERVAL 1 HOUR \
+           AND (has(tables, '{local_table}') OR has(tables, '{local_table}_distributed'))"
+    );
+    match ch.query(&sql).fetch_one::<u64>().await {
+        Ok(inserts) => {
+            m.probes_available = true;
+            m.logs_inserts_1h = inserts;
+        }
+        Err(e) => warn!(
+            "Insert-integrity probe: system.query_log unavailable (grant missing? NAN-1405): {}",
+            e
+        ),
+    }
+    let sql = format!(
+        "SELECT count() AS new_parts \
+         FROM system.part_log \
+         WHERE database = 'nanosiem' AND table = '{logs_base}' \
+           AND event_type = 'NewPart' \
+           AND event_time >= now() - INTERVAL 1 HOUR"
+    );
+    match ch.query(&sql).fetch_one::<u64>().await {
+        Ok(new_parts) => {
+            m.probes_available = true;
+            m.new_parts_1h = new_parts;
+        }
+        Err(e) => warn!(
+            "Insert-integrity probe: system.part_log unavailable (grant missing? NAN-1405): {}",
+            e
+        ),
+    }
+
+    // 2) Error-counter tells from system.errors. The counters never reset, so
+    // gate on last_error_time recency to keep them actionable.
+    let sql = "SELECT name, value FROM system.errors \
+               WHERE name IN ('MEMORY_LIMIT_EXCEEDED', 'CACHE_DICTIONARY_UPDATE_FAIL') \
+                 AND last_error_time >= now() - INTERVAL 24 HOUR";
+    match ch.query(sql).fetch_all::<(String, u64)>().await {
+        Ok(rows) => {
+            m.probes_available = true;
+            for (name, value) in rows {
+                match name.as_str() {
+                    "MEMORY_LIMIT_EXCEEDED" => m.memory_limit_errors = value,
+                    "CACHE_DICTIONARY_UPDATE_FAIL" => m.cache_dictionary_update_fails = value,
+                    _ => {}
+                }
+            }
+        }
+        Err(e) => warn!(
+            "Insert-integrity probe: system.errors unavailable (grant missing? NAN-1405): {}",
+            e
+        ),
+    }
+
+    // 3) FAILED dictionaries referenced by the logs table's MATERIALIZED
+    // columns. Discovered from the live DDL (not a hardcoded list) so the set
+    // tracks schema/profile changes by construction. dictGetOrDefault THROWS
+    // when its dictionary is FAILED, so any hit here means inserts are being
+    // rejected at flush time right now.
+    let referenced = match ch
+        .query(&format!(
+            "SELECT create_table_query FROM system.tables \
+             WHERE database = 'nanosiem' AND name = '{logs_base}'"
+        ))
+        .fetch_all::<String>()
+        .await
+    {
+        Ok(rows) => rows
+            .first()
+            .map(|ddl| extract_dict_references(ddl))
+            .unwrap_or_default(),
+        Err(e) => {
+            warn!("Insert-integrity probe: logs DDL unavailable: {}", e);
+            Vec::new()
+        }
+    };
+    if !referenced.is_empty() {
+        let in_list = referenced
+            .iter()
+            .map(|n| format!("'{}'", n.replace('\'', "\\'")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Fetch ALL referenced dicts (not just FAILED) and filter in Rust:
+        // system.dictionaries rows are filtered by SHOW DICTIONARIES visibility,
+        // so a missing grant returns ZERO rows without an error — a FAILED-only
+        // query can't tell "all healthy" from "blind" (NAN-1437). The DDL just
+        // told us these dicts exist; seeing none of them means the grant is
+        // missing and this probe must not claim it ran.
+        let sql = format!(
+            "SELECT concat(database, '.', name), status, substring(last_exception, 1, 300) \
+             FROM system.dictionaries \
+             WHERE concat(database, '.', name) IN ({in_list})"
+        );
+        match ch.query(&sql).fetch_all::<(String, String, String)>().await {
+            Ok(rows) if rows.is_empty() => warn!(
+                "Insert-integrity probe: logs DDL references {} dictionaries but \
+                 system.dictionaries shows none — GRANT SHOW DICTIONARIES ON *.* \
+                 missing? (NAN-1437); FAILED-dict detection is blind",
+                referenced.len()
+            ),
+            Ok(rows) => {
+                m.probes_available = true;
+                m.failed_logs_dictionaries = rows
+                    .into_iter()
+                    // starts_with: also catches FAILED_AND_RELOADING.
+                    .filter(|(_, status, _)| status.starts_with("FAILED"))
+                    .map(|(name, _, last_exception)| FailedDictionary {
+                        name,
+                        last_exception,
+                    })
+                    .collect();
+            }
+            Err(e) => warn!(
+                "Insert-integrity probe: system.dictionaries unavailable (grant missing? NAN-1405): {}",
+                e
+            ),
+        }
+    }
+
+    // 4) Failing/stale dictionary-staging refreshes (NAN-1407). The
+    // *_dict_refresh refreshable MVs repopulate the *_dict_staging tables the
+    // enrichment dicts load from; a broken refresh keeps serving the last
+    // good snapshot (rows still land — that's the design), but the staleness
+    // must surface somewhere. Flag exception != '' (refresher failing,
+    // retrying on schedule) or a last success > 1h old (wedged/disabled
+    // refresher; longest cadence is 10 min, so 1h ≈ 6 missed cycles — no
+    // flapping on slow refreshes, same-day detection of stuck ones). A view
+    // that has NEVER succeeded has NULL last_success_time and a non-empty
+    // exception once its first refresh fails, so the exception clause covers
+    // it; the brief NULL-and-no-exception window right after CREATE is not
+    // flagged. 26.4 note: system.view_refreshes has NO last_refresh_result
+    // column — exception/retry/last_success_time are the signal columns.
+    let sql = "SELECT view, substring(exception, 1, 300) AS exception, \
+                      toUInt64(if(last_success_time IS NULL, 0, \
+                                  dateDiff('second', last_success_time, now()))) AS age \
+               FROM system.view_refreshes \
+               WHERE database = 'nanosiem' AND view LIKE '%\\_dict\\_refresh' \
+                 AND (exception != '' OR last_success_time < now() - INTERVAL 1 HOUR)";
+    match ch.query(sql).fetch_all::<(String, String, u64)>().await {
+        Ok(rows) => {
+            m.probes_available = true;
+            m.stale_dict_refreshes = rows
+                .into_iter()
+                .map(|(view, exception, last_success_age_secs)| StaleDictRefresh {
+                    view,
+                    exception,
+                    last_success_age_secs,
+                })
+                .collect();
+        }
+        Err(e) => warn!(
+            "Insert-integrity probe: system.view_refreshes unavailable (grant missing? NAN-1407): {}",
+            e
+        ),
+    }
+
+    // 5) Flush failures from asynchronous_insert_log — only populated once the
+    // NAN-1405 server config ships (the table does not exist before that, and
+    // None distinguishes "log not enabled" from "no failures").
+    let sql = format!(
+        "SELECT countIf(status != 'Ok') AS failures, \
+                anyLastIf(substring(exception, 1, 300), status != 'Ok') AS last_error \
+         FROM system.asynchronous_insert_log \
+         WHERE event_time >= now() - INTERVAL 1 HOUR \
+           AND database = 'nanosiem' \
+           AND table IN ('{logs_base}', '{logs_base}_distributed')"
+    );
+    match ch.query(&sql).fetch_one::<(u64, String)>().await {
+        Ok((failures, last_error)) => {
+            m.probes_available = true;
+            m.async_insert_failures_1h = Some(failures);
+            if !last_error.is_empty() {
+                m.last_async_insert_error = Some(last_error);
+            }
+        }
+        Err(e) => {
+            // Expected on deployments whose server config predates NAN-1405.
+            info!(
+                "Insert-integrity probe: asynchronous_insert_log unavailable (not enabled yet?): {}",
+                e
+            );
+        }
+    }
+
+    m
+}
+
+/// Extract fully qualified dictionary names referenced by `dictGet*` calls in
+/// a CREATE TABLE statement (the logs table's MATERIALIZED enrichment columns).
+fn extract_dict_references(ddl: &str) -> Vec<String> {
+    // dictGetOrDefault('nanosiem.ip_enrichment_dict', ...) — capture the first
+    // quoted argument of any dictGet-family call.
+    let re = regex::Regex::new(r"dictGet\w*\(\s*'([^']+)'").expect("static regex compiles");
+    let mut names: Vec<String> = re.captures_iter(ddl).map(|c| c[1].to_string()).collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Collect parsing health metrics from ClickHouse
@@ -980,5 +1206,32 @@ mod tests {
         // Filtering/grouping is shared and must survive.
         assert!(sql.contains("source_type != 'audit'"));
         assert!(sql.contains("HAVING total_events >= 100"));
+    }
+
+    #[test]
+    fn extract_dict_references_finds_all_dictget_forms() {
+        // NAN-1405: shaped like the real nanosiem.logs DDL — dictGetOrDefault
+        // with a quoted fully-qualified dict name, repeated per MATERIALIZED
+        // column, plus a plain dictGet variant for good measure.
+        let ddl = r#"CREATE TABLE nanosiem.logs (
+            `enriched_src_country` String MATERIALIZED dictGetOrDefault('nanosiem.ip_enrichment_dict', 'country', src_ip, ''),
+            `enriched_dest_country` String MATERIALIZED dictGetOrDefault('nanosiem.ip_enrichment_dict', 'country', dest_ip, ''),
+            `ioc_confidence` UInt8 MATERIALIZED dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'confidence', dest_ip, 0),
+            `prevalence_file_hash` UInt64 MATERIALIZED dictGet('nanosiem.hash_prevalence_dict', 'cnt', file_hash),
+            `user_identity_title` String MATERIALIZED dictGetOrDefault('nanosiem.user_registry_dict', 'title', user, '')
+        ) ENGINE = MergeTree ORDER BY timestamp"#;
+        let refs = extract_dict_references(ddl);
+        assert_eq!(
+            refs,
+            vec![
+                "nanosiem.hash_prevalence_dict".to_string(),
+                "nanosiem.ioc_enrichment_dict".to_string(),
+                "nanosiem.ip_enrichment_dict".to_string(),
+                "nanosiem.user_registry_dict".to_string(),
+            ],
+            "deduped + sorted dict references from the DDL"
+        );
+        // A dict-free DDL (no enrichment MATERIALIZED columns) yields nothing.
+        assert!(extract_dict_references("CREATE TABLE t (x String) ENGINE = Memory").is_empty());
     }
 }

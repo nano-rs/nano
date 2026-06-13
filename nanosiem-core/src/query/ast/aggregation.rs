@@ -87,8 +87,12 @@ impl Aggregation {
 pub enum AggFunc {
     /// Count of records
     Count,
-    /// Distinct count of field values
+    /// Distinct count of field values (exact — uniqExact; memory grows
+    /// linearly with cardinality, ~190 B per distinct string state)
     Dc,
+    /// Approximate distinct count (uniqCombined64 — ~0.9% measured error,
+    /// fixed small memory footprint; use on high-cardinality fields)
+    EstDc,
     /// Sum of field values
     Sum,
     /// Average of field values
@@ -133,6 +137,7 @@ impl AggFunc {
         match self {
             AggFunc::Count => "count",
             AggFunc::Dc => "dc",
+            AggFunc::EstDc => "estdc",
             AggFunc::Sum => "sum",
             AggFunc::Avg => "avg",
             AggFunc::Min => "min",

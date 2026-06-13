@@ -24,7 +24,15 @@ impl SearchService {
 
         // Issue KILL QUERY directly using the request_id as query_id.
         // This works regardless of which instance started the query.
-        let cancelled = ch_executor.cancel_query(request_id).await?;
+        //
+        // NAN-1428: one search fans out to the data query plus companion
+        // queries (count / histogram / field-stats) carrying derived ids —
+        // the companions are ~90% of the fan-out's I/O, so cancel must kill
+        // all of them, not just the data query. Exact derived ids, never
+        // LIKE patterns (client ids can contain %/_).
+        let cancelled = ch_executor
+            .cancel_queries(&all_query_ids(request_id))
+            .await?;
 
         // Clean up local tracker if this instance happened to be tracking it
         self.query_tracker.unregister(request_id);
@@ -316,9 +324,10 @@ impl SearchService {
             return Ok(false);
         }
 
-        // Kill the ClickHouse query — works from any instance
+        // Kill the ClickHouse query — works from any instance.
+        // NAN-1428: include the derived companion ids (count/hist/fstats).
         if let Some(ref executor) = self.ch_executor {
-            let _ = executor.cancel_query(&job.query_id).await;
+            let _ = executor.cancel_queries(&all_query_ids(&job.query_id)).await;
         }
 
         // Mark as cancelled in the (potentially Redis-backed) store
@@ -399,6 +408,10 @@ impl SearchService {
         // `| sort -<first-numeric-agg>` after the trailing stats/chart so the
         // outer LIMIT keeps the actual top-N.
         let (query, auto_sort_decision) = apply_auto_sort(query);
+
+        // Determine the display type once, up front — it gates the histogram
+        // companion below (NAN-1429) and is reported in the response.
+        let display_type = determine_display_type(&query);
 
         // Pre-execution guardrail: reject queries that would cause unbounded memory usage (OOM)
         // Covers: eventstats/streamstats, dedup, reverse, transaction, values()/list(), high-cardinality GROUP BY
@@ -569,7 +582,6 @@ impl SearchService {
                     .build_asset_view(Vec::new(), asset_info, &time_range, Some(pre_id))
                     .await?;
                 let execution_time_ms = start_time.elapsed().as_millis() as u64;
-                let display_type = determine_display_type(&query);
                 let column_order = get_column_order(&query);
 
                 if let Some(ref req_id) = request.request_id {
@@ -658,7 +670,13 @@ impl SearchService {
             let options = QueryOptions {
                 use_cache: request.use_cache,
                 table_view: request.table_view,
-                limit: Some(limit),
+                // Raw event queries are paginated by the executor, which
+                // injects LIMIT/OFFSET itself. Baking the page-size limit into
+                // the SQL here made that injection a silent no-op (page N
+                // re-served page 1's rows) and capped the count companion's
+                // total_count at the page size (NAN-1410). Aggregation /
+                // tree / asset / prevalence queries keep their explicit caps.
+                limit: if is_raw_event_query { None } else { Some(limit) },
             };
             // Apply current query safety limits to the SQL generator
             let ch_gen = self
@@ -675,13 +693,27 @@ impl SearchService {
 
         // Start histogram query in parallel with data execution — it only needs
         // the base search expression and time range, independent of data results.
-        let histogram_handle = if !request.skip_histogram && !is_tree_query && !is_asset_query {
+        //
+        // NAN-1429: skip it entirely when the UI never renders the timeline for
+        // this display type (timechart/ranked_bar/flow/tree/asset/cloud/lateral)
+        // — for those, the companion's full-window scan was computed and then
+        // discarded (an exact 2x window read for `| timechart`).
+        //
+        // NAN-1428: the companion carries the derived `{query_id}-hist` id (and
+        // the resolved per-priority settings via the cloned service) so cancel
+        // kills it together with the data query.
+        let histogram_handle = if !request.skip_histogram
+            && !is_tree_query
+            && !is_asset_query
+            && display_type_renders_timeline(display_type)
+        {
             let search_service = self.clone();
             let histogram_query = cleaned_query.clone();
             let histogram_time_range = adjusted_time_range.clone();
+            let hist_qid = format!("{query_id}-hist");
             Some(tokio::spawn(async move {
                 match search_service
-                    .generate_histogram(&histogram_query, &histogram_time_range)
+                    .generate_histogram(&histogram_query, &histogram_time_range, Some(&hist_qid))
                     .await
                 {
                     Ok(h) => Some(h),
@@ -755,11 +787,14 @@ impl SearchService {
                         .collect()
                     });
 
-                    // Run data query and field stats query in parallel
-                    // Use no sampling for inline field stats (async endpoint handles large datasets)
+                    // Run data query and field stats query in parallel.
+                    // NAN-1428: the companion carries the derived
+                    // `{query_id}-fstats` id and the resolved per-priority
+                    // settings so it is cancellable and admission-bounded.
                     let field_stats_sql =
                         ClickHouseExecutor::build_field_stats_sql(&sql, None, &columns);
                     debug!("Generated field stats SQL: {}", field_stats_sql);
+                    let fstats_qid = format!("{query_id}-fstats");
 
                     let (data_result, field_stats_result) = tokio::join!(
                         self.execute_clickhouse_sql_with_query_id(
@@ -769,7 +804,12 @@ impl SearchService {
                             Some(&query_id),
                             None
                         ),
-                        ch_executor.execute_field_stats_query(&field_stats_sql, &columns)
+                        ch_executor.execute_field_stats_query(
+                            &field_stats_sql,
+                            &columns,
+                            Some(&fstats_qid),
+                            self.active_ch_settings.as_ref()
+                        )
                     );
 
                     let (results, total_count) = data_result?;
@@ -1192,9 +1232,6 @@ impl SearchService {
         };
 
         let execution_time_ms = start_time.elapsed().as_millis() as u64;
-
-        // Determine display type from the query AST
-        let display_type = determine_display_type(&query);
 
         // Extract column order from table command if present
         let column_order = get_column_order(&query);

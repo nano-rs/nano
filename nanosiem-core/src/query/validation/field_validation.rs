@@ -1483,6 +1483,180 @@ mod tests {
         assert_eq!(errors[0].field_name, "src_ipp");
     }
 
+    // --- NAN-1422: flat operational aliases pass under the OCSF profile ---
+
+    #[test]
+    fn test_flat_operational_aliases_pass_under_ocsf_profile() {
+        // `sourcetype` sits one edit from `source_type` so the UDM-distance typo
+        // gate rejects it unless the active profile claims it. OCSF now
+        // canonicalizes the flat alias to its operational column (NAN-1422), so
+        // the G5 profile gate must accept it — on the search term and in
+        // pipeline positions.
+        let ocsf = crate::schema::OcsfProfile::new();
+        for q in [
+            r#"sourcetype="windows_sysmon""#,
+            r#"* | where sourcetype="windows_sysmon""#,
+            "* | stats count() by sourcetype",
+            "* | table sourcetype",
+        ] {
+            let query = parse_query(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+            let errors = validate_query_fields_with_profile(&query, Some(&ocsf));
+            assert_eq!(
+                errors.len(),
+                0,
+                "flat operational alias must pass under the OCSF profile: {q} -> {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gated_alias_without_ocsf_target_still_rejected_under_ocsf() {
+        // `username` normalizes to `user`, which is NOT a physical ocsf_logs
+        // column — the canonicalize gate must refuse the rewrite, leaving the
+        // alias subject to the same typo rejection as today (and as UDM).
+        let ocsf = crate::schema::OcsfProfile::new();
+        let query = parse_query(r#"username="admin""#).unwrap();
+        let errors = validate_query_fields_with_profile(&query, Some(&ocsf));
+        assert_eq!(errors.len(), 1, "gated alias must stay rejected: {errors:?}");
+        assert_eq!(errors[0].field_name, "username");
+    }
+
+    // --- NAN-1425: the explicit alias set passes under the UDM profile ---
+
+    /// Every `normalize_field_name` alias whose target is a physical explicit
+    /// column of `logs` — pinned alias-by-alias (NAN-1425). `source_ip` is
+    /// deliberately absent: it is a pinned typo case and the NAN-1380 G5 gate
+    /// takes precedence over the alias map (see
+    /// `test_pinned_typo_alias_source_ip_still_rejected_under_udm`).
+    const UDM_ACCEPTED_ALIASES: &[(&str, &str)] = &[
+        ("_time", "timestamp"),
+        ("sourcetype", "source_type"),
+        ("dest_hostname", "dest_host"),
+        ("src_hostname", "src_host"),
+        ("username", "user"),
+        ("destination_ip", "dest_ip"),
+        ("src_address", "src_ip"),
+        ("dest_address", "dest_ip"),
+        ("source_port", "src_port"),
+        ("destination_port", "dest_port"),
+        ("source_mac", "src_mac"),
+        ("destination_mac", "dest_mac"),
+        ("process", "command_line"),
+        ("parent_process", "parent_command_line"),
+        ("uri", "url"),
+        ("referer", "http_referrer"),
+        ("referrer", "http_referrer"),
+        ("useragent", "http_user_agent"),
+        ("filename", "file_name"),
+        ("filepath", "file_path"),
+        ("outcome", "status"),
+        ("response_code", "http_status_code"),
+        ("http_status", "http_status_code"),
+        ("http_response_code", "http_status_code"),
+        ("resp_code", "http_status_code"),
+        ("request_method", "http_method"),
+        ("method", "http_method"),
+        ("dns_query", "query"),
+        ("dns_response", "answer"),
+        ("dns_answer", "answer"),
+        ("cloud.provider", "cloud_provider"),
+        ("cloud.account.id", "cloud_account_id"),
+        ("cloud.account.name", "cloud_account_name"),
+        ("cloud.region", "cloud_region"),
+        ("cloud.service.name", "cloud_service"),
+        ("service_name", "cloud_service"),
+        ("event_id", "signature_id"),
+        ("eventid", "signature_id"),
+    ];
+
+    #[test]
+    fn test_explicit_alias_set_passes_under_udm_profile() {
+        // The whole explicit alias set (every normalize_field_name entry whose
+        // target is a UDM explicit column) must pass the input-side validator
+        // under the UDM profile (NAN-1425) — previously the G5 typo gate
+        // 400-rejected the near-miss-shaped ones (`sourcetype`, `_time`,
+        // `username`, `filepath`, `cloud.provider`, …) on the RAW spelling
+        // before alias canonicalization ever ran, even though codegen
+        // normalized them fine.
+        let udm = crate::schema::UdmProfile::new();
+        for (alias, target) in UDM_ACCEPTED_ALIASES {
+            let q = format!(r#"{alias}="x""#);
+            let query = parse_query(&q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+            let errors = validate_query_fields_with_profile(&query, Some(&udm));
+            assert_eq!(
+                errors.len(),
+                0,
+                "alias {alias} (→ {target}) must pass under the UDM profile: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_alias_passes_in_pipeline_positions_under_udm_profile() {
+        // Same gate fires in pipeline positions — pin the representative
+        // alias (`sourcetype`, the NAN-1425 report) across where/stats/table
+        // and the IN-list seam.
+        let udm = crate::schema::UdmProfile::new();
+        for q in [
+            r#"sourcetype="windows_sysmon""#,
+            r#"* | where sourcetype="windows_sysmon""#,
+            "* | stats count() by sourcetype",
+            "* | table sourcetype",
+            r#"sourcetype IN ("windows_sysmon", "conduit_proxy")"#,
+            r#"_time="2024-01-01""#,
+        ] {
+            let query = parse_query(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+            let errors = validate_query_fields_with_profile(&query, Some(&udm));
+            assert_eq!(
+                errors.len(),
+                0,
+                "alias must pass under the UDM profile: {q} -> {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pinned_typo_alias_source_ip_still_rejected_under_udm() {
+        // COLLISION (recorded on NAN-1425): normalize_field_name DOES map
+        // `source_ip` → `src_ip`, but the typo gate's rejection of `source_ip`
+        // is pinned behavior (test_typos_still_rejected_under_both_profiles,
+        // test_udm_profile_matches_profile_blind_behavior) and takes
+        // precedence over the alias map — the profile must NOT claim it.
+        let udm = crate::schema::UdmProfile::new();
+        let query = parse_query(r#"source_ip="1.2.3.4""#).unwrap();
+        let errors = validate_query_fields_with_profile(&query, Some(&udm));
+        assert_eq!(
+            errors.len(),
+            1,
+            "pinned typo case source_ip must stay rejected: {errors:?}"
+        );
+        assert_eq!(errors[0].field_name, "source_ip");
+        assert!(
+            errors[0].suggestions.contains(&"src_ip".to_string()),
+            "did-you-mean must still suggest src_ip: {:?}",
+            errors[0].suggestions
+        );
+    }
+
+    #[test]
+    fn test_aliases_without_explicit_target_unchanged_under_udm() {
+        // `hostname` → `host` and `destination` → `dest` have no explicit
+        // `logs` column as target, so the profile's gated alias authority
+        // refuses the rewrite (mirroring NAN-1422's `hostname` pin on OCSF).
+        // They are far from every UDM name, so the distance gate lets them
+        // through as potential ext fields — exactly the pre-NAN-1425 outcome.
+        let udm = crate::schema::UdmProfile::new();
+        for q in [r#"hostname="web-01""#, r#"destination="db-01""#] {
+            let query = parse_query(q).unwrap_or_else(|e| panic!("parse {q}: {e}"));
+            let errors = validate_query_fields_with_profile(&query, Some(&udm));
+            assert_eq!(
+                errors.len(),
+                0,
+                "non-rewriting alias must keep passing (as ext): {q} -> {errors:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_quoted_output_alias_not_format_checked() {
         // Output aliases (eval/rename `to`/spath `output`) are owned by codegen

@@ -48,10 +48,27 @@ pub enum SearchError {
     ResponseTooLarge(usize, usize),
     #[error("Admission denied: {0}")]
     AdmissionDenied(String),
+    /// The query was killed (`KILL QUERY` via the search-cancel endpoint, or an
+    /// admin kill) — ClickHouse error code 394 / `QUERY_WAS_CANCELLED`.
+    /// Distinct from the generic `DatabaseError` so the HTTP layer can return
+    /// a deliberate status instead of a misleading 500 (NAN-1436).
+    #[error("Query was cancelled")]
+    Cancelled,
 }
 
 /// Parse a ClickHouse error message and convert to a user-friendly SearchError
 pub fn parse_clickhouse_error(error_msg: &str) -> SearchError {
+    // Pattern: Code 394 — the query was killed (search cancel / KILL QUERY).
+    // Checked first: it is the most specific signal and must not fall through
+    // to the generic DatabaseError mapping, which the HTTP layer renders as a
+    // misleading 500 INTERNAL_ERROR for what was a deliberate cancellation
+    // (NAN-1435 made cancel actually kill queries; NAN-1436 maps the result).
+    // Message shapes: "Query was cancelled" / "Query was cancelled or a client
+    // has disconnected" + "(QUERY_WAS_CANCELLED)".
+    if error_msg.contains("QUERY_WAS_CANCELLED") || error_msg.contains("Query was cancelled") {
+        return SearchError::Cancelled;
+    }
+
     // Pattern: "Unknown expression identifier `field_name` ... Maybe you meant: ['suggestion1', 'suggestion2']"
     if error_msg.contains("Unknown expression identifier")
         || error_msg.contains("UNKNOWN_IDENTIFIER")
@@ -650,6 +667,53 @@ mod tests {
         );
         assert_eq!(detect_json_type(&json!([1, 2, 3])), "array");
         assert_eq!(detect_json_type(&json!({"a": 1})), "object");
+    }
+
+    /// NAN-1436: CH Code 394 (search cancel / KILL QUERY) must map to the
+    /// dedicated `Cancelled` variant, not the generic DatabaseError that the
+    /// HTTP layer renders as a 500.
+    #[test]
+    fn test_parse_clickhouse_error_query_was_cancelled() {
+        // Shape observed live via clickhouse-rs (HTTP transport)
+        let live = "bad response: Code: 394. DB::Exception: Query was cancelled (QUERY_WAS_CANCELLED) (version 26.4.1.1)";
+        assert!(matches!(
+            parse_clickhouse_error(live),
+            SearchError::Cancelled
+        ));
+
+        // Alternate server wording (client disconnect variant)
+        let disconnect = "Code: 394. DB::Exception: Query was cancelled or a client has disconnected (QUERY_WAS_CANCELLED)";
+        assert!(matches!(
+            parse_clickhouse_error(disconnect),
+            SearchError::Cancelled
+        ));
+    }
+
+    /// NAN-1436: the 394 mapping must not change how other ClickHouse errors
+    /// are classified.
+    #[test]
+    fn test_parse_clickhouse_error_other_codes_unchanged() {
+        assert!(matches!(
+            parse_clickhouse_error(
+                "Code: 47. DB::Exception: Unknown expression identifier `bogus_field` in scope (UNKNOWN_IDENTIFIER)"
+            ),
+            SearchError::FieldNotFound { .. }
+        ));
+        assert!(matches!(
+            parse_clickhouse_error(
+                "Code: 241. DB::Exception: Memory limit (for query) exceeded (MEMORY_LIMIT_EXCEEDED)"
+            ),
+            SearchError::SqlValidationError(_)
+        ));
+        assert!(matches!(
+            parse_clickhouse_error("Code: 159. DB::Exception: Timeout exceeded: elapsed 1.2 seconds (TIMEOUT_EXCEEDED)"),
+            SearchError::Timeout(_)
+        ));
+        // Anything unrecognized still falls through to DatabaseError
+        assert!(matches!(
+            parse_clickhouse_error("Code: 999. DB::Exception: something else entirely"),
+            SearchError::DatabaseError(_)
+        ));
     }
 }
 

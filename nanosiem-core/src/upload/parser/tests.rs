@@ -120,6 +120,93 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_csv_rejects_row_wider_than_headers() {
+        // NAN-1363: a too-wide row must NOT gain fabricated col_N keys
+        let parser = FileParser::new();
+        let content = b"name,age,active\nAlice,30,true\nBob,25,false,EXTRA";
+        let config = ParserConfig::csv();
+
+        let result = parser.parse(content, &config).unwrap();
+
+        assert_eq!(result.successful, 1);
+        assert_eq!(result.failed, 1);
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].line_number, 3);
+        assert!(result.errors[0]
+            .error_message
+            .contains("expected 3 fields, found 4"));
+        // No record carries an invented column
+        assert!(result
+            .records
+            .iter()
+            .all(|r| !r.fields.contains_key("col_3")));
+    }
+
+    #[test]
+    fn test_parse_csv_rejects_row_narrower_than_headers() {
+        // NAN-1363: a too-short row must not silently drop fields
+        let parser = FileParser::new();
+        let content = b"name,age,active\nAlice,30\nBob,25,false";
+        let config = ParserConfig::csv();
+
+        let result = parser.parse(content, &config).unwrap();
+
+        assert_eq!(result.successful, 1);
+        assert_eq!(result.failed, 1);
+        assert_eq!(result.errors[0].line_number, 2);
+        assert!(result.errors[0]
+            .error_message
+            .contains("expected 3 fields, found 2"));
+    }
+
+    #[test]
+    fn test_parse_csv_width_mismatch_fails_fast_when_strict() {
+        let parser = FileParser::new();
+        let content = b"name,age\nAlice,30,EXTRA\nBob,25";
+        let config = ParserConfig::csv().with_skip_invalid(false);
+
+        let err = parser.parse(content, &config).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Line 2"), "got: {msg}");
+        assert!(msg.contains("expected 2 fields, found 3"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_parse_csv_no_headers_width_set_by_first_record() {
+        // Headerless: first record establishes the width, later rows must match
+        let parser = FileParser::new();
+        let content = b"Alice,30\nBob,25,EXTRA\nCarol,41";
+        let config = ParserConfig::csv().with_headers(false);
+
+        let result = parser.parse(content, &config).unwrap();
+
+        assert_eq!(result.successful, 2);
+        assert_eq!(result.failed, 1);
+        assert_eq!(result.errors[0].line_number, 2);
+        assert!(result.errors[0]
+            .error_message
+            .contains("expected 2 fields, found 3"));
+    }
+
+    #[test]
+    fn test_parse_csv_custom_headers_width_enforced() {
+        let parser = FileParser::new();
+        let content = b"Alice,30,EXTRA\nBob,25";
+        let config = ParserConfig::csv()
+            .with_headers(false)
+            .with_custom_headers(vec!["person".to_string(), "years".to_string()]);
+
+        let result = parser.parse(content, &config).unwrap();
+
+        assert_eq!(result.successful, 1);
+        assert_eq!(result.failed, 1);
+        assert_eq!(result.errors[0].line_number, 1);
+        assert!(result.errors[0]
+            .error_message
+            .contains("expected 2 fields, found 3"));
+    }
+
+    #[test]
     fn test_parse_csv_with_newline_in_quotes() {
         let parser = FileParser::new();
         let content = b"name,note\nAlice,\"Line 1\nLine 2\"";

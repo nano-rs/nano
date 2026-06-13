@@ -180,6 +180,34 @@ impl ClickHouseSqlGenerator {
         }
     }
 
+    /// Whether `field`'s *resolved physical column* is lowercase-normalized at
+    /// ingest, so an Eq/Ne string compare can skip the `lower()` wrapper and the
+    /// raw-column bloom/set indexes engage. Judged on the resolved column, not
+    /// the raw nPL token: under OCSF a UDM alias like `src_ip` resolves to the
+    /// ingest-lowercased promoted column `src_endpoint.ip`, which a raw-token
+    /// lookup misses. Pre-NAN-1412 the explicit-PREWHERE duplicate carried the
+    /// raw-form equality (resolved inside `extract_prewhere_conditions`) and
+    /// rescued the index; with the single WHERE this arm is the only emission,
+    /// so the resolution must happen here (EXPLAIN-verified on local CH:
+    /// `idx_src_endpoint_ip` 553→88 granules). Class-split concepts (OCSF
+    /// host/user/process/url) compare on the `_unified` column — `resolve()`
+    /// returns only the primary source column, so they are deliberately
+    /// excluded and keep the `lower(...)` form their text index serves
+    /// (NAN-1333). UDM resolution is the identity and its lowercased set
+    /// carries both alias and target spellings → byte-identical there.
+    fn is_resolved_lowercased_at_ingest(&self, field: &str) -> bool {
+        if self.profile.class_split_value_sql(field).is_some() {
+            return false;
+        }
+        match self.profile.resolve(field) {
+            crate::schema::FieldResolution::ExplicitColumn(col)
+            | crate::schema::FieldResolution::Alias(col) => {
+                self.profile.is_lowercased_at_ingest(&col)
+            }
+            _ => self.profile.is_lowercased_at_ingest(field),
+        }
+    }
+
     /// Generate SQL for a search expression (WHERE clause content)
     pub fn generate_search_expr(&self, expr: &SearchExpr) -> Result<String, SqlGenError> {
         match expr {
@@ -195,11 +223,33 @@ impl ClickHouseSqlGenerator {
                 // correct (substring semantics — `anom` matches `anomalous`) and
                 // index-accelerated. Pre-NAN-1026 the codegen used hasToken which
                 // silently dropped any needle that wasn't a whole CH token.
-                let escaped = escape_string(&kw.to_lowercase());
-                Ok(format!(
+                //
+                // NAN-1416: the dictionary scan serves single-token needles ONLY —
+                // any non-alphanumeric char (phrase, IP, `file.exe`, snake_case)
+                // makes the index bail → full message scan (up to 307x read_bytes).
+                // Multi-token needles get an index-servable longest-token guard
+                // ANDed AFTER the full-needle iLike; every token is a substring
+                // of the needle so full ∧ guard ≡ full — byte-identical results.
+                // Skip-index analysis is order-independent (EXPLAIN-verified:
+                // identical granule pruning either way) but the row stage is
+                // cheaper with the selective full needle leading — on a
+                // guard-dense probe ('process create', guard token in 70% of
+                // rows) guard-first measured +42% CPU vs +13% full-first. The
+                // guard token is ASCII-alnum by construction (no LIKE
+                // metachars, no quotes) → embedded unescaped. Single-token
+                // needles keep EXACTLY the prior shape (index DIRECT READ).
+                let lowered = kw.to_lowercase();
+                let escaped = escape_string(&lowered);
+                let full = format!(
                     "lower(message) iLike '%{}%'",
                     escape_like_pattern(&escaped)
-                ))
+                );
+                Ok(match longest_guard_token(&lowered) {
+                    Some(token) => {
+                        format!("{} AND lower(message) iLike '%{}%'", full, token)
+                    }
+                    None => full,
+                })
             }
             SearchExpr::FieldFilter { field, op, value } => {
                 self.generate_field_filter(field, op, value)
@@ -325,8 +375,8 @@ impl ClickHouseSqlGenerator {
         let enum_mapping = self.profile.enum_int_mapping(field);
         if self.profile.is_known_field(field) || is_class_split || enum_mapping.is_some() {
             // Determine the physical access expression via the active profile:
-            // ExplicitColumn → escaped column, JsonPath → JSONExtract, Unknown →
-            // `ext.{field}` (UDM's spill). For OCSF a known field is always a
+            // ExplicitColumn → escaped column, JsonPath → native `event` subcolumn
+            // access (NAN-1426), Unknown → `ext.{field}` (UDM's spill). For OCSF a known field is always a
             // promoted ExplicitColumn, so this is byte-identical for UDM.
             // NAN-1321: class-split concepts resolve to the value-pick `if(...)` so
             // an IN-list filter matches the host/user/process wherever the class put
@@ -500,7 +550,8 @@ impl ClickHouseSqlGenerator {
         value: &Value,
     ) -> Result<String, SqlGenError> {
         // Profile-aware physical access: ExplicitColumn → escaped column (direct,
-        // possibly dotted/promoted), JsonPath → JSONExtract (OCSF tail), Unknown →
+        // possibly dotted/promoted), JsonPath → native `event` subcolumn access
+        // (OCSF tail, NAN-1426), Unknown →
         // `ext.{field}` (UDM's existing ext-JSON dot-notation, byte-identical).
         // NAN-1321: a class-split concept resolves to the value-pick `if(...)`.
         let field_expr = self.filter_field_expr(field, "String");
@@ -548,13 +599,26 @@ impl ClickHouseSqlGenerator {
                 // correct + splitByNonAlpha index-accelerated) instead of hasToken*.
                 if let Value::Regex(pattern) = value {
                     if let Some(token) = extract_simple_regex_token(pattern) {
-                        let escaped = escape_string(&token.to_lowercase());
+                        let escaped = escape_string(&token);
                         let like = escape_like_pattern(&escaped);
-                        return Ok(format!(
-                            "{} iLike '%{}%'",
-                            self.search_lowered(field, &field_expr),
-                            like
-                        ));
+                        let lhs = self.search_lowered(field, &field_expr);
+                        let full = format!("{} iLike '%{}%'", lhs, like);
+                        // NAN-1416: a multi-token literal (`/failed login/`,
+                        // `/10.0.0.52/`) can't be served by the text index —
+                        // AND a longest-token guard after it (full-needle
+                        // first; see the Keyword arm for the ordering
+                        // rationale). Only when the lhs is the bare
+                        // `lower(col)` index expression; ext/JSON targets have
+                        // no index to serve the guard.
+                        if self.is_plain_string_search_column(field) {
+                            if let Some(guard) = longest_guard_token(&token) {
+                                return Ok(format!(
+                                    "{} AND {} iLike '%{}%'",
+                                    full, lhs, guard
+                                ));
+                            }
+                        }
+                        return Ok(full);
                     }
                     // Complex regex — try bloom-guard pre-filtering and pattern rewrites
                     return Ok(build_optimized_regex_sql(
@@ -614,12 +678,23 @@ impl ClickHouseSqlGenerator {
                 // silently dropped (`message CONTAINS "anom"` matches "anomalous";
                 // `src_host CONTAINS "dc"` matches "srv-dc01"; etc.).
                 if let Value::String(s) = value {
-                    let escaped = escape_like_pattern(&escape_string(&s.to_lowercase()));
-                    Ok(format!(
-                        "{} iLike '%{}%'",
-                        self.search_lowered(field, &field_expr),
-                        escaped
-                    ))
+                    let lowered = s.to_lowercase();
+                    let escaped = escape_like_pattern(&escape_string(&lowered));
+                    let lhs = self.search_lowered(field, &field_expr);
+                    let full = format!("{} iLike '%{}%'", lhs, escaped);
+                    // NAN-1416: multi-token needles bypass the text index —
+                    // AND a longest-token guard after the full-needle iLike
+                    // (full ∧ guard ≡ full; see the Keyword arm for the
+                    // ordering rationale). Only when the lhs is the bare
+                    // `lower(col)` index expression; ext/JSON targets have no
+                    // index to serve the guard. Negated CONTAINS gets no guard
+                    // (NOT full ≢ NOT full ∧ guard).
+                    if self.is_plain_string_search_column(field) {
+                        if let Some(token) = longest_guard_token(&lowered) {
+                            return Ok(format!("{} AND {} iLike '%{}%'", full, lhs, token));
+                        }
+                    }
+                    Ok(full)
                 } else {
                     Ok(format!(
                         "{} iLike concat('%', {}, '%')",
@@ -800,9 +875,12 @@ impl ClickHouseSqlGenerator {
                                     "(lower({}) != '{}' AND NOT startsWith(lower({}), '{}.'))",
                                     field_expr, escaped_lower, field_expr, escaped_lower
                                 ))
-                            } else if self.profile.is_lowercased_at_ingest(field) {
+                            } else if self.is_resolved_lowercased_at_ingest(field) {
                                 // For fields normalized to lowercase at ingest, skip lower() wrapper
-                                // This allows efficient index usage (set indexes, bloom filters)
+                                // This allows efficient index usage (set indexes, bloom filters).
+                                // Judged on the profile-RESOLVED column so OCSF UDM-aliases
+                                // (src_ip → src_endpoint.ip) keep their bloom pruning now that
+                                // the raw-form PREWHERE duplicate is gone (NAN-1412).
                                 Ok(format!("{} {} '{}'", field_expr, sql_op, escaped_lower))
                             } else {
                                 Ok(format!(
@@ -860,8 +938,8 @@ impl ClickHouseSqlGenerator {
         } else {
             // Profile-aware spill access. For UDM the profile returns Unknown →
             // `ext.{field}` (byte-identical to the prior native-dot-notation). For
-            // OCSF an unpromoted tail field resolves to JsonPath →
-            // `JSONExtract<T>(event, 'p1', 'p2', …)`. NAN-1321: OCSF UDM-semantic
+            // OCSF an unpromoted tail field resolves to JsonPath → native `event`
+            // subcolumn access (NAN-1426). NAN-1321: OCSF UDM-semantic
             // aliases (`src_host`, `user`, …) are not promoted columns so they reach
             // THIS path; `filter_field_expr` resolves the class-split ones to the
             // value-pick `if(...)` so `src_host="ws-01"` matches device.hostname too.
@@ -1111,6 +1189,33 @@ impl ClickHouseSqlGenerator {
                     // NAN-1381 broadened the guard from class-split-only to every plain
                     // non-null String target (a UDM alias resolving to a promoted String
                     // column gets the same index-preserving form).
+                    // NAN-1412: when the resolved column is lowercase-normalized at
+                    // ingest (src_endpoint.ip & co.), drop the lower() wrapper entirely —
+                    // those columns carry RAW-expression bloom indexes, which
+                    // `lower(col) =` orphans. Pre-NAN-1412 the explicit-PREWHERE
+                    // duplicate carried the raw form (resolved inside
+                    // `extract_prewhere_conditions`) and rescued the pruning; with the
+                    // single WHERE this is the only emission (EXPLAIN-verified:
+                    // idx_src_endpoint_ip 553→88 granules). Class-split concepts are
+                    // excluded by the helper and keep the lower() form their
+                    // `lower(<col>_unified)` text index serves.
+                    // Eq ONLY: for Eq the raw form is row-identical to the old
+                    // PREWHERE(raw) ∧ WHERE(lower) conjunction even against
+                    // invariant-violating data; for Ne it is not (an uppercase row
+                    // flips from excluded to included), and a bloom can never prune
+                    // a negation anyway — keep Ne on the lower() form.
+                    Value::String(s)
+                        if plain_string_target
+                            && *op == Comparator::Eq
+                            && self.is_resolved_lowercased_at_ingest(&field_path) =>
+                    {
+                        Ok(format!(
+                            "{} {} '{}'",
+                            field_expr,
+                            sql_op,
+                            escape_string(&s.to_lowercase())
+                        ))
+                    }
                     Value::String(s) if plain_string_target => Ok(format!(
                         "lower({}) {} '{}'",
                         field_expr,
@@ -1143,24 +1248,17 @@ impl ClickHouseSqlGenerator {
     ///
     /// OCSF Phase 2: when the active profile resolves `field` to a
     /// [`FieldResolution::JsonPath`] (a nested path in an arbitrary JSON column,
-    /// e.g. OCSF's `event` column), emit an N-level
-    /// `JSONExtract<T>(col, 'p1', 'p2', …)` against that column. For UDM the
+    /// e.g. OCSF's `event` column), emit native subcolumn access against that
+    /// column via [`json_tail_access_sql`] (NAN-1426 — the previous N-level
+    /// `JSONExtract<T>(col, 'p1', …)` re-serialized the entire `event` object
+    /// per row; parity carve-outs documented on the helper). For UDM the
     /// profile only ever returns `ExplicitColumn` or `Unknown` — neither hits the
     /// JsonPath branch — so the legacy `metadata`-prefixed behavior below is
     /// preserved byte-for-byte.
     pub fn generate_json_extract(&self, field: &str, json_type: &str) -> String {
         // OCSF nested-path resolution (additive; never exercised by UDM).
         if let crate::schema::FieldResolution::JsonPath { col, path } = self.profile.resolve(field) {
-            let path_args: Vec<String> = path
-                .iter()
-                .map(|p| format!("'{}'", escape_string(p)))
-                .collect();
-            return format!(
-                "JSONExtract{}({}, {})",
-                json_type,
-                col,
-                path_args.join(", ")
-            );
+            return json_tail_access_sql(&col, &path, json_type);
         }
 
         // Handle metadata_ prefix: metadata_endpoint -> JSONExtract(metadata, 'endpoint')
@@ -1254,11 +1352,24 @@ impl ClickHouseSqlGenerator {
                 // position(). After stats/timechart where message no longer exists,
                 // ClickHouse returns a clear "column not found" error — correct, since bare
                 // keyword searches don't make sense after aggregation.
-                let escaped = escape_string(&kw.to_lowercase());
-                Ok(format!(
+                //
+                // NAN-1416: mirrors the top-level Keyword arm — multi-token needles
+                // get the longest-token index guard after the full-needle iLike
+                // (full ∧ guard ≡ full; see that arm for the ordering rationale);
+                // the predicate pushes down through the stage CTEs to the table
+                // read, where idx_message_words serves the single-token guard.
+                let lowered = kw.to_lowercase();
+                let escaped = escape_string(&lowered);
+                let full = format!(
                     "lower(message) iLike '%{}%'",
                     escape_like_pattern(&escaped)
-                ))
+                );
+                Ok(match longest_guard_token(&lowered) {
+                    Some(token) => {
+                        format!("{} AND lower(message) iLike '%{}%'", full, token)
+                    }
+                    None => full,
+                })
             }
             SearchExpr::FieldFilter { field, op, value } => {
                 // Normalize field name (apply aliases like command_line -> process)
@@ -1643,30 +1754,22 @@ impl ClickHouseSqlGenerator {
             return_fields[0]
         };
 
-        // Build the inner WHERE clause from the subsearch's search expression
-        let inner_where = if let Some(expr) = search_expr {
-            let where_sql = self.generate_search_expr(expr)?;
-            format!(" WHERE ({})", where_sql)
-        } else {
-            String::new()
-        };
-
-        // Build PREWHERE with time range and any indexed field conditions
-        let mut prewhere = format!(
+        // Build a single WHERE with the time range and the subsearch's search
+        // expression — `optimize_move_to_prewhere` does placement (NAN-1412).
+        let mut where_clause = format!(
             "timestamp BETWEEN '{}' AND '{}'",
             time_range.start.format("%Y-%m-%d %H:%M:%S%.6f"),
             time_range.end.format("%Y-%m-%d %H:%M:%S%.6f"),
         );
         if let Some(expr) = search_expr {
-            let extra = super::extract_prewhere_conditions(expr, self.profile.as_ref());
-            if !extra.is_empty() {
-                prewhere = format!("{} AND {}", prewhere, extra.join(" AND "));
-            }
+            let where_sql = self.generate_search_expr(expr)?;
+            where_clause = format!("{} AND ({})", where_clause, where_sql);
         }
 
         // Build the SELECT expression for the return field (profile-aware: direct
-        // column for promoted/UDM columns, JSONExtract for an OCSF tail path,
-        // `ext.{field}` for a UDM Unknown — byte-identical for UDM).
+        // column for promoted/UDM columns, native `event` subcolumn access for an
+        // OCSF tail path (NAN-1426), `ext.{field}` for a UDM Unknown —
+        // byte-identical for UDM).
         let return_field_expr = self.field_access_expr(return_field, "String");
 
         // Build the outer field expression (same profile-aware resolution).
@@ -1678,24 +1781,22 @@ impl ClickHouseSqlGenerator {
         let is_numeric = self.profile.is_numeric_field(field);
         if is_numeric {
             Ok(format!(
-                "{} {} (SELECT DISTINCT {} FROM {} PREWHERE {}{} LIMIT {})",
+                "{} {} (SELECT DISTINCT {} FROM {} WHERE {} LIMIT {})",
                 outer_field_expr,
                 op,
                 return_field_expr,
                 self.table_name,
-                prewhere,
-                inner_where,
+                where_clause,
                 SUBSEARCH_RESULT_LIMIT,
             ))
         } else {
             Ok(format!(
-                "lower({}) {} (SELECT DISTINCT lower({}) FROM {} PREWHERE {}{} LIMIT {})",
+                "lower({}) {} (SELECT DISTINCT lower({}) FROM {} WHERE {} LIMIT {})",
                 outer_field_expr,
                 op,
                 return_field_expr,
                 self.table_name,
-                prewhere,
-                inner_where,
+                where_clause,
                 SUBSEARCH_RESULT_LIMIT,
             ))
         }

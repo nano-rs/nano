@@ -116,6 +116,45 @@ fn determine_display_type(query: &Query) -> DisplayType {
     }
 }
 
+/// Derived ClickHouse query_ids for the companion queries fanned out by one
+/// search request (NAN-1428): count, histogram, and field-stats.
+///
+/// Cancellation must kill the data query plus exactly these ids. They are
+/// always matched EXACTLY (never via `LIKE '{id}%'`) because client-provided
+/// request ids can legitimately contain `%`/`_` LIKE metacharacters.
+pub(crate) fn companion_query_ids(query_id: &str) -> [String; 3] {
+    [
+        format!("{query_id}-count"),
+        format!("{query_id}-hist"),
+        format!("{query_id}-fstats"),
+    ]
+}
+
+/// The data query id plus all derived companion ids — the full kill set for
+/// one search request (NAN-1428).
+pub(crate) fn all_query_ids(query_id: &str) -> Vec<String> {
+    let mut ids = Vec::with_capacity(4);
+    ids.push(query_id.to_string());
+    ids.extend(companion_query_ids(query_id));
+    ids
+}
+
+/// Whether the UI renders the histogram timeline for this display type
+/// (NAN-1429).
+///
+/// Mirrors the gate in `nanosiem-web/src/pages/Search.tsx` (the
+/// `<TimelineVisualization>` render condition): tree, asset, cloud, and
+/// lateral views ship their own visualizations; timechart / ranked_bar / flow
+/// render their own charts. For those, the histogram companion's full-window
+/// scan was computed and then discarded — so the backend skips it entirely.
+/// Events, Table (trailing `stats`), and Transaction DO render the timeline.
+fn display_type_renders_timeline(display_type: DisplayType) -> bool {
+    matches!(
+        display_type,
+        DisplayType::Events | DisplayType::Table | DisplayType::Transaction
+    )
+}
+
 /// Input-side field-name validation for the nPL request path (NAN-1354).
 ///
 /// Runs after parse and before SQL generation so a malformed or typo'd field
@@ -766,6 +805,85 @@ impl SearchService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NAN-1428: the companion id scheme is fixed — cancel derives these
+    /// exact ids; changing the suffixes breaks kill coverage for in-flight
+    /// searches during a rolling deploy.
+    #[test]
+    fn companion_ids_are_exact_derived_suffixes() {
+        assert_eq!(
+            companion_query_ids("req-1"),
+            [
+                "req-1-count".to_string(),
+                "req-1-hist".to_string(),
+                "req-1-fstats".to_string()
+            ]
+        );
+        assert_eq!(
+            all_query_ids("req-1"),
+            vec!["req-1", "req-1-count", "req-1-hist", "req-1-fstats"]
+        );
+        // Ids with LIKE metacharacters stay literal — derivation is plain
+        // concatenation, matching is exact (never LIKE).
+        assert_eq!(
+            all_query_ids("a%b_c")[1..],
+            ["a%b_c-count", "a%b_c-hist", "a%b_c-fstats"]
+        );
+    }
+
+    /// NAN-1429: histogram companion is skipped server-side exactly for the
+    /// display types whose UI never renders the timeline. This pins the list
+    /// against `Search.tsx`'s `<TimelineVisualization>` render gate.
+    #[test]
+    fn histogram_skip_list_matches_ui_timeline_gate() {
+        // Skipped: the UI renders its own chart / no per-bucket density.
+        for (query, expected) in [
+            ("* | timechart span=1h count", DisplayType::Timechart),
+            ("* | top src_ip", DisplayType::RankedBar),
+            ("* | rare user", DisplayType::RankedBar),
+            (
+                r#"* | sequence by user [action="login"] [action="delete"]"#,
+                DisplayType::Flow,
+            ),
+            (
+                "* | tree parent=ppid child=pid label=process_name",
+                DisplayType::Tree,
+            ),
+            ("src_host=\"web01\" | asset", DisplayType::Asset),
+            ("* | cloud", DisplayType::Cloud),
+            ("* | lateral", DisplayType::Lateral),
+        ] {
+            let q = parse_query(query).unwrap();
+            let dt = determine_display_type(&q);
+            assert_eq!(dt, expected, "display type drifted for {query}");
+            assert!(
+                !display_type_renders_timeline(dt),
+                "histogram must be skipped for {query} ({dt:?})"
+            );
+        }
+
+        // Kept: the timeline IS rendered next to these results.
+        for (query, expected) in [
+            ("error", DisplayType::Events),
+            ("* | stats count by src_ip", DisplayType::Table),
+            ("* | table src_ip, user", DisplayType::Table),
+            ("* | transaction session_id", DisplayType::Transaction),
+            // Prevalence enrich keeps Events — the empty-state UX explains
+            // filtered-out results by pointing at the histogram.
+            (
+                "* | prevalence enrich=true | where host_count < 3",
+                DisplayType::Events,
+            ),
+        ] {
+            let q = parse_query(query).unwrap();
+            let dt = determine_display_type(&q);
+            assert_eq!(dt, expected, "display type drifted for {query}");
+            assert!(
+                display_type_renders_timeline(dt),
+                "histogram must be kept for {query} ({dt:?})"
+            );
+        }
+    }
 
     #[test]
     fn test_explain_query() {

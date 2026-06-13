@@ -84,6 +84,8 @@ impl ClickHouseSqlGenerator {
                     }
                     AggFunc::Dc => format!("uniqExact({}) OVER ({}ORDER BY timestamp {})",
                         field_expr, partition_clause, frame_spec),
+                    AggFunc::EstDc => format!("uniqCombined64({}) OVER ({}ORDER BY timestamp {})",
+                        field_expr, partition_clause, frame_spec),
                     AggFunc::Values => format!("arrayStringConcat(arrayFilter(x -> x != '', groupArrayDistinct({})(toString({})) OVER ({}ORDER BY timestamp {})), ', ')",
                         self.max_group_array_size, field_expr, partition_clause, frame_spec),
                     AggFunc::List => format!("arrayStringConcat(arrayFilter(x -> x != '', groupArray({})(toString({})) OVER ({}ORDER BY timestamp {})), ', ')",
@@ -116,6 +118,7 @@ impl ClickHouseSqlGenerator {
                             AggFunc::First => "first",
                             AggFunc::Last => "last",
                             AggFunc::Dc => "dc",
+                            AggFunc::EstDc => "estdc",
                             AggFunc::Values => "values",
                             AggFunc::List => "list",
                             AggFunc::Stdev => "stdev",
@@ -193,6 +196,15 @@ impl ClickHouseSqlGenerator {
                             format!("uniqExact({}) {}", field_expr, over)
                         }
                     }
+                    AggFunc::EstDc => {
+                        // Approximate distinct count: same shape as dc() but bounded
+                        // memory via uniqCombined64 (~0.9% measured error).
+                        if partition_clause.is_empty() {
+                            format!("(SELECT uniqCombined64({}) FROM {})", field_expr, source)
+                        } else {
+                            format!("uniqCombined64({}) {}", field_expr, over)
+                        }
+                    }
                     AggFunc::Sum => format!("sum({}) {}", field_expr, over),
                     AggFunc::Avg => format!("avg({}) {}", field_expr, over),
                     AggFunc::Min => format!("min({}) {}", field_expr, over),
@@ -233,6 +245,7 @@ impl ClickHouseSqlGenerator {
                     let func_name = match agg.func {
                         AggFunc::Count => "count",
                         AggFunc::Dc => "dc",
+                        AggFunc::EstDc => "estdc",
                         AggFunc::Sum => "sum",
                         AggFunc::Avg => "avg",
                         AggFunc::Min => "min",

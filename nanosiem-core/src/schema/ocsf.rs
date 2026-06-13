@@ -18,8 +18,9 @@
 //!   quote-escapes the dotted name via `escape_identifier`.
 //! - Any **unpromoted** tail path (e.g. `actor.process.parent_process.name`)
 //!   resolves to [`FieldResolution::JsonPath`] against the `event` JSON column —
-//!   the OCSF analog of UDM's `ext`. The generator emits
-//!   `JSONExtract<T>(event, 'p1', 'p2', …)`.
+//!   the OCSF analog of UDM's `ext`. The generator emits native subcolumn
+//!   access (`event."p1"."p2"` forms — NAN-1426; JSONExtract* re-serialized
+//!   the whole event per row).
 //!
 //! Array `[]` paths never arrive from the nPL tokenizer (it only emits dotted
 //! identifiers), so `resolve()` does not synthesize `ArrayElement`; array-derived
@@ -37,6 +38,7 @@ use super::types::{
     EnrichmentKind, EnrichmentMode, EntityRole, EntityType, EnumIntMapping, FieldCategory,
     FieldDef, FieldResolution, FieldType, SchemaId,
 };
+use crate::query::normalize_field_name;
 
 /// Fully-qualified canonical OCSF table (`clickhouse/ocsf/init.sql`).
 const OCSF_TABLE_NAME: &str = "nanosiem.ocsf_logs";
@@ -47,7 +49,7 @@ const OCSF_TABLE_NAME: &str = "nanosiem.ocsf_logs";
 const OCSF_TIMESTAMP_EXPR: &str = "timestamp";
 
 /// The JSON column holding the full standard OCSF record. The unpromoted tail
-/// resolves to `JSONExtract*(event, …)` against this column.
+/// resolves to native subcolumn access against this column (NAN-1426).
 const OCSF_EVENT_COLUMN: &str = "event";
 
 /// The operational provenance / routing key (Security Lake "custom source"
@@ -560,23 +562,26 @@ impl OcsfProfile {
             enrichment_mode: mode,
         }
     }
-}
 
-impl SchemaProfile for OcsfProfile {
-    fn id(&self) -> SchemaId {
-        SchemaId::Ocsf
+    /// Whether `name` — taken verbatim, with NO alias canonicalization — resolves
+    /// to a real physical column of `ocsf_logs` (operational/bookkeeping column,
+    /// promoted manifest column, or a UDM-correspondence column). This is the
+    /// [`canonicalize`](SchemaProfile::canonicalize) gate predicate (NAN-1422):
+    /// it must consult [`resolve_canonical`](Self::resolve_canonical) directly
+    /// (never the canonicalizing `resolve`) or the two would recurse.
+    fn resolves_to_physical_column(&self, name: &str) -> bool {
+        matches!(
+            self.resolve_canonical(name),
+            FieldResolution::ExplicitColumn(_)
+        )
     }
 
-    /// OCSF's JSON tail is the `event` column (UDM uses `ext`) — NAN-1343.
-    fn json_tail_column(&self) -> &'static str {
-        OCSF_EVENT_COLUMN
-    }
-
-    fn fields(&self) -> &[FieldDef] {
-        &registry().fields
-    }
-
-    fn resolve(&self, npl_field: &str) -> FieldResolution {
+    /// Resolve an already-canonical field name (the historical `resolve` body).
+    /// The trait's [`resolve`](SchemaProfile::resolve) canonicalizes flat
+    /// operational aliases first (NAN-1422) and delegates here; internal
+    /// recursions (the `ext.` / `event.` prefix remaps) stay on this method so
+    /// stripped tails are never re-aliased.
+    fn resolve_canonical(&self, npl_field: &str) -> FieldResolution {
         // The physical sort column `timestamp` (and its bookkeeping sibling
         // `_inserted_at`) are real, non-promoted columns of the OCSF table. They
         // MUST resolve to a direct column, not a JsonPath: the query layer injects
@@ -652,7 +657,7 @@ impl SchemaProfile for OcsfProfile {
             // Re-resolve so a (hypothetical future) promoted `unmapped.*`
             // column would win. Depth is bounded: `unmapped.…` matches neither
             // prefix arm, so this recurses at most once more.
-            return self.resolve(&format!("unmapped.{rest}"));
+            return self.resolve_canonical(&format!("unmapped.{rest}"));
         }
         if npl_field.starts_with("event.") {
             // Strip ALL leading `event.` segments iteratively (not one per
@@ -662,7 +667,7 @@ impl SchemaProfile for OcsfProfile {
             while let Some(r) = rest.strip_prefix("event.") {
                 rest = r;
             }
-            return self.resolve(rest);
+            return self.resolve_canonical(rest);
         }
         // Everything else is the unpromoted `event` tail → N-level JSONExtract.
         FieldResolution::JsonPath {
@@ -670,18 +675,71 @@ impl SchemaProfile for OcsfProfile {
             path: npl_field.split('.').map(String::from).collect(),
         }
     }
+}
+
+impl SchemaProfile for OcsfProfile {
+    fn id(&self) -> SchemaId {
+        SchemaId::Ocsf
+    }
+
+    /// OCSF's JSON tail is the `event` column (UDM uses `ext`) — NAN-1343.
+    fn json_tail_column(&self) -> &'static str {
+        OCSF_EVENT_COLUMN
+    }
+
+    fn fields(&self) -> &[FieldDef] {
+        &registry().fields
+    }
+
+    fn resolve(&self, npl_field: &str) -> FieldResolution {
+        // Flat operational aliases canonicalize first (NAN-1422) so every
+        // resolve consumer — including codegen seams that pass the RAW name,
+        // like the IN-list filter — lands on the same physical column as the
+        // canonical spelling. Dotted / non-aliased names borrow straight
+        // through, so this is a no-op for native OCSF paths.
+        self.resolve_canonical(self.canonicalize(npl_field).as_ref())
+    }
 
     fn canonicalize<'a>(&self, npl_field: &'a str) -> Cow<'a, str> {
-        // Pass-through: dotted OCSF paths are already canonical and MUST NOT be
-        // mangled by UDM-style snake_case aliasing (scoping §Phase 4 ⚠️). TODO
-        // (deferred): add OCSF-flavored aliases (e.g. UDM `src_ip` →
-        // `src_endpoint.ip`, `user` → class-aware COALESCE) once the alias surface
-        // is designed — do NOT invent them here.
-        Cow::Borrowed(npl_field)
+        // Dotted OCSF paths are already canonical and MUST NOT be mangled by
+        // UDM-style snake_case aliasing (scoping §Phase 4 ⚠️) — this also keeps
+        // the dotted `normalize_field_name` entries (`cloud.provider` →
+        // `cloud_provider`) from rewriting a PROMOTED OCSF column backwards.
+        if npl_field.contains('.') {
+            return Cow::Borrowed(npl_field);
+        }
+        // Flat (dot-free) inputs: apply the operational aliases UDM applies via
+        // `normalize_field_name` (`sourcetype` → `source_type`, `_time` →
+        // `timestamp`, …), gated conservatively (NAN-1422): accept the rewrite
+        // only when the normalized target is a real physical column of
+        // `ocsf_logs` AND the raw spelling is not. An alias whose target has no
+        // OCSF column (`hostname` → `host`) does NOT rewrite — it stays exactly
+        // as unknown as before. This deliberately does NOT invent OCSF-flavored
+        // aliases: UDM `src_ip` → `src_endpoint.ip` is `resolve_canonical`'s
+        // manifest correspondence (NAN-1248), and the class-aware `user`
+        // COALESCE surface remains deferred until designed.
+        let normalized = normalize_field_name(npl_field);
+        if std::ptr::eq(normalized, npl_field) {
+            return Cow::Borrowed(npl_field);
+        }
+        if !self.resolves_to_physical_column(npl_field)
+            && self.resolves_to_physical_column(normalized)
+        {
+            Cow::Owned(normalized.to_string())
+        } else {
+            Cow::Borrowed(npl_field)
+        }
     }
 
     fn is_known_field(&self, name: &str) -> bool {
-        name == OCSF_SOURCE_TYPE_COLUMN || registry().promoted.contains(name)
+        // Alias-aware (NAN-1422): judge the canonical spelling, so the flat
+        // operational aliases (`sourcetype` → `source_type`) belong to the field
+        // universe. This is the gate the input-side field validator consults
+        // (NAN-1380 G5) — `sourcetype` sits one edit from `source_type`, so
+        // without this it was 400-rejected as a typo while codegen handled it.
+        let canonical = self.canonicalize(name);
+        canonical.as_ref() == OCSF_SOURCE_TYPE_COLUMN
+            || registry().promoted.contains(canonical.as_ref())
     }
 
     fn field_type(&self, field: &str) -> Option<FieldType> {
@@ -1082,14 +1140,89 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_is_pass_through() {
+    fn canonicalize_is_pass_through_for_dotted_and_non_aliased() {
         let p = OcsfProfile::new();
-        // Dotted paths must NOT be mangled.
-        assert_eq!(p.canonicalize("src_endpoint.ip").as_ref(), "src_endpoint.ip");
+        // Dotted paths must NOT be mangled — byte-identical pass-through
+        // (Borrowed, never re-spelled). NAN-1422 scoped aliasing to dot-free
+        // inputs only.
+        for dotted in [
+            "src_endpoint.ip",
+            "actor.process.cmd_line",
+            // Dotted normalize_field_name entries must not rewrite a PROMOTED
+            // OCSF column backwards (`cloud.provider` → `cloud_provider`).
+            "cloud.provider",
+            // Unpromoted event-tail paths stay verbatim too.
+            "unmapped.error_code",
+        ] {
+            assert!(
+                matches!(p.canonicalize(dotted), Cow::Borrowed(s) if s == dotted),
+                "dotted path {dotted} must pass through byte-identical"
+            );
+        }
+        // Non-aliased flat names are untouched as well.
+        for flat in ["class_uid", "message", "source_type", "timestamp", "severity"] {
+            assert!(
+                matches!(p.canonicalize(flat), Cow::Borrowed(s) if s == flat),
+                "non-aliased flat name {flat} must pass through byte-identical"
+            );
+        }
+    }
+
+    #[test]
+    fn canonicalize_applies_flat_operational_aliases() {
+        let p = OcsfProfile::new();
+        // `sourcetype` → `source_type`: the operational provenance column exists
+        // on ocsf_logs, so the Splunk-muscle-memory alias must land on it
+        // (NAN-1422 — previously a validator 400 under the OCSF profile).
+        assert_eq!(p.canonicalize("sourcetype").as_ref(), "source_type");
         assert_eq!(
-            p.canonicalize("actor.process.cmd_line").as_ref(),
-            "actor.process.cmd_line"
+            p.resolve("sourcetype"),
+            FieldResolution::ExplicitColumn("source_type".to_string())
         );
+        assert!(p.is_known_field("sourcetype"));
+        // `_time` → `timestamp`: the bookkeeping sort column resolves directly.
+        assert_eq!(p.canonicalize("_time").as_ref(), "timestamp");
+        assert_eq!(
+            p.resolve("_time"),
+            FieldResolution::ExplicitColumn("timestamp".to_string())
+        );
+        // The alias and the canonical spelling must resolve identically.
+        assert_eq!(p.resolve("sourcetype"), p.resolve("source_type"));
+        assert_eq!(p.resolve("_time"), p.resolve("timestamp"));
+    }
+
+    #[test]
+    fn canonicalize_gate_refuses_alias_without_physical_target() {
+        let p = OcsfProfile::new();
+        // `hostname` normalizes to `host` under UDM, but `host` is NOT a
+        // physical ocsf_logs column (not promoted, not operational, no manifest
+        // udm_field correspondence) — the rewrite must be refused so the alias
+        // stays exactly as unknown as before (the deferred OCSF alias design
+        // owns any future mapping; do NOT invent one here).
+        for (alias, target) in [
+            ("hostname", "host"),
+            ("destination", "dest"),
+            ("event_id", "signature_id"),
+        ] {
+            assert!(
+                !p.resolves_to_physical_column(target),
+                "{target} unexpectedly became a physical column — revisit the gate"
+            );
+            assert!(
+                matches!(p.canonicalize(alias), Cow::Borrowed(s) if s == alias),
+                "alias {alias} must NOT rewrite (target {target} has no OCSF column)"
+            );
+            assert!(!p.is_known_field(alias));
+            // Unchanged fall-through: the raw spelling still JSONExtracts the
+            // event tail, exactly as before NAN-1422.
+            assert_eq!(
+                p.resolve(alias),
+                FieldResolution::JsonPath {
+                    col: "event".into(),
+                    path: vec![alias.into()],
+                },
+            );
+        }
     }
 
     #[test]

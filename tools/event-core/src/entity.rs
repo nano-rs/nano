@@ -8,6 +8,7 @@ use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use rand::seq::IndexedRandom;
 use rand::Rng;
+use serde::Serialize;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -20,6 +21,11 @@ const INTERFACES: &[&str] = &["eth0", "Ethernet", "Wi-Fi"];
 
 const DEPARTMENTS: &[&str] = &[
     "ENG", "SALES", "HR", "FIN", "IT", "MKT", "LEGAL", "OPS", "EXEC", "SUPPORT",
+];
+
+const TITLES: &[&str] = &[
+    "Engineer", "Senior Engineer", "Manager", "Director", "Analyst", "Specialist",
+    "Coordinator", "Lead", "Administrator", "Associate",
 ];
 
 const SERVER_ROLES: &[&str] = &[
@@ -745,6 +751,27 @@ pub struct WorldState {
     pub domain: String,
 }
 
+/// A `nano_enrich` identity record (kind=identity, source=ad) for one fleet
+/// user — pushed to seed `user_registry` so generated logs enrich. The
+/// `username` is exactly `WorldState::gen_user(i)` (the `user_registry_dict`
+/// key, matched case-insensitively against the log's `.user`). NAN-1154.
+#[derive(Debug, Clone, Serialize)]
+pub struct IdentitySeedRecord {
+    pub kind: &'static str,
+    pub source: &'static str,
+    pub external_id: String,
+    pub username: String,
+    pub upn: String,
+    pub email: String,
+    pub display_name: String,
+    pub first_name: String,
+    pub last_name: String,
+    pub department: String,
+    pub title: String,
+    pub groups: Vec<String>,
+    pub account_enabled: bool,
+}
+
 impl WorldState {
     pub fn new(asset_count: usize) -> Self {
         Self::with_domain(asset_count, "corp.local")
@@ -873,6 +900,44 @@ impl WorldState {
         &self.entities
     }
 
+    /// Identity records for the fleet's real (non-service) users — one per
+    /// `gen_user(i)` over the workstation+laptop population. Push these as
+    /// `nano_enrich` records to seed `user_registry`; a subsequent blast then
+    /// produces logs whose `.user` matches the dict key and enriches. NAN-1154.
+    pub fn identity_roster(&self) -> Vec<IdentitySeedRecord> {
+        let user_count = self.workstation_count + self.laptop_count;
+        (0..user_count)
+            .map(|idx| {
+                let first = FIRST_NAMES[idx % FIRST_NAMES.len()];
+                let last = LAST_NAMES[idx / FIRST_NAMES.len() % LAST_NAMES.len()];
+                let dept = DEPARTMENTS[idx % DEPARTMENTS.len()];
+                let title = TITLES[idx % TITLES.len()];
+                let email = format!(
+                    "{}.{}@corp.example",
+                    first.to_lowercase(),
+                    last.to_lowercase()
+                );
+                IdentitySeedRecord {
+                    kind: "identity",
+                    source: "ad",
+                    // Deterministic SID-like id, unique per user.
+                    external_id: format!("S-1-5-21-1001-{}", 1000 + idx),
+                    // EXACTLY the log's `.user` value → the user_registry_dict key.
+                    username: Self::gen_user(idx),
+                    upn: email.clone(),
+                    email,
+                    display_name: format!("{first} {last}"),
+                    first_name: first.to_string(),
+                    last_name: last.to_string(),
+                    department: dept.to_string(),
+                    title: title.to_string(),
+                    groups: vec![dept.to_string(), "All Staff".to_string()],
+                    account_enabled: true,
+                }
+            })
+            .collect()
+    }
+
     pub fn random_entity(&self) -> &Entity {
         let mut rng = rand::rng();
         self.entities.choose(&mut rng).unwrap()
@@ -886,5 +951,40 @@ impl WorldState {
 impl Default for WorldState {
     fn default() -> Self {
         Self::new(2000)
+    }
+}
+
+#[cfg(test)]
+mod identity_roster_tests {
+    use super::WorldState;
+    use std::collections::HashSet;
+
+    /// NAN-1154: every seeded identity's username MUST be a real fleet user
+    /// (= gen_user(i)) so a blast's logs (whose `.user` is a fleet user) match
+    /// the seeded user_registry rows and enrich. The roster is also the right
+    /// size (one per workstation+laptop user) with required fields populated.
+    #[test]
+    fn roster_usernames_match_fleet_users() {
+        let world = WorldState::new(200);
+        let fleet_users: HashSet<&str> =
+            world.entities().iter().map(|e| e.user.as_str()).collect();
+
+        let roster = world.identity_roster();
+        assert_eq!(roster.len(), world.workstation_count + world.laptop_count);
+        assert!(!roster.is_empty());
+
+        for rec in &roster {
+            assert!(
+                fleet_users.contains(rec.username.as_str()),
+                "seeded username {:?} is not a fleet user — logs would never match it",
+                rec.username
+            );
+            assert!(rec.username.starts_with(r"CORP\"));
+            assert!(!rec.external_id.is_empty());
+            assert!(rec.email.contains('@'));
+            assert_eq!(rec.kind, "identity");
+            assert_eq!(rec.source, "ad");
+            assert!(rec.account_enabled);
+        }
     }
 }

@@ -16,16 +16,38 @@ impl ClickHouseExecutor {
     /// Returns true if a query was found and killed, false if no matching query was running.
     /// Uses KILL QUERY SYNC to wait for the query to actually stop.
     pub async fn cancel_query(&self, query_id: &str) -> Result<bool, SearchError> {
-        // Escape single quotes in the query_id to prevent SQL injection
-        let escaped_id = query_id.replace('\'', "''");
+        let ids = [query_id.to_string()];
+        self.cancel_queries(&ids).await
+    }
 
-        // Check if the query is still running
+    /// Cancel a set of running queries by their EXACT query_ids in one round trip.
+    ///
+    /// NAN-1428: one search fans out to a data query plus derived companions
+    /// (`{id}-count` / `{id}-hist` / `{id}-fstats`); cancel must kill all of
+    /// them. Exact-match `IN` is used deliberately instead of a
+    /// `LIKE '{id}%'` pattern — client-provided request ids can legitimately
+    /// contain `%`/`_`, which would wildcard a LIKE and kill unrelated queries.
+    ///
+    /// Returns true if at least one of the queries was found running and killed.
+    pub async fn cancel_queries(&self, query_ids: &[String]) -> Result<bool, SearchError> {
+        if query_ids.is_empty() {
+            return Ok(false);
+        }
+
+        // Escape single quotes in each id to prevent SQL injection
+        let id_list = query_ids
+            .iter()
+            .map(|id| format!("'{}'", id.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // Check if any of the queries are still running
         let check_sql = format!(
-            "SELECT count() as cnt FROM system.processes WHERE query_id = '{}'",
-            escaped_id
+            "SELECT count() as cnt FROM system.processes WHERE query_id IN ({})",
+            id_list
         );
 
-        debug!("Checking if query is running: {}", check_sql);
+        debug!("Checking if queries are running: {}", check_sql);
 
         let mut cursor = self
             .client
@@ -34,8 +56,14 @@ impl ClickHouseExecutor {
             .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
 
         let mut response_bytes = Vec::new();
-        while let Ok(Some(chunk)) = cursor.next().await {
-            response_bytes.extend_from_slice(&chunk);
+        // Propagate a mid-stream Err instead of treating it as EOF — a failed
+        // check would otherwise read as "not running" and silently skip the KILL.
+        loop {
+            match cursor.next().await {
+                Ok(Some(chunk)) => response_bytes.extend_from_slice(&chunk),
+                Ok(None) => break,
+                Err(e) => return Err(parse_clickhouse_error(&e.to_string())),
+            }
         }
 
         let response_str = String::from_utf8(response_bytes).map_err(|e| {
@@ -45,22 +73,21 @@ impl ClickHouseExecutor {
             )))
         })?;
 
-        let is_running = response_str
+        let running_count = response_str
             .lines()
             .next()
             .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .and_then(|v| v.get("cnt")?.as_u64())
-            .unwrap_or(0)
-            > 0;
+            .unwrap_or(0);
 
-        if !is_running {
-            debug!("Query {} is not running", query_id);
+        if running_count == 0 {
+            debug!("None of the queries {:?} are running", query_ids);
             return Ok(false);
         }
 
-        // Kill the query synchronously
-        let kill_sql = format!("KILL QUERY WHERE query_id = '{}' SYNC", escaped_id);
-        info!("Killing query: {}", kill_sql);
+        // Kill all matching queries synchronously
+        let kill_sql = format!("KILL QUERY WHERE query_id IN ({}) SYNC", id_list);
+        info!("Killing {} running queries: {}", running_count, kill_sql);
 
         self.client
             .query(&kill_sql)
@@ -68,7 +95,7 @@ impl ClickHouseExecutor {
             .await
             .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
 
-        info!("Successfully killed query {}", query_id);
+        info!("Successfully killed queries {:?}", query_ids);
         Ok(true)
     }
 
@@ -139,7 +166,16 @@ impl ClickHouseExecutor {
 
     /// Quick count query to estimate dataset size for sampling decisions
     /// Returns approximate count, or 0 on error
-    pub async fn quick_count(&self, base_sql: &str) -> Result<u64, SearchError> {
+    ///
+    /// NAN-1428: `query_id` / `settings` tag the streaming path's count
+    /// companion (`{request_id}-count`) so cancel kills it and per-priority
+    /// limits bound it.
+    pub async fn quick_count(
+        &self,
+        base_sql: &str,
+        query_id: Option<&str>,
+        settings: Option<&crate::search::admission::ClickHouseQuerySettings>,
+    ) -> Result<u64, SearchError> {
         // Extract FROM and WHERE clauses from base SQL
         let base_upper = base_sql.to_uppercase();
         let from_pos = base_upper.find(" FROM ").unwrap_or(0);
@@ -162,12 +198,11 @@ impl ClickHouseExecutor {
         debug!("Quick count SQL: {}", count_sql);
 
         let escaped_sql = escape_question_marks_in_strings(&count_sql);
-        let result = self
-            .client
-            .query(&escaped_sql)
-            .fetch_one::<u64>()
-            .await
-            .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
+        let result =
+            super::types::with_query_options(self.client.query(&escaped_sql), query_id, settings)
+                .fetch_one::<u64>()
+                .await
+                .map_err(|e| parse_clickhouse_error(&e.to_string()))?;
 
         Ok(result)
     }

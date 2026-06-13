@@ -105,27 +105,37 @@ fn ocsf_where_src_ip_hits_promoted_column() {
     );
 }
 
-/// The ambiguous `user` token maps to the manifest's primary choice
-/// (`user.name`), not the bare `user` that CH silently resolves to the session
-/// username.
+/// The ambiguous `user` token resolves to a real OCSF column, not the bare
+/// `user` that CH silently resolves to the session username. Since NAN-1333 the
+/// class-split concept lands on the indexed unified column (`user_unified`,
+/// which materializes the `user.name` / `actor.user.name` union) rather than
+/// the manifest primary `user.name` alone — this assertion drifted and is
+/// updated to pin the unified form (same union, index-served; see the
+/// `GROUP BY user_unified` pin in clickhouse_sql_gen.rs unit tests).
 #[test]
-fn ocsf_user_maps_to_user_name() {
+fn ocsf_user_maps_to_unified_user_column() {
     let sql = ocsf("* | stats count by user");
     assert!(
-        sql.contains("user.name"),
-        "OCSF `stats by user` must resolve to user.name.\nSQL:\n{sql}"
+        sql.contains("user_unified"),
+        "OCSF `stats by user` must resolve to the unified user column (NAN-1333).\nSQL:\n{sql}"
     );
 }
 
-/// An UNMAPPED UDM field under OCSF degrades to a JSONExtract from the `event`
-/// tail (graceful empty result), NOT a bare reference that 500s. `status_code`
+/// An UNMAPPED UDM field under OCSF degrades to a read from the `event` tail
+/// (graceful empty result), NOT a bare reference that 500s. `status_code`
 /// has no OCSF mapping — the manifest maps `http_status_code` → `http_response.code`.
+/// NAN-1426: the tail read is native subcolumn access (the ''-defaulting
+/// multiIf string form), no longer `JSONExtractString(event, …)` which
+/// re-serialized the whole event per row.
 #[test]
 fn ocsf_unmapped_field_degrades_to_json_extract() {
     let sql = ocsf("* | stats count by status_code");
     assert!(
-        sql.contains("JSONExtractString(event, 'status_code')"),
-        "OCSF unmapped `status_code` must JSONExtract from event (graceful), not emit a bare 500.\nSQL:\n{sql}"
+        sql.contains(
+            "multiIf(isNotNull(event.\"status_code\"), toString(event.\"status_code\"), \
+             toJSONString(event.^\"status_code\") != '{}', toJSONString(event.^\"status_code\"), '')"
+        ) && !sql.contains("JSONExtractString(event"),
+        "OCSF unmapped `status_code` must read the event tail via subcolumn access (graceful), not emit a bare 500.\nSQL:\n{sql}"
     );
 }
 

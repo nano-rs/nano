@@ -5,10 +5,14 @@ use super::*;
 impl SearchService {
     /// Generate histogram data for a piped query
     /// Extracts the base filter (before any pipe commands) and generates time buckets
+    ///
+    /// NAN-1428: `query_id` should be the derived `{request_id}-hist` id so
+    /// the companion is killable by `KILL QUERY` alongside the data query.
     pub(crate) async fn generate_histogram(
         &self,
         query: &str,
         time_range: &TimeRangeInput,
+        query_id: Option<&str>,
     ) -> Result<Vec<HistogramBucket>, SearchError> {
         // Extract base filter (everything before the first pipe command)
         let base_query = extract_base_query(query);
@@ -29,7 +33,7 @@ impl SearchService {
         // Calculate appropriate bucket interval based on time range
         let duration_secs = (time_range.end - time_range.start).num_seconds();
 
-        self.generate_clickhouse_histogram(&parsed, &tr, duration_secs)
+        self.generate_clickhouse_histogram(&parsed, &tr, duration_secs, query_id)
             .await
     }
 
@@ -39,6 +43,7 @@ impl SearchService {
         query: &Query,
         time_range: &TimeRange,
         duration_secs: i64,
+        query_id: Option<&str>,
     ) -> Result<Vec<HistogramBucket>, SearchError> {
         // Verify ClickHouse client is configured
         if self.ch_client.is_none() {
@@ -97,7 +102,7 @@ impl SearchService {
 
         // Execute the query using dynamic JSON parsing
         let mut histogram = self
-            .execute_clickhouse_histogram_query(&histogram_sql)
+            .execute_clickhouse_histogram_query(&histogram_sql, query_id)
             .await?;
 
         // Fill in missing buckets with zero counts to show the complete time range
@@ -107,9 +112,14 @@ impl SearchService {
     }
 
     /// Execute a ClickHouse histogram query and parse results dynamically
+    ///
+    /// NAN-1428: carries the derived companion query_id (when given) and the
+    /// resolved per-priority settings from the admission-controlled path, so
+    /// the companion is cancellable and bounded like the data query.
     async fn execute_clickhouse_histogram_query(
         &self,
         sql: &str,
+        query_id: Option<&str>,
     ) -> Result<Vec<HistogramBucket>, SearchError> {
         let ch_client = self.ch_client.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
@@ -122,15 +132,34 @@ impl SearchService {
         let escaped_sql = escape_question_marks_in_strings(sql);
 
         // Use fetch_bytes with JSONEachRow format
-        let mut cursor = ch_client
-            .query(&escaped_sql)
-            .fetch_bytes("JSONEachRow")
-            .map_err(|e| SearchError::DatabaseError(sqlx::Error::Protocol(e.to_string())))?;
+        let mut cursor = execution::clickhouse_executor::with_query_options(
+            ch_client.query(&escaped_sql),
+            query_id,
+            self.active_ch_settings.as_ref(),
+        )
+        .fetch_bytes("JSONEachRow")
+        .map_err(|e| SearchError::DatabaseError(sqlx::Error::Protocol(e.to_string())))?;
 
-        // Collect all bytes from the cursor
+        // Collect all bytes from the cursor.
+        //
+        // NAN-1429 (E5): must distinguish a stream Err from end-of-stream. The
+        // old `while let Ok(Some(chunk))` treated a mid-stream ClickHouse error
+        // (e.g. the execution-time cap firing on a full-range scan) as EOF, so
+        // partial/empty buckets flowed into `fill_histogram_gaps`, which
+        // zero-filled them into a confidently wrong all-zero timeline next to
+        // real result rows. Same fix NAN-1160/1177 applied to count/field-stats.
+        // Both histogram call sites wrap in match{Ok/Err→None}, so propagating
+        // yields histogram:null plus a logged warning.
         let mut response_bytes = Vec::new();
-        while let Ok(Some(chunk)) = cursor.next().await {
-            response_bytes.extend_from_slice(&chunk);
+        loop {
+            match cursor.next().await {
+                Ok(Some(chunk)) => response_bytes.extend_from_slice(&chunk),
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::warn!("Histogram query failed mid-stream: {}", e);
+                    return Err(parse_clickhouse_error(&e.to_string()));
+                }
+            }
         }
 
         // Parse JSONEachRow format
@@ -159,6 +188,27 @@ impl SearchService {
             .collect();
 
         Ok(histogram)
+    }
+
+    /// Test-only seam (NAN-1436): run the real nPL histogram path with
+    /// explicitly forced per-query ClickHouse settings.
+    ///
+    /// `generate_histogram` is `pub(crate)` and `active_ch_settings` is only
+    /// set by the admission-controlled path (whose per-priority settings are
+    /// fixed), so the forced-error regression test for the NAN-1429 read-loop
+    /// fix — which must drive `execute_clickhouse_histogram_query` into a real
+    /// ClickHouse stream error — cannot reach this code through the public
+    /// API. This wrapper is the smallest surface that exercises the actual
+    /// fixed loop with a real cursor; it is not part of the supported API.
+    #[doc(hidden)]
+    pub async fn histogram_with_forced_ch_settings(
+        &mut self,
+        query: &str,
+        time_range: &TimeRangeInput,
+        settings: crate::search::admission::ClickHouseQuerySettings,
+    ) -> Result<Vec<HistogramBucket>, SearchError> {
+        self.active_ch_settings = Some(settings);
+        self.generate_histogram(query, time_range, None).await
     }
 
     /// Generate histogram for a time range (used for raw SQL queries)
@@ -232,7 +282,7 @@ impl SearchService {
 
         // Execute query and fill gaps
         let mut histogram = self
-            .execute_clickhouse_histogram_query(&histogram_sql)
+            .execute_clickhouse_histogram_query(&histogram_sql, None)
             .await?;
 
         // Convert TimeRangeInput to TimeRange for fill_histogram_gaps

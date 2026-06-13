@@ -386,6 +386,7 @@ mod tests {
         let all_funcs = [
             AggFunc::Count,
             AggFunc::Dc,
+            AggFunc::EstDc,
             AggFunc::Sum,
             AggFunc::Avg,
             AggFunc::Min,
@@ -411,6 +412,7 @@ mod tests {
             match f {
                 AggFunc::Count
                 | AggFunc::Dc
+                | AggFunc::EstDc
                 | AggFunc::Sum
                 | AggFunc::Avg
                 | AggFunc::Min

@@ -243,6 +243,10 @@ export interface FieldStatsRequest {
   query: string;
   start: string;
   end: string;
+  /** Search request id — the server derives `{request_id}-fstats` so cancelling the search kills the stats query too (NAN-1428) */
+  request_id?: string;
+  /** Column subset to compute stats for; omit for the full table inventory (NAN-1427) */
+  columns?: string[];
 }
 
 export interface FieldStatsResponse {

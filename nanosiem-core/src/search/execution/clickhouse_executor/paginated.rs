@@ -68,10 +68,14 @@ impl ClickHouseExecutor {
             // For first page with few results (< limit), the count query result is
             // discarded in favor of the exact row count, but the parallel execution
             // avoids the worst case where data finishes fast and count adds 200ms+.
+            //
+            // NAN-1428: the companion carries the derived `{query_id}-count` id so
+            // cancellation kills it together with the data query.
             let count_sql = build_count_query(sql);
+            let count_qid = format!("{query_id}-count");
             let (results, count_result) = tokio::join!(
                 self.execute_dynamic_query_with_query_id(&paginated_sql, query_id),
-                self.execute_count_query(&count_sql)
+                self.execute_count_query_with_options(&count_sql, Some(&count_qid), None)
             );
             let results = results?;
             let total_count = if results.len() < limit && offset == 0 {
@@ -123,10 +127,13 @@ impl ClickHouseExecutor {
 
             let paginated_sql = inject_limit_offset(sql, limit, offset);
 
+            // NAN-1428: derived id + the same per-priority settings for the
+            // count companion (settings change no result rows).
             let count_sql = build_count_query(sql);
+            let count_qid = format!("{query_id}-count");
             let (results, count_result) = tokio::join!(
                 self.execute_dynamic_query_with_settings(&paginated_sql, query_id, settings),
-                self.execute_count_query(&count_sql)
+                self.execute_count_query_with_options(&count_sql, Some(&count_qid), Some(settings))
             );
             let results = results?;
             let total_count = if results.len() < limit && offset == 0 {

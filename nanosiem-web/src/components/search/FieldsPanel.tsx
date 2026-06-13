@@ -57,6 +57,10 @@ interface FieldsPanelProps {
   query?: string;
   timeRange?: { start: string; end: string };
   onFetchFieldValues?: (field: string, query: string, start: string, end: string) => Promise<{ values: FieldValueInfo[]; total_count: number }>;
+  // NAN-1427: the server stats were computed over a reduced column set
+  // (visible + pinned columns); offer "Index all fields" to fetch the rest.
+  isReducedFieldSet?: boolean;
+  onLoadAllFields?: () => void;
 }
 
 const INITIAL_VALUES_SHOWN = 10;
@@ -74,8 +78,13 @@ const SELECTED_FIELDS_UDM = new Set([
   'src_host',
   'dest_ip',
   'dest_host',
+  'dest_port',
+  'protocol',
   'user',
   'event_type',
+  'process_name',
+  'command_line',
+  'auth_result',
   'timestamp',
   '_time',
 ]);
@@ -85,12 +94,24 @@ const SELECTED_FIELDS_OCSF = new Set([
   'time_dt',
   'class_uid',
   'activity',
+  'severity',
   'src_endpoint.ip',
   'dst_endpoint.ip',
+  'dst_endpoint.port',
   'user.name',
   'actor.user.name',
+  'actor.process.name',
+  'actor.process.cmd_line',
   'status',
 ]);
+
+// NAN-1427: pinned columns always included in the reduced field-stats request
+// so the "Selected" section stays complete. Union of both schemas — the server
+// intersects with the live table inventory, so the other schema's names are
+// dropped harmlessly.
+export const FIELD_STATS_PINNED_COLUMNS: string[] = Array.from(
+  new Set([...SELECTED_FIELDS_UDM, ...SELECTED_FIELDS_OCSF])
+);
 
 function SectionHdr({ label, count }: { label: string; count: number }) {
   return (
@@ -117,6 +138,8 @@ export function FieldsPanel({
   query,
   timeRange,
   onFetchFieldValues,
+  isReducedFieldSet = false,
+  onLoadAllFields,
 }: FieldsPanelProps) {
   const [searchTerm, setSearchTerm] = useState('');
   const [openMenuKey, setOpenMenuKey] = useState<string | null>(null);
@@ -147,7 +170,10 @@ export function FieldsPanel({
         onFetchFieldValues(field, query, timeRange.start, timeRange.end)
           .then(response => {
             setServerFieldValues(prev => new Map(prev).set(field, {
-              values: response.values,
+              // Empty string is "field absent", not a value — don't render
+              // "-" rows (percentages stay server-relative: "X% of all
+              // matching events", which remains honest after the drop).
+              values: response.values.filter(v => v.value !== ''),
               loading: false
             }));
           })
@@ -277,8 +303,8 @@ export function FieldsPanel({
                   onClick={() => onToggleField(stat.field)}
                 >
                   <span className={cn(
-                    'text-[10px] w-2 inline-block transition-transform shrink-0',
-                    isOpen ? 'text-primary rotate-90' : 'text-muted-foreground/50'
+                    'text-[14px] leading-none w-3 inline-block text-center transition-transform shrink-0',
+                    isOpen ? 'text-primary rotate-90' : 'text-muted-foreground/70'
                   )}>›</span>
                   <span className="flex-1 whitespace-nowrap overflow-hidden text-ellipsis">{stat.field}</span>
                   <span
@@ -443,6 +469,52 @@ export function FieldsPanel({
                     <SectionHdr label="Available" count={availableStats.length} />
                     {availableStats.map(renderRow)}
                   </>
+                )}
+                {isReducedFieldSet && onLoadAllFields && (
+                  /* Teaser for the unindexed remainder (NAN-1427 reduced
+                     fetch): ghost rows fading out signal "more fields
+                     below", with the load affordance floating over the
+                     fade. Ghosts pulse while the full-inventory fetch is
+                     in flight (isLoadingMore). */
+                  <div className="relative mt-1 pb-1">
+                    <div
+                      aria-hidden
+                      className="px-1 pt-0.5 [mask-image:linear-gradient(to_bottom,black_20%,transparent)]"
+                    >
+                      {[68, 46, 72].map((w, i) => (
+                        <div
+                          key={w}
+                          className={`flex items-center justify-between gap-8 py-[7px] ${
+                            isLoadingMore ? 'animate-pulse' : ''
+                          }`}
+                          style={{ opacity: 0.65 - i * 0.2 }}
+                        >
+                          <span
+                            className="h-[7px] rounded-full bg-foreground/15"
+                            style={{ width: `${w}%` }}
+                          />
+                          <span className="h-[7px] w-7 rounded-full bg-foreground/10" />
+                        </div>
+                      ))}
+                    </div>
+                    <div className="absolute inset-x-0 bottom-0 flex justify-center">
+                      {isLoadingMore ? (
+                        <span className="inline-flex items-center gap-1.5 font-mono text-[10.5px] text-muted-foreground bg-card border border-border rounded-md px-2.5 py-1">
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                          Indexing fields…
+                        </span>
+                      ) : (
+                        <button
+                          onClick={onLoadAllFields}
+                          title="Stats currently cover the columns in your results — load stats for every table column"
+                          className="inline-flex items-center gap-1.5 font-mono text-[10.5px] text-foreground bg-card border border-border-2 rounded-md px-2.5 py-1 hover:border-primary/50 hover:text-primary transition-colors"
+                        >
+                          <ChevronDown className="w-3 h-3" />
+                          Show all fields
+                        </button>
+                      )}
+                    </div>
+                  </div>
                 )}
               </>
             );

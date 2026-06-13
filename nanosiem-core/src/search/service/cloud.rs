@@ -529,27 +529,41 @@ impl SearchService {
             }
         };
 
+        // NAN-1429 sweep: the event list feeds the investigation view — a
+        // mid-stream ClickHouse error must propagate instead of being read as
+        // EOF (which silently truncated the events with no warning).
         let events_future = async {
-            let mut events: Vec<serde_json::Value> = Vec::new();
-            let mut cursor = match clickhouse.query(&events_sql).fetch_bytes("JSONEachRow") {
-                Ok(c) => c,
-                Err(e) => {
+            let mut cursor = clickhouse
+                .query(&events_sql)
+                .fetch_bytes("JSONEachRow")
+                .map_err(|e| {
                     tracing::warn!("Cloud events query failed: {}", e);
-                    return events;
-                }
-            };
+                    parse_clickhouse_error(&e.to_string())
+                })?;
             let mut response_bytes = Vec::new();
-            while let Ok(Some(chunk)) = cursor.next().await {
-                response_bytes.extend_from_slice(&chunk);
+            loop {
+                match cursor.next().await {
+                    Ok(Some(chunk)) => response_bytes.extend_from_slice(&chunk),
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::warn!("Cloud events query failed mid-stream: {}", e);
+                        return Err(parse_clickhouse_error(&e.to_string()));
+                    }
+                }
             }
-            if let Ok(response_str) = String::from_utf8(response_bytes) {
-                events = response_str
+            let response_str = String::from_utf8(response_bytes).map_err(|e| {
+                SearchError::DatabaseError(sqlx::Error::Protocol(format!(
+                    "Invalid UTF-8 in cloud events response: {}",
+                    e
+                )))
+            })?;
+            Ok::<Vec<serde_json::Value>, SearchError>(
+                response_str
                     .lines()
                     .filter(|line| !line.is_empty())
                     .filter_map(|line| serde_json::from_str(line).ok())
-                    .collect();
-            }
-            events
+                    .collect(),
+            )
         };
 
         let count_future = async {
@@ -744,6 +758,7 @@ impl SearchService {
             mfa_future,
             user_activity_future
         );
+        let events = events?;
 
         // Build facet summary from UNION ALL results
         let mut summary = serde_json::Map::new();
@@ -1120,31 +1135,44 @@ impl SearchService {
             }
         };
 
+        // NAN-1429 sweep: propagate mid-stream errors instead of silently
+        // truncating the event page (see build_cloud_view's events_future).
         let events_future = async {
-            let mut events: Vec<serde_json::Value> = Vec::new();
             let mut q = clickhouse.query(&events_sql);
             for val in &filter_bind_values {
                 q = q.bind(val);
             }
-            let mut cursor = match q.fetch_bytes("JSONEachRow") {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("Cloud paginated events query failed: {}", e);
-                    return events;
-                }
-            };
+            let mut cursor = q.fetch_bytes("JSONEachRow").map_err(|e| {
+                tracing::warn!("Cloud paginated events query failed: {}", e);
+                parse_clickhouse_error(&e.to_string())
+            })?;
             let mut response_bytes = Vec::new();
-            while let Ok(Some(chunk)) = cursor.next().await {
-                response_bytes.extend_from_slice(&chunk);
+            loop {
+                match cursor.next().await {
+                    Ok(Some(chunk)) => response_bytes.extend_from_slice(&chunk),
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Cloud paginated events query failed mid-stream: {}",
+                            e
+                        );
+                        return Err(parse_clickhouse_error(&e.to_string()));
+                    }
+                }
             }
-            if let Ok(response_str) = String::from_utf8(response_bytes) {
-                events = response_str
+            let response_str = String::from_utf8(response_bytes).map_err(|e| {
+                SearchError::DatabaseError(sqlx::Error::Protocol(format!(
+                    "Invalid UTF-8 in cloud paginated events response: {}",
+                    e
+                )))
+            })?;
+            Ok::<Vec<serde_json::Value>, SearchError>(
+                response_str
                     .lines()
                     .filter(|line| !line.is_empty())
                     .filter_map(|line| serde_json::from_str(line).ok())
-                    .collect();
-            }
-            events
+                    .collect(),
+            )
         };
 
         let count_future = async {
@@ -1276,6 +1304,7 @@ impl SearchService {
             resources_future,
             user_activity_future
         );
+        let events = events?;
 
         // Build CloudFacets from UNION ALL results
         let mut facets = CloudFacets::default();
@@ -1403,31 +1432,44 @@ impl SearchService {
             base_cte
         );
 
+        // NAN-1429 sweep: propagate mid-stream errors instead of silently
+        // truncating the timeline (see build_cloud_view's events_future).
         let events_future = async {
-            let mut events: Vec<serde_json::Value> = Vec::new();
             let mut q = clickhouse.query(&events_sql);
             if user_bound {
                 q = q.bind(&user_bind);
             }
-            let mut cursor = match q.fetch_bytes("JSONEachRow") {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("Cloud user timeline events query failed: {}", e);
-                    return events;
-                }
-            };
+            let mut cursor = q.fetch_bytes("JSONEachRow").map_err(|e| {
+                tracing::warn!("Cloud user timeline events query failed: {}", e);
+                parse_clickhouse_error(&e.to_string())
+            })?;
             let mut response_bytes = Vec::new();
-            while let Ok(Some(chunk)) = cursor.next().await {
-                response_bytes.extend_from_slice(&chunk);
+            loop {
+                match cursor.next().await {
+                    Ok(Some(chunk)) => response_bytes.extend_from_slice(&chunk),
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Cloud user timeline events query failed mid-stream: {}",
+                            e
+                        );
+                        return Err(parse_clickhouse_error(&e.to_string()));
+                    }
+                }
             }
-            if let Ok(response_str) = String::from_utf8(response_bytes) {
-                events = response_str
+            let response_str = String::from_utf8(response_bytes).map_err(|e| {
+                SearchError::DatabaseError(sqlx::Error::Protocol(format!(
+                    "Invalid UTF-8 in cloud user timeline response: {}",
+                    e
+                )))
+            })?;
+            Ok::<Vec<serde_json::Value>, SearchError>(
+                response_str
                     .lines()
                     .filter(|line| !line.is_empty())
                     .filter_map(|line| serde_json::from_str(line).ok())
-                    .collect();
-            }
-            events
+                    .collect(),
+            )
         };
 
         let summary_future = async {
@@ -1492,6 +1534,7 @@ impl SearchService {
         };
 
         let (events, summary) = tokio::join!(events_future, summary_future);
+        let events = events?;
 
         tracing::info!(
             "Cloud user timeline for '{}': {} events, {} risk indicators",
@@ -1665,31 +1708,44 @@ impl SearchService {
             base_cte, entity_filter
         );
 
+        // NAN-1429 sweep: propagate mid-stream errors instead of silently
+        // truncating the pivot events (see build_cloud_view's events_future).
         let events_future = async {
-            let mut events: Vec<serde_json::Value> = Vec::new();
             let mut q = clickhouse.query(&events_sql);
             for val in &entity_binds {
                 q = q.bind(val);
             }
-            let mut cursor = match q.fetch_bytes("JSONEachRow") {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("Cloud entity pivot events query failed: {}", e);
-                    return events;
-                }
-            };
+            let mut cursor = q.fetch_bytes("JSONEachRow").map_err(|e| {
+                tracing::warn!("Cloud entity pivot events query failed: {}", e);
+                parse_clickhouse_error(&e.to_string())
+            })?;
             let mut response_bytes = Vec::new();
-            while let Ok(Some(chunk)) = cursor.next().await {
-                response_bytes.extend_from_slice(&chunk);
+            loop {
+                match cursor.next().await {
+                    Ok(Some(chunk)) => response_bytes.extend_from_slice(&chunk),
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Cloud entity pivot events query failed mid-stream: {}",
+                            e
+                        );
+                        return Err(parse_clickhouse_error(&e.to_string()));
+                    }
+                }
             }
-            if let Ok(response_str) = String::from_utf8(response_bytes) {
-                events = response_str
+            let response_str = String::from_utf8(response_bytes).map_err(|e| {
+                SearchError::DatabaseError(sqlx::Error::Protocol(format!(
+                    "Invalid UTF-8 in cloud entity pivot response: {}",
+                    e
+                )))
+            })?;
+            Ok::<Vec<serde_json::Value>, SearchError>(
+                response_str
                     .lines()
                     .filter(|line| !line.is_empty())
                     .filter_map(|line| serde_json::from_str(line).ok())
-                    .collect();
-            }
-            events
+                    .collect(),
+            )
         };
 
         let xref_future = async {
@@ -1742,6 +1798,7 @@ impl SearchService {
 
         let (events, cross_references, entity_summary) =
             tokio::join!(events_future, xref_future, summary_future);
+        let events = events?;
 
         tracing::info!(
             "Cloud entity pivot for {}='{}': {} events, {} cross-refs",

@@ -116,6 +116,36 @@ impl Transport {
     }
 }
 
+/// Send a batch of pre-shaped JSON records as NDJSON under a fixed
+/// `X-Source-Type` (e.g. `nano_enrich` for enrichment-lane records, NAN-1154).
+/// Unlike `send_event`, the records aren't `Event`s — they're arbitrary
+/// serializable payloads (e.g. identity seed records). Vector transport only.
+pub async fn send_json_records<T: serde::Serialize>(
+    client: &Client,
+    transport: &Transport,
+    source_type: &str,
+    records: &[T],
+) -> Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let body: String = records
+        .iter()
+        .map(|r| serde_json::to_string(r).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut req = client
+        .post(transport.url())
+        .header("Content-Type", "application/x-ndjson")
+        .header("X-Source-Type", source_type)
+        .body(body);
+    if let Some(t) = transport.token() {
+        req = req.bearer_auth(t);
+    }
+    req.send().await?.error_for_status()?;
+    Ok(())
+}
+
 /// Send a single event over the configured transport.
 pub async fn send_event(client: &Client, transport: &Transport, event: &Event) -> Result<()> {
     match transport {

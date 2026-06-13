@@ -353,8 +353,8 @@ export function useExplainQuery() {
 
 export function useFieldStats() {
   return useMutation(
-    ({ query, start, end }: { query: string; start: string; end: string }) =>
-      api.getFieldStats({ query, start, end })
+    (request: import('@/lib/api/types').FieldStatsRequest) =>
+      api.getFieldStats(request)
   );
 }
 

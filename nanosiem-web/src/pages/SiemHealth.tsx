@@ -902,6 +902,72 @@ function IngestionDetail({
   const total = metrics.total_events_24h;
   const prior = metrics.total_events_prior_24h;
   const delta = prior > 0 ? Math.round(((total - prior) / prior) * 100) : null;
+  // NAN-1405: insert-path integrity signals (NAN-1404 silent-loss probes).
+  // Optional — reports stored before NAN-1405 lack the block; hidden when the
+  // probes could not run (missing system-table grants).
+  const ii = metrics.insert_integrity;
+  const insertsWithoutParts =
+    !!ii && ii.logs_inserts_1h >= 10 && ii.new_parts_1h === 0;
+  // NAN-1407: failing/stale dict-staging refreshes — stale enrichment, not
+  // loss (rows keep landing with the last good snapshot).
+  const staleRefreshes = ii?.stale_dict_refreshes ?? [];
+  const integrityRows: Array<{
+    key: string;
+    label: string;
+    value: string;
+    bad: boolean;
+  }> =
+    ii && ii.probes_available
+      ? [
+          {
+            key: 'failed-dicts',
+            label: 'FAILED enrichment dictionaries',
+            value:
+              ii.failed_logs_dictionaries.length > 0
+                ? ii.failed_logs_dictionaries.map((d) => d.name).join(', ')
+                : 'none',
+            bad: ii.failed_logs_dictionaries.length > 0,
+          },
+          {
+            key: 'inserts-vs-parts',
+            label: 'INSERTs vs new parts on disk (1h)',
+            value: `${ii.logs_inserts_1h.toLocaleString()} inserts · ${ii.new_parts_1h.toLocaleString()} parts`,
+            bad: insertsWithoutParts,
+          },
+          ...(ii.async_insert_failures_1h !== null
+            ? [
+                {
+                  key: 'flush-failures',
+                  label: 'Async-insert flush failures (1h)',
+                  value: ii.async_insert_failures_1h.toLocaleString(),
+                  bad: ii.async_insert_failures_1h > 0,
+                },
+              ]
+            : []),
+          {
+            key: 'oom',
+            label: 'MEMORY_LIMIT_EXCEEDED (24h)',
+            value: ii.memory_limit_errors.toLocaleString(),
+            bad: ii.memory_limit_errors > 0,
+          },
+          {
+            key: 'dict-update-fail',
+            label: 'CACHE_DICTIONARY_UPDATE_FAIL (24h)',
+            value: ii.cache_dictionary_update_fails.toLocaleString(),
+            bad: ii.cache_dictionary_update_fails > 0,
+          },
+          {
+            key: 'stale-dict-refresh',
+            label: 'Stale dictionary refreshes (staging MVs)',
+            value:
+              staleRefreshes.length > 0
+                ? staleRefreshes.map((r) => r.view).join(', ')
+                : 'none',
+            bad: staleRefreshes.length > 0,
+          },
+        ]
+      : [];
+  const integrityBadCount = integrityRows.filter((r) => r.bad).length;
   return (
     <>
       <MetricsGrid
@@ -929,6 +995,54 @@ function IngestionDetail({
           },
         ]}
       />
+      {integrityRows.length > 0 && (
+        <SubPanel
+          title="Insert integrity"
+          subtitle={
+            integrityBadCount > 0
+              ? `${integrityBadCount} storage-layer signal${integrityBadCount === 1 ? '' : 's'} firing — possible silent loss`
+              : 'storage-layer loss probes · all clear'
+          }
+        >
+          <div className="divide-y divide-border">
+            {integrityRows.map((row) => (
+              <div
+                key={row.key}
+                className="flex items-center gap-3 px-5 py-2.5 hover:bg-foreground/[.02]"
+              >
+                <span
+                  className="h-[6px] w-[6px] shrink-0 rounded-full"
+                  style={{
+                    background: row.bad ? TONE_DOT.critical : TONE_DOT.good,
+                  }}
+                />
+                <span className="flex-1 truncate text-[12px] text-foreground">
+                  {row.label}
+                </span>
+                <span
+                  className={cn(
+                    'max-w-[360px] truncate text-right font-mono text-[11px] tabular-nums',
+                    row.bad ? 'text-red-400' : 'text-muted-foreground',
+                  )}
+                  title={row.value}
+                >
+                  {row.value}
+                </span>
+              </div>
+            ))}
+            {ii?.last_async_insert_error && (
+              <div className="px-5 py-2.5">
+                <div className="mb-1 font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground">
+                  last flush exception
+                </div>
+                <div className="break-all font-mono text-[11px] text-red-400">
+                  {ii.last_async_insert_error}
+                </div>
+              </div>
+            )}
+          </div>
+        </SubPanel>
+      )}
       {metrics.silent_sources.length > 0 && (
         <SubPanel
           title="Silent sources"

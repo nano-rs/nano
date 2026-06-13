@@ -34,10 +34,19 @@ pub fn fallback_report(metrics: &CollectedMetrics) -> AnalysisResult {
     // different things — and confusing them was the bug NAN-617 fixed. A
     // fresh deployment with no setup is fine; a configured tenant whose
     // ingestion stopped is a critical outage.
-    match deployment_state(metrics) {
-        DeploymentState::Fresh => return fresh_deployment_report(),
-        DeploymentState::Stalled => return stalled_ingestion_report(metrics),
-        DeploymentState::Live => {}
+    //
+    // NAN-1405: a firing hard-critical insert-integrity signal bypasses BOTH
+    // shortcircuits. A FAILED logs dict discards every insert, so a tenant
+    // whose first events all bounced still has zero stored events — Fresh
+    // would report 100/healthy while data is actively being lost, and
+    // Stalled's generic report would bury the precise dictionary pointer the
+    // Live-path scorer and recommendations carry.
+    if !has_critical_insert_integrity(&metrics.ingestion.insert_integrity) {
+        match deployment_state(metrics) {
+            DeploymentState::Fresh => return fresh_deployment_report(),
+            DeploymentState::Stalled => return stalled_ingestion_report(metrics),
+            DeploymentState::Live => {}
+        }
     }
 
     // Simple heuristic scoring without AI
@@ -84,7 +93,10 @@ pub fn fallback_report(metrics: &CollectedMetrics) -> AnalysisResult {
             metrics.alerting.active_webhooks,
             metrics.alerting.active_routing_rules,
         ),
-        recommendations: vec![],
+        // NAN-1405: fired insert-integrity signals become explicit critical/high
+        // recommendations even without AI — silent ingestion loss must never
+        // depend on an LLM being reachable to surface.
+        recommendations: insert_integrity_recommendations(&metrics.ingestion.insert_integrity),
         dimension_details: DimensionDetails {
             ingestion: "AI analysis unavailable".to_string(),
             parsing: "AI analysis unavailable".to_string(),
@@ -224,8 +236,30 @@ fn stalled_ingestion_report(metrics: &CollectedMetrics) -> AnalysisResult {
     }
 }
 
+/// NAN-1405: true when an insert-integrity signal proves rows are being
+/// discarded right now — a FAILED dict referenced by the logs MATERIALIZED
+/// columns (every flush THROWs), or INSERTs finishing for an hour with ZERO
+/// new parts reaching disk (the exact NAN-1404 correlation that diagnosed
+/// Saturn). The >=10 floor keeps a quiet tenant's trickle from alarming on a
+/// thin window. Shared by the scorer, the recommendations, and the
+/// deployment-state bypass in `fallback_report`.
+fn has_critical_insert_integrity(ii: &InsertIntegrityMetrics) -> bool {
+    !ii.failed_logs_dictionaries.is_empty()
+        || (ii.logs_inserts_1h >= 10 && ii.new_parts_1h == 0)
+}
+
 // Simple heuristic scorers for fallback mode
 fn score_ingestion(m: &IngestionMetrics) -> i32 {
+    // NAN-1405: insert-path integrity first — these signals mean rows are
+    // being discarded RIGHT NOW, regardless of what the 24h volume windows
+    // show (during the first hours of a NAN-1404-style outage the 24h totals
+    // still look normal). Checked before the empty-source-volumes early
+    // return: a long-dead pipeline can have empty volumes AND a FAILED dict.
+    let ii = &m.insert_integrity;
+    if has_critical_insert_integrity(ii) {
+        return 5;
+    }
+
     if m.source_volumes.is_empty() {
         return 50;
     }
@@ -243,7 +277,134 @@ fn score_ingestion(m: &IngestionMetrics) -> i32 {
     } else {
         0
     };
-    (100 - silent_penalty - volume_change).clamp(0, 100)
+    // Secondary integrity tells: not proof of loss on their own, but the
+    // NAN-1404 collateral signatures — worth dragging the score down.
+    let mut integrity_penalty = 0;
+    if ii.async_insert_failures_1h.unwrap_or(0) > 0 {
+        integrity_penalty += 30;
+    }
+    if ii.memory_limit_errors > 0 {
+        integrity_penalty += 20;
+    }
+    if ii.cache_dictionary_update_fails > 0 {
+        integrity_penalty += 15;
+    }
+    // NAN-1407: a failing/stale dict-staging refresh degrades ENRICHMENT
+    // freshness, not ingestion — rows keep landing with the last good
+    // snapshot (that's the entire point of the staging indirection). Worth a
+    // visible drag, never the critical floor.
+    if !ii.stale_dict_refreshes.is_empty() {
+        integrity_penalty += 15;
+    }
+    (100 - silent_penalty - volume_change - integrity_penalty).clamp(0, 100)
+}
+
+/// Recommendations for fired insert-integrity signals (NAN-1405). Used by the
+/// heuristic fallback path; the enterprise AI analyzer sees the same metrics
+/// JSON and produces its own. Each maps a signal to the diagnostic recipe
+/// proven during NAN-1404 (dict status → part_log → system.errors).
+fn insert_integrity_recommendations(ii: &InsertIntegrityMetrics) -> Vec<Recommendation> {
+    let mut recs = Vec::new();
+    if !ii.failed_logs_dictionaries.is_empty() {
+        let dicts = ii
+            .failed_logs_dictionaries
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        recs.push(Recommendation {
+            title: format!("FAILED enrichment dictionary is halting ingestion: {dicts}"),
+            description: format!(
+                "The logs table's MATERIALIZED columns call dictGetOrDefault on {dicts}, and a \
+                 FAILED dictionary makes that call THROW on every insert flush — all incoming \
+                 batches are being discarded while every upstream ACK stays green (NAN-1404). \
+                 Inspect system.dictionaries.last_exception, fix the dictionary source, then \
+                 SYSTEM RELOAD DICTIONARY to restore ingestion."
+            ),
+            priority: "critical".to_string(),
+        });
+    }
+    if ii.logs_inserts_1h >= 10 && ii.new_parts_1h == 0 {
+        recs.push(Recommendation {
+            title: format!(
+                "{} log INSERTs in the last hour produced ZERO new parts on disk",
+                ii.logs_inserts_1h
+            ),
+            description: "INSERTs into the logs table keep finishing (the ingest chain is \
+                 ACKing), but part_log shows no new parts reaching storage — async-insert \
+                 flushes are discarding every batch (the NAN-1404 silent-loss fingerprint). \
+                 Check system.dictionaries for FAILED dictionaries, system.errors for \
+                 MEMORY_LIMIT_EXCEEDED, and system.asynchronous_insert_log for flush \
+                 exceptions."
+                .to_string(),
+            priority: "critical".to_string(),
+        });
+    }
+    if ii.async_insert_failures_1h.unwrap_or(0) > 0 {
+        let failures = ii.async_insert_failures_1h.unwrap_or(0);
+        recs.push(Recommendation {
+            title: format!("{failures} async-insert flush failures in the last hour"),
+            description: format!(
+                "system.asynchronous_insert_log recorded {failures} non-Ok flush entries — \
+                 those batches were ACKed to the sender and then dropped. Last exception: {}",
+                ii.last_async_insert_error.as_deref().unwrap_or("(none)")
+            ),
+            priority: "critical".to_string(),
+        });
+    }
+    if ii.memory_limit_errors > 0 {
+        recs.push(Recommendation {
+            title: "ClickHouse is hitting its memory limit".to_string(),
+            description: format!(
+                "system.errors shows {} MEMORY_LIMIT_EXCEEDED occurrences with activity in the \
+                 last 24h. On a memory-capped deployment this is the NAN-1404 trigger: \
+                 dictionary loads / insert flushes OOM and ingestion fails. Check dictionary \
+                 source queries and merge pressure before it escalates.",
+                ii.memory_limit_errors
+            ),
+            priority: "high".to_string(),
+        });
+    }
+    if ii.cache_dictionary_update_fails > 0 {
+        recs.push(Recommendation {
+            title: "Cache dictionary updates are failing".to_string(),
+            description: format!(
+                "system.errors shows {} CACHE_DICTIONARY_UPDATE_FAIL occurrences with activity \
+                 in the last 24h — a cache-layout dictionary (e.g. hash_prevalence_dict) cannot \
+                 refresh from its source. Inspect system.dictionaries.last_exception for the \
+                 failing dictionary.",
+                ii.cache_dictionary_update_fails
+            ),
+            priority: "high".to_string(),
+        });
+    }
+    if !ii.stale_dict_refreshes.is_empty() {
+        let views = ii
+            .stale_dict_refreshes
+            .iter()
+            .map(|r| r.view.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let detail = ii
+            .stale_dict_refreshes
+            .iter()
+            .find(|r| !r.exception.is_empty())
+            .map(|r| format!(" Last refresh exception: {}", r.exception))
+            .unwrap_or_default();
+        recs.push(Recommendation {
+            title: format!("Enrichment dictionary refresh is failing or stale: {views}"),
+            description: format!(
+                "The dictionary-staging refresh views ({views}) are failing or haven't \
+                 succeeded in over an hour (system.view_refreshes). Ingestion is NOT \
+                 affected — the dictionaries keep serving the last good staging snapshot \
+                 (NAN-1407) — but enrichment values (GeoIP/IOC/identity/prevalence) are \
+                 drifting stale. Inspect system.view_refreshes.exception, fix the \
+                 underlying source query/table, then SYSTEM REFRESH VIEW to catch up.{detail}"
+            ),
+            priority: "high".to_string(),
+        });
+    }
+    recs
 }
 
 fn score_parsing(m: &ParsingMetrics) -> i32 {
@@ -459,6 +620,7 @@ mod tests {
                 total_events_24h: 0,
                 total_events_prior_24h: 0,
                 silent_sources: vec![],
+                insert_integrity: Default::default(),
             },
             parsing: ParsingMetrics {
                 field_coverage: vec![],
@@ -591,5 +753,211 @@ mod tests {
         m.geoip_fill_pct = 10.0;
         m.asn_fill_pct = 10.0;
         assert!(score_enrichment(&m) < 50, "genuinely low geo/asn is still bad");
+    }
+
+    /// NAN-1405: a healthy ingestion fixture for the insert-integrity tests —
+    /// volumes that would score Healthy without the integrity signals.
+    fn healthy_ingestion() -> IngestionMetrics {
+        IngestionMetrics {
+            source_volumes: vec![SourceVolumeMetric {
+                source_type: "windows_event".to_string(),
+                count_24h: 1_000_000,
+                count_prior_24h: 1_000_000,
+                change_pct: 0.0,
+            }],
+            total_events_24h: 1_000_000,
+            total_events_prior_24h: 1_000_000,
+            silent_sources: vec![],
+            insert_integrity: InsertIntegrityMetrics {
+                probes_available: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn failed_logs_dict_forces_critical_ingestion_score() {
+        // NAN-1405: a FAILED dict referenced by the logs MATERIALIZED columns
+        // is a guaranteed total ingestion halt — must score critical even
+        // when the 24h volume windows still look perfectly healthy (Saturn
+        // looked "healthy" for 36 hours).
+        let mut m = healthy_ingestion();
+        m.insert_integrity.failed_logs_dictionaries = vec![FailedDictionary {
+            name: "nanosiem.ip_enrichment_dict".to_string(),
+            last_exception: "MEMORY_LIMIT_EXCEEDED".to_string(),
+        }];
+        assert!(
+            score_ingestion(&m) < 50,
+            "FAILED logs dict must be critical (got {})",
+            score_ingestion(&m)
+        );
+        let recs = insert_integrity_recommendations(&m.insert_integrity);
+        assert!(
+            recs.iter()
+                .any(|r| r.priority == "critical" && r.title.contains("ip_enrichment_dict")),
+            "must raise a critical recommendation naming the dict; got {recs:?}"
+        );
+    }
+
+    #[test]
+    fn inserts_without_new_parts_force_critical_ingestion_score() {
+        // The exact NAN-1404 correlation: INSERTs keep finishing (ACK layer
+        // green) while zero new parts reach disk. NOTE deliberately NOT keyed
+        // on written_rows — per-query async entries read written_rows=0 even
+        // when healthy (791/795 on a healthy node, verified live).
+        let mut m = healthy_ingestion();
+        m.insert_integrity.logs_inserts_1h = 452;
+        m.insert_integrity.new_parts_1h = 0;
+        assert!(
+            score_ingestion(&m) < 50,
+            "inserts-without-parts must be critical (got {})",
+            score_ingestion(&m)
+        );
+        let recs = insert_integrity_recommendations(&m.insert_integrity);
+        assert!(
+            recs.iter()
+                .any(|r| r.priority == "critical" && r.title.contains("ZERO new parts")),
+            "must raise a critical inserts-without-parts recommendation; got {recs:?}"
+        );
+
+        // ...but a quiet tenant's trickle must NOT page on a thin window.
+        let mut quiet = healthy_ingestion();
+        quiet.insert_integrity.logs_inserts_1h = 3;
+        quiet.insert_integrity.new_parts_1h = 0;
+        assert!(
+            score_ingestion(&quiet) >= 80,
+            "below the floor, a thin window is not an alarm"
+        );
+
+        // ...and inserts with parts landing is healthy operation.
+        let mut healthy = healthy_ingestion();
+        healthy.insert_integrity.logs_inserts_1h = 452;
+        healthy.insert_integrity.new_parts_1h = 6;
+        assert!(
+            score_ingestion(&healthy) >= 80,
+            "parts landing means storage is receiving data"
+        );
+    }
+
+    #[test]
+    fn secondary_integrity_tells_drag_score_down() {
+        // Flush failures + OOM counters: not the hard-critical path, but the
+        // score must reflect that the insert path is degrading.
+        let mut m = healthy_ingestion();
+        m.insert_integrity.async_insert_failures_1h = Some(7);
+        m.insert_integrity.memory_limit_errors = 204;
+        let score = score_ingestion(&m);
+        assert!(
+            score < 80,
+            "flush failures + OOM must not score Healthy (got {score})"
+        );
+        let recs = insert_integrity_recommendations(&m.insert_integrity);
+        assert!(
+            recs.iter().any(|r| r.priority == "critical"
+                && r.title.contains("flush failures")),
+            "flush failures are confirmed loss — critical; got {recs:?}"
+        );
+        assert!(
+            recs.iter()
+                .any(|r| r.priority == "high" && r.title.contains("memory limit")),
+            "OOM counter is a high-priority tell; got {recs:?}"
+        );
+    }
+
+    #[test]
+    fn stale_dict_refresh_is_high_priority_not_critical() {
+        // NAN-1407: a failing dict-staging refresh degrades ENRICHMENT
+        // freshness — rows still land with the last good snapshot (that is
+        // the entire point of the staging indirection). It must drag the
+        // score and raise a high-priority recommendation, but must NOT trip
+        // the hard-critical path reserved for proven data loss.
+        let mut m = healthy_ingestion();
+        m.insert_integrity.stale_dict_refreshes = vec![StaleDictRefresh {
+            view: "ip_enrichment_dict_refresh".to_string(),
+            exception: "Code: 241. DB::Exception: MEMORY_LIMIT_EXCEEDED".to_string(),
+            last_success_age_secs: 7200,
+        }];
+        let score = score_ingestion(&m);
+        assert!(
+            (50..90).contains(&score),
+            "stale refresh drags the score without hitting the critical floor (got {score})"
+        );
+        let recs = insert_integrity_recommendations(&m.insert_integrity);
+        let rec = recs
+            .iter()
+            .find(|r| r.title.contains("ip_enrichment_dict_refresh"))
+            .expect("must raise a recommendation naming the stale refresh view");
+        assert_eq!(
+            rec.priority, "high",
+            "staleness is degradation, not loss — never critical"
+        );
+        assert!(
+            rec.description.contains("Ingestion is NOT affected"),
+            "the rec must say rows keep landing: {}",
+            rec.description
+        );
+    }
+
+    #[test]
+    fn healthy_integrity_raises_nothing() {
+        let m = healthy_ingestion();
+        assert!(score_ingestion(&m) >= 90, "healthy fixture scores healthy");
+        assert!(
+            insert_integrity_recommendations(&m.insert_integrity).is_empty(),
+            "no integrity signals → no recommendations"
+        );
+        // async_insert_failures_1h == Some(0) (log enabled, zero failures) is
+        // healthy, distinct from None (log not enabled).
+        let mut with_log = healthy_ingestion();
+        with_log.insert_integrity.async_insert_failures_1h = Some(0);
+        assert!(insert_integrity_recommendations(&with_log.insert_integrity).is_empty());
+    }
+
+    #[test]
+    fn critical_insert_integrity_bypasses_fresh_and_stalled_shortcircuits() {
+        // NAN-1405: a tenant whose FIRST events all bounced off a FAILED dict
+        // has zero stored events and (often) no rules yet — deployment_state
+        // calls that Fresh and NAN-617's shortcircuit would report 100/healthy
+        // while data is actively being lost. The integrity-critical bypass
+        // must route it to the Live scorer instead.
+        let mut metrics = base_zero_metrics_fixture();
+        metrics.ingestion.insert_integrity = InsertIntegrityMetrics {
+            probes_available: true,
+            failed_logs_dictionaries: vec![FailedDictionary {
+                name: "nanosiem.ip_enrichment_dict".to_string(),
+                last_exception: "MEMORY_LIMIT_EXCEEDED".to_string(),
+            }],
+            ..Default::default()
+        };
+        let report = fallback_report(&metrics);
+        assert!(
+            report.ingestion_score < 50,
+            "FAILED dict on a zero-event deployment must not report healthy (got {})",
+            report.ingestion_score
+        );
+        assert!(
+            report
+                .recommendations
+                .iter()
+                .any(|r| r.priority == "critical" && r.title.contains("ip_enrichment_dict")),
+            "the dict pointer must survive into the report; got {:?}",
+            report.recommendations
+        );
+    }
+
+    #[test]
+    fn pre_nan1405_reports_deserialize_without_insert_integrity() {
+        // Reports stored before NAN-1405 lack the insert_integrity key — the
+        // serde(default) must keep them loadable.
+        let old_json = r#"{
+            "source_volumes": [],
+            "total_events_24h": 5,
+            "total_events_prior_24h": 7,
+            "silent_sources": []
+        }"#;
+        let m: IngestionMetrics =
+            serde_json::from_str(old_json).expect("pre-NAN-1405 report deserializes");
+        assert!(!m.insert_integrity.probes_available);
+        assert!(m.insert_integrity.async_insert_failures_1h.is_none());
     }
 }

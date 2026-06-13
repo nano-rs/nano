@@ -1132,3 +1132,62 @@ body {
 .rare-glow {
   filter: drop-shadow(0 0 4px color-mix(in srgb, var(--primary) 60%, transparent));
 }
+
+/* Match-highlight wipe: when a search run completes, the amber <mark>
+   highlights in results reveal left→right. Gated by the transient
+   hl-wipe class (Search.tsx sets it for ~1.5s when isSearching falls)
+   so virtualizer row remounts on scroll don't replay the animation. */
+.search-console-page.hl-wipe mark {
+  animation: hlWipe 0.5s ease-out 0.12s backwards;
+}
+@keyframes hlWipe {
+  from {
+    clip-path: inset(0 100% 0 0);
+  }
+  to {
+    clip-path: inset(0 0 0 0);
+  }
+}
+
+/* Event-stream reveal: same hl-wipe window — the histogram plot uncovers
+   left→right with a scanline riding the reveal edge (same duration and
+   easing keeps them locked together). Works for bar/line/area alike. */
+.hl-wipe .hl-chart .recharts-responsive-container {
+  animation: hlWipe 1.1s cubic-bezier(0.3, 0, 0.3, 1) 0.05s backwards;
+}
+.hl-chart::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  bottom: 26px; /* clear the x-axis labels */
+  width: 1.5px;
+  left: 55px; /* start at the y-axis edge */
+  background: color-mix(in oklab, var(--primary) 55%, transparent);
+  box-shadow: 0 0 10px color-mix(in oklab, var(--primary) 35%, transparent);
+  opacity: 0;
+  pointer-events: none;
+}
+.hl-wipe .hl-chart::after {
+  animation: hlScanline 1.1s cubic-bezier(0.3, 0, 0.3, 1) 0.05s;
+}
+@keyframes hlScanline {
+  0% {
+    left: 55px;
+    opacity: 1;
+  }
+  85% {
+    opacity: 1;
+  }
+  100% {
+    left: calc(100% - 2px);
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .search-console-page.hl-wipe mark,
+  .hl-wipe .hl-chart .recharts-responsive-container,
+  .hl-wipe .hl-chart::after {
+    animation: none;
+  }
+}

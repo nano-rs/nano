@@ -297,15 +297,23 @@ impl SearchService {
         // For non-aggregate queries, run a count query in parallel so metadata
         // reports the real total. For aggregation, the total is the row count
         // of the streamed output (number of groups).
+        // NAN-1428: companions carry derived ids ({query_id}-count / -hist) and
+        // the resolved per-priority settings, so a disconnect/cancel kills them
+        // along with the chunk queries and admission limits bound them.
         let count_handle = if !is_aggregation {
             let count_sql = self
                 .ch_sql_generator
                 .generate_with_options(query, &full_time_range, &options)
                 .ok();
             let count_executor = ch_executor.clone();
+            let count_qid = format!("{query_id}-count");
+            let count_settings = self.active_ch_settings.clone();
             Some(tokio::spawn(async move {
                 if let Some(sql) = count_sql {
-                    count_executor.quick_count(&sql).await.ok()
+                    count_executor
+                        .quick_count(&sql, Some(&count_qid), count_settings.as_ref())
+                        .await
+                        .ok()
                 } else {
                     None
                 }
@@ -316,13 +324,19 @@ impl SearchService {
 
         // Start histogram query in parallel with chunk streaming — it only needs
         // the base query and full time range, so it can run independently.
-        let histogram_handle = if !request.skip_histogram {
+        //
+        // NAN-1429: skipped when the UI never renders a timeline for this
+        // display type (same gate as the sync path in core_search.rs).
+        let histogram_handle = if !request.skip_histogram
+            && super::display_type_renders_timeline(display_type)
+        {
             let search_service = self.clone();
             let histogram_query = cleaned_query.to_string();
             let histogram_time_range = adjusted_time_range.clone();
+            let hist_qid = format!("{query_id}-hist");
             Some(tokio::spawn(async move {
                 match search_service
-                    .generate_histogram(&histogram_query, &histogram_time_range)
+                    .generate_histogram(&histogram_query, &histogram_time_range, Some(&hist_qid))
                     .await
                 {
                     Ok(h) => Some(h),

@@ -77,7 +77,7 @@ import { useSearchHistory } from '@/hooks/useSearchHistory';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { Sheet, SheetContent, SheetTitle } from '@/components/ui/sheet';
 import { useNotebookCapture } from '@/enterprise/contexts/NotebookContext';
-import { TimelineVisualization, FieldsPanel, SearchResults, SearchQueryInput, SavedQueriesPalette, SearchJobsModal, PrevalenceSlider, type FieldStat } from '@/components/search';
+import { TimelineVisualization, FieldsPanel, FIELD_STATS_PINNED_COLUMNS, SearchResults, SearchQueryInput, SavedQueriesPalette, SearchJobsModal, PrevalenceSlider, type FieldStat } from '@/components/search';
 import { AnalyzeView } from '@/enterprise/components/search/AnalyzeView';
 import { useHereCardOverride } from '@/contexts/PageContext';
 import type { SearchJobSummary } from '@/lib/api';
@@ -306,6 +306,25 @@ const flattenFieldsForStats = (fields: Record<string, unknown>, prefix = ''): [s
   return result;
 };
 
+// NAN-1427: derive the column set the field index needs from the rows the
+// analyst can actually see, plus the pinned "Selected" columns. The server's
+// field-stats query reads every requested column over all matching rows, so
+// the default request covers visible + pinned columns only (measured 50x less
+// I/O than the full ~90-column inventory); the panel's "Index all fields"
+// action refetches without `columns` for the full inventory. Unknown names
+// (ext-JSON keys etc.) are dropped server-side by intersection with the live
+// table inventory.
+const collectFieldStatsColumns = (results: SearchResult[]): string[] => {
+  const cols = new Set<string>(FIELD_STATS_PINNED_COLUMNS);
+  // First 200 rows are plenty to discover the visible column population.
+  for (const result of results.slice(0, 200)) {
+    if (result?.fields && typeof result.fields === 'object' && result.fields !== null) {
+      for (const key of Object.keys(result.fields)) cols.add(key);
+    }
+  }
+  return Array.from(cols);
+};
+
 // Map API preset format to UI display format
 const timeRangePresetToDisplay: Record<string, string> = {
   'last_15_minutes': 'Last 15 minutes',
@@ -355,6 +374,11 @@ export function Search() {
   const [naturalLanguageQuery, setNaturalLanguageQuery] = useState(urlMode === 'natural' ? urlQuery : '');
   const [timeRange, setTimeRange] = useState<TimeRangeValue>(getInitialTimeRange());
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  // Mirror of searchResults for callbacks that fire outside the render cycle
+  // (e.g. SSE onCompleted needs the streamed rows to derive the field-stats
+  // column set, NAN-1427).
+  const searchResultsRef = useRef<SearchResult[]>([]);
+  useEffect(() => { searchResultsRef.current = searchResults; }, [searchResults]);
   const [searchError, setSearchError] = useState<ApiError | null>(null);
   const [isCorrectingQuery, setIsCorrectingQuery] = useState(false);
   const [isReviewingQuery, setIsReviewingQuery] = useState(false);
@@ -383,6 +407,28 @@ export function Search() {
   const [tailInterval, setTailInterval] = useState(15000);
   const tailTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const tailSearchingRef = useRef(false);
+
+  // Transient hl-wipe class when a search run completes — drives the
+  // left→right reveal on result <mark> highlights (index.css). Skipped
+  // during live tail (replaying it every refresh tick reads as noise).
+  const [hlWipe, setHlWipe] = useState(false);
+  const hlWipeWasSearchingRef = useRef(false);
+  useEffect(() => {
+    const was = hlWipeWasSearchingRef.current;
+    hlWipeWasSearchingRef.current = isSearching;
+    if (isSearching && !was) {
+      // A new run inside the wipe window cancels the reset timer via this
+      // effect's cleanup — clear explicitly so the class re-toggles (CSS
+      // animations fire on class addition, not presence) on completion.
+      setHlWipe(false);
+      return;
+    }
+    if (was && !isSearching && !tailActive) {
+      setHlWipe(true);
+      const t = setTimeout(() => setHlWipe(false), 1500);
+      return () => clearTimeout(t);
+    }
+  }, [isSearching, tailActive]);
 
   // Pagination state for tabular views (stats, table)
   const [tablePage, setTablePage] = useState(0);
@@ -513,7 +559,13 @@ export function Search() {
     top_values: [string, number][];
     cardinality?: number;
   }> | null>(null);
-  
+
+  // NAN-1427: whether the current server field stats were computed over the
+  // reduced (visible + pinned) column set — gates "Index all fields".
+  const [fieldStatsReduced, setFieldStatsReduced] = useState(false);
+  // Parameters of the last field-stats fetch, for the "Index all fields" refetch.
+  const lastFieldStatsRequestRef = useRef<{ query: string; start: string; end: string; request_id?: string } | null>(null);
+
   
   // Share state
   const [copiedUrl, setCopiedUrl] = useState(false);
@@ -769,6 +821,26 @@ export function Search() {
   const { mutate: explainQuery, loading: explaining } = useExplainQuery();
   const { mutate: fetchFieldStats, loading: fieldStatsLoading } = useFieldStats();
   const { mutate: fetchSearchFieldValues } = useSearchFieldValues();
+
+  // NAN-1427: refetch field stats over the FULL column inventory (no
+  // `columns` restriction) when the analyst asks to index all fields.
+  const loadAllFieldStats = useCallback(() => {
+    const req = lastFieldStatsRequestRef.current;
+    if (!req) return;
+    // `reduced` stays true until the full stats land — the panel's teaser
+    // derives its in-flight state from (reduced && isLoadingMore), and a
+    // failure simply leaves the affordance in place.
+    fetchFieldStats(req)
+      .then(fieldStatsResponse => {
+        if (fieldStatsResponse.fields && fieldStatsResponse.fields.length > 0) {
+          setServerFieldStats(fieldStatsResponse.fields);
+          setFieldStatsReduced(false);
+        }
+      })
+      .catch(err => {
+        console.warn('Failed to fetch full field stats:', err);
+      });
+  }, [fetchFieldStats]);
   const { data: savedSearches, refetch: refetchSaved } = useSavedSearches();
   const { data: sharedSearches } = useSharedSearches();
 
@@ -1122,10 +1194,19 @@ export function Search() {
     // Fetch field stats asynchronously (for non-aggregate piped queries)
     if (!isAggregate && currentMode === 'piped') {
       const apiTime = toApiTimeRange(currentTimeRange);
-      fetchFieldStats({ query: currentQuery, start: apiTime.start, end: apiTime.end })
+      // NAN-1427/1428: reduced column set + request_id for cancel coverage
+      const fsRequest = {
+        query: currentQuery,
+        start: apiTime.start,
+        end: apiTime.end,
+        request_id: currentRequestIdRef.current ?? undefined,
+      };
+      lastFieldStatsRequestRef.current = fsRequest;
+      fetchFieldStats({ ...fsRequest, columns: collectFieldStatsColumns(results) })
         .then(fieldStatsResponse => {
           if (fieldStatsResponse.fields && fieldStatsResponse.fields.length > 0) {
             setServerFieldStats(fieldStatsResponse.fields);
+            setFieldStatsReduced(true);
             // Update cache entry with field stats
             const cached = searchResultCache.get(cacheKey);
             if (cached) cached.serverFieldStats = fieldStatsResponse.fields;
@@ -1422,10 +1503,20 @@ export function Search() {
         // Fetch field stats for non-aggregate queries
         if (!isAggregate && currentMode === 'piped') {
           const apiTime = toApiTimeRange(currentTimeRange);
-          fetchFieldStats({ query: currentQuery, start: apiTime.start, end: apiTime.end })
+          // NAN-1427/1428: reduced column set (from the streamed rows mirror)
+          // + request_id for cancel coverage
+          const fsRequest = {
+            query: currentQuery,
+            start: apiTime.start,
+            end: apiTime.end,
+            request_id: currentRequestIdRef.current ?? undefined,
+          };
+          lastFieldStatsRequestRef.current = fsRequest;
+          fetchFieldStats({ ...fsRequest, columns: collectFieldStatsColumns(searchResultsRef.current) })
             .then(fieldStatsResponse => {
               if (fieldStatsResponse.fields && fieldStatsResponse.fields.length > 0) {
                 setServerFieldStats(fieldStatsResponse.fields);
+                setFieldStatsReduced(true);
               }
             })
             .catch(err => console.warn('Failed to fetch field stats:', err));
@@ -1526,6 +1617,7 @@ export function Search() {
     if (!append) {
       setSearchResults([]);
       setServerFieldStats(null);
+      setFieldStatsReduced(false);
       setPeakRowsScanned(0);
       // Don't clear histogram here - keep showing previous data while loading
       // New histogram will be set when API response arrives
@@ -1744,11 +1836,20 @@ export function Search() {
       // Fetch field stats asynchronously (separate from main search for better UX)
       // This allows search results to display immediately while field stats load in background
       if (!append && !isAggregate && currentMode === 'piped') {
-        // Trigger async field stats fetch - don't await, let it run in background
-        fetchFieldStats({ query: cleanQuery, start: apiTimeRange.start, end: apiTimeRange.end })
+        // Trigger async field stats fetch - don't await, let it run in background.
+        // NAN-1427/1428: reduced column set + request_id for cancel coverage
+        const fsRequest = {
+          query: cleanQuery,
+          start: apiTimeRange.start,
+          end: apiTimeRange.end,
+          request_id: requestId,
+        };
+        lastFieldStatsRequestRef.current = fsRequest;
+        fetchFieldStats({ ...fsRequest, columns: collectFieldStatsColumns(results) })
           .then(fieldStatsResponse => {
             if (fieldStatsResponse.fields && fieldStatsResponse.fields.length > 0) {
               setServerFieldStats(fieldStatsResponse.fields);
+              setFieldStatsReduced(true);
               // Update cache entry with field stats
               if (cacheKey) {
                 const cached = searchResultCache.get(cacheKey);
@@ -1763,6 +1864,7 @@ export function Search() {
       } else if (!append) {
         // For aggregate queries or SQL mode, we compute field stats client-side
         setServerFieldStats(null);
+        setFieldStatsReduced(false);
       }
 
       // Capture search in notebook (if active)
@@ -2283,6 +2385,7 @@ export function Search() {
     setTablePage(0); // Reset pagination
     setSearchResults([]); // Clear current results
     setServerFieldStats(null); // Clear server field stats
+    setFieldStatsReduced(false);
 
     // Use a ref to track the new query and trigger search
     setTimeout(() => {
@@ -2587,22 +2690,45 @@ export function Search() {
     isDraggingRef.current = false;
   }, [refAreaLeft, refAreaRight, timelineData]);
 
+  // Synthetic CH helper columns leaking from the OCSF table — `*_unified`
+  // coalesce internals (the NAN-1241 resolver maps logical names onto them;
+  // analysts never address them directly) and the `event_bytes` sizing
+  // metric. Not schema fields; keep them out of the field index.
+  const isInternalHelperField = (name: string) =>
+    name.endsWith('_unified') || name === 'event_bytes';
+
   // Field stats - prefer server-provided stats (from topK across ALL matching events)
   // Fall back to client-side stats for aggregate queries or when server stats unavailable
   const fieldStats = useMemo<FieldStat[]>(() => {
     // Prefer server-provided field stats (more accurate - computed across all matching events)
     if (serverFieldStats && serverFieldStats.length > 0) {
-      return serverFieldStats.map(field => ({
-        field: field.name,
-        count: field.count,
-        // Use cardinality if provided, otherwise count top_values
-        uniqueCount: field.cardinality ?? field.top_values.length,
-        topValues: field.top_values.map(([value, count]) => ({
-          value,
+      return serverFieldStats.map(field => {
+        // Empty string is "field absent" (CH columns default to ''), not a
+        // value — uniq()/topK() count it, which both surfaced "-" rows and
+        // inflated the unique count by one. Strip it and rebase the counts
+        // on actual values.
+        const emptyCount = field.top_values
+          .filter(([value]) => value === '')
+          .reduce((sum, [, count]) => sum + count, 0);
+        const nonEmpty = field.top_values.filter(([value]) => value !== '');
+        const count = Math.max(0, field.count - emptyCount);
+        const uniqueCount = Math.max(
+          0,
+          (field.cardinality ?? field.top_values.length) - (emptyCount > 0 ? 1 : 0),
+        );
+        return {
+          field: field.name,
           count,
-          percentage: field.count > 0 ? Math.round((count / field.count) * 100) : 0
-        }))
-      }));
+          uniqueCount,
+          topValues: nonEmpty.map(([value, valueCount]) => ({
+            value,
+            count: valueCount,
+            percentage: count > 0 ? Math.round((valueCount / count) * 100) : 0
+          }))
+        };
+      // Fields whose every value is empty are noise, and internal helper
+      // columns aren't schema fields — don't surface either.
+      }).filter(stat => stat.count > 0 && stat.topValues.length > 0 && !isInternalHelperField(stat.field));
     }
 
     // Fall back to client-side calculation (for aggregate queries or when server stats unavailable)
@@ -2618,6 +2744,10 @@ export function Search() {
         for (const [field, value] of flattenedFields) {
           // Only count scalar values (not objects/arrays)
           if (typeof value === 'object' && value !== null) continue;
+          // Empty/null is "field absent", not a value (mirrors the server-
+          // stats path above; String(null) would otherwise count as "null")
+          if (value === null || value === undefined || value === '') continue;
+          if (isInternalHelperField(field)) continue;
 
           const valueStr = String(value);
 
@@ -2879,6 +3009,7 @@ export function Search() {
           setSearchResults(cached.results);
           setHistogramData(cached.histogramData);
           setServerFieldStats(cached.serverFieldStats);
+          setFieldStatsReduced(false); // cached stats: don't re-offer partial-index refetch
           setTotalCount(cached.totalCount);
           setExecutionTimeMs(cached.executionTimeMs);
           setDisplayType(cached.displayType);
@@ -2911,6 +3042,7 @@ export function Search() {
         setSearchResults([]);
         setHistogramData([]);
         setServerFieldStats(null);
+        setFieldStatsReduced(false);
         setTotalCount(0);
         setPeakRowsScanned(0);
         setExecutionTimeMs(null);
@@ -2976,7 +3108,7 @@ export function Search() {
   const showErrorOrWarning = !!searchError || showLimitWarning;
 
   return (
-    <div className="search-console-page flex flex-col gap-2.5 w-full min-w-0 overflow-x-hidden md:[overflow-x:clip]">
+    <div className={`search-console-page flex flex-col gap-2.5 w-full min-w-0 overflow-x-hidden md:[overflow-x:clip] ${hlWipe ? 'hl-wipe' : ''}`}>
       {/* Demo onboarding: sample queries */}
       {!hasSearched && (
         <SearchDemoHint onRunQuery={(q) => { setQuery(q); handleSearch(1, false, q); }} />
@@ -3969,6 +4101,8 @@ export function Search() {
                       onFetchFieldValues={(field, q, start, end) =>
                         fetchSearchFieldValues({ field, query: q, start, end, limit: 100 })
                       }
+                      isReducedFieldSet={fieldStatsReduced}
+                      onLoadAllFields={loadAllFieldStats}
                     />
                   </div>
                 )}
@@ -4044,6 +4178,8 @@ export function Search() {
             onToggleExpanded={() => setMobileFieldsOpen(false)}
             isLoading={fieldStatsLoading && fieldStats.length === 0}
             isLoadingMore={fieldStatsLoading && fieldStats.length > 0}
+            isReducedFieldSet={fieldStatsReduced}
+            onLoadAllFields={loadAllFieldStats}
             query={query}
             timeRange={apiTimeRange}
             onFetchFieldValues={(field, q, start, end) =>

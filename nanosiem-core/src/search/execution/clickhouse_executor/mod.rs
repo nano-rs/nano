@@ -25,3 +25,4 @@ pub use sql_helpers::{
     wrap_query_with_pagination,
 };
 pub use types::{ClickHouseExecutor, ClickHouseLogReadRow};
+pub(crate) use types::with_query_options;

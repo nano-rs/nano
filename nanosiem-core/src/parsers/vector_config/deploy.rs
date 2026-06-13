@@ -445,6 +445,10 @@ impl VectorConfigManager {
              # DO NOT EDIT - regenerated on every parser deploy.\n\
              # Each parser's generated `_ocsf_prepare` fork feeds nanosiem.ocsf_logs.\n\
              # Emitted only under NANO_SCHEMA_PROFILE=ocsf; mirrors clickhouse_logs.\n\
+             # Durability ACK (NAN-1406): the server-side profile sets\n\
+             # wait_for_async_insert=1, so HTTP 200 means the flush succeeded —\n\
+             # a flush failure (NAN-1404 class) is a visible, retryable sink\n\
+             # error instead of a silently discarded pre-ACKed batch.\n\
              [sinks.clickhouse_ocsf_logs]\n\
              type = \"clickhouse\"\n\
              inputs = [{inputs}]\n\
@@ -762,7 +766,13 @@ del(.event_type)
 .process_name = to_string(.process_name) ?? ""
 .process_id = to_int(.process_id) ?? 0
 .process_path = to_string(.process_path) ?? ""
-.process_hash = to_string(.process_hash) ?? ""
+# NAN-1415: hex hash case is encoding noise - canonicalize to lowercase at
+# ingest so new rows compare raw and the enrichment dicts that key on
+# lower hashes join consistently. History stays mixed-case, so query codegen
+# still emits the lower form - served by the migration-132 expression blooms.
+# process_guid needs no line here: the logs column is MATERIALIZED from a
+# lower hex expression in ClickHouse, so it is lowercase by construction.
+.process_hash = downcase(to_string(.process_hash) ?? "")
 cmd_val = .command_line
 if cmd_val == null || cmd_val == "" { cmd_val = .process }
 .command_line = to_string(cmd_val) ?? ""
@@ -774,7 +784,7 @@ if pcmd_val == null || pcmd_val == "" { pcmd_val = .parent_process }
 .parent_process_path = to_string(.parent_process_path) ?? ""
 .file_path = to_string(.file_path) ?? ""
 .file_name = to_string(.file_name) ?? ""
-.file_hash = to_string(.file_hash) ?? ""
+.file_hash = downcase(to_string(.file_hash) ?? "")
 .file_action = to_string(.file_action) ?? ""
 .url = to_string(.url) ?? ""
 .url_domain = to_string(.url_domain) ?? ""
@@ -876,6 +886,14 @@ for_each(keys(.)) -> |_idx, key| {
 
 # =============================================================================
 # ClickHouse Sink
+#
+# Durability ACK (NAN-1406): the server-side profile sets async_insert=1 +
+# wait_for_async_insert=1, so ClickHouse's HTTP 200 means the async-insert
+# FLUSH succeeded (rows durably written), not merely buffered. A flush failure
+# (e.g. FAILED enrichment dict, NAN-1404) comes back as a sink error Vector
+# retries and surfaces in metrics, instead of a silently discarded pre-ACKed
+# batch. Measured: zero throughput cost at 5k eps; sustained-overload shedding
+# unchanged (the drop_newest buffer below sheds either way, now visibly).
 # =============================================================================
 [sinks.clickhouse_logs]
 type = "clickhouse"
@@ -1472,6 +1490,25 @@ mod tests {
             failures.is_empty(),
             "pipeline VRL failed to compile:\n{}",
             failures.join("\n----\n")
+        );
+    }
+
+    /// NAN-1415: hex hash case is encoding noise — file_hash / process_hash are
+    /// canonicalized to lowercase in the clickhouse_mapping stage (the chokepoint
+    /// every log event flows through), so new rows compare raw and the IOC/TI
+    /// enrichment dicts that key on lower(hash) join consistently. Pin the
+    /// downcase wrappers: silently dropping one reintroduces mixed-case ingest
+    /// while history is being relied on to converge.
+    #[test]
+    fn pipeline_config_canonicalizes_hashes_lowercase() {
+        let content = VectorConfigManager::pipeline_config_content();
+        assert!(
+            content.contains(r#".file_hash = downcase(to_string(.file_hash) ?? "")"#),
+            "clickhouse_mapping must downcase file_hash at ingest (NAN-1415)"
+        );
+        assert!(
+            content.contains(r#".process_hash = downcase(to_string(.process_hash) ?? "")"#),
+            "clickhouse_mapping must downcase process_hash at ingest (NAN-1415)"
         );
     }
 

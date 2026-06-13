@@ -826,6 +826,8 @@ fn agg_func(input: &str) -> ParseResult<'_, AggFunc> {
             value(AggFunc::Count, tag_no_case("count")),
             // distinct_count must come before dc to avoid partial match
             value(AggFunc::Dc, tag_no_case("distinct_count")),
+            // estdc: approximate distinct count (uniqCombined64)
+            value(AggFunc::EstDc, tag_no_case("estdc")),
             value(AggFunc::Dc, tag_no_case("dc")),
             value(AggFunc::Sum, tag_no_case("sum")),
             value(AggFunc::Avg, tag_no_case("avg")),

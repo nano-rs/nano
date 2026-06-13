@@ -9,15 +9,78 @@ use crate::query::escape_identifier;
 use crate::query::MATERIALIZED_COLUMNS;
 
 impl SearchService {
+    /// Get field statistics for a query, gated by the admission controller
+    /// (NAN-1427).
+    ///
+    /// The field-stats companion is the heaviest query a search fans out to
+    /// (measured 8.4x the data query's read bytes for the full ~90-column
+    /// set), and the `/api/search/field-stats` endpoint fires after every
+    /// Search-page search — previously with no admission permit, no query_id,
+    /// and no per-priority settings. This wrapper:
+    ///
+    /// 1. Acquires an admission permit (N analysts no longer means N
+    ///    concurrent unbounded all-column scans),
+    /// 2. Applies the priority's `ClickHouseQuerySettings`,
+    /// 3. Runs the stats query under the derived `{request_id}-fstats` id so
+    ///    `DELETE /api/search/{request_id}` cancels it (NAN-1428).
+    pub async fn get_field_stats_with_admission(
+        &self,
+        query: &str,
+        time_range: &TimeRangeInput,
+        requested_columns: Option<&[String]>,
+        request_id: Option<&str>,
+        user_id: uuid::Uuid,
+        priority: super::admission::QueryPriority,
+    ) -> Result<Vec<FieldInfo>, SearchError> {
+        let derived_qid = request_id.map(|r| format!("{r}-fstats"));
+
+        // No controller wired up → no gating, run directly (tests,
+        // single-tenant deployments) — mirrors `search_with_admission`.
+        let Some(controller) = self.admission_controller.clone() else {
+            return self
+                .get_field_stats_for_query(
+                    query,
+                    time_range,
+                    requested_columns,
+                    derived_qid.as_deref(),
+                )
+                .await;
+        };
+
+        let job_id = uuid::Uuid::now_v7().to_string();
+        let _permit = controller
+            .acquire(&job_id, user_id, priority)
+            .await
+            .map_err(|e| SearchError::AdmissionDenied(e.to_string()))?;
+
+        let mut service = self.clone();
+        service.active_ch_settings = Some(priority.to_ch_settings());
+        // _permit drops at end of scope, freeing the slot.
+        service
+            .get_field_stats_for_query(query, time_range, requested_columns, derived_qid.as_deref())
+            .await
+    }
+
     /// Get field statistics for a query (async, separate from main search)
     ///
     /// This endpoint is designed to be called separately from the main search,
     /// allowing the UI to display search results immediately while field stats
     /// load in the background. Uses topK + uniq for efficient cardinality.
+    ///
+    /// `requested_columns` (NAN-1427) restricts the stat'd column set: the
+    /// companion's read bytes scale with the number of columns aggregated
+    /// (topK+uniq per column), so computing stats over only the columns the
+    /// caller actually renders is the effective I/O lever (measured 50x on
+    /// the audit dataset). Requested names are intersected with the live
+    /// table inventory — unknown names are dropped, and an empty intersection
+    /// falls back to the full inventory so a stale client column list cannot
+    /// blank the field panel. `None` keeps today's full-inventory behavior.
     pub async fn get_field_stats_for_query(
         &self,
         query: &str,
         time_range: &TimeRangeInput,
+        requested_columns: Option<&[String]>,
+        query_id: Option<&str>,
     ) -> Result<Vec<FieldInfo>, SearchError> {
         // Only supported for ClickHouse backend
         if self.backend != SearchBackend::ClickHouse {
@@ -84,6 +147,19 @@ impl SearchService {
             .collect()
         });
 
+        // NAN-1427: reduce the column set to what the caller requested
+        // (intersected with the live inventory). Falls back to the full
+        // inventory when nothing is requested or nothing intersects.
+        let inventory_len = columns.len();
+        let columns = select_field_stats_columns(columns, requested_columns);
+        if columns.len() < inventory_len {
+            info!(
+                "Field stats column set reduced to {} of {} inventory columns",
+                columns.len(),
+                inventory_len
+            );
+        }
+
         // Build and execute field stats SQL (topK + uniq for each column)
         let field_stats_sql = ClickHouseExecutor::build_field_stats_sql(&base_sql, None, &columns);
         info!(
@@ -92,7 +168,12 @@ impl SearchService {
         );
 
         let stats = ch_executor
-            .execute_field_stats_query(&field_stats_sql, &columns)
+            .execute_field_stats_query(
+                &field_stats_sql,
+                &columns,
+                query_id,
+                self.active_ch_settings.as_ref(),
+            )
             .await?;
         info!(
             "Async field stats returned {} fields with data",
@@ -251,10 +332,19 @@ impl SearchService {
         }
         let fields = stats.get_field_info(self.config.top_values_count);
 
-        // Generate histogram for UDM field query
-        let histogram = self
+        // Generate histogram for UDM field query.
+        // NAN-1429: degrade to histogram:null on failure instead of failing
+        // the whole query (matches the piped-query path's behavior).
+        let histogram = match self
             .generate_histogram_for_time_range(&request.time_range)
-            .await?;
+            .await
+        {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::warn!("UDM field query histogram failed: {}", e);
+                None
+            }
+        };
 
         let execution_time_ms = start_time.elapsed().as_millis() as u64;
 
@@ -270,7 +360,7 @@ impl SearchService {
             } else {
                 None
             },
-            histogram: Some(histogram),
+            histogram,
             warnings: None,
             cost_score: None,
             display_type: Some(DisplayType::Events),
@@ -447,6 +537,42 @@ impl SearchService {
     }
 }
 
+/// Select the column set for a field-stats query (NAN-1427).
+///
+/// - `requested = None` → the full table inventory (today's behavior — API
+///   callers that don't send `columns` are unchanged).
+/// - `requested = Some(set)` → the inventory restricted to the requested
+///   names (exact match; inventory order preserved). Unknown names (ext-JSON
+///   keys, typos) are dropped — only enumerated table columns ever reach the
+///   generated SQL, so a client cannot inject identifiers.
+/// - An empty intersection falls back to the FULL inventory: a stale client
+///   column list must not silently blank the field panel.
+fn select_field_stats_columns(
+    inventory: Vec<String>,
+    requested: Option<&[String]>,
+) -> Vec<String> {
+    let Some(requested) = requested else {
+        return inventory;
+    };
+    let requested_set: std::collections::HashSet<&str> =
+        requested.iter().map(|s| s.as_str()).collect();
+    let reduced: Vec<String> = inventory
+        .iter()
+        .filter(|c| requested_set.contains(c.as_str()))
+        .cloned()
+        .collect();
+    if reduced.is_empty() {
+        warn!(
+            "Requested field-stats columns ({}) matched no table columns; \
+             falling back to full inventory",
+            requested.len()
+        );
+        inventory
+    } else {
+        reduced
+    }
+}
+
 /// Build the SQL for `fetch_log_by_id`.
 ///
 /// Extracted into a free function so the audit-exclusion behavior is unit-testable
@@ -515,6 +641,55 @@ fn build_fetch_log_sql(
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
+
+    fn inv(cols: &[&str]) -> Vec<String> {
+        cols.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// NAN-1427: requested-columns reduction — exact-match intersection with
+    /// the live inventory, inventory order preserved.
+    #[test]
+    fn field_stats_columns_intersect_requested_with_inventory() {
+        let inventory = inv(&["action", "dest_ip", "src_ip", "user"]);
+        let requested = inv(&["user", "src_ip", "not_a_column"]);
+        assert_eq!(
+            select_field_stats_columns(inventory, Some(&requested)),
+            inv(&["src_ip", "user"]),
+        );
+    }
+
+    /// No requested set → full inventory (existing API callers unchanged).
+    #[test]
+    fn field_stats_columns_default_to_full_inventory() {
+        let inventory = inv(&["action", "src_ip"]);
+        assert_eq!(
+            select_field_stats_columns(inventory.clone(), None),
+            inventory
+        );
+    }
+
+    /// A requested set matching nothing must NOT blank the field panel —
+    /// fall back to the full inventory.
+    #[test]
+    fn field_stats_columns_empty_intersection_falls_back_to_full() {
+        let inventory = inv(&["action", "src_ip"]);
+        let requested = inv(&["ext_only_key", "typo_column"]);
+        assert_eq!(
+            select_field_stats_columns(inventory.clone(), Some(&requested)),
+            inventory
+        );
+    }
+
+    /// OCSF dotted column names intersect exactly (no normalization).
+    #[test]
+    fn field_stats_columns_dotted_ocsf_names_match_exactly() {
+        let inventory = inv(&["class_uid", "src_endpoint.ip", "user.name"]);
+        let requested = inv(&["src_endpoint.ip", "user.name"]);
+        assert_eq!(
+            select_field_stats_columns(inventory, Some(&requested)),
+            inv(&["src_endpoint.ip", "user.name"]),
+        );
+    }
 
     #[test]
     fn fetch_log_sql_without_audit_exclusion_omits_source_type_filter() {
