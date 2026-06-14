@@ -3520,9 +3520,10 @@ mod tests {
         // An unpromoted JSON-tail field keeps the NAN-1161 toString null-guard:
         // a missing key must read as '' so negation keeps absent-key rows.
         // NAN-1426: the tail access is native subcolumn (the multiIf parity
-        // form), no longer `JSONExtractString(event, …)` which re-serialized
-        // the whole event per row; the multiIf itself yields '' for missing
-        // keys and the outer toString wrapper is preserved.
+        // form), no longer `JSONExtractString(…)` which re-serialized the whole
+        // JSON per row; the multiIf itself yields '' for missing keys and the
+        // outer toString wrapper is preserved. NAN-1443: the tail column is the
+        // stored `unmapped` spill (was the now-EPHEMERAL `event`).
         let sql = gen
             .generate(
                 &parse_query("custom_tail_key CONTAINS \"x\"").unwrap(),
@@ -3531,10 +3532,10 @@ mod tests {
             .unwrap();
         assert!(
             sql.contains(
-                "toString(multiIf(isNotNull(event.\"custom_tail_key\"), \
-                 toString(event.\"custom_tail_key\"), \
-                 toJSONString(event.^\"custom_tail_key\") != '{}', \
-                 toJSONString(event.^\"custom_tail_key\"), '')) iLike '%x%'"
+                "toString(multiIf(isNotNull(unmapped.\"custom_tail_key\"), \
+                 toString(unmapped.\"custom_tail_key\"), \
+                 toJSONString(unmapped.^\"custom_tail_key\") != '{}', \
+                 toJSONString(unmapped.^\"custom_tail_key\"), '')) iLike '%x%'"
             ),
             "OCSF JSON-tail CONTAINS must keep the toString null-guard over the subcolumn access, got:\n{sql}"
         );
@@ -3562,11 +3563,11 @@ mod tests {
             .unwrap();
         assert!(
             sql.contains(
-                "lower(toString(multiIf(isNotNull(event.\"unmapped\".\"signature_status\"), \
-                 toString(event.\"unmapped\".\"signature_status\"), \
-                 toJSONString(event.^\"unmapped\".\"signature_status\") != '{}', \
-                 toJSONString(event.^\"unmapped\".\"signature_status\"), ''))) != 'valid'"
-            ) && !sql.contains("JSONExtractString(event"),
+                "lower(toString(multiIf(isNotNull(unmapped.\"signature_status\"), \
+                 toString(unmapped.\"signature_status\"), \
+                 toJSONString(unmapped.^\"signature_status\") != '{}', \
+                 toJSONString(unmapped.^\"signature_status\"), ''))) != 'valid'"
+            ) && !sql.contains("JSONExtractString(unmapped"),
             "OCSF negated tail string compare must use the ''-defaulting subcolumn multiIf, got:\n{sql}"
         );
 
@@ -3577,10 +3578,12 @@ mod tests {
                 &time_range(),
             )
             .unwrap();
+        // NAN-1443: the spill is the stored `unmapped` column, addressed with a
+        // RELATIVE path (was `event."unmapped"."error_code"` pre-chop).
         assert!(
             sql.contains(
-                "coalesce(accurateCastOrNull(event.\"unmapped\".\"error_code\", 'Float64'), 0.) = 23"
-            ) && !sql.contains("JSONExtractFloat(event"),
+                "coalesce(accurateCastOrNull(unmapped.\"error_code\", 'Float64'), 0.) = 23"
+            ) && !sql.contains("JSONExtractFloat("),
             "OCSF numeric tail compare must use the coalesced subcolumn cast, got:\n{sql}"
         );
 
@@ -3593,7 +3596,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            sql.contains("JSONExtractBool(event, 'unmapped', 'signed')"),
+            sql.contains("JSONExtractBool(unmapped, 'signed')"),
             "OCSF bool tail compare must keep JSONExtractBool, got:\n{sql}"
         );
     }
@@ -3672,7 +3675,8 @@ mod tests {
         let ocsf = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()));
         assert_eq!(
             ocsf.generate_json_extract("unmapped.error_code", "Float"),
-            "coalesce(accurateCastOrNull(event.\"unmapped\".\"error_code\", 'Float64'), 0.)"
+            // NAN-1443: spill addressed relative to the stored `unmapped` column.
+            "coalesce(accurateCastOrNull(unmapped.\"error_code\", 'Float64'), 0.)"
         );
         assert_eq!(
             ocsf.generate_json_extract("connection_info.direction", "String"),

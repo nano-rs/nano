@@ -102,10 +102,13 @@ impl AuditEmitter {
         // principals (NAN-1390 / G16). Same write contract as the NAN-1254
         // Detection Finding writer: `event` JSON + explicit `timestamp`
         // (DateTime64(3) ← millis) + operational `source_type`; `id` and
-        // `_inserted_at` are server-defaulted, everything else materializes
-        // from `event`.
+        // `_inserted_at` are server-defaulted, everything else derives from
+        // `event`. NAN-1443: write into the `ocsf_logs_raw` ENGINE=Null landing
+        // table — the `ocsf_logs_raw_mv` MV derives the stored row into
+        // `ocsf_logs` (which no longer stores `event`). Always the local table:
+        // a Null landing table has no distributed wrapper.
         if self.mirror_to_ocsf {
-            let ocsf_table = self.dual_pool.table_names().read_bare("ocsf_logs");
+            let ocsf_table = self.dual_pool.table_names().local("ocsf_logs_raw");
             let placeholders = vec!["(?, ?, 'audit')"; events.len()].join(", ");
             let ocsf_query = format!(
                 "INSERT INTO {} (event, timestamp, source_type) VALUES {}",

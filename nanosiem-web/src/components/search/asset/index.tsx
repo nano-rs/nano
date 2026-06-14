@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { AlertTriangle } from 'lucide-react';
 import { api } from '@/lib/api';
 import { useAssetDossier } from '@/hooks/use-api';
 import type {
@@ -62,6 +63,11 @@ interface AssetProfile {
   identities: AssetIdentityRecord[];
   first_seen: string | null;
   last_seen: string | null;
+  // NAN-1455: set by `| asset` when the requested window had no events and the
+  // command re-anchored to the entity's last activity. The frontend then drives
+  // the dossier/timeline/stream off this window so they match the events shown.
+  reanchored?: boolean;
+  effective_time_range?: { start: string; end: string } | null;
 }
 
 interface SearchResult {
@@ -114,6 +120,13 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
   const kind: 'host' | 'user' =
     identifierField === 'user' || identifierField === 'src_user' ? 'user' : 'host';
 
+  // NAN-1455: when `| asset` re-anchored to the entity's last activity (the
+  // requested window was empty), drive every window-scoped fetch off that
+  // effective range so the dossier/timeline/stream match the events the command
+  // surfaced. Otherwise use the requested window verbatim.
+  const reanchored = !!assetProfile?.reanchored && !!assetProfile?.effective_time_range;
+  const effectiveTimeRange = reanchored ? assetProfile!.effective_time_range! : timeRange;
+
   // Focus mode — persisted in localStorage, mirrors the mockup
   const [focus, setFocus] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false;
@@ -127,14 +140,14 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
 
   // Dossier aggregate fetch
   const dossierRequest = useMemo(() => {
-    if (!identifierField || !identifierValue || !timeRange) return null;
+    if (!identifierField || !identifierValue || !effectiveTimeRange) return null;
     return {
       identifier_field: identifierField,
       identifier_value: identifierValue,
       identities,
-      time_range: timeRange,
+      time_range: effectiveTimeRange,
     };
-  }, [identifierField, identifierValue, identities, timeRange]);
+  }, [identifierField, identifierValue, identities, effectiveTimeRange]);
   const { data: dossier, loading: dossierLoading } = useAssetDossier(dossierRequest);
 
   // Identity-aware drilldown — see `helpers.tsx:withAssetIdentity`. Wrapped in
@@ -142,15 +155,36 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
   const handleAssetDrilldown = useCallback(
     (filters: Record<string, unknown>) => {
       if (!onDrilldown) return;
+      // NAN-1458: land the pivot in the window the asset view is actually showing
+      // (event-centered, or re-anchored to last activity), not the picker's
+      // default. Callers that already scope a window — e.g. a timeline bucket —
+      // keep theirs.
+      const scoped =
+        effectiveTimeRange && filters._timeRangeOverride === undefined
+          ? { ...filters, _timeRangeOverride: effectiveTimeRange }
+          : filters;
       onDrilldown(
         withAssetIdentity(
-          filters,
+          scoped,
           identities as { ip?: string | null; hostname?: string | null; user?: string | null }[],
           identifierField && identifierValue ? { field: identifierField, value: identifierValue } : null,
         ),
       );
     },
-    [onDrilldown, identities, identifierField, identifierValue],
+    [onDrilldown, identities, identifierField, identifierValue, effectiveTimeRange],
+  );
+
+  // Investigate pivot — the plain entity filter, scoped to the asset view's
+  // window (NAN-1458). Kept separate from handleAssetDrilldown so it doesn't
+  // OR-expand across related identities.
+  const handleInvestigate = useCallback(
+    (filters: Record<string, unknown>) => {
+      if (!onDrilldown) return;
+      onDrilldown(
+        effectiveTimeRange ? { ...filters, _timeRangeOverride: effectiveTimeRange } : filters,
+      );
+    },
+    [onDrilldown, effectiveTimeRange],
   );
 
   const navigate = useNavigate();
@@ -170,8 +204,8 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
     (lane: string, bucketIdx: number) => {
       const bucketCount = dossier?.timeline.buckets;
       const bucketWindow =
-        timeRange && bucketCount && bucketCount > 0
-          ? computeBucketWindow(timeRange, bucketCount, bucketIdx)
+        effectiveTimeRange && bucketCount && bucketCount > 0
+          ? computeBucketWindow(effectiveTimeRange, bucketCount, bucketIdx)
           : undefined;
       const extras: Record<string, unknown> = bucketWindow
         ? { _timeRangeOverride: bucketWindow }
@@ -196,7 +230,7 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
           handleAssetDrilldown(extras);
       }
     },
-    [handleAssetDrilldown, dossier?.timeline.buckets, timeRange],
+    [handleAssetDrilldown, dossier?.timeline.buckets, effectiveTimeRange],
   );
 
   // Entity context (risk + alerts + cases) fetched in parallel from nanosiem-api
@@ -231,7 +265,7 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
   }
 
   const kindLabel = kind === 'host' ? 'host dossier' : 'user dossier';
-  const spanLabel = labelForRange(timeRange);
+  const spanLabel = labelForRange(effectiveTimeRange);
   const lastObservationLabel = dossier?.identity.last_seen_in_range
     ? formatTimestampHMS(dossier.identity.last_seen_in_range)
     : undefined;
@@ -255,13 +289,25 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
 
       <div className="flex-1 min-w-0 overflow-y-auto overflow-x-hidden">
         <div className="px-4 py-4 space-y-4 min-w-0">
+          {reanchored && (
+            <div className="flex items-center gap-2 px-3 py-1.5 border border-amber-500/40 bg-amber-500/10 text-[11px] font-mono text-muted-foreground">
+              <AlertTriangle className="w-4 h-4 shrink-0 text-amber-500" strokeWidth={1.5} />
+              <span>
+                <span className="text-amber-500 font-medium">No activity in the selected range</span>
+                {' — showing the last 6h of activity'}
+                {assetProfile?.effective_time_range
+                  ? ` (ending ${formatTimestampHMS(assetProfile.effective_time_range.end)})`
+                  : ''}.
+              </span>
+            </div>
+          )}
           {!focus && (
             <>
               <AssetIdentityHeader
                 kind={kind}
                 entityValue={identifierValue}
                 entityField={identifierField}
-                onInvestigate={onDrilldown}
+                onInvestigate={onDrilldown ? handleInvestigate : undefined}
                 identity={
                   dossier?.identity ?? {
                     hostname: null,
@@ -364,7 +410,7 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
             identifierField={identifierField}
             identifierValue={identifierValue}
             identities={identities}
-            timeRange={timeRange}
+            timeRange={effectiveTimeRange}
             focus={focus}
           />
 
@@ -372,7 +418,7 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
             identifierField={identifierField}
             identifierValue={identifierValue}
             identities={identities}
-            timeRange={timeRange}
+            timeRange={effectiveTimeRange}
           />
 
           {dossierLoading && !dossier && (

@@ -148,8 +148,8 @@ fn spath_input_ext_targets_ocsf_event_tail() {
         "nanosiem",
     );
     assert!(
-        sql.contains("JSONExtractString(event, 'request.method')"),
-        "spath must extract from the OCSF `event` tail (NAN-1343); SQL:\n{sql}"
+        sql.contains("JSONExtractString(unmapped, 'request.method')"),
+        "spath must extract from the OCSF tail column `unmapped` (NAN-1343/1443); SQL:\n{sql}"
     );
     assert!(
         !sql.contains("JSONExtractString(ext,"),
@@ -169,8 +169,8 @@ fn ext_prefix_remaps_to_unmapped_under_ocsf() {
     // previously JSONExtractString, which re-serialized the whole event per row).
     let sql = ocsf_sql(r#"ext.cache_status="hit""#, "nanosiem");
     assert!(
-        sql.contains(r#"multiIf(isNotNull(event."unmapped"."cache_status")"#),
-        "ext.* must remap to the unmapped.* spill (NAN-1388) via subcolumn access (NAN-1426); SQL:\n{sql}"
+        sql.contains(r#"multiIf(isNotNull(unmapped."cache_status")"#),
+        "ext.* must remap to the `unmapped` spill column with a relative path (NAN-1388/1443) via subcolumn access (NAN-1426); SQL:\n{sql}"
     );
     assert!(
         !sql.contains("'ext'"),
@@ -181,7 +181,7 @@ fn ext_prefix_remaps_to_unmapped_under_ocsf() {
     let sql = ocsf_sql("ext.sysmon_event_id=7", "nanosiem");
     assert!(
         sql.contains(
-            r#"coalesce(accurateCastOrNull(event."unmapped"."sysmon_event_id", 'Float64'), 0.) = 7"#
+            r#"coalesce(accurateCastOrNull(unmapped."sysmon_event_id", 'Float64'), 0.) = 7"#
         ),
         "numeric ext.* compare must remap + use the coalesced subcolumn cast; SQL:\n{sql}"
     );
@@ -191,7 +191,7 @@ fn ext_prefix_remaps_to_unmapped_under_ocsf() {
     // does not apply here; parity verified vs the old extractor on local CH).
     let sql = ocsf_sql(r#"ext.cache_status!="hit""#, "nanosiem");
     assert!(
-        sql.contains(r#"lower(toString(multiIf(isNotNull(event."unmapped"."cache_status")"#)
+        sql.contains(r#"lower(toString(multiIf(isNotNull(unmapped."cache_status")"#)
             && sql.contains("!= 'hit'"),
         "negated ext.* compare must use the ''-returning subcolumn form; SQL:\n{sql}"
     );
@@ -203,16 +203,16 @@ fn ext_prefix_remaps_to_unmapped_under_ocsf() {
 /// the fix it JSONExtract'd a top-level `event` key that never exists.
 #[test]
 fn event_prefix_strips_to_event_tail_under_ocsf() {
-    // Unpromoted tail attribute → stripped JsonPath into `event`.
+    // Unpromoted tail attribute → stripped JsonPath into the `unmapped` spill.
     let sql = ocsf_sql(
         r#"event.actor.process.parent_process.name="userinit.exe""#,
         "nanosiem",
     );
     assert!(
         sql.contains(
-            r#"multiIf(isNotNull(event."actor"."process"."parent_process"."name")"#
+            r#"multiIf(isNotNull(unmapped."actor"."process"."parent_process"."name")"#
         ),
-        "event.* must strip to the event tail (NAN-1388) via subcolumn access (NAN-1426); SQL:\n{sql}"
+        "event.* must strip to the `unmapped` spill tail (NAN-1388/1443) via subcolumn access (NAN-1426); SQL:\n{sql}"
     );
     assert!(
         !sql.contains("'event'"),
@@ -419,7 +419,7 @@ fn numeric_tail_comparison_emits_real_extractor_under_ocsf() {
     let sql = ocsf_sql("unmapped.some_num>3", "nanosiem");
     assert!(
         sql.contains(
-            r#"coalesce(accurateCastOrNull(event."unmapped"."some_num", 'Float64'), 0.) > 3"#
+            r#"coalesce(accurateCastOrNull(unmapped."some_num", 'Float64'), 0.) > 3"#
         ),
         "numeric tail comparison must use the coalesced subcolumn cast (NAN-1426; \
          the coalesce keeps JSONExtractFloat's missing-key→0 semantics); SQL:\n{sql}"
@@ -859,7 +859,7 @@ async fn reachable(client: &reqwest::Client) -> bool {
 
 /// Insert one OCSF event (the `event` column only — the client contract).
 async fn insert_event(client: &reqwest::Client, db: &str, event_json: &str) -> Result<(), String> {
-    let stmt = format!("INSERT INTO {db}.ocsf_logs (event) FORMAT JSONEachRow").replace(' ', "%20");
+    let stmt = format!("INSERT INTO {db}.ocsf_logs_raw (event) FORMAT JSONEachRow").replace(' ', "%20");
     let url = format!("{}/?query={stmt}&async_insert=0&wait_end_of_query=1", ch_url());
     let row = serde_json::json!({ "event": serde_json::from_str::<Value>(event_json).unwrap() })
         .to_string();
@@ -880,28 +880,35 @@ async fn insert_event(client: &reqwest::Client, db: &str, event_json: &str) -> R
 }
 
 /// Strip CREATE DATABASE + TTL and repoint at the throwaway DB.
-fn test_table_ddl(db: &str) -> String {
-    // NAN-1241: extract ONLY the ocsf_logs CREATE TABLE — the canonical DDL is
-    // multi-statement (prevalence MVs/dicts) and the CH HTTP endpoint rejects
-    // multi-statement bodies. Strip `--` comments + the TTL clause.
+fn test_table_ddl(db: &str) -> Vec<String> {
+    // NAN-1443: the OCSF table is now three objects — `ocsf_logs_raw` (ENGINE=Null
+    // landing table), `ocsf_logs_raw_mv` (derives the row), and `ocsf_logs`
+    // (MergeTree storage; the `*_unified` columns are inline in its CREATE). They
+    // are contiguous, ahead of the `CREATE OR REPLACE DICTIONARY` statements.
+    // Extract that block, strip `--` comments + the TTL clause, split into the
+    // individual statements (the CH HTTP endpoint rejects multi-statement bodies),
+    // and repoint at the throwaway DB. Inserts go to `ocsf_logs_raw`; reads hit
+    // `ocsf_logs`. `dictGet('nanosiem.…')` refs stay cross-DB to the real dicts.
     let start = DDL
-        .find("CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs")
-        .expect("ocsf_logs CREATE TABLE in DDL");
-    let no_comments: String = DDL[start..]
+        .find("CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs_raw")
+        .expect("ocsf_logs_raw CREATE TABLE in DDL");
+    let end = DDL[start..]
+        .find("CREATE OR REPLACE DICTIONARY")
+        .map(|i| start + i)
+        .expect("dictionaries follow the ocsf_logs table block");
+    DDL[start..end]
         .lines()
         .map(|l| match l.find("--") {
             Some(i) => &l[..i],
             None => l,
         })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let end = no_comments.find(';').expect("CREATE TABLE terminator");
-    no_comments[..end]
-        .lines()
         .filter(|l| !l.trim_start().starts_with("TTL "))
         .collect::<Vec<_>>()
         .join("\n")
-        .replace("nanosiem.ocsf_logs", &format!("{db}.ocsf_logs"))
+        .split(';')
+        .map(|s| s.trim().replace("nanosiem.ocsf_logs", &format!("{db}.ocsf_logs")))
+        .filter(|s| !s.trim().is_empty())
+        .collect()
 }
 
 /// Run an nPL query that ends in `| stats count` (or `count by`) and return the
@@ -961,7 +968,9 @@ async fn ocsf_npl_queries_execute_against_fixtures() {
 }
 
 async fn run_assertions(client: &reqwest::Client, db: &str) -> Result<(), String> {
-    exec(client, &test_table_ddl(db)).await?;
+    for stmt in test_table_ddl(db) {
+        exec(client, &stmt).await?;
+    }
     for (name, raw) in FIXTURES {
         insert_event(client, db, raw)
             .await
@@ -1036,18 +1045,21 @@ async fn run_assertions(client: &reqwest::Client, db: &str) -> Result<(), String
         ));
     }
 
-    // 5) Unpromoted TAIL field via JsonPath. actor.process.parent_process.name
-    //    is NOT a promoted column (only its .cmd_line sibling is) → resolves to
-    //    JSONExtractString(event, 'actor','process','parent_process','name').
-    //    Only the process fixture has actor.process.parent_process.name =
-    //    "userinit.exe".
+    // 5) Unpromoted TAIL field. actor.process.parent_process.name is NOT a
+    //    promoted column (only its .cmd_line sibling is) AND it is a top-level
+    //    *standard* OCSF attribute — not under `unmapped`. NAN-1443's lean
+    //    storage stores only promoted columns + `message` + the `unmapped` spill,
+    //    so this field is dropped (promote-to-query). It resolves to the
+    //    `unmapped` spill column via native subcolumn access, and since the value
+    //    was never written to the spill it matches nothing (the process fixture
+    //    carries it at event.actor.process… top-level, which is no longer stored).
     let tail_sql = ocsf_sql(
         "actor.process.parent_process.name=\"userinit.exe\" | stats count",
         db,
     );
-    if !tail_sql.contains("JSONExtractString(event, 'actor', 'process', 'parent_process', 'name')") {
+    if !tail_sql.contains("unmapped.\"actor\".\"process\".\"parent_process\".\"name\"") {
         return Err(format!(
-            "tail field did not resolve to JSONExtract(event,…); SQL:\n{tail_sql}"
+            "tail field did not resolve to the unmapped spill subcolumn; SQL:\n{tail_sql}"
         ));
     }
     let tail = count(
@@ -1056,9 +1068,10 @@ async fn run_assertions(client: &reqwest::Client, db: &str) -> Result<(), String
         "actor.process.parent_process.name=\"userinit.exe\" | stats count",
     )
     .await;
-    if tail != 1 {
+    if tail != 0 {
         return Err(format!(
-            "tail actor.process.parent_process.name=userinit.exe count = {tail}, expected 1 (process)"
+            "tail actor.process.parent_process.name=userinit.exe count = {tail}, expected 0 \
+             (top-level standard field not stored by the lean-storage chop, NAN-1443)"
         ));
     }
     // A tail value that exists in no event matches nothing (guards the

@@ -5,13 +5,13 @@ follow-up to the NAN-1400 validation): log-blaster ships its generators'
 **raw, pre-parse payloads** to a Tenzir HTTP listener; the TQL pipeline in
 this directory parses them, maps each feed to OCSF 1.8.0 (same
 class/activity/promoted-field coverage as the native Vector OCSF parsers),
-and INSERTs straight into `nanosiem.ocsf_logs` as the INSERT-only
+and INSERTs straight into `nanosiem.ocsf_logs_raw` as the INSERT-only
 `nanosiem_ingest` user — Vector is bypassed entirely.
 
 ```
 log-blaster --tenzir ─NDJSON {message, timestamp, source_type}→ Tenzir accept_http :9095
   → route on source_type → parse raw (JSON / Apache combined log) → OCSF 1.8.0
-  → {event, source_type} → ClickHouse HTTP INSERT (nanosiem.ocsf_logs)
+  → {event, source_type} → ClickHouse HTTP INSERT (nanosiem.ocsf_logs_raw)
 ```
 
 Producer contract: `docs/user-guide/direct-ocsf-ingestion.md`.

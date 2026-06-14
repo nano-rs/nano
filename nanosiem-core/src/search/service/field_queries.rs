@@ -274,13 +274,25 @@ impl SearchService {
         let table = self
             .table_names
             .read(Self::logs_table_key(self.active_profile.as_ref()));
+        // NAN-1443: `unmapped` (the OCSF spill) is a MATERIALIZED column excluded
+        // from `SELECT *`, and it is NOT in the manifest-derived materialized
+        // re-add list — so the row-expand inspector would miss spill fields. The
+        // full OCSF `event` is EPHEMERAL, so the promoted columns + `message` +
+        // `unmapped` ARE the complete stored record; append `unmapped` for the
+        // OCSF row-expand fetch only. It is intentionally NOT added to
+        // `materialized_columns()` (which also drives the search-results CTE
+        // re-add — every result row would then carry the spill blob).
+        let mut mat_cols: Vec<&str> = self.active_profile.materialized_columns().to_vec();
+        if self.active_profile.id() == crate::schema::SchemaId::Ocsf {
+            mat_cols.push("unmapped");
+        }
         let sql = build_fetch_log_sql(
             &table,
             id,
             time_range,
             source_type,
             exclude_audit,
-            self.active_profile.materialized_columns(),
+            &mat_cols,
         );
 
         debug!("Fetching log by ID: {}", sql);
@@ -381,15 +393,17 @@ impl SearchService {
             ))
         })?;
 
-        // NAN-1241: enumerate the active ingested-events table's dynamic-JSON
-        // column — `ext` under UDM, `event` under OCSF.
+        // NAN-1241/1443: enumerate the active table's dynamic-JSON tail column —
+        // `ext` under UDM, the `unmapped` spill under OCSF (was the full `event`,
+        // now EPHEMERAL). Promoted/known fields are surfaced from the schema
+        // separately; this discovers the spill-only tail leaf paths.
         let profile = self.active_profile.as_ref();
         let table = self.table_names.read(Self::logs_table_key(profile));
-        // OCSF `event` is deeply nested, so the enumerator must return full leaf
+        // The OCSF spill is still nested, so the enumerator returns full leaf
         // paths rather than collapsing to the top-level segment (which is correct
         // for UDM's effectively-flat `ext`).
         let is_ocsf = profile.id() == crate::schema::SchemaId::Ocsf;
-        let json_col = if is_ocsf { "event" } else { "ext" };
+        let json_col = profile.json_tail_column();
         ch_executor
             .get_ext_field_names(&table, json_col, is_ocsf)
             .await

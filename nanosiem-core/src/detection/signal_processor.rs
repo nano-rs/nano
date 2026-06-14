@@ -699,10 +699,14 @@ impl SignalProcessor {
     /// Every identifier is profile-resolved so the query is valid against both
     /// physical schemas:
     /// - `metadata` (the full-context JSON blob): UDM has a literal `metadata`
-    ///   String column; OCSF has no such column — its full event lives in the
-    ///   `event` JSON column (the profile's `json_tail_column`), so it is read
-    ///   as `toString(event) AS metadata`. Selecting the literal under OCSF was
-    ///   CH Code 47 → every real-time signal warn-skipped (zero alerts, G1).
+    ///   String column; OCSF has no such column — it is read from the profile's
+    ///   `json_tail_column` as `toString(...) AS metadata`. NAN-1443 repointed
+    ///   that tail from the full `event` (now EPHEMERAL) to the stored `unmapped`
+    ///   spill, so OCSF metadata is the spill object (which carries a finding's
+    ///   `risk_entity_field`); the matched event's entities + `message` are
+    ///   selected as their own columns below, so alert context is preserved.
+    ///   Selecting a literal `event`/`metadata` under OCSF was CH Code 47 → every
+    ///   real-time signal warn-skipped (zero alerts, G1).
     /// - `ts`: `toUnixTimestamp64Micro(timestamp)` is precision-independent —
     ///   it yields µs ticks for both UDM's DateTime64(6) (byte-identical to the
     ///   old `reinterpretAsInt64`) and OCSF's DateTime64(3), where the raw
@@ -724,7 +728,7 @@ impl SignalProcessor {
         };
 
         // UDM carries the full original log in its `metadata` String column;
-        // OCSF carries the full event in the JSON tail column (`event`).
+        // OCSF reads the JSON tail column (`unmapped` spill, NAN-1443).
         let metadata_expr = match profile.id() {
             crate::schema::SchemaId::Udm => "metadata".to_string(),
             crate::schema::SchemaId::Ocsf => {
@@ -943,11 +947,12 @@ mod tests {
         let query =
             SignalProcessor::build_fetch_matched_log_query(&profile, "nanosiem.ocsf_logs", log_id);
 
-        // The full-context blob comes from the OCSF JSON tail column — never
-        // the bare `metadata` identifier, which does not exist on ocsf_logs.
+        // The full-context blob comes from the OCSF JSON tail column — the
+        // `unmapped` spill (NAN-1443; was `event`, now EPHEMERAL) — never the
+        // bare `metadata` identifier, which does not exist on ocsf_logs.
         assert!(
-            query.contains("toString(event) AS metadata"),
-            "OCSF metadata must read the event JSON column: {query}"
+            query.contains("toString(unmapped) AS metadata"),
+            "OCSF metadata must read the unmapped spill column: {query}"
         );
         assert!(
             !query.contains("\n                metadata,"),

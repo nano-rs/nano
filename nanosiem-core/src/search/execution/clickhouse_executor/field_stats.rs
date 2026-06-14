@@ -155,7 +155,11 @@ impl ClickHouseExecutor {
               AND name NOT LIKE '%.search'
               AND name NOT LIKE 'prevalence_%'
               AND default_kind != 'ALIAS'
-              AND name NOT IN ('ext', 'metadata', 'event_id', 'ingest_time', 'namespace')
+              -- NAN-1443: `event_bytes` was MATERIALIZED (so the companion-safe
+              -- filter below dropped it from the analyst inventory). Under the
+              -- Null+MV chop it is a PLAIN column the MV populates, so exclude it
+              -- by name here. `unmapped` is already excluded as a JSON type.
+              AND name NOT IN ('ext', 'metadata', 'event_id', 'ingest_time', 'namespace', 'event_bytes')
             ORDER BY name
         "#,
             table = table_lit
@@ -706,10 +710,11 @@ mod tests {
         // exploded a row per path and timed out at scale (NAN-1177).
         assert!(sql.contains("distinctJSONPaths(ext)"), "sql: {sql}");
 
-        // NAN-1241: under OCSF the dynamic-JSON column is `event`, not `ext`, and the
-        // column is deeply nested → nested=true returns full leaf paths.
-        let ocsf_sql = build_ext_field_names_sql("nanosiem.ocsf_logs", "event", true);
-        assert!(ocsf_sql.contains("distinctJSONPaths(event)"), "sql: {ocsf_sql}");
+        // NAN-1241/1443: under OCSF the dynamic-JSON tail column is the
+        // `unmapped` spill (was `event`, now EPHEMERAL), still nested → nested=true
+        // returns full leaf paths.
+        let ocsf_sql = build_ext_field_names_sql("nanosiem.ocsf_logs", "unmapped", true);
+        assert!(ocsf_sql.contains("distinctJSONPaths(unmapped)"), "sql: {ocsf_sql}");
         assert!(ocsf_sql.contains("FROM nanosiem.ocsf_logs"), "sql: {ocsf_sql}");
         // Bounded window + native aggregate still apply to the OCSF lane.
         assert!(ocsf_sql.contains("INTERVAL 3 HOUR"), "sql: {ocsf_sql}");

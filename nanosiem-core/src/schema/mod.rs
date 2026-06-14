@@ -74,11 +74,31 @@ pub fn active_logs_table() -> &'static str {
 
 /// The ingested-events table name for a given schema id. Pure (env-free) so it
 /// is unit-testable; `active_logs_table` is the env-resolving wrapper. NAN-1241.
+/// This is the READ table — search/detection/maintenance all target it.
 pub fn logs_table_for(id: SchemaId) -> &'static str {
     match id {
         SchemaId::Ocsf => "ocsf_logs",
         SchemaId::Udm => "logs",
     }
+}
+
+/// The table OCSF/UDM events are INSERTED into — distinct from the read table
+/// under OCSF. NAN-1443: OCSF writes land in `ocsf_logs_raw` (ENGINE = Null);
+/// the `ocsf_logs_raw_mv` materialized view derives the stored row into
+/// `ocsf_logs` (so the full `event` blob is never stored). UDM has no such
+/// split — writes and reads are both `logs` (byte-identical).
+pub fn ingest_table_for(id: SchemaId) -> &'static str {
+    match id {
+        SchemaId::Ocsf => "ocsf_logs_raw",
+        SchemaId::Udm => "logs",
+    }
+}
+
+/// Env-resolving wrapper for [`ingest_table_for`] (mirrors `active_logs_table`).
+pub fn active_ingest_table() -> &'static str {
+    active_profile_from_env()
+        .map(|p| ingest_table_for(p.id()))
+        .unwrap_or("logs")
 }
 
 /// The log-source-repository subtree to sync for a given schema id. Parser and

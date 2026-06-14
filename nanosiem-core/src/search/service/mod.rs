@@ -1026,4 +1026,28 @@ mod tests {
         assert_eq!(earliest, None);
         assert_eq!(latest, Some(0));
     }
+
+    // NAN-1453: full-chain guard. A non-audit-view user's query is rewritten by
+    // `enforce_non_audit_query` before it reaches `search()`, where
+    // `extract_time_modifiers` reads the time window. If the rewrite drops
+    // `earliest=`/`latest=` (the original bug — parse + pretty-print strips
+    // them), the offsets vanish and the search/timeline silently scope to the
+    // picker window. This pins the whole chain end-to-end.
+    #[test]
+    fn test_enforce_non_audit_preserves_time_window_end_to_end() {
+        let enforced =
+            crate::search::query_processing::enforce_non_audit_query("error earliest=-12h latest=now")
+                .unwrap();
+        let (_cleaned, earliest, latest) = extract_time_modifiers(&enforced);
+        assert_eq!(
+            earliest,
+            Some(-12 * 3600),
+            "earliest= lost through audit enforcement: {enforced}"
+        );
+        assert_eq!(
+            latest,
+            Some(0),
+            "latest= lost through audit enforcement: {enforced}"
+        );
+    }
 }

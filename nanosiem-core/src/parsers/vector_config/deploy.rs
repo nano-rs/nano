@@ -454,7 +454,7 @@ impl VectorConfigManager {
              inputs = [{inputs}]\n\
              endpoint = \"${{CLICKHOUSE_URL:-http://clickhouse:8123}}\"\n\
              database = \"${{CLICKHOUSE_DATABASE:-nanosiem}}\"\n\
-             table = \"${{CLICKHOUSE_OCSF_LOGS_TABLE:-ocsf_logs}}\"\n\
+             table = \"${{CLICKHOUSE_OCSF_LOGS_TABLE:-ocsf_logs_raw}}\"\n\
              auth.strategy = \"basic\"\n\
              auth.user = \"${{CLICKHOUSE_USER:-nanosiem}}\"\n\
              auth.password = \"${{CLICKHOUSE_PASSWORD:-nanosiem}}\"\n\

@@ -177,13 +177,55 @@
 
 CREATE DATABASE IF NOT EXISTS nanosiem;
 
+CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs_raw
+(
+    -- NAN-1443: implicit-insertable derivation source for the Null-table + MV
+    -- pattern. `event` is a NORMAL column here (NOT ephemeral) so ClickHouse's
+    -- implicit (no-column-list) INSERT — what the Vector clickhouse sink emits —
+    -- populates it. ENGINE = Null stores nothing; the ocsf_logs_raw_mv reads each
+    -- inserted block, derives every promoted column, and writes the result to
+    -- nanosiem.ocsf_logs. Both ingest paths still write only (event, source_type)
+    -- [+ optional timestamp/id]; the INSERT contract is unchanged.
+    `event` JSON(max_dynamic_paths = 1024) DEFAULT '{}' CODEC(ZSTD(3)),
+    -- Derive timestamp from event.time when a direct writer omits it (Vector always
+    -- provides it). EXACT multiIf carried over from the old ocsf_logs.timestamp DEFAULT.
+    `timestamp` DateTime64(3, 'UTC')
+        DEFAULT multiIf(
+            toInt64OrZero(JSONExtractString(event, 'time')) >= 100000000000000,
+                fromUnixTimestamp64Milli(intDiv(toInt64OrZero(JSONExtractString(event, 'time')), 1000), 'UTC'),
+            toInt64OrZero(JSONExtractString(event, 'time')) >= 10000000000,
+                fromUnixTimestamp64Milli(toInt64OrZero(JSONExtractString(event, 'time')), 'UTC'),
+            toInt64OrZero(JSONExtractString(event, 'time')) > 0,
+                fromUnixTimestamp64Milli(toInt64OrZero(JSONExtractString(event, 'time')) * 1000, 'UTC'),
+            parseDateTime64BestEffortOrZero(JSONExtractString(event, 'time'), 3, 'UTC') != toDateTime64(0, 3, 'UTC'),
+                parseDateTime64BestEffortOrZero(JSONExtractString(event, 'time'), 3, 'UTC'),
+            now64(3, 'UTC')
+        ),
+    `source_type` LowCardinality(String) DEFAULT 'unknown',
+    `id` UUID DEFAULT generateUUIDv7()
+)
+ENGINE = Null
+;
+
+-- =============================================================================
+-- STORAGE TABLE  (nanosiem.ocsf_logs — MergeTree; MV-populated promoted columns)
+-- =============================================================================
+-- NAN-1443: every promoted column below is now a PLAIN column populated by
+-- nanosiem.ocsf_logs_raw_mv (which derives it from the `event` JSON on the Null
+-- staging table nanosiem.ocsf_logs_raw). The `*_unified` and `prevalence_*`
+-- columns stay MATERIALIZED here — they derive from the PLAIN promoted columns
+-- the MV inserts, not from `event`. The PARTITION BY / ORDER BY / TTL / SETTINGS
+-- and all skip indexes are byte-identical to the pre-NAN-1443 single-table form.
 CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
 (
     -- -------------------------------------------------------------------------
-    -- THE ONLY CLIENT-WRITTEN PAYLOAD COLUMN
+    -- NO `event` COLUMN (NAN-1443 Null-table + MV pattern).
     -- -------------------------------------------------------------------------
-    -- Full standard OCSF record. Everything below is derived from this.
-    `event` JSON(max_dynamic_paths = 1024) DEFAULT '{}' CODEC(ZSTD(3)),
+    -- `event` is NOT stored here. It is a normal column on nanosiem.ocsf_logs_raw
+    -- (ENGINE = Null); nanosiem.ocsf_logs_raw_mv derives every promoted column
+    -- below from it and inserts the result here. The unpromoted spill is persisted
+    -- in `unmapped`; the full OCSF envelope is reconstructed on demand from the
+    -- promoted columns + `message` + `unmapped`.
 
     -- -------------------------------------------------------------------------
     -- SORT / PARTITION KEY  (client-written DEFAULT; CANNOT be MATERIALIZED — see
@@ -213,19 +255,7 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     -- The Vector lane always writes `timestamp` explicitly, so this DEFAULT only
     -- fires on the direct-write path. See also the TTL guard at the bottom of
     -- this CREATE and docs/user-guide/direct-ocsf-ingestion.md.
-    `timestamp` DateTime64(3, 'UTC')
-        DEFAULT multiIf(
-            toInt64OrZero(JSONExtractString(event, 'time')) >= 100000000000000,
-                fromUnixTimestamp64Milli(intDiv(toInt64OrZero(JSONExtractString(event, 'time')), 1000), 'UTC'),
-            toInt64OrZero(JSONExtractString(event, 'time')) >= 10000000000,
-                fromUnixTimestamp64Milli(toInt64OrZero(JSONExtractString(event, 'time')), 'UTC'),
-            toInt64OrZero(JSONExtractString(event, 'time')) > 0,
-                fromUnixTimestamp64Milli(toInt64OrZero(JSONExtractString(event, 'time')) * 1000, 'UTC'),
-            parseDateTime64BestEffortOrZero(JSONExtractString(event, 'time'), 3, 'UTC') != toDateTime64(0, 3, 'UTC'),
-                parseDateTime64BestEffortOrZero(JSONExtractString(event, 'time'), 3, 'UTC'),
-            now64(3, 'UTC')
-        )
-        CODEC(Delta(8), ZSTD(3)),
+    `timestamp` DateTime64(3, 'UTC') CODEC(Delta(8), ZSTD(3)),
     -- Manifest alias: queries written against `time_dt` resolve to `timestamp`.
     `time_dt` DateTime64(3, 'UTC') ALIAS timestamp,
     -- Bookkeeping (parity with UDM logs minmax-indexed insert clock).
@@ -242,7 +272,7 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     -- insert `id` explicitly to override. `metadata.uid` stays the OCSF-native
     -- semantic/correlation id (promoted column) — deliberately distinct from this
     -- physical row key. Mirrors UDM `logs.id` (UUIDv7 + ZSTD(3)) byte-for-byte.
-    `id` UUID DEFAULT generateUUIDv7() CODEC(ZSTD(3)),
+    `id` UUID CODEC(ZSTD(3)),
     -- -------------------------------------------------------------------------
     -- OPERATIONAL PROVENANCE KEY  (Security Lake "custom source" pattern)
     -- -------------------------------------------------------------------------
@@ -265,7 +295,7 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     -- (dictionary-evaluated on LowCardinality, so effectively free) and
     -- nonconformant rows stay findable. UDM keeps its fast-path: its ingestion
     -- is exclusively Vector-owned, which lowercases at the edge.
-    `source_type` LowCardinality(String) DEFAULT 'unknown' CODEC(ZSTD(1)),
+    `source_type` LowCardinality(String) CODEC(ZSTD(1)),
 
     -- =========================================================================
     -- TAXONOMY  (numeric event-kind discriminators; PREWHERE-eligible)
@@ -275,33 +305,42 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     -- per-source discriminator. Leads the sort key — so it is DEFAULT (NOT
     -- MATERIALIZED), as CH forbids MATERIALIZED columns in the sort key. The
     -- DEFAULT expression still derives it from `event` (NAN-1334).
-    `class_uid` UInt32 DEFAULT JSONExtractUInt(event, 'class_uid') CODEC(T64, ZSTD(1)),
+    `class_uid` UInt32 CODEC(T64, ZSTD(1)),
     -- Coarser category (1=System, 3=IAM, 4=Network).
-    `category_uid` UInt32 MATERIALIZED JSONExtractUInt(event, 'category_uid') CODEC(T64, ZSTD(1)),
+    `category_uid` UInt32 CODEC(T64, ZSTD(1)),
     -- Class-scoped activity enum (Auth 1=Logon; File 1=Create/4=Delete/...).
     -- ALSO serves UDM `file_action` on class_uid=1001 (manifest: file_action has
     -- no own column — it is activity_id scoped by class).
-    `activity_id` UInt32 MATERIALIZED JSONExtractUInt(event, 'activity_id') CODEC(T64, ZSTD(1)),
+    `activity_id` UInt32 CODEC(T64, ZSTD(1)),
     -- Sibling display string for activity_id (UDM action analog). Emitters
     -- serialize it as `activity_name`; nano-internal sibling label = `activity`.
-    `activity` String MATERIALIZED JSONExtractString(event, 'activity_name') CODEC(ZSTD(1)),
+    `activity` String CODEC(ZSTD(1)),
     -- Most-specific id: type_uid = class_uid*100 + activity_id. long_t -> UInt64.
-    `type_uid` UInt64 MATERIALIZED JSONExtractUInt(event, 'type_uid') CODEC(T64, ZSTD(1)),
+    `type_uid` UInt64 CODEC(T64, ZSTD(1)),
     -- Severity enum int (0=Unknown,1=Info..6=Fatal,99=Other).
-    `severity_id` UInt8 MATERIALIZED JSONExtractUInt(event, 'severity_id') CODEC(T64, LZ4),
+    `severity_id` UInt8 CODEC(T64, LZ4),
     -- Sibling severity string (mirrors UDM severity LowCardinality + set index).
-    `severity` LowCardinality(String) MATERIALIZED JSONExtractString(event, 'severity') CODEC(ZSTD(1)),
+    `severity` LowCardinality(String) CODEC(ZSTD(1)),
 
     -- =========================================================================
     -- CORE OUTCOME / MESSAGE
     -- =========================================================================
     -- Generic outcome enum (0=Unknown,1=Success,2=Failure,99=Other). UDM
     -- auth_result / status. status_id is canonical for filtering.
-    `status_id` UInt32 MATERIALIZED JSONExtractUInt(event, 'status_id') CODEC(T64, ZSTD(1)),
+    `status_id` UInt32 CODEC(T64, ZSTD(1)),
     -- Sibling status string (UDM status; set-indexed).
-    `status` LowCardinality(String) MATERIALIZED JSONExtractString(event, 'status') CODEC(ZSTD(1)),
+    `status` LowCardinality(String) CODEC(ZSTD(1)),
     -- Human-readable summary; the primary full-text hunt field (text index).
-    `message` String MATERIALIZED JSONExtractString(event, 'message') CODEC(ZSTD(3)),
+    `message` String CODEC(ZSTD(3)),
+    -- The OCSF `unmapped` spill — producer source fields that did not map to a
+    -- standard OCSF attribute (the OCSF analog of UDM's `ext`). This is the ONLY
+    -- part of the arriving `event` we persist verbatim (NAN-1443): everything else
+    -- is a promoted column, so the full `event` is never stored. Unpromoted tail
+    -- reads (`ext.*` / `unmapped.*` / bare non-promoted tokens) resolve here via
+    -- native subcolumn access; `event.^unmapped` extracts the sub-object (a clean
+    -- `{}` when the producer emitted no unmapped key). It IS the OCSF profile's
+    -- `json_tail_column` (NAN-1443; was `event`).
+    `unmapped` JSON(max_dynamic_paths = 512) CODEC(ZSTD(3)),
 
     -- =========================================================================
     -- NETWORK  (endpoints, ports, MACs, traffic, protocol)
@@ -310,31 +349,31 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     -- Part of the sort key (NAN-1334: clusters a hot IP into few granules so the
     -- bloom prunes), so it is DEFAULT (NOT MATERIALIZED) — CH forbids MATERIALIZED
     -- columns in the sort key. Same lower(JSONExtract...) derivation from `event`.
-    `src_endpoint.ip` String DEFAULT lower(JSONExtractString(event, 'src_endpoint', 'ip')) CODEC(ZSTD(1)),
+    `src_endpoint.ip` String CODEC(ZSTD(1)),
     -- Responder IP.
-    `dst_endpoint.ip` String MATERIALIZED lower(JSONExtractString(event, 'dst_endpoint', 'ip')) CODEC(ZSTD(1)),
+    `dst_endpoint.ip` String CODEC(ZSTD(1)),
     -- Ports: port_t -> UInt16 (NUMERIC, never lower()'d).
-    `src_endpoint.port` UInt16 MATERIALIZED toUInt16(JSONExtractUInt(event, 'src_endpoint', 'port')) CODEC(T64, LZ4),
-    `dst_endpoint.port` UInt16 MATERIALIZED toUInt16(JSONExtractUInt(event, 'dst_endpoint', 'port')) CODEC(T64, LZ4),
+    `src_endpoint.port` UInt16 CODEC(T64, LZ4),
+    `dst_endpoint.port` UInt16 CODEC(T64, LZ4),
     -- MACs (network_endpoint.mac). UDM src_mac/dest_mac parity (bloom). lower()'d.
-    `src_endpoint.mac` String MATERIALIZED lower(JSONExtractString(event, 'src_endpoint', 'mac')) CODEC(ZSTD(1)),
-    `dst_endpoint.mac` String MATERIALIZED lower(JSONExtractString(event, 'dst_endpoint', 'mac')) CODEC(ZSTD(1)),
+    `src_endpoint.mac` String CODEC(ZSTD(1)),
+    `dst_endpoint.mac` String CODEC(ZSTD(1)),
     -- Initiator hostname (primary src_host source). lowercase-normalized.
-    `src_endpoint.hostname` LowCardinality(String) MATERIALIZED lower(JSONExtractString(event, 'src_endpoint', 'hostname')) CODEC(ZSTD(1)),
+    `src_endpoint.hostname` LowCardinality(String) CODEC(ZSTD(1)),
     -- Host-context hostname: fallback src_host for endpoint-centric classes
     -- (Process/File) where there is no src_endpoint. Profile may
     -- COALESCE(`src_endpoint.hostname`, `device.hostname`).
-    `device.hostname` LowCardinality(String) MATERIALIZED lower(JSONExtractString(event, 'device', 'hostname')) CODEC(ZSTD(1)),
+    `device.hostname` LowCardinality(String) CODEC(ZSTD(1)),
     -- Responder hostname (UDM dest_host parity).
-    `dst_endpoint.hostname` LowCardinality(String) MATERIALIZED lower(JSONExtractString(event, 'dst_endpoint', 'hostname')) CODEC(ZSTD(1)),
+    `dst_endpoint.hostname` LowCardinality(String) CODEC(ZSTD(1)),
     -- IANA protocol number (integer_t, -1 unknown -> Int32). UDM `protocol`
     -- string is surfaced via profile mapping, not a separate hot column.
-    `connection_info.protocol_num` Int32 MATERIALIZED JSONExtractInt(event, 'connection_info', 'protocol_num') CODEC(T64, ZSTD(1)),
+    `connection_info.protocol_num` Int32 CODEC(T64, ZSTD(1)),
     -- Traffic counters: long_t -> UInt64 (NUMERIC).
-    `traffic.bytes_in` UInt64 MATERIALIZED JSONExtractUInt(event, 'traffic', 'bytes_in') CODEC(T64, ZSTD(1)),
-    `traffic.bytes_out` UInt64 MATERIALIZED JSONExtractUInt(event, 'traffic', 'bytes_out') CODEC(T64, ZSTD(1)),
-    `traffic.packets_in` UInt64 MATERIALIZED JSONExtractUInt(event, 'traffic', 'packets_in') CODEC(T64, ZSTD(1)),
-    `traffic.packets_out` UInt64 MATERIALIZED JSONExtractUInt(event, 'traffic', 'packets_out') CODEC(T64, ZSTD(1)),
+    `traffic.bytes_in` UInt64 CODEC(T64, ZSTD(1)),
+    `traffic.bytes_out` UInt64 CODEC(T64, ZSTD(1)),
+    `traffic.packets_in` UInt64 CODEC(T64, ZSTD(1)),
+    `traffic.packets_out` UInt64 CODEC(T64, ZSTD(1)),
 
     -- =========================================================================
     -- IDENTITY  (class-dependent subject vs actor — both promoted)
@@ -342,14 +381,14 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     -- For Authentication 3002 / IAM the SUBJECT is top-level `user.name`.
     -- lowercase-normalized like UDM user. Profile resolves UDM `user` to
     -- COALESCE(`user.name`, `actor.user.name`) per-class.
-    `user.name` String MATERIALIZED lower(JSONExtractString(event, 'user', 'name')) CODEC(ZSTD(1)),
+    `user.name` String CODEC(ZSTD(1)),
     -- The INITIATOR / actor user (UDM src_user; fallback for `user` in endpoint
     -- classes). lowercase-normalized.
-    `actor.user.name` String MATERIALIZED lower(JSONExtractString(event, 'actor', 'user', 'name')) CODEC(ZSTD(1)),
+    `actor.user.name` String CODEC(ZSTD(1)),
     -- user.domain (UDM user_domain; lowercase-normalized — skips lower() wrapper).
-    `user.domain` String MATERIALIZED lower(JSONExtractString(event, 'user', 'domain')) CODEC(ZSTD(1)),
+    `user.domain` String CODEC(ZSTD(1)),
     -- user.uid: OCSF string_t (SID/UPN/objectGUID) — opaque String, not numeric.
-    `user.uid` String MATERIALIZED JSONExtractString(event, 'user', 'uid') CODEC(ZSTD(1)),
+    `user.uid` String CODEC(ZSTD(1)),
 
     -- =========================================================================
     -- PROCESS  (OCSF role model: `process` = SUBJECT, `actor.process` = PARENT)
@@ -364,94 +403,70 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     --
     -- SUBJECT (process.*) — the PRIMARY UDM process columns ("what ran").
     -- process.name — UDM process_name.
-    `process.name` String MATERIALIZED JSONExtractString(event, 'process', 'name') CODEC(ZSTD(1)),
+    `process.name` String CODEC(ZSTD(1)),
     -- process.cmd_line — UDM command_line. OCSF uses `cmd_line` (not command_line).
-    `process.cmd_line` String MATERIALIZED JSONExtractString(event, 'process', 'cmd_line') CODEC(ZSTD(1)),
+    `process.cmd_line` String CODEC(ZSTD(1)),
     -- process.pid (integer_t -> UInt32, NUMERIC) — UDM process_id.
-    `process.pid` UInt32 MATERIALIZED JSONExtractUInt(event, 'process', 'pid') CODEC(T64, LZ4),
+    `process.pid` UInt32 CODEC(T64, LZ4),
     -- process.uid — OCSF-native process identifier (process_t.uid). The OCSF
     -- analog of UDM process_guid; promoted directly (NOT recomputed). bloom for
     -- process-tree pivots.
-    `process.uid` String MATERIALIZED JSONExtractString(event, 'process', 'uid') CODEC(ZSTD(1)),
+    `process.uid` String CODEC(ZSTD(1)),
     -- ARRAY-DERIVED: process.file.hashes[] is fingerprint[]; pick algorithm_id=3
     -- (SHA-256) -> .value, lowercased (UDM hash dict-key conv). UDM process_hash.
     -- arrayFirst over the parsed JSON array selects the SHA-256 element; if none
     -- present arrayFirst returns '' (default of the inner extracted type).
-    `process.file.hashes.sha256` String MATERIALIZED lower(
-        JSONExtractString(
-            arrayFirst(
-                h -> JSONExtractInt(h, 'algorithm_id') = 3,
-                JSONExtractArrayRaw(JSONExtractRaw(event, 'process', 'file', 'hashes'))
-            ),
-            'value'
-        )
-    ) CODEC(ZSTD(3)),
+    `process.file.hashes.sha256` String CODEC(ZSTD(3)),
     -- process.file.path — SUBJECT process image path (Process Activity 1007).
     -- UDM process_path. Not lower()'d (paths preserve case, like file.path). Text
     -- skip index for path-fragment hunts.
-    `process.file.path` String MATERIALIZED JSONExtractString(event, 'process', 'file', 'path') CODEC(ZSTD(1)),
+    `process.file.path` String CODEC(ZSTD(1)),
     -- PARENT / INITIATOR (actor.process.*) — UDM parent_command_line + parent pivots.
     -- actor.process.name — PARENT process name (no UDM scalar; pivots/hunts).
-    `actor.process.name` String MATERIALIZED JSONExtractString(event, 'actor', 'process', 'name') CODEC(ZSTD(1)),
+    `actor.process.name` String CODEC(ZSTD(1)),
     -- actor.process.cmd_line — PARENT cmd line == UDM parent_command_line.
-    `actor.process.cmd_line` String MATERIALIZED JSONExtractString(event, 'actor', 'process', 'cmd_line') CODEC(ZSTD(1)),
+    `actor.process.cmd_line` String CODEC(ZSTD(1)),
     -- actor.process.pid — PARENT process pid (integer_t -> UInt32, NUMERIC).
-    `actor.process.pid` UInt32 MATERIALIZED JSONExtractUInt(event, 'actor', 'process', 'pid') CODEC(T64, LZ4),
+    `actor.process.pid` UInt32 CODEC(T64, LZ4),
     -- actor.process.uid — PARENT process uid (process_t.uid). bloom for pivots.
-    `actor.process.uid` String MATERIALIZED JSONExtractString(event, 'actor', 'process', 'uid') CODEC(ZSTD(1)),
+    `actor.process.uid` String CODEC(ZSTD(1)),
     -- ARRAY-DERIVED: actor.process.file.hashes[] is fingerprint[]; pick
     -- algorithm_id=3 (SHA-256) -> .value, lowercased. PARENT process hash
     -- (parent-hash pivots + prevalence summary). arrayFirst over the parsed JSON
     -- array selects the SHA-256 element; '' when none present.
-    `actor.process.file.hashes.sha256` String MATERIALIZED lower(
-        JSONExtractString(
-            arrayFirst(
-                h -> JSONExtractInt(h, 'algorithm_id') = 3,
-                JSONExtractArrayRaw(JSONExtractRaw(event, 'actor', 'process', 'file', 'hashes'))
-            ),
-            'value'
-        )
-    ) CODEC(ZSTD(3)),
+    `actor.process.file.hashes.sha256` String CODEC(ZSTD(3)),
     -- actor.process.file.path — PARENT/INITIATOR process image path; also the
     -- acting-process image on module/network/file/dns/registry classes. UDM
     -- parent_process_path. Not lower()'d. Text skip index for path-fragment hunts.
-    `actor.process.file.path` String MATERIALIZED JSONExtractString(event, 'actor', 'process', 'file', 'path') CODEC(ZSTD(1)),
+    `actor.process.file.path` String CODEC(ZSTD(1)),
 
     -- =========================================================================
     -- FILE  (File System Activity 1001 target object)
     -- =========================================================================
-    `file.name` String MATERIALIZED JSONExtractString(event, 'file', 'name') CODEC(ZSTD(1)),
-    `file.path` String MATERIALIZED JSONExtractString(event, 'file', 'path') CODEC(ZSTD(1)),
+    `file.name` String CODEC(ZSTD(1)),
+    `file.path` String CODEC(ZSTD(1)),
     -- module.file.path — loaded module image path (Module Activity 1005).
     -- OCSF-native; no UDM equivalent. Not lower()'d. Text skip index.
-    `module.file.path` String MATERIALIZED JSONExtractString(event, 'module', 'file', 'path') CODEC(ZSTD(1)),
+    `module.file.path` String CODEC(ZSTD(1)),
     -- module.file.name — loaded module file name (Module Activity 1005). bloom.
-    `module.file.name` String MATERIALIZED JSONExtractString(event, 'module', 'file', 'name') CODEC(ZSTD(1)),
+    `module.file.name` String CODEC(ZSTD(1)),
     -- ARRAY-DERIVED: file.hashes[] is fingerprint[]; SHA-256 (algorithm_id=3).
     -- There is NO scalar file_hash in OCSF. Lowercased.
-    `file.hashes.sha256` String MATERIALIZED lower(
-        JSONExtractString(
-            arrayFirst(
-                h -> JSONExtractInt(h, 'algorithm_id') = 3,
-                JSONExtractArrayRaw(JSONExtractRaw(event, 'file', 'hashes'))
-            ),
-            'value'
-        )
-    ) CODEC(ZSTD(3)),
+    `file.hashes.sha256` String CODEC(ZSTD(3)),
 
     -- =========================================================================
     -- AUTHENTICATION  (Authentication 3002)
     -- =========================================================================
     -- Auth protocol enum int (1=NTLM,2=Kerberos,5=SAML,6=OAUTH2,...,99=Other).
-    `auth_protocol_id` UInt32 MATERIALIZED JSONExtractUInt(event, 'auth_protocol_id') CODEC(T64, ZSTD(1)),
+    `auth_protocol_id` UInt32 CODEC(T64, ZSTD(1)),
     -- Sibling auth protocol string (display; auth_protocol_id is canonical).
-    `auth_protocol` LowCardinality(String) MATERIALIZED JSONExtractString(event, 'auth_protocol') CODEC(ZSTD(1)),
+    `auth_protocol` LowCardinality(String) CODEC(ZSTD(1)),
     -- session.uid (UDM session_id).
-    `session.uid` String MATERIALIZED JSONExtractString(event, 'session', 'uid') CODEC(ZSTD(1)),
+    `session.uid` String CODEC(ZSTD(1)),
     -- is_mfa — OCSF boolean_t (Authentication 3002, recommended); whether MFA was
     -- used. UDM mfa_used (boolean -> UInt8 0/1). NUMERIC (never lower()'d). No skip
     -- index: a 2-value boolean is non-selective, mirroring UDM mfa_used (no index).
-    `is_mfa` UInt8 MATERIALIZED toUInt8(JSONExtractBool(event, 'is_mfa')) CODEC(T64, LZ4),
+    `is_mfa` UInt8 CODEC(T64, LZ4),
 
     -- =========================================================================
     -- WEB  (top-level `url` object — Network Activity 4001, NOT HTTP 4002)
@@ -462,62 +477,54 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     -- So these columns serve 4001; the UDM url_domain/url aliases resolve to the
     -- HTTP `http_request.url.*` columns (fixed in the NAN-1241 HTTP-url placement).
     -- url.hostname == the network-activity domain (IOC/prevalence pivot entity).
-    `url.hostname` String MATERIALIZED JSONExtractString(event, 'url', 'hostname') CODEC(ZSTD(1)),
+    `url.hostname` String CODEC(ZSTD(1)),
     -- url.url_string == full URL string for 4001. OCSF 1.8.0 uses `url_string`
     -- (the prior manifest's `url.text` was wrong — `text` is not a url attr).
-    `url.url_string` String MATERIALIZED JSONExtractString(event, 'url', 'url_string') CODEC(ZSTD(1)),
+    `url.url_string` String CODEC(ZSTD(1)),
 
     -- =========================================================================
     -- HTTP ACTIVITY  (class 4002 — URL lives under http_request.url, not top-level)
     -- =========================================================================
     -- http_request.http_method (GET/POST/...). UDM http_method (set index).
-    `http_request.http_method` LowCardinality(String) MATERIALIZED JSONExtractString(event, 'http_request', 'http_method') CODEC(ZSTD(1)),
+    `http_request.http_method` LowCardinality(String) CODEC(ZSTD(1)),
     -- http_request.url.hostname — HTTP request URL domain. HTTP 4002 has no
     -- top-level url, so THIS is the UDM url_domain for HTTP (bloom; domain entity).
     -- NOT lower()'d (matches the top-level url.hostname convention).
-    `http_request.url.hostname` String MATERIALIZED JSONExtractString(event, 'http_request', 'url', 'hostname') CODEC(ZSTD(1)),
+    `http_request.url.hostname` String CODEC(ZSTD(1)),
     -- http_request.url.url_string — full HTTP request URL. HTTP 4002 has no
     -- top-level url, so THIS is the UDM url for HTTP (text index, URL-fragment hunts).
-    `http_request.url.url_string` String MATERIALIZED JSONExtractString(event, 'http_request', 'url', 'url_string') CODEC(ZSTD(1)),
+    `http_request.url.url_string` String CODEC(ZSTD(1)),
     -- http_request.url.path — requested path component (URL-fragment hunt field).
-    `http_request.url.path` String MATERIALIZED JSONExtractString(event, 'http_request', 'url', 'path') CODEC(ZSTD(1)),
+    `http_request.url.path` String CODEC(ZSTD(1)),
     -- http_request.user_agent. UDM http_user_agent (tokenized UA hunts).
-    `http_request.user_agent` String MATERIALIZED JSONExtractString(event, 'http_request', 'user_agent') CODEC(ZSTD(1)),
+    `http_request.user_agent` String CODEC(ZSTD(1)),
     -- http_response.code (HTTP status int -> UInt16). UDM http_status_code.
-    `http_response.code` UInt16 MATERIALIZED toUInt16(JSONExtractUInt(event, 'http_response', 'code')) CODEC(T64, LZ4),
+    `http_response.code` UInt16 CODEC(T64, LZ4),
 
     -- =========================================================================
     -- DNS ACTIVITY  (class 4003)
     -- =========================================================================
     -- query.hostname — queried domain (UDM query; domain entity + tokenized).
-    `query.hostname` String MATERIALIZED JSONExtractString(event, 'query', 'hostname') CODEC(ZSTD(1)),
+    `query.hostname` String CODEC(ZSTD(1)),
     -- ARRAY-DERIVED: answers[] is dns_answer[]; take the FIRST element's rdata
     -- (UDM answer). answers may be empty -> '' (default). bloom.
-    `answers.rdata` String MATERIALIZED JSONExtractString(
-        arrayElement(
-            JSONExtractArrayRaw(JSONExtractRaw(event, 'answers')),
-            1
-        ),
-        'rdata'
-    ) CODEC(ZSTD(1)),
+    `answers.rdata` String CODEC(ZSTD(1)),
 
     -- =========================================================================
     -- EMAIL ACTIVITY  (class 4009)
     -- =========================================================================
     -- email.from (single email_t). UDM sender. lowercase-normalized.
-    `email.from` String MATERIALIZED lower(JSONExtractString(event, 'email', 'from')) CODEC(ZSTD(1)),
+    `email.from` String CODEC(ZSTD(1)),
     -- ARRAY-DERIVED: email.to[] is an email-address array of SCALAR strings;
     -- take the FIRST recipient (UDM recipient). lowercase-normalized.
     -- arrayElement over the raw JSON array yields a quoted JSON string; pull it
     -- through JSONExtractString to strip the quotes before lower().
-    `email.to` String MATERIALIZED lower(
-        JSONExtractString(JSONExtractRaw(event, 'email', 'to'), 1)
-    ) CODEC(ZSTD(1)),
+    `email.to` String CODEC(ZSTD(1)),
     -- email.subject (UDM subject; tokenized).
-    `email.subject` String MATERIALIZED JSONExtractString(event, 'email', 'subject') CODEC(ZSTD(1)),
+    `email.subject` String CODEC(ZSTD(1)),
     -- email.message_uid — RFC5322 Message-ID (UDM message_id). bloom.
     -- (email.uid is the THREAD id — different concept, left in tail.)
-    `email.message_uid` String MATERIALIZED JSONExtractString(event, 'email', 'message_uid') CODEC(ZSTD(1)),
+    `email.message_uid` String CODEC(ZSTD(1)),
 
     -- =========================================================================
     -- FINDING  (vulnerabilities[] — Finding classes, e.g. 2002)
@@ -525,25 +532,19 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     -- ARRAY-DERIVED: vulnerabilities[] is a vulnerability[]; take the FIRST
     -- element's nested cve.uid (UDM cve, e.g. CVE-2021-12345). bloom. Non-finding
     -- events leave this empty. Multi-CVE tail stays in event.
-    `vulnerabilities.cve.uid` String MATERIALIZED JSONExtractString(
-        arrayElement(
-            JSONExtractArrayRaw(JSONExtractRaw(event, 'vulnerabilities')),
-            1
-        ),
-        'cve', 'uid'
-    ) CODEC(ZSTD(1)),
+    `vulnerabilities.cve.uid` String CODEC(ZSTD(1)),
 
     -- =========================================================================
     -- CLOUD  (cloud object — Cloud profile; DUAL-MODE enrichment)
     -- =========================================================================
     -- cloud.provider (required). UDM cloud_provider (set index).
-    `cloud.provider` LowCardinality(String) MATERIALIZED JSONExtractString(event, 'cloud', 'provider') CODEC(ZSTD(1)),
+    `cloud.provider` LowCardinality(String) CODEC(ZSTD(1)),
     -- cloud.account.uid (account/subscription id). UDM cloud_account_id (bloom).
-    `cloud.account.uid` String MATERIALIZED JSONExtractString(event, 'cloud', 'account', 'uid') CODEC(ZSTD(1)),
+    `cloud.account.uid` String CODEC(ZSTD(1)),
     -- cloud.account.name. UDM cloud_account_name (set index).
-    `cloud.account.name` LowCardinality(String) MATERIALIZED JSONExtractString(event, 'cloud', 'account', 'name') CODEC(ZSTD(1)),
+    `cloud.account.name` LowCardinality(String) CODEC(ZSTD(1)),
     -- cloud.region. UDM cloud_region (set index).
-    `cloud.region` LowCardinality(String) MATERIALIZED JSONExtractString(event, 'cloud', 'region') CODEC(ZSTD(1)),
+    `cloud.region` LowCardinality(String) CODEC(ZSTD(1)),
 
     -- =========================================================================
     -- CLOUD API ACTIVITY  (API Activity 6003 — `api` object + resources[])
@@ -551,12 +552,12 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     -- api.service is a Service object (objects/api -> objects/service); service.name
     -- is the targeted cloud/AWS service (e.g. 'signin','sts','s3'). UDM cloud_service
     -- (set index). Distinct from cloud.provider (the CSP) and api.operation (the verb).
-    `api.service.name` LowCardinality(String) MATERIALIZED JSONExtractString(event, 'api', 'service', 'name') CODEC(ZSTD(1)),
+    `api.service.name` LowCardinality(String) CODEC(ZSTD(1)),
     -- api.operation is the AWS API verb (e.g. 'CreateAccessKey','AssumeRole',
     -- 'AttachUserPolicy') the call invoked. NO UDM equivalent (the cloud action
     -- allow-lists reference this native column directly under OCSF). Distinct from
     -- the generic `activity` (Create/Read/Update/Delete) and api.service.name (target).
-    `api.operation` LowCardinality(String) MATERIALIZED JSONExtractString(event, 'api', 'operation') CODEC(ZSTD(1)),
+    `api.operation` LowCardinality(String) CODEC(ZSTD(1)),
     -- ARRAY-DERIVED: resources[] is a resource_details[] array; take the FIRST
     -- element's sub-field (mirrors the vulnerabilities[].cve.uid pattern:
     -- arrayElement(JSONExtractArrayRaw(JSONExtractRaw(... 'resources')), 1) then the
@@ -564,27 +565,9 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     -- tail stays in event. `type` is the source-defined resource type (set index);
     -- `uid`/`name` are bloom (resource-pivot entities). Column names = array-derived
     -- `resources.<attr>`.
-    `resources.type` LowCardinality(String) MATERIALIZED JSONExtractString(
-        arrayElement(
-            JSONExtractArrayRaw(JSONExtractRaw(event, 'resources')),
-            1
-        ),
-        'type'
-    ) CODEC(ZSTD(1)),
-    `resources.uid` String MATERIALIZED JSONExtractString(
-        arrayElement(
-            JSONExtractArrayRaw(JSONExtractRaw(event, 'resources')),
-            1
-        ),
-        'uid'
-    ) CODEC(ZSTD(1)),
-    `resources.name` String MATERIALIZED JSONExtractString(
-        arrayElement(
-            JSONExtractArrayRaw(JSONExtractRaw(event, 'resources')),
-            1
-        ),
-        'name'
-    ) CODEC(ZSTD(1)),
+    `resources.type` LowCardinality(String) CODEC(ZSTD(1)),
+    `resources.uid` String CODEC(ZSTD(1)),
+    `resources.name` String CODEC(ZSTD(1)),
     -- NOTE: UDM `change_type` has NO own column — on API Activity 6003 the change
     -- action is the shared `activity_id` (Create=1/Read=2/Update=3/Delete=4), the
     -- same column as the taxonomy/file_action entries. The query layer translates
@@ -606,16 +589,16 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     -- This is what lets nano-OWNED OCSF ingestion enrich rows that arrive un-enriched.
     -- The dict `asn` attribute is a String like "AS13335" -> strip non-digits + parse
     -- for the numeric autonomous_system.number column.
-    `src_endpoint.location.country` LowCardinality(String) MATERIALIZED if(JSONExtractString(event, 'src_endpoint', 'location', 'country') != '', JSONExtractString(event, 'src_endpoint', 'location', 'country'), if(`src_endpoint.ip` != '', if(isIPv4String(`src_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'country_code', toIPv4OrDefault(`src_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'country_code', toIPv6OrDefault(`src_endpoint.ip`), '')), '')) CODEC(ZSTD(1)),
-    `src_endpoint.location.continent` LowCardinality(String) MATERIALIZED if(JSONExtractString(event, 'src_endpoint', 'location', 'continent') != '', JSONExtractString(event, 'src_endpoint', 'location', 'continent'), if(`src_endpoint.ip` != '', if(isIPv4String(`src_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'continent', toIPv4OrDefault(`src_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'continent', toIPv6OrDefault(`src_endpoint.ip`), '')), '')) CODEC(ZSTD(1)),
+    `src_endpoint.location.country` LowCardinality(String) CODEC(ZSTD(1)),
+    `src_endpoint.location.continent` LowCardinality(String) CODEC(ZSTD(1)),
     -- autonomous_system.number is a numeric ASN (integer_t -> UInt32). UDM
     -- enriched_src_asn (String) surfaced via profile mapping. NUMERIC.
-    `src_endpoint.autonomous_system.number` UInt32 MATERIALIZED if(JSONExtractUInt(event, 'src_endpoint', 'autonomous_system', 'number') != 0, JSONExtractUInt(event, 'src_endpoint', 'autonomous_system', 'number'), if(`src_endpoint.ip` != '', toUInt32OrZero(replaceRegexpAll(if(isIPv4String(`src_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'asn', toIPv4OrDefault(`src_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'asn', toIPv6OrDefault(`src_endpoint.ip`), '')), '[^0-9]', '')), 0)) CODEC(T64, ZSTD(1)),
-    `src_endpoint.autonomous_system.name` String MATERIALIZED if(JSONExtractString(event, 'src_endpoint', 'autonomous_system', 'name') != '', JSONExtractString(event, 'src_endpoint', 'autonomous_system', 'name'), if(`src_endpoint.ip` != '', if(isIPv4String(`src_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'as_name', toIPv4OrDefault(`src_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'as_name', toIPv6OrDefault(`src_endpoint.ip`), '')), '')) CODEC(ZSTD(1)),
-    `dst_endpoint.location.country` LowCardinality(String) MATERIALIZED if(JSONExtractString(event, 'dst_endpoint', 'location', 'country') != '', JSONExtractString(event, 'dst_endpoint', 'location', 'country'), if(`dst_endpoint.ip` != '', if(isIPv4String(`dst_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'country_code', toIPv4OrDefault(`dst_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'country_code', toIPv6OrDefault(`dst_endpoint.ip`), '')), '')) CODEC(ZSTD(1)),
-    `dst_endpoint.location.continent` LowCardinality(String) MATERIALIZED if(JSONExtractString(event, 'dst_endpoint', 'location', 'continent') != '', JSONExtractString(event, 'dst_endpoint', 'location', 'continent'), if(`dst_endpoint.ip` != '', if(isIPv4String(`dst_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'continent', toIPv4OrDefault(`dst_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'continent', toIPv6OrDefault(`dst_endpoint.ip`), '')), '')) CODEC(ZSTD(1)),
-    `dst_endpoint.autonomous_system.number` UInt32 MATERIALIZED if(JSONExtractUInt(event, 'dst_endpoint', 'autonomous_system', 'number') != 0, JSONExtractUInt(event, 'dst_endpoint', 'autonomous_system', 'number'), if(`dst_endpoint.ip` != '', toUInt32OrZero(replaceRegexpAll(if(isIPv4String(`dst_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'asn', toIPv4OrDefault(`dst_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'asn', toIPv6OrDefault(`dst_endpoint.ip`), '')), '[^0-9]', '')), 0)) CODEC(T64, ZSTD(1)),
-    `dst_endpoint.autonomous_system.name` String MATERIALIZED if(JSONExtractString(event, 'dst_endpoint', 'autonomous_system', 'name') != '', JSONExtractString(event, 'dst_endpoint', 'autonomous_system', 'name'), if(`dst_endpoint.ip` != '', if(isIPv4String(`dst_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'as_name', toIPv4OrDefault(`dst_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'as_name', toIPv6OrDefault(`dst_endpoint.ip`), '')), '')) CODEC(ZSTD(1)),
+    `src_endpoint.autonomous_system.number` UInt32 CODEC(T64, ZSTD(1)),
+    `src_endpoint.autonomous_system.name` String CODEC(ZSTD(1)),
+    `dst_endpoint.location.country` LowCardinality(String) CODEC(ZSTD(1)),
+    `dst_endpoint.location.continent` LowCardinality(String) CODEC(ZSTD(1)),
+    `dst_endpoint.autonomous_system.number` UInt32 CODEC(T64, ZSTD(1)),
+    `dst_endpoint.autonomous_system.name` String CODEC(ZSTD(1)),
 
     -- =========================================================================
     -- ENRICHMENT — IOC / CUSTOM  (DUAL-MODE; OCSF-native enrichments[] BY NAME)
@@ -635,60 +618,12 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     --  nanosiem.custom_enrichment_dict keyed on tuple('ip', <ip>) returning
     --  Array(String) tags joined with ', '). Parity with clickhouse/init.sql
     --  ioc_*_threat_type / custom_*_ip_tags. Enriches nano-OWNED OCSF ingestion.
-    `enrichments.ioc_src_ip_threat_type` String MATERIALIZED if(JSONExtractString(
-        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_src_ip_threat_type',
-                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
-        'value'
-    ) != '', JSONExtractString(
-        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_src_ip_threat_type',
-                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
-        'value'
-    ), if(`src_endpoint.ip` != '', dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', `src_endpoint.ip`, ''), '')) CODEC(ZSTD(1)),
-    `enrichments.ioc_dest_ip_threat_type` String MATERIALIZED if(JSONExtractString(
-        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_dest_ip_threat_type',
-                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
-        'value'
-    ) != '', JSONExtractString(
-        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_dest_ip_threat_type',
-                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
-        'value'
-    ), if(`dst_endpoint.ip` != '', dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', `dst_endpoint.ip`, ''), '')) CODEC(ZSTD(1)),
-    `enrichments.ioc_domain_threat_type` String MATERIALIZED if(JSONExtractString(
-        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_domain_threat_type',
-                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
-        'value'
-    ) != '', JSONExtractString(
-        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_domain_threat_type',
-                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
-        'value'
-    ), multiIf(`url.hostname` != '' AND dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`url.hostname`), '') != '', dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`url.hostname`), ''), `http_request.url.hostname` != '' AND dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`http_request.url.hostname`), '') != '', dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`http_request.url.hostname`), ''), `query.hostname` != '' AND dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`query.hostname`), '') != '', dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`query.hostname`), ''), '')) CODEC(ZSTD(1)),
-    `enrichments.ioc_hash_threat_type` String MATERIALIZED if(JSONExtractString(
-        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_hash_threat_type',
-                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
-        'value'
-    ) != '', JSONExtractString(
-        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_hash_threat_type',
-                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
-        'value'
-    ), multiIf(`file.hashes.sha256` != '' AND dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`file.hashes.sha256`), '') != '', dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`file.hashes.sha256`), ''), `process.file.hashes.sha256` != '' AND dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`process.file.hashes.sha256`), '') != '', dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`process.file.hashes.sha256`), ''), '')) CODEC(ZSTD(1)),
-    `enrichments.custom_src_ip_tags` String MATERIALIZED if(JSONExtractString(
-        arrayFirst(e -> JSONExtractString(e, 'name') = 'custom_src_ip_tags',
-                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
-        'value'
-    ) != '', JSONExtractString(
-        arrayFirst(e -> JSONExtractString(e, 'name') = 'custom_src_ip_tags',
-                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
-        'value'
-    ), if(`src_endpoint.ip` != '', arrayStringConcat(dictGetOrDefault('nanosiem.custom_enrichment_dict', 'tags', tuple('ip', `src_endpoint.ip`), []), ', '), '')) CODEC(ZSTD(1)),
-    `enrichments.custom_dest_ip_tags` String MATERIALIZED if(JSONExtractString(
-        arrayFirst(e -> JSONExtractString(e, 'name') = 'custom_dest_ip_tags',
-                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
-        'value'
-    ) != '', JSONExtractString(
-        arrayFirst(e -> JSONExtractString(e, 'name') = 'custom_dest_ip_tags',
-                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
-        'value'
-    ), if(`dst_endpoint.ip` != '', arrayStringConcat(dictGetOrDefault('nanosiem.custom_enrichment_dict', 'tags', tuple('ip', `dst_endpoint.ip`), []), ', '), '')) CODEC(ZSTD(1)),
+    `enrichments.ioc_src_ip_threat_type` String CODEC(ZSTD(1)),
+    `enrichments.ioc_dest_ip_threat_type` String CODEC(ZSTD(1)),
+    `enrichments.ioc_domain_threat_type` String CODEC(ZSTD(1)),
+    `enrichments.ioc_hash_threat_type` String CODEC(ZSTD(1)),
+    `enrichments.custom_src_ip_tags` String CODEC(ZSTD(1)),
+    `enrichments.custom_dest_ip_tags` String CODEC(ZSTD(1)),
 
     -- =========================================================================
     -- METADATA / PROVENANCE  (standard OCSF `metadata` object — source identity)
@@ -705,23 +640,23 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     -- The reporting product (e.g. 'apache http server'). This is the per-source
     -- axis the UI's source selector should read for OCSF rows — DISTINCT from
     -- class_uid (the event CLASS). bloom_filter + PREWHERE-eligible. UDM vendor_product.
-    `metadata.product.name` String MATERIALIZED JSONExtractString(event, 'metadata', 'product', 'name') CODEC(ZSTD(1)),
+    `metadata.product.name` String CODEC(ZSTD(1)),
     -- metadata.product.vendor_name — vendor of the reporting product. Low-card.
-    `metadata.product.vendor_name` LowCardinality(String) MATERIALIZED JSONExtractString(event, 'metadata', 'product', 'vendor_name') CODEC(ZSTD(1)),
+    `metadata.product.vendor_name` LowCardinality(String) CODEC(ZSTD(1)),
     -- metadata.product.feature.name — feature / log-type sub-source (feature object
     -- nested under product). Finer-grained than product.name. bloom.
-    `metadata.product.feature.name` String MATERIALIZED JSONExtractString(event, 'metadata', 'product', 'feature', 'name') CODEC(ZSTD(1)),
+    `metadata.product.feature.name` String CODEC(ZSTD(1)),
     -- metadata.log_name — log channel / source file (e.g. access.log, 'Security'). bloom.
-    `metadata.log_name` String MATERIALIZED JSONExtractString(event, 'metadata', 'log_name') CODEC(ZSTD(1)),
+    `metadata.log_name` String CODEC(ZSTD(1)),
     -- metadata.log_provider — logging provider / collector (e.g. 'Vector'). Low-card.
-    `metadata.log_provider` LowCardinality(String) MATERIALIZED JSONExtractString(event, 'metadata', 'log_provider') CODEC(ZSTD(1)),
+    `metadata.log_provider` LowCardinality(String) CODEC(ZSTD(1)),
     -- metadata.uid — producer-assigned unique event id (UDM id/event_id; opaque
     -- String, NOT a CH UUID). bloom for by-id lookup/dedup pivots.
-    `metadata.uid` String MATERIALIZED JSONExtractString(event, 'metadata', 'uid') CODEC(ZSTD(1)),
+    `metadata.uid` String CODEC(ZSTD(1)),
     -- metadata.version — OCSF schema version of the record (e.g. '1.8.0'). Low-card.
-    `metadata.version` LowCardinality(String) MATERIALIZED JSONExtractString(event, 'metadata', 'version') CODEC(ZSTD(1)),
+    `metadata.version` LowCardinality(String) CODEC(ZSTD(1)),
     -- metadata.correlation_uid — producer correlation id grouping related events. bloom.
-    `metadata.correlation_uid` String MATERIALIZED JSONExtractString(event, 'metadata', 'correlation_uid') CODEC(ZSTD(1)),
+    `metadata.correlation_uid` String CODEC(ZSTD(1)),
 
     -- =========================================================================
     -- PREVALENCE  (asset-card parity with UDM logs.prevalence_* — NAN-1248)
@@ -805,7 +740,7 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     -- granting the INSERT-only nanosiem_ingest user SELECT on `event` (raw log
     -- content) would defeat the NAN-1384 least-privilege contract, and
     -- MATERIALIZED-column expressions are exempt from the MV-push SELECT check.
-    `event_bytes` UInt64 MATERIALIZED length(toString(event)) CODEC(T64, LZ4),
+    `event_bytes` UInt64 CODEC(T64, LZ4),
 
     -- =========================================================================
     -- FULL-TEXT SEARCH  (NAN-1241)
@@ -1047,6 +982,230 @@ SAMPLE BY cityHash64(id)
 -- vanishing; normal rows expire exactly as before.
 TTL timestamp + toIntervalDay(365) DELETE WHERE timestamp > toDateTime64('2000-01-01 00:00:00', 3, 'UTC')
 SETTINGS index_granularity = 8192, non_replicated_deduplication_window = 1000
+;
+
+-- =============================================================================
+-- DERIVATION MATERIALIZED VIEW  (nanosiem.ocsf_logs_raw_mv — Null -> MergeTree)
+-- =============================================================================
+-- NAN-1443: reads each block inserted into nanosiem.ocsf_logs_raw, derives every
+-- promoted column from `event` (the EXACT expressions that were MATERIALIZED /
+-- DEFAULT on the old single-table ocsf_logs), and writes the result to
+-- nanosiem.ocsf_logs. This pattern works for BOTH implicit (Vector clickhouse
+-- sink — no column list) and explicit (Tenzir — `(event, source_type)`) inserts,
+-- because `event` is a normal (non-ephemeral) column on the staging table.
+-- The `*_unified` columns are NOT selected here (they MATERIALIZE on ocsf_logs
+-- from these plain columns); `_inserted_at` (DEFAULT now64 on ocsf_logs) and
+-- `time_dt` (ALIAS) are likewise omitted. The `prevalence_*` columns are also
+-- MATERIALIZED on ocsf_logs (from the plain hash/ip/domain columns), so they are
+-- not selected here either.
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_logs_raw_mv
+TO nanosiem.ocsf_logs
+AS SELECT
+    timestamp,
+    source_type,
+    id,
+    JSONExtractUInt(event, 'class_uid') AS `class_uid`,
+    JSONExtractUInt(event, 'category_uid') AS `category_uid`,
+    JSONExtractUInt(event, 'activity_id') AS `activity_id`,
+    JSONExtractString(event, 'activity_name') AS `activity`,
+    JSONExtractUInt(event, 'type_uid') AS `type_uid`,
+    JSONExtractUInt(event, 'severity_id') AS `severity_id`,
+    JSONExtractString(event, 'severity') AS `severity`,
+    JSONExtractUInt(event, 'status_id') AS `status_id`,
+    JSONExtractString(event, 'status') AS `status`,
+    JSONExtractString(event, 'message') AS `message`,
+    event.^unmapped AS `unmapped`,
+    lower(JSONExtractString(event, 'src_endpoint', 'ip')) AS `src_endpoint.ip`,
+    lower(JSONExtractString(event, 'dst_endpoint', 'ip')) AS `dst_endpoint.ip`,
+    toUInt16(JSONExtractUInt(event, 'src_endpoint', 'port')) AS `src_endpoint.port`,
+    toUInt16(JSONExtractUInt(event, 'dst_endpoint', 'port')) AS `dst_endpoint.port`,
+    lower(JSONExtractString(event, 'src_endpoint', 'mac')) AS `src_endpoint.mac`,
+    lower(JSONExtractString(event, 'dst_endpoint', 'mac')) AS `dst_endpoint.mac`,
+    lower(JSONExtractString(event, 'src_endpoint', 'hostname')) AS `src_endpoint.hostname`,
+    lower(JSONExtractString(event, 'device', 'hostname')) AS `device.hostname`,
+    lower(JSONExtractString(event, 'dst_endpoint', 'hostname')) AS `dst_endpoint.hostname`,
+    JSONExtractInt(event, 'connection_info', 'protocol_num') AS `connection_info.protocol_num`,
+    JSONExtractUInt(event, 'traffic', 'bytes_in') AS `traffic.bytes_in`,
+    JSONExtractUInt(event, 'traffic', 'bytes_out') AS `traffic.bytes_out`,
+    JSONExtractUInt(event, 'traffic', 'packets_in') AS `traffic.packets_in`,
+    JSONExtractUInt(event, 'traffic', 'packets_out') AS `traffic.packets_out`,
+    lower(JSONExtractString(event, 'user', 'name')) AS `user.name`,
+    lower(JSONExtractString(event, 'actor', 'user', 'name')) AS `actor.user.name`,
+    lower(JSONExtractString(event, 'user', 'domain')) AS `user.domain`,
+    JSONExtractString(event, 'user', 'uid') AS `user.uid`,
+    JSONExtractString(event, 'process', 'name') AS `process.name`,
+    JSONExtractString(event, 'process', 'cmd_line') AS `process.cmd_line`,
+    JSONExtractUInt(event, 'process', 'pid') AS `process.pid`,
+    JSONExtractString(event, 'process', 'uid') AS `process.uid`,
+    lower(
+        JSONExtractString(
+            arrayFirst(
+                h -> JSONExtractInt(h, 'algorithm_id') = 3,
+                JSONExtractArrayRaw(JSONExtractRaw(event, 'process', 'file', 'hashes'))
+            ),
+            'value'
+        )
+    ) AS `process.file.hashes.sha256`,
+    JSONExtractString(event, 'process', 'file', 'path') AS `process.file.path`,
+    JSONExtractString(event, 'actor', 'process', 'name') AS `actor.process.name`,
+    JSONExtractString(event, 'actor', 'process', 'cmd_line') AS `actor.process.cmd_line`,
+    JSONExtractUInt(event, 'actor', 'process', 'pid') AS `actor.process.pid`,
+    JSONExtractString(event, 'actor', 'process', 'uid') AS `actor.process.uid`,
+    lower(
+        JSONExtractString(
+            arrayFirst(
+                h -> JSONExtractInt(h, 'algorithm_id') = 3,
+                JSONExtractArrayRaw(JSONExtractRaw(event, 'actor', 'process', 'file', 'hashes'))
+            ),
+            'value'
+        )
+    ) AS `actor.process.file.hashes.sha256`,
+    JSONExtractString(event, 'actor', 'process', 'file', 'path') AS `actor.process.file.path`,
+    JSONExtractString(event, 'file', 'name') AS `file.name`,
+    JSONExtractString(event, 'file', 'path') AS `file.path`,
+    JSONExtractString(event, 'module', 'file', 'path') AS `module.file.path`,
+    JSONExtractString(event, 'module', 'file', 'name') AS `module.file.name`,
+    lower(
+        JSONExtractString(
+            arrayFirst(
+                h -> JSONExtractInt(h, 'algorithm_id') = 3,
+                JSONExtractArrayRaw(JSONExtractRaw(event, 'file', 'hashes'))
+            ),
+            'value'
+        )
+    ) AS `file.hashes.sha256`,
+    JSONExtractUInt(event, 'auth_protocol_id') AS `auth_protocol_id`,
+    JSONExtractString(event, 'auth_protocol') AS `auth_protocol`,
+    JSONExtractString(event, 'session', 'uid') AS `session.uid`,
+    toUInt8(JSONExtractBool(event, 'is_mfa')) AS `is_mfa`,
+    JSONExtractString(event, 'url', 'hostname') AS `url.hostname`,
+    JSONExtractString(event, 'url', 'url_string') AS `url.url_string`,
+    JSONExtractString(event, 'http_request', 'http_method') AS `http_request.http_method`,
+    JSONExtractString(event, 'http_request', 'url', 'hostname') AS `http_request.url.hostname`,
+    JSONExtractString(event, 'http_request', 'url', 'url_string') AS `http_request.url.url_string`,
+    JSONExtractString(event, 'http_request', 'url', 'path') AS `http_request.url.path`,
+    JSONExtractString(event, 'http_request', 'user_agent') AS `http_request.user_agent`,
+    toUInt16(JSONExtractUInt(event, 'http_response', 'code')) AS `http_response.code`,
+    JSONExtractString(event, 'query', 'hostname') AS `query.hostname`,
+    JSONExtractString(
+        arrayElement(
+            JSONExtractArrayRaw(JSONExtractRaw(event, 'answers')),
+            1
+        ),
+        'rdata'
+    ) AS `answers.rdata`,
+    lower(JSONExtractString(event, 'email', 'from')) AS `email.from`,
+    lower(
+        JSONExtractString(JSONExtractRaw(event, 'email', 'to'), 1)
+    ) AS `email.to`,
+    JSONExtractString(event, 'email', 'subject') AS `email.subject`,
+    JSONExtractString(event, 'email', 'message_uid') AS `email.message_uid`,
+    JSONExtractString(
+        arrayElement(
+            JSONExtractArrayRaw(JSONExtractRaw(event, 'vulnerabilities')),
+            1
+        ),
+        'cve', 'uid'
+    ) AS `vulnerabilities.cve.uid`,
+    JSONExtractString(event, 'cloud', 'provider') AS `cloud.provider`,
+    JSONExtractString(event, 'cloud', 'account', 'uid') AS `cloud.account.uid`,
+    JSONExtractString(event, 'cloud', 'account', 'name') AS `cloud.account.name`,
+    JSONExtractString(event, 'cloud', 'region') AS `cloud.region`,
+    JSONExtractString(event, 'api', 'service', 'name') AS `api.service.name`,
+    JSONExtractString(event, 'api', 'operation') AS `api.operation`,
+    JSONExtractString(
+        arrayElement(
+            JSONExtractArrayRaw(JSONExtractRaw(event, 'resources')),
+            1
+        ),
+        'type'
+    ) AS `resources.type`,
+    JSONExtractString(
+        arrayElement(
+            JSONExtractArrayRaw(JSONExtractRaw(event, 'resources')),
+            1
+        ),
+        'uid'
+    ) AS `resources.uid`,
+    JSONExtractString(
+        arrayElement(
+            JSONExtractArrayRaw(JSONExtractRaw(event, 'resources')),
+            1
+        ),
+        'name'
+    ) AS `resources.name`,
+    if(JSONExtractString(event, 'src_endpoint', 'location', 'country') != '', JSONExtractString(event, 'src_endpoint', 'location', 'country'), if(`src_endpoint.ip` != '', if(isIPv4String(`src_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'country_code', toIPv4OrDefault(`src_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'country_code', toIPv6OrDefault(`src_endpoint.ip`), '')), '')) AS `src_endpoint.location.country`,
+    if(JSONExtractString(event, 'src_endpoint', 'location', 'continent') != '', JSONExtractString(event, 'src_endpoint', 'location', 'continent'), if(`src_endpoint.ip` != '', if(isIPv4String(`src_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'continent', toIPv4OrDefault(`src_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'continent', toIPv6OrDefault(`src_endpoint.ip`), '')), '')) AS `src_endpoint.location.continent`,
+    if(JSONExtractUInt(event, 'src_endpoint', 'autonomous_system', 'number') != 0, JSONExtractUInt(event, 'src_endpoint', 'autonomous_system', 'number'), if(`src_endpoint.ip` != '', toUInt32OrZero(replaceRegexpAll(if(isIPv4String(`src_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'asn', toIPv4OrDefault(`src_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'asn', toIPv6OrDefault(`src_endpoint.ip`), '')), '[^0-9]', '')), 0)) AS `src_endpoint.autonomous_system.number`,
+    if(JSONExtractString(event, 'src_endpoint', 'autonomous_system', 'name') != '', JSONExtractString(event, 'src_endpoint', 'autonomous_system', 'name'), if(`src_endpoint.ip` != '', if(isIPv4String(`src_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'as_name', toIPv4OrDefault(`src_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'as_name', toIPv6OrDefault(`src_endpoint.ip`), '')), '')) AS `src_endpoint.autonomous_system.name`,
+    if(JSONExtractString(event, 'dst_endpoint', 'location', 'country') != '', JSONExtractString(event, 'dst_endpoint', 'location', 'country'), if(`dst_endpoint.ip` != '', if(isIPv4String(`dst_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'country_code', toIPv4OrDefault(`dst_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'country_code', toIPv6OrDefault(`dst_endpoint.ip`), '')), '')) AS `dst_endpoint.location.country`,
+    if(JSONExtractString(event, 'dst_endpoint', 'location', 'continent') != '', JSONExtractString(event, 'dst_endpoint', 'location', 'continent'), if(`dst_endpoint.ip` != '', if(isIPv4String(`dst_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'continent', toIPv4OrDefault(`dst_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'continent', toIPv6OrDefault(`dst_endpoint.ip`), '')), '')) AS `dst_endpoint.location.continent`,
+    if(JSONExtractUInt(event, 'dst_endpoint', 'autonomous_system', 'number') != 0, JSONExtractUInt(event, 'dst_endpoint', 'autonomous_system', 'number'), if(`dst_endpoint.ip` != '', toUInt32OrZero(replaceRegexpAll(if(isIPv4String(`dst_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'asn', toIPv4OrDefault(`dst_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'asn', toIPv6OrDefault(`dst_endpoint.ip`), '')), '[^0-9]', '')), 0)) AS `dst_endpoint.autonomous_system.number`,
+    if(JSONExtractString(event, 'dst_endpoint', 'autonomous_system', 'name') != '', JSONExtractString(event, 'dst_endpoint', 'autonomous_system', 'name'), if(`dst_endpoint.ip` != '', if(isIPv4String(`dst_endpoint.ip`), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'as_name', toIPv4OrDefault(`dst_endpoint.ip`), ''), dictGetOrDefault('nanosiem.ip_enrichment_dict', 'as_name', toIPv6OrDefault(`dst_endpoint.ip`), '')), '')) AS `dst_endpoint.autonomous_system.name`,
+    if(JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_src_ip_threat_type',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ) != '', JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_src_ip_threat_type',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ), if(`src_endpoint.ip` != '', dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', `src_endpoint.ip`, ''), '')) AS `enrichments.ioc_src_ip_threat_type`,
+    if(JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_dest_ip_threat_type',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ) != '', JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_dest_ip_threat_type',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ), if(`dst_endpoint.ip` != '', dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', `dst_endpoint.ip`, ''), '')) AS `enrichments.ioc_dest_ip_threat_type`,
+    if(JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_domain_threat_type',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ) != '', JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_domain_threat_type',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ), multiIf(`url.hostname` != '' AND dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`url.hostname`), '') != '', dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`url.hostname`), ''), `http_request.url.hostname` != '' AND dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`http_request.url.hostname`), '') != '', dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`http_request.url.hostname`), ''), `query.hostname` != '' AND dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`query.hostname`), '') != '', dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`query.hostname`), ''), '')) AS `enrichments.ioc_domain_threat_type`,
+    if(JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_hash_threat_type',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ) != '', JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'ioc_hash_threat_type',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ), multiIf(`file.hashes.sha256` != '' AND dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`file.hashes.sha256`), '') != '', dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`file.hashes.sha256`), ''), `process.file.hashes.sha256` != '' AND dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`process.file.hashes.sha256`), '') != '', dictGetOrDefault('nanosiem.ioc_enrichment_dict', 'threat_type', lower(`process.file.hashes.sha256`), ''), '')) AS `enrichments.ioc_hash_threat_type`,
+    if(JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'custom_src_ip_tags',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ) != '', JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'custom_src_ip_tags',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ), if(`src_endpoint.ip` != '', arrayStringConcat(dictGetOrDefault('nanosiem.custom_enrichment_dict', 'tags', tuple('ip', `src_endpoint.ip`), []), ', '), '')) AS `enrichments.custom_src_ip_tags`,
+    if(JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'custom_dest_ip_tags',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ) != '', JSONExtractString(
+        arrayFirst(e -> JSONExtractString(e, 'name') = 'custom_dest_ip_tags',
+                   JSONExtractArrayRaw(JSONExtractRaw(event, 'enrichments'))),
+        'value'
+    ), if(`dst_endpoint.ip` != '', arrayStringConcat(dictGetOrDefault('nanosiem.custom_enrichment_dict', 'tags', tuple('ip', `dst_endpoint.ip`), []), ', '), '')) AS `enrichments.custom_dest_ip_tags`,
+    JSONExtractString(event, 'metadata', 'product', 'name') AS `metadata.product.name`,
+    JSONExtractString(event, 'metadata', 'product', 'vendor_name') AS `metadata.product.vendor_name`,
+    JSONExtractString(event, 'metadata', 'product', 'feature', 'name') AS `metadata.product.feature.name`,
+    JSONExtractString(event, 'metadata', 'log_name') AS `metadata.log_name`,
+    JSONExtractString(event, 'metadata', 'log_provider') AS `metadata.log_provider`,
+    JSONExtractString(event, 'metadata', 'uid') AS `metadata.uid`,
+    JSONExtractString(event, 'metadata', 'version') AS `metadata.version`,
+    JSONExtractString(event, 'metadata', 'correlation_uid') AS `metadata.correlation_uid`,
+    length(toString(event)) AS `event_bytes`
+FROM nanosiem.ocsf_logs_raw
 ;
 
 -- =============================================================================
@@ -1661,9 +1820,12 @@ ALTER TABLE nanosiem.ocsf_logs ADD COLUMN IF NOT EXISTS `url_domain_unified` Str
 ALTER TABLE nanosiem.ocsf_logs ADD COLUMN IF NOT EXISTS `url_unified` String MATERIALIZED if(`http_request.url.url_string` != '', `http_request.url.url_string`, `url.url_string`) CODEC(ZSTD(1));
 ALTER TABLE nanosiem.ocsf_logs ADD COLUMN IF NOT EXISTS `src_host_unified` LowCardinality(String) MATERIALIZED if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, `device.hostname`) CODEC(ZSTD(1));
 -- NAN-1385: telemetry payload-size column (see the TELEMETRY section above).
--- No MATERIALIZE COLUMN: only rows inserted after the rollup MV exists matter
--- to it, and unmaterialized parts compute the expression on read anyway.
-ALTER TABLE nanosiem.ocsf_logs ADD COLUMN IF NOT EXISTS `event_bytes` UInt64 MATERIALIZED length(toString(event)) CODEC(T64, LZ4);
+-- NAN-1443: now a PLAIN column populated by ocsf_logs_raw_mv (length(toString(event))
+-- runs in the MV, not here) — `event` is no longer a column on ocsf_logs, so this
+-- ALTER MUST NOT reference it. ADD COLUMN IF NOT EXISTS is a no-op on a fresh table
+-- (already declared plain in the CREATE TABLE above); it only brings a pre-NAN-1443
+-- grown table forward to the plain definition. No MATERIALIZE COLUMN.
+ALTER TABLE nanosiem.ocsf_logs ADD COLUMN IF NOT EXISTS `event_bytes` UInt64 CODEC(T64, LZ4);
 
 ALTER TABLE nanosiem.ocsf_logs MATERIALIZE COLUMN `process_name_unified`;
 ALTER TABLE nanosiem.ocsf_logs MATERIALIZE COLUMN `process_path_unified`;

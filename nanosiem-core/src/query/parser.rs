@@ -157,7 +157,30 @@ fn strip_comments(input: &str) -> String {
 /// these are time-range controls handled by the UI/API TimeRange parameter, not by the parser.
 /// Values can be: -24h, -1d, -7d@d, now, @d, etc. (relative or snap-to time specs)
 fn strip_time_modifiers(input: &str) -> String {
+    split_time_modifiers(input).0
+}
+
+/// Extract the literal `earliest=`/`latest=` modifier tokens from query input,
+/// preserving their original text (e.g. `earliest=-12h`).
+///
+/// Because `parse_query` strips these tokens (they are TimeRange controls, not
+/// AST nodes), any rewrite that round-trips through `parse_query` +
+/// `PrettyPrint` would silently drop them. Callers that rewrite a query but must
+/// preserve the analyst's time window (e.g. access-control enforcement) re-append
+/// these so the downstream search layer still sees them (NAN-1453).
+pub(crate) fn extract_time_modifier_tokens(input: &str) -> Vec<String> {
+    split_time_modifiers(input).1
+}
+
+/// Split `earliest=`/`latest=` time modifiers out of the query input.
+///
+/// Returns `(query_without_modifiers, modifier_tokens)`. The scanner is
+/// quote-aware so it never strips a modifier-looking substring that lives inside
+/// a quoted value. Capture and strip share this single implementation so the two
+/// can never drift out of sync.
+fn split_time_modifiers(input: &str) -> (String, Vec<String>) {
     let mut result = String::with_capacity(input.len());
+    let mut tokens = Vec::new();
     let mut remaining = input;
 
     while !remaining.is_empty() {
@@ -192,6 +215,8 @@ fn strip_time_modifiers(input: &str) -> String {
             let value_end = after_eq
                 .find(|c: char| c.is_whitespace() || c == '|' || c == ']')
                 .unwrap_or(after_eq.len());
+            // Capture the full literal token (`earliest=-12h`) before advancing.
+            tokens.push(remaining[..eq_pos + 1 + value_end].to_string());
             remaining = &after_eq[value_end..];
             // Add a space to keep tokens separated
             result.push(' ');
@@ -204,7 +229,7 @@ fn strip_time_modifiers(input: &str) -> String {
         remaining = &remaining[c.len_utf8()..];
     }
 
-    result
+    (result, tokens)
 }
 
 /// Parse a piped query string into an AST

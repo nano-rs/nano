@@ -203,12 +203,13 @@ impl MetricsCollector {
         // caller-supplied values flow through `.bind(...)` placeholders.
         // NAN-1254: under OCSF the nano finding payload is an OCSF Detection
         // Finding (class_uid 2004) in `ocsf_logs` — there is no `rule_id`
-        // column; the rule id lives in `event.unmapped.rule_id`. Branch the
-        // filter column accordingly; UDM stays byte-identical (`rule_id`).
+        // column; the rule id lives in the spill, `unmapped.rule_id`. NAN-1443:
+        // the spill is now the stored `unmapped` column (the full `event` is
+        // EPHEMERAL), so read it directly. UDM stays byte-identical (`rule_id`).
         let is_ocsf = active_profile_is_ocsf();
         let table = self.table_names.read(crate::schema::active_logs_table());
         let rule_id_col = if is_ocsf {
-            "JSONExtractString(event, 'unmapped', 'rule_id')"
+            "JSONExtractString(toString(unmapped), 'rule_id')"
         } else {
             "rule_id"
         };
@@ -249,17 +250,17 @@ impl MetricsCollector {
         // caller-supplied values flow through `.bind(...)` placeholders.
         // NAN-1254: under OCSF the finding is a Detection Finding (class_uid
         // 2004) on `ocsf_logs` with no `rule_id`/`metadata` columns — the nano
-        // payload (rule_id, signal_type, matched_events_sample, …) lives in
-        // `event.unmapped`. `JSONExtractRaw(event,'unmapped')` returns that
-        // object as a JSON string, which the parsing below reads
-        // `.matched_events_sample` from unchanged. `severity` is materialized on
-        // `ocsf_logs`. UDM stays byte-identical.
+        // payload (rule_id, signal_type, matched_events_sample, …) lives in the
+        // spill. NAN-1443: the spill is the stored `unmapped` column (the full
+        // `event` is EPHEMERAL); `toString(unmapped)` returns that object as a
+        // JSON string, which the parsing below reads `.matched_events_sample`
+        // from unchanged. `severity` is materialized. UDM stays byte-identical.
         let is_ocsf = active_profile_is_ocsf();
         let table = self.table_names.read(crate::schema::active_logs_table());
         let (meta_col, rule_id_col) = if is_ocsf {
             (
-                "JSONExtractRaw(event, 'unmapped')",
-                "JSONExtractString(event, 'unmapped', 'rule_id')",
+                "toString(unmapped)",
+                "JSONExtractString(toString(unmapped), 'rule_id')",
             )
         } else {
             ("metadata", "rule_id")

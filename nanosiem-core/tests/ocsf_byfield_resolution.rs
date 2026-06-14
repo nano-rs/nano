@@ -132,10 +132,10 @@ fn ocsf_unmapped_field_degrades_to_json_extract() {
     let sql = ocsf("* | stats count by status_code");
     assert!(
         sql.contains(
-            "multiIf(isNotNull(event.\"status_code\"), toString(event.\"status_code\"), \
-             toJSONString(event.^\"status_code\") != '{}', toJSONString(event.^\"status_code\"), '')"
-        ) && !sql.contains("JSONExtractString(event"),
-        "OCSF unmapped `status_code` must read the event tail via subcolumn access (graceful), not emit a bare 500.\nSQL:\n{sql}"
+            "multiIf(isNotNull(unmapped.\"status_code\"), toString(unmapped.\"status_code\"), \
+             toJSONString(unmapped.^\"status_code\") != '{}', toJSONString(unmapped.^\"status_code\"), '')"
+        ) && !sql.contains("JSONExtractString(unmapped"),
+        "OCSF unmapped `status_code` must read the `unmapped` spill tail via subcolumn access (NAN-1443; graceful), not emit a bare 500.\nSQL:\n{sql}"
     );
 }
 

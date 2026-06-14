@@ -152,7 +152,8 @@ const ParserRepositories = lazyWithRetryNamed(() => import('@/pages/ParserReposi
 // LAZY IMPORTS - Tier 4: All other pages
 // ============================================================================
 const OnboardingWizard = lazyWithRetryNamed(() => import('@/pages/OnboardingWizard'), 'OnboardingWizard');
-const EntityPage = lazyWithRetryNamed(() => import('@/enterprise/pages/EntityPage'), 'EntityPage');
+// NAN-1450: the legacy /entities/:type/:value EntityPage was retired — entity
+// drilldowns now run `<field>="<value>" | asset` on the Search page.
 // NAN-1070: Cases.tsx is no longer routed — /cases redirects to /inbox.
 // The module is kept in the tree so we can revive if needed.
 // NAN-1071: Case search — cross-cutting query surface under the Cases nav.
@@ -591,15 +592,6 @@ function ProtectedAppRoutes() {
             <PermissionRoute permission="settings:view" element={
               <Suspense fallback={<ListPageLoadingFallback />}>
                 <SiemHealth key={resetKey} />
-              </Suspense>
-            } />
-          } />
-
-          {/* Entity */}
-          <Route path="/entities/:type/:value" element={
-            <PermissionRoute permission="search:view" element={
-              <Suspense fallback={<DetailPageLoadingFallback />}>
-                <EntityPage key={resetKey} />
               </Suspense>
             } />
           } />

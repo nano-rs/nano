@@ -69,12 +69,25 @@
 
     <!--
       NAN-1384 (G18): INSERT-only credential for DIRECT OCSF writers (Tenzir /
-      Cribl-style pipelines inserting into nanosiem.ocsf_logs without Vector).
+      Cribl-style pipelines inserting OCSF records without Vector).
       The shared `nanosiem` user grants SELECT+INSERT+DDL on all of nanosiem.* —
       handing it to a foreign pipeline means read access to every log and write
       access to the identity/prevalence dictionaries' source tables. This user
-      is scoped to exactly what an INSERT into ocsf_logs requires:
-        * INSERT on ocsf_logs itself.
+      is scoped to exactly what a direct OCSF INSERT requires. NAN-1443: writers
+      now INSERT into the `ocsf_logs_raw` ENGINE=Null landing table; the
+      `ocsf_logs_raw_mv` derives the stored row into `ocsf_logs` (the full `event`
+      blob is never stored). CH checks the INSERTING user's grants across the
+      whole MV chain, so the credential needs:
+        * INSERT on ocsf_logs_raw (the write target).
+        * table-level SELECT on ocsf_logs_raw — the ocsf_logs_raw_mv reads
+          `timestamp`, `source_type`, `id`, `event`, AND the typed JSON
+          subcolumn `event.^unmapped`. That subcolumn CANNOT be named in a
+          GRANT (the `^` caret is a grant-parser SYNTAX_ERROR), so a
+          column-scoped grant can't cover it (NAN-1444). ocsf_logs_raw is
+          ENGINE=Null — it stores nothing and SELECT always returns empty —
+          so table-level SELECT exposes no data; it only satisfies the MV
+          chain's insert-time grant check.
+        * INSERT on ocsf_logs — the ocsf_logs_raw_mv writes the derived row there.
         * dictGet on the 6 dictionaries its MATERIALIZED enrichment/prevalence
           columns call at insert time (insert fails ACCESS_DENIED otherwise —
           verified on CH 26.4).
@@ -97,6 +110,16 @@
       <access_management>0</access_management>
       <allow_ddl>0</allow_ddl>
       <grants>
+        <!-- NAN-1443/NAN-1444: write into the ocsf_logs_raw landing table; the
+             ocsf_logs_raw_mv reads timestamp/source_type/id/event AND the typed
+             JSON subcolumn event.^unmapped from raw and INSERTs the derived row
+             into ocsf_logs. CH checks the inserting user's SELECT across the MV
+             chain. event.^unmapped can't be column-scoped in a GRANT (the caret
+             is a syntax error), and raw is ENGINE=Null (no data to read), so a
+             table-level SELECT is both necessary and safe. SELECT(`event`) alone
+             fails the direct path with ACCESS_DENIED on the unnameable subcolumn. -->
+        <query>GRANT INSERT ON nanosiem.ocsf_logs_raw</query>
+        <query>GRANT SELECT ON nanosiem.ocsf_logs_raw</query>
         <query>GRANT INSERT ON nanosiem.ocsf_logs</query>
         <query>GRANT SELECT(`timestamp`, `src_endpoint.ip`, `dst_endpoint.ip`, `src_endpoint.hostname`, `dst_endpoint.hostname`, `query.hostname`, `url.hostname`, `file.hashes.sha256`, `process.file.hashes.sha256`, `actor.process.file.hashes.sha256`, `src_host_unified`, `user_unified`, `src_endpoint.mac`, `source_type`, `metadata.product.name`, `event_bytes`, `http_response.code`, `status_id`, `activity_id`, `class_uid`, `is_mfa`, `api.service.name`, `cloud.region`, `cloud.provider`) ON nanosiem.ocsf_logs</query>
         <!-- NAN-1400: nat_detection_mv chains off identity_observations (which

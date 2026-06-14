@@ -114,7 +114,7 @@ async fn reachable(client: &reqwest::Client) -> bool {
 }
 
 async fn insert_event(client: &reqwest::Client, db: &str, event_json: &str) -> Result<(), String> {
-    let stmt = format!("INSERT INTO {db}.ocsf_logs (event) FORMAT JSONEachRow").replace(' ', "%20");
+    let stmt = format!("INSERT INTO {db}.ocsf_logs_raw (event) FORMAT JSONEachRow").replace(' ', "%20");
     let url = format!("{}/?query={stmt}&async_insert=0&wait_end_of_query=1", ch_url());
     let row = serde_json::json!({ "event": serde_json::from_str::<Value>(event_json).unwrap() })
         .to_string();
@@ -135,28 +135,35 @@ async fn insert_event(client: &reqwest::Client, db: &str, event_json: &str) -> R
 }
 
 /// Strip CREATE DATABASE + TTL and repoint at the throwaway DB.
-fn test_table_ddl(db: &str) -> String {
-    // NAN-1241: extract ONLY the ocsf_logs CREATE TABLE — the canonical DDL is
-    // multi-statement (prevalence MVs/dicts) and the CH HTTP endpoint rejects
-    // multi-statement bodies. Strip `--` comments + the TTL clause.
+fn test_table_ddl(db: &str) -> Vec<String> {
+    // NAN-1443: the OCSF table is now three objects — `ocsf_logs_raw` (ENGINE=Null
+    // landing table), `ocsf_logs_raw_mv` (derives the row), and `ocsf_logs`
+    // (MergeTree storage; the `*_unified` columns are inline in its CREATE). They
+    // are contiguous, ahead of the `CREATE OR REPLACE DICTIONARY` statements.
+    // Extract that block, strip `--` comments + the TTL clause, split into the
+    // individual statements (the CH HTTP endpoint rejects multi-statement bodies),
+    // and repoint at the throwaway DB. Inserts go to `ocsf_logs_raw`; reads hit
+    // `ocsf_logs`. `dictGet('nanosiem.…')` refs stay cross-DB to the real dicts.
     let start = DDL
-        .find("CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs")
-        .expect("ocsf_logs CREATE TABLE in DDL");
-    let no_comments: String = DDL[start..]
+        .find("CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs_raw")
+        .expect("ocsf_logs_raw CREATE TABLE in DDL");
+    let end = DDL[start..]
+        .find("CREATE OR REPLACE DICTIONARY")
+        .map(|i| start + i)
+        .expect("dictionaries follow the ocsf_logs table block");
+    DDL[start..end]
         .lines()
         .map(|l| match l.find("--") {
             Some(i) => &l[..i],
             None => l,
         })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let end = no_comments.find(';').expect("CREATE TABLE terminator");
-    no_comments[..end]
-        .lines()
         .filter(|l| !l.trim_start().starts_with("TTL "))
         .collect::<Vec<_>>()
         .join("\n")
-        .replace("nanosiem.ocsf_logs", &format!("{db}.ocsf_logs"))
+        .split(';')
+        .map(|s| s.trim().replace("nanosiem.ocsf_logs", &format!("{db}.ocsf_logs")))
+        .filter(|s| !s.trim().is_empty())
+        .collect()
 }
 
 /// Mirror of `ClickHouseExecutor::get_table_columns`'s `system.columns` filter,
@@ -180,7 +187,7 @@ async fn field_stats_column_rows(
            AND name NOT LIKE '%.search' \
            AND name NOT LIKE 'prevalence_%' \
            AND default_kind != 'ALIAS' \
-           AND name NOT IN ('ext', 'metadata', 'event_id', 'ingest_time', 'namespace') \
+           AND name NOT IN ('ext', 'metadata', 'event_id', 'ingest_time', 'namespace', 'event_bytes') \
          ORDER BY name FORMAT JSONEachRow"
     );
     let body = exec(client, &sql).await?;
@@ -297,7 +304,9 @@ async fn ocsf_field_stats_executes_against_ocsf_logs() {
 }
 
 async fn run_assertions(client: &reqwest::Client, db: &str) -> Result<(), String> {
-    exec(client, &test_table_ddl(db)).await?;
+    for stmt in test_table_ddl(db) {
+        exec(client, &stmt).await?;
+    }
     for (name, raw) in FIXTURES {
         insert_event(client, db, raw)
             .await
@@ -310,12 +319,15 @@ async fn run_assertions(client: &reqwest::Client, db: &str) -> Result<(), String
         return Err("field-stats column enumeration returned no columns".into());
     }
 
-    // The raw enumeration DOES surface `event_bytes` (a MATERIALIZED metering
-    // column with no manifest promotion, NAN-1385) — proving the
-    // companion-safety filter below is what excludes it, not the SQL filters.
-    if !rows.iter().any(|(n, _)| n == "event_bytes") {
+    // NAN-1443: `event_bytes` was MATERIALIZED (so the companion-safety filter
+    // below dropped it). Under the Null+MV chop it is a PLAIN column the
+    // `ocsf_logs_raw_mv` populates, so the `SELECT *`-excludes-MATERIALIZED logic
+    // no longer catches it — it is excluded at the SQL stage by name instead, and
+    // must not reach the enumeration at all.
+    if rows.iter().any(|(n, _)| n == "event_bytes") {
         return Err(format!(
-            "expected raw enumeration to contain `event_bytes` (did the DDL drop it?); got: {rows:?}"
+            "`event_bytes` leaked into the field-stats enumeration — a plain metering \
+             column must be excluded by name (NAN-1443); got: {rows:?}"
         ));
     }
 
@@ -324,12 +336,10 @@ async fn run_assertions(client: &reqwest::Client, db: &str) -> Result<(), String
     let readd = profile.materialized_columns();
     let cols = apply_companion_safety_filter(&rows, readd);
 
-    // NAN-1397 regression: `event_bytes` must NOT reach the analyst-facing
-    // field-stats inventory — inside the companion's CTE wrap it does not
-    // resolve (`SELECT *` excludes MATERIALIZED; it is not in the re-add list),
-    // so its presence fails EVERY wrapped OCSF search with Code 47.
+    // Defensive: `event_bytes` must NOT reach the analyst-facing field-stats
+    // inventory under any path (NAN-1397/1443).
     if cols.iter().any(|c| c == "event_bytes") {
-        return Err("`event_bytes` leaked into the field-stats inventory (NAN-1397)".into());
+        return Err("`event_bytes` leaked into the field-stats inventory (NAN-1397/1443)".into());
     }
 
     // Chokepoint for the next metering column: every surviving inventory

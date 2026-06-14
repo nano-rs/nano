@@ -48,9 +48,14 @@ const OCSF_TABLE_NAME: &str = "nanosiem.ocsf_logs";
 /// MATERIALIZED"); queries treat it exactly like UDM's `timestamp`.
 const OCSF_TIMESTAMP_EXPR: &str = "timestamp";
 
-/// The JSON column holding the full standard OCSF record. The unpromoted tail
-/// resolves to native subcolumn access against this column (NAN-1426).
-const OCSF_EVENT_COLUMN: &str = "event";
+/// The stored JSON column holding the OCSF `unmapped` spill — the producer
+/// source fields that did not map to a standard OCSF attribute (the OCSF analog
+/// of UDM's `ext`). The unpromoted tail resolves to native subcolumn access
+/// against this column. NAN-1443 repointed this from the full `event` column
+/// (now `EPHEMERAL`, never stored) to `unmapped`; paths are RELATIVE to the
+/// spill sub-object (e.g. `ext.error_code` → `unmapped."error_code"`, which is
+/// the same data that was `event."unmapped"."error_code"` pre-chop).
+const OCSF_TAIL_COLUMN: &str = "unmapped";
 
 /// The operational provenance / routing key (Security Lake "custom source"
 /// pattern). NOT an OCSF `event` field and NOT manifest-promoted: it is a plain
@@ -413,6 +418,10 @@ const OCSF_UNIFIED_COLUMNS: &[&str] = &[
 /// metering/bookkeeping column here.
 pub const OCSF_BOOKKEEPING_COLUMNS: &[&str] = &[
     "event",
+    // NAN-1443: the stored OCSF spill column. Reached via the `ext.*` /
+    // `unmapped.*` tail namespaces (and `spath input=ext`), never surfaced as a
+    // bare analyst field — same treatment the full `event` column had.
+    "unmapped",
     "timestamp",
     "_inserted_at",
     "source_type",
@@ -639,39 +648,47 @@ impl OcsfProfile {
         if let Some(col) = registry().udm_to_column.get(npl_field) {
             return FieldResolution::ExplicitColumn(col.clone());
         }
-        // UDM-muscle-memory tail prefixes (NAN-1388, G14). Under UDM the JSON
-        // spill column is `ext`, so saved searches write `ext.error_code=…`.
-        // OCSF carries no top-level `ext` key — its spill location is
-        // `unmapped.*` inside `event` — so without remapping these terms
-        // JSONExtract a key that never exists and return silently empty.
-        // Strip-and-remap: `ext.foo` resolves as `unmapped.foo`, and
-        // `event.foo` (the tail column named explicitly) strips the prefix and
-        // resolves the rest — landing on the promoted column when one exists,
-        // else the `event` tail below. No manifest column or UDM alias starts
-        // with `ext.`/`event.` (verified), so nothing real is shadowed; bare
-        // `ext`/`event` (no dot) are untouched, keeping the `spath input=ext`
-        // tail fallback (#2043) intact. Aligns bare `ext.*` terms with the
-        // already-remapped `spath input=ext` surface. UDM is unaffected (this
-        // is OcsfProfile::resolve; `ext.*` is native there).
-        if let Some(rest) = npl_field.strip_prefix("ext.") {
-            // Re-resolve so a (hypothetical future) promoted `unmapped.*`
-            // column would win. Depth is bounded: `unmapped.…` matches neither
-            // prefix arm, so this recurses at most once more.
-            return self.resolve_canonical(&format!("unmapped.{rest}"));
+        // Spill namespace (NAN-1388 G14; repointed by NAN-1443). The spill is
+        // the stored `unmapped` column — the OCSF analog of UDM's `ext`. Both
+        // `ext.*` (UDM muscle memory from saved searches) and `unmapped.*` (the
+        // OCSF-native spelling) address it, with the path RELATIVE to the
+        // sub-object: `ext.error_code` / `unmapped.error_code` →
+        // `unmapped."error_code"`. That is the SAME data that resolved to
+        // `event."unmapped"."error_code"` before the full `event` column was
+        // dropped to `EPHEMERAL`. No manifest column or UDM alias starts with
+        // `ext.`/`unmapped.`/`event.` (verified), so nothing real is shadowed;
+        // bare `ext`/`event` (no dot) fall through to the spill below, keeping
+        // the `spath input=ext` tail fallback (#2043) intact. UDM is unaffected
+        // (this is OcsfProfile::resolve; `ext.*` is native there).
+        if let Some(rest) = npl_field
+            .strip_prefix("ext.")
+            .or_else(|| npl_field.strip_prefix("unmapped."))
+        {
+            return FieldResolution::JsonPath {
+                col: OCSF_TAIL_COLUMN.to_string(),
+                path: rest.split('.').map(String::from).collect(),
+            };
         }
         if npl_field.starts_with("event.") {
-            // Strip ALL leading `event.` segments iteratively (not one per
-            // recursive call) so an adversarial `event.event.…` chain cannot
-            // grow the stack with the input length.
+            // `event.<rest>` strips the (now-EPHEMERAL) tail-column prefix and
+            // re-resolves: `event.src_endpoint.ip` lands on the promoted column,
+            // `event.<unpromoted>` falls through to the spill below. Strip ALL
+            // leading `event.` segments iteratively (not one per recursive call)
+            // so an adversarial `event.event.…` chain cannot grow the stack.
             let mut rest = npl_field;
             while let Some(r) = rest.strip_prefix("event.") {
                 rest = r;
             }
             return self.resolve_canonical(rest);
         }
-        // Everything else is the unpromoted `event` tail → N-level JSONExtract.
+        // Everything else is the unpromoted tail → the `unmapped` spill column.
+        // A bare non-promoted token that was a top-level `event.<x>` field
+        // pre-chop now resolves into `unmapped` and returns NULL if absent — the
+        // accepted "promote-to-query" tradeoff: standard OCSF attributes we did
+        // not promote AND that the producer did not place under `unmapped` are
+        // no longer stored (NAN-1443).
         FieldResolution::JsonPath {
-            col: OCSF_EVENT_COLUMN.to_string(),
+            col: OCSF_TAIL_COLUMN.to_string(),
             path: npl_field.split('.').map(String::from).collect(),
         }
     }
@@ -682,9 +699,10 @@ impl SchemaProfile for OcsfProfile {
         SchemaId::Ocsf
     }
 
-    /// OCSF's JSON tail is the `event` column (UDM uses `ext`) — NAN-1343.
+    /// OCSF's JSON tail is the stored `unmapped` spill column (UDM uses `ext`) —
+    /// NAN-1343; repointed from the now-EPHEMERAL `event` column by NAN-1443.
     fn json_tail_column(&self) -> &'static str {
-        OCSF_EVENT_COLUMN
+        OCSF_TAIL_COLUMN
     }
 
     fn fields(&self) -> &[FieldDef] {
@@ -1059,13 +1077,16 @@ mod tests {
     }
 
     #[test]
-    fn tail_paths_resolve_to_jsonpath_against_event() {
+    fn tail_paths_resolve_to_jsonpath_against_unmapped() {
         let p = OcsfProfile::new();
-        // An unpromoted nested OCSF attribute lands in the `event` tail.
+        // An unpromoted attribute lands in the `unmapped` spill tail (NAN-1443;
+        // was the full `event` column before the chop). At runtime it returns
+        // NULL unless the producer placed it under `unmapped` — the
+        // promote-to-query tradeoff.
         assert_eq!(
             p.resolve("actor.process.parent_process.name"),
             FieldResolution::JsonPath {
-                col: "event".into(),
+                col: "unmapped".into(),
                 path: vec![
                     "actor".into(),
                     "process".into(),
@@ -1077,36 +1098,44 @@ mod tests {
         assert!(!p.is_known_field("actor.process.parent_process.name"));
     }
 
-    /// NAN-1388 (G14): UDM-muscle-memory `ext.foo` strips to the OCSF spill
-    /// location `unmapped.foo`, and `event.foo` strips the explicit tail-column
-    /// prefix and resolves the rest. Before the fix both JSONExtract'd a
-    /// top-level `ext`/`event` key that never exists → silently 0 rows
-    /// (ext.error_code = 0 vs unmapped.error_code = 23,117 on demo data).
+    /// NAN-1388 (G14) / NAN-1443: UDM-muscle-memory `ext.foo` and OCSF-native
+    /// `unmapped.foo` both address the stored `unmapped` spill column with a
+    /// path RELATIVE to the sub-object; `event.foo` strips the (now-EPHEMERAL)
+    /// tail-column prefix and resolves the rest. Each yields the SAME underlying
+    /// data it did when the spill lived inside the full `event` column
+    /// (`event."unmapped"."error_code"` → `unmapped."error_code"`).
     #[test]
     fn ext_and_event_prefixes_strip_and_remap() {
         let p = OcsfProfile::new();
-        // ext.foo → unmapped.foo in the event tail.
+        // ext.foo → unmapped column, relative path [foo].
         assert_eq!(
             p.resolve("ext.error_code"),
             FieldResolution::JsonPath {
-                col: "event".into(),
-                path: vec!["unmapped".into(), "error_code".into()],
+                col: "unmapped".into(),
+                path: vec!["error_code".into()],
+            },
+        );
+        // unmapped.foo (OCSF-native spelling) resolves identically.
+        assert_eq!(
+            p.resolve("unmapped.error_code"),
+            FieldResolution::JsonPath {
+                col: "unmapped".into(),
+                path: vec!["error_code".into()],
             },
         );
         // Nested ext path keeps the rest of the path intact.
         assert_eq!(
             p.resolve("ext.request.method"),
             FieldResolution::JsonPath {
-                col: "event".into(),
-                path: vec!["unmapped".into(), "request".into(), "method".into()],
+                col: "unmapped".into(),
+                path: vec!["request".into(), "method".into()],
             },
         );
-        // event.<unpromoted> → the stripped path in the event tail (no
-        // top-level 'event' key).
+        // event.<unpromoted> → the stripped path in the spill tail.
         assert_eq!(
             p.resolve("event.actor.process.parent_process.name"),
             FieldResolution::JsonPath {
-                col: "event".into(),
+                col: "unmapped".into(),
                 path: vec![
                     "actor".into(),
                     "process".into(),
@@ -1120,21 +1149,22 @@ mod tests {
             p.resolve("event.src_endpoint.ip"),
             FieldResolution::ExplicitColumn("src_endpoint.ip".to_string()),
         );
-        // Bare `ext` / `event` (no dot) are untouched — `spath input=ext`'s
-        // tail fallback (#2043) keys off the unresolved form.
+        // Bare `ext` / `event` (no dot) fall through to the spill tail —
+        // `spath input=ext`'s tail fallback (#2043) keys off the unresolved form.
         assert_eq!(
             p.resolve("ext"),
             FieldResolution::JsonPath {
-                col: "event".into(),
+                col: "unmapped".into(),
                 path: vec!["ext".into()],
             },
         );
-        // ext.unmapped.foo composes (strip once, no double-prefix).
+        // ext.unmapped.foo composes to unmapped column path [unmapped, foo] —
+        // same data as the pre-chop event."unmapped"."unmapped"."foo".
         assert_eq!(
             p.resolve("ext.unmapped.foo"),
             FieldResolution::JsonPath {
-                col: "event".into(),
-                path: vec!["unmapped".into(), "unmapped".into(), "foo".into()],
+                col: "unmapped".into(),
+                path: vec!["unmapped".into(), "foo".into()],
             },
         );
     }
@@ -1213,12 +1243,12 @@ mod tests {
                 "alias {alias} must NOT rewrite (target {target} has no OCSF column)"
             );
             assert!(!p.is_known_field(alias));
-            // Unchanged fall-through: the raw spelling still JSONExtracts the
-            // event tail, exactly as before NAN-1422.
+            // Unchanged fall-through: the raw spelling still resolves to the
+            // spill tail (NAN-1443: the stored `unmapped` column, was `event`).
             assert_eq!(
                 p.resolve(alias),
                 FieldResolution::JsonPath {
-                    col: "event".into(),
+                    col: "unmapped".into(),
                     path: vec![alias.into()],
                 },
             );

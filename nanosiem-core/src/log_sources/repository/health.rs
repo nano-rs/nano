@@ -220,12 +220,14 @@ impl LogSourceRepository {
     ) -> Result<LogSourceHealth, LogSourceRepositoryError> {
         let where_clause = Self::build_log_source_where_clause(log_source);
 
-        // NAN-1241: read the active ingested-events table. Under OCSF the payload
-        // is the single `event` JSON column (there is no `message`/`metadata`
-        // column), so estimate row size from it; UDM keeps the original calc.
+        // NAN-1241/1443: read the active ingested-events table. Under OCSF the
+        // arriving `event` JSON is EPHEMERAL (not stored/selectable), but its
+        // original byte length is captured at insert in the MATERIALIZED
+        // `event_bytes` column — the right estimate of ingested payload size.
+        // UDM keeps the original message/metadata calc.
         let logs_table = crate::schema::active_logs_table();
         let size_expr = if logs_table == "ocsf_logs" {
-            "length(toString(event)) + length(source_type) + 100"
+            "event_bytes + length(source_type) + 100"
         } else {
             "length(message) + length(metadata) + length(source_type) + 100"
         };

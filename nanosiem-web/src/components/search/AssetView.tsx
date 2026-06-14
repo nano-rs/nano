@@ -15,6 +15,16 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 
+// NAN-1450: module-level so the object identity is stable across renders. Passed
+// inline, it gave `useSchemaEntityMap` a fresh `fallback` every render, which
+// made `resolveEntityType` a new callback each render, which re-fired the
+// entity-context effect → setEntityContext → re-render → an infinite
+// `/api/entities/:type/:value/context` request storm. Const fallbacks keep UDM
+// byte-identical (NAN-1241).
+const ASSET_ENTITY_FALLBACK: Record<string, string> = {
+  src_ip: 'ip', dest_ip: 'ip', src_host: 'host', dest_host: 'host', user: 'user',
+};
+
 // Types for asset view data
 interface AssetIdentity {
   ip?: string | null;
@@ -988,9 +998,10 @@ interface EventGroup {
 
 export function AssetView({ results, onDrilldown, onAddToQuery, prevalenceFilter, timeRange, onFetchLog }: AssetViewProps) {
   // Schema-aware entity resolution + identity field set (OCSF dotted columns).
-  // The const fallbacks below keep UDM byte-identical (NAN-1241).
+  // `fallback` MUST be a stable reference (ASSET_ENTITY_FALLBACK) — see its
+  // definition for the infinite-loop this prevents (NAN-1450).
   const { resolveEntityType, schemaFields } = useSchemaEntityMap({
-    fallback: { src_ip: 'ip', dest_ip: 'ip', src_host: 'host', dest_host: 'host', user: 'user' },
+    fallback: ASSET_ENTITY_FALLBACK,
   });
 
   // Highlight state for prevalence click → scroll-to-event

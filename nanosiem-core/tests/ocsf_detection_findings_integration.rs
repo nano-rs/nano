@@ -68,7 +68,7 @@ async fn reachable(client: &reqwest::Client) -> bool {
 /// `query` URL param, JSON in the body (the form reqwest doesn't drop). timestamp
 /// is left to default; the test table strips TTL so it never prunes.
 async fn insert_finding(client: &reqwest::Client, db: &str, event: &serde_json::Value) -> Result<(), String> {
-    let stmt = format!("INSERT INTO {db}.ocsf_logs (event, source_type) FORMAT JSONEachRow")
+    let stmt = format!("INSERT INTO {db}.ocsf_logs_raw (event, source_type) FORMAT JSONEachRow")
         .replace(' ', "%20");
     let url = format!("{}/?query={stmt}&async_insert=0&wait_end_of_query=1", ch_url());
     let row = json!({ "event": event, "source_type": "findings" }).to_string();
@@ -100,27 +100,35 @@ async fn select1(client: &reqwest::Client, db: &str, expr: &str) -> String {
 /// latter using creds placeholders we don't want here). Strip `--` comments
 /// (so a comment semicolon can't truncate it early) and the TTL clause (so the
 /// default epoch-0 timestamp isn't pruned), and point it at the test DB.
-fn test_table_ddl(db: &str) -> String {
+fn test_table_ddl(db: &str) -> Vec<String> {
+    // NAN-1443: the OCSF table is now three objects — `ocsf_logs_raw` (ENGINE=Null
+    // landing table), `ocsf_logs_raw_mv` (derives the row), and `ocsf_logs`
+    // (MergeTree storage; the `*_unified` columns are inline in its CREATE). They
+    // are contiguous, ahead of the `CREATE OR REPLACE DICTIONARY` statements.
+    // Extract that block, strip `--` comments + the TTL clause, split into the
+    // individual statements (the CH HTTP endpoint rejects multi-statement bodies),
+    // and repoint at the throwaway DB. Inserts go to `ocsf_logs_raw`; reads hit
+    // `ocsf_logs`. `dictGet('nanosiem.…')` refs stay cross-DB to the real dicts.
     let start = DDL
-        .find("CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs")
-        .expect("ocsf_logs CREATE TABLE in DDL");
-    let from = &DDL[start..];
-    // Drop line comments first so their semicolons don't terminate us early.
-    let no_comments: String = from
+        .find("CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs_raw")
+        .expect("ocsf_logs_raw CREATE TABLE in DDL");
+    let end = DDL[start..]
+        .find("CREATE OR REPLACE DICTIONARY")
+        .map(|i| start + i)
+        .expect("dictionaries follow the ocsf_logs table block");
+    DDL[start..end]
         .lines()
         .map(|l| match l.find("--") {
             Some(i) => &l[..i],
             None => l,
         })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let end = no_comments.find(';').expect("CREATE TABLE terminator");
-    no_comments[..end]
-        .lines()
         .filter(|l| !l.trim_start().starts_with("TTL "))
         .collect::<Vec<_>>()
         .join("\n")
-        .replace("nanosiem.ocsf_logs", &format!("{db}.ocsf_logs"))
+        .split(';')
+        .map(|s| s.trim().replace("nanosiem.ocsf_logs", &format!("{db}.ocsf_logs")))
+        .filter(|s| !s.trim().is_empty())
+        .collect()
 }
 
 fn sample_metadata() -> serde_json::Value {
@@ -171,7 +179,9 @@ async fn ocsf_finding_round_trips_write_to_read() {
 }
 
 async fn run_round_trip(client: &reqwest::Client, db: &str) -> Result<(), String> {
-    exec(client, &test_table_ddl(db)).await?;
+    for stmt in test_table_ddl(db) {
+        exec(client, &stmt).await?;
+    }
 
     // Build the event with the REAL writer, then write it.
     let event = FindingLogger::build_ocsf_finding_event(
@@ -190,37 +200,37 @@ async fn run_round_trip(client: &reqwest::Client, db: &str) -> Result<(), String
 
     // 2) The risk-repository read path's exact extraction expressions.
     assert_eq!(
-        select1(client, db, "JSONExtractString(event, 'unmapped', 'risk_entity')").await,
+        select1(client, db, "JSONExtractString(toString(unmapped), 'risk_entity')").await,
         "10.0.0.5",
         "read-path risk_entity"
     );
     assert_eq!(
-        select1(client, db, "JSONExtractInt(event, 'risk_score')").await,
+        select1(client, db, "JSONExtractInt(toString(unmapped), 'risk_score')").await,
         "75",
         "read-path risk_score (Int)"
     );
     assert_eq!(
-        select1(client, db, "toFloat32(JSONExtractInt(event, 'risk_score'))").await,
+        select1(client, db, "toFloat32(JSONExtractInt(toString(unmapped), 'risk_score'))").await,
         "75",
         "read-path risk_score (f32-safe, get_signals_for_entities)"
     );
     assert_eq!(
-        select1(client, db, "JSONExtractString(event, 'finding_info', 'title')").await,
+        select1(client, db, "JSONExtractString(toString(unmapped), 'rule_name')").await,
         "Suspicious Login",
         "read-path rule_name"
     );
     assert_eq!(
-        select1(client, db, "JSONExtractString(event, 'unmapped', 'rule_id')").await,
+        select1(client, db, "JSONExtractString(toString(unmapped), 'rule_id')").await,
         "rule-abc-123",
         "read-path rule_id"
     );
     assert_eq!(
-        select1(client, db, "JSONExtractString(event, 'unmapped', 'signal_type')").await,
+        select1(client, db, "JSONExtractString(toString(unmapped), 'signal_type')").await,
         "detection_match",
         "read-path signal_type"
     );
     assert_eq!(
-        select1(client, db, "lower(JSONExtractString(event, 'severity'))").await,
+        select1(client, db, "lower(severity)").await,
         "high",
         "read-path severity (lowercased to match UDM)"
     );

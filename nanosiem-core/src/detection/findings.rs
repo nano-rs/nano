@@ -614,9 +614,11 @@ impl FindingLogger {
             // source_type='findings' (operational column, so the read path's
             // `WHERE source_type='findings'` is unchanged across modes). `id`
             // and `_inserted_at` are server-defaulted; everything else
-            // materializes from `event`.
+            // materializes from `event`. NAN-1443: insert into the `ocsf_logs_raw`
+            // ENGINE=Null landing table — the `ocsf_logs_raw_mv` MV derives the
+            // stored row into `ocsf_logs` (which no longer stores `event`).
             let ocsf_query = r#"
-                INSERT INTO ocsf_logs (event, timestamp, source_type)
+                INSERT INTO ocsf_logs_raw (event, timestamp, source_type)
                 VALUES (?, ?, 'findings')
             "#;
             client

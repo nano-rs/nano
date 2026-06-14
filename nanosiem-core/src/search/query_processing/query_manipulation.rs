@@ -179,14 +179,27 @@ pub fn enforce_source_type_exclusion(query: &Query, excluded_source_type: &str) 
 /// shares one canonical implementation. Drift on one site now surfaces
 /// as a compile error instead of a silent permission bypass.
 pub fn enforce_non_audit_query(query: &str) -> Result<String, crate::SearchError> {
-    use crate::query::{PrettyPrint, parse_query};
+    use crate::query::{extract_time_modifier_tokens, parse_query, PrettyPrint};
     let parsed = parse_query(query).map_err(|e| {
         crate::SearchError::ParseError(format!(
             "Query parsing failed for access control enforcement: {}",
             e
         ))
     })?;
-    Ok(enforce_source_type_exclusion(&parsed, "audit").pretty_print())
+    let mut enforced = enforce_source_type_exclusion(&parsed, "audit").pretty_print();
+
+    // NAN-1453: `parse_query` strips `earliest=`/`latest=` (they are TimeRange
+    // controls, not AST nodes), so the pretty-printed rewrite above drops them.
+    // Re-append the analyst's original tokens so the downstream search layer's
+    // `extract_time_modifiers` still applies them — otherwise a non-audit-view
+    // user's `earliest=` silently no-ops and their results/timeline come back
+    // empty. Append position is safe: that consumer strips modifiers by regex
+    // anywhere in the string, regardless of pipe placement.
+    for token in extract_time_modifier_tokens(query) {
+        enforced.push(' ');
+        enforced.push_str(&token);
+    }
+    Ok(enforced)
 }
 
 fn inject_source_type_exclusion_recursive(query: &Query, excluded_source_type: &str) -> Query {
@@ -286,6 +299,45 @@ fn strip_ai_and_after_recursive(query: &Query, parent_found: bool) -> (Query, bo
 mod tests {
     use super::*;
     use crate::query::parse_query;
+
+    // NAN-1453: non-audit-view users have their query rewritten by
+    // `enforce_non_audit_query`, which round-trips through parse + pretty-print.
+    // That path strips `earliest=`/`latest=`; these tests pin that the rewrite
+    // re-attaches the analyst's time window so it isn't silently lost.
+    #[test]
+    fn test_enforce_non_audit_query_preserves_earliest() {
+        let out = enforce_non_audit_query("actor.user.name=\"mmoore\" earliest=-12h").unwrap();
+        assert!(
+            out.contains("source_type!=\"audit\""),
+            "audit exclusion missing: {out}"
+        );
+        assert!(out.contains("earliest=-12h"), "earliest= dropped: {out}");
+    }
+
+    #[test]
+    fn test_enforce_non_audit_query_preserves_earliest_and_latest() {
+        let out = enforce_non_audit_query("error earliest=-1h latest=now").unwrap();
+        assert!(out.contains("source_type!=\"audit\""), "{out}");
+        assert!(out.contains("earliest=-1h"), "earliest= dropped: {out}");
+        assert!(out.contains("latest=now"), "latest= dropped: {out}");
+    }
+
+    #[test]
+    fn test_enforce_non_audit_query_preserves_modifiers_with_pipe() {
+        let out = enforce_non_audit_query("error earliest=-12h | stats count").unwrap();
+        assert!(out.contains("source_type!=\"audit\""), "{out}");
+        assert!(out.contains("earliest=-12h"), "earliest= dropped: {out}");
+        assert!(out.contains("stats count"), "pipe command dropped: {out}");
+    }
+
+    #[test]
+    fn test_enforce_non_audit_query_no_modifiers_unchanged() {
+        // No earliest=/latest= → exactly the bare exclusion, no trailing tokens.
+        let out = enforce_non_audit_query("error").unwrap();
+        assert!(out.contains("source_type!=\"audit\""), "{out}");
+        assert!(!out.contains("earliest"), "spurious earliest=: {out}");
+        assert!(!out.contains("latest"), "spurious latest=: {out}");
+    }
 
     #[test]
     fn test_strip_post_prevalence_commands() {

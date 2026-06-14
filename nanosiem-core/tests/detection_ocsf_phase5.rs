@@ -191,7 +191,7 @@ async fn reachable(client: &reqwest::Client) -> bool {
 }
 
 async fn insert_event(client: &reqwest::Client, db: &str, event_json: &str) -> Result<(), String> {
-    let stmt = format!("INSERT INTO {db}.ocsf_logs (event) FORMAT JSONEachRow").replace(' ', "%20");
+    let stmt = format!("INSERT INTO {db}.ocsf_logs_raw (event) FORMAT JSONEachRow").replace(' ', "%20");
     let url = format!("{}/?query={stmt}&async_insert=0&wait_end_of_query=1", ch_url());
     let row = serde_json::json!({ "event": serde_json::from_str::<Value>(event_json).unwrap() })
         .to_string();
@@ -211,28 +211,35 @@ async fn insert_event(client: &reqwest::Client, db: &str, event_json: &str) -> R
     }
 }
 
-fn test_table_ddl(db: &str) -> String {
-    // NAN-1241: extract ONLY the ocsf_logs CREATE TABLE — the canonical DDL is
-    // multi-statement (prevalence MVs/dicts) and the CH HTTP endpoint rejects
-    // multi-statement bodies. Strip `--` comments + the TTL clause.
+fn test_table_ddl(db: &str) -> Vec<String> {
+    // NAN-1443: the OCSF table is now three objects — `ocsf_logs_raw` (ENGINE=Null
+    // landing table), `ocsf_logs_raw_mv` (derives the row), and `ocsf_logs`
+    // (MergeTree storage; the `*_unified` columns are inline in its CREATE). They
+    // are contiguous, ahead of the `CREATE OR REPLACE DICTIONARY` statements.
+    // Extract that block, strip `--` comments + the TTL clause, split into the
+    // individual statements (the CH HTTP endpoint rejects multi-statement bodies),
+    // and repoint at the throwaway DB. Inserts go to `ocsf_logs_raw`; reads hit
+    // `ocsf_logs`. `dictGet('nanosiem.…')` refs stay cross-DB to the real dicts.
     let start = DDL
-        .find("CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs")
-        .expect("ocsf_logs CREATE TABLE in DDL");
-    let no_comments: String = DDL[start..]
+        .find("CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs_raw")
+        .expect("ocsf_logs_raw CREATE TABLE in DDL");
+    let end = DDL[start..]
+        .find("CREATE OR REPLACE DICTIONARY")
+        .map(|i| start + i)
+        .expect("dictionaries follow the ocsf_logs table block");
+    DDL[start..end]
         .lines()
         .map(|l| match l.find("--") {
             Some(i) => &l[..i],
             None => l,
         })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let end = no_comments.find(';').expect("CREATE TABLE terminator");
-    no_comments[..end]
-        .lines()
         .filter(|l| !l.trim_start().starts_with("TTL "))
         .collect::<Vec<_>>()
         .join("\n")
-        .replace("nanosiem.ocsf_logs", &format!("{db}.ocsf_logs"))
+        .split(';')
+        .map(|s| s.trim().replace("nanosiem.ocsf_logs", &format!("{db}.ocsf_logs")))
+        .filter(|s| !s.trim().is_empty())
+        .collect()
 }
 
 /// Run a `| stats count` rule query and return the scalar count.
@@ -279,7 +286,9 @@ async fn ocsf_scheduled_detection_rule_query_matches_fixtures() {
 }
 
 async fn run_ch_assertions(client: &reqwest::Client, db: &str) -> Result<(), String> {
-    exec(client, &test_table_ddl(db)).await?;
+    for stmt in test_table_ddl(db) {
+        exec(client, &stmt).await?;
+    }
     insert_event(client, db, OCSF_AUTH_FIXTURE).await?;
     insert_event(client, db, OCSF_NETWORK_FIXTURE).await?;
 

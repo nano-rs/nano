@@ -610,17 +610,20 @@ impl AnonymizationService {
             "recipient",
         ];
         let sql = if self.profile.id() == SchemaId::Ocsf {
-            // OCSF: scrub PII by rewriting the `event` JSON; the promoted
-            // (MATERIALIZED) columns re-derive on the mutation (validated). Match
-            // the subject on the OCSF user identity columns.
+            // OCSF (NAN-1443): the full `event` column is EPHEMERAL (never
+            // stored) and every PII-bearing column (`message`, `unmapped`, the
+            // promoted identity columns) is MATERIALIZED from it — so there is no
+            // stored `event` to rewrite, and a mutation cannot recompute the
+            // derived columns. Erasure therefore DELETEs the subject's rows: the
+            // strongest GDPR right-to-erasure outcome, and the same approach the
+            // `cloud_user_activity_agg` rollup below already uses. Match the
+            // subject on the OCSF user identity columns.
             let ocsf_user_cols: &[&str] = &["user.name", "actor.user.name"];
-            let event_expr =
-                Self::build_freetext_replace("event", ocsf_user_cols, &salt_escaped, anon_hash);
             let where_match =
                 Self::build_hash_match_where(ocsf_user_cols, &salt_escaped, anon_hash);
             let ocsf_local = self.table_names.local(self.logs_key());
             format!(
-                "ALTER TABLE {ocsf_local} UPDATE {event_expr} WHERE {where_match} SETTINGS mutations_sync = 0"
+                "ALTER TABLE {ocsf_local} DELETE WHERE {where_match} SETTINGS mutations_sync = 0"
             )
         } else {
             let message_expr =
@@ -725,16 +728,16 @@ impl AnonymizationService {
         let salt_escaped = salt.replace('\'', "\\'");
         let ip_columns: &[&str] = &["src_ip", "dest_ip", "dvc_ip"];
         let sql = if self.profile.id() == SchemaId::Ocsf {
-            // OCSF: scrub PII by rewriting the `event` JSON; promoted columns
-            // re-derive. Match the subject on the OCSF endpoint IP columns.
+            // OCSF (NAN-1443): `event` is EPHEMERAL and the IP columns are
+            // MATERIALIZED from it, so there is nothing to rewrite in place —
+            // DELETE the subject's rows (see anonymize_user_fields for the full
+            // rationale). Match on the OCSF endpoint IP columns.
             let ocsf_ip_cols: &[&str] = &["src_endpoint.ip", "dst_endpoint.ip"];
-            let event_expr =
-                Self::build_freetext_replace("event", ocsf_ip_cols, &salt_escaped, anon_hash);
             let where_match =
                 Self::build_hash_match_where(ocsf_ip_cols, &salt_escaped, anon_hash);
             let ocsf_local = self.table_names.local(self.logs_key());
             format!(
-                "ALTER TABLE {ocsf_local} UPDATE {event_expr} WHERE {where_match} SETTINGS mutations_sync = 0"
+                "ALTER TABLE {ocsf_local} DELETE WHERE {where_match} SETTINGS mutations_sync = 0"
             )
         } else {
             let message_expr =
@@ -955,19 +958,22 @@ mod ocsf_anonymization_tests {
     }
 
     #[test]
-    fn freetext_replace_ocsf_rewrites_event_json() {
-        // OCSF erasure rewrites the `event` JSON (promoted columns re-derive),
-        // matching on the dotted OCSF identity columns.
-        let e = A::build_freetext_replace("event", &["user.name", "actor.user.name"], "SALT", "HASH");
-        assert!(e.starts_with("event = if("), "got: {e}");
-        assert!(e.contains("toString(event)"), "must rewrite the event column: {e}");
-        assert!(e.contains("replaceRegexpAll("));
-        assert!(e.contains("\"user.name\"") && e.contains("\"actor.user.name\""));
-        // (?i) case-insensitive prefix is emitted via char codes 40,63,105,41
-        assert!(e.contains("char(40, 63, 105, 41)"));
-        assert!(e.contains("'HASH'"));
-        // never touches the UDM `ext`/`message` columns
-        assert!(!e.contains("toString(ext)"));
+    fn ocsf_erasure_matches_subject_on_dotted_identity_columns() {
+        // NAN-1443: OCSF erasure no longer rewrites the `event` JSON — `event` is
+        // EPHEMERAL and every PII column is MATERIALIZED from it, so a mutation
+        // can neither rewrite nor re-derive it. Erasure now DELETEs the subject's
+        // rows, matched by the dotted OCSF identity columns via
+        // `build_hash_match_where`. Lock that match shape here.
+        let w = A::build_hash_match_where(&["user.name", "actor.user.name"], "SALT", "HASH");
+        assert!(
+            w.contains("lower(hex(SHA256(concat('SALT', lower(\"user.name\"))))) = 'HASH'"),
+            "must match the dotted OCSF user column: {w}"
+        );
+        assert!(w.contains("\"actor.user.name\""), "got: {w}");
+        // The generic free-text rewrite helper is unchanged and still serves the
+        // UDM message/ext path (see `freetext_replace_udm_unchanged`).
+        let e = A::build_freetext_replace("message", &["user"], "SALT", "HASH");
+        assert!(e.starts_with("message = if("), "got: {e}");
     }
 
     #[test]

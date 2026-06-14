@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// Parse an asset time-range timestamp (`query_asset_true_time_range` emits
+/// RFC3339-ish `%Y-%m-%dT%H:%M:%SZ`) into a UTC instant. Returns None on any
+/// parse failure so callers fall back to the requested window. NAN-1455.
+fn parse_asset_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
 impl SearchService {
     /// Default page size for asset events
     const ASSET_EVENT_PAGE_SIZE: usize = 200;
@@ -228,7 +237,7 @@ impl SearchService {
         );
 
         // Step 2: Resolve all related identities with time bounds
-        let identities = self
+        let mut identities = self
             .resolve_asset_identities(
                 &identifier_field,
                 &identifier_value,
@@ -241,7 +250,7 @@ impl SearchService {
         // Step 3: Query paginated events (facets + first page).
         // Artifact summary and true time range are fetched lazily by the frontend
         // via separate endpoints — they don't block the initial render.
-        let (paginated_events, total_count, facets) = self
+        let (mut paginated_events, mut total_count, mut facets) = self
             .query_asset_events_paginated(
                 &identifier_field,
                 &identifier_value,
@@ -257,6 +266,58 @@ impl SearchService {
             paginated_events.len(),
             total_count
         );
+
+        // NAN-1455: re-anchor to the entity's last activity when the requested
+        // window is empty. The asset view is capped at MAX_ASSET_VIEW_HOURS, so a
+        // recent-window default (or data older than the window) renders an empty
+        // dossier even though the entity is well-attested. When zero events match,
+        // look up the entity's unbounded last-seen (entity_time_range_agg) and, if
+        // it falls outside the requested window, re-run identity resolution + the
+        // events query over `[last_seen - cap, last_seen]`. The effective window is
+        // surfaced in `_asset_profile` so the frontend dossier/timeline align and
+        // can show a notice. Click-from-event already centers the window (NAN-1451);
+        // this only fires on a genuinely empty window.
+        let mut effective_range: Option<TimeRange> = None;
+        if total_count == 0 {
+            let (_first_seen, last_seen) = self
+                .query_asset_true_time_range(&identifier_field, &identifier_value, &identities)
+                .await;
+            if let Some(ls) = last_seen.as_deref().and_then(parse_asset_timestamp) {
+                if ls < time_range.start || ls > time_range.end {
+                    let anchored = TimeRange::new(
+                        ls - chrono::Duration::hours(Self::MAX_ASSET_VIEW_HOURS),
+                        ls,
+                    );
+                    tracing::info!(
+                        "Asset view empty for requested window; re-anchoring to last activity [{} .. {}]",
+                        anchored.start, anchored.end
+                    );
+                    identities = self
+                        .resolve_asset_identities(
+                            &identifier_field,
+                            &identifier_value,
+                            &anchored,
+                            asset_info.max_identity_age,
+                        )
+                        .await?;
+                    let (ev, tc, fc) = self
+                        .query_asset_events_paginated(
+                            &identifier_field,
+                            &identifier_value,
+                            &identities,
+                            &anchored,
+                            0,
+                            Self::ASSET_EVENT_PAGE_SIZE,
+                            None,
+                        )
+                        .await?;
+                    paginated_events = ev;
+                    total_count = tc;
+                    facets = fc;
+                    effective_range = Some(anchored);
+                }
+            }
+        }
 
         // Transform raw events into timeline-friendly format
         let asset_events: Vec<serde_json::Value> = paginated_events
@@ -311,6 +372,14 @@ impl SearchService {
                 "identities": identities,
                 "first_seen": null,
                 "last_seen": null,
+                // NAN-1455: present only when the requested window was empty and we
+                // re-anchored to the entity's last activity. The frontend uses this
+                // for the dossier fetch + timeline and shows a notice.
+                "reanchored": effective_range.is_some(),
+                "effective_time_range": effective_range.as_ref().map(|r| json!({
+                    "start": r.start.to_rfc3339(),
+                    "end": r.end.to_rfc3339(),
+                })),
             },
             "_asset_events": asset_events,
             "_asset_pagination": {

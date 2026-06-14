@@ -245,7 +245,10 @@ fn stalled_ingestion_report(metrics: &CollectedMetrics) -> AnalysisResult {
 /// deployment-state bypass in `fallback_report`.
 fn has_critical_insert_integrity(ii: &InsertIntegrityMetrics) -> bool {
     !ii.failed_logs_dictionaries.is_empty()
-        || (ii.logs_inserts_1h >= 10 && ii.new_parts_1h == 0)
+        // NAN-1461: require the part_log probe to have actually run — a missing
+        // system.part_log grant leaves new_parts_1h at its default 0 while
+        // query_log inserts read fine, which otherwise reads as "data loss".
+        || (ii.new_parts_probe_ok && ii.logs_inserts_1h >= 10 && ii.new_parts_1h == 0)
 }
 
 // Simple heuristic scorers for fallback mode
@@ -324,7 +327,7 @@ fn insert_integrity_recommendations(ii: &InsertIntegrityMetrics) -> Vec<Recommen
             priority: "critical".to_string(),
         });
     }
-    if ii.logs_inserts_1h >= 10 && ii.new_parts_1h == 0 {
+    if ii.new_parts_probe_ok && ii.logs_inserts_1h >= 10 && ii.new_parts_1h == 0 {
         recs.push(Recommendation {
             title: format!(
                 "{} log INSERTs in the last hour produced ZERO new parts on disk",
@@ -808,6 +811,7 @@ mod tests {
         let mut m = healthy_ingestion();
         m.insert_integrity.logs_inserts_1h = 452;
         m.insert_integrity.new_parts_1h = 0;
+        m.insert_integrity.new_parts_probe_ok = true; // we actually measured 0
         assert!(
             score_ingestion(&m) < 50,
             "inserts-without-parts must be critical (got {})",
@@ -820,10 +824,30 @@ mod tests {
             "must raise a critical inserts-without-parts recommendation; got {recs:?}"
         );
 
+        // NAN-1461: 0 parts because the part_log probe COULDN'T run (missing
+        // grant) must NOT alarm — query_log inserts read fine while new_parts
+        // defaults to 0. This is the Saturn false positive.
+        let mut no_probe = healthy_ingestion();
+        no_probe.insert_integrity.logs_inserts_1h = 481;
+        no_probe.insert_integrity.new_parts_1h = 0;
+        no_probe.insert_integrity.new_parts_probe_ok = false;
+        assert!(
+            score_ingestion(&no_probe) >= 80,
+            "missing part_log probe must not read as data loss (got {})",
+            score_ingestion(&no_probe)
+        );
+        assert!(
+            !insert_integrity_recommendations(&no_probe.insert_integrity)
+                .iter()
+                .any(|r| r.title.contains("ZERO new parts")),
+            "must not raise inserts-without-parts when the probe didn't run"
+        );
+
         // ...but a quiet tenant's trickle must NOT page on a thin window.
         let mut quiet = healthy_ingestion();
         quiet.insert_integrity.logs_inserts_1h = 3;
         quiet.insert_integrity.new_parts_1h = 0;
+        quiet.insert_integrity.new_parts_probe_ok = true;
         assert!(
             score_ingestion(&quiet) >= 80,
             "below the floor, a thin window is not an alarm"

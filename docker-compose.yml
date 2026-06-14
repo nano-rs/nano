@@ -282,6 +282,11 @@ services:
       CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-nanosiem}
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-nanosiem}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-nanosiem}
+      # NAN-1443: the OCSF lane inserts into the `ocsf_logs_raw` ENGINE=Null
+      # landing table; the `ocsf_logs_raw_mv` MV derives the stored row into
+      # `ocsf_logs` (which no longer stores the full `event` blob). The generated
+      # OCSF sink reads this; default keeps it pointed at the landing table.
+      CLICKHOUSE_OCSF_LOGS_TABLE: ${CLICKHOUSE_OCSF_LOGS_TABLE:-ocsf_logs_raw}
     ports:
       # Single HTTP ingestion endpoint - auto-detects format from Content-Type
       # Production: Map to 443 with TLS termination (e.g., via ALB/nginx)

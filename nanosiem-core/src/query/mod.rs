@@ -35,6 +35,7 @@ pub(crate) use clickhouse_sql_gen::{
 };
 pub use clickhouse_sql_gen::{ClickHouseSqlGenerator, QueryOptions};
 pub use parser::{parse_query, ParseError};
+pub(crate) use parser::extract_time_modifier_tokens;
 pub use pretty_print::PrettyPrint;
 pub use sql_gen::{SqlGenError, TimeRange};
 pub use validation::{

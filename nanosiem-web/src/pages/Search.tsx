@@ -2353,12 +2353,17 @@ export function Search() {
       newQuery = filterClauses.join(' ');
     } else {
       newQuery = baseSearch.trim();
-      if (filterClauses.length > 0) {
-        if (newQuery) {
-          newQuery = `${newQuery} ${filterClauses.join(' ')}`;
-        } else {
-          newQuery = filterClauses.join(' ');
-        }
+      // NAN-1457: don't re-append a filter the base search already carries. The
+      // asset view's base is `<field>="<value>"` (the `| asset` source) and the
+      // Investigate pivot passes that same `{field: value}`, which produced
+      // `user="mmoore" user="mmoore"`. Match on a word boundary so `dest_user=…`
+      // doesn't shadow `user=…`.
+      const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const baseHasClause = (clause: string) =>
+        new RegExp(`(^|[\\s(])${escapeRegExp(clause)}($|[\\s)])`).test(newQuery);
+      const newClauses = filterClauses.filter((c) => !baseHasClause(c));
+      if (newClauses.length > 0) {
+        newQuery = newQuery ? `${newQuery} ${newClauses.join(' ')}` : newClauses.join(' ');
       }
     }
     
@@ -2832,9 +2837,24 @@ export function Search() {
         setShowAiThinking(true);
       }
 
+      // NAN-1451: honor the time window the deep-link specifies, not the stale
+      // `timeRange` state. `setTimeRange` from the URL-sync effect hasn't applied
+      // yet when this fires, and this effect doesn't depend on `timeRange`, so
+      // passing the state value ran the search over whatever range was previously
+      // active — e.g. the asset-view redirect (`…&run=true&time=Last 4 hours`)
+      // executed over the old wide range and tripped the `| asset` 6h cap while
+      // the picker showed "Last 4 hours". Fall back to state only when the URL
+      // names no window (AI-suggestion `run=true` links).
+      const autoRunTimeRange: TimeRangeValue =
+        urlTimeStart && urlTimeEnd
+          ? { type: 'custom', start: new Date(urlTimeStart), end: new Date(urlTimeEnd) }
+          : urlTimePreset
+            ? { type: 'preset', preset: urlTimePreset }
+            : timeRange;
+
       // Small delay to ensure state is ready
       const timer = setTimeout(() => {
-        handleSearch(1, false, urlQuery, queryMode, timeRange);
+        handleSearch(1, false, urlQuery, queryMode, autoRunTimeRange);
         // Clear the run and ai params from URL after execution
         const params = new URLSearchParams(searchParams);
         params.delete('run');

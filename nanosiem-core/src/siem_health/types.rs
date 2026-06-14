@@ -133,6 +133,14 @@ pub struct InsertIntegrityMetrics {
     /// is the NAN-1404 fingerprint: inserts ACKing while nothing reaches disk
     /// (the exact correlation that diagnosed Saturn).
     pub new_parts_1h: u64,
+    /// Whether the `system.part_log` probe actually ran (NAN-1461). The
+    /// `query_log` and `part_log` grants are independent — a tenant can have one
+    /// and not the other — so a failed part_log read leaves `new_parts_1h` at its
+    /// default 0. Without this flag the inserts-without-parts critical can't tell
+    /// "measured 0 parts" (real loss) from "couldn't measure" (missing grant) and
+    /// false-alarms data loss. `serde(default)` so pre-NAN-1461 reports deserialize.
+    #[serde(default)]
+    pub new_parts_probe_ok: bool,
     /// system.errors counter for MEMORY_LIMIT_EXCEEDED (code 241), only when
     /// its last occurrence is within 24h (the counter never resets).
     pub memory_limit_errors: u64,

@@ -147,7 +147,10 @@ function flattenFieldsForExpand(fields: Record<string, unknown>, isOcsf = false,
         fieldName === 'last_seen') return 4;
     if (fieldName.startsWith('lookup_')) return 5;
     if (fieldName.startsWith('enriched_')) return 6;
-    if (fieldName.startsWith('metadata_')) return 7;
+    // UDM flattens its `metadata` JSON with underscores (`metadata_*`); OCSF
+    // surfaces it as dotted leaf paths (`metadata.version`) — match both so the
+    // Metadata enrichment toggle hides OCSF metadata too (NAN-1448).
+    if (fieldName.startsWith('metadata_') || fieldName.startsWith('metadata.')) return 7;
     if (isOcsf && fieldName.startsWith('unmapped.')) return 9; // OCSF unmapped spill last
     if (!UDM_COLUMNS.has(fieldName)) return 8;
     return 0;
@@ -187,7 +190,8 @@ const ENRICHMENT_CATEGORIES_EXPAND: Record<string, (k: string) => boolean> = {
   lookup: (k) => k.startsWith('lookup_') && !k.startsWith('lookup_custom_'),
   geo: (k) => k.startsWith('enriched_'),
   identity: (k) => k.includes('_identity_') || k.startsWith('identity_') || k === 'is_nat_candidate',
-  metadata: (k) => k.startsWith('metadata_'),
+  // `metadata_*` (UDM flattened) and `metadata.*` (OCSF dotted leaves) — NAN-1448.
+  metadata: (k) => k.startsWith('metadata_') || k.startsWith('metadata.'),
 };
 
 function isFieldHiddenExpand(fieldName: string, hiddenEnrichments: Set<string>): boolean {
@@ -574,14 +578,46 @@ interface FieldValueMenuProps {
   className?: string;
   notebookActive?: boolean;
   onAddToNotebook?: (entityType: string, value: string) => void;
+  /**
+   * Timestamp of the event row this value came from. The "Open asset view"
+   * drilldown centers its (≤6h) window on this so it shows activity AROUND the
+   * clicked event — anchoring to "now" would render an empty asset view when
+   * drilling from older events. Absent for aggregated stats cells, which fall
+   * back to a recent now-anchored window. NAN-1451.
+   */
+  eventTimestamp?: Date;
 }
 
-// NAN-955: types EntityPage (`/entities/:type/:value`) can actually resolve.
-// FIELD_TO_ENTITY_TYPE is broader (covers `domain`/`hash`/`url`/etc. used by
-// the notebook surface) but EntityPage's ENTITY_TYPE_TO_FIELD map only knows
-// the three below; offering "Open entity page" for the others would land on
-// a broken search query.
-const ENTITY_PAGE_TYPES = new Set(['ip', 'host', 'user']);
+// NAN-1450: entity types the search-native asset view (`| asset`) handles —
+// ip / host / user. We gate the "Open asset view" action on these (the broader
+// FIELD_TO_ENTITY_TYPE also covers domain/hash/url for the notebook surface,
+// which `| asset` doesn't model). The legacy dedicated EntityPage was retired in
+// favor of redirecting into `<field>="<value>" | asset` on the Search page.
+const ASSET_VIEW_ENTITY_TYPES = new Set(['ip', 'host', 'user']);
+
+// `| asset` resolves its identifier only from canonical UDM fields
+// (ASSET_IDENTIFIER_FIELDS in nanosiem-core asset.rs) — never OCSF dotted names
+// like `actor.user.name`, which yield "no resolved identifier". Map the resolved
+// entity type to its canonical field and pass `field=<canonical>` so the backend
+// fast-path resolves identity via the profile-aware `udm_column_sql` (works in
+// OCSF). Matches `| lateral` and the retired EntityPage. NAN-1452.
+const ENTITY_TYPE_TO_ASSET_FIELD: Record<string, string> = {
+  ip: 'src_ip',
+  host: 'src_host',
+  user: 'user',
+};
+
+// Fallback window for the asset-view drilldown when there's no event timestamp
+// to anchor to (aggregated stats cells). Largest relative preset (see
+// DateTimeRangePicker) under the `| asset` 6h cap (MAX_ASSET_VIEW_HOURS in
+// nanosiem-core asset.rs); the next preset up (12h) would trip it. NAN-1450.
+const ASSET_VIEW_TIME_PRESET = 'Last 4 hours';
+
+// Half-width of the asset-view window centered on a clicked event's timestamp:
+// ±3h = a 6h span, exactly the `| asset` cap (the backend rejects only > 6h).
+// Centering keeps the asset view populated around the event the analyst clicked
+// instead of an empty now-anchored window. NAN-1451.
+const ASSET_VIEW_EVENT_HALF_WINDOW_MS = 3 * 60 * 60 * 1000;
 
 // NAN-955: exported so StatsView (sibling component) can reuse the same
 // popover on aggregated GROUP BY cells. Same affordances (Add to filter /
@@ -598,15 +634,16 @@ export function FieldValueMenu({
   className = '',
   notebookActive,
   onAddToNotebook,
+  eventTimestamp,
 }: FieldValueMenuProps) {
   const navigate = useNavigate();
   const { resolveEntityType, schemaFields } = useSchemaEntityMap({ fallback: FIELD_TO_ENTITY_TYPE });
   const stringValue = typeof value === 'object' ? JSON.stringify(value) : String(value);
   const fieldType = getFieldType(fieldName);
   const entityType = resolveEntityType(fieldName);
-  const canOpenEntityPage =
+  const canOpenAssetView =
     !!entityType &&
-    ENTITY_PAGE_TYPES.has(entityType) &&
+    ASSET_VIEW_ENTITY_TYPES.has(entityType) &&
     typeof value === 'string' &&
     value.trim().length > 0;
 
@@ -872,17 +909,37 @@ export function FieldValueMenu({
           <DropdownMenuShortcut className="text-[10.5px]">⌘C</DropdownMenuShortcut>
         </DropdownMenuItem>
 
-        {/* NAN-955: drill to the entity dossier page when the field maps to
-            a type EntityPage can resolve (ip / host / user). Other entityTypes
-            in FIELD_TO_ENTITY_TYPE (domain / hash / url) are notebook-only
-            today — exposing them here would land on a broken search query. */}
-        {canOpenEntityPage && (
+        {/* NAN-1450/1452: drill into the search-native asset view for entity
+            fields (ip / host / user). The legacy EntityPage was retired — we run
+            `<canonical>="<value>" | asset field=<canonical>` on the Search page,
+            mapping the OCSF/UDM field to the canonical identifier `| asset`
+            understands, over a window centered on the clicked event (≤6h cap). */}
+        {canOpenAssetView && (
           <DropdownMenuItem
-            onClick={() => navigate(`/entities/${entityType}/${encodeURIComponent(stringValue)}`)}
+            onClick={() => {
+              // Filter on the canonical identifier field, not the clicked OCSF
+              // field, so `| asset` can resolve the identifier (NAN-1452).
+              const assetField = ENTITY_TYPE_TO_ASSET_FIELD[entityType ?? ''] ?? fieldName;
+              const params = new URLSearchParams({
+                q: `${assetField}="${escapeValue(stringValue)}" | asset field=${assetField}`,
+                run: 'true',
+              });
+              // Center the (≤6h) asset window on the clicked event so it isn't
+              // empty when drilling from older events; fall back to a recent
+              // window for stats cells with no event timestamp. NAN-1451.
+              if (eventTimestamp && !Number.isNaN(eventTimestamp.getTime())) {
+                const t = eventTimestamp.getTime();
+                params.set('start', new Date(t - ASSET_VIEW_EVENT_HALF_WINDOW_MS).toISOString());
+                params.set('end', new Date(t + ASSET_VIEW_EVENT_HALF_WINDOW_MS).toISOString());
+              } else {
+                params.set('time', ASSET_VIEW_TIME_PRESET);
+              }
+              navigate(`/search?${params.toString()}`);
+            }}
             className="gap-1.5 px-2 py-1 text-[12px]"
           >
             <ExternalLink className="w-[13px] h-[13px]" />
-            <span>Open entity page</span>
+            <span>Open asset view</span>
           </DropdownMenuItem>
         )}
 
@@ -2088,6 +2145,7 @@ function RawView({
                                 className={accent ? 'text-primary font-semibold' : 'text-str'}
                                 notebookActive={notebookActive}
                                 onAddToNotebook={onAddToNotebook}
+                                eventTimestamp={result.timestamp}
                               />
                             </span>
                           </span>
@@ -2173,6 +2231,7 @@ function RawView({
                                     className={isIoc ? "text-red-400" : isRisk ? "text-orange-400" : "text-str"}
                                     notebookActive={notebookActive}
                                     onAddToNotebook={onAddToNotebook}
+                                    eventTimestamp={result.timestamp}
                                   />
                                   {shouldTruncate && (
                                     <button

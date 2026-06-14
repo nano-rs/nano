@@ -94,7 +94,7 @@ async fn insert_row(client: &reqwest::Client, db: &str, row_json: &str) -> Resul
     // Statement in the URL `query` param (spaces percent-encoded; CH tolerates
     // bare parens); data is the body. Avoids the inline-statement+data body form
     // whose data reqwest silently drops.
-    let stmt = format!("INSERT INTO {db}.ocsf_logs (event) FORMAT JSONEachRow").replace(' ', "%20");
+    let stmt = format!("INSERT INTO {db}.ocsf_logs_raw (event) FORMAT JSONEachRow").replace(' ', "%20");
     // Force synchronous inserts: the dev server may default async_insert on, in
     // which case the part flushes after the response returns and a read-back
     // races it (observed count lag 0,0,0,1). wait_end_of_query=1 also blocks
@@ -141,26 +141,35 @@ fn sha256_of(hashes: &Value) -> String {
 /// multi-statement bodies — this test only needs the table (it validates the
 /// materialized columns). Strip `--` comments (so a comment `;` can't truncate
 /// the statement early) and the TTL clause (so historical fixtures aren't pruned).
-fn test_table_ddl(db: &str) -> String {
+fn test_table_ddl(db: &str) -> Vec<String> {
+    // NAN-1443: the OCSF table is now three objects — `ocsf_logs_raw` (ENGINE=Null
+    // landing table), `ocsf_logs_raw_mv` (derives the row), and `ocsf_logs`
+    // (MergeTree storage; the `*_unified` columns are inline in its CREATE). They
+    // are contiguous, ahead of the `CREATE OR REPLACE DICTIONARY` statements.
+    // Extract that block, strip `--` comments + the TTL clause, split into the
+    // individual statements (the CH HTTP endpoint rejects multi-statement bodies),
+    // and repoint at the throwaway DB. Inserts go to `ocsf_logs_raw`; reads hit
+    // `ocsf_logs`. `dictGet('nanosiem.…')` refs stay cross-DB to the real dicts.
     let start = DDL
-        .find("CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs")
-        .expect("ocsf_logs CREATE TABLE in DDL");
-    let from = &DDL[start..];
-    let no_comments: String = from
+        .find("CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs_raw")
+        .expect("ocsf_logs_raw CREATE TABLE in DDL");
+    let end = DDL[start..]
+        .find("CREATE OR REPLACE DICTIONARY")
+        .map(|i| start + i)
+        .expect("dictionaries follow the ocsf_logs table block");
+    DDL[start..end]
         .lines()
         .map(|l| match l.find("--") {
             Some(i) => &l[..i],
             None => l,
         })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let end = no_comments.find(';').expect("CREATE TABLE terminator");
-    no_comments[..end]
-        .lines()
         .filter(|l| !l.trim_start().starts_with("TTL "))
         .collect::<Vec<_>>()
         .join("\n")
-        .replace("nanosiem.ocsf_logs", &format!("{db}.ocsf_logs"))
+        .split(';')
+        .map(|s| s.trim().replace("nanosiem.ocsf_logs", &format!("{db}.ocsf_logs")))
+        .filter(|s| !s.trim().is_empty())
+        .collect()
 }
 
 #[tokio::test]
@@ -199,7 +208,9 @@ async fn ocsf_materialized_columns_populate_from_event_only() {
 }
 
 async fn run_assertions(client: &reqwest::Client, db: &str) -> Result<(), String> {
-    exec(client, &test_table_ddl(db)).await?;
+    for stmt in test_table_ddl(db) {
+        exec(client, &stmt).await?;
+    }
 
     let fixtures = [
         ("auth", FIX_AUTH),

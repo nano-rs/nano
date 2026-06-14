@@ -69,9 +69,6 @@ const BREADCRUMB_CONFIG: Array<{ path: string; segments: BreadcrumbSegment[]; ca
   { path: '/settings/risk', segments: [{ label: 'Home', href: '/' }, { label: 'Settings' }, { label: 'Risk Scoring' }], capability: 'risk' },
   { path: '/platform/health', segments: [{ label: 'Home', href: '/' }, { label: 'SIEM Health' }], capability: 'siemHealth' },
 
-  // Entity
-  { path: '/entities/:type/:value', segments: [{ label: 'Home', href: '/' }, { label: 'Search', href: '/search' }, { label: ':dynamic' }] },
-
   // Alerts — NAN-746: open-core triage surface. /alerts is the list page;
   // /alerts/:id is the detail. No capability tag — both ship in core.
   { path: '/alerts', segments: [{ label: 'Home', href: '/' }, { label: 'Alerts' }] },

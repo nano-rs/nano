@@ -159,10 +159,11 @@ async fn collect_insert_integrity(ch: &ClickHouseClient) -> InsertIntegrityMetri
     match ch.query(&sql).fetch_one::<u64>().await {
         Ok(new_parts) => {
             m.probes_available = true;
+            m.new_parts_probe_ok = true;
             m.new_parts_1h = new_parts;
         }
         Err(e) => warn!(
-            "Insert-integrity probe: system.part_log unavailable (grant missing? NAN-1405): {}",
+            "Insert-integrity probe: system.part_log unavailable (grant missing? NAN-1405/1461): {}",
             e
         ),
     }

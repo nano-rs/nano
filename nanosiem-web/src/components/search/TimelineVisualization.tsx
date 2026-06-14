@@ -395,15 +395,8 @@ export function TimelineVisualization({
   const extractedData = useMemo(() => extractArtifactsWithTimestamps(results), [results]);
   const hasArtifacts = extractedData.hashes.length > 0 || extractedData.domains.length > 0;
 
-  // X-axis domain:
-  // - In static mode (timechart results): use data range for proper visualization
-  // - In normal mode: use full requested time range so chart spans correctly
-  const xDomain: [number, number] | ['dataMin', 'dataMax'] = useMemo(() => {
-    // In static mode, use the actual data range
-    if (staticMode) {
-      return ['dataMin', 'dataMax'];
-    }
-    // In normal mode, use the full requested time range
+  // The picker window, as a numeric [start, end] (ms), or null if unusable.
+  const pickerRange = useMemo<[number, number] | null>(() => {
     if (timeRange?.start && timeRange?.end) {
       const start = new Date(timeRange.start).getTime();
       const end = new Date(timeRange.end).getTime();
@@ -411,8 +404,52 @@ export function TimelineVisualization({
         return [start, end];
       }
     }
+    return null;
+  }, [timeRange]);
+
+  // The actual extent of the histogram buckets (ms), or null if no data.
+  const dataExtent = useMemo<[number, number] | null>(() => {
+    if (timelineData.length === 0) return null;
+    let min = Infinity;
+    let max = -Infinity;
+    for (const d of timelineData) {
+      if (d.timestamp < min) min = d.timestamp;
+      if (d.timestamp > max) max = d.timestamp;
+    }
+    return Number.isFinite(min) && Number.isFinite(max) ? [min, max] : null;
+  }, [timelineData]);
+
+  // Effective rendered window = the picker range UNIONED with the histogram
+  // extent (NAN-1454). An in-query `earliest=`/`latest=` modifier widens the
+  // window the backend actually queries beyond the time picker; the histogram
+  // is computed over that broadened window (the backend zero-fills the whole
+  // adjusted range), so without the union the numeric XAxis clips every bar
+  // outside the picker domain and the timeline looks empty even though data
+  // came back. A normal search keeps the histogram inside the picker, so the
+  // union is a no-op and the chart renders exactly as before.
+  const effectiveRange = useMemo<[number, number] | null>(() => {
+    if (pickerRange && dataExtent) {
+      return [
+        Math.min(pickerRange[0], dataExtent[0]),
+        Math.max(pickerRange[1], dataExtent[1]),
+      ];
+    }
+    return pickerRange ?? dataExtent;
+  }, [pickerRange, dataExtent]);
+
+  // X-axis domain:
+  // - In static mode (timechart results): use data range for proper visualization
+  // - In normal mode: use the effective window so the chart spans the data
+  const xDomain: [number, number] | ['dataMin', 'dataMax'] = useMemo(() => {
+    // In static mode, use the actual data range
+    if (staticMode) {
+      return ['dataMin', 'dataMax'];
+    }
+    if (effectiveRange) {
+      return effectiveRange;
+    }
     return ['dataMin', 'dataMax'];
-  }, [timeRange, staticMode]);
+  }, [effectiveRange, staticMode]);
 
   // Check if time range spans multiple days (for showing dates in labels)
   const spansDays = useMemo(() => {
@@ -422,13 +459,11 @@ export function TimelineVisualization({
       const end = timelineData[timelineData.length - 1].timestamp;
       return (end - start) > 24 * 60 * 60 * 1000;
     }
-    if (timeRange?.start && timeRange?.end) {
-      const start = new Date(timeRange.start).getTime();
-      const end = new Date(timeRange.end).getTime();
-      return (end - start) > 24 * 60 * 60 * 1000; // > 24 hours
+    if (effectiveRange) {
+      return (effectiveRange[1] - effectiveRange[0]) > 24 * 60 * 60 * 1000; // > 24 hours
     }
     return false;
-  }, [timeRange, staticMode, timelineData]);
+  }, [effectiveRange, staticMode, timelineData]);
 
   // Check time range duration for formatting precision
   const rangeDurationMs = useMemo(() => {
@@ -438,13 +473,11 @@ export function TimelineVisualization({
       const end = timelineData[timelineData.length - 1].timestamp;
       return end - start || 24 * 60 * 60 * 1000;
     }
-    if (timeRange?.start && timeRange?.end) {
-      const start = new Date(timeRange.start).getTime();
-      const end = new Date(timeRange.end).getTime();
-      return end - start;
+    if (effectiveRange) {
+      return effectiveRange[1] - effectiveRange[0];
     }
     return 24 * 60 * 60 * 1000; // default 24h
-  }, [timeRange, staticMode, timelineData]);
+  }, [effectiveRange, staticMode, timelineData]);
 
   // Generate evenly-spaced tick values for the X-axis
   const xAxisTicks = useMemo(() => {

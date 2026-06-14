@@ -60,6 +60,25 @@ export interface EventInspectorPanelProps {
 // Field utilities (mirrors SearchResults.tsx logic)
 // ============================================================================
 
+// NAN-1447: the OCSF `unmapped` column is a JSON object (the true source spill).
+// Flatten it into DOTTED `unmapped.<path>` leaf rows — matching the Unmapped
+// category match (`getFieldCategory` keys off the `unmapped.` prefix) and the
+// dotted form the promoted OCSF columns already arrive in — so it renders as
+// individual inspectable rows instead of one raw JSON blob. Dotted (not the
+// underscore `flattenFields` uses) on purpose; empty objects yield no rows.
+function flattenUnmapped(obj: Record<string, unknown>, prefix = 'unmapped'): [string, unknown][] {
+  const out: [string, unknown][] = [];
+  for (const [k, v] of Object.entries(obj)) {
+    const key = `${prefix}.${k}`;
+    if (v !== null && typeof v === 'object' && !Array.isArray(v)) {
+      out.push(...flattenUnmapped(v as Record<string, unknown>, key));
+    } else {
+      out.push([key, v]);
+    }
+  }
+  return out;
+}
+
 function flattenFields(fields: Record<string, unknown>, isOcsf = false, prefix = '', promotedNames?: Set<string>): [string, unknown][] {
   const result: [string, unknown][] = [];
 
@@ -83,6 +102,15 @@ function flattenFields(fields: Record<string, unknown>, isOcsf = false, prefix =
 
     if (key.startsWith('prevalence_') && (value === 255 || value === 65535 || value === 9999)) continue;
     if (key === 'risk_score' && (value === 0 || value === '0')) continue;
+
+    // NAN-1446: the OCSF `*_unified` entity columns are an internal query
+    // accelerator (a coalesce over class-split OCSF paths) and `event_bytes` is a
+    // sizing metric — neither is an OCSF spec field. They're already hidden from
+    // the field picker (`isInternalHelperField`); keep them out of the record view
+    // too so an OCSF row renders as pure spec (Core OCSF fields + `unmapped`),
+    // never `process_name_unified` echoing `actor.process.name`. Harmless on UDM
+    // (no such columns there).
+    if (key.endsWith('_unified') || key === 'event_bytes') continue;
 
     const isPrevalence = key === 'host_count' || key === 'is_rare' || key === 'prevalence_score' ||
                          key === 'prevalence_type' || key === 'total_occurrences' ||
@@ -110,6 +138,24 @@ function flattenFields(fields: Record<string, unknown>, isOcsf = false, prefix =
       } else if (value) {
         result.push([fullKey, value]);
       }
+    } else if (key === 'unmapped' && prefix === '') {
+      // NAN-1447: expand the OCSF unmapped spill into dotted leaf rows instead of
+      // pushing the whole object as one JSON blob. Accept either a parsed object
+      // or a JSON string; anything else falls through as the raw value.
+      let unmappedObj: Record<string, unknown> | null = null;
+      if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+        unmappedObj = value as Record<string, unknown>;
+      } else if (typeof value === 'string' && value.startsWith('{')) {
+        try {
+          const parsed = JSON.parse(value);
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) unmappedObj = parsed;
+        } catch { /* not JSON */ }
+      }
+      if (unmappedObj) {
+        result.push(...flattenUnmapped(unmappedObj));
+      } else if (value) {
+        result.push([fullKey, value]);
+      }
     } else if (typeof value === 'object' && !Array.isArray(value) && prefix === '') {
       result.push([fullKey, value]);
     } else {
@@ -130,7 +176,9 @@ function flattenFields(fields: Record<string, unknown>, isOcsf = false, prefix =
         fieldName === 'last_seen') return 4;
     if (fieldName.startsWith('lookup_')) return 5;
     if (fieldName.startsWith('enriched_')) return 6;
-    if (fieldName.startsWith('metadata_')) return 7;
+    // UDM flattens `metadata` with underscores; OCSF surfaces dotted leaves
+    // (`metadata.version`) — match both so the Metadata toggle hides OCSF too (NAN-1448).
+    if (fieldName.startsWith('metadata_') || fieldName.startsWith('metadata.')) return 7;
     if (isOcsf && fieldName.startsWith('unmapped.')) return 9; // OCSF unmapped spill last
     if (!UDM_COLUMNS.has(fieldName)) return 8;
     return 0;
@@ -195,7 +243,8 @@ const ENRICHMENT_CATEGORIES: Record<string, (k: string) => boolean> = {
   lookup: (k) => k.startsWith('lookup_') && !k.startsWith('lookup_custom_'),
   geo: (k) => k.startsWith('enriched_'),
   identity: (k) => k.includes('_identity_') || k.startsWith('identity_') || k === 'is_nat_candidate',
-  metadata: (k) => k.startsWith('metadata_'),
+  // `metadata_*` (UDM flattened) and `metadata.*` (OCSF dotted leaves) — NAN-1448.
+  metadata: (k) => k.startsWith('metadata_') || k.startsWith('metadata.'),
 };
 
 function isFieldHidden(fieldName: string, hiddenEnrichments: Set<string>): boolean {
