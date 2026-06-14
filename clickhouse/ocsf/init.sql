@@ -500,6 +500,17 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     `http_request.user_agent` String CODEC(ZSTD(1)),
     -- http_response.code (HTTP status int -> UInt16). UDM http_status_code.
     `http_response.code` UInt16 CODEC(T64, LZ4),
+    -- NAN-1465: UDM-parity promotions — registry forensics (sysmon), web
+    -- referrer + content category, AWS principal identity, base-event duration.
+    `reg_key.path` String CODEC(ZSTD(1)),
+    `reg_value.name` String CODEC(ZSTD(1)),
+    `reg_value.path` String CODEC(ZSTD(1)),
+    `reg_value.data` String CODEC(ZSTD(1)),
+    `http_request.referrer` String CODEC(ZSTD(1)),
+    `http_request.url.categories` Array(String) DEFAULT [] CODEC(ZSTD(1)),
+    `actor.user.uid` String CODEC(ZSTD(1)),
+    `actor.user.type` LowCardinality(String) CODEC(ZSTD(1)),
+    `duration` UInt32 CODEC(T64, LZ4),
 
     -- =========================================================================
     -- DNS ACTIVITY  (class 4003)
@@ -838,6 +849,14 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     INDEX idx_http_url_string_words lower(`http_request.url.url_string`) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_http_url_path_words lower(`http_request.url.path`) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_http_user_agent_words lower(`http_request.user_agent`) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
+    -- NAN-1465 promotions: lower(col) forms so the lower()-based codegen hits them.
+    INDEX idx_reg_key_path_words lower(`reg_key.path`) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
+    INDEX idx_reg_value_path_words lower(`reg_value.path`) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
+    INDEX idx_reg_value_name lower(`reg_value.name`) TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_reg_value_data_words lower(`reg_value.data`) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
+    INDEX idx_http_referrer_words lower(`http_request.referrer`) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
+    INDEX idx_actor_user_uid lower(`actor.user.uid`) TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_actor_user_type lower(`actor.user.type`) TYPE set(20) GRANULARITY 4,
     -- DNS: query tokenized text (UDM query parity); answer rdata bloom (UDM answer).
     INDEX idx_query_words lower(`query.hostname`) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_answer `answers.rdata` TYPE bloom_filter GRANULARITY 4,
@@ -1086,6 +1105,16 @@ AS SELECT
     JSONExtractString(event, 'http_request', 'url', 'path') AS `http_request.url.path`,
     JSONExtractString(event, 'http_request', 'user_agent') AS `http_request.user_agent`,
     toUInt16(JSONExtractUInt(event, 'http_response', 'code')) AS `http_response.code`,
+    -- NAN-1465 promotions
+    JSONExtractString(event, 'reg_key', 'path') AS `reg_key.path`,
+    JSONExtractString(event, 'reg_value', 'name') AS `reg_value.name`,
+    JSONExtractString(event, 'reg_value', 'path') AS `reg_value.path`,
+    JSONExtractString(event, 'reg_value', 'data') AS `reg_value.data`,
+    JSONExtractString(event, 'http_request', 'referrer') AS `http_request.referrer`,
+    JSONExtract(toString(event), 'http_request', 'url', 'categories', 'Array(String)') AS `http_request.url.categories`,
+    JSONExtractString(event, 'actor', 'user', 'uid') AS `actor.user.uid`,
+    JSONExtractString(event, 'actor', 'user', 'type') AS `actor.user.type`,
+    toUInt32(JSONExtractUInt(event, 'duration')) AS `duration`,
     JSONExtractString(event, 'query', 'hostname') AS `query.hostname`,
     JSONExtractString(
         arrayElement(

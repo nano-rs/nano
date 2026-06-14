@@ -4,7 +4,7 @@
  * UDM (Unified Data Model) field definitions
  *
  * AUTO-GENERATED — do not edit manually.
- * Source: nanosiem-core/docs/udmfields.csv (518 fields)
+ * Source: nanosiem-core/docs/udmfields.csv (519 fields)
  * Regenerate: npm run generate:udm
  */
 
@@ -111,7 +111,7 @@ export const UDM_COLUMNS = new Set([
   'storage_used', 'storage_used_percent', 'stored_procedures_called', 'subject', 'swap',
   'swap_free', 'swap_used', 'table_scans', 'tables_hit', 'tablespace_name',
   'tablespace_reads', 'tablespace_status', 'tablespace_used', 'tablespace_writes', 'tag',
-  'tcp_flag', 'temperature', 'thruput', 'thruput_max', 'time', 'timestamp', 'tos',
+  'tags', 'tcp_flag', 'temperature', 'thruput', 'thruput_max', 'time', 'timestamp', 'tos',
   'transaction_id', 'transport', 'transport_dest_port', 'ttl', 'type', 'uri_path',
   'uri_query', 'url', 'url_domain', 'url_length', 'user', 'user_agent', 'user_domain',
   'user_group', 'user_id', 'user_identity_account_status', 'user_identity_company',

@@ -463,6 +463,7 @@ tablespace_writes,Databases
 tag,Alerts
 tcp_flag,Network
 temperature,Performance
+tags,System
 thruput,Performance
 thruput_max,Performance
 time,System

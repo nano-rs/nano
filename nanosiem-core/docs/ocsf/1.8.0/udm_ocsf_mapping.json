@@ -23,7 +23,7 @@
     "array_key": null,
     "entity_type": null,
     "category": "Taxonomy",
-    "notes": "OCSF category (1=System, 3=IAM, 4=Network Activity). Coarser than class_uid; PREWHERE for category-wide filters. Also the closest OCSF home for UDM `category` (change/event grouping) — there is no scalar OCSF `category` string."
+    "notes": "OCSF category (1=System, 3=IAM, 4=Network Activity). Coarser than class_uid; PREWHERE for category-wide filters. Also the closest OCSF home for UDM `category` (change/event grouping) \u2014 there is no scalar OCSF `category` string."
   },
   {
     "udm_field": "event_type",
@@ -37,7 +37,7 @@
     "entity_type": null,
     "category": "Taxonomy",
     "enum_label_column": "activity",
-    "notes": "Enum int; sibling display string is `activity` (activity_name in some emitters). class-scoped (e.g. Auth activity_id 1=Logon, File activity_id 4=Delete) — so there is NO fixed enum_values table; a string-verb filter must match the sibling `activity` label column (enum_label_column, NAN-1382). Maps to UDM event_type/action. Filter on the int (fast) when the id is known."
+    "notes": "Enum int; sibling display string is `activity` (activity_name in some emitters). class-scoped (e.g. Auth activity_id 1=Logon, File activity_id 4=Delete) \u2014 so there is NO fixed enum_values table; a string-verb filter must match the sibling `activity` label column (enum_label_column, NAN-1382). Maps to UDM event_type/action. Filter on the int (fast) when the id is known."
   },
   {
     "udm_field": "action",
@@ -76,7 +76,16 @@
     "array_key": null,
     "entity_type": null,
     "category": "Taxonomy",
-    "enum_values": {"unknown": 0, "informational": 1, "low": 2, "medium": 3, "high": 4, "critical": 5, "fatal": 6, "other": 99},
+    "enum_values": {
+      "unknown": 0,
+      "informational": 1,
+      "low": 2,
+      "medium": 3,
+      "high": 4,
+      "critical": 5,
+      "fatal": 6,
+      "other": 99
+    },
     "notes": "Enum int (0=Unknown,1=Informational..6=Fatal,99=Other); sibling `severity` string. UDM severity is a LowCardinality(String); here the int is canonical/indexed, string is display. enum_values is the fixed base-event label->id table the query layer uses to translate string verbs onto the indexed int (NAN-1382)."
   },
   {
@@ -246,7 +255,7 @@
     "array_key": null,
     "entity_type": "user",
     "category": "Identity",
-    "notes": "Duplicate-column entry (activity_id precedent): maps UDM dest_user to the same promoted `user.name` column. Per OCSF Authentication 3002, `user` is the TARGET/subject account being acted upon and `actor.user` the initiator — exactly UDM dest_user/src_user (src_user already maps to actor.user.name). Without this, dest_user fell through to JSONExtract(event, dest_user) — a key OCSF never carries — so searches/stats/resolve_identity on it silently matched nothing (NAN-1339 follow-up from NAN-1346 #5)."
+    "notes": "Duplicate-column entry (activity_id precedent): maps UDM dest_user to the same promoted `user.name` column. Per OCSF Authentication 3002, `user` is the TARGET/subject account being acted upon and `actor.user` the initiator \u2014 exactly UDM dest_user/src_user (src_user already maps to actor.user.name). Without this, dest_user fell through to JSONExtract(event, dest_user) \u2014 a key OCSF never carries \u2014 so searches/stats/resolve_identity on it silently matched nothing (NAN-1339 follow-up from NAN-1346 #5)."
   },
   {
     "udm_field": "src_user",
@@ -298,7 +307,7 @@
     "array_key": null,
     "entity_type": null,
     "category": "Process",
-    "notes": "PARENT/INITIATOR process name. Per OCSF Process Activity 1007, top-level `process` is the SUBJECT (the launched/terminated process) and `actor.process` is the PARENT/initiator that acted on it. So `actor.process.name` is the parent — secondary, no UDM alias (udm_field=null). UDM process_name now resolves to the primary `process.name`. bloom + text index + PREWHERE + lowercase-normalized retained for parent-process pivots/hunts."
+    "notes": "PARENT/INITIATOR process name. Per OCSF Process Activity 1007, top-level `process` is the SUBJECT (the launched/terminated process) and `actor.process` is the PARENT/initiator that acted on it. So `actor.process.name` is the parent \u2014 secondary, no UDM alias (udm_field=null). UDM process_name now resolves to the primary `process.name`. bloom + text index + PREWHERE + lowercase-normalized retained for parent-process pivots/hunts."
   },
   {
     "udm_field": "process_name",
@@ -363,7 +372,7 @@
     "array_key": null,
     "entity_type": null,
     "category": "Process",
-    "notes": "PARENT process pid. Per OCSF Process Activity 1007 `actor.process` is the parent/initiator; secondary, no UDM alias (udm_field=null — UDM process_id now resolves to the subject `process.pid`). OCSF process.pid (integer_t) -> UInt32. NUMERIC."
+    "notes": "PARENT process pid. Per OCSF Process Activity 1007 `actor.process` is the parent/initiator; secondary, no UDM alias (udm_field=null \u2014 UDM process_id now resolves to the subject `process.pid`). OCSF process.pid (integer_t) -> UInt32. NUMERIC."
   },
   {
     "udm_field": "process_guid",
@@ -376,7 +385,7 @@
     "array_key": null,
     "entity_type": null,
     "category": "Process",
-    "notes": "PRIMARY subject process uid — OCSF-native process identifier (process_t.uid, string_t). Per OCSF Process Activity 1007 the SUBJECT is top-level `process`, so process.uid IS the UDM process_guid analog (client-provided GUID, NOT recomputed). bloom for process-tree pivots. The parent uid is `actor.process.uid`."
+    "notes": "PRIMARY subject process uid \u2014 OCSF-native process identifier (process_t.uid, string_t). Per OCSF Process Activity 1007 the SUBJECT is top-level `process`, so process.uid IS the UDM process_guid analog (client-provided GUID, NOT recomputed). bloom for process-tree pivots. The parent uid is `actor.process.uid`."
   },
   {
     "udm_field": "parent_process_guid",
@@ -389,7 +398,7 @@
     "array_key": null,
     "entity_type": null,
     "category": "Process",
-    "notes": "PARENT process uid (process_t.uid, string_t). Per OCSF Process Activity 1007 `actor.process` is the parent/initiator, so its uid maps to UDM parent_process_guid (NAN-1346 tree lineage; mirrors parent_command_line → actor.process.cmd_line). UDM process_guid resolves to the subject `process.uid`. bloom for process-tree pivots."
+    "notes": "PARENT process uid (process_t.uid, string_t). Per OCSF Process Activity 1007 `actor.process` is the parent/initiator, so its uid maps to UDM parent_process_guid (NAN-1346 tree lineage; mirrors parent_command_line \u2192 actor.process.cmd_line). UDM process_guid resolves to the subject `process.uid`. bloom for process-tree pivots."
   },
   {
     "udm_field": "process_hash",
@@ -399,7 +408,11 @@
     "index": "bloom_filter",
     "prewhere": false,
     "is_search_col": false,
-    "array_key": {"key_attr": "algorithm_id", "value_attr": "value", "key_value": 3},
+    "array_key": {
+      "key_attr": "algorithm_id",
+      "value_attr": "value",
+      "key_value": 3
+    },
     "entity_type": "hash",
     "category": "Process",
     "notes": "PRIMARY subject process hash. ARRAY flatten: process.file.hashes is an array of fingerprint{algorithm_id,value}; pick algorithm_id=3 (SHA-256) -> .value. Per OCSF Process Activity 1007 the SUBJECT is top-level `process`, so this IS the UDM process_hash (bloom). MATERIALIZED expr uses arrayFirst over the JSON array to select SHA-256, lowercased to match UDM hash dict-key convention. The parent hash is `actor.process.file.hashes.sha256`. No scalar OCSF path -> array-derived convention `<path>.sha256`."
@@ -438,10 +451,14 @@
     "index": "bloom_filter",
     "prewhere": false,
     "is_search_col": false,
-    "array_key": {"key_attr": "algorithm_id", "value_attr": "value", "key_value": 3},
+    "array_key": {
+      "key_attr": "algorithm_id",
+      "value_attr": "value",
+      "key_value": 3
+    },
     "entity_type": "hash",
     "category": "Process",
-    "notes": "PARENT process hash. ARRAY flatten: actor.process.file.hashes fingerprint[] -> algorithm_id=3 (SHA-256). Per OCSF Process Activity 1007 `actor.process` is the parent/initiator; secondary, no UDM alias (udm_field=null — UDM process_hash now resolves to the subject `process.file.hashes.sha256`). Still bloom + lowercased (parent-hash pivots / prevalence summary). Array-derived convention `<path>.sha256`."
+    "notes": "PARENT process hash. ARRAY flatten: actor.process.file.hashes fingerprint[] -> algorithm_id=3 (SHA-256). Per OCSF Process Activity 1007 `actor.process` is the parent/initiator; secondary, no UDM alias (udm_field=null \u2014 UDM process_hash now resolves to the subject `process.file.hashes.sha256`). Still bloom + lowercased (parent-hash pivots / prevalence summary). Array-derived convention `<path>.sha256`."
   },
   {
     "udm_field": "file_name",
@@ -477,7 +494,11 @@
     "index": "bloom_filter",
     "prewhere": false,
     "is_search_col": false,
-    "array_key": {"key_attr": "algorithm_id", "value_attr": "value", "key_value": 3},
+    "array_key": {
+      "key_attr": "algorithm_id",
+      "value_attr": "value",
+      "key_value": 3
+    },
     "entity_type": "hash",
     "category": "File",
     "notes": "ARRAY flatten: file.hashes is fingerprint[]; pick algorithm_id=3 (SHA-256). There is NO scalar file_hash in OCSF. Maps to UDM file_hash (bloom). MATERIALIZED arrayFirst over JSON array; lowercase to match UDM hash convention. Multi-algo (MD5=1, SHA1=2, SHA512=4) stay in the event tail. Column name = array-derived convention `<path>.sha256`."
@@ -598,7 +619,20 @@
     "array_key": null,
     "entity_type": null,
     "category": "Authentication",
-    "enum_values": {"unknown": 0, "ntlm": 1, "kerberos": 2, "digest": 3, "openid": 4, "saml": 5, "oauth 2.0": 6, "pap": 7, "chap": 8, "eap": 9, "radius": 10, "other": 99},
+    "enum_values": {
+      "unknown": 0,
+      "ntlm": 1,
+      "kerberos": 2,
+      "digest": 3,
+      "openid": 4,
+      "saml": 5,
+      "oauth 2.0": 6,
+      "pap": 7,
+      "chap": 8,
+      "eap": 9,
+      "radius": 10,
+      "other": 99
+    },
     "notes": "Authentication 3002 only. Enum int (1=NTLM,2=Kerberos,5=SAML,6=OAUTH 2.0,...,99=Other); sibling string `auth_protocol`. Maps to UDM auth_type. Filter on int (fast); string for display. enum_values is the fixed OCSF 1.8.0 auth_protocol_id label->id table for query-layer verb translation (NAN-1382); vendor labels outside the spec enum (e.g. Windows 'Negotiate' -> 99/Other) are NOT translatable and fail validation."
   },
   {
@@ -625,8 +659,13 @@
     "array_key": null,
     "entity_type": null,
     "category": "Authentication",
-    "enum_values": {"unknown": 0, "success": 1, "failure": 2, "other": 99},
-    "notes": "Generic outcome enum (1=Success, 2=Failure, 0=Unknown, 99=Other) present on base_event, used across classes. Maps to UDM auth_result / status. Sibling string `status`. Filter on int — enum_values is the fixed label->id table the query layer uses to translate `auth_result=\"failure\"` onto the indexed int (NAN-1382); the int is also more complete than the sibling string (emitters may omit `status`)."
+    "enum_values": {
+      "unknown": 0,
+      "success": 1,
+      "failure": 2,
+      "other": 99
+    },
+    "notes": "Generic outcome enum (1=Success, 2=Failure, 0=Unknown, 99=Other) present on base_event, used across classes. Maps to UDM auth_result / status. Sibling string `status`. Filter on int \u2014 enum_values is the fixed label->id table the query layer uses to translate `auth_result=\"failure\"` onto the indexed int (NAN-1382); the int is also more complete than the sibling string (emitters may omit `status`)."
   },
   {
     "udm_field": "status",
@@ -678,7 +717,7 @@
     "array_key": null,
     "entity_type": "domain",
     "category": "Web",
-    "notes": "OCSF url object has `hostname` (the domain) + `path` + full `url_string`. Top-level `url` is carried by Network Activity 4001 (and other classes with a url object), NOT by HTTP Activity 4002. So this is the network-activity URL domain — secondary, no UDM alias (udm_field=null); UDM url_domain now resolves to the HTTP `http_request.url.hostname`. bloom-indexed domain entity for IOC/prevalence pivots on 4001."
+    "notes": "OCSF url object has `hostname` (the domain) + `path` + full `url_string`. Top-level `url` is carried by Network Activity 4001 (and other classes with a url object), NOT by HTTP Activity 4002. So this is the network-activity URL domain \u2014 secondary, no UDM alias (udm_field=null); UDM url_domain now resolves to the HTTP `http_request.url.hostname`. bloom-indexed domain entity for IOC/prevalence pivots on 4001."
   },
   {
     "udm_field": null,
@@ -792,7 +831,11 @@
     "index": "bloom_filter",
     "prewhere": false,
     "is_search_col": false,
-    "array_key": {"key_attr": null, "value_attr": "rdata", "key_value": null},
+    "array_key": {
+      "key_attr": null,
+      "value_attr": "rdata",
+      "key_value": null
+    },
     "entity_type": null,
     "category": "DNS",
     "notes": "DNS Activity 4003. answers is a dns_answer[] array; rdata holds the resolved record data (IP for A/AAAA, target for CNAME). There is no scalar OCSF answer - we promote the FIRST answer's rdata to match UDM `answer` (bloom). array_key with null key_attr/key_value signals 'take the first element's value_attr' (no algorithm-id selector). Multi-answer tail stays in event. Column name = array-derived `<path>.rdata`."
@@ -818,7 +861,11 @@
     "index": "bloom_filter",
     "prewhere": false,
     "is_search_col": false,
-    "array_key": {"key_attr": null, "value_attr": null, "key_value": null},
+    "array_key": {
+      "key_attr": null,
+      "value_attr": null,
+      "key_value": null
+    },
     "entity_type": null,
     "category": "Email",
     "notes": "Email Activity 4009. email.to is an email_address ARRAY. UDM recipient is a scalar; we promote the FIRST recipient to match UDM (bloom), additional recipients stay in the event tail. array_key with null key_attr AND null value_attr signals 'take the first element directly' (the array holds scalar strings, not objects). lowercase-normalized."
@@ -857,7 +904,11 @@
     "index": "bloom_filter",
     "prewhere": false,
     "is_search_col": false,
-    "array_key": {"key_attr": null, "value_attr": "cve.uid", "key_value": null},
+    "array_key": {
+      "key_attr": null,
+      "value_attr": "cve.uid",
+      "key_value": null
+    },
     "entity_type": null,
     "category": "Finding",
     "notes": "FINDING-CLASS ONLY (Vulnerability Finding 2002 and other Finding classes carry vulnerabilities[]). vulnerabilities is an array of vulnerability objects; vulnerability.cve.uid is the CVE id (e.g. CVE-2021-12345). UDM cve is scalar; we promote the FIRST vuln's cve.uid (bloom). array_key value_attr is a DOTTED sub-path 'cve.uid' resolved within the first array element; null key_attr/key_value = take first element. Multi-CVE tail stays in event. Non-finding events leave this empty. Column name = array-derived `<path>.cve.uid`."
@@ -938,7 +989,7 @@
     "array_key": null,
     "entity_type": null,
     "category": "Cloud",
-    "notes": "API Activity 6003 (and other classes carrying the `api` object). `api.operation` (verified against OCSF 1.8.0 objects/api: operation is string_t, recommended) is the API verb the call invoked — for AWS CloudTrail this is the eventName (e.g. 'CreateAccessKey', 'AssumeRole', 'AttachUserPolicy', 'PutBucketPolicy'). NO UDM equivalent: there is no scalar UDM field for the cloud action verb, so this is a native OCSF-only promotion (udm_field=null). The cloud action allow-lists reference the native `api.operation` column directly under the OCSF profile (the generic `activity` Create/Read/Update/Delete enum is too coarse for these AWS-verb filters). Low-cardinality verb axis -> LowCardinality + set(100) index. CLIENT-POPULATED. Distinct from api.service.name (the targeted service) and the activity_id taxonomy (the CRUD class)."
+    "notes": "API Activity 6003 (and other classes carrying the `api` object). `api.operation` (verified against OCSF 1.8.0 objects/api: operation is string_t, recommended) is the API verb the call invoked \u2014 for AWS CloudTrail this is the eventName (e.g. 'CreateAccessKey', 'AssumeRole', 'AttachUserPolicy', 'PutBucketPolicy'). NO UDM equivalent: there is no scalar UDM field for the cloud action verb, so this is a native OCSF-only promotion (udm_field=null). The cloud action allow-lists reference the native `api.operation` column directly under the OCSF profile (the generic `activity` Create/Read/Update/Delete enum is too coarse for these AWS-verb filters). Low-cardinality verb axis -> LowCardinality + set(100) index. CLIENT-POPULATED. Distinct from api.service.name (the targeted service) and the activity_id taxonomy (the CRUD class)."
   },
   {
     "udm_field": "resource_type",
@@ -948,10 +999,14 @@
     "index": "set",
     "prewhere": false,
     "is_search_col": false,
-    "array_key": {"key_attr": null, "value_attr": "type", "key_value": null},
+    "array_key": {
+      "key_attr": null,
+      "value_attr": "type",
+      "key_value": null
+    },
     "entity_type": null,
     "category": "Cloud",
-    "notes": "API Activity 6003. `resources` is a resource_details[] array (verified against OCSF 1.8.0 classes/api_activity -> objects/resource_details). UDM resource_type is scalar; we promote the FIRST resource's `type` (resource_details.type, string_t, optional — the source-defined resource type, e.g. 'AWS::S3::Bucket', 'AWS::IAM::Role'). array_key with null key_attr/key_value = take first element; value_attr 'type' selects the sub-field. Multi-resource tail stays in event. Low-cardinality -> LowCardinality + set(200). Column name = array-derived convention `<path>.type`."
+    "notes": "API Activity 6003. `resources` is a resource_details[] array (verified against OCSF 1.8.0 classes/api_activity -> objects/resource_details). UDM resource_type is scalar; we promote the FIRST resource's `type` (resource_details.type, string_t, optional \u2014 the source-defined resource type, e.g. 'AWS::S3::Bucket', 'AWS::IAM::Role'). array_key with null key_attr/key_value = take first element; value_attr 'type' selects the sub-field. Multi-resource tail stays in event. Low-cardinality -> LowCardinality + set(200). Column name = array-derived convention `<path>.type`."
   },
   {
     "udm_field": "resource_id",
@@ -961,10 +1016,14 @@
     "index": "bloom_filter",
     "prewhere": false,
     "is_search_col": false,
-    "array_key": {"key_attr": null, "value_attr": "uid", "key_value": null},
+    "array_key": {
+      "key_attr": null,
+      "value_attr": "uid",
+      "key_value": null
+    },
     "entity_type": null,
     "category": "Cloud",
-    "notes": "API Activity 6003. resources[] resource_details[]; we promote the FIRST resource's `uid` (resource_details.uid, recommended — the unique resource identifier, e.g. an ARN / resource OCID). UDM resource_id (bloom for resource pivots). array_key null key_attr/key_value = first element; value_attr 'uid'. Column name = array-derived `<path>.uid`."
+    "notes": "API Activity 6003. resources[] resource_details[]; we promote the FIRST resource's `uid` (resource_details.uid, recommended \u2014 the unique resource identifier, e.g. an ARN / resource OCID). UDM resource_id (bloom for resource pivots). array_key null key_attr/key_value = first element; value_attr 'uid'. Column name = array-derived `<path>.uid`."
   },
   {
     "udm_field": "resource_name",
@@ -974,10 +1033,14 @@
     "index": "bloom_filter",
     "prewhere": false,
     "is_search_col": false,
-    "array_key": {"key_attr": null, "value_attr": "name", "key_value": null},
+    "array_key": {
+      "key_attr": null,
+      "value_attr": "name",
+      "key_value": null
+    },
     "entity_type": null,
     "category": "Cloud",
-    "notes": "API Activity 6003. resources[] resource_details[]; we promote the FIRST resource's `name` (resource_details.name, recommended — the human resource name). UDM resource_name (bloom). array_key null key_attr/key_value = first element; value_attr 'name'. Column name = array-derived `<path>.name`."
+    "notes": "API Activity 6003. resources[] resource_details[]; we promote the FIRST resource's `name` (resource_details.name, recommended \u2014 the human resource name). UDM resource_name (bloom). array_key null key_attr/key_value = first element; value_attr 'name'. Column name = array-derived `<path>.name`."
   },
   {
     "udm_field": "change_type",
@@ -991,7 +1054,7 @@
     "entity_type": null,
     "category": "Cloud",
     "enum_label_column": "activity",
-    "notes": "VALUE-SEMANTICS CAVEAT (like auth_result string->int). On API Activity 6003 the change action is encoded in activity_id (Create=1, Read=2, Update=3, Delete=4, Unknown=0, Other=99) — there is NO scalar OCSF `change_type` string column. UDM change_type values are 'permission_change' | 'create' | 'delete' | 'update'. Partial mapping ONLY: create<->1, update<->3, delete<->4. UDM 'permission_change' has NO OCSF activity_id equivalent (it is a UDM-specific normalization, not in the 6003 enum), and OCSF activity_id=2 (Read) has no UDM change_type. So change_type is class-scoped to activity_id with class_uid=6003 (reuses the shared activity_id column, exactly like file_action reuses it for class_uid=1001) and the query layer must translate enum int<->UDM string with the lossy mapping above; 'permission_change' is unrepresentable and must be derived from richer context (api.operation / resource type) at the query layer, NOT from this column. NO new column is added — this is a documented reuse of the existing taxonomy activity_id."
+    "notes": "VALUE-SEMANTICS CAVEAT (like auth_result string->int). On API Activity 6003 the change action is encoded in activity_id (Create=1, Read=2, Update=3, Delete=4, Unknown=0, Other=99) \u2014 there is NO scalar OCSF `change_type` string column. UDM change_type values are 'permission_change' | 'create' | 'delete' | 'update'. Partial mapping ONLY: create<->1, update<->3, delete<->4. UDM 'permission_change' has NO OCSF activity_id equivalent (it is a UDM-specific normalization, not in the 6003 enum), and OCSF activity_id=2 (Read) has no UDM change_type. So change_type is class-scoped to activity_id with class_uid=6003 (reuses the shared activity_id column, exactly like file_action reuses it for class_uid=1001) and the query layer must translate enum int<->UDM string with the lossy mapping above; 'permission_change' is unrepresentable and must be derived from richer context (api.operation / resource type) at the query layer, NOT from this column. NO new column is added \u2014 this is a documented reuse of the existing taxonomy activity_id."
   },
   {
     "udm_field": "mfa_used",
@@ -1004,7 +1067,7 @@
     "array_key": null,
     "entity_type": null,
     "category": "Authentication",
-    "notes": "Authentication 3002 only. OCSF `is_mfa` is a boolean_t (verified against OCSF 1.8.0 classes/authentication: is_mfa, boolean, recommended) indicating whether MFA was used. Promoted as UInt8 (0/1) to match UDM mfa_used boolean storage. NUMERIC — never lower()'d. JSONExtractBool/JSONExtractUInt over event.is_mfa. No skip index (low-selectivity 2-value boolean; mirrors UDM mfa_used which carries no dedicated skip index)."
+    "notes": "Authentication 3002 only. OCSF `is_mfa` is a boolean_t (verified against OCSF 1.8.0 classes/authentication: is_mfa, boolean, recommended) indicating whether MFA was used. Promoted as UInt8 (0/1) to match UDM mfa_used boolean storage. NUMERIC \u2014 never lower()'d. JSONExtractBool/JSONExtractUInt over event.is_mfa. No skip index (low-selectivity 2-value boolean; mirrors UDM mfa_used which carries no dedicated skip index)."
   },
   {
     "udm_field": "enriched_src_country_code",
@@ -1118,7 +1181,11 @@
     "index": "bloom_filter",
     "prewhere": false,
     "is_search_col": false,
-    "array_key": {"key_attr": "name", "value_attr": "value", "key_value_str": "ioc_src_ip_threat_type"},
+    "array_key": {
+      "key_attr": "name",
+      "value_attr": "value",
+      "key_value_str": "ioc_src_ip_threat_type"
+    },
     "entity_type": null,
     "category": "Enrichment",
     "notes": "DUAL-MODE IOC. OCSF-native enrichments[] is an array of {name,value,type,provider,data}. We select by NAME: arrayFirst(e -> name='ioc_src_ip_threat_type', enrichments).value. The enrichment NAME is the UDM column name (the contract: nano writes enrichments[] entries named after the UDM ioc_*/custom_* column; clients shipping pre-enriched OCSF use the same names). array_key uses key_value_str (a STRING key) instead of key_value (int) - the DDL emits a string arrayFirst and the consistency test handles either shape. Maps to UDM ioc_src_ip_threat_type (bloom)."
@@ -1131,7 +1198,11 @@
     "index": "bloom_filter",
     "prewhere": false,
     "is_search_col": false,
-    "array_key": {"key_attr": "name", "value_attr": "value", "key_value_str": "ioc_dest_ip_threat_type"},
+    "array_key": {
+      "key_attr": "name",
+      "value_attr": "value",
+      "key_value_str": "ioc_dest_ip_threat_type"
+    },
     "entity_type": null,
     "category": "Enrichment",
     "notes": "DUAL-MODE IOC. enrichments[name='ioc_dest_ip_threat_type'].value -> UDM ioc_dest_ip_threat_type (bloom)."
@@ -1144,7 +1215,11 @@
     "index": "bloom_filter",
     "prewhere": false,
     "is_search_col": false,
-    "array_key": {"key_attr": "name", "value_attr": "value", "key_value_str": "ioc_domain_threat_type"},
+    "array_key": {
+      "key_attr": "name",
+      "value_attr": "value",
+      "key_value_str": "ioc_domain_threat_type"
+    },
     "entity_type": null,
     "category": "Enrichment",
     "notes": "DUAL-MODE IOC. enrichments[name='ioc_domain_threat_type'].value -> UDM ioc_domain_threat_type (bloom)."
@@ -1157,7 +1232,11 @@
     "index": "bloom_filter",
     "prewhere": false,
     "is_search_col": false,
-    "array_key": {"key_attr": "name", "value_attr": "value", "key_value_str": "ioc_hash_threat_type"},
+    "array_key": {
+      "key_attr": "name",
+      "value_attr": "value",
+      "key_value_str": "ioc_hash_threat_type"
+    },
     "entity_type": null,
     "category": "Enrichment",
     "notes": "DUAL-MODE IOC. enrichments[name='ioc_hash_threat_type'].value -> UDM ioc_hash_threat_type (bloom)."
@@ -1170,7 +1249,11 @@
     "index": "bloom_filter",
     "prewhere": false,
     "is_search_col": false,
-    "array_key": {"key_attr": "name", "value_attr": "value", "key_value_str": "custom_src_ip_tags"},
+    "array_key": {
+      "key_attr": "name",
+      "value_attr": "value",
+      "key_value_str": "custom_src_ip_tags"
+    },
     "entity_type": null,
     "category": "Enrichment",
     "notes": "DUAL-MODE CUSTOM. enrichments[name='custom_src_ip_tags'].value -> UDM custom_src_ip_tags. UDM stores this as Array(String); the enrichments[] value is a String (comma/JSON-joined tags) so we promote it as String + bloom (the UDM Array semantics are reconstructed at the query layer). Covers the UDM-indexed custom_* enrichment_value_* footprint via the generic by-name selector."
@@ -1183,7 +1266,11 @@
     "index": "bloom_filter",
     "prewhere": false,
     "is_search_col": false,
-    "array_key": {"key_attr": "name", "value_attr": "value", "key_value_str": "custom_dest_ip_tags"},
+    "array_key": {
+      "key_attr": "name",
+      "value_attr": "value",
+      "key_value_str": "custom_dest_ip_tags"
+    },
     "entity_type": null,
     "category": "Enrichment",
     "notes": "DUAL-MODE CUSTOM. enrichments[name='custom_dest_ip_tags'].value -> UDM custom_dest_ip_tags (bloom)."
@@ -1199,7 +1286,7 @@
     "array_key": null,
     "entity_type": null,
     "category": "Metadata",
-    "notes": "THE OCSF SOURCE IDENTIFIER (source_type analog). metadata.product.name (object_type=product, scalar string_t; verified against OCSF 1.8.0 objects/product + objects/metadata at schema.ocsf.io) is the reporting product that emitted the event — e.g. 'apache http server', 'Conduit Proxy', 'Microsoft Sysmon'. Maps to UDM vendor_product (the product field). bloom_filter + PREWHERE=true: this is the per-source axis the UI's source/source_type selector should read for OCSF rows, DISTINCT from class_uid (which is the event CLASS, not the origin product). Case is preserved (NOT lower()'d) — product name is a display label, unlike host/user/ip. Dotted CH column name = literal OCSF path."
+    "notes": "THE OCSF SOURCE IDENTIFIER (source_type analog). metadata.product.name (object_type=product, scalar string_t; verified against OCSF 1.8.0 objects/product + objects/metadata at schema.ocsf.io) is the reporting product that emitted the event \u2014 e.g. 'apache http server', 'Conduit Proxy', 'Microsoft Sysmon'. Maps to UDM vendor_product (the product field). bloom_filter + PREWHERE=true: this is the per-source axis the UI's source/source_type selector should read for OCSF rows, DISTINCT from class_uid (which is the event CLASS, not the origin product). Case is preserved (NOT lower()'d) \u2014 product name is a display label, unlike host/user/ip. Dotted CH column name = literal OCSF path."
   },
   {
     "udm_field": "vendor",
@@ -1212,7 +1299,7 @@
     "array_key": null,
     "entity_type": null,
     "category": "Metadata",
-    "notes": "metadata.product.vendor_name (string_t) — the vendor of the reporting product (e.g. 'Apache', 'nano', 'Microsoft'). Low-cardinality vendor axis; set index. No direct UDM column (UDM folds vendor+product into vendor_product); kept as provenance for source-grouping. Case preserved."
+    "notes": "metadata.product.vendor_name (string_t) \u2014 the vendor of the reporting product (e.g. 'Apache', 'nano', 'Microsoft'). Low-cardinality vendor axis; set index. No direct UDM column (UDM folds vendor+product into vendor_product); kept as provenance for source-grouping. Case preserved."
   },
   {
     "udm_field": null,
@@ -1225,7 +1312,7 @@
     "array_key": null,
     "entity_type": null,
     "category": "Metadata",
-    "notes": "metadata.product.feature.name (feature object_t under product; feature.name is string_t; verified against OCSF 1.8.0 objects/feature) — the product feature / log-type sub-source (e.g. 'access_log', 'WAF', 'mod_security'). Finer-grained than product.name. No UDM analog -> udm_field null; pure provenance. bloom_filter for sub-source pivots. Case preserved."
+    "notes": "metadata.product.feature.name (feature object_t under product; feature.name is string_t; verified against OCSF 1.8.0 objects/feature) \u2014 the product feature / log-type sub-source (e.g. 'access_log', 'WAF', 'mod_security'). Finer-grained than product.name. No UDM analog -> udm_field null; pure provenance. bloom_filter for sub-source pivots. Case preserved."
   },
   {
     "udm_field": null,
@@ -1238,7 +1325,7 @@
     "array_key": null,
     "entity_type": null,
     "category": "Metadata",
-    "notes": "metadata.log_name (string_t) — the log channel / file name the event was read from (e.g. 'Security', '/var/log/apache2/access.log'). No UDM analog -> udm_field null; provenance. bloom_filter."
+    "notes": "metadata.log_name (string_t) \u2014 the log channel / file name the event was read from (e.g. 'Security', '/var/log/apache2/access.log'). No UDM analog -> udm_field null; provenance. bloom_filter."
   },
   {
     "udm_field": null,
@@ -1251,7 +1338,7 @@
     "array_key": null,
     "entity_type": null,
     "category": "Metadata",
-    "notes": "metadata.log_provider (string_t) — the logging provider / collector that produced the log (e.g. 'Vector', 'Syslog', 'Windows Event Log'). Low-cardinality -> LowCardinality + set index. No UDM analog -> udm_field null; provenance."
+    "notes": "metadata.log_provider (string_t) \u2014 the logging provider / collector that produced the log (e.g. 'Vector', 'Syslog', 'Windows Event Log'). Low-cardinality -> LowCardinality + set index. No UDM analog -> udm_field null; provenance."
   },
   {
     "udm_field": "id",
@@ -1264,7 +1351,7 @@
     "array_key": null,
     "entity_type": null,
     "category": "Metadata",
-    "notes": "metadata.uid (string_t) — the unique event identifier assigned by the producer. Provenance / lookup / dedup key; the OCSF analog of UDM id/event_id (opaque String, not a CH UUID). bloom_filter for by-id lookup pivots. Case preserved."
+    "notes": "metadata.uid (string_t) \u2014 the unique event identifier assigned by the producer. Provenance / lookup / dedup key; the OCSF analog of UDM id/event_id (opaque String, not a CH UUID). bloom_filter for by-id lookup pivots. Case preserved."
   },
   {
     "udm_field": null,
@@ -1277,7 +1364,7 @@
     "array_key": null,
     "entity_type": null,
     "category": "Metadata",
-    "notes": "metadata.version (string_t) — the OCSF schema version of the record (e.g. '1.8.0'). REQUIRED in OCSF. Provenance only; no UDM analog -> udm_field null. Extremely low cardinality -> LowCardinality + set index."
+    "notes": "metadata.version (string_t) \u2014 the OCSF schema version of the record (e.g. '1.8.0'). REQUIRED in OCSF. Provenance only; no UDM analog -> udm_field null. Extremely low cardinality -> LowCardinality + set index."
   },
   {
     "udm_field": null,
@@ -1290,7 +1377,7 @@
     "array_key": null,
     "entity_type": null,
     "category": "Metadata",
-    "notes": "metadata.correlation_uid (string_t) — the producer-assigned correlation id grouping related events. Provenance / pivot key; no UDM analog -> udm_field null. bloom_filter for correlation pivots. Case preserved."
+    "notes": "metadata.correlation_uid (string_t) \u2014 the producer-assigned correlation id grouping related events. Provenance / pivot key; no UDM analog -> udm_field null. bloom_filter for correlation pivots. Case preserved."
   },
   {
     "udm_field": "prevalence_file_hash",
@@ -1303,7 +1390,7 @@
     "array_key": null,
     "entity_type": null,
     "category": "Prevalence",
-    "notes": "Ingest-time host_count for the file SHA-256 against the SCHEMA-AGNOSTIC nanosiem.hash_prevalence_dict (NAN-1248). Real promoted column (UInt16) mirroring UDM logs.prevalence_file_hash byte-for-byte: 1-9998 = actual host count, 9999 = common/not-tracked, 65535 = no hash present. Keyed on file.hashes.sha256 (already lowercased at ingest). Powers asset-card prevalence parity. NUMERIC — never lower()'d."
+    "notes": "Ingest-time host_count for the file SHA-256 against the SCHEMA-AGNOSTIC nanosiem.hash_prevalence_dict (NAN-1248). Real promoted column (UInt16) mirroring UDM logs.prevalence_file_hash byte-for-byte: 1-9998 = actual host count, 9999 = common/not-tracked, 65535 = no hash present. Keyed on file.hashes.sha256 (already lowercased at ingest). Powers asset-card prevalence parity. NUMERIC \u2014 never lower()'d."
   },
   {
     "udm_field": "prevalence_process_hash",
@@ -1316,7 +1403,7 @@
     "array_key": null,
     "entity_type": null,
     "category": "Prevalence",
-    "notes": "Ingest-time host_count for the subject process SHA-256 against nanosiem.hash_prevalence_dict (NAN-1248). Mirrors UDM logs.prevalence_process_hash. Keyed on process.file.hashes.sha256 (the SUBJECT process hash, lowercased at ingest) — per OCSF Process Activity 1007 `process` is the subject and `actor.process` is the parent. NUMERIC."
+    "notes": "Ingest-time host_count for the subject process SHA-256 against nanosiem.hash_prevalence_dict (NAN-1248). Mirrors UDM logs.prevalence_process_hash. Keyed on process.file.hashes.sha256 (the SUBJECT process hash, lowercased at ingest) \u2014 per OCSF Process Activity 1007 `process` is the subject and `actor.process` is the parent. NUMERIC."
   },
   {
     "udm_field": "prevalence_dest_domain",
@@ -1356,5 +1443,122 @@
     "entity_type": null,
     "category": "Prevalence",
     "notes": "least() of the four prevalence_* columns, mirroring UDM logs.prevalence_min (NAN-1383). DERIVED (no single OCSF source path, ocsf_path=null): each per-column 65535 'no entity' sentinel remaps to 9999 before the least(), so all-entities-absent reads 9999 exactly like UDM's inline definition. Powers prevalence-gated saved content ('| where prevalence_min < N') under OCSF. NUMERIC."
+  },
+  {
+    "udm_field": "registry_path",
+    "ocsf_path": "reg_key.path",
+    "ch_column_name": "reg_key.path",
+    "ch_type": "String",
+    "index": "tokenbf",
+    "prewhere": false,
+    "is_search_col": false,
+    "array_key": null,
+    "entity_type": null,
+    "category": "Endpoint",
+    "notes": "NAN-1465: Registry Key Activity (201001). Key path acted on. sysmon_json EventID 12/14."
+  },
+  {
+    "udm_field": "registry_value_name",
+    "ocsf_path": "reg_value.name",
+    "ch_column_name": "reg_value.name",
+    "ch_type": "String",
+    "index": "bloom_filter",
+    "prewhere": false,
+    "is_search_col": false,
+    "array_key": null,
+    "entity_type": null,
+    "category": "Endpoint",
+    "notes": "NAN-1465: Registry Value Activity (201002). Value name. sysmon_json EventID 13."
+  },
+  {
+    "udm_field": "registry_key_name",
+    "ocsf_path": "reg_value.path",
+    "ch_column_name": "reg_value.path",
+    "ch_type": "String",
+    "index": "tokenbf",
+    "prewhere": false,
+    "is_search_col": false,
+    "array_key": null,
+    "entity_type": null,
+    "category": "Endpoint",
+    "notes": "NAN-1465: Registry Value Activity. Key path holding the value. sysmon_json EventID 13."
+  },
+  {
+    "udm_field": "registry_value_data",
+    "ocsf_path": "reg_value.data",
+    "ch_column_name": "reg_value.data",
+    "ch_type": "String",
+    "index": "tokenbf",
+    "prewhere": false,
+    "is_search_col": false,
+    "array_key": null,
+    "entity_type": null,
+    "category": "Endpoint",
+    "notes": "NAN-1465: Registry Value Activity. Value data payload. sysmon_json EventID 13."
+  },
+  {
+    "udm_field": "http_referrer",
+    "ocsf_path": "http_request.referrer",
+    "ch_column_name": "http_request.referrer",
+    "ch_type": "String",
+    "index": "tokenbf",
+    "prewhere": false,
+    "is_search_col": false,
+    "array_key": null,
+    "entity_type": null,
+    "category": "Web",
+    "notes": "NAN-1465: HTTP Activity 4002. http_request.referrer. apache."
+  },
+  {
+    "udm_field": "category",
+    "ocsf_path": "http_request.url.categories",
+    "ch_column_name": "http_request.url.categories",
+    "ch_type": "Array(String)",
+    "index": "none",
+    "prewhere": false,
+    "is_search_col": false,
+    "array_key": null,
+    "entity_type": null,
+    "category": "Web",
+    "notes": "NAN-1465: Web content/filtering categories (url object). Array -> nPL membership via has(). conduit_proxy."
+  },
+  {
+    "udm_field": null,
+    "ocsf_path": "actor.user.uid",
+    "ch_column_name": "actor.user.uid",
+    "ch_type": "String",
+    "index": "bloom_filter",
+    "prewhere": false,
+    "is_search_col": false,
+    "array_key": null,
+    "entity_type": null,
+    "category": "Identity",
+    "notes": "NAN-1465: Actor (principal) uid \u2014 AWS ARN/principalId. aws_cloudtrail."
+  },
+  {
+    "udm_field": "user_type",
+    "ocsf_path": "actor.user.type",
+    "ch_column_name": "actor.user.type",
+    "ch_type": "LowCardinality(String)",
+    "index": "set",
+    "prewhere": false,
+    "is_search_col": false,
+    "array_key": null,
+    "entity_type": null,
+    "category": "Identity",
+    "notes": "NAN-1465: Actor user type (IAMUser/AssumedRole/Root/Service). aws_cloudtrail."
+  },
+  {
+    "udm_field": "duration",
+    "ocsf_path": "duration",
+    "ch_column_name": "duration",
+    "ch_type": "UInt32",
+    "index": "none",
+    "prewhere": false,
+    "is_search_col": false,
+    "array_key": null,
+    "entity_type": null,
+    "category": "Network",
+    "notes": "NAN-1465: Base-event duration (ms). conduit_proxy (from duration_ms)."
   }
 ]

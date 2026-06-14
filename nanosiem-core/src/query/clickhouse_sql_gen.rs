@@ -284,11 +284,37 @@ pub(crate) const EXPLICIT_COLUMNS: &[&str] = &[
     "dest_user_identity_account_status",
     "dest_user_identity_mfa_enabled",
     "dest_user_identity_groups",
+    // NAN-1464: CIM event-class taxonomy, Array(String). Membership via has().
+    "tags",
 ];
 
 /// HashSet for O(1) explicit column lookups (initialized lazily)
 static EXPLICIT_COLUMNS_SET: Lazy<HashSet<&'static str>> =
     Lazy::new(|| EXPLICIT_COLUMNS.iter().copied().collect());
+
+/// UDM columns physically typed `Array(String)` on `logs`. nPL equality on these
+/// must compile to `has(col, 'v')` (array membership) — a scalar `col = 'v'` is a
+/// ClickHouse type error that silently returns nothing (NAN-1464). The existing
+/// `*_tags` enrichment columns were already subject to this and are fixed here too.
+pub(crate) const ARRAY_COLUMNS: &[&str] = &[
+    "tags",
+    "ioc_tags",
+    "custom_src_ip_tags",
+    "custom_dest_ip_tags",
+    "custom_domain_tags",
+    "custom_hash_tags",
+    "custom_url_tags",
+    // OCSF web content categories (NAN-1465) — membership via has().
+    "http_request.url.categories",
+];
+
+static ARRAY_COLUMNS_SET: Lazy<HashSet<&'static str>> =
+    Lazy::new(|| ARRAY_COLUMNS.iter().copied().collect());
+
+/// True when `field` is an `Array(String)` column (membership via `has()`).
+pub(crate) fn is_array_column(field: &str) -> bool {
+    ARRAY_COLUMNS_SET.contains(field)
+}
 
 /// Columns declared `MATERIALIZED` on the `logs` table (computed at insert — enrichment,
 /// IOC, custom threat-intel, prevalence, process-GUID hashing, and resolved-identity
@@ -4385,6 +4411,60 @@ mod tests {
         assert!(
             sql.contains("toString(id) = '018f3a2b-0000-7000-8000-000000000000'"),
             "id (real UUID column) must keep the toString compare, got:\n{sql}"
+        );
+    }
+
+    // NAN-1464: equality on an Array(String) column must compile to has()
+    // (membership), never scalar `col = 'v'` (a CH type error that silently
+    // matches nothing).
+    #[test]
+    fn tags_eq_emits_has_membership() {
+        let query = parse_query("tags=\"web\"").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("has(tags, 'web')"),
+            "tags equality must emit has(tags, '<lowered>'), got:\n{sql}"
+        );
+        assert!(!sql.contains("tags = "), "must not scalar-compare an array, got:\n{sql}");
+    }
+
+    #[test]
+    fn tags_ne_emits_not_has() {
+        let query = parse_query("tags!=\"web\"").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("NOT has(tags, 'web')"),
+            "tags inequality must emit NOT has(...), got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn tags_wildcard_emits_array_exists() {
+        let query = parse_query("tags=\"web*\"").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("arrayExists(x -> lower(x) iLike 'web%', tags)"),
+            "tags wildcard must emit arrayExists over the elements, got:\n{sql}"
+        );
+    }
+
+    // The pre-existing `*_tags` enrichment columns were subject to the same bug;
+    // they now route through the same has() path.
+    #[test]
+    fn ioc_tags_eq_emits_has_membership() {
+        let query = parse_query("ioc_tags=\"phishing\"").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("has(ioc_tags, 'phishing')"),
+            "ioc_tags equality must emit has(), got:\n{sql}"
         );
     }
 

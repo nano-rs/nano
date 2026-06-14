@@ -7,10 +7,14 @@ import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { formatUTCShort } from '@/lib/date-utils';
-import { UDM_COLUMNS } from '@/lib/udm-fields';
 import { isClickHouseDefault } from '@/lib/utils';
 import { api } from '@/lib/api';
-import { expandEventLeaves, getEventObject } from './event-flatten';
+import {
+  flattenEventFields,
+  buildFieldCategories,
+  isFieldHidden,
+  splitFieldKey,
+} from './event-flatten';
 
 // ============================================================================
 // Types
@@ -57,201 +61,25 @@ export interface EventInspectorPanelProps {
 }
 
 // ============================================================================
-// Field utilities (mirrors SearchResults.tsx logic)
+// Field utilities
+//
+// The flattening + categorization logic is shared with the inline expanded-row
+// view in SearchResults — both live in ./event-flatten so they can't drift.
 // ============================================================================
-
-// NAN-1447: the OCSF `unmapped` column is a JSON object (the true source spill).
-// Flatten it into DOTTED `unmapped.<path>` leaf rows — matching the Unmapped
-// category match (`getFieldCategory` keys off the `unmapped.` prefix) and the
-// dotted form the promoted OCSF columns already arrive in — so it renders as
-// individual inspectable rows instead of one raw JSON blob. Dotted (not the
-// underscore `flattenFields` uses) on purpose; empty objects yield no rows.
-function flattenUnmapped(obj: Record<string, unknown>, prefix = 'unmapped'): [string, unknown][] {
-  const out: [string, unknown][] = [];
-  for (const [k, v] of Object.entries(obj)) {
-    const key = `${prefix}.${k}`;
-    if (v !== null && typeof v === 'object' && !Array.isArray(v)) {
-      out.push(...flattenUnmapped(v as Record<string, unknown>, key));
-    } else {
-      out.push([key, v]);
-    }
-  }
-  return out;
-}
-
-function flattenFields(fields: Record<string, unknown>, isOcsf = false, prefix = '', promotedNames?: Set<string>): [string, unknown][] {
-  const result: [string, unknown][] = [];
-
-  // OCSF (NAN-1241): the raw `event` column is the full nested OCSF record. Expand
-  // it into dotted leaf paths (the UDM `ext` analog — backend already flattens ext)
-  // so each nested OCSF field is individually inspectable instead of one blob. Done
-  // only at the top level under OCSF; promoted top-level keys win on collision.
-  const topLevelKeys = prefix === '' ? new Set(Object.keys(fields)) : new Set<string>();
-
-  for (const [key, value] of Object.entries(fields)) {
-    const fullKey = prefix ? `${prefix}_${key}` : key;
-
-    if (prefix === '' && isOcsf && key === 'event') {
-      const eventObj = getEventObject(fields);
-      if (eventObj) {
-        topLevelKeys.delete('event');
-        result.push(...expandEventLeaves(eventObj, topLevelKeys, promotedNames));
-        continue;
-      }
-    }
-
-    if (key.startsWith('prevalence_') && (value === 255 || value === 65535 || value === 9999)) continue;
-    if (key === 'risk_score' && (value === 0 || value === '0')) continue;
-
-    // NAN-1446: the OCSF `*_unified` entity columns are an internal query
-    // accelerator (a coalesce over class-split OCSF paths) and `event_bytes` is a
-    // sizing metric — neither is an OCSF spec field. They're already hidden from
-    // the field picker (`isInternalHelperField`); keep them out of the record view
-    // too so an OCSF row renders as pure spec (Core OCSF fields + `unmapped`),
-    // never `process_name_unified` echoing `actor.process.name`. Harmless on UDM
-    // (no such columns there).
-    if (key.endsWith('_unified') || key === 'event_bytes') continue;
-
-    const isPrevalence = key === 'host_count' || key === 'is_rare' || key === 'prevalence_score' ||
-                         key === 'prevalence_type' || key === 'total_occurrences' ||
-                         key === '_prevalence' || key.startsWith('_prevalence.');
-    if (!isPrevalence && isClickHouseDefault(value, key)) continue;
-
-    if (key === 'metadata') {
-      let metadataObj: Record<string, unknown> | null = null;
-      if (typeof value === 'object' && !Array.isArray(value) && value !== null) {
-        metadataObj = value as Record<string, unknown>;
-      } else if (typeof value === 'string' && value.startsWith('{')) {
-        try {
-          const parsed = JSON.parse(value);
-          if (typeof parsed === 'object' && !Array.isArray(parsed)) metadataObj = parsed;
-        } catch { /* not JSON */ }
-      }
-      if (metadataObj) {
-        result.push(...flattenFields(metadataObj, isOcsf, 'metadata', promotedNames));
-      } else if (value) {
-        result.push([fullKey, value]);
-      }
-    } else if (key === '_prevalence') {
-      if (typeof value === 'object' && !Array.isArray(value) && value !== null) {
-        result.push(...flattenFields(value as Record<string, unknown>, isOcsf, '_prevalence', promotedNames));
-      } else if (value) {
-        result.push([fullKey, value]);
-      }
-    } else if (key === 'unmapped' && prefix === '') {
-      // NAN-1447: expand the OCSF unmapped spill into dotted leaf rows instead of
-      // pushing the whole object as one JSON blob. Accept either a parsed object
-      // or a JSON string; anything else falls through as the raw value.
-      let unmappedObj: Record<string, unknown> | null = null;
-      if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
-        unmappedObj = value as Record<string, unknown>;
-      } else if (typeof value === 'string' && value.startsWith('{')) {
-        try {
-          const parsed = JSON.parse(value);
-          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) unmappedObj = parsed;
-        } catch { /* not JSON */ }
-      }
-      if (unmappedObj) {
-        result.push(...flattenUnmapped(unmappedObj));
-      } else if (value) {
-        result.push([fullKey, value]);
-      }
-    } else if (typeof value === 'object' && !Array.isArray(value) && prefix === '') {
-      result.push([fullKey, value]);
-    } else {
-      result.push([fullKey, value]);
-    }
-  }
-
-  const getFieldCategory = (fieldName: string): number => {
-    if (fieldName === 'risk_score' || fieldName === 'risk_entity' ||
-        fieldName === 'risk_factors' || fieldName.startsWith('risk_')) return 1;
-    if (fieldName.startsWith('ioc_')) return 2;
-    if (fieldName.includes('_identity_') || fieldName.startsWith('identity_') || fieldName === 'is_nat_candidate') return 3;
-    if (fieldName.startsWith('prevalence_') || fieldName === '_prevalence' ||
-        fieldName.startsWith('_prevalence.') || fieldName === 'host_count' ||
-        fieldName === 'is_rare' || fieldName === 'prevalence_score' ||
-        fieldName === 'prevalence_type' || fieldName === 'prevalence_artifact' ||
-        fieldName === 'total_occurrences' || fieldName === 'first_seen' ||
-        fieldName === 'last_seen') return 4;
-    if (fieldName.startsWith('lookup_')) return 5;
-    if (fieldName.startsWith('enriched_')) return 6;
-    // UDM flattens `metadata` with underscores; OCSF surfaces dotted leaves
-    // (`metadata.version`) — match both so the Metadata toggle hides OCSF too (NAN-1448).
-    if (fieldName.startsWith('metadata_') || fieldName.startsWith('metadata.')) return 7;
-    if (isOcsf && fieldName.startsWith('unmapped.')) return 9; // OCSF unmapped spill last
-    if (!UDM_COLUMNS.has(fieldName)) return 8;
-    return 0;
-  };
-
-  return result.sort((a, b) => {
-    const catA = getFieldCategory(a[0]);
-    const catB = getFieldCategory(b[0]);
-    if (catA !== catB) return catA - catB;
-    return a[0].localeCompare(b[0]);
-  });
-}
 
 function formatValue(value: unknown): string {
   if (value === null || value === undefined) return '';
+  // NAN-1466: Array(String) columns (url.categories, tags, *_tags) arrive as
+  // real arrays — render a scalar list as a comma-join, not a JSON blob. Nested
+  // arrays/objects (e.g. threat_signals) still fall through to JSON.
+  if (Array.isArray(value)) {
+    if (value.every((v) => v === null || typeof v !== 'object')) {
+      return value.filter((v) => v !== null && v !== undefined).map(String).join(', ');
+    }
+    return JSON.stringify(value, null, 2);
+  }
   if (typeof value === 'object') return JSON.stringify(value, null, 2);
   return String(value);
-}
-
-function isIocField(fieldName: string): boolean {
-  return fieldName.startsWith('ioc_');
-}
-
-function isRiskField(fieldName: string): boolean {
-  return fieldName === 'risk_score' || fieldName === 'risk_entity' || fieldName === 'risk_factors';
-}
-
-function isPrevalenceField(fieldName: string): boolean {
-  return fieldName === 'host_count' || fieldName === 'is_rare' ||
-         fieldName === 'prevalence_score' || fieldName === 'prevalence_type' ||
-         fieldName === 'prevalence_artifact' || fieldName === 'total_occurrences' ||
-         fieldName === 'first_seen' || fieldName === 'last_seen' ||
-         fieldName === '_prevalence' || fieldName.startsWith('_prevalence.') ||
-         fieldName === 'prevalence_file_hash' || fieldName === 'prevalence_process_hash' ||
-         fieldName === 'prevalence_dest_domain' || fieldName === 'prevalence_dest_ip' ||
-         fieldName === 'prevalence_min';
-}
-
-function isLookupField(fieldName: string): boolean {
-  return fieldName.startsWith('lookup_');
-}
-
-function isIdentityField(fieldName: string): boolean {
-  // Resolved-identity dict fills are named `user_identity_*`, `src_user_identity_*`,
-  // `dest_user_identity_*` (NAN-1147). The legacy `identity_*` / `is_nat_candidate`
-  // forms are kept for back-compat. NAN-1154.
-  return fieldName.includes('_identity_') || fieldName.startsWith('identity_') ||
-         fieldName === 'is_nat_candidate';
-}
-
-// (NAN-1241 Phase 7) Field categorization is now profile-aware and computed
-// inside the component against the active schema's field universe — see the
-// `fieldCategories` memo. The old `isExtField(fieldName)` helper assumed UDM
-// (`!UDM_COLUMNS.has`), so every OCSF promoted field fell into "Extended"; it
-// was removed.
-
-// Enrichment category check (mirrors SearchResults)
-const ENRICHMENT_CATEGORIES: Record<string, (k: string) => boolean> = {
-  ioc: (k) => k.startsWith('ioc_'),
-  custom: (k) => k.startsWith('lookup_custom_'),
-  prevalence: (k) => isPrevalenceField(k),
-  lookup: (k) => k.startsWith('lookup_') && !k.startsWith('lookup_custom_'),
-  geo: (k) => k.startsWith('enriched_'),
-  identity: (k) => k.includes('_identity_') || k.startsWith('identity_') || k === 'is_nat_candidate',
-  // `metadata_*` (UDM flattened) and `metadata.*` (OCSF dotted leaves) — NAN-1448.
-  metadata: (k) => k.startsWith('metadata_') || k.startsWith('metadata.'),
-};
-
-function isFieldHidden(fieldName: string, hiddenEnrichments: Set<string>): boolean {
-  for (const [category, check] of Object.entries(ENRICHMENT_CATEGORIES)) {
-    if (hiddenEnrichments.has(category) && check(fieldName)) return true;
-  }
-  return false;
 }
 
 // ============================================================================
@@ -374,7 +202,7 @@ export function EventInspectorPanel({
     : event.fields;
 
   const isOcsf = schemaFields?.schema === 'ocsf';
-  let flattenedFields = displayFields ? flattenFields(displayFields, isOcsf, '', knownSchemaFields) : [];
+  let flattenedFields = displayFields ? flattenEventFields(displayFields, isOcsf, '', knownSchemaFields) : [];
   if (hiddenEnrichments.size > 0) {
     flattenedFields = flattenedFields.filter(([k]) => !isFieldHidden(k, hiddenEnrichments));
   }
@@ -458,62 +286,18 @@ export function EventInspectorPanel({
   // Full JSON
   const fullJson = JSON.stringify(displayFields, null, 2);
 
-  // Group fields by category for the Fields tab
-  const fieldCategories = React.useMemo(() => {
-    // Core (base UDM columns) stays neutral; everything else — derived /
-    // enriched / extended data — shares one subtle brand accent so a reader
-    // can tell at a glance which fields are "added on top" of the base event.
-    const NEUTRAL = 'text-muted-foreground';
-    const ACCENT = 'text-primary/80';
-    const categories: { label: string; color: string; tooltip: string; fields: [string, unknown][] }[] = [
-      { label: 'Core', color: NEUTRAL, tooltip: 'Promoted, indexed schema columns for fast search (UDM or OCSF)', fields: [] },
-      { label: 'Risk', color: ACCENT, tooltip: 'Risk scores and factors from detection rules', fields: [] },
-      { label: 'IOC', color: ACCENT, tooltip: 'Indicators of compromise from threat intelligence feeds', fields: [] },
-      { label: 'Identity', color: ACCENT, tooltip: 'Resolved identity from the user registry (department, title, groups, account status)', fields: [] },
-      { label: 'Prevalence', color: ACCENT, tooltip: 'Rarity metrics — how common this artifact is across your environment', fields: [] },
-      { label: 'Lookup', color: ACCENT, tooltip: 'Enrichments from lookup tables', fields: [] },
-      { label: 'Enrichment', color: ACCENT, tooltip: 'Auto-enriched fields (geo, ASN, reputation)', fields: [] },
-      { label: 'Metadata', color: ACCENT, tooltip: 'Parser metadata and processing info', fields: [] },
-      // Non-promoted fields: UDM `ext` spill, or OCSF schema fields that simply
-      // aren't promoted to a Core column (class_name, *.file.name, …). These are
-      // still MAPPED to the schema — distinct from `unmapped` below.
-      { label: 'Extended', color: ACCENT, tooltip: 'Non-promoted fields (UDM ext spill; OCSF schema fields without a promoted column)', fields: [] },
-      // NAN-1278: OCSF's `unmapped` object (base_event.unmapped) is the TRUE
-      // source spill — fields with no OCSF attribute (e.g. unmapped.granted_access).
-      // Its own bucket so it isn't conflated with non-promoted-but-mapped OCSF
-      // fields. OCSF only; empty (and filtered out) under UDM.
-      { label: 'Unmapped', color: ACCENT, tooltip: 'Source fields with no OCSF attribute (the unmapped.* spill)', fields: [] },
-    ];
-
-    for (const field of flattenedFields) {
-      const [k] = field;
-      if (Array.isArray(field[1]) && (field[1] as unknown[]).length === 0) continue;
-      if (isRiskField(k)) categories[1].fields.push(field);
-      else if (isIocField(k)) categories[2].fields.push(field);
-      else if (isIdentityField(k)) categories[3].fields.push(field);
-      else if (isPrevalenceField(k)) categories[4].fields.push(field);
-      else if (isLookupField(k)) categories[5].fields.push(field);
-      else if (k.startsWith('enriched_')) categories[6].fields.push(field);
-      else if (k.startsWith('metadata_')) categories[7].fields.push(field);
-      // Core = a field known to the ACTIVE schema profile (OCSF promoted fields
-      // like `src_endpoint.ip`/`class_uid`) OR a base UDM column (covers the
-      // shared operational fields — message/severity/status/source_type/id/
-      // timestamp — that aren't in the OCSF field universe). NAN-1241 Phase 7.
-      else if (knownSchemaFields.has(k) || UDM_COLUMNS.has(k)) categories[0].fields.push(field);
-      // OCSF `unmapped.*` = the true source spill (no OCSF attribute) → own bucket.
-      else if (isOcsf && (k === 'unmapped' || k.startsWith('unmapped.'))) categories[9].fields.push(field);
-      // Non-promoted but schema-mapped (or UDM ext spill).
-      else categories[8].fields.push(field);
-    }
-
-    return categories.filter(c => c.fields.length > 0);
-  }, [flattenedFields, knownSchemaFields, isOcsf]);
+  // Group fields by category for the Fields tab (shared with the inline view).
+  const fieldCategories = React.useMemo(
+    () => buildFieldCategories(flattenedFields, knownSchemaFields, isOcsf),
+    [flattenedFields, knownSchemaFields, isOcsf],
+  );
 
   const tabs: { id: InspectorTab; label: string; count?: number }[] = [
     { id: 'fields', label: 'Fields', count: flattenedFields.length },
     { id: 'raw', label: 'Raw' },
     { id: 'json', label: 'JSON' },
   ];
+
 
   return (
     <div className="flex-shrink-0 sticky top-0 border border-border rounded-r-lg overflow-hidden" style={{ width }}>
@@ -679,63 +463,74 @@ export function EventInspectorPanel({
                     </Tooltip>
                   </TooltipProvider>
                 </div>
-                <table className="w-full text-xs font-mono">
-                  <tbody>
-                    {category.fields
-                      .filter(([, v]) => !(Array.isArray(v) && (v as unknown[]).length === 0))
-                      .map(([k, v]) => {
-                        const displayValue = formatValue(v);
-                        const detailKey = `inspector:${k}`;
-                        const isValueExpanded = expandedValues.has(detailKey);
-                        const shouldTruncate = !isValueExpanded && displayValue.length > 200;
-                        const truncatedValue = shouldTruncate ? displayValue.substring(0, 200) : displayValue;
+                <div className="text-xs font-mono">
+                  {category.fields
+                    .filter(([, v]) => !(Array.isArray(v) && (v as unknown[]).length === 0))
+                    .map(([k, v]) => {
+                      const displayValue = formatValue(v);
+                      const detailKey = `inspector:${k}`;
+                      const isValueExpanded = expandedValues.has(detailKey);
+                      const shouldTruncate = !isValueExpanded && displayValue.length > 200;
+                      const truncatedValue = shouldTruncate ? displayValue.substring(0, 200) : displayValue;
 
-                        return (
-                          <tr key={k} className="group hover:bg-muted/20">
-                            <td className="py-1.5 pl-4 pr-2 align-top w-40 text-muted-foreground font-mono">
-                              <div className="flex items-center gap-1">
-                                <span className="truncate">{k}</span>
-                                <button
-                                  onClick={() => copyToClipboard(displayValue, k)}
-                                  className="opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0"
-                                  title="Copy value"
-                                >
-                                  {copiedField === k ? (
-                                    <Check className="w-3 h-3 text-green-400" />
-                                  ) : (
-                                    <Copy className="w-3 h-3 text-muted-foreground hover:text-foreground" />
-                                  )}
-                                </button>
-                              </div>
-                            </td>
-                            <td className="py-1.5 pr-4 align-top break-all whitespace-pre-wrap">
-                              <FieldValueMenu
-                                fieldName={k}
-                                value={v}
-                                displayValue={truncatedValue}
-                                onAddToQuery={onAddToQuery}
-                                onSetQuery={onSetQuery}
-                                query={query}
-                                highlightKeywords={highlightKeywords}
-                                className="text-str"
-                                notebookActive={notebookActive}
-                                onAddToNotebook={onAddToNotebook}
-                              />
-                              {shouldTruncate && (
-                                <button
-                                  onClick={() => setExpandedValues(prev => new Set(prev).add(detailKey))}
-                                  className="ml-1 text-muted-foreground hover:text-primary cursor-pointer"
-                                  title="Show full value"
-                                >
-                                  ...
-                                </button>
+                      return (
+                        <div
+                          key={k}
+                          className="group hover:bg-muted/20 px-4 py-1.5 flex flex-col gap-0.5"
+                        >
+                          {/* Key: full name always visible on its own line —
+                              wraps instead of truncating, no matter how long the
+                              OCSF dotted path (or UDM name) is. */}
+                          <div className="flex items-start gap-1 text-muted-foreground min-w-0">
+                            <span className="break-all leading-tight" title={k}>
+                              {(() => {
+                                const { namespace, leaf } = splitFieldKey(k);
+                                return namespace
+                                  ? <><span className="opacity-50">{namespace}</span>{leaf}</>
+                                  : leaf;
+                              })()}
+                            </span>
+                            <button
+                              onClick={() => copyToClipboard(displayValue, k)}
+                              className="opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0 mt-px"
+                              title="Copy value"
+                            >
+                              {copiedField === k ? (
+                                <Check className="w-3 h-3 text-green-400" />
+                              ) : (
+                                <Copy className="w-3 h-3 text-muted-foreground hover:text-foreground" />
                               )}
-                            </td>
-                          </tr>
-                        );
-                      })}
-                  </tbody>
-                </table>
+                            </button>
+                          </div>
+                          {/* Value: full panel width on its own line, slightly
+                              indented to separate it from the next field's key. */}
+                          <div className="min-w-0 break-all whitespace-pre-wrap pl-3">
+                            <FieldValueMenu
+                              fieldName={k}
+                              value={v}
+                              displayValue={truncatedValue}
+                              onAddToQuery={onAddToQuery}
+                              onSetQuery={onSetQuery}
+                              query={query}
+                              highlightKeywords={highlightKeywords}
+                              className="text-str"
+                              notebookActive={notebookActive}
+                              onAddToNotebook={onAddToNotebook}
+                            />
+                            {shouldTruncate && (
+                              <button
+                                onClick={() => setExpandedValues(prev => new Set(prev).add(detailKey))}
+                                className="ml-1 text-muted-foreground hover:text-primary cursor-pointer"
+                                title="Show full value"
+                              >
+                                ...
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                </div>
               </div>
             ))}
           </div>

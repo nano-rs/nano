@@ -9,7 +9,8 @@ use tracing::debug;
 use super::sql_helpers::escape_question_marks_in_strings;
 use super::types::{ClickHouseExecutor, CLICKHOUSE_LOG_COLUMNS};
 use crate::search::evaluator::helpers::{
-    clickhouse_row_to_json, convert_timestamps_to_iso8601, strip_empty_values,
+    clickhouse_row_to_json, convert_timestamps_to_iso8601, flatten_ext_field_in_place,
+    strip_empty_values,
 };
 use crate::search::{parse_clickhouse_error, SearchError};
 
@@ -134,36 +135,8 @@ impl ClickHouseExecutor {
                     }
 
                     // Post-process: flatten ext JSON fields into main result
-                    // ext contains extended/overflow UDM fields that aren't in explicit columns
-                    if let Some(ext_val) = obj.get("ext") {
-                        // ext might be a string (JSON string) or already parsed object
-                        let ext_obj = if let Some(ext_str) = ext_val.as_str() {
-                            // It's a string, parse it
-                            if !ext_str.is_empty() && ext_str != "{}" && ext_str != "null" {
-                                serde_json::from_str::<serde_json::Value>(ext_str).ok()
-                            } else {
-                                None
-                            }
-                        } else if ext_val.is_object() {
-                            // It's already an object
-                            Some(ext_val.clone())
-                        } else {
-                            None
-                        };
-
-                        // Flatten ext fields into the main result
-                        if let Some(serde_json::Value::Object(ext_map)) = ext_obj {
-                            if !ext_map.is_empty() {
-                                debug!("Flattening {} ext fields into result", ext_map.len());
-                                for (key, value) in ext_map {
-                                    obj.insert(key, value);
-                                }
-                            }
-                        }
-
-                        // Remove the ext field itself from the result
-                        obj.remove("ext");
-                    }
+                    // (NAN-1463: without clobbering promoted columns)
+                    flatten_ext_field_in_place(obj);
 
                     // Post-process: convert timestamp to ISO 8601 with Z suffix
                     // ClickHouse returns timestamps as "YYYY-MM-DD HH:MM:SS" without timezone
@@ -320,26 +293,7 @@ impl ClickHouseExecutor {
                     }
 
                     // Flatten ext JSON fields
-                    if let Some(ext_val) = obj.get("ext") {
-                        let ext_obj = if let Some(ext_str) = ext_val.as_str() {
-                            if !ext_str.is_empty() && ext_str != "{}" && ext_str != "null" {
-                                serde_json::from_str::<serde_json::Value>(ext_str).ok()
-                            } else {
-                                None
-                            }
-                        } else if ext_val.is_object() {
-                            Some(ext_val.clone())
-                        } else {
-                            None
-                        };
-
-                        if let Some(serde_json::Value::Object(ext_map)) = ext_obj {
-                            for (key, value) in ext_map {
-                                obj.insert(key, value);
-                            }
-                        }
-                        obj.remove("ext");
-                    }
+                    flatten_ext_field_in_place(obj);
 
                     convert_timestamps_to_iso8601(obj);
 
@@ -433,26 +387,7 @@ impl ClickHouseExecutor {
                     }
 
                     // Flatten ext JSON fields
-                    if let Some(ext_val) = obj.get("ext") {
-                        let ext_obj = if let Some(ext_str) = ext_val.as_str() {
-                            if !ext_str.is_empty() && ext_str != "{}" && ext_str != "null" {
-                                serde_json::from_str::<serde_json::Value>(ext_str).ok()
-                            } else {
-                                None
-                            }
-                        } else if ext_val.is_object() {
-                            Some(ext_val.clone())
-                        } else {
-                            None
-                        };
-
-                        if let Some(serde_json::Value::Object(ext_map)) = ext_obj {
-                            for (key, value) in ext_map {
-                                obj.insert(key, value);
-                            }
-                        }
-                        obj.remove("ext");
-                    }
+                    flatten_ext_field_in_place(obj);
 
                     convert_timestamps_to_iso8601(obj);
                     strip_empty_values(obj);
@@ -483,26 +418,7 @@ impl ClickHouseExecutor {
             }
 
             // Flatten ext JSON fields into main result
-            if let Some(ext_val) = obj.get("ext") {
-                let ext_obj = if let Some(ext_str) = ext_val.as_str() {
-                    if !ext_str.is_empty() && ext_str != "{}" && ext_str != "null" {
-                        serde_json::from_str::<serde_json::Value>(ext_str).ok()
-                    } else {
-                        None
-                    }
-                } else if ext_val.is_object() {
-                    Some(ext_val.clone())
-                } else {
-                    None
-                };
-
-                if let Some(serde_json::Value::Object(ext_map)) = ext_obj {
-                    for (key, value) in ext_map {
-                        obj.insert(key, value);
-                    }
-                }
-                obj.remove("ext");
-            }
+            flatten_ext_field_in_place(obj);
 
             convert_timestamps_to_iso8601(obj);
             strip_empty_values(obj);

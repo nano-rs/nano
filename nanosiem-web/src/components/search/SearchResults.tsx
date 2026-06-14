@@ -63,9 +63,12 @@ const CloudOverviewView = lazy(() => import('./cloud-overview').then(m => ({ def
 const CloudPrincipalDossier = lazy(() => import('./cloud-dossier').then(m => ({ default: m.CloudPrincipalDossier })));
 const LateralView = lazy(() => import('./lateral').then(m => ({ default: m.LateralView })));
 const StatsView = lazy(() => import('./StatsView').then(m => ({ default: m.StatsView })));
-import { UDM_COLUMNS } from '@/lib/udm-fields';
-import { isClickHouseDefault } from '@/lib/utils';
-import { expandEventLeaves, getEventObject } from './event-flatten';
+import {
+  flattenEventFields,
+  buildFieldCategories,
+  isFieldHidden,
+  splitFieldKey,
+} from './event-flatten';
 
 // ============================================================================
 // Detail view mode — persisted to localStorage
@@ -83,123 +86,10 @@ function getDetailViewMode(): DetailViewMode {
   return 'panel';
 }
 
-// ============================================================================
-// Field utility functions (for inline expand view)
-// ============================================================================
-
-function flattenFieldsForExpand(fields: Record<string, unknown>, isOcsf = false, prefix = '', promotedNames?: Set<string>): [string, unknown][] {
-  const result: [string, unknown][] = [];
-  // OCSF (NAN-1241): expand the raw nested `event` record into dotted leaf paths —
-  // the UDM `ext` analog — so nested OCSF fields are inspectable instead of one
-  // blob. Top level only; promoted top-level keys win on collision. See
-  // EventInspectorPanel.flattenFields for the matching inspector-side logic.
-  const topLevelKeys = prefix === '' ? new Set(Object.keys(fields)) : new Set<string>();
-  for (const [key, value] of Object.entries(fields)) {
-    const fullKey = prefix ? `${prefix}_${key}` : key;
-    if (prefix === '' && isOcsf && key === 'event') {
-      const eventObj = getEventObject(fields);
-      if (eventObj) {
-        topLevelKeys.delete('event');
-        result.push(...expandEventLeaves(eventObj, topLevelKeys, promotedNames));
-        continue;
-      }
-    }
-    if (key.startsWith('prevalence_') && (value === 255 || value === 65535 || value === 9999)) continue;
-    if (key === 'risk_score' && (value === 0 || value === '0')) continue;
-    const isPrevalence = key === 'host_count' || key === 'is_rare' || key === 'prevalence_score' ||
-                         key === 'prevalence_type' || key === '_prevalence' || key.startsWith('_prevalence.');
-    if (!isPrevalence && isClickHouseDefault(value, key)) continue;
-    if (key === 'metadata') {
-      let metadataObj: Record<string, unknown> | null = null;
-      if (typeof value === 'object' && !Array.isArray(value) && value !== null) {
-        metadataObj = value as Record<string, unknown>;
-      } else if (typeof value === 'string' && value.startsWith('{')) {
-        try {
-          const parsed = JSON.parse(value);
-          if (typeof parsed === 'object' && !Array.isArray(parsed)) metadataObj = parsed;
-        } catch { /* not JSON */ }
-      }
-      if (metadataObj) {
-        result.push(...flattenFieldsForExpand(metadataObj, isOcsf, 'metadata', promotedNames));
-      } else if (value) {
-        result.push([fullKey, value]);
-      }
-    } else if (key === '_prevalence') {
-      if (typeof value === 'object' && !Array.isArray(value) && value !== null) {
-        result.push(...flattenFieldsForExpand(value as Record<string, unknown>, isOcsf, '_prevalence', promotedNames));
-      } else if (value) {
-        result.push([fullKey, value]);
-      }
-    } else {
-      result.push([fullKey, value]);
-    }
-  }
-  const getFieldCategory = (fieldName: string): number => {
-    if (fieldName === 'risk_score' || fieldName === 'risk_entity' ||
-        fieldName === 'risk_factors' || fieldName.startsWith('risk_')) return 1;
-    if (fieldName.startsWith('ioc_')) return 2;
-    if (fieldName.includes('_identity_') || fieldName.startsWith('identity_') || fieldName === 'is_nat_candidate') return 3;
-    if (fieldName.startsWith('prevalence_') || fieldName === '_prevalence' ||
-        fieldName.startsWith('_prevalence.') || fieldName === 'host_count' ||
-        fieldName === 'is_rare' || fieldName === 'prevalence_score' ||
-        fieldName === 'prevalence_type' || fieldName === 'prevalence_artifact' ||
-        fieldName === 'total_occurrences' || fieldName === 'first_seen' ||
-        fieldName === 'last_seen') return 4;
-    if (fieldName.startsWith('lookup_')) return 5;
-    if (fieldName.startsWith('enriched_')) return 6;
-    // UDM flattens its `metadata` JSON with underscores (`metadata_*`); OCSF
-    // surfaces it as dotted leaf paths (`metadata.version`) — match both so the
-    // Metadata enrichment toggle hides OCSF metadata too (NAN-1448).
-    if (fieldName.startsWith('metadata_') || fieldName.startsWith('metadata.')) return 7;
-    if (isOcsf && fieldName.startsWith('unmapped.')) return 9; // OCSF unmapped spill last
-    if (!UDM_COLUMNS.has(fieldName)) return 8;
-    return 0;
-  };
-  return result.sort((a, b) => {
-    const catA = getFieldCategory(a[0]);
-    const catB = getFieldCategory(b[0]);
-    if (catA !== catB) return catA - catB;
-    return a[0].localeCompare(b[0]);
-  });
-}
-
-function isIocFieldExpand(fieldName: string): boolean {
-  return fieldName.startsWith('ioc_');
-}
-
-function isRiskFieldExpand(fieldName: string): boolean {
-  return fieldName === 'risk_score' || fieldName === 'risk_entity' || fieldName === 'risk_factors';
-}
-
-function isPrevalenceFieldExpand(fieldName: string): boolean {
-  return fieldName === 'host_count' || fieldName === 'is_rare' ||
-         fieldName === 'prevalence_score' || fieldName === 'prevalence_type' ||
-         fieldName === 'prevalence_artifact' || fieldName === 'total_occurrences' ||
-         fieldName === 'first_seen' || fieldName === 'last_seen' ||
-         fieldName === '_prevalence' || fieldName.startsWith('_prevalence.') ||
-         fieldName === 'prevalence_file_hash' || fieldName === 'prevalence_process_hash' ||
-         fieldName === 'prevalence_dest_domain' || fieldName === 'prevalence_dest_ip' ||
-         fieldName === 'prevalence_min';
-}
-
-
-const ENRICHMENT_CATEGORIES_EXPAND: Record<string, (k: string) => boolean> = {
-  ioc: (k) => k.startsWith('ioc_'),
-  custom: (k) => k.startsWith('lookup_custom_'),
-  prevalence: (k) => isPrevalenceFieldExpand(k),
-  lookup: (k) => k.startsWith('lookup_') && !k.startsWith('lookup_custom_'),
-  geo: (k) => k.startsWith('enriched_'),
-  identity: (k) => k.includes('_identity_') || k.startsWith('identity_') || k === 'is_nat_candidate',
-  // `metadata_*` (UDM flattened) and `metadata.*` (OCSF dotted leaves) — NAN-1448.
-  metadata: (k) => k.startsWith('metadata_') || k.startsWith('metadata.'),
-};
-
-function isFieldHiddenExpand(fieldName: string, hiddenEnrichments: Set<string>): boolean {
-  for (const [category, check] of Object.entries(ENRICHMENT_CATEGORIES_EXPAND)) {
-    if (hiddenEnrichments.has(category) && check(fieldName)) return true;
-  }
-  return false;
-}
+// Field flattening + categorization for the inline expand view lives in
+// ./event-flatten, shared verbatim with the Event Inspector panel so the two
+// can't drift (the inline copy previously never expanded the OCSF `unmapped`
+// spill — that's exactly what sharing prevents).
 
 // ============================================================================
 // Query Parsing Utilities
@@ -638,7 +528,17 @@ export function FieldValueMenu({
 }: FieldValueMenuProps) {
   const navigate = useNavigate();
   const { resolveEntityType, schemaFields } = useSchemaEntityMap({ fallback: FIELD_TO_ENTITY_TYPE });
-  const stringValue = typeof value === 'object' ? JSON.stringify(value) : String(value);
+  // NAN-1466: Array(String) columns (url.categories, tags, *_tags) must filter
+  // on an ELEMENT — the backend compiles `field="x"` to has(col,'x'). Using the
+  // JSON-stringified whole array (`["x"]`) matches nothing. Single-element is the
+  // common case (a category list); multi-element filters on the first element.
+  const scalarArray =
+    Array.isArray(value) && value.every((v) => v === null || typeof v !== 'object');
+  const stringValue = scalarArray
+    ? String((value as unknown[]).find((v) => v !== null && v !== undefined) ?? '')
+    : typeof value === 'object'
+      ? JSON.stringify(value)
+      : String(value);
   const fieldType = getFieldType(fieldName);
   const entityType = resolveEntityType(fieldName);
   const canOpenAssetView =
@@ -1785,6 +1685,14 @@ type EnrichmentCategory = keyof typeof ENRICHMENT_CATEGORIES;
 // Format value for display - handle objects, arrays, etc.
 function formatValue(value: unknown): string {
   if (value === null || value === undefined) return '';
+  // NAN-1466: Array(String) columns render as a comma-join, not a JSON blob;
+  // nested arrays/objects still fall through to JSON.
+  if (Array.isArray(value)) {
+    if (value.every((v) => v === null || typeof v !== 'object')) {
+      return value.filter((v) => v !== null && v !== undefined).map(String).join(', ');
+    }
+    return JSON.stringify(value, null, 2);
+  }
   if (typeof value === 'object') {
     return JSON.stringify(value, null, 2);
   }
@@ -2157,12 +2065,16 @@ function RawView({
                 {/* Inline expanded fields table */}
                 {isInlineMode && expandedFields.has(result.id) && (() => {
                   const isLoadingFullData = loadingLogsSet.has(result.id);
-                  let flattenedFields = displayFields ? flattenFieldsForExpand(displayFields, schemaFields?.schema === 'ocsf', '', new Set((schemaFields?.fields ?? []).map((f) => f.name))) : [];
+                  const isOcsf = schemaFields?.schema === 'ocsf';
+                  const knownSchemaFields = new Set((schemaFields?.fields ?? []).map((f) => f.name));
+                  let flattenedFields = displayFields ? flattenEventFields(displayFields, isOcsf, '', knownSchemaFields) : [];
                   if (_hiddenEnrichments.size > 0) {
-                    flattenedFields = flattenedFields.filter(([k]) => !isFieldHiddenExpand(k, _hiddenEnrichments));
+                    flattenedFields = flattenedFields.filter(([k]) => !isFieldHidden(k, _hiddenEnrichments));
                   }
+                  // Same grouped categories / colors / tooltips as the Event Inspector.
+                  const categories = buildFieldCategories(flattenedFields, knownSchemaFields, isOcsf);
                   return (
-                    <div className="mt-3 pt-3 border-t border-border/30 -mx-3 px-3 md:mx-0 md:px-0 overflow-x-auto md:overflow-x-visible">
+                    <div className="mt-3 pt-3 border-t border-border/30 -mx-3 px-3 md:mx-0 md:px-0">
                       {isLoadingFullData && !fullData ? (
                         <div className="flex items-center gap-2 py-2 text-xs text-muted-foreground">
                           <div className="w-3 h-3 border-2 border-muted-foreground/30 border-t-muted-foreground rounded-full animate-spin" />
@@ -2176,78 +2088,93 @@ function RawView({
                           Loading remaining fields...
                         </div>
                       )}
-                      <table className="min-w-full md:w-full md:table-fixed text-xs font-mono">
-                        <thead>
-                          <tr className="text-muted-foreground">
-                            <th className="text-left py-1 pr-4 md:pr-6 font-medium w-32 md:w-64 whitespace-nowrap">Field</th>
-                            <th className="text-left py-1 font-medium">Value</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {flattenedFields
-                            .filter(([, v]) => !(Array.isArray(v) && v.length === 0))
-                            .map(([k, v]) => {
-                            const dv = formatValue(v);
-                            const isIoc = isIocFieldExpand(k);
-                            const isRisk = isRiskFieldExpand(k);
-                            // Field names always render muted grey (matches parsed k:v style)
-                            const fieldColor = 'text-muted-foreground';
-                            const detailKey = `${result.id}:${k}`;
-                            const isValueExpanded = expandedDetailValues.has(detailKey);
-                            const shouldTruncate = !isValueExpanded && dv.length > 200;
-                            const truncatedValue = shouldTruncate ? dv.substring(0, 200) : dv;
-                            return (
-                              <tr key={k} className="group/irow border-t border-border/20 hover:bg-muted/20">
-                                <td className={`py-1.5 pr-4 md:pr-6 align-top whitespace-nowrap md:truncate ${fieldColor}`} title={k}>
-                                  <div className="flex items-center gap-1">
-                                    <span className="truncate">{k}</span>
-                                    <button
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        navigator.clipboard.writeText(dv);
-                                        setCopiedInlineField(detailKey);
-                                        setTimeout(() => setCopiedInlineField(null), 1500);
-                                      }}
-                                      className="opacity-0 group-hover/irow:opacity-100 transition-opacity flex-shrink-0"
-                                      title="Copy value"
-                                    >
-                                      {copiedInlineField === detailKey ? (
-                                        <Check className="w-3 h-3 text-green-400" />
-                                      ) : (
-                                        <Copy className="w-3 h-3 text-muted-foreground hover:text-foreground" />
-                                      )}
-                                    </button>
-                                  </div>
-                                </td>
-                                <td className="py-1.5 align-top whitespace-nowrap md:whitespace-pre-wrap md:break-all">
-                                  <FieldValueMenu
-                                    fieldName={k}
-                                    value={v}
-                                    displayValue={truncatedValue}
-                                    onAddToQuery={onAddToQuery}
-                                    onSetQuery={onSetQuery}
-                                    query={query}
-                                    highlightKeywords={highlightKeywords}
-                                    className={isIoc ? "text-red-400" : isRisk ? "text-orange-400" : "text-str"}
-                                    notebookActive={notebookActive}
-                                    onAddToNotebook={onAddToNotebook}
-                                    eventTimestamp={result.timestamp}
-                                  />
-                                  {shouldTruncate && (
-                                    <button
-                                      onClick={(e) => { e.stopPropagation(); setExpandedDetailValues(prev => new Set(prev).add(detailKey)); }}
-                                      className="ml-1 text-muted-foreground hover:text-primary cursor-pointer"
-                                      title="Show full value"
-                                    >
-                                      ...
-                                    </button>
-                                  )}
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
+                      <div className="space-y-2">
+                        {categories.map(category => (
+                          <div key={category.label}>
+                            {/* Category header — same labels/colors/tooltips as the inspector */}
+                            <div className="py-1">
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <span className={`text-[10px] font-semibold uppercase tracking-wider cursor-default ${category.color}`}>
+                                    {category.label}
+                                    <span className="text-muted-foreground ml-1">({category.fields.length})</span>
+                                  </span>
+                                </TooltipTrigger>
+                                <TooltipContent side="right" className="text-xs max-w-60">
+                                  {category.tooltip}
+                                </TooltipContent>
+                              </Tooltip>
+                            </div>
+                            <div className="text-xs font-mono">
+                              {category.fields
+                                .filter(([, v]) => !(Array.isArray(v) && v.length === 0))
+                                .map(([k, v]) => {
+                                  const dv = formatValue(v);
+                                  const detailKey = `${result.id}:${k}`;
+                                  const isValueExpanded = expandedDetailValues.has(detailKey);
+                                  const shouldTruncate = !isValueExpanded && dv.length > 200;
+                                  const truncatedValue = shouldTruncate ? dv.substring(0, 200) : dv;
+                                  const { namespace, leaf } = splitFieldKey(k);
+                                  return (
+                                    <div key={k} className="group/irow hover:bg-muted/20 py-1 flex flex-col gap-0.5 md:flex-row md:items-start md:gap-3">
+                                      {/* Key: capped column so the value keeps room (the wide
+                                          card has space for side-by-side). Full name always
+                                          visible — wraps instead of truncating — with the OCSF
+                                          namespace de-emphasized so the leaf reads clearly. */}
+                                      <div className="flex items-start gap-1 text-muted-foreground min-w-0 md:w-64 md:shrink-0">
+                                        <span className="break-all leading-tight" title={k}>
+                                          {namespace ? <><span className="opacity-50">{namespace}</span>{leaf}</> : leaf}
+                                        </span>
+                                        <button
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            navigator.clipboard.writeText(dv);
+                                            setCopiedInlineField(detailKey);
+                                            setTimeout(() => setCopiedInlineField(null), 1500);
+                                          }}
+                                          className="opacity-0 group-hover/irow:opacity-100 transition-opacity flex-shrink-0 mt-px"
+                                          title="Copy value"
+                                        >
+                                          {copiedInlineField === detailKey ? (
+                                            <Check className="w-3 h-3 text-green-400" />
+                                          ) : (
+                                            <Copy className="w-3 h-3 text-muted-foreground hover:text-foreground" />
+                                          )}
+                                        </button>
+                                      </div>
+                                      {/* Value: takes the rest of the row beside the key (stacks
+                                          under it only on a narrow/mobile card). */}
+                                      <div className="min-w-0 flex-1 break-all whitespace-pre-wrap pl-3 md:pl-0">
+                                        <FieldValueMenu
+                                          fieldName={k}
+                                          value={v}
+                                          displayValue={truncatedValue}
+                                          onAddToQuery={onAddToQuery}
+                                          onSetQuery={onSetQuery}
+                                          query={query}
+                                          highlightKeywords={highlightKeywords}
+                                          className="text-str"
+                                          notebookActive={notebookActive}
+                                          onAddToNotebook={onAddToNotebook}
+                                          eventTimestamp={result.timestamp}
+                                        />
+                                        {shouldTruncate && (
+                                          <button
+                                            onClick={(e) => { e.stopPropagation(); setExpandedDetailValues(prev => new Set(prev).add(detailKey)); }}
+                                            className="ml-1 text-muted-foreground hover:text-primary cursor-pointer"
+                                            title="Show full value"
+                                          >
+                                            ...
+                                          </button>
+                                        )}
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
                       </>) : null}
                     </div>
                   );

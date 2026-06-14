@@ -538,6 +538,78 @@ impl ClickHouseSqlGenerator {
         }
     }
 
+    /// Generate SQL for a filter on an `Array(String)` column (`tags`, `*_tags`).
+    ///
+    /// Equality is element membership (`has`), which is index/short-circuit
+    /// friendly; wildcards / contains / like / starts/ends / regex fall back to
+    /// `arrayExists` over a per-element predicate. Values are lowercased to match
+    /// the lowercase-canonical tag convention. Numeric comparators don't apply.
+    fn generate_array_field_filter(
+        &self,
+        field: &str,
+        op: &Comparator,
+        value: &Value,
+    ) -> Result<String, SqlGenError> {
+        let col = self.filter_field_expr(field, "String");
+
+        // (per-element predicate over `x`, negate). Exact-equality short-circuits
+        // to has() before this, since it's cheaper than arrayExists.
+        let (elem, negate): (String, bool) = match (op, value) {
+            (Comparator::Eq, Value::String(s)) if s == "*" => return Ok("1".to_string()),
+            (Comparator::Ne, Value::String(s)) if s == "*" => return Ok("0".to_string()),
+            (Comparator::Eq | Comparator::Ne, Value::String(s)) => {
+                let negate = *op == Comparator::Ne;
+                if s.contains('*') || s.contains('?') {
+                    let pattern = wildcard_to_like_pattern(&s.to_lowercase());
+                    (format!("lower(x) iLike '{}'", pattern), negate)
+                } else {
+                    let lit = escape_string(&s.to_lowercase());
+                    let has = format!("has({}, '{}')", col, lit);
+                    return Ok(if negate { format!("NOT {}", has) } else { has });
+                }
+            }
+            (Comparator::Contains | Comparator::NotContains, Value::String(s)) => {
+                let pattern = escape_like_pattern(&escape_string(&s.to_lowercase()));
+                (
+                    format!("lower(x) iLike '%{}%'", pattern),
+                    *op == Comparator::NotContains,
+                )
+            }
+            (Comparator::Like | Comparator::NotLike, Value::String(s)) => {
+                let pattern = wildcard_to_like_pattern(&s.to_lowercase());
+                (
+                    format!("lower(x) iLike '{}'", pattern),
+                    *op == Comparator::NotLike,
+                )
+            }
+            (Comparator::StartsWith | Comparator::NotStartsWith, Value::String(s)) => (
+                format!("startsWith(lower(x), '{}')", escape_string(&s.to_lowercase())),
+                *op == Comparator::NotStartsWith,
+            ),
+            (Comparator::EndsWith | Comparator::NotEndsWith, Value::String(s)) => (
+                format!("endsWith(lower(x), '{}')", escape_string(&s.to_lowercase())),
+                *op == Comparator::NotEndsWith,
+            ),
+            (Comparator::Regex | Comparator::NotRegex, Value::Regex(p)) => (
+                format!("match(x, '{}')", escape_regex_pattern(p)),
+                *op == Comparator::NotRegex,
+            ),
+            _ => {
+                return Err(SqlGenError::InvalidQuery(format!(
+                    "operator {:?} is not supported on array field '{}'",
+                    op, field
+                )))
+            }
+        };
+
+        let exists = format!("arrayExists(x -> {}, {})", elem, col);
+        Ok(if negate {
+            format!("NOT {}", exists)
+        } else {
+            exists
+        })
+    }
+
     /// Generate SQL for UDM field filter (direct column or ext JSON access)
     ///
     /// In the hybrid schema:
@@ -549,6 +621,13 @@ impl ClickHouseSqlGenerator {
         op: &Comparator,
         value: &Value,
     ) -> Result<String, SqlGenError> {
+        // NAN-1464: Array(String) columns (`tags`, `*_tags`) use membership
+        // semantics — a scalar `col = 'v'` is a ClickHouse type error that
+        // silently matches nothing.
+        if super::is_array_column(field) {
+            return self.generate_array_field_filter(field, op, value);
+        }
+
         // Profile-aware physical access: ExplicitColumn → escaped column (direct,
         // possibly dotted/promoted), JsonPath → native `event` subcolumn access
         // (OCSF tail, NAN-1426), Unknown →

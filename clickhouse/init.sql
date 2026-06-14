@@ -741,6 +741,10 @@ CREATE TABLE IF NOT EXISTS nanosiem.logs
     `result` LowCardinality(String) DEFAULT '' CODEC(ZSTD(1)),
     `severity` LowCardinality(String) DEFAULT '' CODEC(ZSTD(1)),
     `category` LowCardinality(String) DEFAULT '' CODEC(ZSTD(1)),
+    -- NAN-1464: CIM event-class taxonomy (web/proxy/authentication/...). Written
+    -- by parsers via `.udm.tags`; `category` is freed for the CIM content category.
+    -- nPL `tags="web"` compiles to has(tags,'web') (array membership).
+    `tags` Array(String) DEFAULT [] CODEC(ZSTD(1)),
     `auth_type` LowCardinality(String) DEFAULT '' CODEC(ZSTD(1)),
     `auth_result` LowCardinality(String) DEFAULT '' CODEC(ZSTD(1)),
     `session_id` String DEFAULT '' CODEC(ZSTD(1)),

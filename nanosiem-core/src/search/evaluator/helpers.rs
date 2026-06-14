@@ -107,6 +107,62 @@ pub fn strip_empty_values(obj: &mut serde_json::Map<String, serde_json::Value>) 
     });
 }
 
+/// Merge the `ext` overflow object's fields into `obj`.
+///
+/// `ext` carries extended/overflow UDM fields that are NOT promoted columns. On
+/// a name collision with a key already present in `obj` (a real promoted
+/// column), the column is authoritative: we keep it and preserve the colliding
+/// ext value under `ext.<key>` rather than silently overwriting the column.
+///
+/// NAN-1463: the old `obj.insert(key, value)` clobbered the column (e.g.
+/// conduit's `ext.category="social_media"` destroyed the `category` column
+/// value `"web_proxy"`). This is display/result-shaping only; nPL `ext.<key>`
+/// querying hits the JSON column directly and is unaffected.
+pub fn merge_ext_fields_into(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    ext_map: serde_json::Map<String, serde_json::Value>,
+) {
+    for (key, value) in ext_map {
+        // Only a column carrying a REAL value is authoritative. An absent or
+        // blank (null / "") column is filled by ext as before — so parsers that
+        // use `ext.X` to populate a same-named empty column keep working; we
+        // only refuse to overwrite a column that actually holds a value.
+        let column_occupied = obj
+            .get(&key)
+            .is_some_and(|v| !matches!(v, serde_json::Value::Null)
+                && !matches!(v, serde_json::Value::String(s) if s.is_empty()));
+        if column_occupied {
+            obj.insert(format!("ext.{key}"), value);
+        } else {
+            obj.insert(key, value);
+        }
+    }
+}
+
+/// Parse a row's `ext` field (a JSON string or already-parsed object) and
+/// flatten it into `obj` without clobbering existing columns, then drop the raw
+/// `ext` key. No-op when `ext` is absent, empty, or not an object.
+pub fn flatten_ext_field_in_place(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(ext_val) = obj.get("ext") else {
+        return;
+    };
+    let ext_obj = if let Some(ext_str) = ext_val.as_str() {
+        if !ext_str.is_empty() && ext_str != "{}" && ext_str != "null" {
+            serde_json::from_str::<serde_json::Value>(ext_str).ok()
+        } else {
+            None
+        }
+    } else if ext_val.is_object() {
+        Some(ext_val.clone())
+    } else {
+        None
+    };
+    if let Some(serde_json::Value::Object(ext_map)) = ext_obj {
+        merge_ext_fields_into(obj, ext_map);
+    }
+    obj.remove("ext");
+}
+
 /// Convert timestamp fields in a JSON object to ISO 8601 format with Z suffix.
 /// ClickHouse returns timestamps as "YYYY-MM-DD HH:MM:SS.ffffff" without timezone indicator.
 /// This function converts them to "YYYY-MM-DDTHH:MM:SS.ffffffZ" so JavaScript clients
@@ -444,39 +500,77 @@ pub fn clickhouse_row_to_json(row: &ClickHouseLogReadRow) -> serde_json::Value {
         map.insert("enrich_time".to_string(), enrich_dt);
     }
 
-    // Parse ext JSON string and flatten fields into the result
-    // ext contains extended/overflow UDM fields that aren't in explicit columns
+    // Parse ext JSON string and flatten fields into the result.
+    // ext contains extended/overflow UDM fields that aren't in explicit columns.
+    // NAN-1463: merge without clobbering promoted columns (a colliding ext key
+    // is preserved as `ext.<key>`).
     if !row.ext.is_empty() && row.ext != "{}" && row.ext != "null" {
-        debug!("Attempting to parse ext field: {}", row.ext);
         match serde_json::from_str::<serde_json::Value>(&row.ext) {
-            Ok(ext_value) => {
-                debug!("Successfully parsed ext JSON: {:?}", ext_value);
-                // Check if it's an object and not empty
-                if let Some(ext_map) = ext_value.as_object() {
-                    if !ext_map.is_empty() {
-                        debug!("Flattening {} ext fields into result", ext_map.len());
-                        // Flatten ext fields into the main result
-                        for (key, value) in ext_map {
-                            map.insert(key.clone(), value.clone());
-                        }
-                    } else {
-                        debug!("ext_map is empty");
-                    }
-                } else {
-                    debug!("ext_value is not an object: {:?}", ext_value);
-                }
+            Ok(serde_json::Value::Object(ext_map)) => {
+                merge_ext_fields_into(&mut map, ext_map);
+            }
+            Ok(other) => {
+                debug!("ext is not an object: {:?}", other);
             }
             Err(e) => {
                 debug!("Failed to parse ext JSON: {} - Error: {}", row.ext, e);
             }
         }
-    } else {
-        debug!(
-            "Skipping ext field - empty: {}, value: {}",
-            row.ext.is_empty(),
-            row.ext
-        );
     }
 
     serde_json::Value::Object(map)
+}
+
+#[cfg(test)]
+mod ext_flatten_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn obj(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    // NAN-1463: an ext key that collides with a real column must NOT overwrite
+    // the column; the column wins and the ext value is preserved as `ext.<key>`.
+    #[test]
+    fn ext_collision_preserves_promoted_column() {
+        let mut o = obj(json!({
+            "category": "web_proxy",          // promoted column (event-class)
+            "ext": { "category": "social_media", "cache_status": "hit" }
+        }));
+        flatten_ext_field_in_place(&mut o);
+
+        assert_eq!(o["category"], json!("web_proxy"), "column was clobbered");
+        assert_eq!(o["ext.category"], json!("social_media"), "ext value lost");
+        assert_eq!(o["cache_status"], json!("hit"), "non-colliding ext key dropped");
+        assert!(!o.contains_key("ext"), "raw ext key should be removed");
+    }
+
+    // An empty/absent same-named column should still be FILLED by ext (not
+    // namespaced) so ext-fills-empty-column parsers keep working.
+    #[test]
+    fn ext_fills_blank_or_absent_column() {
+        let mut o = obj(json!({ "user": "", "ext": { "user": "jdoe", "host": "ws1" } }));
+        flatten_ext_field_in_place(&mut o);
+        assert_eq!(o["user"], json!("jdoe"), "blank column should be filled by ext");
+        assert_eq!(o["host"], json!("ws1"));
+        assert!(!o.contains_key("ext.user"), "should not namespace when column was blank");
+    }
+
+    #[test]
+    fn ext_string_form_is_parsed_and_flattened() {
+        let mut o = obj(json!({ "ext": "{\"foo\":\"bar\"}" }));
+        flatten_ext_field_in_place(&mut o);
+        assert_eq!(o["foo"], json!("bar"));
+        assert!(!o.contains_key("ext"));
+    }
+
+    #[test]
+    fn ext_empty_or_missing_is_noop() {
+        for v in [json!({}), json!({ "ext": "{}" }), json!({ "ext": "null" }), json!({ "ext": "" })] {
+            let mut o = obj(v);
+            flatten_ext_field_in_place(&mut o);
+            assert!(!o.contains_key("ext"));
+        }
+    }
 }

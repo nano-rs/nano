@@ -120,14 +120,21 @@ fn normalize_base(ty: &str) -> String {
 /// naive line parser would misread as column declarations. The manifest⟷DDL gate
 /// only concerns the `ocsf_logs` promoted columns, so we parse just that block.
 fn ocsf_logs_table_body(ddl: &str) -> &str {
+    // NAN-1465: anchor on the exact table — `nanosiem.ocsf_logs` is a substring
+    // prefix of `nanosiem.ocsf_logs_raw` (declared first, NAN-1443), so a bare
+    // `find` matched the Null raw table's body and the whole gate silently
+    // parsed the wrong columns. The trailing newline pins the real table.
     let start = ddl
-        .find("CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs")
+        .find("CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs\n")
         .expect("ocsf_logs CREATE TABLE must exist");
     let rest = &ddl[start..];
     // The column/index list ends at the table's ENGINE clause; everything after
     // (PARTITION/ORDER/SETTINGS, then the appended prevalence statements) is out
     // of scope for column parsing.
-    let end = rest.find("ENGINE =").unwrap_or(rest.len());
+    // NAN-1465: anchor on a line-start `ENGINE =` — the leading NAN-1443 comment
+    // block mentions `(ENGINE = Null)` mid-line, which a bare `find("ENGINE =")`
+    // matched, truncating the body to the comment (0 columns parsed).
+    let end = rest.find("\nENGINE =").map(|i| i + 1).unwrap_or(rest.len());
     &rest[..end]
 }
 
