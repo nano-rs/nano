@@ -143,6 +143,9 @@ export function FieldsPanel({
 }: FieldsPanelProps) {
   const [searchTerm, setSearchTerm] = useState('');
   const [openMenuKey, setOpenMenuKey] = useState<string | null>(null);
+  // Whether the open value-menu's label shows the full (un-clamped) value.
+  // Resets whenever a different menu opens — only one menu is open at a time.
+  const [labelValueExpanded, setLabelValueExpanded] = useState(false);
   const [expandedValueFields, setExpandedValueFields] = useState<Set<string>>(new Set());
   // Pin the active schema's key fields under "Selected" (NAN-1241). Cached app-wide.
   const { data: schemaFields } = useQuery({
@@ -363,7 +366,7 @@ export function FieldsPanel({
                               <DropdownMenu
                                 key={idx}
                                 open={openMenuKey === menuKey}
-                                onOpenChange={(open) => setOpenMenuKey(open ? menuKey : null)}
+                                onOpenChange={(open) => { setOpenMenuKey(open ? menuKey : null); setLabelValueExpanded(false); }}
                               >
                                 <DropdownMenuTrigger asChild>
                                   <div
@@ -374,6 +377,7 @@ export function FieldsPanel({
                                     onContextMenu={(e) => {
                                       e.preventDefault();
                                       setOpenMenuKey(menuKey);
+                                      setLabelValueExpanded(false);
                                     }}
                                   >
                                     <span className="text-str whitespace-nowrap overflow-hidden text-ellipsis" title={valueInfo.value}>
@@ -392,12 +396,32 @@ export function FieldsPanel({
                                     />
                                   </div>
                                 </DropdownMenuTrigger>
-                                <DropdownMenuContent align="start" className="min-w-[180px] p-1">
+                                <DropdownMenuContent align="start" className="min-w-[180px] max-w-[340px] p-1">
                                   <DropdownMenuLabel className="px-2 py-1 text-[11px] tracking-normal normal-case text-muted-foreground font-normal">
                                     {stat.field} ={' '}
-                                    <span className="text-primary font-medium">
+                                    <span
+                                      className={cn(
+                                        'text-primary font-medium break-all',
+                                        // Only box/clamp large values — short ones stay
+                                        // inline (`duration = 358` reads on one line).
+                                        valueInfo.value.length > 240 &&
+                                          (labelValueExpanded
+                                            ? 'block max-h-[40vh] overflow-y-auto'
+                                            : 'line-clamp-6')
+                                      )}
+                                    >
                                       {valueInfo.value}
                                     </span>
+                                    {valueInfo.value.length > 240 && (
+                                      <button
+                                        type="button"
+                                        onClick={(e) => { e.preventDefault(); e.stopPropagation(); setLabelValueExpanded(v => !v); }}
+                                        className="mt-1 flex items-center gap-1 text-[10.5px] text-muted-foreground hover:text-primary transition-colors"
+                                      >
+                                        <ChevronDown className={cn('w-3 h-3 transition-transform', labelValueExpanded && 'rotate-180')} />
+                                        {labelValueExpanded ? 'Show less' : 'Show all'}
+                                      </button>
+                                    )}
                                   </DropdownMenuLabel>
                                   <DropdownMenuSeparator className="-mx-1 my-1 h-px bg-border" />
                                   <DropdownMenuItem

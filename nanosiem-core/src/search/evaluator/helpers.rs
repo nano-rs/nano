@@ -107,40 +107,35 @@ pub fn strip_empty_values(obj: &mut serde_json::Map<String, serde_json::Value>) 
     });
 }
 
-/// Merge the `ext` overflow object's fields into `obj`.
+/// Merge the `ext` overflow object's fields into `obj`, each namespaced as
+/// `ext.<key>`.
 ///
-/// `ext` carries extended/overflow UDM fields that are NOT promoted columns. On
-/// a name collision with a key already present in `obj` (a real promoted
-/// column), the column is authoritative: we keep it and preserve the colliding
-/// ext value under `ext.<key>` rather than silently overwriting the column.
+/// `ext` carries extended/overflow UDM fields that are NOT promoted columns.
+/// Every ext field is surfaced under its `ext.<key>` name so that (a) it can
+/// never collide with or overwrite a real promoted column, and (b) the
+/// displayed field name IS the queryable nPL path (`ext.<key>` hits the JSON
+/// column), so click-to-filter is correct. This mirrors how OCSF keeps overflow
+/// fields under their `unmapped.<key>` prefix — in UDM land the raw `ext`
+/// wrapper was hidden, but the per-field prefix is what makes each leaf
+/// addressable.
 ///
-/// NAN-1463: the old `obj.insert(key, value)` clobbered the column (e.g.
-/// conduit's `ext.category="social_media"` destroyed the `category` column
-/// value `"web_proxy"`). This is display/result-shaping only; nPL `ext.<key>`
-/// querying hits the JSON column directly and is unaffected.
+/// NAN-1467: previously ext keys merged bare, namespacing only on collision
+/// with an occupied column (NAN-1463) and otherwise filling a blank same-named
+/// column. That made the displayed name diverge from the queryable path — an
+/// `ext.user` shown as bare `user` queried the (empty) `user` column and
+/// returned nothing. Always-namespacing removes that ambiguity. This is
+/// display/result-shaping only; nPL `ext.<key>` querying is unaffected.
 pub fn merge_ext_fields_into(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     ext_map: serde_json::Map<String, serde_json::Value>,
 ) {
     for (key, value) in ext_map {
-        // Only a column carrying a REAL value is authoritative. An absent or
-        // blank (null / "") column is filled by ext as before — so parsers that
-        // use `ext.X` to populate a same-named empty column keep working; we
-        // only refuse to overwrite a column that actually holds a value.
-        let column_occupied = obj
-            .get(&key)
-            .is_some_and(|v| !matches!(v, serde_json::Value::Null)
-                && !matches!(v, serde_json::Value::String(s) if s.is_empty()));
-        if column_occupied {
-            obj.insert(format!("ext.{key}"), value);
-        } else {
-            obj.insert(key, value);
-        }
+        obj.insert(format!("ext.{key}"), value);
     }
 }
 
 /// Parse a row's `ext` field (a JSON string or already-parsed object) and
-/// flatten it into `obj` without clobbering existing columns, then drop the raw
+/// flatten each entry into `obj` under its `ext.<key>` name, then drop the raw
 /// `ext` key. No-op when `ext` is absent, empty, or not an object.
 pub fn flatten_ext_field_in_place(obj: &mut serde_json::Map<String, serde_json::Value>) {
     let Some(ext_val) = obj.get("ext") else {
@@ -502,8 +497,8 @@ pub fn clickhouse_row_to_json(row: &ClickHouseLogReadRow) -> serde_json::Value {
 
     // Parse ext JSON string and flatten fields into the result.
     // ext contains extended/overflow UDM fields that aren't in explicit columns.
-    // NAN-1463: merge without clobbering promoted columns (a colliding ext key
-    // is preserved as `ext.<key>`).
+    // NAN-1467: every ext field is surfaced as `ext.<key>` so the displayed name
+    // is the queryable nPL path and can never clobber a promoted column.
     if !row.ext.is_empty() && row.ext != "{}" && row.ext != "null" {
         match serde_json::from_str::<serde_json::Value>(&row.ext) {
             Ok(serde_json::Value::Object(ext_map)) => {
@@ -530,8 +525,9 @@ mod ext_flatten_tests {
         v.as_object().unwrap().clone()
     }
 
-    // NAN-1463: an ext key that collides with a real column must NOT overwrite
-    // the column; the column wins and the ext value is preserved as `ext.<key>`.
+    // NAN-1467: every ext field is namespaced as `ext.<key>`. A key that shares
+    // a name with a real promoted column can never overwrite it (the column
+    // value is untouched and the ext value lands at `ext.<key>`).
     #[test]
     fn ext_collision_preserves_promoted_column() {
         let mut o = obj(json!({
@@ -542,26 +538,28 @@ mod ext_flatten_tests {
 
         assert_eq!(o["category"], json!("web_proxy"), "column was clobbered");
         assert_eq!(o["ext.category"], json!("social_media"), "ext value lost");
-        assert_eq!(o["cache_status"], json!("hit"), "non-colliding ext key dropped");
+        assert_eq!(o["ext.cache_status"], json!("hit"), "non-colliding ext key dropped");
         assert!(!o.contains_key("ext"), "raw ext key should be removed");
     }
 
-    // An empty/absent same-named column should still be FILLED by ext (not
-    // namespaced) so ext-fills-empty-column parsers keep working.
+    // NAN-1467: even a blank same-named column is NOT filled in place — the ext
+    // value is surfaced as `ext.<key>` so the displayed name matches the
+    // queryable nPL path (filling the bare column would query the empty column
+    // on click-to-filter and return nothing).
     #[test]
-    fn ext_fills_blank_or_absent_column() {
+    fn ext_always_namespaces_not_fills_blank_column() {
         let mut o = obj(json!({ "user": "", "ext": { "user": "jdoe", "host": "ws1" } }));
         flatten_ext_field_in_place(&mut o);
-        assert_eq!(o["user"], json!("jdoe"), "blank column should be filled by ext");
-        assert_eq!(o["host"], json!("ws1"));
-        assert!(!o.contains_key("ext.user"), "should not namespace when column was blank");
+        assert_eq!(o["ext.user"], json!("jdoe"), "ext value should land at ext.<key>");
+        assert_eq!(o["user"], json!(""), "blank column should stay untouched");
+        assert_eq!(o["ext.host"], json!("ws1"));
     }
 
     #[test]
     fn ext_string_form_is_parsed_and_flattened() {
         let mut o = obj(json!({ "ext": "{\"foo\":\"bar\"}" }));
         flatten_ext_field_in_place(&mut o);
-        assert_eq!(o["foo"], json!("bar"));
+        assert_eq!(o["ext.foo"], json!("bar"));
         assert!(!o.contains_key("ext"));
     }
 

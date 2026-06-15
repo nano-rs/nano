@@ -149,7 +149,13 @@ function extractKeywordsFromQuery(query: string | undefined): string[] {
   const searchPortion = query.split('|')[0];
   if (!searchPortion.trim()) return [];
 
-  const keywords: string[] = [];
+  // Two tiers of highlight terms:
+  //  • strong — explicit field=value, IN-list, and quoted values. Always
+  //    highlighted, INCLUDING numeric values like status=500 / dest_port=443.
+  //  • weak — bare free-text tokens. Short pure numbers are dropped from this
+  //    tier because they produce noisy false-positive highlights everywhere.
+  const strongKeywords: string[] = [];
+  const weakKeywords: string[] = [];
   const fieldValueRegex = /(\w+)\s*(?:!=|=|<=|>=|<|>)\s*(?:"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|\/((?:\\.|[^/\\])*)\/|(\S+))/g;
   const unescapeQuoted = (value: string): string =>
     value.replace(/\\(["'\\])/g, '$1');
@@ -171,7 +177,7 @@ function extractKeywordsFromQuery(query: string | undefined): string[] {
       // Strip leading/trailing wildcards for highlighting (e.g., *powershell* -> powershell)
       value = value.trim().replace(/^\*+|\*+$/g, '');
       if (value) {
-        keywords.push(value);
+        strongKeywords.push(value);
       }
     }
   }
@@ -189,7 +195,7 @@ function extractKeywordsFromQuery(query: string | undefined): string[] {
     const quotedInRegex = /"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'/g;
     while ((inMatch = quotedInRegex.exec(valueList)) !== null) {
       const val = inMatch[1] || inMatch[2];
-      if (val && val.trim()) keywords.push(unescapeQuoted(val.trim()));
+      if (val && val.trim()) strongKeywords.push(unescapeQuoted(val.trim()));
     }
     return ' ';
   });
@@ -202,7 +208,7 @@ function extractKeywordsFromQuery(query: string | undefined): string[] {
   while ((match = quotedRegex.exec(withoutOperators)) !== null) {
     const phrase = match[1] || match[2];
     if (phrase && phrase.trim()) {
-      keywords.push(unescapeQuoted(phrase.trim()));
+      strongKeywords.push(unescapeQuoted(phrase.trim()));
     }
   }
 
@@ -212,17 +218,21 @@ function extractKeywordsFromQuery(query: string | undefined): string[] {
     .replace(/[(),]/g, ' ')
     .split(/\s+/)
     .filter(w => w.trim().length > 0);
-  keywords.push(...words);
+  weakKeywords.push(...words);
 
-  // Filter out noise: *, operators, empty, punctuation, and short pure numbers (e.g. "2", "10")
-  // Short numbers cause excessive false-positive highlights across all results
-  return [...new Set(keywords.filter(k =>
-    k.length > 0 &&
-    k !== '*' &&
-    !/^[\\'"`]+$/.test(k) &&
-    !/^[=<>!,()]+$/.test(k) &&
-    !/^\d{1,4}$/.test(k)
-  ))];
+  // Shared noise filter: wildcards, empties, pure punctuation.
+  const isNoise = (k: string): boolean =>
+    k.length === 0 ||
+    k === '*' ||
+    /^[\\'"`]+$/.test(k) ||
+    /^[=<>!,()]+$/.test(k);
+
+  // Strong terms highlight as-is (numbers included). Weak (bare) terms also
+  // drop short pure numbers (1–4 digits) to avoid excessive false positives.
+  const strong = strongKeywords.filter(k => !isNoise(k));
+  const weak = weakKeywords.filter(k => !isNoise(k) && !/^\d{1,4}$/.test(k));
+
+  return [...new Set([...strong, ...weak])];
 }
 
 /**
@@ -1982,7 +1992,17 @@ function RawView({
               }`}
               onMouseEnter={() => handleRowMouseEnter(result.id, result.fields?.id as string, result.timestamp, result.fields?.source_type as string | undefined)}
               onMouseLeave={handleRowMouseLeave}
-              onClick={() => handleRowClick(result, virtualRow.index)}
+              onClick={(e) => {
+                // Don't toggle/select the row when the click came from an
+                // interactive child — the message "…" expander, value chips
+                // (Radix menu triggers), copy buttons, etc. Those handle their
+                // own action; without this guard they also fall through to the
+                // row and (in inline mode) toggle the parsed-field breakdown.
+                if ((e.target as HTMLElement).closest('button, a, input, [aria-haspopup], [role="menuitem"], [data-stop-row-toggle]')) {
+                  return;
+                }
+                handleRowClick(result, virtualRow.index);
+              }}
             >
             <div className="px-3 py-2">
                 {/* Timestamp row on top — expand chevron + date */}
@@ -2008,10 +2028,10 @@ function RawView({
                       {shouldTruncate && (
                         <button
                           onClick={(e) => { e.stopPropagation(); expandMessage(result.id); }}
-                          className="text-muted-foreground hover:text-primary cursor-pointer ml-1"
+                          className="ml-1 inline-flex items-center px-1 rounded-sm align-baseline whitespace-nowrap text-muted-foreground hover:text-primary hover:bg-foreground/10 cursor-pointer"
                           title="Expand"
                         >
-                          ...
+                          …
                         </button>
                       )}
                     </div>
@@ -2161,10 +2181,10 @@ function RawView({
                                         {shouldTruncate && (
                                           <button
                                             onClick={(e) => { e.stopPropagation(); setExpandedDetailValues(prev => new Set(prev).add(detailKey)); }}
-                                            className="ml-1 text-muted-foreground hover:text-primary cursor-pointer"
+                                            className="ml-1 inline-flex items-center px-1 rounded-sm align-baseline whitespace-nowrap text-muted-foreground hover:text-primary hover:bg-foreground/10 cursor-pointer"
                                             title="Show full value"
                                           >
-                                            ...
+                                            …
                                           </button>
                                         )}
                                       </div>
