@@ -53,6 +53,14 @@ const MIGRATION_133: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../clickhouse/133_dict_staging_indirection.sql"
 ));
+/// NAN-1473 lengthened ip_enrichment_dict's IP_TRIE reload LIFETIME (5–10min →
+/// 6–12h) to cut rebuild churn on memory-tight boxes. The dict body is
+/// otherwise byte-identical to 133; this migration is the canonical definition
+/// for the dicts in `DICTS_REDEFINED_BY_136`.
+const MIGRATION_136: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../clickhouse/136_lengthen_ip_enrichment_dict_lifetime.sql"
+));
 
 /// The first numbered migration written under the NAN-1404 rule. Migrations
 /// before this predate it and are immutable (editing them trips
@@ -70,6 +78,12 @@ const STAGED_DICTS: &[&str] = &[
     "nanosiem.custom_ioc_enrichment_dict",
     "nanosiem.user_registry_dict",
 ];
+
+/// Staged dicts whose canonical CREATE OR REPLACE moved off migration 133 to a
+/// later migration (only the LIFETIME changed — NAN-1473). For these, init.sql
+/// must match the LATER migration; their staging table + refresh MV still match
+/// 133 (those objects were not touched). Migration 133 stays immutable history.
+const DICTS_REDEFINED_BY_136: &[&str] = &["nanosiem.ip_enrichment_dict"];
 
 /// The prevalence CACHE dicts keep migration-130 key-pushdown sources and
 /// must NEVER grow staging/refresh objects (NAN-1440 — the full-keyspace
@@ -297,12 +311,28 @@ fn migration_133_matches_init_definitions() {
     let udm_dicts = create_dictionary_statements(UDM_INIT);
     let ocsf_dicts = create_dictionary_statements(OCSF_INIT);
     let mig_dicts = create_dictionary_statements(MIGRATION_133);
+    let mig136_dicts = create_dictionary_statements(MIGRATION_136);
+
+    // Migration 136 must redefine exactly the dicts it claims to (catches an
+    // accidental extra/missing CREATE OR REPLACE).
+    assert_eq!(
+        mig136_dicts.keys().map(String::as_str).collect::<Vec<_>>(),
+        DICTS_REDEFINED_BY_136.to_vec(),
+        "migration 136 redefines a different dict set than DICTS_REDEFINED_BY_136"
+    );
 
     for name in STAGED_DICTS {
+        // Redefined dicts' canonical body lives in the later migration; the
+        // rest stay pinned to 133. init.sql must match whichever is canonical.
+        let (canonical, source) = if DICTS_REDEFINED_BY_136.contains(name) {
+            (mig136_dicts.get(*name), "migration 136")
+        } else {
+            (mig_dicts.get(*name), "migration 133")
+        };
         assert_eq!(
-            mig_dicts.get(*name),
+            canonical,
             udm_dicts.get(*name),
-            "{name} differs between migration 133 and clickhouse/init.sql"
+            "{name} differs between {source} and clickhouse/init.sql"
         );
     }
     for name in PUSHDOWN_DICTS {

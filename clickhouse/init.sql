@@ -138,7 +138,7 @@ SOURCE(CLICKHOUSE(
     DB 'nanosiem'
     QUERY 'SELECT network, country, country_code, continent, continent_code, asn, as_name, as_domain FROM nanosiem.ip_enrichment_dict_staging'
 ))
-LIFETIME(MIN 300 MAX 600)
+LIFETIME(MIN 21600 MAX 43200) -- 6–12h: near-static IPinfo geo/ASN; freshness is the staging MV's job (NAN-1473)
 LAYOUT(IP_TRIE())
 -- The dict load runs the source QUERY as the nanosiem user, which inherits the
 -- `default` profile's max_result_rows=1M / max_result_bytes=1G caps (result_overflow_mode=throw).

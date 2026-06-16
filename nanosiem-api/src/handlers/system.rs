@@ -376,8 +376,10 @@ pub async fn get_system_config(
 
     let is_managed = state.config.deployment_mode.is_managed();
 
-    // Derive api_keys_editable from tier limits (only Hobby restricts API access),
-    // not deployment mode. Fall back to true if tier lookup fails (fail open).
+    // Derive api_keys_editable from tier limits, not deployment mode. As of
+    // NAN-1472 all tiers grant Full API access, so this is effectively always
+    // true for enforced tiers; kept tier-driven in case gating ever returns.
+    // Fall back to true if tier lookup fails (fail open).
     let api_keys_editable = match nanosiem_core::TierSettings::new(state.pool.clone())
         .get_tier_limits()
         .await

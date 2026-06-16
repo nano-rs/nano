@@ -193,7 +193,8 @@ impl TierLimits {
                 max_team_members: Some(3),
                 max_daily_gb: Some(2.0),
                 max_eps: Some(30),
-                api_access: ApiAccessLevel::None,
+                // NAN-1472: API access is available on all tiers (not plan-gated).
+                api_access: ApiAccessLevel::Full,
                 sso_enabled: false,
                 ha_enabled: false,
                 ai_credits_per_month: Some(3_000),
@@ -206,7 +207,8 @@ impl TierLimits {
                 max_team_members: Some(8),
                 max_daily_gb: Some(5.0),
                 max_eps: Some(75),
-                api_access: ApiAccessLevel::None,
+                // NAN-1472: API access is available on all tiers (not plan-gated).
+                api_access: ApiAccessLevel::Full,
                 sso_enabled: false,
                 ha_enabled: false,
                 ai_credits_per_month: Some(10_000),
@@ -874,7 +876,7 @@ mod tests {
         assert_eq!(limits.max_team_members, Some(3));
         assert_eq!(limits.max_daily_gb, Some(2.0));
         assert_eq!(limits.max_eps, Some(30));
-        assert_eq!(limits.api_access, ApiAccessLevel::None);
+        assert_eq!(limits.api_access, ApiAccessLevel::Full); // NAN-1472: API access on all tiers
         assert!(!limits.sso_enabled);
         assert!(!limits.ha_enabled);
         assert_eq!(limits.ai_credits_per_month, Some(3_000));
@@ -890,7 +892,7 @@ mod tests {
         assert_eq!(limits.max_team_members, Some(8));
         assert_eq!(limits.max_daily_gb, Some(5.0));
         assert_eq!(limits.max_eps, Some(75));
-        assert_eq!(limits.api_access, ApiAccessLevel::None);
+        assert_eq!(limits.api_access, ApiAccessLevel::Full); // NAN-1472: API access on all tiers
         assert!(!limits.sso_enabled);
         assert!(!limits.ha_enabled);
         assert_eq!(limits.ai_credits_per_month, Some(10_000));
@@ -978,9 +980,10 @@ mod tests {
 
     #[test]
     fn test_api_access() {
+        // NAN-1472: API access is available on all tiers, including Hobby.
         let hobby = TierLimits::for_tier(OrganizationTier::Hobby);
-        assert!(check_api_write_access(&hobby).is_err());
-        assert!(check_api_access(&hobby).is_err());
+        assert!(check_api_write_access(&hobby).is_ok());
+        assert!(check_api_access(&hobby).is_ok());
 
         let growth = TierLimits::for_tier(OrganizationTier::Growth);
         assert!(check_api_write_access(&growth).is_ok());
