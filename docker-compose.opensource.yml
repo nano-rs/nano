@@ -274,6 +274,9 @@ services:
       NANOSIEM_DEV_MODE: ${NANOSIEM_DEV_MODE:-false}
       API_HOST: 0.0.0.0
       API_PORT: "3000"
+      # Storage schema profile (udm | ocsf). Fixed at install time by install.sh.
+      # Must match nano-search or the two services read different CH tables.
+      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-udm}
       RUST_LOG: ${RUST_LOG:-info}
       # Parser config delivery — api writes here, vector reads from same volume.
       VECTOR_CONFIG_DIR: /app/config/vector
@@ -341,6 +344,10 @@ services:
       NANOSIEM_DEV_MODE: ${NANOSIEM_DEV_MODE:-false}
       JOBS_PORT: "3003"
       LEADER_ELECTION_ENABLED: "true"
+      # Storage schema profile (udm | ocsf). Must match nano-api/nano-search —
+      # the detection runner and repo sync resolve the rules repo + target
+      # table from this, so a mismatch syncs the wrong rules.
+      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-udm}
       RUST_LOG: ${RUST_LOG:-info}
       VECTOR_CONFIG_DIR: /app/config/vector
       VECTOR_SOURCES_RUNTIME_PATH: /etc/vector/dynamic
@@ -402,6 +409,8 @@ services:
       CORS_ORIGINS: ${BASE_URL:-http://localhost}
       AUTH_ENABLED: "true"
       NANOSIEM_DEV_MODE: ${NANOSIEM_DEV_MODE:-false}
+      # Storage schema profile (udm | ocsf). Must match nano-api (above).
+      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-udm}
       REDIS_URL: redis://dragonfly:6379
       RUST_LOG: ${RUST_LOG:-info}
       LOG_FORMAT: ${LOG_FORMAT:-}

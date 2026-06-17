@@ -76,8 +76,9 @@ when it finishes.
 **Minimum host:** 2 vCPU, 4 GB RAM — the lowest stable spec, suitable for up to ~10 GB/day of ingest. Below this, ClickHouse and the API will OOM under load.
 
 For non-interactive installs, pre-set `NANO_ADMIN_EMAIL`,
-`NANO_ADMIN_NAME`, `NANO_ADMIN_PASSWORD`, and `NANO_BASE_URL` before
-piping. See [`.env.opensource.example`](./.env.opensource.example) for
+`NANO_ADMIN_NAME`, `NANO_ADMIN_PASSWORD`, `NANO_BASE_URL`, and optionally
+`NANO_SCHEMA_PROFILE` (`udm` | `ocsf`, see [below](#schema-profile-udm-or-ocsf))
+before piping. See [`.env.opensource.example`](./.env.opensource.example) for
 the full env-var surface.
 
 ### HTTPS / TLS
@@ -102,6 +103,36 @@ nginx serves HTTPS on :443 and redirects :80 → :443. Set `BASE_URL=https://you
 in `.env` so login cookies get the `Secure` flag. Renew certs out of band and
 `docker compose ... restart nginx` to pick them up. See
 [`config/nginx/ssl/README.md`](./config/nginx/ssl/README.md) for details.
+
+## Schema profile: UDM or OCSF
+
+At install time nano asks which storage schema you want — and it's largely a
+matter of preference:
+
+- **UDM** (Unified Data Model) — nano's native schema. Short, explicit field
+  names (`src_ip`, `dest_ip`, `process_name`, …) comparable to Splunk's Common
+  Information Model (CIM). This is the default and the path of least
+  resistance: the broadest out-of-the-box parser and detection coverage, and
+  the terser field names most analysts already have in muscle memory.
+- **OCSF** (Open Cybersecurity Schema Framework) — the open, vendor-neutral
+  standard schema. Choose it if you're standardizing on OCSF across tools, feed
+  an OCSF-native data lake, or simply prefer the open spec. Same engine, same
+  nPL, same UI — events land in OCSF-shaped tables instead.
+
+Both run the identical search, detection, and triage stack; the difference is
+the field universe your events are stored and queried in. Pick whichever
+matches how you think about your data (or how the rest of your pipeline is
+shaped) — there's no wrong answer for a fresh deployment.
+
+```sh
+# Interactive install prompts for this. To preset it (e.g. non-interactive):
+NANO_SCHEMA_PROFILE=ocsf curl -fsSL https://get.nano.rs | bash
+```
+
+> **Pick once.** The schema profile is fixed at first install. It selects the
+> ClickHouse tables, parsers, and fields the whole stack runs against, so it
+> can't be switched after you've ingested data without a full re-ingest into a
+> fresh deployment. Defaults to `udm` if unset.
 
 ## What's in the box
 
@@ -183,9 +214,8 @@ Full documentation: **[nano.rs/docs](https://nano.rs/docs/getting-started/first-
 - `nanosiem-api` — rules, alerts, settings, ingestion, OpenAPI at `/swagger-ui`
 - `nanosiem-search` — query execution, field stats, log fetch
 - `nanosiem-jobs` — scheduled detection runner, repository sync
-- Both Postgres + ClickHouse required for full features. The DualPool
-  abstraction lets services degrade to Postgres-only when ClickHouse is
-  briefly unavailable.
+- Both Postgres + ClickHouse are required. The DualPool abstraction wires
+  the two together; boot fails fast if either is unreachable.
 
 ## Documentation
 
