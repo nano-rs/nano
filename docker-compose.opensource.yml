@@ -163,6 +163,9 @@ services:
       CLICKHOUSE_ADMIN_USER: nanosiem_admin
       CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD}
       CLICKHOUSE_SELF_USER: nanosiem
+      # NAN-1476: must match api/search/jobs — when ocsf, the migrator applies
+      # the clickhouse/ocsf/init.sql overlay so ocsf_logs exists before boot.
+      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-udm}
       # The migrator substitutes these into {pg_dict_*} placeholders in
       # clickhouse/init.sql so the PG-sourced dictionaries can authenticate
       # without hardcoded creds (NAN-807 bug #3).

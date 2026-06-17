@@ -344,7 +344,20 @@ impl ClickHouseMigrator {
         rows.len()
     }
 
-    pub async fn run_init_sql(&mut self, init_sql: &str) -> Result<(), ClickHouseMigrateError> {
+    /// Shared implementation for `run_init_sql` (the primary schema) and
+    /// `run_overlay_init_sql` (profile overlays like OCSF). `version_key` is the
+    /// `_migrations` row the SHA-256 idempotency hash is stored under, `label`
+    /// is the human name used in logs, and `seed_baseline` controls whether the
+    /// numbered-migration baseline is seeded afterward (only the primary init
+    /// does this — an overlay merely adds profile-specific objects on top of an
+    /// already-seeded schema).
+    async fn run_init_sql_inner(
+        &mut self,
+        init_sql: &str,
+        version_key: &str,
+        label: &str,
+        seed_baseline: bool,
+    ) -> Result<(), ClickHouseMigrateError> {
         let is_cloud = self.detect_cloud().await?;
         let cluster_name = self.detect_cluster().await?;
 
@@ -354,8 +367,8 @@ impl ClickHouseMigrator {
             _ => String::new(),
         };
 
-        // Check if init.sql has changed since last run by comparing SHA-256 hashes.
-        // The hash is stored in the _migrations table under version '__init_sql'.
+        // Check if the script has changed since last run by comparing SHA-256
+        // hashes. The hash is stored in the _migrations table under version_key.
         use sha2::{Sha256, Digest};
         let hash = hex::encode(Sha256::digest(init_sql.as_bytes()));
 
@@ -364,8 +377,8 @@ impl ClickHouseMigrator {
         let stored_hash: Option<String> = self
             .client
             .query(&format!(
-                "SELECT checksum FROM {}._migrations WHERE version = '__init_sql' LIMIT 1",
-                self.database
+                "SELECT checksum FROM {}._migrations WHERE version = '{}' LIMIT 1",
+                self.database, version_key
             ))
             .fetch_all::<String>()
             .await
@@ -373,11 +386,11 @@ impl ClickHouseMigrator {
             .and_then(|rows| rows.into_iter().next());
 
         if stored_hash.as_deref() == Some(hash.as_str()) {
-            tracing::info!("init.sql unchanged (hash match) — skipping{}", mode_label);
+            tracing::info!("{} unchanged (hash match) — skipping{}", label, mode_label);
             return Ok(());
         }
 
-        tracing::info!("Running init.sql{}", mode_label);
+        tracing::info!("Running {}{}", label, mode_label);
 
         // NAN-788: strip `--` line comments BEFORE substitution so a generated
         // password containing `--` can't be misread as a comment start. See
@@ -518,35 +531,63 @@ impl ClickHouseMigrator {
             }
         }
 
-        tracing::info!("Init SQL completed successfully");
+        tracing::info!("{} completed successfully", label);
 
-        // Store the hash so we can skip init.sql on next startup
+        // Store the hash so we can skip this script on next startup
         let upsert_sql = format!(
-            "INSERT INTO {}._migrations (version, name, checksum) VALUES ('__init_sql', 'init.sql', '{}')",
-            self.database, hash
+            "INSERT INTO {}._migrations (version, name, checksum) VALUES ('{}', '{}', '{}')",
+            self.database, version_key, label, hash
         );
         // Use ALTER + DELETE for replicated tables (no REPLACE INTO in ClickHouse)
         let delete_sql = format!(
-            "ALTER TABLE {}._migrations DELETE WHERE version = '__init_sql'",
-            self.database
+            "ALTER TABLE {}._migrations DELETE WHERE version = '{}'",
+            self.database, version_key
         );
         // Best-effort: don't fail startup if hash storage fails
         let _ = self.client.query(&delete_sql).execute().await;
         if let Err(e) = self.client.query(&upsert_sql).execute().await {
-            tracing::warn!("Failed to store init.sql hash: {} — next startup will re-run init.sql", e);
+            tracing::warn!("Failed to store {} hash: {} — next startup will re-run it", label, e);
         }
 
         // Seed baseline migrations on fresh deployments so the runner
-        // won't try to re-apply migrations already baked into init.sql
-        let seeded = self.seed_baseline_migrations().await?;
-        if seeded > 0 {
-            tracing::info!(
-                "Fresh deployment detected — seeded {} baseline migrations",
-                seeded
-            );
+        // won't try to re-apply migrations already baked into init.sql.
+        // Overlays skip this — the primary init already seeded the baseline.
+        if seed_baseline {
+            let seeded = self.seed_baseline_migrations().await?;
+            if seeded > 0 {
+                tracing::info!(
+                    "Fresh deployment detected — seeded {} baseline migrations",
+                    seeded
+                );
+            }
         }
 
         Ok(())
+    }
+
+    /// Run the primary `init.sql` schema: hash-tracked under `__init_sql` and
+    /// followed by baseline-migration seeding. The canonical entry point used
+    /// by every deployment regardless of schema profile.
+    pub async fn run_init_sql(&mut self, init_sql: &str) -> Result<(), ClickHouseMigrateError> {
+        self.run_init_sql_inner(init_sql, "__init_sql", "init.sql", true)
+            .await
+    }
+
+    /// Apply a profile-overlay init script (e.g. `clickhouse/ocsf/init.sql`) on
+    /// top of the primary schema. Tracked under its own `version_key` so it
+    /// never clobbers the `__init_sql` hash, and does NOT seed baseline
+    /// migrations — the overlay only adds profile-specific objects (OCSF
+    /// tables/MVs) and relies on the shared dictionaries/`signals` already
+    /// created by `run_init_sql` + the numbered migrations. Must run AFTER
+    /// those so the overlay's `dictGet`-backed columns resolve.
+    pub async fn run_overlay_init_sql(
+        &mut self,
+        init_sql: &str,
+        version_key: &str,
+        label: &str,
+    ) -> Result<(), ClickHouseMigrateError> {
+        self.run_init_sql_inner(init_sql, version_key, label, false)
+            .await
     }
 
     /// Load migrations from a directory

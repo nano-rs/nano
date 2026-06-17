@@ -28,6 +28,10 @@
 //! - `CLICKHOUSE_ADMIN_USER`     — admin user with DDL permissions (preferred)
 //! - `CLICKHOUSE_ADMIN_PASSWORD` — admin password
 //! - `CLICKHOUSE_MIGRATIONS_DIR` — defaults to `./clickhouse`
+//! - `NANO_SCHEMA_PROFILE`       — `udm` (default) | `ocsf`. When `ocsf`, the
+//!   OCSF table overlay `<CLICKHOUSE_MIGRATIONS_DIR>/ocsf/init.sql` is applied
+//!   after the shared init + numbered migrations (NAN-1476). Must match the
+//!   value the api/search/jobs binaries run with.
 //! - `CLICKHOUSE_ENTERPRISE_MIGRATIONS_DIR` — defaults to
 //!   `./clickhouse-enterprise`. Only consulted when this binary is built
 //!   with `--features enterprise`. Today the directory is empty and the
@@ -132,6 +136,32 @@ async fn run() -> Result<()> {
         tracing::info!("Applied {} ClickHouse migration(s)", count);
     } else {
         tracing::info!("ClickHouse migrations up to date");
+    }
+
+    // NAN-1476: when the deployment runs the OCSF schema profile, apply the
+    // OCSF table overlay (`<migrations_dir>/ocsf/init.sql`) AFTER the shared
+    // init.sql + numbered migrations. Those create the dictionaries and
+    // `signals` table that the OCSF tables' `dictGet`-backed MATERIALIZED
+    // columns depend on (CH validates dict sources at CREATE TABLE time), so
+    // the overlay must run last. Without this, `ocsf_logs` is never created and
+    // api/jobs/search fail-fast boot validation and crash-loop. The overlay is
+    // hash-tracked under its own `__ocsf_init_sql` key so it never clobbers the
+    // primary `__init_sql` hash. UDM deployments skip this entirely.
+    let schema_raw = std::env::var(nanosiem_core::schema::SCHEMA_PROFILE_ENV).unwrap_or_default();
+    let schema_id = nanosiem_core::schema::SchemaId::from_env_str(&schema_raw)
+        .map_err(|e| anyhow::anyhow!("invalid {}: {e}", nanosiem_core::schema::SCHEMA_PROFILE_ENV))?;
+    if matches!(schema_id, nanosiem_core::schema::SchemaId::Ocsf) {
+        let ocsf_init_path = migrations_dir.join("ocsf").join("init.sql");
+        tracing::info!(
+            "OCSF schema profile active — applying OCSF overlay {}",
+            ocsf_init_path.display()
+        );
+        let ocsf_init_sql = std::fs::read_to_string(&ocsf_init_path)
+            .with_context(|| format!("reading {}", ocsf_init_path.display()))?;
+        migrator
+            .run_overlay_init_sql(&ocsf_init_sql, "__ocsf_init_sql", "ocsf/init.sql")
+            .await
+            .context("running OCSF overlay init.sql")?;
     }
 
     // NAN-747 Phase 6: enterprise overlay only on enterprise builds. The
