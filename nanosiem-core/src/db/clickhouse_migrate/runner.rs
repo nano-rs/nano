@@ -52,6 +52,18 @@ fn ensure_distributed_ddl_timeout(sql: &str) -> String {
         return sql.to_string();
     }
 
+    // NAN-1487: `ALTER TABLE … MODIFY REFRESH …` (refreshable-MV cadence
+    // reschedules, e.g. migration 137) is an ALTER TABLE form whose trailing
+    // SETTINGS clause binds to the MV's refresh/table settings, NOT query-level
+    // settings — so a `distributed_ddl_task_timeout` there is rejected as
+    // UNKNOWN_SETTING (Code 115). It only surfaces on clustered tenants
+    // (Saturn): the cluster transform adds `ON CLUSTER`, which is the trigger
+    // for injection; single-node boxes never hit it. These reschedules are
+    // metadata-only and finish inside the default timeout, so skip injection.
+    if trimmed_upper.contains("MODIFY REFRESH") {
+        return sql.to_string();
+    }
+
     // Find a top-level SETTINGS clause (not inside parens — e.g. CREATE TABLE
     // column defs / TTL / ENGINE() args may contain `SETTINGS` as a keyword
     // for the engine config; we only want to amend the trailing query-level
@@ -847,6 +859,26 @@ mod tests {
                 ensure_distributed_ddl_timeout(sql),
                 sql,
                 "non-table DDL should be left untouched: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn modify_refresh_on_cluster_is_not_amended() {
+        // NAN-1487 repro: migration 137 reschedules refreshable-MV cadences.
+        // The cluster transform makes each `ON CLUSTER`, and an injected
+        // `SETTINGS distributed_ddl_task_timeout = 900` binds to the MV's
+        // refresh settings → CH rejects it as UNKNOWN_SETTING. Must stay
+        // verbatim despite being an `ALTER TABLE … ON CLUSTER` statement.
+        let cases = [
+            "ALTER TABLE nanosiem.ip_enrichment_dict_refresh ON CLUSTER 'default' MODIFY REFRESH EVERY 6 HOUR",
+            "ALTER TABLE nanosiem.user_registry_dict_refresh ON CLUSTER 'default' MODIFY REFRESH EVERY 1 HOUR",
+        ];
+        for sql in cases {
+            assert_eq!(
+                ensure_distributed_ddl_timeout(sql),
+                sql,
+                "MODIFY REFRESH must not get a query-level SETTINGS clause: {sql}"
             );
         }
     }
