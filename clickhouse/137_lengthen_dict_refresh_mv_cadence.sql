@@ -1,0 +1,64 @@
+-- Migration: lengthen the five full-reload dict-refresh MV cadences (NAN-1482).
+--
+-- WHY: migration 133 (NAN-1407) moved each full-reload dictionary's heavy
+-- aggregation off the dict LOAD path into a refreshable MV that rebuilds a
+-- *_dict_staging table on a fixed cadence. Those cadences (ip / ioc /
+-- custom_ioc / user_registry @ REFRESH EVERY 5 MINUTE, custom_enrichment @ 10
+-- MINUTE) were picked to preserve the old LIFETIME-driven freshness — but the
+-- refresh itself is the expensive part. ip_enrichment_dict_refresh fully
+-- re-aggregates the ENTIRE ip_enrichments table (~3.59M rows on a central
+-- aggregator tenant, 8 argMax states) every 5 minutes — ~288x/day — over
+-- IPinfo Lite ranges the enrichment scheduler syncs at most DAILY
+-- (default_sync_interval_hours = 24). That recurring GROUP BY is the dominant
+-- ClickHouse memory consumer on memory-tight compose boxes and the thing that
+-- OOMs (Code 241) under a constrained max_server_memory_usage, taking
+-- coincident async-insert flushes down with it (silent ingest loss, the
+-- NAN-1404 class). Migration 136 (NAN-1473) lengthened the ip_enrichment_dict
+-- LIFETIME 5–10min → 6–12h, but LIFETIME only governs how often the dict
+-- re-reads the (trivial) `SELECT … FROM staging` — the MV that REBUILDS
+-- staging still ran every 5 minutes, so the heavy aggregation cadence was
+-- unchanged. This migration fixes the cadence itself.
+--
+-- CADENCE (new staleness budget per dict = refresh cadence + dict LIFETIME):
+--   * ip_enrichment      5 MIN  → 6 HOUR. THE memory hog (IP_TRIE over ~3.59M
+--     IPinfo Lite ranges). Geo/ASN data is near-static and the source syncs
+--     daily, so a 6h staging refresh is ample — 98% fewer heavy aggregations
+--     (288 → 4 per day), and the OOM trigger is gone. Pairs with the 6–12h
+--     dict LIFETIME from 136.
+--   * ioc_enrichment     5 MIN  → 1 HOUR ┐ small HASHED dicts whose rebuilds are
+--   * custom_ioc         5 MIN  → 1 HOUR │ cheap, so this is churn reduction,
+--   * custom_enrichment 10 MIN  → 1 HOUR │ NOT a memory fix. 1h bounds the
+--   * user_registry      5 MIN  → 1 HOUR ┘ worst-case freshness lag for new
+--     marketplace/custom IOCs, custom tags, and identity-directory changes to
+--     refresh(1h) + LIFETIME(1–5min for IOC / 5–10min for user_registry) —
+--     acceptable for triage, and these feeds don't sync sub-hourly anyway.
+--
+-- MECHANISM: ALTER TABLE <mv> MODIFY REFRESH EVERY <interval>. CH 26.4 has NO
+-- `CREATE OR REPLACE MATERIALIZED VIEW` (syntax error — REPLACE rejects
+-- MATERIALIZED VIEW); MODIFY REFRESH is the purpose-built, in-place reschedule
+-- and does NOT recreate the MV or touch its *_dict_staging target table, so
+-- there is zero enrichment-data risk and no refresh gap beyond the new
+-- cadence. The cluster transform adds ON CLUSTER fan-out, applying the
+-- reschedule to each replica's per-replica MV (staging tables + MVs are
+-- deliberately per-replica — see migration 133's CLUSTER SHAPE note).
+--
+-- The MVs always exist by the time this runs: fresh bootstraps create them in
+-- clickhouse/init.sql (which runs before numbered migrations and now creates
+-- them at the new intervals directly), existing tenants got them from 133.
+-- clickhouse/ocsf/init.sql has none of these MVs (its only dicts are the
+-- prevalence CACHE family, which keeps key-pushdown sources — NAN-1440). Both
+-- init files stay in lockstep with the migrations (guard test:
+-- nanosiem-core/tests/dict_source_memory_guard.rs). The siem-health staleness
+-- probe (collector.rs) keys off next_refresh_time / status, not a fixed
+-- "last success > 1h" threshold, so it does not false-flag these slower
+-- refreshes (NAN-1482).
+--
+-- Prior migrations are immutable (editing them trips ChecksumMismatch), so
+-- this is a new file. Idempotent: re-running MODIFY REFRESH to the same
+-- interval is a harmless no-op.
+
+ALTER TABLE nanosiem.ip_enrichment_dict_refresh MODIFY REFRESH EVERY 6 HOUR;
+ALTER TABLE nanosiem.ioc_enrichment_dict_refresh MODIFY REFRESH EVERY 1 HOUR;
+ALTER TABLE nanosiem.custom_enrichment_dict_refresh MODIFY REFRESH EVERY 1 HOUR;
+ALTER TABLE nanosiem.custom_ioc_enrichment_dict_refresh MODIFY REFRESH EVERY 1 HOUR;
+ALTER TABLE nanosiem.user_registry_dict_refresh MODIFY REFRESH EVERY 1 HOUR;

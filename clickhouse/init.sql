@@ -101,7 +101,7 @@ ORDER BY network;
 -- data on failure. Runs an initial refresh at CREATE, so fresh installs
 -- populate without a seed.
 CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ip_enrichment_dict_refresh
-REFRESH EVERY 5 MINUTE TO nanosiem.ip_enrichment_dict_staging AS
+REFRESH EVERY 6 HOUR TO nanosiem.ip_enrichment_dict_staging AS
 SELECT network, argMax(country, updated_at) AS country, argMax(country_code, updated_at) AS country_code, argMax(continent, updated_at) AS continent, argMax(continent_code, updated_at) AS continent_code, argMax(asn, updated_at) AS asn, argMax(as_name, updated_at) AS as_name, argMax(as_domain, updated_at) AS as_domain
 FROM nanosiem.ip_enrichments
 GROUP BY network
@@ -166,7 +166,7 @@ ENGINE = MergeTree /* nano:keep-local-engine */
 ORDER BY ioc_value;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ioc_enrichment_dict_refresh
-REFRESH EVERY 5 MINUTE TO nanosiem.ioc_enrichment_dict_staging AS
+REFRESH EVERY 1 HOUR TO nanosiem.ioc_enrichment_dict_staging AS
 SELECT
     key_value AS ioc_value,
     anyLast(key_type) AS ioc_type,
@@ -365,7 +365,7 @@ ENGINE = MergeTree /* nano:keep-local-engine */
 ORDER BY (key_type, key_value);
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.custom_enrichment_dict_refresh
-REFRESH EVERY 10 MINUTE TO nanosiem.custom_enrichment_dict_staging AS
+REFRESH EVERY 1 HOUR TO nanosiem.custom_enrichment_dict_staging AS
 SELECT
     key_type,
     key_value,
@@ -416,7 +416,7 @@ ENGINE = MergeTree /* nano:keep-local-engine */
 ORDER BY (key_type, key_value);
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.custom_ioc_enrichment_dict_refresh
-REFRESH EVERY 5 MINUTE TO nanosiem.custom_ioc_enrichment_dict_staging AS
+REFRESH EVERY 1 HOUR TO nanosiem.custom_ioc_enrichment_dict_staging AS
 SELECT
     key_type,
     key_value,
@@ -656,7 +656,7 @@ ENGINE = MergeTree /* nano:keep-local-engine */
 ORDER BY username;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.user_registry_dict_refresh
-REFRESH EVERY 5 MINUTE TO nanosiem.user_registry_dict_staging AS
+REFRESH EVERY 1 HOUR TO nanosiem.user_registry_dict_staging AS
 SELECT * FROM (SELECT username_lc AS username, argMax(email, version) AS email, argMax(display_name, version) AS display_name, argMax(department, version) AS department, argMax(title, version) AS title, argMax(manager_upn, version) AS manager_upn, argMax(manager_display_name, version) AS manager_display_name, argMax(company, version) AS company, argMax(arrayStringConcat(groups, ','), version) AS groups, argMax(account_enabled, version) AS account_enabled, argMax(account_status, version) AS account_status, argMax(mfa_enabled, version) AS mfa_enabled, argMax(employee_type, version) AS employee_type, argMax(country, version) AS country, argMax(office_location, version) AS office_location FROM nanosiem.user_registry WHERE username_lc != '' GROUP BY username_lc) WHERE account_status != 'deleted'
 SETTINGS max_bytes_before_external_group_by = 1000000000, max_memory_usage = 2500000000, max_threads = 2;
 

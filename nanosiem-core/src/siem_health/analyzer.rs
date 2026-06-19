@@ -397,8 +397,8 @@ fn insert_integrity_recommendations(ii: &InsertIntegrityMetrics) -> Vec<Recommen
         recs.push(Recommendation {
             title: format!("Enrichment dictionary refresh is failing or stale: {views}"),
             description: format!(
-                "The dictionary-staging refresh views ({views}) are failing or haven't \
-                 succeeded in over an hour (system.view_refreshes). Ingestion is NOT \
+                "The dictionary-staging refresh views ({views}) are failing, disabled, or \
+                 overdue past their refresh schedule (system.view_refreshes). Ingestion is NOT \
                  affected — the dictionaries keep serving the last good staging snapshot \
                  (NAN-1407) — but enrichment values (GeoIP/IOC/identity/prevalence) are \
                  drifting stale. Inspect system.view_refreshes.exception, fix the \

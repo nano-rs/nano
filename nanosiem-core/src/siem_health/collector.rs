@@ -255,25 +255,32 @@ async fn collect_insert_integrity(ch: &ClickHouseClient) -> InsertIntegrityMetri
         }
     }
 
-    // 4) Failing/stale dictionary-staging refreshes (NAN-1407). The
-    // *_dict_refresh refreshable MVs repopulate the *_dict_staging tables the
-    // enrichment dicts load from; a broken refresh keeps serving the last
-    // good snapshot (rows still land — that's the design), but the staleness
-    // must surface somewhere. Flag exception != '' (refresher failing,
-    // retrying on schedule) or a last success > 1h old (wedged/disabled
-    // refresher; longest cadence is 10 min, so 1h ≈ 6 missed cycles — no
-    // flapping on slow refreshes, same-day detection of stuck ones). A view
-    // that has NEVER succeeded has NULL last_success_time and a non-empty
-    // exception once its first refresh fails, so the exception clause covers
-    // it; the brief NULL-and-no-exception window right after CREATE is not
-    // flagged. 26.4 note: system.view_refreshes has NO last_refresh_result
-    // column — exception/retry/last_success_time are the signal columns.
+    // 4) Failing / disabled / overdue dictionary-staging refreshes (NAN-1407;
+    // cadence-widened in NAN-1482). The *_dict_refresh refreshable MVs
+    // repopulate the *_dict_staging tables the enrichment dicts load from; a
+    // broken refresh keeps serving the last good snapshot (rows still land —
+    // that's the design), but the staleness must surface somewhere. Cadence now
+    // varies per view (ip_enrichment 6h, the other four 1h — NAN-1482), so the
+    // old fixed "last success > 1h" threshold would false-flag the slow views
+    // EVERY cycle. Key off the SCHEDULE instead: flag exception != '' (refresher
+    // failing, retrying), status = 'Disabled' (refresher stopped), or
+    // next_refresh_time more than 1h in the past (a scheduled refresh came due
+    // and never ran — wedged). A healthy view's next_refresh_time sits in the
+    // FUTURE at any cadence, so this is cadence-independent and never flaps on
+    // the 6h ip_enrichment refresh. A view that has NEVER succeeded carries a
+    // non-empty exception once its first refresh fails (covered); the brief
+    // window right after CREATE (future next_refresh, empty exception) is not
+    // flagged. The reported `age` is last-success staleness, for display. 26.4
+    // note: system.view_refreshes has NO last_refresh_result column —
+    // exception / status / next_refresh_time / last_success_time are the
+    // signal columns.
     let sql = "SELECT view, substring(exception, 1, 300) AS exception, \
                       toUInt64(if(last_success_time IS NULL, 0, \
                                   dateDiff('second', last_success_time, now()))) AS age \
                FROM system.view_refreshes \
                WHERE database = 'nanosiem' AND view LIKE '%\\_dict\\_refresh' \
-                 AND (exception != '' OR last_success_time < now() - INTERVAL 1 HOUR)";
+                 AND (exception != '' OR status = 'Disabled' \
+                      OR next_refresh_time < now() - INTERVAL 1 HOUR)";
     match ch.query(sql).fetch_all::<(String, String, u64)>().await {
         Ok(rows) => {
             m.probes_available = true;

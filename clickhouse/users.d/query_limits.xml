@@ -88,6 +88,24 @@
             <wait_for_async_insert>1</wait_for_async_insert>
             <async_insert_max_data_size>104857600</async_insert_max_data_size>
 
+            <!-- Async-insert flush window — adaptive batching (NAN-1478).
+                 With no explicit busy-timeout, async_insert falls back to
+                 ClickHouse's ~50–200ms default flush, and every flush emits one
+                 part per materialized-view target. A single logs insert fans out
+                 to ~14 prevalence/aggregation MV parts, so a sub-second flush is a
+                 part storm that saturates the BackgroundSchedulePool and stalls
+                 merge-selection (the failure mode behind the Saturn part-backlog
+                 incident; managed tenants run the same window via nano-main
+                 k8s-manifests/clickhouse.ts). Adaptive 2s–10s shrinks toward the
+                 2s floor under sustained insert pressure (bounding the part rate)
+                 and only grows toward 10s when ingest is light. The in-flight
+                 buffer is still capped by async_insert_max_data_size above, so a
+                 wider window adds no memory cost. Inserts only — analyst SELECTs
+                 are unaffected. -->
+            <async_insert_use_adaptive_busy_timeout>1</async_insert_use_adaptive_busy_timeout>
+            <async_insert_busy_timeout_min_ms>2000</async_insert_busy_timeout_min_ms>
+            <async_insert_busy_timeout_max_ms>10000</async_insert_busy_timeout_max_ms>
+
             <!-- Result Formatting -->
             <output_format_pretty_max_rows>10000</output_format_pretty_max_rows>
 

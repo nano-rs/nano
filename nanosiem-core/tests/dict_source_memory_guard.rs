@@ -32,7 +32,11 @@
 //! 2. Migration 133 (existing deployments) and the init files (fresh
 //!    bootstraps) define byte-equivalent dictionaries, staging tables, and
 //!    refresh MVs (modulo comments/whitespace/CREATE prefix), so the two
-//!    paths converge.
+//!    paths converge. Two fields are canonically redefined by later
+//!    migrations and init.sql tracks those: the ip_enrichment_dict body's
+//!    LIFETIME (migration 136, NAN-1473) and the `*_dict_refresh` MV REFRESH
+//!    cadences (migration 137, NAN-1482) — so refresh MVs are compared modulo
+//!    their REFRESH interval, which migration 137 must set to match init.sql.
 //! 3. Every `*_dict_staging` CREATE TABLE carries the
 //!    `nano:keep-local-engine` marker — without it the cluster transform
 //!    converts the engine to ReplicatedMergeTree, and ClickHouse REFUSES a
@@ -60,6 +64,16 @@ const MIGRATION_133: &str = include_str!(concat!(
 const MIGRATION_136: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../clickhouse/136_lengthen_ip_enrichment_dict_lifetime.sql"
+));
+/// NAN-1482 lengthened the five `*_dict_refresh` MV cadences (ip_enrichment →
+/// 6 HOUR, the other four → 1 HOUR) via `ALTER TABLE … MODIFY REFRESH`. CH 26.4
+/// has no CREATE OR REPLACE for materialized views, so the cadence moves by
+/// ALTER, not a new CREATE. The MV SELECT bodies + staging targets are
+/// unchanged from 133 — only the REFRESH interval moves — so clickhouse/init.sql
+/// matches 133 modulo that interval, which this migration sets.
+const MIGRATION_137: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../clickhouse/137_lengthen_dict_refresh_mv_cadence.sql"
 ));
 
 /// The first numbered migration written under the NAN-1404 rule. Migrations
@@ -175,6 +189,50 @@ fn create_mv_statements(sql: &str) -> BTreeMap<String, String> {
 
 fn create_table_statements(sql: &str) -> BTreeMap<String, String> {
     create_statements(sql, &["CREATE TABLE IF NOT EXISTS ", "CREATE TABLE "])
+}
+
+/// Extract a refreshable MV's `REFRESH EVERY <interval>` from a normalized MV
+/// body (the `EVERY …` portion between `REFRESH EVERY ` and ` TO `), e.g.
+/// `"6 HOUR"`. Returns None for a non-refreshable / `TO`-less MV.
+fn refresh_interval(mv_body: &str) -> Option<String> {
+    let start = mv_body.find("REFRESH EVERY ")? + "REFRESH EVERY ".len();
+    let rest = &mv_body[start..];
+    let end = rest.find(" TO ")?;
+    Some(rest[..end].trim().to_string())
+}
+
+/// Drop the `REFRESH EVERY <interval> ` clause from a normalized MV body so two
+/// MVs that differ ONLY in cadence (NAN-1482) compare equal. Returns the body
+/// unchanged when there is no refresh clause.
+fn strip_refresh(mv_body: &str) -> String {
+    match (mv_body.find("REFRESH EVERY "), mv_body.find(" TO ")) {
+        (Some(s), Some(t)) if t > s => format!("{}{}", &mv_body[..s], &mv_body[t + 1..]),
+        _ => mv_body.to_string(),
+    }
+}
+
+/// Map each `ALTER TABLE <name> MODIFY REFRESH EVERY <interval>` in `sql` to
+/// {name → interval} (e.g. `nanosiem.ip_enrichment_dict_refresh → "6 HOUR"`).
+/// This is how migration 137 recadences the refresh MVs (CH 26.4 has no
+/// CREATE OR REPLACE for MVs).
+fn alter_refresh_intervals(sql: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for stmt in statements(sql) {
+        let norm = normalize(&stmt);
+        let Some(rest) = norm.strip_prefix("ALTER TABLE ") else {
+            continue;
+        };
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+            .collect();
+        let Some(pos) = rest.find("MODIFY REFRESH EVERY ") else {
+            continue;
+        };
+        let interval = rest[pos + "MODIFY REFRESH EVERY ".len()..].trim().to_string();
+        out.insert(name, interval);
+    }
+    out
 }
 
 /// Extract the SOURCE QUERY string literal from a normalized dictionary
@@ -376,6 +434,19 @@ fn migration_133_matches_init_definitions() {
     let ocsf_mvs = create_mv_statements(OCSF_INIT);
     let mig_mvs = create_mv_statements(MIGRATION_133);
 
+    // NAN-1482: the *_dict_refresh MV cadences are canonically set by migration
+    // 137 (ALTER … MODIFY REFRESH), not 133. It must recadence exactly the five
+    // staged refresh MVs and nothing else.
+    let mig137_intervals = alter_refresh_intervals(MIGRATION_137);
+    let mut expected_137: Vec<String> =
+        STAGED_DICTS.iter().map(|n| format!("{n}_refresh")).collect();
+    expected_137.sort();
+    assert_eq!(
+        mig137_intervals.keys().cloned().collect::<Vec<_>>(),
+        expected_137,
+        "migration 137 must ALTER … MODIFY REFRESH exactly the five *_dict_refresh MVs"
+    );
+
     for name in STAGED_DICTS {
         let staging = format!("{name}_staging");
         let refresh = format!("{name}_refresh");
@@ -392,10 +463,23 @@ fn migration_133_matches_init_definitions() {
             udm_tables.get(&staging),
             "{staging} differs between migration 133 and clickhouse/init.sql"
         );
+        // The refresh MV bodies must match modulo the REFRESH cadence: only the
+        // interval moved in 137; the aggregation + staging target are unchanged.
+        let mig_mv = mig_mvs.get(&refresh).expect("refresh MV in migration 133");
+        let udm_mv = udm_mvs
+            .get(&refresh)
+            .expect("refresh MV in clickhouse/init.sql");
         assert_eq!(
-            mig_mvs.get(&refresh),
-            udm_mvs.get(&refresh),
-            "{refresh} differs between migration 133 and clickhouse/init.sql"
+            strip_refresh(mig_mv),
+            strip_refresh(udm_mv),
+            "{refresh} body (excluding REFRESH cadence) differs between migration 133 and clickhouse/init.sql"
+        );
+        // init.sql's cadence must be exactly what migration 137 recadences to,
+        // so fresh bootstraps and upgraded tenants converge on the same interval.
+        assert_eq!(
+            mig137_intervals.get(&refresh),
+            refresh_interval(udm_mv).as_ref(),
+            "{refresh} REFRESH interval in clickhouse/init.sql must match migration 137's MODIFY REFRESH"
         );
     }
     // NAN-1440: the prevalence CACHE dicts must never grow staging/refresh
