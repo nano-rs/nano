@@ -171,6 +171,12 @@ impl AppState {
         let agent_config_registry: Arc<RwLock<Option<Arc<AgentConfigRegistry>>>> =
             Arc::new(RwLock::new(None));
 
+        // Stable per-pod identity for cross-pod claim coordination (detection
+        // scheduler, and NAN-1492 re-triage debounce). Computed here (ahead of
+        // the shadow-investigation wiring that now consumes it) and stored on
+        // AppState below.
+        let node_id = generate_node_id();
+
         // Create shadow investigation service for auto-triage on new case creation.
         // Phase 3.2 (NAN-744): cases lifted to enterprise — the whole shadow
         // investigation hook only wires up in enterprise builds. Open-core
@@ -184,12 +190,26 @@ impl AppState {
                     agent_config_registry.clone(),
                 ),
             );
-            Arc::new(ShadowInvestigationService::new(
+            let svc = Arc::new(ShadowInvestigationService::new(
                 pg_pool.clone(),
                 search_service.clone(),
                 shadow_ai_client,
                 3, // max 3 concurrent investigations
-            ))
+            ));
+
+            // NAN-1490: on boot, sweep for shadow investigations that were
+            // `running` when the previous process died and resume them from
+            // their last checkpoint (no credit re-charge). NAN-1488: also sweep
+            // re-triage coordination rows that were left DUE across the restart
+            // (orphaned with no further alert adds) and spawn a worker per due
+            // case. Both are fire-and-forget so startup isn't blocked on them.
+            let sweep = svc.clone();
+            tokio::spawn(async move {
+                sweep.resume_interrupted().await;
+                sweep.sweep_due_coordination().await;
+            });
+
+            svc
         };
 
         // Build the case-grouping hook for enterprise builds. NAN-744 Phase 2.3
@@ -262,7 +282,6 @@ impl AppState {
             ))
         };
 
-        let node_id = generate_node_id();
         #[cfg(feature = "enterprise")]
         let (case_events_tx, _) = tokio::sync::broadcast::channel(256);
 

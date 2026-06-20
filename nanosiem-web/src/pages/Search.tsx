@@ -663,6 +663,9 @@ export function Search() {
           const aiSuggestion = {
             description: result.explanation,
             replacement: result.corrected_query,
+            // Flag when the correction couldn't be validated (NAN-1496) so the
+            // UI can surface an "unverified" badge.
+            unverified: result.validated === false,
           };
           const existing = prev.details?.suggestions || [];
           return {
@@ -3878,6 +3881,15 @@ export function Search() {
                         >
                           {aiSuggestion.replacement}
                         </button>
+                        {aiSuggestion.unverified && (
+                          <Badge
+                            variant="outline"
+                            className="px-1.5 py-0 text-[10px] font-mono uppercase tracking-wide text-amber-400 border-amber-500/40"
+                            title="This correction could not be validated against the schema — review before running."
+                          >
+                            unverified
+                          </Badge>
+                        )}
                         <span className="text-xs text-muted-foreground/60">{aiSuggestion.description}</span>
                       </div>
                     );

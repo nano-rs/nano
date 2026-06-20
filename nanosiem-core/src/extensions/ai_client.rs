@@ -202,8 +202,13 @@ pub trait AiClient: Send + Sync {
     /// which is far more reliable than text parsing.
     ///
     /// `json_schema` is a JSON Schema object describing the expected shape.
-    /// Callers should still validate/clamp the returned values — neither path
-    /// guarantees the model honoured the schema.
+    /// The returned value is shape-validated against the schema (top-level type
+    /// + required fields, via [`validate_structured`]) before it is handed
+    /// back; on a parse or validation failure the model is re-prompted once
+    /// with the specific error, and a terminal failure surfaces as an error.
+    /// Callers must NOT substitute an empty default on `Err` — for an
+    /// investigation agent a malformed response would otherwise masquerade as a
+    /// genuine "nothing found" (NAN-1489).
     async fn complete_structured(
         &self,
         agent_id: AiAgentId<'_>,
@@ -218,15 +223,137 @@ pub trait AiClient: Send + Sync {
             Schema:\n{}",
             serde_json::to_string(json_schema).unwrap_or_default()
         );
-        let raw = self
-            .complete_for_agent(agent_id, messages, &augmented_system)
-            .await?;
-        extract_json_object(&raw).ok_or_else(|| {
-            ExtensionError::AiProvider(format!(
-                "structured completion did not return parseable JSON (got {} chars)",
-                raw.len()
-            ))
-        })
+
+        // Two attempts: the model occasionally returns prose-wrapped or
+        // schema-violating JSON, and feeding the specific error back fixes the
+        // common cases without unbounded cost.
+        let mut convo = messages;
+        let mut last_err = String::new();
+        for _ in 0..MAX_STRUCTURED_ATTEMPTS {
+            let raw = self
+                .complete_for_agent(agent_id, convo.clone(), &augmented_system)
+                .await?;
+            match extract_json_object(&raw) {
+                Some(value) => match validate_structured(&value, json_schema) {
+                    Ok(()) => return Ok(value),
+                    Err(e) => last_err = e,
+                },
+                None => {
+                    last_err =
+                        format!("response was not parseable JSON (got {} chars)", raw.len())
+                }
+            }
+            // Feed the bad turn + a corrective instruction into the retry.
+            convo.push(AiMessage::assistant(raw));
+            convo.push(AiMessage::user(structured_retry_followup(&last_err)));
+        }
+
+        Err(ExtensionError::AiProvider(format!(
+            "structured completion failed validation after {MAX_STRUCTURED_ATTEMPTS} attempts: {last_err}"
+        )))
+    }
+}
+
+/// Maximum attempts for a structured completion (initial + one schema-aware
+/// retry). Shared by the core default impl and the enterprise bridge override
+/// so both paths bound retry cost identically.
+pub const MAX_STRUCTURED_ATTEMPTS: usize = 2;
+
+/// Corrective instruction appended after a malformed or schema-violating
+/// structured response. Fed back to the model on the retry attempt so it can
+/// repair the specific problem rather than guessing.
+pub fn structured_retry_followup(error: &str) -> String {
+    format!(
+        "Your previous response could not be used: {error}. \
+        Respond again with ONLY a single JSON object that matches the required schema — \
+        no prose, no markdown, no code fences."
+    )
+}
+
+/// Lightweight structural validation of an LLM-produced value against a JSON
+/// Schema fragment. This is deliberately NOT a full JSON Schema validator — it
+/// checks the failure modes that actually bite a SIEM agent: a wrong top-level
+/// type (e.g. the model returns an object where an array was required, or vice
+/// versa) and missing required fields, one level deep plus required fields on
+/// array items. `Ok(())` means "the shape looks right", not "fully schema
+/// valid"; callers still clamp/validate individual values. Returns a
+/// human-readable error suitable for feeding back to the model on a retry.
+pub fn validate_structured(value: &Value, schema: &Value) -> Result<(), String> {
+    validate_node(value, schema, "$")
+}
+
+fn validate_node(value: &Value, schema: &Value, path: &str) -> Result<(), String> {
+    if let Some(expected) = schema.get("type").and_then(|t| t.as_str()) {
+        if !type_matches(value, expected) {
+            return Err(format!(
+                "{path}: expected {expected}, got {}",
+                json_type_name(value)
+            ));
+        }
+    }
+
+    // Required object fields must be present and non-null.
+    if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
+        let obj = value.as_object();
+        for req in required {
+            if let Some(key) = req.as_str() {
+                let present = obj
+                    .and_then(|o| o.get(key))
+                    .map(|v| !v.is_null())
+                    .unwrap_or(false);
+                if !present {
+                    return Err(format!("{path}: missing required field '{key}'"));
+                }
+            }
+        }
+    }
+
+    // Recurse into declared object properties that are present, so nested
+    // shape errors (e.g. a wrong-typed field, or array items below) are caught.
+    if let (Some(props), Some(obj)) = (
+        schema.get("properties").and_then(|p| p.as_object()),
+        value.as_object(),
+    ) {
+        for (key, subschema) in props {
+            if let Some(child) = obj.get(key) {
+                validate_node(child, subschema, &format!("{path}.{key}"))?;
+            }
+        }
+    }
+
+    // Array element shape — catches an array of the wrong item type or items
+    // missing their required fields.
+    if let (Some(items_schema), Some(arr)) = (schema.get("items"), value.as_array()) {
+        for (i, item) in arr.iter().enumerate() {
+            validate_node(item, items_schema, &format!("{path}[{i}]"))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn type_matches(value: &Value, expected: &str) -> bool {
+    match expected {
+        "object" => value.is_object(),
+        "array" => value.is_array(),
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "boolean" => value.is_boolean(),
+        "null" => value.is_null(),
+        // Unknown or compound (`["string","null"]`) type spec — don't reject.
+        _ => true,
+    }
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -419,5 +546,179 @@ mod tests {
             .await;
         // Default implementation calls complete_for_agent → complete → Unavailable
         assert!(matches!(result, Err(ExtensionError::Unavailable(_))));
+    }
+
+    #[test]
+    fn validate_structured_accepts_matching_object() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "query": { "type": "string" } },
+            "required": ["query"]
+        });
+        let value = serde_json::json!({ "query": "error | head 5", "reason": "scope" });
+        assert!(validate_structured(&value, &schema).is_ok());
+    }
+
+    #[test]
+    fn validate_structured_rejects_wrong_top_level_type() {
+        // The model returned a bare array where the schema required an object —
+        // exactly the Step-7 wrapping mismatch we want caught, not silently
+        // accepted.
+        let schema = serde_json::json!({ "type": "object", "required": ["queries"] });
+        let value = serde_json::json!([{ "query": "x" }]);
+        let err = validate_structured(&value, &schema).unwrap_err();
+        assert!(err.contains("expected object"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_structured_rejects_missing_required_field() {
+        let schema = serde_json::json!({ "type": "object", "required": ["queries"] });
+        let value = serde_json::json!({ "other": 1 });
+        let err = validate_structured(&value, &schema).unwrap_err();
+        assert!(err.contains("missing required field 'queries'"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_structured_rejects_null_required_field() {
+        // A present-but-null required field is as useless as a missing one.
+        let schema = serde_json::json!({ "type": "object", "required": ["queries"] });
+        let value = serde_json::json!({ "queries": null });
+        assert!(validate_structured(&value, &schema).is_err());
+    }
+
+    #[test]
+    fn validate_structured_checks_array_item_required_fields() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "queries": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": { "query": { "type": "string" } },
+                        "required": ["query"]
+                    }
+                }
+            },
+            "required": ["queries"]
+        });
+        let ok = serde_json::json!({ "queries": [{ "query": "a" }, { "query": "b" }] });
+        assert!(validate_structured(&ok, &schema).is_ok());
+
+        // Second element is missing `query`.
+        let bad = serde_json::json!({ "queries": [{ "query": "a" }, { "reason": "no query" }] });
+        let err = validate_structured(&bad, &schema).unwrap_err();
+        assert!(err.contains("[1]"), "expected the offending index in: {err}");
+        assert!(err.contains("missing required field 'query'"), "got: {err}");
+    }
+
+    /// Scripted client that returns a queued sequence of responses, recording
+    /// how many times it was invoked — lets us assert the retry actually fires
+    /// and that the corrective turn is appended.
+    #[derive(Debug)]
+    struct ScriptedClient {
+        responses: std::sync::Mutex<std::collections::VecDeque<String>>,
+        calls: std::sync::atomic::AtomicUsize,
+        last_message_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedClient {
+        fn new(responses: Vec<&str>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(
+                    responses.into_iter().map(String::from).collect(),
+                ),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                last_message_count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AiClient for ScriptedClient {
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn complete(
+            &self,
+            messages: Vec<AiMessage>,
+            _system_prompt: &str,
+        ) -> Result<String, ExtensionError> {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.last_message_count
+                .store(messages.len(), Ordering::SeqCst);
+            Ok(self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| "still not json".to_string()))
+        }
+
+        async fn enrich_rows(
+            &self,
+            rows: Vec<Value>,
+            _prompt: &str,
+            _max_rows: usize,
+        ) -> Result<Vec<Value>, ExtensionError> {
+            Ok(rows)
+        }
+    }
+
+    fn obj_schema() -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": { "verdict": { "type": "string" } },
+            "required": ["verdict"]
+        })
+    }
+
+    #[tokio::test]
+    async fn complete_structured_returns_valid_first_try() {
+        let client = ScriptedClient::new(vec![r#"{"verdict":"benign"}"#]);
+        let v = client
+            .complete_structured("agent", vec![AiMessage::user("go")], "sys", &obj_schema())
+            .await
+            .unwrap();
+        assert_eq!(v["verdict"], "benign");
+        assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn complete_structured_retries_then_succeeds() {
+        // First response is unparseable prose; the retry returns valid JSON.
+        let client = ScriptedClient::new(vec![
+            "I cannot help with that.",
+            r#"{"verdict":"malicious"}"#,
+        ]);
+        let v = client
+            .complete_structured("agent", vec![AiMessage::user("go")], "sys", &obj_schema())
+            .await
+            .unwrap();
+        assert_eq!(v["verdict"], "malicious");
+        // Two invocations, and the second carried the appended corrective turns
+        // (original user + assistant echo + corrective user = 3 messages).
+        assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            client
+                .last_message_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_structured_surfaces_error_not_empty_default() {
+        // Both attempts return schema-violating JSON (missing `verdict`). The
+        // result must be an Err the caller can record as a degradation — NOT a
+        // silent empty object that reads as "investigation found nothing".
+        let client = ScriptedClient::new(vec![r#"{"foo":1}"#, r#"{"bar":2}"#]);
+        let result = client
+            .complete_structured("agent", vec![AiMessage::user("go")], "sys", &obj_schema())
+            .await;
+        assert!(matches!(result, Err(ExtensionError::AiProvider(_))));
+        assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

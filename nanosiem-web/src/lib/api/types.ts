@@ -972,6 +972,11 @@ export interface ParseErrorDetails {
 export interface ErrorSuggestion {
   description: string;
   replacement: string;
+  /**
+   * For AI query-correction suggestions only: the corrected query could not be
+   * validated (syntax/runtime), so it is surfaced as "unverified" (NAN-1496).
+   */
+  unverified?: boolean;
 }
 
 export interface EnrichmentSource {
@@ -1913,6 +1918,12 @@ export interface CorrectQueryRequest {
 export interface CorrectQueryResponse {
   corrected_query: string;
   explanation: string;
+  /**
+   * Whether the corrected query passed all available validation checks. When
+   * false, the suggestion could not be verified and is surfaced as
+   * "unverified" (NAN-1496).
+   */
+  validated: boolean;
 }
 
 /** Request to review a successful query for best practices */
