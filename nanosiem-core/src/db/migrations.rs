@@ -538,4 +538,115 @@ mod tests {
             "backfill set diverged from pre-baseline range — filter is wrong"
         );
     }
+
+    /// Bare (schema-stripped, lowercased) table names that a chunk of SQL
+    /// CREATEs. Used to model what tables exist on a fresh OPEN database.
+    fn created_tables(sql: &str) -> std::collections::HashSet<String> {
+        let re = regex::Regex::new(
+            r"(?i)\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:public\.)?([a-z_][a-z0-9_]*)",
+        )
+        .unwrap();
+        re.captures_iter(sql)
+            .map(|c| c[1].to_lowercase())
+            .collect()
+    }
+
+    /// Bare table names a chunk of SQL READS/WRITES in a way that requires the
+    /// table to already exist: FK targets, ALTER TABLE, CREATE INDEX ... ON,
+    /// and INSERT/UPDATE/DELETE targets. Deliberately conservative — anything
+    /// matched here must resolve to a table that exists on open.
+    fn referenced_tables(sql: &str) -> std::collections::HashSet<String> {
+        let patterns = [
+            r"(?i)\bREFERENCES\s+(?:public\.)?([a-z_][a-z0-9_]*)",
+            r"(?i)\bALTER\s+TABLE\s+(?:ONLY\s+)?(?:IF\s+EXISTS\s+)?(?:public\.)?([a-z_][a-z0-9_]*)",
+            r"(?i)\bCREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?\S+\s+ON\s+(?:public\.)?([a-z_][a-z0-9_]*)",
+            r"(?i)\bINSERT\s+INTO\s+(?:public\.)?([a-z_][a-z0-9_]*)",
+            r"(?i)\bUPDATE\s+(?:public\.)?([a-z_][a-z0-9_]*)\s+SET\b",
+            r"(?i)\bDELETE\s+FROM\s+(?:public\.)?([a-z_][a-z0-9_]*)",
+        ];
+        let mut out = std::collections::HashSet::new();
+        for p in patterns {
+            for c in regex::Regex::new(p).unwrap().captures_iter(sql) {
+                out.insert(c[1].to_lowercase());
+            }
+        }
+        out
+    }
+
+    /// Bare table names a migration existence-GUARDS before touching — e.g.
+    /// `IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'foo')` or
+    /// `to_regclass('public.foo') IS NOT NULL`. A reference wrapped in such a
+    /// guard is a no-op on open (the table is absent), so it's safe and must
+    /// not trip the drift check. 178_playbook_repo_rename is the canonical
+    /// example. (Conservative: a guard anywhere in the migration exempts every
+    /// reference to that table in it — fine for the all-or-nothing guard blocks
+    /// these migrations actually use.)
+    fn guarded_tables(sql: &str) -> std::collections::HashSet<String> {
+        let patterns = [
+            r"(?i)\brelname\s*=\s*'(?:public\.)?([a-z_][a-z0-9_]*)'",
+            r"(?i)\btablename\s*=\s*'(?:public\.)?([a-z_][a-z0-9_]*)'",
+            r"(?i)\bto_regclass\s*\(\s*'(?:public\.)?([a-z_][a-z0-9_]*)'",
+        ];
+        let mut out = std::collections::HashSet::new();
+        for p in patterns {
+            for c in regex::Regex::new(p).unwrap().captures_iter(sql) {
+                out.insert(c[1].to_lowercase());
+            }
+        }
+        out
+    }
+
+    /// NAN-1502: the open-core snapshot-drift guard.
+    ///
+    /// `tools/nan749_split_open_overlay.py` deliberately strips enterprise
+    /// tables (cases, notebooks, shadow_investigations, agent_model_config, …)
+    /// from the open snapshot — they only exist once the enterprise overlay
+    /// runs. A core (`migrations/postgres/`) migration ABOVE the baseline that
+    /// references such a table therefore runs on the open fresh-init path
+    /// where the table is absent and aborts EVERY fresh open-edition deploy
+    /// (`relation "<t>" does not exist`). It sails through dev because
+    /// enterprise/legacy DBs have the table from history.
+    ///
+    /// This bit us as NAN-1251 (cases, → NAN-1265) and again as NAN-1488
+    /// (shadow_investigations, migrations 204/205/206) + the NAN-1501 bedrock
+    /// fix (agent_model_config, 207) → NAN-1502. The fix for each was to move
+    /// the migration into `migrations/postgres-enterprise/`.
+    ///
+    /// This guard models a fresh open DB (snapshot tables only) and walks the
+    /// post-baseline core migrations, asserting every table they touch is
+    /// either in the snapshot or created by an earlier post-baseline core
+    /// migration. It runs in the normal test suite (no DB needed), so it fails
+    /// at PR time instead of on a customer's first boot.
+    #[test]
+    fn post_baseline_core_migrations_only_touch_open_tables() {
+        let mut available = created_tables(OPEN_INIT_SNAPSHOT);
+        let migrator = sqlx::migrate!("../migrations/postgres");
+
+        let mut ordered: Vec<_> = migrator
+            .iter()
+            .filter(|m| m.version > OPEN_INIT_BASELINE_VERSION)
+            .collect();
+        ordered.sort_by_key(|m| m.version);
+
+        for m in ordered {
+            let created = created_tables(&m.sql);
+            let guarded = guarded_tables(&m.sql);
+            for t in referenced_tables(&m.sql) {
+                if guarded.contains(&t) {
+                    continue;
+                }
+                assert!(
+                    available.contains(&t) || created.contains(&t),
+                    "Open fresh-init snapshot drift (NAN-1502): core migration {} touches \
+                     table `{}`, which is not in the open snapshot (000_open_init.sql) nor \
+                     created by a post-baseline core migration. If `{}` is enterprise-stripped \
+                     (see ENTERPRISE_TABLES in tools/nan749_split_open_overlay.py), move this \
+                     migration to migrations/postgres-enterprise/; otherwise add the table to \
+                     the open snapshot.",
+                    m.version, t, t
+                );
+            }
+            available.extend(created);
+        }
+    }
 }
