@@ -703,8 +703,8 @@ class ApiClient {
     return this._core.getFieldValues(name, limit);
   }
 
-  async getExtFieldNames(): Promise<string[]> {
-    return this._core.getExtFieldNames();
+  async getExtFieldNames(start?: string, end?: string): Promise<string[]> {
+    return this._core.getExtFieldNames(start, end);
   }
 
   async getSourceTypes(timeRange?: { start: string; end: string }): Promise<[string, number][]> {

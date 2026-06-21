@@ -791,8 +791,14 @@ impl SearchService {
                     // NAN-1428: the companion carries the derived
                     // `{query_id}-fstats` id and the resolved per-priority
                     // settings so it is cancellable and admission-bounded.
-                    let field_stats_sql =
-                        ClickHouseExecutor::build_field_stats_sql(&sql, None, &columns);
+                    // NAN-1506: bound the inline companion scan too (same cap as
+                    // the standalone /field-stats path) — see FIELD_STATS_ROW_CAP.
+                    let field_stats_sql = ClickHouseExecutor::build_field_stats_sql(
+                        &sql,
+                        None,
+                        &columns,
+                        Some(FIELD_STATS_ROW_CAP),
+                    );
                     debug!("Generated field stats SQL: {}", field_stats_sql);
                     let fstats_qid = format!("{query_id}-fstats");
 

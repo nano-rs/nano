@@ -29,8 +29,15 @@ export class CoreApi {
   }
 
   // Fields
-  async getExtFieldNames(): Promise<string[]> {
-    return this.request('/api/fields/ext');
+  // NAN-1505: pass the active search window so the picker enumerates ext keys
+  // for THAT range (a historical search otherwise saw none). Omit both bounds
+  // for the syntax-highlighter path → backend uses a recent default window.
+  async getExtFieldNames(start?: string, end?: string): Promise<string[]> {
+    const qs =
+      start && end
+        ? `?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`
+        : '';
+    return this.request(`/api/fields/ext${qs}`);
   }
 
   async getFieldValues(name: string, limit: number = 10): Promise<[string, number][]> {

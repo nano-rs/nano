@@ -160,8 +160,14 @@ impl SearchService {
             );
         }
 
-        // Build and execute field stats SQL (topK + uniq for each column)
-        let field_stats_sql = ClickHouseExecutor::build_field_stats_sql(&base_sql, None, &columns);
+        // Build and execute field stats SQL (topK + uniq for each column).
+        // NAN-1506: bound the scan to FIELD_STATS_ROW_CAP rows. topK/uniq over
+        // many columns is a full-window scan otherwise (12.6s for 20 cols / 24h /
+        // 22M rows on Saturn; timeout for the full inventory). Tight windows
+        // (≤ cap matching rows) stay exact; large windows become a fast
+        // PK-order sample. Per-field drill-in stays exact + unbounded.
+        let field_stats_sql =
+            ClickHouseExecutor::build_field_stats_sql(&base_sql, None, &columns, Some(FIELD_STATS_ROW_CAP));
         info!(
             "Executing async field stats query for {} columns",
             columns.len()
@@ -380,9 +386,17 @@ impl SearchService {
         })
     }
 
-    /// Get ext field names that exist in recent data (last 24h).
-    /// Used by the frontend for syntax highlighting and autocomplete.
-    pub async fn get_ext_field_names(&self) -> Result<Vec<String>, SearchError> {
+    /// Get ext field names that exist in the data.
+    ///
+    /// `time_range` scopes enumeration to the active search window (the fields
+    /// picker, NAN-1505) so a historical search surfaces ITS ext keys; `None`
+    /// keeps the bounded recent window for the context-free syntax-highlighter
+    /// path. Without scoping, any search outside the last 3h showed no ext fields
+    /// in the picker even though the time-scoped result rows carried them.
+    pub async fn get_ext_field_names(
+        &self,
+        time_range: Option<&TimeRangeInput>,
+    ) -> Result<Vec<String>, SearchError> {
         if self.backend != SearchBackend::ClickHouse {
             return Ok(Vec::new());
         }
@@ -404,8 +418,11 @@ impl SearchService {
         // for UDM's effectively-flat `ext`).
         let is_ocsf = profile.id() == crate::schema::SchemaId::Ocsf;
         let json_col = profile.json_tail_column();
+        // Same scoping for UDM `ext` and OCSF `unmapped` — the window is applied
+        // on the raw table, independent of which JSON tail column is enumerated.
+        let window = time_range.map(|tr| (tr.start, tr.end));
         ch_executor
-            .get_ext_field_names(&table, json_col, is_ocsf)
+            .get_ext_field_names(&table, json_col, is_ocsf, window)
             .await
     }
 

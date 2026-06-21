@@ -195,21 +195,45 @@ pub struct UdmFieldInfo {
     pub description: String,
 }
 
-/// Get ext field names discovered in recent data (last 24h).
-/// Used by the frontend to enable syntax highlighting for non-UDM fields.
+/// Query parameters for the ext-field-names endpoint.
+///
+/// Both bounds optional: with both present, enumeration is scoped to that search
+/// window (the fields picker, NAN-1505); absent, the service uses a bounded
+/// recent window (the syntax-highlighter path, which has no search context).
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ExtFieldsQuery {
+    /// Start of the search time range (ISO 8601)
+    pub start: Option<chrono::DateTime<chrono::Utc>>,
+    /// End of the search time range (ISO 8601)
+    pub end: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Get ext field names discovered in the data.
+/// Used by the fields picker (scoped to the search window) and to enable syntax
+/// highlighting for non-UDM fields (no range → recent window).
 #[utoipa::path(
     get,
     path = "/api/fields/ext",
     tag = "fields",
+    params(ExtFieldsQuery),
     responses(
         (status = 200, description = "List of ext field names", body = Vec<String>),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
-pub async fn get_ext_fields(State(state): State<AppState>) -> Result<Json<Vec<String>>, ApiError> {
+pub async fn get_ext_fields(
+    State(state): State<AppState>,
+    Query(query): Query<ExtFieldsQuery>,
+) -> Result<Json<Vec<String>>, ApiError> {
+    // Only scope when BOTH bounds are present; a half-specified range falls back
+    // to the recent default rather than silently using "now" for the missing end.
+    let time_range = match (query.start, query.end) {
+        (Some(start), Some(end)) => Some(TimeRangeInput::new(start, end)),
+        _ => None,
+    };
     let names = state
         .search_service
-        .get_ext_field_names()
+        .get_ext_field_names(time_range.as_ref())
         .await
         .map_err(|e| ApiError::InternalError(format!("Failed to get ext field names: {}", e)))?;
     Ok(Json(names))

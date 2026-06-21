@@ -27,7 +27,12 @@ use crate::search::{parse_clickhouse_error, FieldInfo, SearchError};
 /// dotted (`a.b.c`); the query-bar tokenizer matches bare identifiers, so each is
 /// reduced to its top-level segment — the same key form the results-driven field list
 /// registers. The cap keeps this best-effort, fire-and-forget query from ever hanging.
-fn build_ext_field_names_sql(table: &str, json_col: &str, nested: bool) -> String {
+fn build_ext_field_names_sql(
+    table: &str,
+    json_col: &str,
+    nested: bool,
+    time_range: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+) -> String {
     // NAN-1241: the dynamic-JSON column is `ext` under UDM, `event` under OCSF.
     //
     // UDM `ext` is effectively flat — keys are bare identifiers (`foo`) the
@@ -44,12 +49,28 @@ fn build_ext_field_names_sql(table: &str, json_col: &str, nested: bool) -> Strin
     } else {
         "splitByChar('.', path)[1]"
     };
+    // NAN-1505: scope enumeration to the caller's search window when given.
+    // The legacy `now() - 3h` window is blind to historical searches — a search
+    // over a past day surfaced NO ext fields in the picker even though the
+    // (correctly time-scoped) result rows carried them. When a range is passed
+    // we emit `timestamp BETWEEN start AND end`, matching how field-stats scopes;
+    // when absent (the syntax-highlighter path, which has no search context) we
+    // keep the bounded recent window. `max_execution_time` stays as the
+    // best-effort backstop for very wide windows on busy tenants.
+    let window = match time_range {
+        Some((start, end)) => format!(
+            "timestamp BETWEEN '{}' AND '{}'",
+            start.format("%Y-%m-%d %H:%M:%S%.6f"),
+            end.format("%Y-%m-%d %H:%M:%S%.6f"),
+        ),
+        None => "timestamp >= now() - INTERVAL 3 HOUR".to_string(),
+    };
     format!(
         "SELECT DISTINCT {name_expr} AS name \
          FROM ( \
              SELECT arrayJoin(distinctJSONPaths({json_col})) AS path \
              FROM {table} \
-             WHERE timestamp >= now() - INTERVAL 3 HOUR \
+             WHERE {window} \
          ) \
          WHERE name != '' \
          ORDER BY name \
@@ -223,10 +244,21 @@ impl ClickHouseExecutor {
     /// Build a SQL query to get field statistics using topK
     /// Optionally uses sampling for large datasets (sample_rate < 1.0)
     /// topK is a probabilistic algorithm that's much faster than GROUP BY
+    ///
+    /// NAN-1506: `row_cap` bounds the stats scan to the first N matching rows
+    /// (a `LIMIT` on the data source feeding the aggregates). topK/uniq over many
+    /// columns is otherwise a full-window scan — measured 12.6s for 20 real
+    /// columns over a 24h / 22M-row window on Saturn, and an outright timeout for
+    /// the full inventory. A row-bounded sample makes it ~0.1s, decoupled from
+    /// window size. Windows with ≤ `row_cap` matching rows are byte-identical
+    /// (LIMIT doesn't truncate), so the common tight-window case stays EXACT;
+    /// only large windows become an approximate (PK-order) sample. `None` keeps
+    /// the legacy unbounded form (used by tests and any caller that wants exact).
     pub fn build_field_stats_sql(
         base_sql: &str,
         sample_rate: Option<f64>,
         fields: &[String],
+        row_cap: Option<usize>,
     ) -> String {
         let base_upper = base_sql.to_uppercase();
         let settings_pos = base_upper.find(" SETTINGS ").unwrap_or(base_sql.len());
@@ -264,7 +296,16 @@ impl ClickHouseExecutor {
         // the simple single-table path below.
         if base_upper.trim_start().starts_with("WITH ") {
             let inner = base_sql[..settings_pos].trim_end();
-            return format!("SELECT\n  {}\nFROM (\n{}\n)", select_clause, inner);
+            // Bound the CTE result feeding the aggregates (NAN-1506). The inner
+            // query already projects every needed column, so a plain
+            // `SELECT * FROM (inner) LIMIT n` exposes them for the outer topK/uniq.
+            return match row_cap {
+                Some(n) => format!(
+                    "SELECT\n  {}\nFROM (\nSELECT * FROM (\n{}\n) LIMIT {}\n)",
+                    select_clause, inner, n
+                ),
+                None => format!("SELECT\n  {}\nFROM (\n{}\n)", select_clause, inner),
+            };
         }
 
         // Simple single-stage query: extract FROM..WHERE and re-apply the filter
@@ -294,17 +335,36 @@ impl ClickHouseExecutor {
             _ => String::new(),
         };
 
-        format!(
-            "SELECT\n  {}\n{}{}{}",
-            select_clause,
-            table_clause,
-            sample_clause,
-            if conditions.is_empty() {
-                "".to_string()
-            } else {
-                format!("\n{}", conditions)
+        let conditions_part = if conditions.is_empty() {
+            "".to_string()
+        } else {
+            format!("\n{}", conditions)
+        };
+
+        match row_cap {
+            // NAN-1506: bound the scan to the first N matching rows. The subquery
+            // must project the exact columns the aggregates reference (NOT `*`) —
+            // `SELECT *` drops ALIAS columns (e.g. `event_type`) and MATERIALIZED
+            // enrichment columns, which the stats then reference → Code 47. Each
+            // column is quoted the same way as the aggregate reference so the
+            // outer `toString(...)`/`uniq(...)` bind to the subquery output.
+            // SAMPLE is mutually exclusive with the LIMIT bound, so it's dropped.
+            Some(n) => {
+                let proj = fields
+                    .iter()
+                    .map(|f| field_stats_quote_ident(f))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "SELECT\n  {}\nFROM (\nSELECT {}\n{}{}\nLIMIT {}\n)",
+                    select_clause, proj, table_clause, conditions_part, n
+                )
             }
-        )
+            None => format!(
+                "SELECT\n  {}\n{}{}{}",
+                select_clause, table_clause, sample_clause, conditions_part
+            ),
+        }
     }
 
     /// Execute a field stats query and parse the results into FieldInfo structs
@@ -479,15 +539,17 @@ impl ClickHouseExecutor {
         Ok(fields)
     }
 
-    /// Get distinct ext field names from recent data.
-    /// Returns field names that exist in the ext JSON column (last 3h).
+    /// Get distinct ext field names that exist in the ext JSON column.
+    /// Scoped to `time_range` when given (the picker, NAN-1505), else the recent
+    /// bounded window (the syntax-highlighter path, which has no search context).
     pub async fn get_ext_field_names(
         &self,
         table: &str,
         json_col: &str,
         nested: bool,
+        time_range: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
     ) -> Result<Vec<String>, SearchError> {
-        let sql = build_ext_field_names_sql(table, json_col, nested);
+        let sql = build_ext_field_names_sql(table, json_col, nested, time_range);
 
         debug!("Querying ext field names: {}", sql);
 
@@ -698,8 +760,8 @@ mod tests {
 
     #[test]
     fn ext_field_names_sql_is_bounded_and_native() {
-        // UDM `ext` is flat → nested=false.
-        let sql = build_ext_field_names_sql("nanosiem.logs", "ext", false);
+        // UDM `ext` is flat → nested=false. No range → legacy recent window.
+        let sql = build_ext_field_names_sql("nanosiem.logs", "ext", false, None);
 
         // Targets the resolved table.
         assert!(sql.contains("FROM nanosiem.logs"), "sql: {sql}");
@@ -709,11 +771,13 @@ mod tests {
         // (NAN-1172), and NOT arrayJoin(JSONAllPaths(ext)) over the raw window, which
         // exploded a row per path and timed out at scale (NAN-1177).
         assert!(sql.contains("distinctJSONPaths(ext)"), "sql: {sql}");
+        // Range-less path keeps the bounded recent window.
+        assert!(sql.contains("INTERVAL 3 HOUR"), "sql: {sql}");
 
         // NAN-1241/1443: under OCSF the dynamic-JSON tail column is the
         // `unmapped` spill (was `event`, now EPHEMERAL), still nested → nested=true
         // returns full leaf paths.
-        let ocsf_sql = build_ext_field_names_sql("nanosiem.ocsf_logs", "unmapped", true);
+        let ocsf_sql = build_ext_field_names_sql("nanosiem.ocsf_logs", "unmapped", true, None);
         assert!(ocsf_sql.contains("distinctJSONPaths(unmapped)"), "sql: {ocsf_sql}");
         assert!(ocsf_sql.contains("FROM nanosiem.ocsf_logs"), "sql: {ocsf_sql}");
         // Bounded window + native aggregate still apply to the OCSF lane.
@@ -721,6 +785,21 @@ mod tests {
         assert!(!sql.contains("toString(ext)"), "sql: {sql}");
         assert!(!sql.contains("JSONExtractKeys"), "sql: {sql}");
         assert!(!sql.contains("JSONAllPaths"), "sql: {sql}");
+
+        // NAN-1505: with a search range, enumeration scopes to that window
+        // (`timestamp BETWEEN …`) instead of the recent default, so historical
+        // searches surface their own ext keys.
+        let start = chrono::DateTime::parse_from_rfc3339("2026-05-30T02:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let end = chrono::DateTime::parse_from_rfc3339("2026-05-30T03:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let scoped = build_ext_field_names_sql("nanosiem.logs", "ext", false, Some((start, end)));
+        assert!(scoped.contains("timestamp BETWEEN '2026-05-30 02:00:00"), "sql: {scoped}");
+        assert!(scoped.contains("AND '2026-05-30 03:00:00"), "sql: {scoped}");
+        assert!(!scoped.contains("INTERVAL 3 HOUR"), "sql: {scoped}");
+        assert!(scoped.contains("distinctJSONPaths(ext)"), "sql: {scoped}");
 
         // UDM (nested=false) reduces dotted JSON paths to the bare top-level key the
         // query-bar tokenizer matches (it looks up bare identifiers, not dotted paths).
@@ -754,7 +833,7 @@ mod tests {
             "src_ip".to_string(),
             "action".to_string(),
         ];
-        let sql = ClickHouseExecutor::build_field_stats_sql(base, None, &cols);
+        let sql = ClickHouseExecutor::build_field_stats_sql(base, None, &cols, None);
 
         let expected = "SELECT\n  \
             topK(100)(toString(user)) as user_top,\n  \
@@ -768,6 +847,38 @@ mod tests {
         assert_eq!(sql, expected, "UDM field-stats SQL drifted:\n{sql}");
     }
 
+    /// NAN-1506: with a row cap, the simple-path scan is wrapped in a bounded
+    /// subquery that projects the exact stat columns (NOT `*`, which would drop
+    /// ALIAS/MATERIALIZED columns), and the outer aggregates read from it.
+    #[test]
+    fn field_stats_sql_simple_path_is_row_bounded() {
+        let base = "SELECT * FROM nanosiem.logs WHERE timestamp >= now()";
+        let cols = vec!["user".to_string(), "src_ip".to_string()];
+        let sql = ClickHouseExecutor::build_field_stats_sql(base, None, &cols, Some(100_000));
+
+        // Outer aggregates unchanged; data source is now a LIMITed subquery that
+        // explicitly projects the stat columns.
+        assert!(sql.contains("topK(100)(toString(user)) as user_top"), "sql: {sql}");
+        assert!(sql.contains("FROM (\nSELECT user, src_ip\n"), "projection missing: {sql}");
+        assert!(sql.contains("LIMIT 100000\n)"), "row cap missing: {sql}");
+        assert!(!sql.contains("SELECT *\nFROM nanosiem.logs"), "must not stat over `*`: {sql}");
+    }
+
+    /// NAN-1506: a multi-CTE base is bounded by wrapping the CTE result in
+    /// `SELECT * FROM (inner) LIMIT n` — the inner already projects every column,
+    /// so `*` is safe here (unlike the simple path).
+    #[test]
+    fn field_stats_sql_cte_path_is_row_bounded() {
+        let base = "WITH s0 AS (SELECT id FROM nanosiem.logs WHERE (1)) SELECT * FROM s0";
+        let cols = vec!["id".to_string()];
+        let sql = ClickHouseExecutor::build_field_stats_sql(base, None, &cols, Some(100_000));
+        assert!(sql.contains("SELECT * FROM (\nWITH s0 AS"), "should wrap CTE: {sql}");
+        assert!(sql.contains("LIMIT 100000\n)"), "row cap missing: {sql}");
+        let opens = sql.matches('(').count();
+        let closes = sql.matches(')').count();
+        assert_eq!(opens, closes, "unbalanced parentheses: {sql}");
+    }
+
     /// NAN-1315: a multi-CTE / piped base query (sequence/funnel/stats) must be
     /// wrapped as a subquery, not sliced by the first FROM/WHERE (which cuts the
     /// CTE chain mid-expression → unbalanced parens, Code 62). The result must be
@@ -779,7 +890,7 @@ mod tests {
                     stage_1 AS (\n  SELECT * FROM stage_0\n)\n\
                     SELECT * FROM stage_1 SETTINGS max_threads=16";
         let cols = vec!["process.name".to_string()];
-        let sql = ClickHouseExecutor::build_field_stats_sql(base, None, &cols);
+        let sql = ClickHouseExecutor::build_field_stats_sql(base, None, &cols, None);
 
         // Wraps the whole query as a subquery and drops trailing SETTINGS.
         assert!(sql.contains("FROM (\nWITH stage_0 AS"), "should wrap the CTE query: {sql}");
@@ -798,7 +909,7 @@ mod tests {
     fn field_stats_sql_quotes_dotted_ocsf_columns() {
         let base = "SELECT * FROM nanosiem.ocsf_logs WHERE timestamp >= now()";
         let cols = vec!["src_endpoint.ip".to_string(), "class_uid".to_string()];
-        let sql = ClickHouseExecutor::build_field_stats_sql(base, None, &cols);
+        let sql = ClickHouseExecutor::build_field_stats_sql(base, None, &cols, None);
 
         // Dotted column: quoted reference, dot-free alias.
         assert!(

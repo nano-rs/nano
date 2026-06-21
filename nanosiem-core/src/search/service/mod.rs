@@ -66,6 +66,16 @@ pub mod cloud_overview;
 mod core_search;
 mod field_queries;
 mod funnel_view;
+
+/// NAN-1506: row cap for the bulk field-stats scan (shared by the standalone
+/// `/api/search/field-stats` companion and the inline parallel companion in
+/// `core_search`). topK/uniq over many columns is a full-window scan otherwise
+/// (Saturn: 12.6s for 20 columns over a 24h / 22M-row window; timeout for the
+/// full inventory). 100k rows brings it to ~0.1s. Windows with ≤ this many
+/// matching rows are byte-identical (the LIMIT doesn't truncate), so tight
+/// searches stay exact; larger windows become a fast PK-order sample. Per-field
+/// drill-in (`get_field_values`) stays exact and unbounded.
+pub(crate) const FIELD_STATS_ROW_CAP: usize = 100_000;
 mod histogram;
 mod lateral;
 mod lateral_graph;

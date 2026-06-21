@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import {
@@ -12,7 +12,7 @@ import {
   DropdownMenuShortcut,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import { ChevronDown, Plus, Minus, Copy, Search, X, Loader2, Filter, ChevronLeft } from 'lucide-react';
+import { ChevronDown, Plus, Minus, Copy, Search, X, Loader2, Filter, ChevronLeft, BarChart2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 interface FieldValueInfo {
@@ -26,6 +26,12 @@ export interface FieldStat {
   count: number;
   uniqueCount: number;  // Total unique values (cardinality) for this field
   topValues: FieldValueInfo[];  // Client-side stats from visible results
+  // NAN-1503: synthetic entry for an `ext.*` / OCSF-unmapped JSON key. Field
+  // stats never enumerate JSON sub-keys (too costly across hundreds of keys),
+  // so these carry no precomputed counts — cardinality and values are fetched
+  // on demand when the row is expanded (the get_field_values path resolves
+  // `ext.{field}` correctly via field_access_expr).
+  onDemand?: boolean;
 }
 
 // Server-side field values (fetched on-demand)
@@ -64,6 +70,10 @@ interface FieldsPanelProps {
 }
 
 const INITIAL_VALUES_SHOWN = 10;
+// Per-field on-demand value fetch cap. MUST match the `limit` the parent passes
+// to `onFetchFieldValues` (Search.tsx) — when a loaded value list hits this many
+// entries the distinct count is "N+", not exact (NAN-1506).
+const ON_DEMAND_VALUE_LIMIT = 100;
 
 // Key fields pinned to a "Selected" section at the top of the field index — the
 // ones analysts land on for most searches. Any field in this list that the
@@ -113,12 +123,42 @@ export const FIELD_STATS_PINNED_COLUMNS: string[] = Array.from(
   new Set([...SELECTED_FIELDS_UDM, ...SELECTED_FIELDS_OCSF])
 );
 
-function SectionHdr({ label, count }: { label: string; count: number }) {
-  return (
-    <div className="pt-2 pb-1 px-1 font-mono text-[9.5px] tracking-[0.12em] uppercase text-muted-foreground/60 font-semibold flex items-center gap-1.5">
+function SectionHdr({
+  label,
+  count,
+  collapsible,
+  open,
+  onToggle,
+}: {
+  label: string;
+  count: number;
+  collapsible?: boolean;
+  open?: boolean;
+  onToggle?: () => void;
+}) {
+  const cls =
+    'pt-2 pb-1 px-1 font-mono text-[9.5px] tracking-[0.12em] uppercase text-muted-foreground/60 font-semibold flex items-center gap-1.5';
+  const inner = (
+    <>
+      {collapsible && (
+        <ChevronDown
+          className={cn('w-3 h-3 transition-transform', open ? '' : '-rotate-90')}
+        />
+      )}
       {label}
       <span className="ml-auto tabular-nums">{count}</span>
-    </div>
+    </>
+  );
+  return collapsible ? (
+    <button
+      type="button"
+      onClick={onToggle}
+      className={cn(cls, 'w-full hover:text-muted-foreground transition-colors')}
+    >
+      {inner}
+    </button>
+  ) : (
+    <div className={cls}>{inner}</div>
   );
 }
 
@@ -142,6 +182,10 @@ export function FieldsPanel({
   onLoadAllFields,
 }: FieldsPanelProps) {
   const [searchTerm, setSearchTerm] = useState('');
+  // Extended/Unmapped (on-demand JSON fields) collapse to a single header by
+  // default — there can be dozens and they'd swamp the rail. A filter term
+  // force-opens the section so matches always surface.
+  const [extExpanded, setExtExpanded] = useState(false);
   const [openMenuKey, setOpenMenuKey] = useState<string | null>(null);
   // Whether the open value-menu's label shows the full (un-clamped) value.
   // Resets whenever a different menu opens — only one menu is open at a time.
@@ -210,13 +254,80 @@ export function FieldsPanel({
     return { values: stat.topValues, loading: false, isServerData: false };
   }, [serverFieldValues]);
 
+  // NAN-1503: ext.* (UDM) / unmapped (OCSF) JSON keys never come back in field
+  // stats — those only enumerate explicit table columns. Pull the key list and
+  // merge any not surfaced as a real column in as on-demand entries so they're
+  // discoverable + expandable.
+  // NAN-1505: scope enumeration to the active search window (keyed on it) so a
+  // historical search surfaces ITS ext keys — the old fixed recent window
+  // returned nothing for any past range. Only fetch while the panel is open.
+  const { data: extFieldNames } = useQuery({
+    queryKey: ['ext-field-names', timeRange?.start, timeRange?.end],
+    queryFn: () => api.getExtFieldNames(timeRange?.start, timeRange?.end),
+    staleTime: 5 * 60 * 1000,
+    enabled: !!onFetchFieldValues && !!timeRange && isExpanded,
+  });
+
   const baseStats = showBaseFields ? baseFieldStats : fieldStats;
+  // Merge in ext keys (deduped against real columns) once a search has produced
+  // a field index — before that we keep the clean "run a query" empty state.
+  // NAN-1504: render with the namespace prefix the inspector/results already use
+  // — `ext.` (UDM) / `unmapped.` (OCSF) — so the picker name matches the row
+  // view. The prefixed form is also the query form: field_access_expr strips the
+  // `ext.` prefix (NAN-1411) and OcsfProfile::resolve strips `unmapped.`, so
+  // expand + add-to-filter resolve to the same spill access as the bare key.
+  const isOcsf = schemaFields?.schema === 'ocsf';
+  const extPrefix = isOcsf ? 'unmapped.' : 'ext.';
+  const mergedStats = useMemo<FieldStat[]>(() => {
+    if (!extFieldNames || extFieldNames.length === 0 || baseStats.length === 0) {
+      return baseStats;
+    }
+    const present = new Set(baseStats.map(s => s.field));
+    const extStats: FieldStat[] = extFieldNames
+      .filter(name => !!name)
+      .map(name => `${extPrefix}${name}`)
+      .filter(name => !present.has(name))
+      .map(name => ({ field: name, count: 0, uniqueCount: 0, topValues: [], onDemand: true }));
+    return extStats.length > 0 ? [...baseStats, ...extStats] : baseStats;
+  }, [baseStats, extFieldNames, extPrefix]);
+
   const displayStats = searchTerm
-    ? baseStats.filter(stat => 
+    ? mergedStats.filter(stat =>
         stat.field.toLowerCase().includes(searchTerm.toLowerCase()) ||
         stat.topValues.some(v => v.value.toLowerCase().includes(searchTerm.toLowerCase()))
       )
-    : baseStats;
+    : mergedStats;
+
+  // NAN-1503: filtering for a field that isn't in the reduced column set used to
+  // dead-end on "Execute a query to build the field index" — the full-inventory
+  // fetch ("Show all fields") lived only in the non-empty branch, so it was
+  // unreachable. When a filter term matches no *real* column and the set is
+  // still reduced, auto-trigger the full fetch so the field surfaces. (ext
+  // matches don't count — a real column may still be hiding in the unindexed
+  // remainder.) isReducedFieldSet flips false once the full set arrives, so this
+  // fires at most once per search.
+  const hasRealMatch = displayStats.some(s => !s.onDemand);
+  // Fetch at most once per distinct (search, filter-term): isLoadingMore toggles
+  // true→false around the request, and a failed fetch leaves isReducedFieldSet
+  // true, either of which would otherwise re-fire this effect into a loop.
+  // NAN-1509: key by query+time-range too, not just the term — otherwise the same
+  // filter term across a NEW reduced search (component still mounted) is blocked
+  // forever and never auto-fetches.
+  const autoFetchKey = `${query ?? ''}|${timeRange?.start ?? ''}|${timeRange?.end ?? ''}|${searchTerm}`;
+  const autoFetchedForRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (
+      searchTerm &&
+      isReducedFieldSet &&
+      !isLoadingMore &&
+      !hasRealMatch &&
+      onLoadAllFields &&
+      autoFetchedForRef.current !== autoFetchKey
+    ) {
+      autoFetchedForRef.current = autoFetchKey;
+      onLoadAllFields();
+    }
+  }, [autoFetchKey, searchTerm, isReducedFieldSet, isLoadingMore, hasRealMatch, onLoadAllFields]);
 
   return (
     <div className="search-workspace-section flex flex-col min-h-0 border-r border-border pr-2 max-h-[calc(100vh-8rem)] overflow-y-auto">
@@ -290,12 +401,49 @@ export function FieldsPanel({
               <span className="text-[12px] font-mono">Indexing fields...</span>
             </div>
           ) : displayStats.length === 0 ? (
-            <p className="text-muted-foreground text-[11.5px] font-mono py-4 text-center">Execute a query to build the field index</p>
+            isLoadingMore ? (
+              // NAN-1503: filter matched nothing in the reduced set and the
+              // full-inventory fetch is in flight — show progress, not the
+              // "run a query" dead-end.
+              <div className="flex items-center justify-center gap-2 py-4 text-muted-foreground">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span className="text-[12px] font-mono">Indexing all fields…</span>
+              </div>
+            ) : searchTerm ? (
+              <p className="text-muted-foreground text-[11.5px] font-mono py-4 text-center">No fields match “{searchTerm}”</p>
+            ) : (
+              <p className="text-muted-foreground text-[11.5px] font-mono py-4 text-center">Execute a query to build the field index</p>
+            )
           ) : (() => {
             const selectedStats = displayStats.filter(s => selectedFieldSet.has(s.field));
-            const availableStats = displayStats.filter(s => !selectedFieldSet.has(s.field));
+            // On-demand ext/unmapped JSON fields get their own section (below),
+            // matching the inspector's Extended/Unmapped buckets — keep them out
+            // of "Available" (which is promoted/indexed schema columns).
+            const availableStats = displayStats.filter(s => !selectedFieldSet.has(s.field) && !s.onDemand);
+            const extStats = displayStats.filter(s => s.onDemand);
             const renderRow = (stat: FieldStat) => {
               const isOpen = expandedFields.has(stat.field);
+              // Expanding a field fetches its values on-demand over the FULL
+              // window (exact, unbounded). Once loaded, derive cardinality/events
+              // from them: this both populates on-demand ext fields (which carry
+              // no precomputed stats, NAN-1503) AND corrects real-column stats,
+              // whose bulk numbers are a fast bounded sample on large windows
+              // (NAN-1506). Exact unless the value list hit the fetch cap → "N+".
+              const serverData = serverFieldValues.get(stat.field);
+              const loadedValues = serverData?.values ?? [];
+              const hasLoaded = loadedValues.length > 0;
+              const loadedCapped = loadedValues.length >= ON_DEMAND_VALUE_LIMIT;
+              const plus = hasLoaded && loadedCapped ? '+' : '';
+              const displayUnique = hasLoaded
+                ? loadedValues.length
+                : stat.onDemand
+                  ? null
+                  : stat.uniqueCount;
+              const displayCount = hasLoaded
+                ? loadedValues.reduce((s, v) => s + v.count, 0)
+                : stat.onDemand
+                  ? null
+                  : stat.count;
               return (
               <div key={stat.field}>
                 <div
@@ -312,9 +460,22 @@ export function FieldsPanel({
                   <span className="flex-1 whitespace-nowrap overflow-hidden text-ellipsis">{stat.field}</span>
                   <span
                     className={cn('text-[10.5px]', isOpen ? 'text-primary' : 'text-muted-foreground')}
-                    title={`${stat.uniqueCount.toLocaleString()} unique values`}
+                    title={
+                      stat.onDemand && !hasLoaded
+                        ? 'Expand to load values'
+                        : `${(displayUnique ?? 0).toLocaleString()}${plus} unique values`
+                    }
                   >
-                    {isLoadingMore && stat.uniqueCount === 0 ? (
+                    {serverData?.loading ? (
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                    ) : hasLoaded ? (
+                      `${formatCardinality(displayUnique ?? 0)}${plus}`
+                    ) : stat.onDemand ? (
+                      // Values load on expand: a distribution glyph (previews the
+                      // value bars the expanded view shows) instead of a bare
+                      // `{ }` glyph that read as a value.
+                      <BarChart2 className="w-3 h-3 text-muted-foreground/50" />
+                    ) : isLoadingMore && stat.uniqueCount === 0 ? (
                       <Loader2 className="w-3 h-3 animate-spin" />
                     ) : (
                       formatCardinality(stat.uniqueCount)
@@ -326,7 +487,9 @@ export function FieldsPanel({
                   <div className="mt-1 mb-2 pl-3 pr-1 py-1 border-l border-primary/25 anim-slide space-y-0.5">
                     <div className="flex items-center gap-2 pb-1 mb-1 font-mono text-[10px] text-muted-foreground">
                       <span className="text-muted-foreground/80">
-                        {stat.uniqueCount.toLocaleString()} unique · {stat.count.toLocaleString()} events
+                        {displayUnique == null
+                          ? 'Values loaded on demand'
+                          : `${displayUnique.toLocaleString()}${plus} unique · ${(displayCount ?? 0).toLocaleString()}${plus} events`}
                       </span>
                       <button
                         type="button"
@@ -494,12 +657,32 @@ export function FieldsPanel({
                     {availableStats.map(renderRow)}
                   </>
                 )}
+                {extStats.length > 0 && (() => {
+                  /* On-demand JSON spill fields — UDM `ext.*` (Extended) /
+                     OCSF `unmapped.*` (Unmapped), matching the inspector's
+                     buckets. Collapsed by default (there can be dozens); a
+                     filter term force-opens so matches always show. Values
+                     load on expand (NAN-1506). */
+                  const extOpen = !!searchTerm || extExpanded;
+                  return (
+                    <>
+                      <SectionHdr
+                        label={isOcsf ? 'Unmapped' : 'Extended'}
+                        count={extStats.length}
+                        collapsible
+                        open={extOpen}
+                        onToggle={() => setExtExpanded(v => !v)}
+                      />
+                      {extOpen && extStats.map(renderRow)}
+                    </>
+                  );
+                })()}
                 {isReducedFieldSet && onLoadAllFields && (
                   /* Teaser for the unindexed remainder (NAN-1427 reduced
-                     fetch): ghost rows fading out signal "more fields
-                     below", with the load affordance floating over the
-                     fade. Ghosts pulse while the full-inventory fetch is
-                     in flight (isLoadingMore). */
+                     fetch): kept LAST so the fading ghost rows trail off at the
+                     bottom of the list — above a populated section they read as
+                     "hidden content" contradicting the rows right below. Ghosts
+                     pulse while the full-inventory fetch is in flight. */
                   <div className="relative mt-1 pb-1">
                     <div
                       aria-hidden

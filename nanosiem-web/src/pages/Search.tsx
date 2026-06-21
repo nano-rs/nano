@@ -239,6 +239,9 @@ interface CachedSearchResult {
   results: SearchResult[];
   histogramData: Array<{ time: string; count: number }>;
   serverFieldStats: Array<{ name: string; count: number; top_values: [string, number][]; cardinality?: number }> | null;
+  // Whether serverFieldStats were computed over a reduced column set (so restore
+  // can re-offer "Show all fields" / NAN-1503 auto-fetch). Null until stats land.
+  fieldStatsReduced: boolean | null;
   totalCount: number;
   executionTimeMs: number | null;
   displayType: import('@/lib/api/types').DisplayType | undefined;
@@ -314,6 +317,15 @@ const flattenFieldsForStats = (fields: Record<string, unknown>, prefix = ''): [s
 // action refetches without `columns` for the full inventory. Unknown names
 // (ext-JSON keys etc.) are dropped server-side by intersection with the live
 // table inventory.
+// NAN-1507 follow-up: when a search matches fewer than this many rows, the full
+// field-stats scan is ~free (rows-scanned dominates cost, and it's row-bounded to
+// 100k server-side — NAN-1506), so fetch the FULL column inventory straight away
+// instead of the reduced set + "Show all fields" teaser. Targeted hunts (the
+// common case) then get the complete field list with no extra click; broad
+// searches keep the reduced fetch. Gated on the RELIABLE backend count only — an
+// absent/0 count falls through to the reduced (safe) path, never the full scan.
+const AUTO_SHOW_ALL_RESULT_THRESHOLD = 1000;
+
 const collectFieldStatsColumns = (results: SearchResult[]): string[] => {
   const cols = new Set<string>(FIELD_STATS_PINNED_COLUMNS);
   // First 200 rows are plenty to discover the visible column population.
@@ -1145,6 +1157,7 @@ export function Search() {
       results,
       histogramData: histData,
       serverFieldStats: null,
+      fieldStatsReduced: null,
       totalCount: response.total_count || results.length,
       executionTimeMs: response.execution_time_ms ?? null,
       displayType: response.display_type,
@@ -1205,14 +1218,20 @@ export function Search() {
         request_id: currentRequestIdRef.current ?? undefined,
       };
       lastFieldStatsRequestRef.current = fsRequest;
-      fetchFieldStats({ ...fsRequest, columns: collectFieldStatsColumns(results) })
+      // Small, specific result set → fetch the FULL inventory directly (no
+      // reduced set / teaser); broad → reduced. Only on a real backend count.
+      const fsSmall = (response.total_count ?? 0) > 0 && (response.total_count ?? 0) < AUTO_SHOW_ALL_RESULT_THRESHOLD;
+      fetchFieldStats({ ...fsRequest, columns: fsSmall ? undefined : collectFieldStatsColumns(results) })
         .then(fieldStatsResponse => {
           if (fieldStatsResponse.fields && fieldStatsResponse.fields.length > 0) {
             setServerFieldStats(fieldStatsResponse.fields);
-            setFieldStatsReduced(true);
+            setFieldStatsReduced(!fsSmall);
             // Update cache entry with field stats
             const cached = searchResultCache.get(cacheKey);
-            if (cached) cached.serverFieldStats = fieldStatsResponse.fields;
+            if (cached) {
+              cached.serverFieldStats = fieldStatsResponse.fields;
+              cached.fieldStatsReduced = !fsSmall;
+            }
           }
         })
         .catch(err => {
@@ -1486,6 +1505,7 @@ export function Search() {
             results: finalResults,
             histogramData: streamedMetadata.histogramData,
             serverFieldStats: null,
+            fieldStatsReduced: null,
             totalCount: streamedMetadata.totalCount || data.total_rows_delivered || finalResults.length,
             executionTimeMs: streamedMetadata.executionTimeMs,
             displayType: streamedMetadata.displayType,
@@ -1515,11 +1535,25 @@ export function Search() {
             request_id: currentRequestIdRef.current ?? undefined,
           };
           lastFieldStatsRequestRef.current = fsRequest;
-          fetchFieldStats({ ...fsRequest, columns: collectFieldStatsColumns(searchResultsRef.current) })
+          // NAN-1508/1509: the streaming path is the default piped-search path —
+          // apply the same auto-load gate. Small specific result set → full
+          // inventory directly; broad/unknown → reduced. Reliable count only:
+          // raw streamedMetadata.totalCount (absent/0 → safe reduced path).
+          const fsSmall = (streamedMetadata.totalCount ?? 0) > 0 && (streamedMetadata.totalCount ?? 0) < AUTO_SHOW_ALL_RESULT_THRESHOLD;
+          fetchFieldStats({ ...fsRequest, columns: fsSmall ? undefined : collectFieldStatsColumns(searchResultsRef.current) })
             .then(fieldStatsResponse => {
               if (fieldStatsResponse.fields && fieldStatsResponse.fields.length > 0) {
                 setServerFieldStats(fieldStatsResponse.fields);
-                setFieldStatsReduced(true);
+                setFieldStatsReduced(!fsSmall);
+                // NAN-1509: persist field stats + reduced flag to the cache entry
+                // so a cached restore keeps the teaser/auto-fetch behavior.
+                if (cacheKey) {
+                  const cached = searchResultCache.get(cacheKey);
+                  if (cached) {
+                    cached.serverFieldStats = fieldStatsResponse.fields;
+                    cached.fieldStatsReduced = !fsSmall;
+                  }
+                }
               }
             })
             .catch(err => console.warn('Failed to fetch field stats:', err));
@@ -1815,6 +1849,7 @@ export function Search() {
           results,
           histogramData: histData,
           serverFieldStats: null,
+          fieldStatsReduced: null,
           totalCount: effectiveTotalCount,
           executionTimeMs: response.execution_time_ms ?? null,
           displayType: response.display_type,
@@ -1848,15 +1883,22 @@ export function Search() {
           request_id: requestId,
         };
         lastFieldStatsRequestRef.current = fsRequest;
-        fetchFieldStats({ ...fsRequest, columns: collectFieldStatsColumns(results) })
+        // Small, specific result set → full inventory directly; broad → reduced.
+        // effectiveTotalCount is already page-full-aware (estimates large when a
+        // full page came back), so it never falsely reads as "small".
+        const fsSmall = effectiveTotalCount > 0 && effectiveTotalCount < AUTO_SHOW_ALL_RESULT_THRESHOLD;
+        fetchFieldStats({ ...fsRequest, columns: fsSmall ? undefined : collectFieldStatsColumns(results) })
           .then(fieldStatsResponse => {
             if (fieldStatsResponse.fields && fieldStatsResponse.fields.length > 0) {
               setServerFieldStats(fieldStatsResponse.fields);
-              setFieldStatsReduced(true);
+              setFieldStatsReduced(!fsSmall);
               // Update cache entry with field stats
               if (cacheKey) {
                 const cached = searchResultCache.get(cacheKey);
-                if (cached) cached.serverFieldStats = fieldStatsResponse.fields;
+                if (cached) {
+                  cached.serverFieldStats = fieldStatsResponse.fields;
+                  cached.fieldStatsReduced = !fsSmall;
+                }
               }
             }
           })
@@ -3032,7 +3074,11 @@ export function Search() {
           setSearchResults(cached.results);
           setHistogramData(cached.histogramData);
           setServerFieldStats(cached.serverFieldStats);
-          setFieldStatsReduced(false); // cached stats: don't re-offer partial-index refetch
+          // NAN-1509: restore the reduced/full flag the cached stats were computed
+          // with, so a cached broad search keeps its "Show all fields" teaser +
+          // NAN-1503 auto-fetch (was hardcoded false → cached broad searches lost
+          // the affordance). Null (stats never landed) → not reduced.
+          setFieldStatsReduced(cached.fieldStatsReduced ?? false);
           setTotalCount(cached.totalCount);
           setExecutionTimeMs(cached.executionTimeMs);
           setDisplayType(cached.displayType);
