@@ -105,7 +105,9 @@ pub async fn convert_sigma(
                 .get_agent_config(&nanosiem_enterprise::melod::AgentId::Detection)
                 .await
             {
-                Some(config) => nanosiem_core::ai_request_cost(&config.model_id),
+                Some(config) => {
+                    nanosiem_core::resolve_ai_request_cost(&state.pool, &config.model_id).await
+                }
                 None => nanosiem_core::AI_CREDIT_FULL,
             },
             None => nanosiem_core::AI_CREDIT_FULL,

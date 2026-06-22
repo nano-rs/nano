@@ -272,10 +272,12 @@ mod tests {
         // NAN-1232 removed 1 shared path: /api/news (dead cybersecurity news feed).
         // NAN-1241 (OCSF Phase 3b) added 1 shared path: /api/schema/fields
         // (profile-aware field universe), counted in both editions.
+        // NAN-1519 added 1 shared path: /api/settings/ai-usage (AI usage ledger
+        // detail — per-agent/daily/recent breakdowns), counted in both editions.
         #[cfg(feature = "enterprise")]
-        let min_paths = 475;
+        let min_paths = 476;
         #[cfg(not(feature = "enterprise"))]
-        let min_paths = 366;
+        let min_paths = 367;
 
         assert!(
             path_count >= min_paths,

@@ -100,6 +100,15 @@ async fn main() -> Result<()> {
 
     tracing::info!(node_id = %state.node_id, "Node ID for distributed scheduling");
 
+    // AI usage recorder (NAN-1519) — the jobs node runs shadow investigations,
+    // closure summaries and other background AI work, so its calls must land in
+    // the ai_usage_events ledger too. Per-instance init (enterprise-only).
+    #[cfg(feature = "enterprise")]
+    {
+        nanosiem_enterprise::melod::usage_recorder::init(state.pool.clone());
+        tracing::info!("AI usage recorder started");
+    }
+
     // Distributed schedulers: detection rules + scheduled jobs via SKIP LOCKED
     tracing::info!("Starting distributed schedulers (detection rules + scheduled jobs)...");
     let distributed_handles = state.start_distributed_schedulers().await;

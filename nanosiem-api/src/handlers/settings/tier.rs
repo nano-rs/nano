@@ -53,6 +53,40 @@ pub struct UsageRangeQuery {
     pub to: Option<chrono::NaiveDate>,
 }
 
+/// Query params for the AI usage detail endpoint
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct AiUsageQuery {
+    /// Start date (YYYY-MM-DD, UTC), defaults to the first of the current month
+    pub from: Option<chrono::NaiveDate>,
+    /// End date (YYYY-MM-DD, UTC, inclusive), defaults to today
+    pub to: Option<chrono::NaiveDate>,
+    /// Max rows for the recent-call log (1–500, default 50)
+    pub limit: Option<i64>,
+}
+
+/// Detailed AI usage: billed credits plus per-agent / daily / recent breakdowns
+/// from the `ai_usage_events` ledger (NAN-1519).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AiUsageDetailResponse {
+    /// Billed AI credits this month — authoritative, sourced from
+    /// `ai_request_counts` (one charge per request). The ledger breakdowns below
+    /// count individual LLM calls, so their summed `credits` may exceed this.
+    pub credits_used: i32,
+    /// Monthly credit limit (None = unlimited)
+    pub credits_limit: Option<u32>,
+    pub model_tier: nanosiem_core::AiModelTier,
+    /// Inclusive start date the breakdowns cover (UTC)
+    pub from: chrono::NaiveDate,
+    /// Inclusive end date the breakdowns cover (UTC)
+    pub to: chrono::NaiveDate,
+    /// Per-agent rollup over [from, to]
+    pub by_agent: Vec<nanosiem_core::AgentUsage>,
+    /// Daily series over [from, to]
+    pub daily: Vec<nanosiem_core::DailyAiUsage>,
+    /// Most recent AI calls (latest first), independent of the date range
+    pub recent: Vec<nanosiem_core::AiUsageEvent>,
+}
+
 // ============================================================================
 // Handler Functions
 // ============================================================================
@@ -249,4 +283,70 @@ pub async fn get_usage_history(
     let usage = tier_settings.get_usage_range(from, to).await?;
 
     Ok(Json(usage))
+}
+
+/// Get detailed AI usage: billed credits + per-agent, daily, and recent-call
+/// breakdowns from the AI usage ledger (NAN-1519).
+#[utoipa::path(
+    get,
+    path = "/api/settings/ai-usage",
+    tag = "settings",
+    params(AiUsageQuery),
+    responses(
+        (status = 200, body = AiUsageDetailResponse),
+        (status = 403, body = ErrorResponse),
+    ),
+    security(("bearer_auth" = []), ("api_key" = []))
+)]
+pub async fn get_ai_usage_detail(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthContext>,
+    axum::extract::Query(query): axum::extract::Query<AiUsageQuery>,
+) -> Result<Json<AiUsageDetailResponse>, ApiError> {
+    use chrono::Datelike;
+
+    check_permission(&auth, permissions::SETTINGS_SYSTEM)
+        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+
+    let today = chrono::Utc::now().date_naive();
+    let first_of_month = today.with_day(1).unwrap_or(today);
+    let from = query.from.unwrap_or(first_of_month);
+    let to = query.to.unwrap_or(today);
+    if from > to {
+        return Err(ApiError::BadRequest(
+            "`from` must be on or before `to`".to_string(),
+        ));
+    }
+    let limit = query.limit.unwrap_or(50);
+
+    // Convert the inclusive [from, to] date range to a half-open UTC timestamp
+    // range [from 00:00, (to+1) 00:00) so the `to` day is fully covered.
+    // `checked_add_days` guards against overflow on extreme user-supplied dates
+    // (a bare `+ Duration::days(1)` would panic at chrono's max date).
+    let from_ts = from.and_hms_opt(0, 0, 0).unwrap_or_default().and_utc();
+    let to_excl = to
+        .checked_add_days(chrono::Days::new(1))
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|dt| dt.and_utc())
+        .ok_or_else(|| ApiError::BadRequest("`to` date is out of range".to_string()))?;
+
+    let tier_settings = nanosiem_core::TierSettings::new(state.pool.clone());
+    let limits = tier_settings.get_tier_limits().await?;
+    // Headline billed-credit figure degrades to 0 rather than failing the whole
+    // request — the ledger breakdowns below are the primary payload here.
+    let credits_used = tier_settings.get_ai_credits_used().await.unwrap_or(0);
+    let by_agent = tier_settings.get_ai_usage_by_agent(from_ts, to_excl).await?;
+    let daily = tier_settings.get_ai_usage_daily(from_ts, to_excl).await?;
+    let recent = tier_settings.get_recent_ai_events(limit).await?;
+
+    Ok(Json(AiUsageDetailResponse {
+        credits_used,
+        credits_limit: limits.ai_credits_per_month,
+        model_tier: limits.ai_model_tier,
+        from,
+        to,
+        by_agent,
+        daily,
+        recent,
+    }))
 }

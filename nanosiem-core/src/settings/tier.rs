@@ -615,6 +615,152 @@ impl TierSettings {
 
         Ok(count.unwrap_or(0))
     }
+
+    /// Per-agent AI usage rollup over `[from, to)` from the `ai_usage_events`
+    /// ledger (NAN-1519), ordered by credit-equivalent descending — the "what
+    /// consumed the budget" breakdown.
+    pub async fn get_ai_usage_by_agent(
+        &self,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<AgentUsage>, TierError> {
+        // NB: SUM over a bigint column returns `numeric` in Postgres, which does
+        // NOT decode into Rust i64 — cast each SUM back to ::bigint. (credits is an
+        // integer column so SUM→bigint already, but cast for uniformity.)
+        let rows = sqlx::query_as::<_, (String, i64, i64, i64, i64, i64, i64)>(
+            r#"
+            SELECT agent,
+                   COUNT(*)                                        AS calls,
+                   COALESCE(SUM(prompt_tokens), 0)::bigint         AS prompt_tokens,
+                   COALESCE(SUM(completion_tokens), 0)::bigint     AS completion_tokens,
+                   COALESCE(SUM(cached_tokens), 0)::bigint         AS cached_tokens,
+                   COALESCE(SUM(cache_creation_tokens), 0)::bigint AS cache_creation_tokens,
+                   COALESCE(SUM(credits), 0)::bigint               AS credits
+            FROM ai_usage_events
+            WHERE occurred_at >= $1 AND occurred_at < $2
+            GROUP BY agent
+            ORDER BY credits DESC, calls DESC
+            "#,
+        )
+        .bind(from)
+        .bind(to)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(agent, calls, prompt, completion, cached, cache_creation, credits)| AgentUsage {
+                    agent,
+                    calls,
+                    prompt_tokens: prompt,
+                    completion_tokens: completion,
+                    cached_tokens: cached,
+                    cache_creation_tokens: cache_creation,
+                    credits,
+                },
+            )
+            .collect())
+    }
+
+    /// Daily AI usage series over `[from, to)` (NAN-1519), one row per UTC day
+    /// that had activity, ascending — the consumption-over-time trend.
+    pub async fn get_ai_usage_daily(
+        &self,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<DailyAiUsage>, TierError> {
+        let rows = sqlx::query_as::<_, (chrono::NaiveDate, i64, i64, i64, i64, i64)>(
+            r#"
+            -- SUM(bigint)→numeric in Postgres; cast back to ::bigint for i64 decode.
+            SELECT (occurred_at AT TIME ZONE 'UTC')::date AS day,
+                   COUNT(*)                                    AS calls,
+                   COALESCE(SUM(prompt_tokens), 0)::bigint     AS prompt_tokens,
+                   COALESCE(SUM(completion_tokens), 0)::bigint AS completion_tokens,
+                   COALESCE(SUM(cached_tokens), 0)::bigint     AS cached_tokens,
+                   COALESCE(SUM(credits), 0)::bigint           AS credits
+            FROM ai_usage_events
+            WHERE occurred_at >= $1 AND occurred_at < $2
+            GROUP BY day
+            ORDER BY day ASC
+            "#,
+        )
+        .bind(from)
+        .bind(to)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(date, calls, prompt, completion, cached, credits)| DailyAiUsage {
+                    date,
+                    calls,
+                    prompt_tokens: prompt,
+                    completion_tokens: completion,
+                    cached_tokens: cached,
+                    credits,
+                },
+            )
+            .collect())
+    }
+
+    /// Most recent AI calls (NAN-1519), newest first — the per-call event log.
+    pub async fn get_recent_ai_events(&self, limit: i64) -> Result<Vec<AiUsageEvent>, TierError> {
+        let limit = limit.clamp(1, 500);
+        let rows = sqlx::query_as::<
+            _,
+            (
+                chrono::DateTime<chrono::Utc>,
+                String,
+                String,
+                String,
+                i64,
+                i64,
+                i64,
+                i64,
+                i32,
+            ),
+        >(
+            r#"
+            SELECT occurred_at, agent, model_id, provider,
+                   prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens, credits
+            FROM ai_usage_events
+            ORDER BY occurred_at DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    occurred_at,
+                    agent,
+                    model_id,
+                    provider,
+                    prompt,
+                    completion,
+                    cached,
+                    cache_creation,
+                    credits,
+                )| AiUsageEvent {
+                    occurred_at,
+                    agent,
+                    model_id,
+                    provider,
+                    prompt_tokens: prompt,
+                    completion_tokens: completion,
+                    cached_tokens: cached,
+                    cache_creation_tokens: cache_creation,
+                    credits,
+                },
+            )
+            .collect())
+    }
 }
 
 /// Request to update specific tier limits
@@ -666,21 +812,109 @@ pub struct AiUsage {
     pub model_tier: AiModelTier,
 }
 
+/// Per-agent AI usage rollup over a time range (NAN-1519).
+///
+/// Token counts are real provider-reported totals; `credits` is the summed
+/// per-call credit-equivalent (relative attribution, not a billing figure —
+/// the billed total lives in `ai_request_counts`, see [`AiUsage`]).
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct AgentUsage {
+    /// Logical agent label (e.g. `detection`, `shadow_hunting`, `unknown`).
+    pub agent: String,
+    /// Number of LLM calls attributed to this agent.
+    pub calls: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub cached_tokens: i64,
+    pub cache_creation_tokens: i64,
+    /// Summed per-call credit-equivalent.
+    pub credits: i64,
+}
+
+/// One day's AI usage rollup (NAN-1519), keyed by UTC date.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct DailyAiUsage {
+    pub date: chrono::NaiveDate,
+    pub calls: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub cached_tokens: i64,
+    pub credits: i64,
+}
+
+/// One recorded AI call from the `ai_usage_events` ledger (NAN-1519).
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct AiUsageEvent {
+    pub occurred_at: chrono::DateTime<chrono::Utc>,
+    pub agent: String,
+    pub model_id: String,
+    pub provider: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub cached_tokens: i64,
+    pub cache_creation_tokens: i64,
+    pub credits: i32,
+}
+
 /// Cost of an AI request using a lite/economy model (0.2 requests)
 pub const AI_CREDIT_LITE: i32 = 2;
 /// Cost of an AI request using a standard/full model (1.0 request)
 pub const AI_CREDIT_FULL: i32 = 10;
 
-/// Determine the credit cost for an AI request based on the model being used.
-/// Economy/lite models cost 2 credits; everything else costs 10.
+/// Name-heuristic credit cost for an AI request — the **fallback** used only
+/// when the model carries no catalog tier (see [`resolve_ai_request_cost`],
+/// which is the catalog-driven primary path). Economy/lite models cost 2
+/// credits; everything else costs 10.
+///
+/// Kept deliberately small: it only needs to cover models absent from the
+/// catalog (e.g. custom in-app models). The authoritative classification lives
+/// in the model catalog (`available_models.cost_tier`, synced from
+/// `models.yaml`'s `tier:`), not in this list.
 pub fn ai_request_cost(model_id: &str) -> i32 {
     let model_lower = model_id.to_lowercase();
-    let economy_models = ["haiku", "flash-lite", "claude-haiku", "gemini-flash"];
+    // "glm" (Zhipu GLM family) is very cheap — bill it as lite. Insurance for
+    // custom GLM entries that aren't in the upstream catalog with a tier.
+    let economy_models = ["haiku", "flash-lite", "claude-haiku", "gemini-flash", "glm"];
     if economy_models.iter().any(|m| model_lower.contains(m)) {
         AI_CREDIT_LITE
     } else {
         AI_CREDIT_FULL
     }
+}
+
+/// Map a catalog `cost_tier` to credits (NAN-1521): `economy` →
+/// [`AI_CREDIT_LITE`], any other tier → [`AI_CREDIT_FULL`]. When the tier is
+/// absent/NULL (uncatalogued or custom model) falls back to the
+/// [`ai_request_cost`] name heuristic. Shared by [`resolve_ai_request_cost`]
+/// (single lookup) and the usage recorder's batched lookup so both classify
+/// identically.
+pub fn credits_for_cost_tier(cost_tier: Option<&str>, model_id: &str) -> i32 {
+    match cost_tier {
+        Some(t) if t.eq_ignore_ascii_case("economy") => AI_CREDIT_LITE,
+        Some(_) => AI_CREDIT_FULL,
+        None => ai_request_cost(model_id),
+    }
+}
+
+/// Resolve the credit cost for a model — **catalog-first** (NAN-1521).
+///
+/// Reads `available_models.cost_tier` (the upstream `models.yaml` `tier:` synced
+/// by `model_catalog_sync`) and maps it via [`credits_for_cost_tier`]. Falls
+/// back to the name heuristic when the model is absent/has no tier or on any DB
+/// error — usage billing must never fail the AI call.
+pub async fn resolve_ai_request_cost(pool: &PgPool, model_id: &str) -> i32 {
+    let row: Result<Option<Option<String>>, sqlx::Error> =
+        sqlx::query_scalar("SELECT cost_tier FROM available_models WHERE model_id = $1")
+            .bind(model_id)
+            .fetch_optional(pool)
+            .await;
+
+    // No row, NULL cost_tier, or DB error → None → heuristic fallback.
+    let cost_tier = match row {
+        Ok(Some(Some(tier))) => Some(tier),
+        _ => None,
+    };
+    credits_for_cost_tier(cost_tier.as_deref(), model_id)
 }
 
 /// Proactive warning when a resource is approaching its tier limit
@@ -816,7 +1050,7 @@ pub fn check_sso_access(limits: &TierLimits) -> Result<(), TierError> {
 
 /// Validate that a model is accessible on the given AI model tier
 pub fn check_model_access(model: &str, model_tier: &AiModelTier) -> Result<(), TierError> {
-    let economy_models = ["haiku", "flash-lite", "claude-haiku", "gemini-flash"];
+    let economy_models = ["haiku", "flash-lite", "claude-haiku", "gemini-flash", "glm"];
     let standard_models = ["sonnet", "claude-sonnet", "gemini-pro", "gpt-4o-mini"];
 
     match model_tier {
@@ -1018,6 +1252,23 @@ mod tests {
         // Full tier: everything
         assert!(check_model_access("claude-opus-4", &AiModelTier::Full).is_ok());
         assert!(check_model_access("claude-sonnet-4", &AiModelTier::Full).is_ok());
+
+        // GLM (Zhipu) is economy-tier (NAN-1521).
+        assert!(check_model_access("glm-4.6", &AiModelTier::Economy).is_ok());
+        assert!(check_model_access("z-ai/glm-4-flash", &AiModelTier::Economy).is_ok());
+    }
+
+    #[test]
+    fn test_ai_request_cost() {
+        // Economy/lite models cost AI_CREDIT_LITE.
+        assert_eq!(ai_request_cost("claude-haiku-4-5"), AI_CREDIT_LITE);
+        assert_eq!(ai_request_cost("gemini-2.0-flash-lite"), AI_CREDIT_LITE);
+        // GLM is lite — it's very cheap (NAN-1521).
+        assert_eq!(ai_request_cost("glm-4.6"), AI_CREDIT_LITE);
+        assert_eq!(ai_request_cost("z-ai/GLM-4-Flash"), AI_CREDIT_LITE);
+        // Full models cost AI_CREDIT_FULL.
+        assert_eq!(ai_request_cost("claude-sonnet-4-6"), AI_CREDIT_FULL);
+        assert_eq!(ai_request_cost("claude-opus-4-8"), AI_CREDIT_FULL);
     }
 
     #[test]

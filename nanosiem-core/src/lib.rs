@@ -318,8 +318,10 @@ pub use search::{
     SearchService, TimeRangeInput, UdmFieldQueryRequest, UdmQueryOperator,
 };
 pub use settings::{
-    ai_request_cost, check_api_access, check_api_write_access, check_limit, check_model_access,
-    check_sso_access, generate_warnings, AiModelTier, AiUsage, ApiAccessLevel, DailyUsage,
+    ai_request_cost, credits_for_cost_tier, resolve_ai_request_cost, check_api_access,
+    check_api_write_access, check_limit, check_model_access, check_sso_access, generate_warnings,
+    AgentUsage, AiModelTier, AiUsage, AiUsageEvent,
+    ApiAccessLevel, DailyAiUsage, DailyUsage,
     DeveloperSettingsError, DeveloperSettingsRepository, DiskPressureConfig, DiskPressureError,
     DiskPressureLevel, DiskPressureService, DiskPressureStatus, OrganizationTier, RetentionConfig,
     RetentionError, RetentionService, SchedulerSettings, StorageStats, SystemSettings, TierError,

@@ -1577,6 +1577,10 @@ pub fn create_router(state: AppState) -> Router {
             put(handlers::update_tier_limits),
         )
         .route("/api/settings/tier/usage", get(handlers::get_usage_history))
+        .route(
+            "/api/settings/ai-usage",
+            get(handlers::get_ai_usage_detail),
+        )
         // Webhook settings
         .route("/api/settings/webhooks", get(handlers::list_webhooks))
         .route("/api/settings/webhooks", post(handlers::create_webhook))

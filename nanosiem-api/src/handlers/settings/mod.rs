@@ -122,6 +122,7 @@ impl utoipa::OpenApi for SettingsApiDoc {
                 tier::set_tier,
                 tier::update_tier_limits,
                 tier::get_usage_history,
+                tier::get_ai_usage_detail,
             ),
             components(
                 schemas(
@@ -174,6 +175,10 @@ impl utoipa::OpenApi for SettingsApiDoc {
                     nanosiem_core::AiModelTier,
                     nanosiem_core::AiUsage,
                     nanosiem_core::DailyUsage,
+                    tier::AiUsageDetailResponse,
+                    nanosiem_core::AgentUsage,
+                    nanosiem_core::DailyAiUsage,
+                    nanosiem_core::AiUsageEvent,
                     nanosiem_core::UpdateTierLimits,
                     nanosiem_core::TierLimitExceeded,
                     nanosiem_core::TierWarning,
@@ -243,6 +248,7 @@ impl utoipa::OpenApi for SettingsApiDoc {
                 tier::set_tier,
                 tier::update_tier_limits,
                 tier::get_usage_history,
+                tier::get_ai_usage_detail,
             ),
             components(
                 schemas(
@@ -284,6 +290,10 @@ impl utoipa::OpenApi for SettingsApiDoc {
                     nanosiem_core::AiModelTier,
                     nanosiem_core::AiUsage,
                     nanosiem_core::DailyUsage,
+                    tier::AiUsageDetailResponse,
+                    nanosiem_core::AgentUsage,
+                    nanosiem_core::DailyAiUsage,
+                    nanosiem_core::AiUsageEvent,
                     nanosiem_core::UpdateTierLimits,
                     nanosiem_core::TierLimitExceeded,
                     nanosiem_core::TierWarning,

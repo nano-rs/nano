@@ -34,6 +34,10 @@ pub struct TuningSchedulerConfig {
     pub notification_batch_interval_secs: u64,
     /// How often to cleanup expired cache entries (in seconds)
     pub cache_cleanup_interval_secs: u64,
+    /// How often to run silent-rule diagnostics (in seconds). Each silent rule
+    /// can cost an AI phrasing call, so this runs daily by default rather than
+    /// on the 15-min threshold tick (NAN-1523).
+    pub silent_rule_interval_secs: u64,
 }
 
 impl Default for TuningSchedulerConfig {
@@ -44,6 +48,7 @@ impl Default for TuningSchedulerConfig {
             threshold_check_interval_secs: 900,    // 15 minutes
             notification_batch_interval_secs: 300, // 5 minutes
             cache_cleanup_interval_secs: 3600,     // 1 hour
+            silent_rule_interval_secs: 86400,      // 24 hours
         }
     }
 }
@@ -133,6 +138,10 @@ impl TuningScheduler {
 
         // Start threshold detection task
         handles.push(self.start_threshold_detection_task());
+
+        // Start silent-rule diagnostic task (daily — separate from the 15-min
+        // threshold tick because each silent rule can cost an AI call)
+        handles.push(self.start_silent_rule_task());
 
         // Start notification batching task
         handles.push(self.start_notification_batch_task());
@@ -329,27 +338,10 @@ impl TuningScheduler {
                         Err(e) => Err(e.to_string()),
                     };
 
-                    // Silent-rule diagnostic proposals (NAN-880). Runs on the
-                    // same tick as breach detection but is treated as a lower
-                    // priority job: failures are warn-logged and do NOT roll
-                    // into `consecutive_errors` / backoff so a temporary
-                    // ClickHouse hiccup on the source_volume query doesn't
-                    // starve the breach-driven tuning path.
-                    match orch.process_silent_rules().await {
-                        Ok(count) => {
-                            if count > 0 {
-                                info!(
-                                    "Generated {} silent-rule diagnostic proposals",
-                                    count
-                                );
-                            } else {
-                                debug!("No silent rules requiring diagnostic proposals");
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Silent-rule detection failed: {}", e);
-                        }
-                    }
+                    // Silent-rule diagnostic proposals (NAN-880) used to run on
+                    // this same 15-min tick, but phrasing makes an AI call per
+                    // silent rule — re-billing credits every cycle. Moved to its
+                    // own daily task (start_silent_rule_task, NAN-1523).
 
                     breach_ok
                 } else {
@@ -388,6 +380,67 @@ impl TuningScheduler {
                             consecutive_errors, backoff_secs, e
                         );
                         tokio::time::sleep(TokioDuration::from_secs(backoff_secs)).await;
+                    }
+                }
+            }
+        })
+    }
+
+    /// Start the silent-rule diagnostic task (daily by default).
+    ///
+    /// Split out from the 15-min threshold tick (NAN-1523): silent-rule phrasing
+    /// makes an AI call per rule, so running it every 15 min re-billed credits
+    /// for rules that already had an open proposal. This runs on its own
+    /// low-frequency cadence; the detector additionally skips rules whose
+    /// proposal is unchanged (no AI call), so a steady state is cheap. Failures
+    /// are warn-logged only — this is a lower-priority job and must not affect
+    /// the breach-driven tuning path.
+    fn start_silent_rule_task(&self) -> tokio::task::JoinHandle<()> {
+        let orchestrator = self.orchestrator.clone();
+        let interval_secs = self.config.silent_rule_interval_secs;
+        let developer_settings = self.developer_settings.clone();
+
+        info!(interval_secs, "Starting silent-rule diagnostic task");
+
+        tokio::spawn(async move {
+            let mut check_interval = interval(TokioDuration::from_secs(interval_secs));
+
+            loop {
+                check_interval.tick().await;
+
+                // Respect the tuning scheduler enable toggle.
+                if let Some(ref settings_repo) = developer_settings {
+                    match settings_repo.is_tuning_scheduler_enabled().await {
+                        Ok(false) => {
+                            debug!(
+                                "Tuning scheduler disabled, skipping silent-rule diagnostics"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!("Failed to check tuning scheduler enabled status: {}", e);
+                        }
+                        Ok(true) => {}
+                    }
+                }
+
+                let Some(orch) = &orchestrator else {
+                    debug!(
+                        "No orchestrator (AI not configured); skipping silent-rule diagnostics"
+                    );
+                    continue;
+                };
+
+                match orch.process_silent_rules().await {
+                    Ok(count) => {
+                        if count > 0 {
+                            info!("Generated {} silent-rule diagnostic proposals", count);
+                        } else {
+                            debug!("No silent rules requiring diagnostic proposals");
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Silent-rule detection failed: {}", e);
                     }
                 }
             }
@@ -510,6 +563,7 @@ mod tests {
         assert_eq!(config.baseline_update_interval_secs, 3600); // 1 hour
         assert_eq!(config.threshold_check_interval_secs, 900); // 15 minutes
         assert_eq!(config.notification_batch_interval_secs, 300); // 5 minutes
+        assert_eq!(config.silent_rule_interval_secs, 86400); // 24 hours (NAN-1523)
     }
 
     #[test]
@@ -520,6 +574,7 @@ mod tests {
             threshold_check_interval_secs: 300,
             notification_batch_interval_secs: 120,
             cache_cleanup_interval_secs: 1800,
+            silent_rule_interval_secs: 43200,
         };
         assert_eq!(config.metrics_collection_interval_secs, 60);
         assert_eq!(config.baseline_update_interval_secs, 1800);

@@ -202,6 +202,16 @@ async fn main() -> Result<()> {
         tracing::info!("meloD config poller started (30s interval)");
     }
 
+    // AI usage recorder (NAN-1519) — per-instance writer for the ai_usage_events
+    // ledger. Every node makes AI calls and persists its own rows, so this is
+    // initialized on all nodes (not leader-only). Enterprise-only: the AI gateway
+    // that feeds it lives in nanosiem-enterprise.
+    #[cfg(feature = "enterprise")]
+    {
+        nanosiem_enterprise::melod::usage_recorder::init(state.pool.clone());
+        tracing::info!("AI usage recorder started");
+    }
+
     // Rule change listener (per-instance cache invalidation via pg_notify)
     tracing::info!("Starting rule change listener...");
     let rule_listener_handle = state.start_rule_change_listener();

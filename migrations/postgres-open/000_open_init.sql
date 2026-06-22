@@ -7837,3 +7837,19 @@ CREATE INDEX IF NOT EXISTS idx_oidc_auth_transactions_expires_at
 
 CREATE INDEX IF NOT EXISTS idx_oidc_auth_transactions_provider_id
     ON public.oidc_auth_transactions (provider_id);
+
+-- NAN-1524: AI request counter for volume-based rate limiting (open migration
+-- 138, version <= OPEN_INIT_BASELINE_VERSION=175). It was dropped from this
+-- open snapshot during the open-core split (the table also lives in the
+-- enterprise overlay), so fresh DBs — where migration 138 is skipped as
+-- snapshot-covered — never created it. Restored here so the baseline matches
+-- its source migration; without it migration 208 (ai_usage_events) fails its
+-- backfill `INSERT ... FROM ai_request_counts` with 42P01.
+CREATE TABLE IF NOT EXISTS public.ai_request_counts (
+    id SERIAL PRIMARY KEY,
+    month TEXT NOT NULL,
+    request_count INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(month)
+);

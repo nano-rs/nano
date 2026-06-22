@@ -5683,6 +5683,49 @@ export interface AiUsage {
   model_tier: AiModelTier;
 }
 
+// AI usage ledger detail (NAN-1519)
+export interface AgentUsage {
+  agent: string;
+  calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cached_tokens: number;
+  cache_creation_tokens: number;
+  credits: number;
+}
+
+export interface DailyAiUsage {
+  date: string;
+  calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cached_tokens: number;
+  credits: number;
+}
+
+export interface AiUsageEvent {
+  occurred_at: string;
+  agent: string;
+  model_id: string;
+  provider: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cached_tokens: number;
+  cache_creation_tokens: number;
+  credits: number;
+}
+
+export interface AiUsageDetail {
+  credits_used: number;
+  credits_limit: number | null;
+  model_tier: AiModelTier;
+  from: string;
+  to: string;
+  by_agent: AgentUsage[];
+  daily: DailyAiUsage[];
+  recent: AiUsageEvent[];
+}
+
 export interface DailyUsage {
   date: string;
   bytes_ingested: number;
