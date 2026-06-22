@@ -197,11 +197,14 @@ pub struct UdmFieldInfo {
 
 /// Query parameters for the ext-field-names endpoint.
 ///
-/// Both bounds optional: with both present, enumeration is scoped to that search
-/// window (the fields picker, NAN-1505); absent, the service uses a bounded
-/// recent window (the syntax-highlighter path, which has no search context).
+/// All optional. With `query` + both bounds, enumeration is scoped to that
+/// search's predicate (the fields picker, NAN-1510) so listed keys match what a
+/// field expand can return; with bounds only, the search window (NAN-1505);
+/// absent, a bounded recent window (the syntax-highlighter path).
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct ExtFieldsQuery {
+    /// nPL search query to scope enumeration to (matches the per-field value fetch)
+    pub query: Option<String>,
     /// Start of the search time range (ISO 8601)
     pub start: Option<chrono::DateTime<chrono::Utc>>,
     /// End of the search time range (ISO 8601)
@@ -209,8 +212,8 @@ pub struct ExtFieldsQuery {
 }
 
 /// Get ext field names discovered in the data.
-/// Used by the fields picker (scoped to the search window) and to enable syntax
-/// highlighting for non-UDM fields (no range → recent window).
+/// Used by the fields picker (scoped to the search query+window) and to enable
+/// syntax highlighting for non-UDM fields (no params → recent window).
 #[utoipa::path(
     get,
     path = "/api/fields/ext",
@@ -223,17 +226,17 @@ pub struct ExtFieldsQuery {
 )]
 pub async fn get_ext_fields(
     State(state): State<AppState>,
-    Query(query): Query<ExtFieldsQuery>,
+    Query(params): Query<ExtFieldsQuery>,
 ) -> Result<Json<Vec<String>>, ApiError> {
     // Only scope when BOTH bounds are present; a half-specified range falls back
     // to the recent default rather than silently using "now" for the missing end.
-    let time_range = match (query.start, query.end) {
+    let time_range = match (params.start, params.end) {
         (Some(start), Some(end)) => Some(TimeRangeInput::new(start, end)),
         _ => None,
     };
     let names = state
         .search_service
-        .get_ext_field_names(time_range.as_ref())
+        .get_ext_field_names(params.query.as_deref(), time_range.as_ref())
         .await
         .map_err(|e| ApiError::InternalError(format!("Failed to get ext field names: {}", e)))?;
     Ok(Json(names))

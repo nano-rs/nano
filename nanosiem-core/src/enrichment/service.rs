@@ -652,6 +652,14 @@ impl EnrichmentService {
                     if total_inserted.is_multiple_of(500_000) {
                         info!(total_inserted, "Bulk insert progress");
                     }
+                    // NAN-1511: cooperatively yield so this CPU-bound parse+write
+                    // loop doesn't monopolize the runtime under the 1-CPU quota.
+                    // Without this, the jobs liveness probe (GET /health) can't be
+                    // scheduled within its timeout and kubelet kills the pod
+                    // (exit 137), which re-runs the sync → crash loop.
+                    if total_inserted.is_multiple_of(10_000) {
+                        tokio::task::yield_now().await;
+                    }
                 }
                 // A single malformed line shouldn't sink a multi-million-row feed.
                 Some(Err(e)) => {

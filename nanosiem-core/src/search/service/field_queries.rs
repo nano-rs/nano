@@ -386,15 +386,19 @@ impl SearchService {
         })
     }
 
-    /// Get ext field names that exist in the data.
+    /// Get ext field names that exist in the data, scoped to the active search.
     ///
-    /// `time_range` scopes enumeration to the active search window (the fields
-    /// picker, NAN-1505) so a historical search surfaces ITS ext keys; `None`
-    /// keeps the bounded recent window for the context-free syntax-highlighter
-    /// path. Without scoping, any search outside the last 3h showed no ext fields
-    /// in the picker even though the time-scoped result rows carried them.
+    /// NAN-1510: when `query` + `time_range` are given, enumeration is scoped to
+    /// the SAME predicate (time bounds + base filter) the per-field value fetch
+    /// (`get_field_values`) uses — so every key listed has values an expand can
+    /// actually return. Previously enumeration was time-window-only (NAN-1505),
+    /// so a filtered search listed ext keys from other source types in the window
+    /// that then expanded empty ("Values loaded on demand", no entries).
+    /// Fallbacks: time-only when no query (historical window), `now()-3h` when
+    /// neither (the context-free syntax-highlighter path).
     pub async fn get_ext_field_names(
         &self,
+        query: Option<&str>,
         time_range: Option<&TimeRangeInput>,
     ) -> Result<Vec<String>, SearchError> {
         if self.backend != SearchBackend::ClickHouse {
@@ -418,11 +422,47 @@ impl SearchService {
         // for UDM's effectively-flat `ext`).
         let is_ocsf = profile.id() == crate::schema::SchemaId::Ocsf;
         let json_col = profile.json_tail_column();
-        // Same scoping for UDM `ext` and OCSF `unmapped` — the window is applied
-        // on the raw table, independent of which JSON tail column is enumerated.
-        let window = time_range.map(|tr| (tr.start, tr.end));
+
+        let time_only = |tr: &TimeRangeInput| {
+            format!(
+                "timestamp BETWEEN '{}' AND '{}'",
+                tr.start.format("%Y-%m-%d %H:%M:%S%.6f"),
+                tr.end.format("%Y-%m-%d %H:%M:%S%.6f"),
+            )
+        };
+        // Build the scan predicate.
+        //
+        // The query path builds it STRUCTURALLY — `time_only` + the base search's
+        // generated filter (`generate_search_expr`) — i.e. exactly what the data
+        // query and the per-field value fetch emit as their WHERE. We deliberately
+        // do NOT slice the WHERE out of a fully-generated SQL string: that scan
+        // isn't quote/paren aware, so a literal containing `ORDER BY`/`LIMIT` or a
+        // subsearch's own inner `LIMIT` would truncate the predicate into malformed
+        // SQL (codex review, NAN-1510). A provided-but-unparseable/ungenerable query
+        // returns an empty list rather than broadening to the time-only window
+        // (which would re-list the cross-source-type keys this fix removes); a query
+        // that already ran for the search will parse + generate here too.
+        let where_predicate = match (query.map(str::trim).filter(|q| !q.is_empty()), time_range) {
+            (Some(q), Some(tr)) => {
+                let Ok(parsed) = parse_query(q) else {
+                    return Ok(Vec::new());
+                };
+                match extract_base_search(&parsed) {
+                    Query::Search(expr) => match self.ch_sql_generator.generate_search_expr(&expr) {
+                        Ok(filter) => format!("{} AND ({})", time_only(tr), filter),
+                        Err(_) => return Ok(Vec::new()),
+                    },
+                    // extract_base_search always yields Query::Search; defensively
+                    // fall back to the window scope rather than erroring.
+                    _ => time_only(tr),
+                }
+            }
+            (_, Some(tr)) => time_only(tr),
+            _ => "timestamp >= now() - INTERVAL 3 HOUR".to_string(),
+        };
+
         ch_executor
-            .get_ext_field_names(&table, json_col, is_ocsf, window)
+            .get_ext_field_names(&table, json_col, is_ocsf, &where_predicate)
             .await
     }
 

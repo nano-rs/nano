@@ -27,12 +27,7 @@ use crate::search::{parse_clickhouse_error, FieldInfo, SearchError};
 /// dotted (`a.b.c`); the query-bar tokenizer matches bare identifiers, so each is
 /// reduced to its top-level segment — the same key form the results-driven field list
 /// registers. The cap keeps this best-effort, fire-and-forget query from ever hanging.
-fn build_ext_field_names_sql(
-    table: &str,
-    json_col: &str,
-    nested: bool,
-    time_range: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
-) -> String {
+fn build_ext_field_names_sql(table: &str, json_col: &str, nested: bool, where_predicate: &str) -> String {
     // NAN-1241: the dynamic-JSON column is `ext` under UDM, `event` under OCSF.
     //
     // UDM `ext` is effectively flat — keys are bare identifiers (`foo`) the
@@ -49,28 +44,18 @@ fn build_ext_field_names_sql(
     } else {
         "splitByChar('.', path)[1]"
     };
-    // NAN-1505: scope enumeration to the caller's search window when given.
-    // The legacy `now() - 3h` window is blind to historical searches — a search
-    // over a past day surfaced NO ext fields in the picker even though the
-    // (correctly time-scoped) result rows carried them. When a range is passed
-    // we emit `timestamp BETWEEN start AND end`, matching how field-stats scopes;
-    // when absent (the syntax-highlighter path, which has no search context) we
-    // keep the bounded recent window. `max_execution_time` stays as the
-    // best-effort backstop for very wide windows on busy tenants.
-    let window = match time_range {
-        Some((start, end)) => format!(
-            "timestamp BETWEEN '{}' AND '{}'",
-            start.format("%Y-%m-%d %H:%M:%S%.6f"),
-            end.format("%Y-%m-%d %H:%M:%S%.6f"),
-        ),
-        None => "timestamp >= now() - INTERVAL 3 HOUR".to_string(),
-    };
+    // `where_predicate` is the bare predicate (no `WHERE` keyword) scoping the
+    // scan. NAN-1510: the service passes the SAME query+time predicate the
+    // per-field value fetch uses, so the enumerated keys match what expanding a
+    // field can actually return (a time-only or `now()-3h` predicate is used for
+    // the historical-window / highlighter fallbacks). `max_execution_time` stays
+    // as the best-effort backstop for very wide windows on busy tenants.
     format!(
         "SELECT DISTINCT {name_expr} AS name \
          FROM ( \
              SELECT arrayJoin(distinctJSONPaths({json_col})) AS path \
              FROM {table} \
-             WHERE {window} \
+             WHERE {where_predicate} \
          ) \
          WHERE name != '' \
          ORDER BY name \
@@ -539,17 +524,19 @@ impl ClickHouseExecutor {
         Ok(fields)
     }
 
-    /// Get distinct ext field names that exist in the ext JSON column.
-    /// Scoped to `time_range` when given (the picker, NAN-1505), else the recent
-    /// bounded window (the syntax-highlighter path, which has no search context).
+    /// Get distinct ext field names that exist in the JSON tail column, scoped by
+    /// `where_predicate` (bare predicate, no `WHERE`). NAN-1510: the service passes
+    /// the query+time predicate so the keys match the per-field value fetch; the
+    /// time-only / recent-window fallbacks are used for historical-window and
+    /// highlighter callers.
     pub async fn get_ext_field_names(
         &self,
         table: &str,
         json_col: &str,
         nested: bool,
-        time_range: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+        where_predicate: &str,
     ) -> Result<Vec<String>, SearchError> {
-        let sql = build_ext_field_names_sql(table, json_col, nested, time_range);
+        let sql = build_ext_field_names_sql(table, json_col, nested, where_predicate);
 
         debug!("Querying ext field names: {}", sql);
 
@@ -573,9 +560,12 @@ impl ClickHouseExecutor {
                 Err(e) => {
                     // Don't swallow it: a mid-stream error (e.g. the
                     // max_execution_time cap firing) would otherwise return an
-                    // empty list as a 200 and mask the failure (NAN-1177).
+                    // empty list as a 200 and mask the failure (NAN-1177). The
+                    // callers (picker useQuery / highlighter best-effort .catch)
+                    // degrade gracefully on an error, so surface it (NAN-1510:
+                    // the prior `break` returned a silent empty despite this note).
                     warn!("ext field names query failed mid-stream: {}", e);
-                    break;
+                    return Err(parse_clickhouse_error(&e.to_string()));
                 }
             }
         }
@@ -760,8 +750,9 @@ mod tests {
 
     #[test]
     fn ext_field_names_sql_is_bounded_and_native() {
-        // UDM `ext` is flat → nested=false. No range → legacy recent window.
-        let sql = build_ext_field_names_sql("nanosiem.logs", "ext", false, None);
+        // UDM `ext` is flat → nested=false. Recent-window predicate (highlighter).
+        let sql =
+            build_ext_field_names_sql("nanosiem.logs", "ext", false, "timestamp >= now() - INTERVAL 3 HOUR");
 
         // Targets the resolved table.
         assert!(sql.contains("FROM nanosiem.logs"), "sql: {sql}");
@@ -771,33 +762,35 @@ mod tests {
         // (NAN-1172), and NOT arrayJoin(JSONAllPaths(ext)) over the raw window, which
         // exploded a row per path and timed out at scale (NAN-1177).
         assert!(sql.contains("distinctJSONPaths(ext)"), "sql: {sql}");
-        // Range-less path keeps the bounded recent window.
-        assert!(sql.contains("INTERVAL 3 HOUR"), "sql: {sql}");
+        // The caller's predicate is injected verbatim.
+        assert!(sql.contains("WHERE timestamp >= now() - INTERVAL 3 HOUR"), "sql: {sql}");
 
         // NAN-1241/1443: under OCSF the dynamic-JSON tail column is the
         // `unmapped` spill (was `event`, now EPHEMERAL), still nested → nested=true
         // returns full leaf paths.
-        let ocsf_sql = build_ext_field_names_sql("nanosiem.ocsf_logs", "unmapped", true, None);
+        let ocsf_sql = build_ext_field_names_sql(
+            "nanosiem.ocsf_logs",
+            "unmapped",
+            true,
+            "timestamp >= now() - INTERVAL 3 HOUR",
+        );
         assert!(ocsf_sql.contains("distinctJSONPaths(unmapped)"), "sql: {ocsf_sql}");
         assert!(ocsf_sql.contains("FROM nanosiem.ocsf_logs"), "sql: {ocsf_sql}");
-        // Bounded window + native aggregate still apply to the OCSF lane.
-        assert!(ocsf_sql.contains("INTERVAL 3 HOUR"), "sql: {ocsf_sql}");
         assert!(!sql.contains("toString(ext)"), "sql: {sql}");
         assert!(!sql.contains("JSONExtractKeys"), "sql: {sql}");
         assert!(!sql.contains("JSONAllPaths"), "sql: {sql}");
 
-        // NAN-1505: with a search range, enumeration scopes to that window
-        // (`timestamp BETWEEN …`) instead of the recent default, so historical
-        // searches surface their own ext keys.
-        let start = chrono::DateTime::parse_from_rfc3339("2026-05-30T02:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let end = chrono::DateTime::parse_from_rfc3339("2026-05-30T03:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let scoped = build_ext_field_names_sql("nanosiem.logs", "ext", false, Some((start, end)));
+        // NAN-1505/1510: the predicate can carry both the time bounds AND the
+        // query filter (the SAME predicate the per-field value fetch uses), so the
+        // enumerated keys match what expanding a field can return.
+        let scoped = build_ext_field_names_sql(
+            "nanosiem.logs",
+            "ext",
+            false,
+            "timestamp BETWEEN '2026-05-30 02:00:00.000000' AND '2026-05-30 03:00:00.000000' AND (source_type = 'sysmon')",
+        );
         assert!(scoped.contains("timestamp BETWEEN '2026-05-30 02:00:00"), "sql: {scoped}");
-        assert!(scoped.contains("AND '2026-05-30 03:00:00"), "sql: {scoped}");
+        assert!(scoped.contains("source_type = 'sysmon'"), "sql: {scoped}");
         assert!(!scoped.contains("INTERVAL 3 HOUR"), "sql: {scoped}");
         assert!(scoped.contains("distinctJSONPaths(ext)"), "sql: {scoped}");
 

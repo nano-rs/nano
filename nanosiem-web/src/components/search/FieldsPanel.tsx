@@ -258,12 +258,14 @@ export function FieldsPanel({
   // stats — those only enumerate explicit table columns. Pull the key list and
   // merge any not surfaced as a real column in as on-demand entries so they're
   // discoverable + expandable.
-  // NAN-1505: scope enumeration to the active search window (keyed on it) so a
-  // historical search surfaces ITS ext keys — the old fixed recent window
-  // returned nothing for any past range. Only fetch while the panel is open.
+  // NAN-1505/1510: scope enumeration to the active search QUERY + window (keyed on
+  // both) so the list matches what a field expand can return. Keying on the window
+  // alone (1505) listed ext keys from other source types in the window that then
+  // expanded empty; passing the query scopes it to the same predicate as the
+  // per-field value fetch. Only fetch while the panel is open.
   const { data: extFieldNames } = useQuery({
-    queryKey: ['ext-field-names', timeRange?.start, timeRange?.end],
-    queryFn: () => api.getExtFieldNames(timeRange?.start, timeRange?.end),
+    queryKey: ['ext-field-names', query, timeRange?.start, timeRange?.end],
+    queryFn: () => api.getExtFieldNames(query, timeRange?.start, timeRange?.end),
     staleTime: 5 * 60 * 1000,
     enabled: !!onFetchFieldValues && !!timeRange && isExpanded,
   });
@@ -432,6 +434,15 @@ export function FieldsPanel({
               const serverData = serverFieldValues.get(stat.field);
               const loadedValues = serverData?.values ?? [];
               const hasLoaded = loadedValues.length > 0;
+              // NAN-1510: an on-demand (ext) field whose fetch completed with no
+              // values (a key present but empty in the matched rows) → read "No
+              // values" instead of a stuck "loaded on demand". Scoped to
+              // stat.onDemand so a real column (which falls back to client-side
+              // topValues when server values are empty) doesn't claim "No values"
+              // while still rendering rows; excludes the error case so a failed
+              // fetch isn't masked as empty.
+              const loadedEmpty =
+                !!stat.onDemand && !!serverData && !serverData.loading && !serverData.error && loadedValues.length === 0;
               const loadedCapped = loadedValues.length >= ON_DEMAND_VALUE_LIMIT;
               const plus = hasLoaded && loadedCapped ? '+' : '';
               const displayUnique = hasLoaded
@@ -487,9 +498,11 @@ export function FieldsPanel({
                   <div className="mt-1 mb-2 pl-3 pr-1 py-1 border-l border-primary/25 anim-slide space-y-0.5">
                     <div className="flex items-center gap-2 pb-1 mb-1 font-mono text-[10px] text-muted-foreground">
                       <span className="text-muted-foreground/80">
-                        {displayUnique == null
-                          ? 'Values loaded on demand'
-                          : `${displayUnique.toLocaleString()}${plus} unique · ${(displayCount ?? 0).toLocaleString()}${plus} events`}
+                        {loadedEmpty
+                          ? 'No values in this search'
+                          : displayUnique == null
+                            ? 'Values loaded on demand'
+                            : `${displayUnique.toLocaleString()}${plus} unique · ${(displayCount ?? 0).toLocaleString()}${plus} events`}
                       </span>
                       <button
                         type="button"
