@@ -181,24 +181,29 @@ fn analyze_search_expr(
                 impact: Some("May scan all events in the time range".to_string()),
             });
         }
-        SearchExpr::Keyword(kw) if kw != "*" && kw.chars().any(|c| !c.is_alphanumeric()) => {
-            // Bare keyword with special chars (IPs, domains, file paths) searches
-            // the message column via iLike — much slower than field filters.
-            let suggestion = if kw.contains('.') && kw.chars().all(|c| c.is_ascii_digit() || c == '.') {
-                // Looks like an IP address
+        // NAN-1515: a bare keyword is a whole-word (token) search — fast, but it
+        // matches the term only as a complete word, never buried inside a larger
+        // word (`cmd.exe` won't match `dsregcmd.exe`; `fail` won't match `failed`),
+        // same as Splunk/Elastic. Surface that so a missed partial match isn't
+        // silent. Skip needles already carrying a `*` wildcard (the user is
+        // explicitly doing a substring/iLike search) and the bare `*` (handled
+        // above). Numeric-only needles (IPs) get a field-filter nudge instead,
+        // since that is both faster and unambiguous.
+        SearchExpr::Keyword(kw) if !kw.contains('*') && !kw.contains('?') => {
+            let is_ip_like =
+                kw.contains('.') && kw.chars().all(|c| c.is_ascii_digit() || c == '.');
+            let suggestion = if is_ip_like {
                 format!(
-                    "Use a field filter for faster results: src_ip=\"{}\" or dest_ip=\"{}\"",
-                    kw, kw
+                    "For a field match use src_ip=\"{kw}\" / dest_ip=\"{kw}\"; for a partial text match use a wildcard: *{kw}*"
                 )
             } else {
-                "Use a field filter (e.g., src_host=\"...\", url=\"...\") or add sourcetype = \"...\" to narrow the scan".to_string()
+                format!("For a partial match (inside larger words), use a wildcard: *{kw}*")
             };
             analysis.warnings.push(QueryWarning {
                 severity: WarningSeverity::Info,
-                code: "UNINDEXED_KEYWORD_SEARCH".to_string(),
+                code: "KEYWORD_TOKEN_SEARCH".to_string(),
                 message: format!(
-                    "Searching for \"{}\" scans the full message text across all log sources",
-                    kw
+                    "Keyword \"{kw}\" matches whole words only — not when it appears inside a larger word"
                 ),
                 suggestion: Some(suggestion),
                 impact: None,
@@ -611,6 +616,26 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.code == "WILDCARD_SEARCH"));
+    }
+
+    /// NAN-1515: bare keyword (single- or multi-token) surfaces the whole-word /
+    /// token-search advisory so a missed partial match isn't silent; an explicit
+    /// `*kw*` wildcard does NOT (the user already asked for substring).
+    #[test]
+    fn test_keyword_token_search_advisory() {
+        for kw in ["error", "cmd.exe", "comsvcs"] {
+            let analysis = analyze_query_cost(&parse_query(kw).unwrap());
+            assert!(
+                analysis.warnings.iter().any(|w| w.code == "KEYWORD_TOKEN_SEARCH"),
+                "bare keyword {kw:?} should surface the token-search advisory"
+            );
+        }
+        // Explicit wildcard = substring intent → no advisory, no WILDCARD_SEARCH.
+        let analysis = analyze_query_cost(&parse_query("*cmd*").unwrap());
+        assert!(
+            !analysis.warnings.iter().any(|w| w.code == "KEYWORD_TOKEN_SEARCH"),
+            "explicit *cmd* wildcard must not surface the token-search advisory"
+        );
     }
 
     #[test]

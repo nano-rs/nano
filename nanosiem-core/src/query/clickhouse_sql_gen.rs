@@ -3759,14 +3759,15 @@ mod tests {
             "UDM ext CONTAINS must keep the toString null-guard, got:\n{sql}"
         );
 
-        // UDM equality / keyword paths are byte-identical: Eq on an
-        // ingest-lowercased column stays the bare indexed comparison.
+        // UDM equality stays the bare indexed comparison; the bare keyword now
+        // drives idx_message_words via hasAllTokens (NAN-1515).
         let sql = gen
             .generate(&parse_query("user=\"bob\" error").unwrap(), &time_range())
             .unwrap();
         assert!(
-            sql.contains("\"user\" = 'bob'") && sql.contains("lower(message) iLike '%error%'"),
-            "UDM Eq/keyword paths must stay byte-identical, got:\n{sql}"
+            sql.contains("\"user\" = 'bob'")
+                && sql.contains("hasAllTokens(lower(message), 'error')"),
+            "UDM Eq stays bare; bare keyword uses hasAllTokens, got:\n{sql}"
         );
     }
 
@@ -4010,190 +4011,196 @@ mod tests {
         );
     }
 
-    /// Bare keyword `anom` (no field qualifier) must also use iLike.
-    /// Same surface as CONTAINS — the bare-keyword codegen path was the third
-    /// site emitting hasToken on alphanumeric needles.
+    /// NAN-1515: a single-token bare keyword is now a TOKEN match
+    /// (`hasAllTokens`, posting-list lookup), not a substring iLike. This is the
+    /// one deliberate semantic change — bare `anom` no longer matches
+    /// `anomalous`; substring intent goes through `*kw*` / `CONTAINS` (still
+    /// iLike). The substring form was 77–250× slower at Saturn scale.
     #[test]
-    fn bare_keyword_fragment_uses_ilike_not_hastoken() {
+    fn bare_keyword_single_token_uses_hasalltokens() {
         let query = parse_query("anom").unwrap();
         let sql = ClickHouseSqlGenerator::new()
             .generate(&query, &time_range())
             .unwrap();
 
         assert!(
-            sql.contains("lower(message) iLike '%anom%'"),
-            "expected substring iLike on message, got:\n{}",
+            sql.contains("hasAllTokens(lower(message), 'anom')"),
+            "single-token bare keyword should use hasAllTokens, got:\n{}",
             sql
         );
         assert!(
-            !sql.contains("hasToken"),
-            "must NOT lower to hasToken, got:\n{}",
+            !sql.contains("lower(message) iLike "),
+            "single-token bare keyword must NOT emit a substring iLike, got:\n{}",
+            sql
+        );
+        assert!(
+            !sql.contains("position("),
+            "single clean token must NOT grow a position guard, got:\n{}",
             sql
         );
     }
 
-    /// Whole-token analyst patterns (`mimikatz`, `kerberos`) still work — same
-    /// iLike codegen now, splitByNonAlpha + LIKE-via-dictionary-scan keeps perf
-    /// in the same ballpark as the prior hasToken path.
-    ///
-    /// NAN-1416 pin: single-token needles must emit EXACTLY this shape — no
-    /// longest-token guard. The single iLike is index-served with DIRECT READ
-    /// (message never materialized); a redundant guard would disturb that.
+    /// NAN-1515: whole-token analyst patterns (`mimikatz`, `kerberos`) lower to
+    /// a bare `hasAllTokens` — a posting-list lookup on idx_message_words, no
+    /// position guard (single clean token = token match).
     #[test]
-    fn bare_whole_token_keyword_uses_ilike() {
+    fn bare_whole_token_keyword_uses_hasalltokens() {
         let query = parse_query("mimikatz").unwrap();
         let sql = ClickHouseSqlGenerator::new()
             .generate(&query, &time_range())
             .unwrap();
 
         assert!(
-            sql.contains("(lower(message) iLike '%mimikatz%')"),
-            "whole-token keyword should lower to a single bare iLike, got:\n{}",
+            sql.contains("hasAllTokens(lower(message), 'mimikatz')"),
+            "whole-token keyword should lower to a bare hasAllTokens, got:\n{}",
             sql
         );
         assert!(
-            !sql.contains(" AND lower(message) iLike "),
-            "single-token keyword must NOT grow a guard iLike, got:\n{}",
+            !sql.contains("position(") && !sql.contains("iLike"),
+            "single clean token must be bare hasAllTokens (no position, no iLike), got:\n{}",
             sql
         );
     }
 
-    /// NAN-1416: multi-token keywords (phrases, `file.exe`, snake_case) can't
-    /// be served by the splitByNonAlpha text index — they get a
-    /// longest-qualifying-token guard ANDed after the full-needle iLike.
-    /// Every token is a substring of the needle, so full ∧ guard ≡ full.
+    /// NAN-1515: multi-token / structured needles (`file.exe`, snake_case) lower
+    /// to a bare `hasAllTokens` — token-AND via posting-list lookup, same shape as
+    /// single-token. No position guard, no iLike. Replaces the NAN-1416 guard.
     #[test]
-    fn bare_special_char_keyword_gets_longest_token_guard() {
+    fn bare_special_char_keyword_uses_hasalltokens() {
         let query = parse_query("svchost.exe").unwrap();
         let sql = ClickHouseSqlGenerator::new()
             .generate(&query, &time_range())
             .unwrap();
 
         assert!(
-            sql.contains(
-                "lower(message) iLike '%svchost.exe%' AND lower(message) iLike '%svchost%'"
-            ),
-            "multi-token keyword should emit full-needle iLike + guard, got:\n{}",
+            sql.contains("hasAllTokens(lower(message), 'svchost.exe')"),
+            "multi-token keyword should emit bare hasAllTokens, got:\n{}",
+            sql
+        );
+        assert!(
+            !sql.contains("iLike") && !sql.contains("position("),
+            "multi-token keyword must NOT emit iLike or position, got:\n{}",
             sql
         );
     }
 
-    /// NAN-1416: quoted phrase — guard is the longest token (`failed`, 6 > 5),
-    /// ties resolve to first occurrence (deterministic SQL).
+    /// NAN-1515: quoted phrase → hasAllTokens(both tokens). Token-AND, no
+    /// adjacency guard — `"failed login"` matches rows with tokens `failed` AND
+    /// `login` (Splunk parity).
     #[test]
-    fn quoted_phrase_keyword_gets_longest_token_guard() {
+    fn quoted_phrase_keyword_uses_hasalltokens() {
         let query = parse_query("\"failed login\"").unwrap();
         let sql = ClickHouseSqlGenerator::new()
             .generate(&query, &time_range())
             .unwrap();
 
         assert!(
-            sql.contains(
-                "lower(message) iLike '%failed login%' AND lower(message) iLike '%failed%'"
-            ),
-            "phrase keyword should emit full phrase + longest-token guard, got:\n{}",
+            sql.contains("hasAllTokens(lower(message), 'failed login')"),
+            "phrase keyword should emit bare hasAllTokens, got:\n{}",
+            sql
+        );
+        assert!(
+            !sql.contains("position(") && !sql.contains("iLike"),
+            "phrase keyword must NOT emit position or iLike, got:\n{}",
             sql
         );
     }
 
-    /// NAN-1416: needles with no qualifying guard token get NO guard — short
-    /// or numeric-only tokens were measured to cost more than they save
-    /// (`%cmd%` +153% CPU, `%192%` +159%, `%event%` +26%, zero/no pruning);
-    /// shape unchanged.
+    /// NAN-1515: every structured needle (IPs, dotted names, snake_case) takes
+    /// the same bare hasAllTokens path — no per-token length heuristics, no
+    /// position, no iLike. CH tokenizes the string needle itself.
     #[test]
-    fn short_token_keyword_gets_no_guard() {
-        for needle in ["a.b.c", "10.0.0.52", "cmd.exe", "192.168.1.100"] {
+    fn structured_keyword_uses_hasalltokens() {
+        for needle in ["a.b.c", "10.0.0.52", "cmd.exe", "192.168.1.100", "event_data"] {
             let query = parse_query(&format!("\"{}\"", needle)).unwrap();
             let sql = ClickHouseSqlGenerator::new()
                 .generate(&query, &time_range())
                 .unwrap();
 
             assert!(
-                sql.contains(&format!("(lower(message) iLike '%{}%')", needle)),
-                "short-token needle {:?} should stay a single bare iLike, got:\n{}",
+                sql.contains(&format!("hasAllTokens(lower(message), '{needle}')")),
+                "structured needle {:?} should emit bare hasAllTokens, got:\n{}",
                 needle,
                 sql
             );
             assert!(
-                !sql.contains(" AND lower(message) iLike "),
-                "short-token needle {:?} must NOT grow a guard, got:\n{}",
+                !sql.contains("iLike") && !sql.contains("position("),
+                "structured needle {:?} must NOT emit iLike or position, got:\n{}",
                 needle,
                 sql
             );
         }
-
-        // 5-char tokens (`event`) are excluded too — measured +26% CPU on a
-        // dense snake_case hunt with zero pruning.
-        let query = parse_query("\"event_data\"").unwrap();
-        let sql = ClickHouseSqlGenerator::new()
-            .generate(&query, &time_range())
-            .unwrap();
-        assert!(
-            sql.contains("(lower(message) iLike '%event\\\\_data%')")
-                && !sql.contains(" AND lower(message) iLike "),
-            "event_data must stay a single (escaped) iLike with no guard, got:\n{}",
-            sql
-        );
     }
 
-    /// NAN-1416: phrases with leading/trailing spaces around a single token
-    /// stay single-token (no guard); guard tokens never carry LIKE metachars
-    /// or quotes (alnum-only by construction).
+    /// NAN-1515: an explicit wildcard in a bare keyword (`cmd*`, `c?d`) is
+    /// partial-match intent → iLike pattern (the escape hatch from token search),
+    /// not a hasAllTokens token lookup.
     #[test]
-    fn keyword_guard_edge_cases() {
-        // " error " → one token → no guard, full pattern keeps the spaces.
+    fn bare_keyword_wildcard_uses_ilike_not_hasalltokens() {
+        for (q, want) in [
+            ("cmd*", "lower(message) iLike 'cmd%'"),
+            ("c?d", "lower(message) iLike 'c_d'"),
+        ] {
+            let sql = ClickHouseSqlGenerator::new()
+                .generate(&parse_query(q).unwrap(), &time_range())
+                .unwrap();
+            assert!(
+                sql.contains(want) && !sql.contains("hasAllTokens"),
+                "wildcard keyword {q:?} should emit {want:?} (no hasAllTokens), got:\n{sql}"
+            );
+        }
+    }
+
+    /// NAN-1515 edge cases: LIKE metachars are literal (no escaping — hasAllTokens
+    /// takes a literal string); all-symbol needles fall back to substring iLike
+    /// (no index tokens); non-ASCII stays inside a CH token.
+    #[test]
+    fn keyword_edge_cases() {
+        // Spaces are token separators; the needle is just tokenized by CH.
         let query = parse_query("\" error \"").unwrap();
         let sql = ClickHouseSqlGenerator::new()
             .generate(&query, &time_range())
             .unwrap();
         assert!(
-            sql.contains("(lower(message) iLike '% error %')"),
-            "spaced single-token phrase keeps its exact pattern, got:\n{}",
-            sql
-        );
-        assert!(
-            !sql.contains(" AND lower(message) iLike "),
-            "spaced single-token phrase must NOT grow a guard, got:\n{}",
+            sql.contains("hasAllTokens(lower(message), ' error ')")
+                && !sql.contains("position(")
+                && !sql.contains("iLike"),
+            "spaced phrase lowers to bare hasAllTokens, got:\n{}",
             sql
         );
 
-        // Needle with LIKE metachars: the full pattern escapes them, the
-        // guard token is pure alnum (`download` — `%`/`_` are separators,
-        // never part of a token).
+        // LIKE metachars `%`/`_` are ordinary literals to hasAllTokens — no escaping.
         let query = parse_query("\"100%_download\"").unwrap();
         let sql = ClickHouseSqlGenerator::new()
             .generate(&query, &time_range())
             .unwrap();
         assert!(
-            sql.contains(
-                "lower(message) iLike '%100\\\\%\\\\_download%' AND lower(message) iLike '%download%'"
-            ),
-            "guard token must be alnum-only while the full pattern escapes LIKE metachars, got:\n{}",
+            sql.contains("hasAllTokens(lower(message), '100%_download')"),
+            "LIKE metachars must be literal in hasAllTokens, got:\n{}",
             sql
         );
 
-        // All non-alphanumeric needle → no guard.
-        let query = parse_query("\"***\"").unwrap();
+        // All-separator needle with no wildcard → no index tokens → substring iLike.
+        let query = parse_query("\"!!!\"").unwrap();
         let sql = ClickHouseSqlGenerator::new()
             .generate(&query, &time_range())
             .unwrap();
         assert!(
-            !sql.contains(" AND lower(message) iLike "),
-            "all-symbol needle must NOT grow a guard, got:\n{}",
+            sql.contains("lower(message) iLike '%!!!%'") && !sql.contains("hasAllTokens"),
+            "all-separator needle falls back to substring iLike, got:\n{}",
             sql
         );
 
-        // Unicode: non-ASCII chars are conservative token separators; the
-        // guard is the longest qualifying ASCII-alnum run.
+        // Unicode: non-ASCII stays inside a CH token, so `café` is a real token.
         let query = parse_query("\"café attachment\"").unwrap();
         let sql = ClickHouseSqlGenerator::new()
             .generate(&query, &time_range())
             .unwrap();
         assert!(
-            sql.contains(
-                "lower(message) iLike '%café attachment%' AND lower(message) iLike '%attachment%'"
-            ),
-            "unicode phrase guards on the longest qualifying ASCII-alnum run, got:\n{}",
+            sql.contains("hasAllTokens(lower(message), 'café attachment')")
+                && !sql.contains("position(")
+                && !sql.contains("iLike"),
+            "unicode phrase searches café as a token via hasAllTokens, got:\n{}",
             sql
         );
     }
@@ -4253,30 +4260,31 @@ mod tests {
         );
     }
 
-    /// NAN-1416: the keyword guard is profile-independent — OCSF keywords go
+    /// NAN-1515: the keyword codegen is profile-independent — OCSF keywords go
     /// through the same `lower(message)` arm (ocsf_logs carries the identical
     /// splitByNonAlpha index on lower(message)).
     #[test]
-    fn ocsf_keyword_guard_matches_udm_shape() {
+    fn ocsf_keyword_matches_udm_shape() {
         let gen = ClickHouseSqlGenerator::new()
             .with_profile(std::sync::Arc::new(crate::schema::OcsfProfile::new()));
 
         let query = parse_query("\"failed login\"").unwrap();
         let sql = gen.generate(&query, &time_range()).unwrap();
         assert!(
-            sql.contains(
-                "lower(message) iLike '%failed login%' AND lower(message) iLike '%failed%'"
-            ),
-            "OCSF multi-token keyword should emit the same guard shape, got:\n{}",
+            sql.contains("hasAllTokens(lower(message), 'failed login')")
+                && !sql.contains("position(")
+                && !sql.contains("iLike"),
+            "OCSF multi-token keyword should emit the same bare hasAllTokens shape, got:\n{}",
             sql
         );
 
         let query = parse_query("mimikatz").unwrap();
         let sql = gen.generate(&query, &time_range()).unwrap();
         assert!(
-            sql.contains("(lower(message) iLike '%mimikatz%')")
-                && !sql.contains(" AND lower(message) iLike "),
-            "OCSF single-token keyword must stay a single bare iLike, got:\n{}",
+            sql.contains("hasAllTokens(lower(message), 'mimikatz')")
+                && !sql.contains("position(")
+                && !sql.contains("iLike"),
+            "OCSF single-token keyword must be a bare hasAllTokens, got:\n{}",
             sql
         );
     }
@@ -4527,4 +4535,5 @@ mod tests {
         }
     }
 }
+
 

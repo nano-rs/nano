@@ -3894,23 +3894,38 @@ export function Search() {
             } 4%, var(--card))`,
           }}
         >
-          {searchError?.warningSeverity === 'info' ? (
-            <Info
-              className="w-4 h-4 flex-shrink-0"
-              style={{ color: 'color-mix(in srgb, var(--primary) 70%, transparent)' }}
-            />
-          ) : (
-            <AlertTriangle
-              className="w-4 h-4 flex-shrink-0"
-              style={{
-                color: `color-mix(in srgb, ${
-                  searchError?.code === 'PARSE_ERROR' || searchError?.code === 'EMPTY_QUERY' || searchError?.code === 'VALIDATION_ERROR'
-                    ? 'var(--destructive)'
-                    : 'var(--warning)'
-                } 70%, transparent)`,
-              }}
-            />
-          )}
+          {/* Icon-only severity indicator: the glyph + color carries the
+              severity; the precise label ("Info" / "Warning" / "Syntax Error" /
+              …) is a hover tooltip on the wrapping span (a bare <svg> title is
+              unreliable). Same label mapping for every kind. */}
+          <span
+            className="flex-shrink-0 flex items-center"
+            title={
+              searchError?.code === 'PARSE_ERROR' ? 'Syntax Error'
+              : searchError?.code === 'EMPTY_QUERY' ? 'Empty Query'
+              : searchError?.code === 'VALIDATION_ERROR' ? 'Query Blocked'
+              : searchError?.warningSeverity === 'info' ? 'Info'
+              : 'Warning'
+            }
+          >
+            {searchError?.warningSeverity === 'info' ? (
+              <Info
+                className="w-4 h-4"
+                style={{ color: 'color-mix(in srgb, var(--primary) 70%, transparent)' }}
+              />
+            ) : (
+              <AlertTriangle
+                className="w-4 h-4"
+                style={{
+                  color: `color-mix(in srgb, ${
+                    searchError?.code === 'PARSE_ERROR' || searchError?.code === 'EMPTY_QUERY' || searchError?.code === 'VALIDATION_ERROR'
+                      ? 'var(--destructive)'
+                      : 'var(--warning)'
+                  } 70%, transparent)`,
+                }}
+              />
+            )}
+          </span>
           <div className="flex-1 min-w-0">
             {searchError ? (
               <>
@@ -3943,13 +3958,6 @@ export function Search() {
                   return (
                     <>
                       <div className="flex items-center gap-2 flex-wrap">
-                        <span className="text-xs font-semibold uppercase tracking-wide text-foreground/75">
-                          {searchError.code === 'PARSE_ERROR' ? 'Syntax Error' :
-                           searchError.code === 'EMPTY_QUERY' ? 'Empty Query' :
-                           searchError.code === 'VALIDATION_ERROR' ? 'Query Blocked' :
-                           searchError.warningSeverity === 'info' ? 'Info' :
-                           'Warning'}
-                        </span>
                         <span className="text-sm text-muted-foreground">{searchError.message}</span>
                       </div>
                       {searchError.details?.suggestions && searchError.details.suggestions.length > 0 && (

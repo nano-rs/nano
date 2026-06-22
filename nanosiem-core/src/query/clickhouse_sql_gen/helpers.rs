@@ -692,6 +692,69 @@ pub(crate) fn longest_guard_token(needle_lower: &str) -> Option<&str> {
     }
 }
 
+/// NAN-1515: bare free-text keyword → `message` predicate.
+///
+/// Drives the `lower(message)` `text(splitByNonAlpha)` index (`idx_message_words`)
+/// via `hasAllTokens`, a **posting-list lookup**. At Saturn scale (152M rows)
+/// this is 0.16–0.5s vs **35–206s** for the prior `lower(message) iLike '%kw%'`
+/// substring form: the iLike substring extracts no index tokens (`EXPLAIN`:
+/// `tokens: []`) so it degrades to a dictionary scan across every candidate
+/// granule — O(table size), measured 77–250× slower while returning the
+/// identical rows. (Local 2M-row POCs missed this — the dictionary scan is ~8ms
+/// at 547 granules; the cost only shows at 56k granules / 79 GB index.)
+///
+/// Semantics: a bare keyword is a **token search** — `hasAllTokens` matches rows
+/// where every token of the needle is present (token-AND), one token or many.
+/// This is the one deliberate change from the pre-NAN-1515 substring default,
+/// and it applies uniformly:
+/// * `comsvcs` → token `comsvcs`. Bare `error` no longer matches `errors`.
+/// * `update.exe` → tokens `update` AND `exe`. Matches the literal `update.exe`
+///   file; does NOT match `MicrosoftEdgeUpdate.exe` (token `microsoftedgeupdate`,
+///   not `update`). Substring matching that spans token boundaries can't be
+///   served by a posting-list lookup — it requires the dictionary/`position`
+///   full scan (77–250× slower) — so substring intent goes through the explicit
+///   `*kw*` / `CONTAINS` arms (still iLike). Splunk parity.
+/// * **No token content** (`!!!`, `---`) → fall back to the substring iLike; the
+///   text index has no tokens to serve (rare).
+///
+/// Multi-token needles are pure token-AND — we deliberately do NOT add a
+/// `position(needle) > 0` adjacency guard to mimic Splunk's compound segment.
+/// Measured on Saturn: `cmd.exe` is 0.29s as bare `hasAllTokens` but **24s** with
+/// the guard (80×) — `exe` is ubiquitous so the token prefilter barely prunes and
+/// `position()` ends up reading the message column on nearly every row — for an
+/// *identical* result set (scattered `cmd … exe` without an adjacent `cmd.exe`
+/// does not occur in practice). Not worth 80× for zero rows.
+///
+/// The needle is passed to `hasAllTokens` as a **string** (not a Rust-split
+/// array) so ClickHouse tokenizes it with the index's own `splitByNonAlpha`
+/// tokenizer — alignment guaranteed, non-ASCII safe (`café` stays one CH token;
+/// an ASCII split would yield `caf` → false negatives). `escape_string` (not
+/// `escape_like_pattern`) is correct: `hasAllTokens` takes a literal string where
+/// `%`/`_` are ordinary characters, not LIKE metacharacters.
+pub(crate) fn bare_keyword_message_predicate(kw: &str) -> String {
+    let lowered = kw.to_lowercase();
+
+    // Explicit wildcards (`cmd*`, `*cmd`, `c?d`, `**`) are partial-match intent →
+    // an iLike pattern on the text index, NOT a token lookup. This is the
+    // documented escape hatch from token search. Checked FIRST so wildcard-only
+    // needles (`**`, `?`) convert to `%`/`_` rather than falling into the
+    // all-separator literal branch below. (`*cmd*` is already lowered to a
+    // wildcard upstream; this covers single-sided forms that reach here as a bare
+    // Keyword and stops `hasAllTokens` from tokenizing a `*`/`?` needle.)
+    if lowered.contains('*') || lowered.contains('?') {
+        return format!("lower(message) iLike '{}'", wildcard_to_like_pattern(&lowered));
+    }
+
+    let escaped = escape_string(&lowered);
+
+    // All-separator needles (`!!!`) tokenize to nothing — keep the substring iLike.
+    if lowered.chars().all(|c| c.is_ascii() && !c.is_ascii_alphanumeric()) {
+        return format!("lower(message) iLike '%{}%'", escape_like_pattern(&escaped));
+    }
+
+    format!("hasAllTokens(lower(message), '{}')", escaped)
+}
+
 /// Add LIKE-pattern escaping on top of an already SQL-escaped string (single
 /// quotes doubled, backslashes doubled by `escape_string`) so that it matches
 /// as a literal substring inside an `iLike '%X%'` body.

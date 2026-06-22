@@ -217,39 +217,15 @@ impl ClickHouseSqlGenerator {
                     return Ok("1".to_string());
                 }
 
-                // Bare keyword: lower to substring iLike against the message column.
-                // splitByNonAlpha text index (migration 119) + CH 26.4's
-                // LIKE-via-dictionary-scan does granule pruning, so this is both
-                // correct (substring semantics — `anom` matches `anomalous`) and
-                // index-accelerated. Pre-NAN-1026 the codegen used hasToken which
-                // silently dropped any needle that wasn't a whole CH token.
-                //
-                // NAN-1416: the dictionary scan serves single-token needles ONLY —
-                // any non-alphanumeric char (phrase, IP, `file.exe`, snake_case)
-                // makes the index bail → full message scan (up to 307x read_bytes).
-                // Multi-token needles get an index-servable longest-token guard
-                // ANDed AFTER the full-needle iLike; every token is a substring
-                // of the needle so full ∧ guard ≡ full — byte-identical results.
-                // Skip-index analysis is order-independent (EXPLAIN-verified:
-                // identical granule pruning either way) but the row stage is
-                // cheaper with the selective full needle leading — on a
-                // guard-dense probe ('process create', guard token in 70% of
-                // rows) guard-first measured +42% CPU vs +13% full-first. The
-                // guard token is ASCII-alnum by construction (no LIKE
-                // metachars, no quotes) → embedded unescaped. Single-token
-                // needles keep EXACTLY the prior shape (index DIRECT READ).
-                let lowered = kw.to_lowercase();
-                let escaped = escape_string(&lowered);
-                let full = format!(
-                    "lower(message) iLike '%{}%'",
-                    escape_like_pattern(&escaped)
-                );
-                Ok(match longest_guard_token(&lowered) {
-                    Some(token) => {
-                        format!("{} AND lower(message) iLike '%{}%'", full, token)
-                    }
-                    None => full,
-                })
+                // Bare keyword → token search via hasAllTokens (posting-list lookup
+                // on the splitByNonAlpha text index). NAN-1515: the prior
+                // `lower(message) iLike '%kw%'` substring form extracts no index
+                // tokens and degrades to a dictionary scan — 35–206s at Saturn
+                // scale vs 0.16–0.5s here. Bare keywords are now token-AND searches
+                // (Splunk parity); substring intent (CONTAINS / regex / `*kw*`)
+                // keeps its iLike form in its own arm. See
+                // `bare_keyword_message_predicate`.
+                Ok(bare_keyword_message_predicate(kw))
             }
             SearchExpr::FieldFilter { field, op, value } => {
                 self.generate_field_filter(field, op, value)
@@ -1419,36 +1395,17 @@ impl ClickHouseSqlGenerator {
                 if kw == "*" {
                     return Ok("1".to_string());
                 }
-                // In piped commands (search, where), keywords are substring text searches
-                // on message. Use the same `lower(message) iLike '%kw%'` form as the
-                // top-level keyword path (generate_search_expr) so the splitByNonAlpha text
-                // index (idx_message_words) prunes granules. The previous
-                // `position(lower(message), 'kw') > 0` bypasses that index and
-                // full-scans/decompresses the entire message column (~100x more bytes_read,
-                // and can OOM on large windows) — yet is byte-for-byte semantically identical
-                // to the escaped iLike, verified across substring/multi-word/metachar cases
-                // (NAN-1153). escape_like_pattern keeps `%`/`_` literal for parity with
-                // position(). After stats/timechart where message no longer exists,
-                // ClickHouse returns a clear "column not found" error — correct, since bare
-                // keyword searches don't make sense after aggregation.
-                //
-                // NAN-1416: mirrors the top-level Keyword arm — multi-token needles
-                // get the longest-token index guard after the full-needle iLike
-                // (full ∧ guard ≡ full; see that arm for the ordering rationale);
-                // the predicate pushes down through the stage CTEs to the table
-                // read, where idx_message_words serves the single-token guard.
-                let lowered = kw.to_lowercase();
-                let escaped = escape_string(&lowered);
-                let full = format!(
-                    "lower(message) iLike '%{}%'",
-                    escape_like_pattern(&escaped)
-                );
-                Ok(match longest_guard_token(&lowered) {
-                    Some(token) => {
-                        format!("{} AND lower(message) iLike '%{}%'", full, token)
-                    }
-                    None => full,
-                })
+                // In piped commands (search, where), bare keywords are message text
+                // searches. Mirror the top-level Keyword arm exactly via the shared
+                // helper: hasAllTokens drives the splitByNonAlpha text index by a
+                // posting-list lookup (NAN-1515), replacing the prior substring iLike
+                // (NAN-1153 had already moved this off position(), which full-scanned
+                // the message column). The predicate pushes down through the stage CTEs
+                // to the table read where idx_message_words serves it. After
+                // stats/timechart where message no longer exists, ClickHouse returns a
+                // clear "column not found" error — correct, since bare keyword searches
+                // don't make sense after aggregation.
+                Ok(bare_keyword_message_predicate(kw))
             }
             SearchExpr::FieldFilter { field, op, value } => {
                 // Normalize field name (apply aliases like command_line -> process)

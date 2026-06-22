@@ -47,6 +47,12 @@ export NANOSIEM_ALLOW_DEFAULT_KEYS="${NANOSIEM_ALLOW_DEFAULT_KEYS:-true}"
 # Set AUTH_ENABLED=false to disable authentication (development only)
 export AUTH_ENABLED="${AUTH_ENABLED:-true}"
 
+# NAN-1514: agentic investigation tool-loop. On by default in dev so the new
+# research->act->observe->pivot loop drives pivt investigations here; set
+# NANOSIEM_INVESTIGATION_TOOL_LOOP=false (env or .env) to fall back to the
+# legacy single-shot path. Production leaves this unset (off by default).
+export NANOSIEM_INVESTIGATION_TOOL_LOOP="${NANOSIEM_INVESTIGATION_TOOL_LOOP:-true}"
+
 # Encryption key settings
 # For development, we enable dev mode which uses a default key
 # IMPORTANT: In production, set NANOSIEM_ENCRYPTION_KEY to a secure 32-byte value
