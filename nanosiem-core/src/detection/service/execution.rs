@@ -37,6 +37,7 @@ impl DetectionService {
         &self,
         query: &str,
         time_range: TimeRangeInput,
+        dataset: Option<String>,
     ) -> Result<Vec<serde_json::Value>, DetectionError> {
         // Enrich aggregation queries with timestamp bounds so results always carry
         // _first_seen/_last_seen for detection latency calculation.
@@ -58,6 +59,7 @@ impl DetectionService {
             request_id: None,
             async_mode: false,
             priority: None,
+            dataset,
         };
 
         self.search_service
@@ -114,7 +116,9 @@ impl DetectionService {
 
         // Run the rule's query against this window. Shared with the historical
         // tester so test ≡ prod by construction.
-        let mut results = self.evaluate_window(&rule.query, time_range).await?;
+        let mut results = self
+            .evaluate_window(&rule.query, time_range, rule.dataset.clone())
+            .await?;
 
         // Filter out events that have already been matched by this rule
         // This prevents re-detection when rules have long lookback windows

@@ -220,6 +220,7 @@ impl TestEngine {
             request_id: None,
             async_mode: false,
             priority: None,
+            dataset: None,
         };
 
         // Execute search

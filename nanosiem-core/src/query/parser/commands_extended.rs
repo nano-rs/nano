@@ -8,7 +8,7 @@
 use nom::{
     branch::alt,
     bytes::complete::{tag, tag_no_case},
-    character::complete::{char, digit1, multispace0, multispace1, one_of},
+    character::complete::{alpha1, char, digit1, multispace0, multispace1, one_of},
     combinator::{map, map_res, opt, peek, recognize, value},
     multi::separated_list1,
     sequence::{delimited, pair, preceded, terminated},
@@ -1216,6 +1216,11 @@ pub(super) fn join_command(input: &str) -> ParseResult<'_, Command> {
     let (input, _) = char('[').parse(input)?;
     let (input, _) = multispace0(input)?;
 
+    // NAN-1562: optional leading `dataset=<logs|spans|metrics>` (or `from=`)
+    // token scopes the subsearch to a different dataset (cross-dataset join).
+    let (input, subsearch_dataset) = opt(subsearch_dataset_token).parse(input)?;
+    let (input, _) = multispace0(input)?;
+
     // Parse the subsearch query
     let (input, subsearch) = query(input)?;
 
@@ -1236,8 +1241,41 @@ pub(super) fn join_command(input: &str) -> ParseResult<'_, Command> {
             max,
             overwrite,
             maxout,
+            subsearch_dataset,
         },
     ))
+}
+
+/// Parse a leading `dataset=<name>` token inside a subsearch bracket and resolve
+/// it through the strict [`Dataset::from_selector_strict`] (NAN-1562). Used by
+/// both `| join […]` and `field IN […]`. Consumes the token plus its trailing
+/// whitespace so the subsearch `query(…)` parser sees a clean start.
+///
+/// NAN-1562 fixes:
+/// - The `from=` alias is GONE. `from` is a real log field (email/syslog
+///   sender), and an aliased `from=` here silently swallowed a `from=<word>`
+///   field filter (`[from=production …]` parsed as a dataset selector, dropping
+///   the filter). Only `dataset=` is accepted; a `from=…` token is left for the
+///   subsearch's own search parser to consume as a field filter.
+/// - An UNKNOWN selector value is now a hard parse error (`map_res` → `Err`)
+///   rather than the lenient `Logs` fallback. `dataset=spanz` previously
+///   resolved to the logs table and silently scanned the wrong dataset.
+pub(super) fn subsearch_dataset_token(
+    input: &str,
+) -> ParseResult<'_, crate::query::clickhouse_sql_gen::otel::Dataset> {
+    use crate::query::clickhouse_sql_gen::otel::Dataset;
+    use nom::error::{Error, ErrorKind};
+    // `dataset=` absent → recoverable Error so the wrapping `opt(...)` yields
+    // None (no selector). Once the prefix matched, an unknown value is a HARD
+    // Failure: `opt` would otherwise swallow a recoverable Error and let the
+    // bogus `dataset=spanz` token fall through to the subsearch's search parser,
+    // silently scanning the wrong (logs) table (NAN-1562 FIX 3).
+    let (input, _) = tag_no_case("dataset=").parse(input)?;
+    let (rest, name) = alpha1(input)?;
+    let dataset = Dataset::from_selector_strict(name)
+        .ok_or_else(|| nom::Err::Failure(Error::new(input, ErrorKind::Verify)))?;
+    let (rest, _) = multispace1(rest)?;
+    Ok((rest, dataset))
 }
 
 /// Parse format command: format [maxresults=N]

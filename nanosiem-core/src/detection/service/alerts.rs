@@ -501,12 +501,13 @@ impl DetectionService {
         &self,
         status: Option<AlertStatus>,
         severity: Option<Severity>,
+        kinds: Option<&[String]>,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Alert>, DetectionError> {
         let alerts = self
             .alert_repo
-            .list(status, severity, limit, offset)
+            .list(status, severity, kinds, limit, offset)
             .await?;
         Ok(alerts)
     }
@@ -629,8 +630,11 @@ impl DetectionService {
 
     /// Get alert counts by status
     #[instrument(skip(self))]
-    pub async fn get_alert_counts(&self) -> Result<Vec<(AlertStatus, i64)>, DetectionError> {
-        let counts = self.alert_repo.count_by_status().await?;
+    pub async fn get_alert_counts(
+        &self,
+        kinds: Option<&[String]>,
+    ) -> Result<Vec<(AlertStatus, i64)>, DetectionError> {
+        let counts = self.alert_repo.count_by_status(kinds).await?;
         Ok(counts)
     }
 

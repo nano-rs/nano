@@ -122,8 +122,8 @@ impl ClickHouseSqlGenerator {
                     AggFunc::Max => format!("max({})", field_expr),
                     AggFunc::Values => format!("arrayStringConcat(arrayFilter(x -> x != '', groupUniqArray({})(toString({}))), ', ')", self.max_group_array_size, field_expr),
                     AggFunc::List => format!("arrayStringConcat(arrayFilter(x -> x != '', groupArray({})(toString({}))), ', ')", self.max_group_array_size, field_expr),
-                    AggFunc::First => format!("argMin({}, timestamp)", field_expr),
-                    AggFunc::Last => format!("argMax({}, timestamp)", field_expr),
+                    AggFunc::First => format!("argMin({}, {})", field_expr, self.time_column()),
+                    AggFunc::Last => format!("argMax({}, {})", field_expr, self.time_column()),
                     AggFunc::Range => format!("(max({}) - min({}))", field_expr, field_expr),
                     AggFunc::Earliest => format!("min({})", field_expr),
                     AggFunc::Latest => format!("max({})", field_expr),
@@ -139,11 +139,40 @@ impl ClickHouseSqlGenerator {
                         // Uses sumMap to aggregate counts by time bucket in a single pass.
                         let span = sparkline_span_secs.unwrap_or(1800); // default 30min
                         format!(
-                            "sumMap([toUInt32(toStartOfInterval(timestamp, toIntervalSecond({})))], [toUInt64(1)]).2",
+                            "sumMap([toUInt32(toStartOfInterval({}, toIntervalSecond({})))], [toUInt64(1)]).2",
+                            self.time_column(),
                             span
                         )
                     }
+                    // NAN-1528 (OTLP metrics): per-second rate of a cumulative
+                    // counter over the group's window = (last - first value) /
+                    // window-seconds. greatest(...,1) guards a zero-width window
+                    // (single point / same-second bucket) against div-by-zero.
+                    AggFunc::Rate if self.is_metrics_dataset() => {
+                        self.metric_rate_expr(&field_expr)
+                    }
+                    AggFunc::Rate => format!(
+                        "(max({0}) - min({0})) / greatest(dateDiff('second', min({1}), max({1})), 1)",
+                        field_expr,
+                        self.time_column(),
+                    ),
+                    // NAN-1528 (OTLP metrics): histogram quantile. Pragmatic form
+                    // — quantileTDigest over the per-data-point values (works for
+                    // gauge/summary points). True OTLP-bucket interpolation over
+                    // bucket_counts/explicit_bounds is a later refinement.
+                    AggFunc::HistogramQuantile(pct) => {
+                        // Clamp to <=100 so the quantile level stays in [0,1]
+                        // (the parser admits a u8 up to 255).
+                        format!("quantileTDigest({})({})", pct.min(100) as f64 / 100.0, field_expr)
+                    }
                 };
+                // NAN-1555: on a metrics rollup table, rewrite a value-aggregation
+                // onto the pre-aggregated state columns. No-op off the rollup
+                // (returns the per-row expr above) → byte-identical for logs/spans/
+                // raw metrics.
+                let agg_expr = self
+                    .rollup_value_agg(&agg.func, &field_expr, agg.field.as_deref())
+                    .unwrap_or(agg_expr);
 
                 // Output column name. The scheme lives on `Aggregation::output_alias`
                 // so downstream rewrites (auto-sort) can reference the same name.
@@ -241,6 +270,82 @@ impl ClickHouseSqlGenerator {
     }
 
     /// Generate SQL for timechart command
+    /// NAN-1555: counter-reset-aware per-second `rate()` for a cumulative metric
+    /// over a group's window. Sums the POSITIVE consecutive deltas of the
+    /// time-ordered values — a counter reset (process restart) produces a negative
+    /// delta which is dropped rather than counted as a huge spike, matching
+    /// Prometheus `rate()` reset semantics — and divides by the observed window
+    /// seconds. For a monotonic counter with no reset this equals
+    /// `(last - first) / secs`. Used only on the metrics dataset; the logs path
+    /// keeps the prior `(max - min) / secs` form (byte-identical).
+    pub(crate) fn metric_rate_expr(&self, field_expr: &str) -> String {
+        let ts = self.time_column();
+        format!(
+            "arraySum(arrayMap(d -> if(d > 0, d, 0), \
+             arrayDifference(arrayMap(p -> p.2, arraySort(p -> p.1, groupArray(({ts}, {field_expr})))))))\
+             / greatest(dateDiff('second', min({ts}), max({ts})), 1)"
+        )
+    }
+
+    fn is_metrics_dataset(&self) -> bool {
+        self.profile.id() == crate::schema::SchemaId::Metrics
+    }
+
+    /// NAN-1555 resolution routing: rewrite a `value` aggregation onto the
+    /// `otel_metrics_1m/_1h` rollup's pre-aggregated state columns
+    /// (`value_sum`/`value_count`/`value_min`/`value_max`/`value_state`).
+    ///
+    /// Returns `Some(expr)` only when the generator is pointed at a rollup table
+    /// (`is_metrics_rollup`) AND the aggregated field is `value` AND the function
+    /// has a rollup form. `None` otherwise — but `core_search` only routes a query
+    /// to the rollup when EVERY one of its aggregations is covered here (and its
+    /// filters/group-bys touch only the rollup's `metric_name`/`service_name`
+    /// keys), so the `None` fallback to per-row aggregation is never reached on a
+    /// rollup table in practice. The rollup avg/min/max/sum/quantiles were
+    /// validated equal to the raw aggregation within 0.0002% (migration 144).
+    fn rollup_value_agg(
+        &self,
+        func: &AggFunc,
+        field_expr: &str,
+        field: Option<&str>,
+    ) -> Option<String> {
+        if !self.is_metrics_rollup() {
+            return None;
+        }
+        let is_value = field == Some("value") || field_expr == "value";
+        // `count` has a rollup form regardless of field (it counts rows ≡ data
+        // points → sum(value_count)); every other rollup form is value-specific.
+        if !is_value && !matches!(func, AggFunc::Count) {
+            return None;
+        }
+        let q = "quantilesTDigestMerge(0.5, 0.95, 0.99)(value_state)";
+        let ts = self.time_column();
+        Some(match func {
+            AggFunc::Avg => "sum(value_sum) / greatest(sum(value_count), 1)".to_string(),
+            AggFunc::Sum => "sum(value_sum)".to_string(),
+            AggFunc::Min | AggFunc::Earliest => "min(value_min)".to_string(),
+            AggFunc::Max | AggFunc::Latest => "max(value_max)".to_string(),
+            AggFunc::Count => "sum(value_count)".to_string(),
+            AggFunc::Median => format!("{q}[1]"),
+            AggFunc::Perc95 => format!("{q}[2]"),
+            // The rollup t-digest stores p50/p95/p99 only; other percentiles are
+            // not rollup-eligible (core_search keeps them on raw).
+            AggFunc::Percentile(50) => format!("{q}[1]"),
+            AggFunc::Percentile(95) => format!("{q}[2]"),
+            AggFunc::Percentile(99) => format!("{q}[3]"),
+            // `sum`/`count`/`rate` are intentionally NOT rollup-routed (see
+            // `metrics_routing::agg_is_rollup_value`): sum/count are additive and
+            // would over-count the window-edge bucket, and rate must stay
+            // reset-aware on raw points. They never reach here; return None so a
+            // stray rollup-mode call can't silently emit a wrong aggregate. `ts`
+            // (the rollup time column) is retained for the (unused) signature.
+            _ => {
+                let _ = ts;
+                return None;
+            }
+        })
+    }
+
     pub(super) fn generate_timechart_sql(
         &self,
         source: &str,
@@ -281,8 +386,8 @@ impl ClickHouseSqlGenerator {
                     AggFunc::Max => format!("max({})", field_expr),
                     AggFunc::Values => format!("arrayStringConcat(arrayFilter(x -> x != '', groupUniqArray({})(toString({}))), ', ')", self.max_group_array_size, field_expr),
                     AggFunc::List => format!("arrayStringConcat(arrayFilter(x -> x != '', groupArray({})(toString({}))), ', ')", self.max_group_array_size, field_expr),
-                    AggFunc::First => format!("argMin({}, timestamp)", field_expr),
-                    AggFunc::Last => format!("argMax({}, timestamp)", field_expr),
+                    AggFunc::First => format!("argMin({}, {})", field_expr, self.time_column()),
+                    AggFunc::Last => format!("argMax({}, {})", field_expr, self.time_column()),
                     AggFunc::Range => format!("(max({}) - min({}))", field_expr, field_expr),
                     AggFunc::Earliest => format!("min({})", field_expr),
                     AggFunc::Latest => format!("max({})", field_expr),
@@ -296,11 +401,34 @@ impl ClickHouseSqlGenerator {
                         // Sparkline in timechart: use a fraction of the timechart span
                         let sub_span = (span.as_secs() / 10).max(60);
                         format!(
-                            "sumMap([toUInt32(toStartOfInterval(timestamp, toIntervalSecond({})))], [toUInt64(1)]).2",
+                            "sumMap([toUInt32(toStartOfInterval({}, toIntervalSecond({})))], [toUInt64(1)]).2",
+                            self.time_column(),
                             sub_span
                         )
                     }
+                    // NAN-1528 (OTLP metrics): per-second counter rate over the
+                    // timechart bucket. See the stats-path arm for rationale.
+                    AggFunc::Rate if self.is_metrics_dataset() => {
+                        self.metric_rate_expr(&field_expr)
+                    }
+                    AggFunc::Rate => format!(
+                        "(max({0}) - min({0})) / greatest(dateDiff('second', min({1}), max({1})), 1)",
+                        field_expr,
+                        self.time_column(),
+                    ),
+                    // NAN-1528 (OTLP metrics): histogram quantile (pragmatic
+                    // quantileTDigest form — see the stats-path arm).
+                    AggFunc::HistogramQuantile(pct) => {
+                        // Clamp to <=100 so the quantile level stays in [0,1]
+                        // (the parser admits a u8 up to 255).
+                        format!("quantileTDigest({})({})", pct.min(100) as f64 / 100.0, field_expr)
+                    }
                 };
+                // NAN-1555: metrics-rollup value-aggregation rewrite (no-op off the
+                // rollup; see the stats-path arm).
+                let agg_expr = self
+                    .rollup_value_agg(&agg.func, &field_expr, agg.field.as_deref())
+                    .unwrap_or(agg_expr);
 
                 let name = agg
                     .alias
@@ -550,10 +678,46 @@ impl ClickHouseSqlGenerator {
             }
         }
 
-        // cont=true: fill gaps in time axis with zeros using WITH FILL STEP
-        if cont {
-            let span_secs = span.as_secs();
-            write!(sql, " ASC WITH FILL STEP toIntervalSecond({})", span_secs).unwrap();
+        // cont=true: fill gaps in time axis with zeros using WITH FILL STEP.
+        // NAN-1555: metrics ALWAYS gap-fill (a metric time series with holes reads
+        // as missing data, not "no value"), and over the FULL window — `FROM` the
+        // span-aligned window start `TO` the end — so leading/trailing empty
+        // buckets render too, not just gaps between the first and last datapoint.
+        // NAN-1555: force full-window gap-fill for SINGLE-series metric charts only.
+        // With a split-by, ClickHouse `WITH FILL` cannot partition per series — it
+        // fills the GLOBAL time axis once, emitting synthetic rows with an EMPTY
+        // split column (`service_name=''`) and one row per gap instead of one per
+        // series (NAN-1555 adversarial review). So a multi-series metric chart keeps
+        // the normal `cont` behavior (no forced full-window fill); the per-series
+        // grid is the FE/glue's job, as it is for logs.
+        let metrics = self.profile.id() == crate::schema::SchemaId::Metrics && split_by.is_empty();
+        if cont || metrics {
+            let span_secs = span.as_secs().max(1);
+            let window = self
+                .generation_time_range
+                .read()
+                .ok()
+                .and_then(|g| g.clone());
+            match (metrics, window) {
+                (true, Some(tr)) => {
+                    // Align FROM to the span grid so the fill grid coincides with
+                    // the `toStartOf*` buckets; TO is the window end (exclusive upper
+                    // buckets are simply absent). Bound literals are second-precision
+                    // (the bucket is, too).
+                    write!(
+                        sql,
+                        " ASC WITH FILL FROM toStartOfInterval(toDateTime('{start}', 'UTC'), \
+                         toIntervalSecond({span_secs})) TO toDateTime('{end}', 'UTC') \
+                         STEP toIntervalSecond({span_secs})",
+                        start = tr.start.format("%Y-%m-%d %H:%M:%S"),
+                        end = tr.end.format("%Y-%m-%d %H:%M:%S"),
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    write!(sql, " ASC WITH FILL STEP toIntervalSecond({})", span_secs).unwrap();
+                }
+            }
         }
 
         Ok(sql)

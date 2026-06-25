@@ -40,6 +40,12 @@ pub struct TestRuleRequest {
     /// `/api/rules/{id}/test`. Defaults to 15 when omitted.
     #[serde(default)]
     pub lookback_minutes: Option<i64>,
+    /// Dataset to test against: "logs" (default), "spans", or "metrics"
+    /// (NAN-1561). Used by the ad-hoc `/api/rules/test` path so the rule
+    /// editor can preview spans/metrics rules before save. Ignored by
+    /// `/api/rules/{id}/test`, which uses the saved rule's dataset.
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]

@@ -32,6 +32,9 @@ mod helpers;
 // pub(crate): `query::validation::derived_fields` mirrors the resolve_identity
 // output registration from the IDENTITY_*_FIELDS tables (NAN-1380).
 pub(crate) mod identity;
+// pub: the OTLP dataset selector + trace/metrics fetch helpers are called by the
+// search/api layer to target the `otel_spans`/`otel_metrics` tables (NAN-1528).
+pub mod otel;
 mod search_expr;
 
 // Re-export helpers so submodules and external code can access them
@@ -120,6 +123,11 @@ pub(crate) const EXPLICIT_COLUMNS: &[&str] = &[
     "auth_result",
     "session_id",
     "authentication_method",
+    // OpenTelemetry trace-correlation fields (NAN-1528). Plain stored String
+    // columns on `logs` (migration 141, DEFAULT ''); ingest-lowercased hex, so
+    // they also join LOWERCASE_NORMALIZED_FIELDS to engage the raw-column bloom.
+    "trace_id",
+    "span_id",
     // Process fields
     "command_line",
     "process_name",
@@ -573,6 +581,11 @@ pub(crate) const LOWERCASE_NORMALIZED_FIELDS: &[&str] = &[
     // mixed-case, so queries keep the `lower(col)` form, served by the
     // migration-132 `idx_*_lower` expression blooms.
     "src_user",
+    // NAN-1528: OTLP trace/span ids are emitted lowercase-hex (the spans MV uses
+    // `lower(hex(...))` and the logs-lane parsers downcase them), so a raw
+    // `trace_id = '<lowered>'` engages the migration-141 `idx_trace_id` bloom.
+    "trace_id",
+    "span_id",
 ];
 
 /// Numeric UDM fields (UInt16, UInt32, Int64, Float64).
@@ -722,6 +735,24 @@ const DEFAULT_MAX_MVEXPAND_ROWS: usize = 100_000;
 pub struct ClickHouseSqlGenerator {
     /// Table name for logs
     table_name: String,
+    /// Primary time column for the time-bound WHERE / default ORDER BY and the
+    /// counter-rate window. Defaults to `"timestamp"` (logs/metrics); set to
+    /// `"start_time"` for the OTLP spans dataset via [`with_dataset`] (NAN-1534).
+    /// When this is the default `"timestamp"`, every emitted statement is
+    /// byte-identical to the pre-dataset generator.
+    ///
+    /// [`with_dataset`]: ClickHouseSqlGenerator::with_dataset
+    time_column: String,
+    /// Promoted columns of the active OTLP dataset (NAN-1534). EMPTY for the
+    /// default logs dataset — logs field resolution is owned entirely by
+    /// `self.profile`, so when this is empty every resolution path is
+    /// byte-identical. When non-empty (spans/metrics), a field token present here
+    /// resolves to a DIRECT column ahead of the profile's `ext.*` spill (the OTLP
+    /// tables have no `ext` column).
+    dataset_columns: HashSet<&'static str>,
+    /// Numeric columns of the active OTLP dataset (`duration_ns`, `value`, …) —
+    /// suppress `lower()`, coerce string literals to numbers. Empty for logs.
+    dataset_numeric_columns: HashSet<&'static str>,
     /// Max elements in groupArray/groupUniqArray (prevents OOM from unbounded array agg)
     max_group_array_size: usize,
     /// Default row limit for mvexpand when user doesn't specify one
@@ -760,12 +791,24 @@ pub struct ClickHouseSqlGenerator {
     ///
     /// [`with_profile`]: ClickHouseSqlGenerator::with_profile
     profile: Arc<dyn SchemaProfile>,
+    /// The tenant logs profile (UDM/OCSF) captured on the first
+    /// [`with_dataset`](ClickHouseSqlGenerator::with_dataset) swap, so a later
+    /// `Dataset::Logs` (e.g. a cross-dataset subsearch INTO logs from a
+    /// spans/metrics outer query) can RESTORE it instead of inheriting the outer
+    /// spans/metrics profile — which would resolve logs fields like `source_type`
+    /// as `attributes['source_type']` → a correlated subquery (NAN-1567). `None`
+    /// until the first dataset swap; logs-only queries never swap, so it stays
+    /// `None` and behavior is byte-identical.
+    base_profile: Option<Arc<dyn SchemaProfile>>,
 }
 
 impl Clone for ClickHouseSqlGenerator {
     fn clone(&self) -> Self {
         Self {
             table_name: self.table_name.clone(),
+            time_column: self.time_column.clone(),
+            dataset_columns: self.dataset_columns.clone(),
+            dataset_numeric_columns: self.dataset_numeric_columns.clone(),
             max_group_array_size: self.max_group_array_size,
             max_mvexpand_rows: self.max_mvexpand_rows,
             generation_time_range: RwLock::new(None),
@@ -773,6 +816,7 @@ impl Clone for ClickHouseSqlGenerator {
             upstream_computed_fields: RwLock::new(HashSet::new()),
             agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
             profile: Arc::clone(&self.profile),
+            base_profile: self.base_profile.clone(),
         }
     }
 }
@@ -789,6 +833,9 @@ impl ClickHouseSqlGenerator {
     pub fn new() -> Self {
         Self {
             table_name: "logs".to_string(),
+            time_column: "timestamp".to_string(),
+            dataset_columns: HashSet::new(),
+            dataset_numeric_columns: HashSet::new(),
             max_group_array_size: DEFAULT_MAX_GROUP_ARRAY_SIZE,
             max_mvexpand_rows: DEFAULT_MAX_MVEXPAND_ROWS,
             generation_time_range: RwLock::new(None),
@@ -796,6 +843,7 @@ impl ClickHouseSqlGenerator {
             upstream_computed_fields: RwLock::new(HashSet::new()),
             agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
             profile: Arc::new(UdmProfile::new()),
+            base_profile: None,
         }
     }
 
@@ -804,6 +852,9 @@ impl ClickHouseSqlGenerator {
     pub fn with_table(table_name: impl Into<String>) -> Self {
         Self {
             table_name: table_name.into(),
+            time_column: "timestamp".to_string(),
+            dataset_columns: HashSet::new(),
+            dataset_numeric_columns: HashSet::new(),
             max_group_array_size: DEFAULT_MAX_GROUP_ARRAY_SIZE,
             max_mvexpand_rows: DEFAULT_MAX_MVEXPAND_ROWS,
             generation_time_range: RwLock::new(None),
@@ -811,6 +862,7 @@ impl ClickHouseSqlGenerator {
             upstream_computed_fields: RwLock::new(HashSet::new()),
             agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
             profile: Arc::new(UdmProfile::new()),
+            base_profile: None,
         }
     }
 
@@ -820,6 +872,96 @@ impl ClickHouseSqlGenerator {
     pub fn with_profile(mut self, profile: Arc<dyn SchemaProfile>) -> Self {
         self.profile = profile;
         self
+    }
+
+    /// Point the generator at an OTLP [`Dataset`] (NAN-1534). Builder-style; sets
+    /// the storage table AND the primary time column in lock-step so the
+    /// time-bound WHERE, default ORDER BY, and the `rate()` window all reference
+    /// the dataset's own time column (`start_time` for spans).
+    ///
+    /// `Dataset::Logs` (the default) sets `table_name = "logs"` /
+    /// `time_column = "timestamp"`, keeping every emitted statement
+    /// byte-for-byte identical to the pre-dataset generator. The whole nPL
+    /// pipeline (search terms, stats/where/sort/timechart/eval) then runs against
+    /// the selected table unchanged.
+    ///
+    /// [`Dataset`]: otel::Dataset
+    pub fn with_dataset(mut self, dataset: otel::Dataset) -> Self {
+        // NAN-1567: capture the tenant logs profile (UDM/OCSF) on the FIRST dataset
+        // swap, before it is replaced below. A later `Dataset::Logs` — e.g. a
+        // cross-dataset subsearch INTO logs from a spans/metrics outer query —
+        // restores it, so logs fields resolve against the logs profile rather than
+        // the inherited spans/metrics one (which would emit `attributes['…']`
+        // Map access → a correlated subquery CH rejects).
+        if self.base_profile.is_none() {
+            self.base_profile = Some(Arc::clone(&self.profile));
+        }
+        self.table_name = dataset.table_name().to_string();
+        self.time_column = dataset.time_column().to_string();
+        self.dataset_columns = dataset.columns().iter().copied().collect();
+        self.dataset_numeric_columns = dataset.numeric_columns().iter().copied().collect();
+        // NAN-1555: a spans/metrics query resolves fields, projection, the keyword
+        // column, and the attribute `Map` tail through its own dataset profile —
+        // NOT the tenant UDM/OCSF logs profile, which would alias `service_name` →
+        // `cloud_service`, treat `value`/`duration_ns` as a String `ext` spill,
+        // re-add nonexistent enrichment columns, and project the wrong core fields.
+        match dataset {
+            otel::Dataset::Spans => self.profile = Arc::new(crate::schema::SpansProfile::new()),
+            otel::Dataset::Metrics => {
+                self.profile = Arc::new(crate::schema::MetricsProfile::new())
+            }
+            // NAN-1567: restore the captured tenant logs profile. For a logs-only
+            // query `with_dataset` is never called, so this arm is only reached for
+            // a cross-dataset subsearch INTO logs — where `base_profile` was
+            // captured from the outer query's original tenant profile above.
+            otel::Dataset::Logs => {
+                self.profile = self
+                    .base_profile
+                    .clone()
+                    .expect("base_profile captured at top of with_dataset");
+            }
+        }
+        self
+    }
+
+    /// NAN-1555 resolution routing: point a metrics query at the pre-aggregated
+    /// `otel_metrics_1m`/`_1h` rollup (migration 144) instead of raw `otel_metrics`.
+    /// MUST be called AFTER [`with_dataset`](Self::with_dataset)`(Metrics)` — it
+    /// overrides the storage table + time column to the rollup's. `core_search`
+    /// calls this only for rollup-eligible aggregate queries over wide windows;
+    /// the value-aggregations are then rewritten onto the rollup's pre-aggregated
+    /// state columns by `rollup_value_agg`. The `MetricsProfile` stays active so
+    /// `metric_name`/`service_name`/`value` still resolve as columns (they exist on
+    /// the rollup); tag access does NOT (the rollup carries no tag maps — which is
+    /// exactly why core_search never routes a tag-filtered/grouped query here).
+    pub fn with_metrics_rollup(mut self, grain: otel::MetricRollup) -> Self {
+        self.table_name = grain.table_name().to_string();
+        self.time_column = grain.time_column().to_string();
+        self
+    }
+
+    /// Whether the generator is currently pointed at a metrics rollup table.
+    pub(crate) fn is_metrics_rollup(&self) -> bool {
+        self.table_name == "otel_metrics_1m" || self.table_name == "otel_metrics_1h"
+    }
+
+    /// Whether `field` is a promoted column of the active OTLP dataset (NAN-1534).
+    /// Always false for the default logs dataset (empty overlay) → byte-identical.
+    pub(crate) fn is_dataset_column(&self, field: &str) -> bool {
+        self.dataset_columns.contains(field)
+    }
+
+    /// Whether `field` is a numeric column of the active OTLP dataset (NAN-1534).
+    /// Always false for logs.
+    pub(crate) fn is_dataset_numeric_column(&self, field: &str) -> bool {
+        self.dataset_numeric_columns.contains(field)
+    }
+
+    /// The primary time column for the active dataset (`"timestamp"` for
+    /// logs/metrics, `"start_time"` for spans). Used by the time-bound WHERE,
+    /// default ORDER BY, and the `rate()` counter window (NAN-1534).
+    pub(crate) fn time_column(&self) -> &str {
+        &self.time_column
     }
 
     // Phase 2b: route the storage binding (table name / timestamp expression)
@@ -835,7 +977,11 @@ impl ClickHouseSqlGenerator {
     /// `resolve()` returns `ExplicitColumn` for exactly the `EXPLICIT_COLUMNS`
     /// set (proven by `schema::tests`).
     pub(crate) fn resolves_to_column(&self, field: &str) -> bool {
-        matches!(self.profile.resolve(field), FieldResolution::ExplicitColumn(_))
+        // NAN-1534: an OTLP dataset column resolves to a direct column ahead of
+        // the profile (the spans/metrics tables have no `ext` spill). Empty
+        // overlay for logs → falls straight through, byte-identical.
+        self.is_dataset_column(normalize_field_name(field))
+            || matches!(self.profile.resolve(field), FieldResolution::ExplicitColumn(_))
     }
 
     /// Whether `field` resolves to a JSON-tail path under the active profile
@@ -847,6 +993,31 @@ impl ClickHouseSqlGenerator {
     /// referenced as a (nonexistent) bare column that 500s. (NAN-1248)
     pub(crate) fn resolves_to_json_path(&self, field: &str) -> bool {
         matches!(self.profile.resolve(field), FieldResolution::JsonPath { .. })
+    }
+
+    /// Whether `field` resolves to a `Map`-tail attribute lookup under the active
+    /// profile — only true for the spans/metrics datasets (NAN-1555). UDM/OCSF
+    /// never return `MapKey`, so logs callers that branch on it stay
+    /// byte-identical. The value/group seams (`field_to_sql_expr`/`by_field_sql`)
+    /// route these to [`field_access_expr`] (the attribute `Map` subscript) instead
+    /// of the UDM `metadata` JSON column or a bare reference.
+    ///
+    /// [`field_access_expr`]: ClickHouseSqlGenerator::field_access_expr
+    pub(crate) fn resolves_to_map_key(&self, field: &str) -> bool {
+        matches!(self.profile.resolve(field), FieldResolution::MapKey { .. })
+    }
+
+    /// Canonicalize an nPL field token for the value/group/filter seams (NAN-1555).
+    /// Spans canonicalize through the `SpansProfile` (`duration` → `duration_ns`,
+    /// and crucially NO UDM aliasing so `service_name` stays itself rather than
+    /// becoming `cloud_service`). Logs (UDM/OCSF) keep the exact free
+    /// `normalize_field_name` alias map, so every logs statement is byte-identical.
+    pub(crate) fn canonicalize_field<'a>(&self, field: &'a str) -> &'a str {
+        match self.profile.id() {
+            crate::schema::SchemaId::Spans => crate::schema::canonicalize_span_field(field),
+            crate::schema::SchemaId::Metrics => crate::schema::canonicalize_metric_field(field),
+            _ => normalize_field_name(field),
+        }
     }
 
     /// The class-spanning value expression for a UDM-semantic concept the active
@@ -914,10 +1085,27 @@ impl ClickHouseSqlGenerator {
     /// [`JsonPath`]: FieldResolution::JsonPath
     /// [`Unknown`]: FieldResolution::Unknown
     pub(crate) fn field_access_expr(&self, field: &str, json_type: &str) -> String {
+        // NAN-1534: a promoted OTLP dataset column is a direct, escape-safe
+        // column reference — resolved ahead of the profile so it never falls to
+        // UDM's `ext.<field>` spill (the spans/metrics tables have no `ext`).
+        // Empty overlay for logs → this guard is skipped, byte-identical.
+        if self.is_dataset_column(normalize_field_name(field)) {
+            return escape_identifier(normalize_field_name(field));
+        }
         match self.profile.resolve(field) {
             FieldResolution::ExplicitColumn(col) => escape_identifier(&col),
             FieldResolution::JsonPath { col, path } => {
                 json_tail_access_sql(&col, &path, json_type)
+            }
+            // NAN-1555: spans/metrics attribute `Map` tail. The literal dotted key
+            // is preserved (`attributes['http.method']`) — NOT dot-stripped like
+            // the UDM `Unknown` arm below — with a `resource_attributes` fallback.
+            // `json_type` is ignored: the map is `Map(_, String)`, so access is
+            // always String-typed (kept in lockstep with `column_sql`'s MapKey
+            // arm). Only `SpansProfile::resolve` returns this variant, so UDM/OCSF
+            // are unaffected.
+            FieldResolution::MapKey { col, fallback, key } => {
+                map_tail_access_sql(&col, fallback.as_deref(), &key)
             }
             // UDM Unknown (and OCSF array/alias variants the field tokenizer does
             // not surface here): UDM's `ext.{field}` spill access.
@@ -1113,7 +1301,7 @@ impl ClickHouseSqlGenerator {
             Err(poisoned) => *poisoned.into_inner() = agg_aliases,
         }
 
-        let mut ctx = GeneratorContext::new(&self.table_name, time_range);
+        let mut ctx = GeneratorContext::new(&self.table_name, &self.time_column, time_range);
         ctx.use_cache = options.use_cache;
         // With exactly ONE resolve_identity in the pipeline, the bare
         // `identity_*` names are unambiguous — the stage emits them as extra
@@ -1131,6 +1319,14 @@ impl ClickHouseSqlGenerator {
         // In table_view mode, always use minimal fields for fast initial load
         ctx.required_fields =
             field_analysis::analyze_required_fields(query, options.table_view, self.profile.as_ref());
+        // NAN-1555: a metrics rollup read aggregates the pre-aggregated state
+        // columns (value_sum/value_count/value_state/value_min/value_max) that the
+        // slim projection never lists — and the slim list names raw `value`/
+        // `timestamp`, which the rollup lacks. `SELECT *` so every state column
+        // flows from the base read into the aggregation stage. Rollup-only.
+        if self.is_metrics_rollup() {
+            ctx.required_fields = None;
+        }
 
         // Identify ext JSON fields referenced by the query so they can be
         // materialized in stage_0 SELECT, making them visible to downstream CTEs
@@ -1201,14 +1397,15 @@ impl ClickHouseSqlGenerator {
         // move, leaving every non-promoted filter after the full-projection read).
         // Single query with ORDER BY and LIMIT together - much faster than CTE approach
         Ok(format!(
-            "SELECT {} FROM {} WHERE timestamp BETWEEN '{}' AND '{}' AND ({}) ORDER BY timestamp DESC LIMIT {} {}",
+            "SELECT {} FROM {} WHERE {tc} BETWEEN '{}' AND '{}' AND ({}) ORDER BY {tc} DESC LIMIT {} {}",
             select_clause,
             ctx.table_name,
             ctx.time_range.start.format("%Y-%m-%d %H:%M:%S%.6f"),
             ctx.time_range.end.format("%Y-%m-%d %H:%M:%S%.6f"),
             where_clause,
             limit,
-            generate_settings(ctx.use_cache, selective, false)
+            generate_settings(ctx.use_cache, selective, false),
+            tc = ctx.time_column,
         ))
     }
 
@@ -1259,14 +1456,15 @@ impl ClickHouseSqlGenerator {
                     None => String::new(),
                 };
                 Ok(format!(
-                    "SELECT {} FROM {} WHERE timestamp BETWEEN '{}' AND '{}' AND ({}) ORDER BY timestamp DESC {}{}",
+                    "SELECT {} FROM {} WHERE {tc} BETWEEN '{}' AND '{}' AND ({}) ORDER BY {tc} DESC {}{}",
                     select_clause,
                     ctx.table_name,
                     ctx.time_range.start.format("%Y-%m-%d %H:%M:%S%.6f"),
                     ctx.time_range.end.format("%Y-%m-%d %H:%M:%S%.6f"),
                     where_clause,
                     limit_clause,
-                    generate_settings(ctx.use_cache, selective, false)
+                    generate_settings(ctx.use_cache, selective, false),
+                    tc = ctx.time_column,
                 ))
             }
             QueryStage::Command(_) => Err(SqlGenError::UnsupportedOperation(
@@ -1393,21 +1591,23 @@ impl ClickHouseSqlGenerator {
                         // back to the safety bound so the base CTE stays
                         // bounded even for a pagination-owning caller (None).
                         format!(
-                            "\n  ORDER BY timestamp DESC\n  LIMIT {}",
+                            "\n  ORDER BY {} DESC\n  LIMIT {}",
+                            ctx.time_column,
                             ctx.limit.unwrap_or(Self::DEFAULT_RESULT_LIMIT)
                         )
                     } else {
                         String::new()
                     };
                     format!(
-                        "{} AS (\n  SELECT {} FROM {}\n  WHERE timestamp BETWEEN '{}' AND '{}'\n  AND ({}){}\n)",
+                        "{} AS (\n  SELECT {} FROM {}\n  WHERE {tc} BETWEEN '{}' AND '{}'\n  AND ({}){}\n)",
                         cte_name,
                         select_clause,
                         ctx.table_name,
                         ctx.time_range.start.format("%Y-%m-%d %H:%M:%S%.6f"),
                         ctx.time_range.end.format("%Y-%m-%d %H:%M:%S%.6f"),
                         where_clause,
-                        limit_clause
+                        limit_clause,
+                        tc = ctx.time_column,
                     )
                 }
                 QueryStage::Command(cmd) => {
@@ -1517,10 +1717,13 @@ impl ClickHouseSqlGenerator {
         if last_stage_has_ordering || has_aggregate_or_projection {
             write!(sql, "\nSELECT {} FROM {} {}", select_list, last_cte, settings).unwrap();
         } else {
+            // NAN-1555: order by the active dataset's time column (`start_time` for
+            // spans) — `timestamp` does not exist on `otel_spans`. Logs keep
+            // `timestamp` (byte-identical).
             write!(
                 sql,
-                "\nSELECT {} FROM {} ORDER BY timestamp DESC {}",
-                select_list, last_cte, settings
+                "\nSELECT {} FROM {} ORDER BY {} DESC {}",
+                select_list, last_cte, self.time_column, settings
             )
             .unwrap();
         }
@@ -1549,6 +1752,7 @@ impl ClickHouseSqlGenerator {
             max,
             overwrite: _,
             maxout,
+            subsearch_dataset,
         } = cmd
         {
             let limit = resolve_subsearch_limit(*maxout);
@@ -1561,6 +1765,7 @@ impl ClickHouseSqlGenerator {
                 limit,
                 ctx,
                 prior_stages,
+                *subsearch_dataset,
             )?;
             return Ok(format!("{} AS (\n{}\n)", cte_name, inner_sql));
         }
@@ -1917,15 +2122,31 @@ impl ClickHouseSqlGenerator {
     /// Under UDM every branch collapses to `escape_identifier(normalize_field_name(f))`
     /// (no class split; `field_access_expr` of an explicit column is the escaped
     /// name itself), so UDM join SQL is byte-identical to the pre-NAN-1413 form.
-    fn join_key_column(&self, field: &str, shape: &OutputShape) -> String {
-        let normalized = normalize_field_name(field);
+    ///
+    /// NAN-1562: every column resolution flows through `resolver`, the generator
+    /// whose profile/table the side reads against. For a same-table join this is
+    /// always `self` (byte-identical to the pre-NAN-1562 form). For a CROSS-dataset
+    /// join the SUB side must pass `sub_gen` (the subsearch dataset's generator):
+    /// the field is canonicalized through `resolver.canonicalize_field` (which
+    /// KEEPS `service_name` for spans/metrics rather than the free
+    /// `normalize_field_name` mapping it to the logs-only `cloud_service`) and the
+    /// column is resolved against `resolver`'s profile, so `ON main.k = sub.k`
+    /// references a column that actually exists in `otel_spans`/`otel_metrics`
+    /// (was Code 47 UNKNOWN_IDENTIFIER when the sub side used the outer profile).
+    fn join_key_column(
+        &self,
+        resolver: &ClickHouseSqlGenerator,
+        field: &str,
+        shape: &OutputShape,
+    ) -> String {
+        let normalized = resolver.canonicalize_field(field);
         if let OutputShape::Wide(extra) | OutputShape::WideJoined(extra) = shape {
             if !extra.iter().any(|c| c == normalized) {
-                if let Some(col) = self.class_split_column(normalized) {
+                if let Some(col) = resolver.class_split_column(normalized) {
                     return escape_identifier(&col);
                 }
-                if self.resolves_to_column(normalized) {
-                    return self.field_access_expr(normalized, "String");
+                if resolver.resolves_to_column(normalized) {
+                    return resolver.field_access_expr(normalized, "String");
                 }
             }
         }
@@ -1933,6 +2154,7 @@ impl ClickHouseSqlGenerator {
     }
 
     /// Generate SQL for a JOIN command
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn generate_join_sql(
         &self,
@@ -1944,9 +2166,60 @@ impl ClickHouseSqlGenerator {
         limit: usize,
         ctx: &GeneratorContext,
         prior_stages: &[QueryStage],
+        subsearch_dataset: Option<otel::Dataset>,
     ) -> Result<String, SqlGenError> {
-        // Generate the subsearch SQL
-        let subsearch_sql = self.generate_subsearch_sql(subsearch, ctx, limit)?;
+        // NAN-1562: cross-dataset only when the selected dataset's table differs
+        // from the outer table — `dataset=logs` from a logs query stays
+        // byte-identical (no clone, no settings, same ctx).
+        let cross_dataset = subsearch_dataset
+            .map(|ds| ds.table_name() != self.table_name)
+            .unwrap_or(false);
+
+        // NAN-1562 bound: a cross-dataset join MUST have positional key fields —
+        // a keyless cross-dataset join is a Cartesian product across two tables.
+        // Reject with an actionable error (the per-key LIMIT BY also needs keys).
+        if cross_dataset && fields.is_empty() {
+            return Err(SqlGenError::UnsupportedOperation(
+                "cross-dataset correlation requires a join key, e.g. \
+                 `| join trace_id [dataset=logs …]`"
+                    .to_string(),
+            ));
+        }
+
+        // Generate the subsearch SQL. For a cross-dataset join, build a SCOPED
+        // sub-generator pointed at the subsearch's dataset (its own table, time
+        // column, and profile) plus a ctx carrying that table/time column, so the
+        // FROM, time-bound WHERE, field resolution, and projection all hit the
+        // subsearch's dataset. The clone is local — the sub-dataset never leaks
+        // into the outer pipeline (mirrors the IN path / NAN-1555 scoped swap).
+        let sub_gen_owned: Option<ClickHouseSqlGenerator> = if cross_dataset {
+            let g = self.clone().with_dataset(subsearch_dataset.unwrap());
+            match g.generation_time_range.write() {
+                Ok(mut guard) => *guard = Some(ctx.time_range.clone()),
+                Err(poisoned) => *poisoned.into_inner() = Some(ctx.time_range.clone()),
+            }
+            Some(g)
+        } else {
+            None
+        };
+        let sub_gen: &ClickHouseSqlGenerator = sub_gen_owned.as_ref().unwrap_or(self);
+        // Sub table + time column the subsearch reads against (own dataset when cross).
+        let (sub_table, sub_time_col): (String, String) = if cross_dataset {
+            let ds = subsearch_dataset.unwrap();
+            (ds.table_name().to_string(), ds.time_column().to_string())
+        } else {
+            (ctx.table_name.to_string(), ctx.time_column.to_string())
+        };
+        let subsearch_sql = if cross_dataset {
+            let mut sub_ctx =
+                GeneratorContext::new(&sub_table, &sub_time_col, ctx.time_range);
+            sub_ctx.required_fields = ctx.required_fields.clone();
+            sub_ctx.ext_fields = ctx.ext_fields.clone();
+            sub_ctx.use_cache = ctx.use_cache;
+            sub_gen.generate_subsearch_sql(subsearch, &sub_ctx, limit)?
+        } else {
+            self.generate_subsearch_sql(subsearch, ctx, limit)?
+        };
 
         // Resolve each join key PER SIDE (NAN-1413): the outer (main) side
         // against the prior pipeline's output shape, the subsearch (sub) side
@@ -1954,15 +2227,20 @@ impl ClickHouseSqlGenerator {
         // physical/unified column while a `[… | stats … by user]` projects the
         // bare normalized name, and the two must be allowed to differ in the
         // ON clause or the join references a nonexistent column (Code 47).
+        // The MAIN side resolves against `self` (the outer profile); the SUB side
+        // resolves against `sub_gen` — the subsearch dataset's generator for a
+        // cross-dataset join, `self` otherwise (NAN-1562). Using `self` for the
+        // sub keys aliased `service_name → cloud_service` for a spans subsearch,
+        // a column `otel_spans` has no → Code 47 at runtime.
         let main_shape = self.pipeline_output_shape(prior_stages);
-        let sub_shape_for_keys = self.pipeline_output_shape(&self.collect_stages(subsearch));
+        let sub_shape_for_keys = sub_gen.pipeline_output_shape(&sub_gen.collect_stages(subsearch));
         let main_keys: Vec<String> = fields
             .iter()
-            .map(|f| self.join_key_column(f, &main_shape))
+            .map(|f| self.join_key_column(self, f, &main_shape))
             .collect();
         let sub_keys: Vec<String> = fields
             .iter()
-            .map(|f| self.join_key_column(f, &sub_shape_for_keys))
+            .map(|f| self.join_key_column(sub_gen, f, &sub_shape_for_keys))
             .collect();
 
         // A join CHAINED after a wide-sub join needs a stage-unique subsearch
@@ -2029,12 +2307,22 @@ impl ClickHouseSqlGenerator {
         // compares, NAN-1413) so the per-key cap binds to the join key.
         let key_list = sub_keys.join(", ");
         let sub_shape = sub_shape_for_keys;
-        let sub_order = match &sub_shape {
-            OutputShape::Wide(_) => "\n    ORDER BY timestamp",
-            OutputShape::Columns(cols) if cols.iter().any(|c| c == "timestamp") => {
-                "\n    ORDER BY timestamp"
+        // NAN-1555: order the subsearch on the active dataset's time column
+        // (`start_time` for spans). Logs/metrics keep `timestamp` → byte-identical.
+        // NAN-1562: for a cross-dataset subsearch, order on the SUBSEARCH
+        // dataset's time column (`sub_time_col`) — the rows being ordered are the
+        // subsearch's, not the outer query's.
+        let tc: &str = if cross_dataset {
+            &sub_time_col
+        } else {
+            self.time_column()
+        };
+        let sub_order: String = match &sub_shape {
+            OutputShape::Wide(_) => format!("\n    ORDER BY {tc}"),
+            OutputShape::Columns(cols) if cols.iter().any(|c| c == tc) => {
+                format!("\n    ORDER BY {tc}")
             }
-            _ => "",
+            _ => String::new(),
         };
         // When the subsearch's output columns are known, project `main.*` plus
         // the sub's non-key columns under their bare names. A bare `SELECT *`
@@ -2045,8 +2333,12 @@ impl ClickHouseSqlGenerator {
         // can't reference the bare name. Join keys are already in `main.*`.
         let select_clause = match &sub_shape {
             OutputShape::Columns(cols) => {
+                // NAN-1562: the sub-side Columns shape is computed by `sub_gen`,
+                // so canonicalize the key names through the SAME profile to match
+                // (spans/metrics keep `service_name`; logs map through the free
+                // alias table — byte-identical for the same-table path).
                 let key_names: Vec<&str> =
-                    fields.iter().map(|f| normalize_field_name(f)).collect();
+                    fields.iter().map(|f| sub_gen.canonicalize_field(f)).collect();
                 let sub_cols: Vec<String> = cols
                     .iter()
                     .filter(|c| !key_names.contains(&c.as_str()))
@@ -2063,8 +2355,19 @@ impl ClickHouseSqlGenerator {
             }
             _ => "*".to_string(),
         };
+        // NAN-1562: when the subsearch targets a NON-logs dataset, the hash join
+        // build side is the OTLP table (spans/metrics), which is wider and pushes
+        // peak memory; `partial_merge` measured ~36% less peak memory than the
+        // default hash algorithm for that shape. Logs subsearches keep CH's
+        // default (hash) → byte-identical. Emitted on the JOIN CTE.
+        let join_settings = match subsearch_dataset {
+            Some(otel::Dataset::Spans) | Some(otel::Dataset::Metrics) if cross_dataset => {
+                "\n  SETTINGS join_algorithm = 'partial_merge'"
+            }
+            _ => "",
+        };
         Ok(format!(
-            "  SELECT {} FROM {} AS main\n  {} (\n    SELECT * FROM (\n{}\n    ) WHERE {}{}\n    LIMIT {} BY {}\n  ) AS {} ON {}",
+            "  SELECT {} FROM {} AS main\n  {} (\n    SELECT * FROM (\n{}\n    ) WHERE {}{}\n    LIMIT {} BY {}\n  ) AS {} ON {}{}",
             select_clause,
             source_cte,
             join_keyword,
@@ -2074,7 +2377,8 @@ impl ClickHouseSqlGenerator {
             max,
             key_list,
             sub_alias,
-            join_condition
+            join_condition,
+            join_settings
         ))
     }
 
@@ -2125,10 +2429,13 @@ impl ClickHouseSqlGenerator {
             if let QueryStage::Search(expr) = &stages[0] {
                 let where_clause = self.generate_search_expr(expr)?;
                 // Single WHERE — `optimize_move_to_prewhere` does placement (NAN-1412).
+                // Time column is the (sub)dataset's `ctx.time_column` — `start_time`
+                // for a spans subsearch, not the literal `timestamp` (NAN-1562).
                 return Ok(format!(
-                    "    SELECT {} FROM {}\n    WHERE timestamp BETWEEN '{}' AND '{}'\n    AND ({})\n    LIMIT {}",
+                    "    SELECT {} FROM {}\n    WHERE {} BETWEEN '{}' AND '{}'\n    AND ({})\n    LIMIT {}",
                     base_select,
                     ctx.table_name,
+                    ctx.time_column,
                     ctx.time_range.start.format("%Y-%m-%d %H:%M:%S%.6f"),
                     ctx.time_range.end.format("%Y-%m-%d %H:%M:%S%.6f"),
                     where_clause,
@@ -2145,10 +2452,12 @@ impl ClickHouseSqlGenerator {
                 QueryStage::Search(expr) => {
                     let where_clause = self.generate_search_expr(expr)?;
                     // Single WHERE — `optimize_move_to_prewhere` does placement (NAN-1412).
+                    // Time column is the (sub)dataset's `ctx.time_column` (NAN-1562).
                     current_sql = format!(
-                        "SELECT {} FROM {} WHERE timestamp BETWEEN '{}' AND '{}' AND ({})",
+                        "SELECT {} FROM {} WHERE {} BETWEEN '{}' AND '{}' AND ({})",
                         base_select,
                         ctx.table_name,
+                        ctx.time_column,
                         ctx.time_range.start.format("%Y-%m-%d %H:%M:%S%.6f"),
                         ctx.time_range.end.format("%Y-%m-%d %H:%M:%S%.6f"),
                         where_clause
@@ -2351,11 +2660,18 @@ impl ClickHouseSqlGenerator {
                     .collect::<Vec<_>>()
                     .join(", ");
 
-                if ext_fields.is_empty() {
-                    format!("{}, {}", base, materialized)
-                } else {
-                    // Materialize ext JSON fields alongside SELECT * so they appear
-                    // as regular columns in downstream CTEs
+                // NAN-1555: assemble from non-empty parts only. Spans have no
+                // MATERIALIZED columns (`materialized` is ""), so a flat
+                // `format!("{base}, {materialized}")` would emit a trailing-comma
+                // `SELECT *,  FROM` — a CH syntax error. UDM/OCSF always have a
+                // non-empty materialized list, so this is byte-identical for them.
+                let mut parts: Vec<String> = vec![base];
+                if !materialized.is_empty() {
+                    parts.push(materialized);
+                }
+                if !ext_fields.is_empty() {
+                    // Materialize ext/attribute fields alongside SELECT * so they
+                    // appear as regular columns in downstream CTEs.
                     let mut ext_cols: Vec<_> = ext_fields.iter().collect();
                     ext_cols.sort();
                     let ext_exprs: Vec<String> = ext_cols
@@ -2368,8 +2684,9 @@ impl ClickHouseSqlGenerator {
                             )
                         })
                         .collect();
-                    format!("{}, {}, {}", base, materialized, ext_exprs.join(", "))
+                    parts.push(ext_exprs.join(", "));
                 }
+                parts.join(", ")
             }
             Some(fields) => {
                 // Explicit-fields path: `preserve_legacy_columns` is not
@@ -2449,13 +2766,35 @@ impl ClickHouseSqlGenerator {
                 // resolve. UDM is untouched: `UdmProfile::resolve` never yields
                 // `JsonPath`, so `tail_col` stays `None` and the join below is
                 // byte-identical to before.
-                let tail_col: Option<String> = field_list.iter().find_map(|field| {
-                    match self.profile.resolve(field) {
-                        FieldResolution::JsonPath { col, .. } => Some(col),
-                        _ => None,
+                //
+                // NAN-1555: the same hazard for the spans/metrics attribute `Map`
+                // tail. A required `MapKey` field is materialized above as
+                // `toString(if(has(attributes,'k'),attributes['k'],…)) AS k`, but a
+                // later stage that re-derives the SAME map subscript (`stats`/
+                // `timechart`/`top` split-by on `http.method`) references
+                // `attributes`/`resource_attributes` against this stage's output,
+                // which the slim projection dropped → CH Code 47 "Unknown
+                // identifier: attributes". Pass through BOTH backing map columns.
+                // UDM/OCSF never yield `MapKey`, so this is spans/metrics-only.
+                let mut tail_cols: Vec<String> = Vec::new();
+                let mut push_tail = |c: String, acc: &mut Vec<String>| {
+                    if !acc.contains(&c) {
+                        acc.push(c);
                     }
-                });
-                if let Some(col) = tail_col {
+                };
+                for field in &field_list {
+                    match self.profile.resolve(field) {
+                        FieldResolution::JsonPath { col, .. } => push_tail(col, &mut tail_cols),
+                        FieldResolution::MapKey { col, fallback, .. } => {
+                            push_tail(col, &mut tail_cols);
+                            if let Some(fb) = fallback {
+                                push_tail(fb, &mut tail_cols);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for col in tail_cols {
                     let escaped = escape_identifier(&col);
                     // Guard against an accidental duplicate if the tail column
                     // ever appears as its own bare required field.
@@ -2557,6 +2896,11 @@ enum OutputShape {
 /// Context for SQL generation
 struct GeneratorContext<'a> {
     table_name: &'a str,
+    /// Primary time column for the dataset's main-table read — `"timestamp"`
+    /// (logs/metrics) or `"start_time"` (spans). Drives the time-bound WHERE and
+    /// the default ORDER BY at the base-table seam (NAN-1534). Subsearch /
+    /// IN-subquery reads always hit `logs` and keep the literal `timestamp`.
+    time_column: &'a str,
     time_range: &'a TimeRange,
     current_stage: usize,
     /// Fields required by the query (for field pruning optimization)
@@ -2584,9 +2928,10 @@ struct GeneratorContext<'a> {
 }
 
 impl<'a> GeneratorContext<'a> {
-    fn new(table_name: &'a str, time_range: &'a TimeRange) -> Self {
+    fn new(table_name: &'a str, time_column: &'a str, time_range: &'a TimeRange) -> Self {
         Self {
             table_name,
+            time_column,
             time_range,
             current_stage: 0,
             required_fields: None,
@@ -4535,5 +4880,6 @@ mod tests {
         }
     }
 }
+
 
 

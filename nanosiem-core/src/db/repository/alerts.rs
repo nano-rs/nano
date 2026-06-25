@@ -59,16 +59,113 @@ fn strip_nano_fields(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// NAN-1541: a single alert produced by the spine, parameterized over its
+/// `kind` discriminator. This is the unified raise contract: detection and the
+/// three observability evaluators all build one of these and route through
+/// [`AlertRepository::create_alert`].
+///
+/// - `kind` is one of `detection`, `metric_monitor`, `slo`, `synthetic`
+///   (enforced by the migration-212 CHECK).
+/// - `rule_id` is `Some` only for detection alerts; observability rows leave it
+///   `None` (the FK is nullable).
+/// - `source_id` carries the producer's identifier as text — the rule UUID for
+///   detections, the monitor/check typeid for observability alerts.
+/// - `event_hash` drives dedup. `Some` uses `ON CONFLICT (rule_id, event_hash)
+///   DO NOTHING`; `None` skips the dedup conflict path entirely.
+pub struct AlertInsert<'a> {
+    pub kind: &'a str,
+    pub rule_id: Option<Uuid>,
+    pub source_id: Option<String>,
+    pub severity: &'a Severity,
+    pub matched_events: &'a serde_json::Value,
+    pub event_hash: Option<String>,
+}
+
+/// NAN-1541: normalize an optional kinds filter into the `Option<Vec<String>>`
+/// the queries bind. An absent filter OR an empty slice both mean "all kinds"
+/// (bound as SQL NULL so the `$N::text[] IS NULL OR ...` guard short-circuits).
+fn normalize_kinds(kinds: Option<&[String]>) -> Option<Vec<String>> {
+    match kinds {
+        Some(k) if !k.is_empty() => Some(k.to_vec()),
+        _ => None,
+    }
+}
+
 impl AlertRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
 
-    /// Create a new alert with deduplication
+    /// NAN-1541: the ONE unified create. Every alert producer — detection and
+    /// each observability evaluator — funnels through here with its own `kind`
+    /// + `source_id`. Detection behavior is preserved exactly: `create` /
+    /// `create_without_dedup` are thin wrappers that set `kind = "detection"`
+    /// and `source_id = rule_id`.
+    ///
+    /// When `event_hash` is `Some`, the insert is dedup-guarded via
+    /// `ON CONFLICT (rule_id, event_hash) DO NOTHING` (returns `DuplicateAlert`
+    /// on conflict). When `None`, a plain insert is issued (no dedup).
+    pub async fn create_alert(
+        &self,
+        insert: AlertInsert<'_>,
+    ) -> Result<Alert, AlertRepositoryError> {
+        match insert.event_hash {
+            Some(event_hash) => {
+                // Atomic insert with conflict detection - no race condition window
+                let result = sqlx::query_as::<_, Alert>(
+                    r#"
+                    INSERT INTO alerts (rule_id, severity, matched_events, event_hash, kind, source_id)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT (rule_id, event_hash) WHERE event_hash IS NOT NULL DO NOTHING
+                    RETURNING *
+                    "#,
+                )
+                .bind(insert.rule_id)
+                .bind(insert.severity)
+                .bind(insert.matched_events)
+                .bind(&event_hash)
+                .bind(insert.kind)
+                .bind(&insert.source_id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+                match result {
+                    Some(alert) => Ok(alert),
+                    None => Err(AlertRepositoryError::DuplicateAlert(
+                        // rule_id is NULL for observability alerts; surface nil
+                        // in the (rare) dedup-conflict error rather than panic.
+                        insert.rule_id.unwrap_or_else(Uuid::nil),
+                        event_hash,
+                    )),
+                }
+            }
+            None => {
+                let result = sqlx::query_as::<_, Alert>(
+                    r#"
+                    INSERT INTO alerts (rule_id, severity, matched_events, kind, source_id)
+                    VALUES ($1, $2, $3, $4, $5)
+                    RETURNING *
+                    "#,
+                )
+                .bind(insert.rule_id)
+                .bind(insert.severity)
+                .bind(insert.matched_events)
+                .bind(insert.kind)
+                .bind(&insert.source_id)
+                .fetch_one(&self.pool)
+                .await?;
+
+                Ok(result)
+            }
+        }
+    }
+
+    /// Create a new detection alert with deduplication
     /// If event_hash is provided and an alert with the same rule_id + event_hash exists,
     /// returns DuplicateAlert error instead of creating a duplicate
     ///
-    /// Uses INSERT ON CONFLICT to atomically handle deduplication (race-condition safe)
+    /// Uses INSERT ON CONFLICT to atomically handle deduplication (race-condition safe).
+    /// Thin wrapper over [`create_alert`] with `kind = "detection"`.
     pub async fn create(&self, alert: &NewAlert) -> Result<Alert, AlertRepositoryError> {
         // Compute event hash if not provided
         let event_hash = alert
@@ -76,50 +173,66 @@ impl AlertRepository {
             .clone()
             .unwrap_or_else(|| compute_event_hash(&alert.matched_events));
 
-        // Atomic insert with conflict detection - no race condition window
-        let result = sqlx::query_as::<_, Alert>(
-            r#"
-            INSERT INTO alerts (rule_id, severity, matched_events, event_hash)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (rule_id, event_hash) WHERE event_hash IS NOT NULL DO NOTHING
-            RETURNING *
-            "#,
-        )
-        .bind(alert.rule_id)
-        .bind(&alert.severity)
-        .bind(&alert.matched_events)
-        .bind(&event_hash)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        match result {
-            Some(alert) => Ok(alert),
-            None => Err(AlertRepositoryError::DuplicateAlert(
-                alert.rule_id,
-                event_hash,
-            )),
-        }
+        self.create_alert(AlertInsert {
+            kind: "detection",
+            rule_id: Some(alert.rule_id),
+            source_id: Some(alert.rule_id.to_string()),
+            severity: &alert.severity,
+            matched_events: &alert.matched_events,
+            event_hash: Some(event_hash),
+        })
+        .await
     }
 
-    /// Create a new alert without deduplication check (for backwards compatibility)
+    /// Create a new detection alert without deduplication check (for backwards compatibility).
+    /// Thin wrapper over [`create_alert`] with `kind = "detection"`.
     pub async fn create_without_dedup(
         &self,
         alert: &NewAlert,
     ) -> Result<Alert, AlertRepositoryError> {
-        let result = sqlx::query_as::<_, Alert>(
+        self.create_alert(AlertInsert {
+            kind: "detection",
+            rule_id: Some(alert.rule_id),
+            source_id: Some(alert.rule_id.to_string()),
+            severity: &alert.severity,
+            matched_events: &alert.matched_events,
+            event_hash: None,
+        })
+        .await
+    }
+
+    /// NAN-1563: durable re-arm authority for observability alerts.
+    ///
+    /// Returns the `created_at` of the most recent alert for `(kind, source_id)`,
+    /// or `None` if no such alert exists. This is the durable backstop for
+    /// time-based re-arm dedup on the `event_hash: None` insert path (SLO /
+    /// metric-monitor alerts), which carry no per-event dedup hash. Because the
+    /// answer comes from the persisted `alerts` table, it survives a
+    /// jobs-process restart / leader failover — the new leader sees the prior
+    /// leader's last alert and respects the re-arm window instead of re-firing.
+    ///
+    /// Parameterized; `source_id` is the producer's identifier text (the SLO id
+    /// for `kind = "slo"`).
+    pub async fn latest_alert_at_for_source(
+        &self,
+        kind: &str,
+        source_id: &str,
+    ) -> Result<Option<DateTime<Utc>>, AlertRepositoryError> {
+        let created_at: Option<DateTime<Utc>> = sqlx::query_scalar(
             r#"
-            INSERT INTO alerts (rule_id, severity, matched_events)
-            VALUES ($1, $2, $3)
-            RETURNING *
+            SELECT created_at
+            FROM alerts
+            WHERE kind = $1 AND source_id = $2
+            ORDER BY created_at DESC
+            LIMIT 1
             "#,
         )
-        .bind(alert.rule_id)
-        .bind(&alert.severity)
-        .bind(&alert.matched_events)
-        .fetch_one(&self.pool)
+        .bind(kind)
+        .bind(source_id)
+        .fetch_optional(&self.pool)
         .await?;
 
-        Ok(result)
+        Ok(created_at)
     }
 
     /// Find an alert by ID (with rule name)
@@ -152,14 +265,22 @@ impl AlertRepository {
         Ok(result)
     }
 
-    /// List alerts with optional filters (with rule names)
+    /// List alerts with optional filters (with rule names).
+    ///
+    /// NAN-1541: `kinds` filters by the spine discriminator. `None` (or an
+    /// empty slice) returns ALL kinds; the SIEM Alerts view passes
+    /// `["detection"]` and the Observability Alerts view passes the monitor
+    /// kinds. Detection callers that don't pass `kinds` keep the prior
+    /// behavior, but the API layer always scopes them to `["detection"]`.
     pub async fn list(
         &self,
         status: Option<AlertStatus>,
         severity: Option<Severity>,
+        kinds: Option<&[String]>,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Alert>, AlertRepositoryError> {
+        let kinds_filter = normalize_kinds(kinds);
         let results = sqlx::query_as::<_, Alert>(
             r#"
             SELECT
@@ -179,6 +300,7 @@ impl AlertRepository {
             ) t ON t.alert_id = a.id
             WHERE ($1::text IS NULL OR a.status = $1)
               AND ($2::text IS NULL OR a.severity = $2)
+              AND ($5::text[] IS NULL OR a.kind = ANY($5))
             ORDER BY
                 CASE a.severity
                     WHEN 'critical' THEN 1
@@ -195,6 +317,7 @@ impl AlertRepository {
         .bind(severity.map(|s| format!("{:?}", s).to_lowercase()))
         .bind(limit)
         .bind(offset)
+        .bind(kinds_filter)
         .fetch_all(&self.pool)
         .await?;
 
@@ -397,11 +520,22 @@ impl AlertRepository {
         Ok(result.rows_affected() as usize)
     }
 
-    /// Count alerts by status (last 90 days to avoid full table scan)
-    pub async fn count_by_status(&self) -> Result<Vec<(AlertStatus, i64)>, AlertRepositoryError> {
+    /// Count alerts by status (last 90 days to avoid full table scan).
+    ///
+    /// NAN-1541: `kinds` scopes the counts to the spine discriminator (`None`
+    /// = all kinds).
+    pub async fn count_by_status(
+        &self,
+        kinds: Option<&[String]>,
+    ) -> Result<Vec<(AlertStatus, i64)>, AlertRepositoryError> {
+        let kinds_filter = normalize_kinds(kinds);
         let results: Vec<(String, i64)> = sqlx::query_as(
-            r#"SELECT status, COUNT(*) FROM alerts WHERE created_at >= NOW() - INTERVAL '90 days' GROUP BY status"#,
+            r#"SELECT status, COUNT(*) FROM alerts
+               WHERE created_at >= NOW() - INTERVAL '90 days'
+                 AND ($1::text[] IS NULL OR kind = ANY($1))
+               GROUP BY status"#,
         )
+        .bind(kinds_filter)
         .fetch_all(&self.pool)
         .await?;
 

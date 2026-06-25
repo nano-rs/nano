@@ -122,6 +122,9 @@ impl DetectionService {
             request_id: None,
             async_mode: false,
             priority: None,
+            // NAN-1561: thread the rule's dataset so spans/metrics rules analyze
+            // the right physical table.
+            dataset: rule.dataset.clone(),
         };
 
         let response = self
@@ -130,8 +133,9 @@ impl DetectionService {
             .await
             .map_err(|e| DetectionError::SearchError(e.to_string()))?;
 
-        let (matches_by_bucket, bucket_size_seconds) =
-            self.compute_match_buckets(&rule.query, &time_range).await;
+        let (matches_by_bucket, bucket_size_seconds) = self
+            .compute_match_buckets(&rule.query, &time_range, rule.dataset.clone())
+            .await;
         let matches_by_day = derive_daily_counts(&matches_by_bucket);
 
         let execution_time_ms = start_time.elapsed().as_millis() as u64;
@@ -234,7 +238,12 @@ impl DetectionService {
         );
 
         let result = self
-            .run_stepped_windows(&rule.query, &windows, bucket_size_seconds)
+            .run_stepped_windows(
+                &rule.query,
+                &windows,
+                bucket_size_seconds,
+                rule.dataset.clone(),
+            )
             .await;
 
         Ok(HistoricalAnalysisResult {
@@ -257,6 +266,7 @@ impl DetectionService {
         time_range: TimeRangeInput,
         schedule_cron: Option<&str>,
         lookback_minutes: Option<i64>,
+        dataset: Option<String>,
     ) -> Result<HistoricalAnalysisResult, DetectionError> {
         validate_test_range(&time_range)?;
         self.validate_query(query)?;
@@ -285,7 +295,7 @@ impl DetectionService {
         );
 
         let result = self
-            .run_stepped_windows(query, &windows, bucket_size_seconds)
+            .run_stepped_windows(query, &windows, bucket_size_seconds, dataset)
             .await;
 
         Ok(HistoricalAnalysisResult {
@@ -305,6 +315,7 @@ impl DetectionService {
         query: &str,
         windows: &[TimeRangeInput],
         bucket_size_seconds: u32,
+        dataset: Option<String>,
     ) -> HistoricalAnalysisResult {
         let start_time = std::time::Instant::now();
         let semaphore = Arc::new(Semaphore::new(STEPPED_TESTER_CONCURRENCY));
@@ -316,12 +327,15 @@ impl DetectionService {
             let svc = self.clone();
             let q = query.to_string();
             let w = window.clone();
+            // NAN-1561: thread the rule's dataset so a spans/metrics backtest
+            // queries the right physical table instead of silently scanning logs.
+            let ds = dataset.clone();
             futures.push(async move {
                 let _permit = sem
                     .acquire_owned()
                     .await
                     .expect("stepped tester semaphore should not close");
-                let result = svc.evaluate_window(&q, w.clone()).await;
+                let result = svc.evaluate_window(&q, w.clone(), ds).await;
                 (w, result)
             });
         }
@@ -422,6 +436,13 @@ impl DetectionService {
             request_id: None,
             async_mode: false,
             priority: None,
+            // KNOWN LIMITATION (NAN-1561): this ad-hoc query-string analysis path
+            // has no DetectionRule and therefore no dataset — it always queries
+            // logs. The saved-rule paths (analyze_historical / evaluate_window /
+            // the stepped tester) thread the rule's dataset correctly. Spans/
+            // metrics rules should be tested via the stepped tester, which is
+            // dataset-aware.
+            dataset: None,
         };
 
         let response = self
@@ -431,7 +452,7 @@ impl DetectionService {
             .map_err(|e| DetectionError::SearchError(e.to_string()))?;
 
         let (matches_by_bucket, bucket_size_seconds) =
-            self.compute_match_buckets(query, &time_range).await;
+            self.compute_match_buckets(query, &time_range, None).await;
         let matches_by_day = derive_daily_counts(&matches_by_bucket);
 
         let execution_time_ms = start_time.elapsed().as_millis() as u64;
@@ -473,6 +494,7 @@ impl DetectionService {
         &self,
         query: &str,
         time_range: &TimeRangeInput,
+        dataset: Option<String>,
     ) -> (Vec<TimeBucket>, u32) {
         let bucket_size = pick_bucket_size_seconds(time_range.end - time_range.start);
 
@@ -501,7 +523,7 @@ impl DetectionService {
         // Cap at MAX_BUCKETS + a small slack for boundary buckets.
         let limit = (MAX_BUCKETS as usize) + 5;
         let buckets = self
-            .fetch_bucket_counts(&timechart_query, time_range, limit)
+            .fetch_bucket_counts(&timechart_query, time_range, limit, dataset)
             .await;
         (buckets, bucket_size)
     }
@@ -512,6 +534,7 @@ impl DetectionService {
         timechart_query: &str,
         time_range: &TimeRangeInput,
         limit: usize,
+        dataset: Option<String>,
     ) -> Vec<TimeBucket> {
         let request = SearchRequest {
             query: timechart_query.to_string(),
@@ -526,6 +549,9 @@ impl DetectionService {
             request_id: None,
             async_mode: false,
             priority: None,
+            // NAN-1561: threaded from the caller's rule dataset (None for the
+            // ad-hoc query path, which has no rule and therefore queries logs).
+            dataset,
         };
 
         match self.search_service.search(request).await {

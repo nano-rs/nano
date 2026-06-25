@@ -14,6 +14,7 @@ import { getServiceUrl, API_BASE_URL } from './utils';
 import { getAccessToken as getInMemoryToken } from '../auth-token';
 import { AuthApi } from './auth';
 import { SearchApi } from './search';
+import { ObservabilityApi } from './observability';
 import { DetectionsApi } from './detections';
 import { CredentialsApi } from './credentials';
 import { MelodApi } from '@/enterprise/api/melod';
@@ -101,6 +102,7 @@ class ApiClient {
   // Route modules (internal)
   private _auth: AuthApi;
   private _search: SearchApi;
+  private _observability: ObservabilityApi;
   private _detections: DetectionsApi;
   private _credentials: CredentialsApi;
   private _melod: MelodApi;
@@ -147,6 +149,18 @@ class ApiClient {
       this.request.bind(this),
       this.getAccessToken.bind(this),
       this.baseUrl
+    );
+    this._observability = new ObservabilityApi(
+      this.request.bind(this),
+      // Traces/Metrics passthroughs delegate to the SearchApi instance so the
+      // console consumes a single `api.observability` facade (NAN-1536).
+      (req) => this._search.listTraces(req),
+      (id) => this._search.getTrace(id),
+      (service) => this._search.listMetricNames(service),
+      (req) => this._search.queryMetrics(req),
+      // NAN-1540: multi-series metrics + tag discovery.
+      (req) => this._search.queryMetricsV2(req),
+      (metricName, key) => this._search.listMetricTags(metricName, key)
     );
     this._detections = new DetectionsApi(this.request.bind(this));
     this._credentials = new CredentialsApi(this.request.bind(this));
@@ -253,6 +267,10 @@ class ApiClient {
 
   get playbooks(): PlaybooksApi {
     return this._playbooks;
+  }
+
+  get observability(): ObservabilityApi {
+    return this._observability;
   }
 
   private getAccessToken(): string | null {
@@ -400,6 +418,24 @@ class ApiClient {
   // On-demand field values (Kibana-style)
   async getSearchFieldValues(request: import('./types').FieldValuesRequest): Promise<import('./types').FieldValuesResponse> {
     return this._search.getSearchFieldValues(request);
+  }
+
+  // OpenTelemetry observability (NAN-1528)
+  async getTrace(traceId: string): Promise<import('./types').TraceResponse> {
+    return this._search.getTrace(traceId);
+  }
+
+  async queryMetrics(request: import('./types').MetricsQueryRequest): Promise<import('./types').MetricsQueryResponse> {
+    return this._search.queryMetrics(request);
+  }
+
+  // Observability explorers (NAN-1534)
+  async listTraces(request: import('./types').ListTracesRequest): Promise<import('./types').ListTracesResponse> {
+    return this._search.listTraces(request);
+  }
+
+  async listMetricNames(service?: string): Promise<import('./types').MetricNamesResponse> {
+    return this._search.listMetricNames(service);
   }
 
   // Saved searches
@@ -659,12 +695,12 @@ class ApiClient {
     return this._detections.getAlert(id);
   }
 
-  async getAlertCounts(): Promise<import('./types').AlertCounts> {
-    return this._detections.getAlertCounts();
+  async getAlertCounts(kinds?: string[]): Promise<import('./types').AlertCounts> {
+    return this._detections.getAlertCounts(kinds);
   }
 
-  async getAlertVelocity(hours?: number): Promise<import('./types').AlertVelocityBucket[]> {
-    return this._detections.getAlertVelocity(hours);
+  async getAlertVelocity(hours?: number, kinds?: string[]): Promise<import('./types').AlertVelocityBucket[]> {
+    return this._detections.getAlertVelocity(hours, kinds);
   }
 
   async acknowledgeAlert(id: string): Promise<import('./types').Alert> {

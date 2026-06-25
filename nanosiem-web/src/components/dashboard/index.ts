@@ -22,6 +22,18 @@ export { DashboardShareDialog } from './DashboardShareDialog';
 export { PanelEditor, type PanelEditorProps } from './PanelEditor';
 export { QueryTestModal } from './QueryTestModal';
 export { AddToDashboardDialog, type AddToDashboardDialogProps } from './AddToDashboardDialog';
+// NAN-1540: obs_metric widget renderer + metrics-explorer "add to dashboard" helpers.
+export {
+  ObsMetricWidget,
+  type ObsMetricWidgetProps,
+  rowsToMetricSeries,
+  metricSeriesToRows,
+} from './ObsMetricWidget';
+export {
+  buildMetricPanelConfig,
+  addMetricToDashboard,
+  type AddMetricToDashboardArgs,
+} from './metric-widget';
 export { VariableControls, type VariableControlsProps } from './VariableControls';
 export { VariableEditor, type VariableEditorProps } from './VariableEditor';
 

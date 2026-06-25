@@ -2388,6 +2388,43 @@ pub fn create_router(state: AppState) -> Router {
             "/api/siem-health/findings/suppressions/{id}",
             axum::routing::delete(handlers::siem_health_suppressions::deactivate_suppression),
         )
+        // Observability console SLOs (NAN-1536) — PG-backed definitions,
+        // attainment computed on read from otel_spans.
+        .route(
+            "/api/observability/slos",
+            get(handlers::observability_slos::list_slos)
+                .post(handlers::observability_slos::create_slo),
+        )
+        .route(
+            "/api/observability/slos/{id}",
+            put(handlers::observability_slos::update_slo)
+                .delete(handlers::observability_slos::delete_slo),
+        )
+        // Observability console synthetic checks (NAN-1538) — PG-backed
+        // definitions; live uptime/latency/history computed on read from the
+        // ClickHouse synthetic_check_results table the jobs runner writes.
+        .route(
+            "/api/observability/synthetics",
+            get(handlers::observability_synthetics::list_synthetics)
+                .post(handlers::observability_synthetics::create_synthetic),
+        )
+        .route(
+            "/api/observability/synthetics/{id}",
+            put(handlers::observability_synthetics::update_synthetic)
+                .delete(handlers::observability_synthetics::delete_synthetic),
+        )
+        // Observability metric monitors (NAN-1540) — PG-backed definitions;
+        // the jobs runner evaluates due monitors and raises alerts on breach.
+        .route(
+            "/api/observability/metric-monitors",
+            get(handlers::observability_metric_monitors::list_metric_monitors)
+                .post(handlers::observability_metric_monitors::create_metric_monitor),
+        )
+        .route(
+            "/api/observability/metric-monitors/{id}",
+            put(handlers::observability_metric_monitors::update_metric_monitor)
+                .delete(handlers::observability_metric_monitors::delete_metric_monitor),
+        )
         // Tuning endpoints
         .route(
             "/api/tuning/baselines/{rule_id}",
@@ -2451,6 +2488,17 @@ pub fn create_router(state: AppState) -> Router {
         .merge(cached_mitre)
         // OpenAPI / Swagger UI
         .merge(openapi::swagger_ui());
+    // Observability ↔ Security convergence cross-link (NAN-1542) — ENTERPRISE
+    // only (NAN-1544). The service-detail "which detections fired against this
+    // service's hosts/IPs?" strip. Open builds omit the route (404) and the FE
+    // hides the strip via the `observabilityConvergence` capability flag.
+    #[cfg(feature = "enterprise")]
+    {
+        app = app.route(
+            "/api/observability/services/{service}/security-signals",
+            get(handlers::observability_service_signals::get_service_security_signals),
+        );
+    }
     // Demo routes (only on DEPLOYMENT_MODE=demo deployments)
     if let Some(demo) = demo_routes {
         app = app.merge(demo);

@@ -300,6 +300,7 @@ export function RuleEditorRedesign() {
           severity,
           mode: 'staging',
           detection_mode: duplicateRule.detection_mode === 'scheduled' ? 'scheduled' : 'realtime',
+          dataset: duplicateRule.dataset || 'logs',
           schedule: duplicateRule.schedule_cron || '',
           lookback,
           // Carry the source rule's folder into the duplicate so the new rule
@@ -340,6 +341,7 @@ export function RuleEditorRedesign() {
           severity,
           mode: apiRule.mode,
           detection_mode: apiRule.detection_mode === 'scheduled' ? 'scheduled' : 'realtime',
+          dataset: apiRule.dataset || 'logs',
           schedule: apiRule.schedule_cron || '',
           lookback,
           // NAN-729: round-trip folder through the YAML body so the meta-row
@@ -509,6 +511,10 @@ export function RuleEditorRedesign() {
       detection_mode: detectionMode as 'scheduled' | 'real-time',
       schedule_cron: schedule || undefined,
       lookback_minutes: lookbackMinutes || undefined,
+      // NAN-1561: only send a dataset when it's a non-logs OTLP dataset; logs
+      // rules stay byte-identical (server treats undefined/'logs' the same).
+      dataset:
+        metadata.dataset && metadata.dataset !== 'logs' ? metadata.dataset : undefined,
       narrative: metadata.narrative || undefined,
       author: metadata.author || undefined,
       tags,

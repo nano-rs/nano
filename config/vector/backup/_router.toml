@@ -1,0 +1,44 @@
+# Auto-generated dynamic router for deployed parsers
+# DO NOT EDIT - changes will be overwritten by parser deployment
+# Generated at: 2026-06-14T20:28:39.893706+00:00
+
+# =============================================================================
+# Dynamic Source Type Router
+# =============================================================================
+# Accepts input from HTTP pipeline, Vector native protocol, and source configurations.
+[transforms.source_router]
+type = "route"
+inputs = ["vector_merge", "http_ingestion_route", "nan884_smoke_sasl_plaintext_route", "splunk_hec_route"]
+
+[transforms.source_router.route]
+apache_http_server__ocsf_ = 'includes(["apache", "apache_access"], .source_type)'
+aws_cloudtrail__ocsf_ = 'includes(["aws_cloudtrail", "cloudtrail"], .source_type)'
+conduit_mitm_proxy__ocsf_ = 'includes(["conduit", "conduit_proxy", "conduit-proxy"], .source_type)'
+microsoft_sysmon__json__ocsf_ = 'includes(["sysmon", "windows_sysmon", "sysmon_json"], .source_type)'
+windows_event_log__ocsf_ = 'includes(["windows_event", "winlogbeat", "windows", "win_event", "winevent"], .source_type)'
+generic = '!includes(["apache", "apache_access", "aws_cloudtrail", "cloudtrail", "conduit", "conduit_proxy", "conduit-proxy", "sysmon", "windows_sysmon", "sysmon_json", "windows_event", "winlogbeat", "windows", "win_event", "winevent"], .source_type) && !starts_with(downcase(to_string(.source_type) ?? ""), "nano_enrich")'
+
+# =============================================================================
+# NAN-1124/NAN-1151: Enrichment lane router (nano_enrich -> per-source outputs)
+# =============================================================================
+[transforms.enrichment_router]
+type = "route"
+inputs = ["vector_merge", "http_ingestion_route", "nan884_smoke_sasl_plaintext_route", "splunk_hec_route"]
+
+[transforms.enrichment_router.route]
+identity = 'downcase(to_string(.source_type) ?? "") == "nano_enrich" && downcase(to_string(.kind) ?? "") == "identity"'
+ip_context = 'downcase(to_string(.source_type) ?? "") == "nano_enrich" && downcase(to_string(.kind) ?? "") == "ip_context"'
+ioc = 'downcase(to_string(.source_type) ?? "") == "nano_enrich" && downcase(to_string(.kind) ?? "") == "ioc"'
+asset = 'downcase(to_string(.source_type) ?? "") == "nano_enrich" && downcase(to_string(.kind) ?? "") == "asset"'
+
+# =============================================================================
+# Placeholder Transforms
+# =============================================================================
+
+# =============================================================================
+# Placeholder Combiner
+# =============================================================================
+[transforms.placeholder_combiner]
+type = "filter"
+inputs = ["source_router.generic"]
+condition = "false"

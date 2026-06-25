@@ -405,6 +405,8 @@ mod tests {
             AggFunc::Percentile(90),
             AggFunc::Mode,
             AggFunc::Sparkline,
+            AggFunc::Rate,
+            AggFunc::HistogramQuantile(95),
         ];
         // Exhaustiveness guard: a new AggFunc variant fails compilation here
         // until it's added to `all_funcs` above (and a naming decision made).
@@ -430,7 +432,9 @@ mod tests {
                 | AggFunc::Perc95
                 | AggFunc::Percentile(_)
                 | AggFunc::Mode
-                | AggFunc::Sparkline => {}
+                | AggFunc::Sparkline
+                | AggFunc::Rate
+                | AggFunc::HistogramQuantile(_) => {}
             }
         }
 

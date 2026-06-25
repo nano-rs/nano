@@ -43,7 +43,7 @@ pub fn base_router_inputs(
     hec_normalize_covered: bool,
     hec_normalize_present: bool,
 ) -> Vec<&'static str> {
-    let mut inputs = Vec::with_capacity(3);
+    let mut inputs = Vec::with_capacity(4);
     if !source_type_extract_covered {
         inputs.push("source_type_extract");
     }
@@ -51,7 +51,31 @@ pub fn base_router_inputs(
     if hec_normalize_present && !hec_normalize_covered {
         inputs.push("hec_normalize");
     }
+    // NAN-1528: OTLP LogRecords ride the existing UDM/OCSF logs lane. The OTLP
+    // source's `otlp_logs_prep` transform (config/vector/03-otlp-source.toml)
+    // tags `source_type="otlp_log"` and feeds straight into `source_router`,
+    // where a deployed parser's `match_values` claims them like any other
+    // source_type. Gated on presence (same dangling-input class as
+    // `hec_normalize_present`, NAN-867) so deployments without the OTLP source
+    // file don't reference a non-existent component and crashloop Vector 0.55.
+    if otlp_source_present() {
+        inputs.push("otlp_logs_prep");
+    }
     inputs
+}
+
+/// Whether the deployment's base Vector config defines the OTLP source's
+/// `[transforms.otlp_logs_prep]` (i.e. `config/vector/03-otlp-source.toml` is
+/// shipped). NAN-1528.
+///
+/// Reads `NANOSIEM_VECTOR_OTLP_PRESENT`. Defaults to `true` for OOTB open-core
+/// deployments (which ship `03-otlp-source.toml`). Deploys that don't mount the
+/// OTLP source set this to `"false"` so the router never wires a dangling
+/// `otlp_logs_prep` input.
+pub fn otlp_source_present() -> bool {
+    std::env::var("NANOSIEM_VECTOR_OTLP_PRESENT")
+        .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "false" | "0" | "no" | "off"))
+        .unwrap_or(true)
 }
 
 /// Whether the deployment's base Vector config defines `[transforms.hec_normalize]`.
@@ -166,6 +190,14 @@ pub(super) fn parser_claimed_route(parser: &Parser) -> Option<&str> {
     match parser.source_type.as_str() {
         // HEC parsers always read from the OOTB/source-config splunk_hec_route.
         "splunk_hec" | "splunk" | "hec" => Some("splunk_hec_route"),
+        // NAN-1528: OTLP log parsers fan out from the OOTB `otlp_logs_prep`
+        // output (config/vector/03-otlp-source.toml). Since `otlp_logs_prep`
+        // also feeds `source_router` directly as a base input
+        // (base_router_inputs), claiming it here triggers the same
+        // `<route>_unclaimed` substitution as HEC so an otlp_log event reaching
+        // a parser filter does NOT also fall through to `source_router.generic`
+        // and double-write (the NAN-930 class).
+        "opentelemetry" | "otlp" => Some("otlp_logs_prep"),
         // Kafka/S3/GCP parsers only claim a route when bound to a source-config
         // via the DISPATCH FROM picker (NAN-928); otherwise they spin their own
         // owned source and don't intersect with source_router.

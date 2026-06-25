@@ -174,6 +174,11 @@ pub enum SearchExpr {
         field: String,
         subsearch: Box<Query>,
         negated: bool,
+        /// Cross-dataset correlation (NAN-1562): the dataset the subsearch runs
+        /// against, parsed from a leading `dataset=<logs|spans|metrics>` token
+        /// inside the `[ ]` brackets. `None` means the subsearch inherits the
+        /// outer query's dataset (the pre-existing, byte-identical behavior).
+        subsearch_dataset: Option<crate::query::clickhouse_sql_gen::otel::Dataset>,
     },
 }
 

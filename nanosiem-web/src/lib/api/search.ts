@@ -45,6 +45,15 @@ import type {
   AsyncSearchResponse,
   SearchJobStatus,
   SearchStreamCallbacks,
+  TraceResponse,
+  MetricsQueryRequest,
+  MetricsQueryResponse,
+  MetricTimeseriesV2Request,
+  MetricTimeseriesV2Response,
+  MetricTagsResponse,
+  ListTracesRequest,
+  ListTracesResponse,
+  MetricNamesResponse,
 } from './types';
 
 export class SearchApi {
@@ -174,6 +183,87 @@ export class SearchApi {
       method: 'POST',
       body: JSON.stringify(request),
     });
+  }
+
+  // OpenTelemetry observability (NAN-1528)
+
+  /**
+   * Fetch a distributed trace by id. The backend resolves the trace's
+   * [min,max] window from otel_spans_trace_id_ts, then returns its spans
+   * ordered by start_time (ready for waterfall nesting on parent_span_id).
+   */
+  async getTrace(traceId: string): Promise<TraceResponse> {
+    // GET — the backend resolves the [min,max] window from
+    // otel_spans_trace_id_ts internally, so no request body is needed.
+    return this.request(`/api/search/trace/${encodeURIComponent(traceId)}`);
+  }
+
+  /**
+   * Query a metric timeseries (one series of aggregated points over time).
+   */
+  async queryMetrics(request: MetricsQueryRequest): Promise<MetricsQueryResponse> {
+    return this.request('/api/search/metrics/timeseries', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  /**
+   * Query a metric timeseries with aggregation / group_by / filters (NAN-1540).
+   * Hits the same POST /api/search/metrics/timeseries endpoint but returns the
+   * multi-series shape (`series[]`). Back-compatible: omit `agg`/`group_by` for a
+   * single avg series.
+   */
+  async queryMetricsV2(
+    request: MetricTimeseriesV2Request
+  ): Promise<MetricTimeseriesV2Response> {
+    return this.request('/api/search/metrics/timeseries', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
+  }
+
+  /**
+   * List distinct tag keys for a metric, or distinct values for one key
+   * (NAN-1540). GET /api/search/metrics/tags?metric_name=&key=.
+   */
+  async listMetricTags(metricName: string, key?: string): Promise<MetricTagsResponse> {
+    const params = new URLSearchParams({ metric_name: metricName });
+    if (key) params.set('key', key);
+    return this.request(`/api/search/metrics/tags?${params.toString()}`);
+  }
+
+  /**
+   * List recent distributed traces (NAN-1534). One row per trace_id aggregated
+   * from otel_spans (root service, span/error counts, root duration, start time),
+   * ordered most-recent-first. The time range + optional filters are sent as
+   * query params. Param names (start/end/service/errors_only/min_duration_ns)
+   * match the backend `ListTracesParams` (reconciled in the verify stage).
+   */
+  async listTraces(request: ListTracesRequest): Promise<ListTracesResponse> {
+    const params = new URLSearchParams();
+    params.set('start', request.time_range.start);
+    params.set('end', request.time_range.end);
+    if (request.service) params.set('service', request.service);
+    if (request.errors_only) params.set('errors_only', 'true');
+    if (request.min_duration_ns != null) {
+      params.set('min_duration_ns', String(request.min_duration_ns));
+    }
+    if (request.limit != null) params.set('limit', String(request.limit));
+    // Keyset pagination cursor (NAN-1539): the previous page's last start_time.
+    if (request.before) params.set('before', request.before);
+    return this.request(`/api/search/traces?${params.toString()}`);
+  }
+
+  /**
+   * List distinct metric names for the Metrics explorer dropdown (NAN-1534),
+   * optionally scoped to a single service.
+   */
+  async listMetricNames(service?: string): Promise<MetricNamesResponse> {
+    const params = new URLSearchParams();
+    if (service) params.set('service', service);
+    const qs = params.toString();
+    return this.request(`/api/search/metrics/names${qs ? `?${qs}` : ''}`);
   }
 
   // Saved searches

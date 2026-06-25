@@ -946,6 +946,28 @@ impl WorldState {
     pub fn get_entity(&self, hostname: &str) -> Option<&Entity> {
         self.entities.iter().find(|e| e.hostname == hostname)
     }
+
+    /// NAN-1542 convergence: pick an entity from the low-index workstation pool
+    /// that the lateral-chain ("patient zero") emitter seeds from. The chain
+    /// emitter rotates `seed_idx = seed_cursor % workstation_count`, so security
+    /// detections concentrate on these first workstations. Sourcing an OTLP
+    /// trace's `host.name` / `client.address` from the SAME pool guarantees the
+    /// service host overlaps a host with security signals — making the
+    /// service-detail security cross-link demoable instead of relying on a
+    /// 1-in-`assets` random collision.
+    ///
+    /// `n` (typically a monotonic tick counter) selects deterministically across
+    /// the pool; servers are skipped (they're poor patient-zero seeds, mirroring
+    /// the chain emitter). Returns `None` only for an empty world.
+    pub fn convergence_entity(&self, n: usize) -> Option<&Entity> {
+        if self.entities.is_empty() {
+            return None;
+        }
+        // Mirror the chain emitter's seed pool: the first `workstation_count`
+        // entities (workstations precede laptops/servers in init order).
+        let pool = self.workstation_count.max(1).min(self.entities.len());
+        self.entities.get(n % pool)
+    }
 }
 
 impl Default for WorldState {

@@ -6,8 +6,8 @@
   Delete this file or exclude from volume mount for production deployments.
 -->
 <clickhouse>
-    <!-- Cap memory at 4GB instead of 90% of system RAM -->
-    <max_server_memory_usage>4294967296</max_server_memory_usage>
+    <!-- Cap memory at 16GB (Docker VM has ~22GB; leaves room for PG/Vector/api/search) -->
+    <max_server_memory_usage>17179869184</max_server_memory_usage>
 
     <!-- Shrink caches from 28GB total to ~512MB total -->
     <mark_cache_size>134217728</mark_cache_size>                 <!-- 128MB (was 10GB) -->

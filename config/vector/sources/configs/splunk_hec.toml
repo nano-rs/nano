@@ -1,0 +1,16 @@
+# Auto-generated routing rules for system-level source: Splunk HEC
+# DO NOT EDIT - changes will be overwritten
+# Generated at: 2026-06-07T12:40:52.463372+00:00
+
+[transforms.splunk_hec_route]
+inputs = ["hec_normalize"]
+source = """
+# Apply routing rules to set source_type
+if .source_type == "windows_sysmon" {
+    .source_type = "windows_sysmon"
+} else if .source_type == "windows_event" {
+    .source_type = "windows_event"
+}
+# else: passthrough — keep existing .source_type
+"""
+type = "remap"

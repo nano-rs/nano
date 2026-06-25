@@ -1,0 +1,193 @@
+# OpenTelemetry (OTLP) Source — NAN-1528
+# =============================================================================
+# Receives OTLP over gRPC (:4317) and HTTP (:4318) — the two standard OTLP
+# ports. Vector's `opentelemetry` source decodes the protobuf/JSON payloads and
+# fans them out onto three named outputs: `.logs`, `.traces`, `.metrics`.
+#
+# Architecture (mirrors the OCSF Null-table + MV pattern):
+#   * Traces  -> wrapped as { event, timestamp, source_type="otlp_trace" } and
+#                written to `otel_spans_raw` (ENGINE=Null). A ClickHouse
+#                MATERIALIZED VIEW (clickhouse/138_otel_spans.sql) does the
+#                OTLP->column mapping ONCE, in SQL, into `otel_spans`.
+#   * Metrics -> wrapped the same way into `otel_metrics_raw` (ENGINE=Null);
+#                its MV (clickhouse/140_otel_metrics.sql) derives `otel_metrics`.
+#   * Logs    -> OTLP LogRecords are still logs, so they ride the existing
+#                UDM/OCSF logs lane: tagged `source_type="otlp_log"` and fed
+#                into `source_router` (see router.rs base inputs), where a
+#                deployed parser's `match_values` claims them like any other
+#                source_type. We add trace_id/span_id for correlation.
+#
+# ONE row == ONE record (one span / one log record / one metric data point).
+# The raw table is the ONLY contract: a direct producer (Tenzir/Cribl/native
+# OTLP collector exporter) that POSTs the identical
+# { event: <OTLP JSON for one record>, timestamp, source_type } shape to the
+# `otel_spans_raw` / `otel_metrics_raw` tables reuses this exact lane — no
+# Vector required. The MV mapping is shared by both paths.
+#
+# Auth: the OTLP source has no shared-token gate here (OTLP exporters generally
+# terminate auth at the collector / LB tier, like the Vector-native :6000 and
+# HEC :8088 sources). Front it with the LB/mTLS in untrusted networks.
+# =============================================================================
+
+[sources.otlp_ingest]
+type = "opentelemetry"
+
+[sources.otlp_ingest.grpc]
+address = "0.0.0.0:4317"
+
+[sources.otlp_ingest.http]
+address = "0.0.0.0:4318"
+
+# =============================================================================
+# Traces -> spans raw table
+# Near-passthrough: wrap the decoded span record as the raw-table row shape.
+# `encode_json(.)` preserves the FULL OTLP span (attributes, events, status,
+# resource) losslessly — the MV extracts promoted columns but the raw map is
+# never discarded.
+# =============================================================================
+[transforms.otlp_traces_prep]
+type = "remap"
+inputs = ["otlp_ingest.traces"]
+source = '''
+ts = .timestamp
+if ts == null { ts = .start_timestamp }
+if ts == null { ts = now() }
+. = {
+    "event": encode_json(.),
+    "timestamp": ts,
+    "source_type": "otlp_trace"
+}
+'''
+
+# =============================================================================
+# Metrics -> metrics raw table
+# One data point per row. Vector's opentelemetry source already flattens
+# multi-datapoint metrics into individual metric events, so each event maps to
+# exactly one `otel_metrics` row.
+# =============================================================================
+[transforms.otlp_metrics_prep]
+type = "remap"
+inputs = ["otlp_ingest.metrics"]
+source = '''
+ts = .timestamp
+if ts == null { ts = now() }
+. = {
+    "event": encode_json(.),
+    "timestamp": ts,
+    "source_type": "otlp_metric"
+}
+'''
+
+# =============================================================================
+# Logs -> existing UDM/OCSF logs lane
+# OTLP LogRecords are normalized like any other log: tag the source_type so a
+# deployed parser's match_values can claim them, lift the body into `.message`,
+# and surface trace_id/span_id at top level for the logs-table correlation
+# columns (clickhouse/141_logs_otel_correlation.sql). This transform is wired
+# into `source_router` as an always-on base input (see
+# nanosiem-core/src/parsers/vector_config/router.rs::base_router_inputs).
+# =============================================================================
+[transforms.otlp_logs_prep]
+type = "remap"
+inputs = ["otlp_ingest.logs"]
+source = '''
+.source_type = "otlp_log"
+.auth_status = "authenticated"
+.content_format = "otlp"
+.routing_timestamp = now()
+
+# Vector decodes the OTLP LogRecord body into `.message`; keep whatever is there
+# and fall back to a JSON encode of the record so nothing is lost.
+if !exists(.message) || !is_string(.message) {
+    .message = encode_json(.)
+}
+
+# Correlation ids — OTLP carries them as `.trace_id` / `.span_id`. Downcase to
+# match the lower(col) convention the logs table compares on.
+.trace_id = downcase(to_string(.trace_id) ?? "")
+.span_id = downcase(to_string(.span_id) ?? "")
+
+if !is_object(.metadata) {
+    .metadata = {}
+}
+.metadata.forwarded_via = "otlp"
+'''
+
+# =============================================================================
+# ClickHouse Sink — spans raw (ENGINE=Null; MV derives otel_spans)
+# COPIED from the `clickhouse_logs` sink (sources/parsers/_pipeline.toml):
+# basic auth, gzip, memory buffer (drop_newest), batch, adaptive concurrency,
+# acknowledgements off. Table is env-overridable.
+# =============================================================================
+[sinks.clickhouse_otel_spans]
+type = "clickhouse"
+inputs = ["otlp_traces_prep"]
+
+endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
+database = "${CLICKHOUSE_DATABASE:-nanosiem}"
+table = "${CLICKHOUSE_OTEL_SPANS_TABLE:-otel_spans_raw}"
+
+auth.strategy = "basic"
+auth.user = "${CLICKHOUSE_USER:-nanosiem}"
+auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
+
+compression = "gzip"
+date_time_best_effort = true
+skip_unknown_fields = true
+
+[sinks.clickhouse_otel_spans.buffer]
+type = "memory"
+max_events = 100000
+when_full = "drop_newest"
+
+[sinks.clickhouse_otel_spans.acknowledgements]
+enabled = false
+
+[sinks.clickhouse_otel_spans.batch]
+max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}
+max_events = ${VECTOR_BATCH_MAX_EVENTS:-50000}
+timeout_secs = ${VECTOR_BATCH_TIMEOUT_SECS:-10}
+
+[sinks.clickhouse_otel_spans.request]
+concurrency = "adaptive"
+timeout_secs = 120
+retry_initial_backoff_secs = 1
+retry_max_duration_secs = 300
+
+# =============================================================================
+# ClickHouse Sink — metrics raw (ENGINE=Null; MV derives otel_metrics)
+# =============================================================================
+[sinks.clickhouse_otel_metrics]
+type = "clickhouse"
+inputs = ["otlp_metrics_prep"]
+
+endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
+database = "${CLICKHOUSE_DATABASE:-nanosiem}"
+table = "${CLICKHOUSE_OTEL_METRICS_TABLE:-otel_metrics_raw}"
+
+auth.strategy = "basic"
+auth.user = "${CLICKHOUSE_USER:-nanosiem}"
+auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
+
+compression = "gzip"
+date_time_best_effort = true
+skip_unknown_fields = true
+
+[sinks.clickhouse_otel_metrics.buffer]
+type = "memory"
+max_events = 100000
+when_full = "drop_newest"
+
+[sinks.clickhouse_otel_metrics.acknowledgements]
+enabled = false
+
+[sinks.clickhouse_otel_metrics.batch]
+max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}
+max_events = ${VECTOR_BATCH_MAX_EVENTS:-50000}
+timeout_secs = ${VECTOR_BATCH_TIMEOUT_SECS:-10}
+
+[sinks.clickhouse_otel_metrics.request]
+concurrency = "adaptive"
+timeout_secs = 120
+retry_initial_backoff_secs = 1
+retry_max_duration_secs = 300

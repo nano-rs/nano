@@ -538,7 +538,11 @@ impl AppState {
             // mode), through the same tenant-aware registry SearchService uses.
             let key = match profile.id() {
                 nanosiem_core::schema::SchemaId::Ocsf => "ocsf_logs",
-                nanosiem_core::schema::SchemaId::Udm => "logs",
+                // Spans are a per-query dataset, never the tenant log schema
+                // (NAN-1555); UDM default keeps this unreachable arm total.
+                nanosiem_core::schema::SchemaId::Udm
+                | nanosiem_core::schema::SchemaId::Spans
+                | nanosiem_core::schema::SchemaId::Metrics => "logs",
             };
             let local_table = dual_pool.table_names().local(key);
             match nanosiem_core::schema::validate_active_schema_table(

@@ -556,6 +556,33 @@ pub fn create_router(
             post(handlers::field_stats_for_query),
         )
         .route("/api/search/field-values", post(handlers::field_values))
+        // OpenTelemetry observability (NAN-1528): trace waterfall + metric series
+        .route("/api/search/trace/{trace_id}", get(handlers::get_trace))
+        .route(
+            "/api/search/metrics/timeseries",
+            post(handlers::get_metric_timeseries),
+        )
+        // OTLP explorers (NAN-1534): recent-traces list + metric-names dropdown
+        .route("/api/search/traces", get(handlers::list_traces))
+        .route(
+            "/api/search/metrics/names",
+            get(handlers::list_metric_names),
+        )
+        // Metrics v2 (NAN-1540): tag-key / tag-value enumeration for the
+        // group-by / filter pickers.
+        .route(
+            "/api/search/metrics/tags",
+            get(handlers::list_metric_tags),
+        )
+        // Observability console (NAN-1536): services overview + service detail
+        .route("/api/search/services", get(handlers::list_services))
+        .route(
+            "/api/search/services/{service}",
+            get(handlers::get_service_detail),
+        )
+        // Observability console (NAN-1537): infra hosts overview + RUM summary
+        .route("/api/search/infra/hosts", get(handlers::list_infra_hosts))
+        .route("/api/search/rum", get(handlers::get_rum_summary))
         // Asset events pagination
         .route("/api/search/asset-events", post(handlers::get_asset_events))
         // Cloud events pagination

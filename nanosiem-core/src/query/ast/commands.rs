@@ -206,8 +206,9 @@ pub enum Command {
         maxout: Option<usize>,
     },
     /// join command: combine results from main search with subsearch
-    /// Syntax: join [type=inner|left|outer] field1, field2 [max=N] [maxout=N] [subsearch]
+    /// Syntax: join [type=inner|left|outer] field1, field2 [max=N] [maxout=N] [[dataset=spans] subsearch]
     /// Example: ... | join type=left user [search index=users | fields user, dept]
+    /// Cross-dataset example: spans … | join trace_id [dataset=logs search status=500]
     Join {
         /// Type of join to perform
         join_type: JoinType,
@@ -221,6 +222,11 @@ pub enum Command {
         overwrite: bool,
         /// Maximum total rows the subsearch returns (default: 10,000)
         maxout: Option<usize>,
+        /// Cross-dataset correlation (NAN-1562): the dataset the subsearch runs
+        /// against, parsed from a leading `dataset=<logs|spans|metrics>` token
+        /// inside the `[ ]` brackets. `None` means the subsearch inherits the
+        /// outer query's dataset (the pre-existing, byte-identical behavior).
+        subsearch_dataset: Option<crate::query::clickhouse_sql_gen::otel::Dataset>,
     },
     /// format command: format results into a single string
     /// Syntax: format [maxresults=N]
@@ -438,6 +444,38 @@ pub enum Command {
     Output {
         /// Destination name for the output
         destination: String,
+    },
+    /// services command (bare): observability services overview page.
+    /// Short-circuits to the curated /api/search/services surface — no log scan.
+    /// Syntax: | services
+    Services,
+    /// service command: single-service detail page (RED metrics, endpoints).
+    /// Short-circuits to /api/search/services/{service} — no log scan.
+    /// Syntax: | service <name>
+    Service {
+        /// Service name to drill into (e.g. "checkout-api")
+        name: String,
+    },
+    /// trace command: distributed-trace waterfall page.
+    /// Short-circuits to /api/search/trace/{id} — no log scan.
+    /// Syntax: | trace <trace_id>
+    Trace {
+        /// Trace id (hex). Lowercased/escaped downstream by the trace fetch.
+        trace_id: String,
+    },
+    /// metric command: metric time-series page.
+    /// Short-circuits to /api/search/metrics/timeseries — no log scan.
+    /// Syntax: | metric <metric_name> [service=<service_name>]
+    /// Service-scoping (`service=<name>`) is carried on the marker and seeds
+    /// MetricsExplorer's `service_name` query param (the promoted `otel_metrics`
+    /// column — NOT a tag/attribute filter), so the chart opens genuinely scoped
+    /// (NAN-1564, fixing the silent-drop concern from NAN-1560).
+    Metric {
+        /// Metric name (e.g. "http.server.duration")
+        name: String,
+        /// Optional `otel_metrics.service_name` scope (`service=<name>`). `None`
+        /// ⇒ unscoped (all services).
+        service: Option<String>,
     },
 }
 

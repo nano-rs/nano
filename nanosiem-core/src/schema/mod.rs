@@ -14,14 +14,20 @@
 //! `OCSF_SCHEMA_SUPPORT_SCOPING.md` §2.2.
 
 mod boot_validation;
+mod metrics;
 mod ocsf;
 mod profile;
+mod spans;
 mod types;
 mod udm;
 
 pub use boot_validation::{validate_active_schema_table, SchemaValidationError};
+pub use metrics::MetricsProfile;
+pub(crate) use metrics::canonicalize_metric_field;
 pub use ocsf::{OcsfProfile, OCSF_BOOKKEEPING_COLUMNS};
 pub use profile::SchemaProfile;
+pub use spans::SpansProfile;
+pub(crate) use spans::canonicalize_span_field;
 pub use types::{
     EnrichmentKind, EnrichmentMode, EntityRole, EntityType, EnumIntMapping, FieldCategory,
     FieldDef, FieldResolution, FieldType, SchemaId,
@@ -43,6 +49,10 @@ pub fn profile_for_id(id: SchemaId) -> Arc<dyn SchemaProfile> {
     match id {
         SchemaId::Udm => Arc::new(UdmProfile::new()),
         SchemaId::Ocsf => Arc::new(OcsfProfile::new()),
+        // NAN-1555: per-QUERY dataset profiles, injected by the SQL generator's
+        // `with_dataset(...)` — never selected as a tenant log schema.
+        SchemaId::Spans => Arc::new(SpansProfile::new()),
+        SchemaId::Metrics => Arc::new(MetricsProfile::new()),
     }
 }
 
@@ -79,6 +89,11 @@ pub fn logs_table_for(id: SchemaId) -> &'static str {
     match id {
         SchemaId::Ocsf => "ocsf_logs",
         SchemaId::Udm => "logs",
+        // NAN-1555: spans/metrics are per-query datasets, never the tenant log
+        // table; these arms are unreachable in practice (no
+        // `NANO_SCHEMA_PROFILE=spans|metrics`) but keep the dispatch total.
+        SchemaId::Spans => "otel_spans",
+        SchemaId::Metrics => "otel_metrics",
     }
 }
 
@@ -91,6 +106,10 @@ pub fn ingest_table_for(id: SchemaId) -> &'static str {
     match id {
         SchemaId::Ocsf => "ocsf_logs_raw",
         SchemaId::Udm => "logs",
+        // NAN-1555: unreachable as a tenant schema; spans/metrics ingest via their
+        // own `otel_*_raw` Null+MV lanes (migrations 138/140), kept for totality.
+        SchemaId::Spans => "otel_spans_raw",
+        SchemaId::Metrics => "otel_metrics_raw",
     }
 }
 
@@ -111,7 +130,8 @@ pub fn active_ingest_table() -> &'static str {
 /// `active_repo_path` is the env-resolving wrapper. NAN-1266.
 pub fn repo_path_for(id: SchemaId, stored: &str) -> String {
     match id {
-        SchemaId::Udm => stored.to_string(),
+        // NAN-1555: spans/metrics have no parser/rule repo tree; passthrough like UDM.
+        SchemaId::Udm | SchemaId::Spans | SchemaId::Metrics => stored.to_string(),
         SchemaId::Ocsf => {
             let base = stored.trim_end_matches('/');
             if base.ends_with("-ocsf") {
@@ -146,7 +166,8 @@ pub fn active_repo_path(stored: &str) -> String {
 /// NAN-1387.
 pub fn selected_repo_path_for(id: SchemaId, stored_base: &str, selected: &str) -> String {
     match id {
-        SchemaId::Udm => selected.to_string(),
+        // NAN-1555: spans/metrics have no repo tree; passthrough like UDM.
+        SchemaId::Udm | SchemaId::Spans | SchemaId::Metrics => selected.to_string(),
         SchemaId::Ocsf => {
             let base = stored_base.trim_start_matches('/').trim_end_matches('/');
             let sel = selected.trim_start_matches('/').trim_end_matches('/');

@@ -33,6 +33,25 @@ impl DetectionService {
             self.validate_cron(cron)?;
         }
 
+        // NAN-1561: spans/metrics rules are scheduled-only. `create_rule` is the
+        // un-moded create path used by rule import (and other non-MV callers), so
+        // it must enforce the same real-time/dataset guard as `create_rule_with_mode`
+        // — otherwise `/api/rules/import` could persist a non-logs real-time rule
+        // that never gets a materialized view and never runs scheduled.
+        {
+            use crate::models::detection_rule::DetectionMode;
+            let effective_mode = rule.detection_mode.unwrap_or(DetectionMode::Scheduled);
+            if effective_mode == DetectionMode::RealTime {
+                if let Some(ds) = rule.dataset.as_deref() {
+                    if crate::query::Dataset::from_selector(ds) != crate::query::Dataset::Logs {
+                        return Err(DetectionError::InvalidRealtimeRule(format!(
+                            "dataset '{ds}' is scheduled-only (spans/metrics cannot use real-time materialized views)"
+                        )));
+                    }
+                }
+            }
+        }
+
         info!(
             "Creating detection rule: {} (mode: {:?})",
             rule.name,
@@ -92,6 +111,18 @@ impl DetectionService {
         // Validate rule based on detection mode
         match detection_mode {
             DetectionMode::RealTime => {
+                // NAN-1561: spans/metrics rules are scheduled-only. The MV path
+                // reads FROM the logs table and assumes UDM/OCSF columns. Reject
+                // before persisting so the user sees the error up front (belt-and-
+                // suspenders to the generate_view_ddl guard).
+                if let Some(ds) = rule.dataset.as_deref() {
+                    if crate::query::Dataset::from_selector(ds) != crate::query::Dataset::Logs {
+                        return Err(DetectionError::InvalidRealtimeRule(format!(
+                            "dataset '{ds}' is scheduled-only (spans/metrics cannot use real-time materialized views)"
+                        )));
+                    }
+                }
+
                 // Real-time rules must be simple filters (no aggregations, no joins)
                 // risk_entity_field is optional (auto-detects or defaults to src_ip)
                 self.validate_realtime_rule(&rule)?;
@@ -285,6 +316,24 @@ impl DetectionService {
             id, old_mode, new_mode
         );
 
+        // NAN-1561: spans/metrics rules are scheduled-only. If the resulting
+        // (post-patch) rule would run real-time over a non-logs dataset, reject
+        // before any MV is created. Effective dataset = patch value, else
+        // existing value.
+        if new_mode == DetectionMode::RealTime {
+            let effective_dataset = update
+                .dataset
+                .clone()
+                .or_else(|| existing_rule.dataset.clone());
+            if let Some(ds) = effective_dataset.as_deref() {
+                if crate::query::Dataset::from_selector(ds) != crate::query::Dataset::Logs {
+                    return Err(DetectionError::InvalidRealtimeRule(format!(
+                        "dataset '{ds}' is scheduled-only (spans/metrics cannot use real-time materialized views)"
+                    )));
+                }
+            }
+        }
+
         // If detection mode is changing to real-time, validate the rule
         if new_mode == DetectionMode::RealTime && old_mode != DetectionMode::RealTime {
             // Create a temporary NewDetectionRule for validation
@@ -348,6 +397,7 @@ impl DetectionService {
                     .clone()
                     .or(Some(existing_rule.playbook_selector_mode.clone())),
                 playbook_id: update.playbook_id.or(existing_rule.playbook_id),
+                dataset: update.dataset.clone().or(existing_rule.dataset.clone()),
             };
             self.validate_realtime_rule(&validation_rule)?;
         }

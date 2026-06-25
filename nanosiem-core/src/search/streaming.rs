@@ -104,6 +104,9 @@ pub enum StreamingChunk {
 ///     `dropper_top_attrs` JSON structure. Streaming would deliver the raw
 ///     internal arrays to the frontend.
 ///   - InputLookup: `| inputlookup ...`
+///   - Command-page directives: `| service`, `| trace`, `| metric`, `| services`
+///     short-circuit to a synthetic marker row in `core_search` (NAN-1560), so
+///     they must route through the non-streaming path.
 pub fn is_query_streamable(
     _query: &crate::query::Query,
     has_lookup: bool,
@@ -115,6 +118,7 @@ pub fn is_query_streamable(
     has_ai: bool,
     has_lateral: bool,
     has_funnel: bool,
+    has_command_page: bool,
 ) -> bool {
     // Post-processing stages that require the full result set in Rust
     // (can't stream because Rust code needs to transform/enrich all rows)
@@ -127,6 +131,7 @@ pub fn is_query_streamable(
         || has_ai
         || has_lateral
         || has_funnel
+        || has_command_page
     {
         return false;
     }

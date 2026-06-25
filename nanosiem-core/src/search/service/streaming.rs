@@ -105,6 +105,16 @@ impl SearchService {
         let lateral_command = extract_lateral_command(&query);
         let funnel_command = extract_funnel_command(&query);
 
+        // Command-page directives (NAN-1560) short-circuit to a synthetic marker
+        // in core_search — force them onto the non-streaming path.
+        let is_command_page = matches!(
+            determine_display_type(&query),
+            crate::search::types::DisplayType::Services
+                | crate::search::types::DisplayType::Service
+                | crate::search::types::DisplayType::Trace
+                | crate::search::types::DisplayType::Metric
+        );
+
         let streamable = is_query_streamable(
             &query,
             !lookup_commands.is_empty(),
@@ -116,6 +126,7 @@ impl SearchService {
             ai_command.is_some(),
             lateral_command.is_some(),
             funnel_command.is_some(),
+            is_command_page,
         );
 
         let display_type = determine_display_type(&query);
@@ -294,6 +305,24 @@ impl SearchService {
         let full_time_range =
             crate::query::TimeRange::new(adjusted_time_range.start, adjusted_time_range.end);
 
+        // NAN-1555: thread the observability dataset (logs|spans|metrics) into the
+        // streaming generator. The table-view FIRST PAGE streams, so without this
+        // the `dataset` selector was silently ignored on the streaming path (only
+        // the non-streaming `core_search` path threaded it) — a `dataset=spans`
+        // search ran against `logs` and returned 0. `Dataset::Logs` is left
+        // untouched (byte-identical). Streamed queries are non-aggregate, so the
+        // metrics rollup routing (aggregate-only) does not apply here.
+        let stream_gen = {
+            let dataset = crate::query::Dataset::from_selector(
+                request.dataset.as_deref().unwrap_or("logs"),
+            );
+            if dataset == crate::query::Dataset::Logs {
+                self.ch_sql_generator.clone()
+            } else {
+                self.ch_sql_generator.clone().with_dataset(dataset)
+            }
+        };
+
         // For non-aggregate queries, run a count query in parallel so metadata
         // reports the real total. For aggregation, the total is the row count
         // of the streamed output (number of groups).
@@ -301,8 +330,7 @@ impl SearchService {
         // the resolved per-priority settings, so a disconnect/cancel kills them
         // along with the chunk queries and admission limits bound them.
         let count_handle = if !is_aggregation {
-            let count_sql = self
-                .ch_sql_generator
+            let count_sql = stream_gen
                 .generate_with_options(query, &full_time_range, &options)
                 .ok();
             let count_executor = ch_executor.clone();
@@ -334,9 +362,18 @@ impl SearchService {
             let histogram_query = cleaned_query.to_string();
             let histogram_time_range = adjusted_time_range.clone();
             let hist_qid = format!("{query_id}-hist");
+            // NAN-1557: the timeline reads the same dataset as the results.
+            let histogram_dataset = crate::query::Dataset::from_selector(
+                request.dataset.as_deref().unwrap_or("logs"),
+            );
             Some(tokio::spawn(async move {
                 match search_service
-                    .generate_histogram(&histogram_query, &histogram_time_range, Some(&hist_qid))
+                    .generate_histogram(
+                        &histogram_query,
+                        &histogram_time_range,
+                        Some(&hist_qid),
+                        histogram_dataset,
+                    )
                     .await
                 {
                     Ok(h) => Some(h),
@@ -373,7 +410,7 @@ impl SearchService {
 
             // Generate SQL for this chunk's time range
             let chunk_time_range = crate::query::TimeRange::new(*chunk_start, *chunk_end);
-            let chunk_sql = match self.ch_sql_generator.generate_with_options(
+            let chunk_sql = match stream_gen.generate_with_options(
                 query,
                 &chunk_time_range,
                 &options,

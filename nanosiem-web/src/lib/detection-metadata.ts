@@ -25,6 +25,10 @@ export interface DetectionMetadata {
   severity?: 'critical' | 'high' | 'medium' | 'low';
   mode?: 'staging' | 'live' | 'alerting' | 'paused';
   detection_mode?: 'realtime' | 'scheduled';
+  // NAN-1561: dataset this rule queries. 'logs' (default UDM/OCSF), 'spans', or
+  // 'metrics'. Spans/metrics are scheduled-only — the editor forces scheduled
+  // mode when this is set to a non-logs value.
+  dataset?: 'logs' | 'spans' | 'metrics';
   schedule?: string;
   lookback?: string; // e.g., "24h", "1h", "30m"
   folder?: string; // organization folder: network, identity, endpoint, cloud, stash
@@ -111,6 +115,7 @@ export function serializeDetectionMetadata(metadata: DetectionMetadata, query: s
     'severity',
     'mode',
     'detection_mode',
+    'dataset',
     'schedule',
     'lookback',
     'folder',
@@ -277,6 +282,15 @@ export function validateMetadata(metadata: DetectionMetadata): string[] {
   
   if (metadata.detection_mode === 'scheduled' && !metadata.schedule) {
     errors.push('schedule is required when detection_mode is scheduled');
+  }
+
+  // NAN-1561: dataset validation. Spans/metrics are scheduled-only.
+  if (metadata.dataset && !['logs', 'spans', 'metrics'].includes(metadata.dataset)) {
+    errors.push('dataset must be one of: logs, spans, metrics');
+  }
+
+  if (metadata.dataset && metadata.dataset !== 'logs' && metadata.detection_mode !== 'scheduled') {
+    errors.push('spans/metrics datasets require detection_mode: scheduled');
   }
 
   if (metadata.lookback) {

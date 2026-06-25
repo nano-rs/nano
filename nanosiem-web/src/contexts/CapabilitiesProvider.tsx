@@ -27,6 +27,7 @@ const FALLBACK_CAPABILITIES: CapabilitiesContextValue = {
     incidents: true,
     siemHealth: true,
     sso: true,
+    observabilityConvergence: true,
   },
 };
 

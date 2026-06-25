@@ -399,7 +399,18 @@ impl SearchService {
 
         // NAN-1354: input-side field-name validation (defense-in-depth behind
         // codegen escaping). Reject malformed / typo'd field references early.
-        validate_query_field_names(&query, self.active_profile.as_ref())?;
+        // NAN-1557: validate against the active DATASET's profile — spans/metrics
+        // carry their own field universe (`duration_ns`/`span_name`/`span_kind`/
+        // `value`/… are real columns there), so a legitimate span/metric field is
+        // not 400'd as a typo against the UDM/logs schema. Logs keep the tenant
+        // profile (unchanged).
+        // NAN-1559: this per-query profile also scopes the field-stats companion's
+        // column enumeration below — the companion wraps the DATASET's base SQL
+        // (`otel_spans`/`otel_metrics`), so it must enumerate that dataset's
+        // columns, not `self.active_profile`'s UDM/logs set (else ClickHouse 47:
+        // `Unknown expression identifier 'action'`).
+        let query_profile = self.dataset_profile(request.dataset.as_deref());
+        validate_query_field_names(&query, query_profile.as_ref())?;
 
         // NAN-806: a bare `… | stats count by x` runs aggregation over the full
         // event set but the executor's outer `LIMIT N` would trim the GROUP BY
@@ -417,6 +428,64 @@ impl SearchService {
         // Covers: eventstats/streamstats, dedup, reverse, transaction, values()/list(), high-cardinality GROUP BY
         if let Some(risk) = detect_oom_risk(&query) {
             return Err(SearchError::SqlValidationError(risk.message()));
+        }
+
+        // ── Command-page short-circuit (NAN-1560) ─────────────────────────
+        // `| service|trace|metric|services` are PAGE directives, not data
+        // transforms. The entity is carried in the AST itself, so we emit a
+        // synthetic single-row marker and let the frontend reuse the curated
+        // ServiceDetail / TraceWaterfall / MetricsExplorer / ServicesTab
+        // components. NO ClickHouse scan, NO count companion, NO histogram, NO
+        // field stats — mirrors the asset fast-path early-return below.
+        //
+        // Placement is load-bearing: this MUST sit after the OOM guard but
+        // BEFORE any extraction / limit / count fan-out, or these pages
+        // silently scan logs (the count companion is NOT display-type-gated).
+        if matches!(
+            display_type,
+            DisplayType::Services
+                | DisplayType::Service
+                | DisplayType::Trace
+                | DisplayType::Metric
+        ) {
+            let marker = match get_semantic_terminal_command(&query) {
+                Some(Command::Services) => serde_json::json!({
+                    "_display_type": "services",
+                }),
+                Some(Command::Service { name }) => serde_json::json!({
+                    "_display_type": "service",
+                    "_service": name,
+                }),
+                Some(Command::Trace { trace_id }) => serde_json::json!({
+                    "_display_type": "trace",
+                    "_trace_id": trace_id,
+                }),
+                Some(Command::Metric { name, service }) => serde_json::json!({
+                    "_display_type": "metric",
+                    "_metric": name,
+                    // Empty string ⇒ unscoped explorer (frontend treats "" as None).
+                    "_metric_service": service.clone().unwrap_or_default(),
+                }),
+                // determine_display_type guarantees one of the above; defensive.
+                _ => serde_json::json!({ "_display_type": "events" }),
+            };
+
+            let execution_time_ms = start_time.elapsed().as_millis() as u64;
+            if let Some(ref req_id) = request.request_id {
+                self.query_tracker.unregister(req_id);
+            }
+            return Ok(SearchResponse {
+                results: vec![marker],
+                total_count: 1,
+                execution_time_ms,
+                fields: Vec::new(),
+                generated_sql: None,
+                histogram: None,
+                warnings: None,
+                cost_score: None,
+                display_type: Some(display_type),
+                column_order: None,
+            });
         }
 
         // Extract lookup commands for post-processing
@@ -678,12 +747,36 @@ impl SearchService {
                 // tree / asset / prevalence queries keep their explicit caps.
                 limit: if is_raw_event_query { None } else { Some(limit) },
             };
-            // Apply current query safety limits to the SQL generator
-            let ch_gen = self
+            // Apply current query safety limits to the SQL generator.
+            let mut ch_gen = self
                 .ch_sql_generator
                 .clone()
                 .with_max_group_array_size(query_limits.max_group_array_size as usize)
                 .with_max_mvexpand_rows(query_limits.max_mvexpand_rows as usize);
+            // NAN-1534: retarget to the spans/metrics OTLP table for this request.
+            // `Dataset::Logs` is left UNTOUCHED so the generator keeps the
+            // tenant-aware logs table resolved by `with_table` (UDM `logs` /
+            // OCSF `ocsf_logs` / tenant-prefixed) — applying `with_dataset(Logs)`
+            // would clobber that back to the literal `"logs"`.
+            let dataset = crate::query::Dataset::from_selector(
+                request.dataset.as_deref().unwrap_or("logs"),
+            );
+            if dataset != crate::query::Dataset::Logs {
+                ch_gen = ch_gen.with_dataset(dataset);
+            }
+            // NAN-1555 resolution routing: a wide-window metric AGGREGATE over only
+            // the rollup's keys reads the pre-aggregated `otel_metrics_1m/_1h`
+            // (migration 144) instead of scanning raw points. Conservative — any
+            // tag/value/keyword predicate, multi-stage pipe, or narrow window keeps
+            // the query on raw `otel_metrics` (always correct). See
+            // [`metrics_routing`](super::metrics_routing).
+            if dataset == crate::query::Dataset::Metrics {
+                if let Some(grain) =
+                    super::metrics_routing::metrics_rollup_grain(&query_for_sql, &time_range)
+                {
+                    ch_gen = ch_gen.with_metrics_rollup(grain);
+                }
+            }
             ch_gen
                 .generate_with_options(&query_for_sql, &time_range, &options)
                 .map_err(|e| SearchError::SqlGenError(e.to_string()))?
@@ -711,9 +804,18 @@ impl SearchService {
             let histogram_query = cleaned_query.clone();
             let histogram_time_range = adjusted_time_range.clone();
             let hist_qid = format!("{query_id}-hist");
+            // NAN-1557: the timeline reads the same dataset as the results.
+            let histogram_dataset = crate::query::Dataset::from_selector(
+                request.dataset.as_deref().unwrap_or("logs"),
+            );
             Some(tokio::spawn(async move {
                 match search_service
-                    .generate_histogram(&histogram_query, &histogram_time_range, Some(&hist_qid))
+                    .generate_histogram(
+                        &histogram_query,
+                        &histogram_time_range,
+                        Some(&hist_qid),
+                        histogram_dataset,
+                    )
                     .await
                 {
                     Ok(h) => Some(h),
@@ -755,36 +857,31 @@ impl SearchService {
                     })?;
 
                     // Get column list dynamically (run in parallel with data query)
-                    // for the ACTIVE schema's logs table (UDM `logs` / OCSF
-                    // `ocsf_logs`), so OCSF deployments enumerate OCSF columns
-                    // rather than a hardcoded `logs` (NAN-1241). The profile's
-                    // materialized re-add list scopes the inventory to columns
-                    // that actually resolve inside the companion's CTE wrap
+                    // for the per-query DATASET's table (UDM `logs` / OCSF
+                    // `ocsf_logs` / `otel_spans` / `otel_metrics`), so OCSF
+                    // deployments enumerate OCSF columns rather than a hardcoded
+                    // `logs` (NAN-1241) and spans/metrics searches enumerate their
+                    // own columns rather than the UDM set (NAN-1559 — the companion
+                    // wraps the dataset's base SQL, so a UDM column list against an
+                    // `otel_spans` base 47'd `Unknown expression identifier`). The
+                    // profile's materialized re-add list scopes the inventory to
+                    // columns that actually resolve inside the companion's CTE wrap
                     // (NAN-1397: excludes bookkeeping like `event_bytes`).
-                    let logs_table = Self::logs_table_key(self.active_profile.as_ref());
+                    //
+                    // NAN-1559: use `logs_table_for(id)` (the physical READ table)
+                    // rather than `logs_table_key` here — the latter intentionally
+                    // collapses Spans/Metrics → "logs" because it is the generator's
+                    // `table_names` REGISTRY key (the dataset FROM is applied
+                    // separately via `with_dataset`). For `system.columns`
+                    // enumeration we need the actual local table name. Byte-identical
+                    // for UDM (`logs`) / OCSF (`ocsf_logs`).
+                    let logs_table = crate::schema::logs_table_for(query_profile.id());
                     let columns =
-                        ch_executor.get_table_columns(logs_table, self.active_profile.materialized_columns()).await.unwrap_or_else(|e| {
-                        warn!("Failed to get table columns, using defaults: {}", e);
-                        vec![
-                            "user",
-                            "src_ip",
-                            "dest_ip",
-                            "src_host",
-                            "dest_host",
-                            "action",
-                            "status",
-                            "source_type",
-                            "process_name",
-                            "file_name",
-                            "protocol",
-                            "auth_type",
-                            "auth_result",
-                            "category",
-                            "duration",
-                        ]
-                        .into_iter()
-                        .map(String::from)
-                        .collect()
+                        ch_executor.get_table_columns(logs_table, query_profile.materialized_columns()).await.unwrap_or_else(|e| {
+                        // NAN-1559: dataset-correct fallback — a UDM list here over an
+                        // `otel_spans`/`otel_metrics` base would re-trigger CH 47.
+                        warn!("Failed to get table columns, using dataset defaults: {}", e);
+                        Self::field_stats_fallback_columns(request.dataset.as_deref())
                     });
 
                     // Run data query and field stats query in parallel.

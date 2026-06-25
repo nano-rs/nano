@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import React, { useState, useCallback, useEffect, useRef } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { X, Copy, Check, ChevronLeft, ChevronRight, GripVertical, ScanEye } from 'lucide-react';
+import { X, Copy, Check, ChevronLeft, ChevronRight, GripVertical, ScanEye, GitBranch } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
@@ -125,6 +126,7 @@ export function EventInspectorPanel({
   totalCount,
   FieldValueMenu,
 }: EventInspectorPanelProps) {
+  const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState<InspectorTab>('fields');
   const [expandedValues, setExpandedValues] = useState<Set<string>>(new Set());
   const [copiedField, setCopiedField] = useState<string | null>(null);
@@ -200,6 +202,15 @@ export function EventInspectorPanel({
   const displayFields = fullLogData
     ? { ...event.fields, ...fullLogData }
     : event.fields;
+
+  // NAN-1528: OTLP log↔trace correlation. When a log row carries a non-empty
+  // trace_id (the column added to logs/ocsf_logs), surface a "View trace" pivot
+  // that opens the distributed-trace waterfall.
+  const rawTraceId = displayFields?.['trace_id'];
+  const traceId =
+    typeof rawTraceId === 'string' && rawTraceId.trim() && !isClickHouseDefault(rawTraceId, 'trace_id')
+      ? rawTraceId.trim()
+      : null;
 
   const isOcsf = schemaFields?.schema === 'ocsf';
   let flattenedFields = displayFields ? flattenEventFields(displayFields, isOcsf, '', knownSchemaFields) : [];
@@ -283,6 +294,22 @@ export function EventInspectorPanel({
   // Raw message
   const rawMessage = displayFields?.message as string | undefined;
 
+  // OTLP/structured records (spans/metrics) have no raw-text `message`. The
+  // structured record IS the raw, so build it from the row's REAL ingested
+  // fields (internal `_*`/id/timestamp excluded) and show that in the Raw tab
+  // instead of "No raw message available" (NAN-1568). Frontend-only.
+  const syntheticRaw = !rawMessage
+    ? (() => {
+        const obj: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(displayFields ?? {})) {
+          if (k.startsWith('_') || k === 'id' || k === 'timestamp') continue;
+          if (v == null || v === '') continue;
+          obj[k] = v;
+        }
+        return Object.keys(obj).length ? JSON.stringify(obj, null, 2) : null;
+      })()
+    : null;
+
   // Full JSON
   const fullJson = JSON.stringify(displayFields, null, 2);
 
@@ -332,6 +359,23 @@ export function EventInspectorPanel({
           </div>
         </div>
         <div className="flex items-center gap-0 shrink-0 text-muted-foreground">
+          {traceId && (
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    onClick={() => navigate(`/trace/${encodeURIComponent(traceId)}`)}
+                    className="h-5 px-1.5 mr-1 flex items-center gap-1 rounded-sm cursor-pointer text-primary bg-primary/10 hover:bg-primary/16 transition-colors text-[10px] font-medium"
+                  >
+                    <GitBranch className="w-3 h-3" />
+                    <span>Trace</span>
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" className="text-xs">View distributed trace</TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          )}
           <TooltipProvider>
             <Tooltip>
               <TooltipTrigger asChild>
@@ -552,8 +596,13 @@ export function EventInspectorPanel({
                 )}
               </Button>
             </div>
+            {!rawMessage && syntheticRaw && (
+              <div className="text-[10.5px] text-muted-foreground italic mb-1">
+                structured record (OTLP — no raw text)
+              </div>
+            )}
             <pre className="text-xs font-mono text-foreground whitespace-pre-wrap break-all bg-muted/30 rounded-lg p-3 border border-border/30">
-              {rawMessage || <span className="text-muted-foreground italic">No raw message available</span>}
+              {rawMessage || syntheticRaw || <span className="text-muted-foreground italic">No raw message available</span>}
             </pre>
           </div>
         )}

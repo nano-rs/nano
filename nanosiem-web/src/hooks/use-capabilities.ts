@@ -40,6 +40,13 @@ export interface Capabilities {
   siemHealth: boolean;
   /** SAML / OIDC SSO providers. Local credentials still work in open builds. */
   sso: boolean;
+  /**
+   * Observability ↔ security convergence cross-link (NAN-1544): the
+   * "Related security signals" strip on Service detail. Enterprise-only — the
+   * backing route (GET /api/observability/services/{service}/security-signals)
+   * is physically absent (404) on open builds, so the strip is hidden here too.
+   */
+  observabilityConvergence: boolean;
 }
 
 export interface CapabilitiesContextValue {

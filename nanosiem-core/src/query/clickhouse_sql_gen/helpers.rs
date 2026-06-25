@@ -164,8 +164,20 @@ pub(crate) fn field_to_sql_expr(field: &str, gen: &ClickHouseSqlGenerator) -> (S
         return (escape_identifier(field), false);
     }
 
-    // Normalize field name (apply aliases)
-    let field = normalize_field_name(field);
+    // Normalize field name (apply aliases). NAN-1555: profile-aware so spans keep
+    // `service_name` (not the UDM `cloud_service` alias); logs byte-identical.
+    let field = gen.canonicalize_field(field);
+
+    // NAN-1555: spans/metrics — a non-promoted field is an attribute `Map` lookup
+    // (`MapKey`), resolved by the profile via `field_access_expr` (the
+    // `attributes['key']` subscript), NOT the UDM `metadata`/`ext` JSON paths or a
+    // bare column reference below. UDM/OCSF never return `MapKey` → skipped. (A
+    // stats split-by on an attribute re-derives this in the GROUP BY stage, which
+    // is fine: stage_0 passes the maps through; the computed-name hazard lives in
+    // the `| where` path, guarded in `generate_where_condition`, not here.)
+    if gen.resolves_to_map_key(field) {
+        return (gen.field_access_expr(field, "String"), true);
+    }
 
     // Fields with metadata_ prefix always go to JSON
     if field.starts_with("metadata_") {
@@ -272,7 +284,13 @@ pub(crate) fn by_field_sql(field: &str, gen: &ClickHouseSqlGenerator) -> String 
     if gen.is_upstream_computed_field(field) {
         return escape_identifier(field);
     }
-    let field = normalize_field_name(field);
+    // NAN-1555: profile-aware canonicalization (spans keep `service_name`); logs
+    // byte-identical via the free alias map.
+    let field = gen.canonicalize_field(field);
+    // NAN-1555: spans attribute `Map` lookup → `field_access_expr` subscript.
+    if gen.resolves_to_map_key(field) {
+        return gen.field_access_expr(field, "String");
+    }
     if gen.resolves_to_column(field) {
         // NAN-1319: class-split UDM concepts (OCSF host/user/process/url) PARTITION
         // / GROUP / dedup on the class-spanning value, same as `field_to_sql_expr`.
@@ -308,7 +326,10 @@ pub(crate) fn by_field_output_name<'a>(field: &'a str, gen: &ClickHouseSqlGenera
     if gen.is_upstream_computed_field(field) {
         field
     } else {
-        normalize_field_name(field)
+        // NAN-1555: profile-aware so the spans output alias matches the group/sort
+        // expression (`service_name`, not the UDM `cloud_service` alias). Logs keep
+        // the exact `normalize_field_name` alias (byte-identical).
+        gen.canonicalize_field(field)
     }
 }
 
@@ -616,6 +637,28 @@ pub(crate) fn json_tail_access_sql(col: &str, path: &[String], json_type: &str) 
     }
 }
 
+/// NAN-1555: access a ClickHouse `Map(String, String)` attribute tail by LITERAL
+/// dotted key — `attributes['http.method']` — with an optional second map column
+/// tried when the key is absent in the primary (`resource_attributes` for spans).
+///
+/// Unlike [`json_tail_access_sql`] (which extracts from a JSON column and, on the
+/// UDM `Unknown` arm, sanitizes dots out of the key) this is a native `Map`
+/// subscript: the dotted OTel attribute name is preserved verbatim as the key.
+/// `map[absent]` already yields `''` for `Map(_, String)`, but the explicit
+/// `has()` guard keeps a real empty-string value and an absent key unambiguous and
+/// makes the resource fallback exact. Mirrors `otel::tag_lookup_expr` (the
+/// metrics-v2 tag resolver) so spans and metrics resolve attributes identically.
+/// `key` is escaped; `col`/`fallback` are profile-supplied literals.
+pub(crate) fn map_tail_access_sql(col: &str, fallback: Option<&str>, key: &str) -> String {
+    let k = escape_string(key);
+    match fallback {
+        Some(fb) => format!(
+            "if(has({col}, '{k}'), {col}['{k}'], if(has({fb}, '{k}'), {fb}['{k}'], ''))"
+        ),
+        None => format!("if(has({col}, '{k}'), {col}['{k}'], '')"),
+    }
+}
+
 /// NAN-1416: minimum length for an index-guard token (which must also contain
 /// at least one ASCII letter). Empirical (local CH 26.4, 2M-row `logs`,
 /// medians of 4 runs, query-condition-cache off):
@@ -692,7 +735,11 @@ pub(crate) fn longest_guard_token(needle_lower: &str) -> Option<&str> {
     }
 }
 
-/// NAN-1515: bare free-text keyword → `message` predicate.
+/// NAN-1515: bare free-text keyword → text-index predicate on `col` (the active
+/// profile's [`keyword_search_column`] — `message` for logs, `span_name` for
+/// spans, NAN-1555).
+///
+/// [`keyword_search_column`]: crate::schema::SchemaProfile::keyword_search_column
 ///
 /// Drives the `lower(message)` `text(splitByNonAlpha)` index (`idx_message_words`)
 /// via `hasAllTokens`, a **posting-list lookup**. At Saturn scale (152M rows)
@@ -731,7 +778,7 @@ pub(crate) fn longest_guard_token(needle_lower: &str) -> Option<&str> {
 /// an ASCII split would yield `caf` → false negatives). `escape_string` (not
 /// `escape_like_pattern`) is correct: `hasAllTokens` takes a literal string where
 /// `%`/`_` are ordinary characters, not LIKE metacharacters.
-pub(crate) fn bare_keyword_message_predicate(kw: &str) -> String {
+pub(crate) fn bare_keyword_predicate(kw: &str, col: &str) -> String {
     let lowered = kw.to_lowercase();
 
     // Explicit wildcards (`cmd*`, `*cmd`, `c?d`, `**`) are partial-match intent →
@@ -742,17 +789,17 @@ pub(crate) fn bare_keyword_message_predicate(kw: &str) -> String {
     // wildcard upstream; this covers single-sided forms that reach here as a bare
     // Keyword and stops `hasAllTokens` from tokenizing a `*`/`?` needle.)
     if lowered.contains('*') || lowered.contains('?') {
-        return format!("lower(message) iLike '{}'", wildcard_to_like_pattern(&lowered));
+        return format!("lower({col}) iLike '{}'", wildcard_to_like_pattern(&lowered));
     }
 
     let escaped = escape_string(&lowered);
 
     // All-separator needles (`!!!`) tokenize to nothing — keep the substring iLike.
     if lowered.chars().all(|c| c.is_ascii() && !c.is_ascii_alphanumeric()) {
-        return format!("lower(message) iLike '%{}%'", escape_like_pattern(&escaped));
+        return format!("lower({col}) iLike '%{}%'", escape_like_pattern(&escaped));
     }
 
-    format!("hasAllTokens(lower(message), '{}')", escaped)
+    format!("hasAllTokens(lower({col}), '{}')", escaped)
 }
 
 /// Add LIKE-pattern escaping on top of an already SQL-escaped string (single

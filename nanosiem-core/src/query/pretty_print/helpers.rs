@@ -2,6 +2,19 @@
 
 //! Helper functions for pretty-printing.
 
+/// Canonical `dataset=` selector string for a cross-dataset subsearch (NAN-1562).
+/// Round-trips through [`Dataset::from_selector`].
+pub(crate) fn dataset_selector_str(
+    ds: crate::query::clickhouse_sql_gen::otel::Dataset,
+) -> &'static str {
+    use crate::query::clickhouse_sql_gen::otel::Dataset;
+    match ds {
+        Dataset::Logs => "logs",
+        Dataset::Spans => "spans",
+        Dataset::Metrics => "metrics",
+    }
+}
+
 /// Format duration as a human-readable string (1h, 5m, 30s, etc.)
 pub(crate) fn format_duration(duration: std::time::Duration) -> String {
     let secs = duration.as_secs();

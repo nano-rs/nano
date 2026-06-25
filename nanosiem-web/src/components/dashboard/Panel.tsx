@@ -125,6 +125,7 @@ function getVisualizationIcon(type: VisualizationType) {
     case 'table': return <Table className={cls} />;
     case 'single_value': return <Hash className={cls} />;
     case 'timeline': return <Activity className={cls} />;
+    case 'obs_metric': return <Activity className={cls} />;
     default: return <ChartColumn className={cls} />;
   }
 }

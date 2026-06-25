@@ -63,6 +63,11 @@ const CloudOverviewView = lazy(() => import('./cloud-overview').then(m => ({ def
 const CloudPrincipalDossier = lazy(() => import('./cloud-dossier').then(m => ({ default: m.CloudPrincipalDossier })));
 const LateralView = lazy(() => import('./lateral').then(m => ({ default: m.LateralView })));
 const StatsView = lazy(() => import('./StatsView').then(m => ({ default: m.StatsView })));
+// Command-page views (NAN-1560) — reuse the curated observability surfaces.
+const ServicePageView = lazy(() => import('./service-page').then(m => ({ default: m.ServicePageView })));
+const ServicesPageView = lazy(() => import('./services-page-view').then(m => ({ default: m.ServicesPageView })));
+const TracePageView = lazy(() => import('./trace-page-view').then(m => ({ default: m.TracePageView })));
+const MetricPageView = lazy(() => import('./metric-page-view').then(m => ({ default: m.MetricPageView })));
 import {
   flattenEventFields,
   buildFieldCategories,
@@ -969,7 +974,15 @@ export function SearchResults({
     isStatsView ||
     effectiveDisplayType === 'timechart' ||
     effectiveDisplayType === 'ranked_bar' ||
-    effectiveDisplayType === 'transaction';
+    effectiveDisplayType === 'transaction' ||
+    // Command-page directives (NAN-1560) render their own curated chrome
+    // (ServiceDetail / TraceWaterfall / MetricsExplorer / ServicesTab) and
+    // carry only a synthetic marker row — suppress the outer Results header so
+    // the marker isn't offered as a junk CSV export.
+    effectiveDisplayType === 'services' ||
+    effectiveDisplayType === 'service' ||
+    effectiveDisplayType === 'trace' ||
+    effectiveDisplayType === 'metric';
 
   // ── Detail view mode (panel vs inline) ─────────────────────────────────
   const isMobile = useIsMobile();
@@ -1535,6 +1548,41 @@ export function SearchResults({
               fieldsCount={fieldsCollapsed ? fieldsCount : undefined}
               onExpandFields={onExpandFields}
             />
+          ) : effectiveDisplayType === 'services' || results[0]?.fields?._display_type === 'services' ? (
+            // Observability services overview for `| services`. Marker row carries
+            // only `_display_type`; reuse the console's ServicesTab grid/list.
+            <ServicesPageView timeRange={timeRange} />
+          ) : effectiveDisplayType === 'service' || results[0]?.fields?._display_type === 'service' ? (
+            // Service RED drill-in for `| service <name>`. Marker row carries
+            // `_service`; reuse the Observability console's ServiceDetail. The
+            // `key` remounts on a new entity so a second `| service x` (or the
+            // reused stateful child) can't render the previous entity's data.
+            <ServicePageView
+              key={`svc:${String(results[0]?.fields?._service ?? '')}`}
+              service={String(results[0]?.fields?._service ?? '')}
+              timeRange={timeRange}
+            />
+          ) : effectiveDisplayType === 'trace' || results[0]?.fields?._display_type === 'trace' ? (
+            // Distributed-trace waterfall for `| trace <id>`. Marker row carries
+            // `_trace_id`; reuse the console's TraceWaterfall (TracePageView wraps
+            // the fetch since the page-level TracePage is router-param-coupled).
+            <TracePageView
+              key={`trace:${String(results[0]?.fields?._trace_id ?? '')}`}
+              traceId={String(results[0]?.fields?._trace_id ?? '')}
+            />
+          ) : effectiveDisplayType === 'metric' || results[0]?.fields?._display_type === 'metric' ? (
+            // Metrics explorer for `| metric <name> [service=<svc>]`. Marker row
+            // carries `_metric` (may be empty ⇒ unscoped explorer) and
+            // `_metric_service` (the promoted service_name scope, NAN-1564).
+            // `key` includes both so `| metric a` → `| metric b` AND changing the
+            // service scope force a remount that re-seeds MetricsExplorer's
+            // `initialMetric` / `initialService` (they're useState inits).
+            <MetricPageView
+              key={`metric:${String(results[0]?.fields?._metric ?? '')}:${String(results[0]?.fields?._metric_service ?? '')}`}
+              metric={String(results[0]?.fields?._metric ?? '')}
+              service={String(results[0]?.fields?._metric_service ?? '')}
+              timeRange={timeRange}
+            />
           ) : isStatsView ? (
             <StatsView
               results={results}
@@ -1707,6 +1755,30 @@ function formatValue(value: unknown): string {
     return JSON.stringify(value, null, 2);
   }
   return String(value);
+}
+
+/**
+ * Build a compact JSON line from a STRUCTURED result row that has no `message`
+ * field (OTLP spans/metrics). Uses only the row's REAL ingested fields — internal
+ * `_*` markers, `id`, and `timestamp` (already shown) are excluded. Nothing is
+ * stored or fabricated; this is the same record the Fields tab lists, rendered
+ * where the raw `message` line would go so the event stream isn't blank for
+ * spans/metrics. Returns null if there's nothing to show. `pretty` produces the
+ * indented form for the inspector; the compact form is for the row line.
+ */
+function synthesizeStructuredLine(
+  fields: Record<string, unknown> | undefined,
+  pretty = false,
+): string | null {
+  if (!fields) return null;
+  const obj: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(fields)) {
+    if (k.startsWith('_') || k === 'id' || k === 'timestamp') continue;
+    if (v == null || v === '') continue;
+    obj[k] = v;
+  }
+  if (Object.keys(obj).length === 0) return null;
+  return pretty ? JSON.stringify(obj, null, 2) : JSON.stringify(obj);
 }
 
 function RawView({
@@ -2013,8 +2085,13 @@ function RawView({
                 {/* Event body below */}
                 {(() => {
                   const messageValue = displayFields?.message;
-                  if (!messageValue) return null;
-                  const displayValue = formatValue(messageValue);
+                  // OTLP/structured rows (spans/metrics) carry no `message`, so
+                  // synthesize a JSON line from the row's REAL fields rather than
+                  // leaving the event body blank (NAN-1568). Frontend-only.
+                  const displayValue = messageValue
+                    ? formatValue(messageValue)
+                    : synthesizeStructuredLine(displayFields);
+                  if (!displayValue) return null;
                   const isMessageExpanded = expandedMessages.has(result.id);
                   const shouldTruncate = !isMessageExpanded && displayValue.length > 500;
                   const messageDisplayValue = shouldTruncate

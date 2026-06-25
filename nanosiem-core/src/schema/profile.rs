@@ -112,6 +112,31 @@ pub trait SchemaProfile: Send + Sync {
         "ext"
     }
 
+    /// The secondary `Map` column tried when a [`FieldResolution::MapKey`] key is
+    /// absent in the primary [`json_tail_column`](Self::json_tail_column) — spans'
+    /// `resource_attributes` (NAN-1555). `None` (the default) means no fallback:
+    /// UDM/OCSF tails are single JSON columns, not the two-map spans layout.
+    fn json_tail_fallback_column(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// The column a bare free-text keyword (`error`, `"failed login"`) tokenizes
+    /// against (NAN-1515 / NAN-1555). UDM/OCSF logs search `message` (the
+    /// `idx_message_words` text index); spans search `span_name` (`idx_span_words`).
+    /// Default `message` keeps every logs path byte-identical.
+    fn keyword_search_column(&self) -> &'static str {
+        "message"
+    }
+
+    /// The always-projected core fields a slim/table-view query needs for basic
+    /// row identity, time, and free-text display (NAN-1555). UDM/OCSF logs default
+    /// to `id`/`timestamp`/`message`/`source_type`; spans have none of those
+    /// columns and override with their own identity/time/display set. Default is
+    /// byte-identical to the historical hard-coded list.
+    fn core_fields(&self) -> &[&str] {
+        &["id", "timestamp", "message", "source_type"]
+    }
+
     // --- Detection semantics ---
 
     /// Semantic-role → physical field, in priority order. Replaces the three
@@ -240,6 +265,13 @@ pub trait SchemaProfile: Send + Sync {
                 // the raw-SQL builders (asset dossier, lateral movement, signal
                 // matched-log fetch — NAN-1241) rely on.
                 crate::query::json_tail_access_sql(&col, &path, "String")
+            }
+            FieldResolution::MapKey { col, fallback, key } => {
+                // Spans/metrics attribute tail (NAN-1555): native `Map` subscript
+                // with the literal dotted key + optional resource fallback. Same
+                // emission as `field_access_expr`'s MapKey arm (kept in lockstep,
+                // like the JsonPath arm above).
+                crate::query::map_tail_access_sql(&col, fallback.as_deref(), &key)
             }
             FieldResolution::ArrayElement { .. }
             | FieldResolution::Alias(_)

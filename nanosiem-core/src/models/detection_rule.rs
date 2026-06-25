@@ -185,6 +185,18 @@ pub struct DetectionRule {
     /// Useful for prevalence-based detections that need longer lookback windows
     #[sqlx(default)]
     pub lookback_minutes: Option<i32>,
+    /// Dataset this rule queries: None/"logs" (default UDM/OCSF), "spans", or
+    /// "metrics" (NAN-1561). Mirrors `SearchRequest.dataset`. Spans/metrics
+    /// rules are SCHEDULED-ONLY — the real-time MV path rejects them.
+    ///
+    /// NOTE: a spans/metrics rule that wants risk scoring must set an explicit
+    /// `risk_entity_field` to a column that exists in that dataset (e.g.
+    /// `service_name`); `risk::ScoreCalculator::extract_entity` reads the field
+    /// by name, so no UDM allowlist gates it. With no `risk_entity_field` the
+    /// UDM auto-detection falls back to a default entity that won't exist in
+    /// spans/metrics rows and the rule simply records no risk entity.
+    #[sqlx(default)]
+    pub dataset: Option<String>,
     /// Whether auto-tuning is enabled for this rule
     #[sqlx(default)]
     pub auto_tuning_enabled: bool,
@@ -259,6 +271,9 @@ pub struct NewDetectionRule {
     pub risk_modifiers: Option<Vec<RiskModifier>>,
     /// Custom lookback period in minutes for scheduled execution
     pub lookback_minutes: Option<i32>,
+    /// Dataset this rule queries: "logs" (default), "spans", or "metrics".
+    /// Spans/metrics force scheduled mode.
+    pub dataset: Option<String>,
     /// Whether auto-tuning is enabled for this rule
     pub auto_tuning_enabled: Option<bool>,
     /// Minimum confidence threshold for auto-tuning (0.0-1.0)
@@ -323,6 +338,8 @@ pub struct UpdateDetectionRule {
     pub archived: Option<bool>,
     /// Custom lookback period in minutes for scheduled execution
     pub lookback_minutes: Option<i32>,
+    /// Dataset this rule queries: "logs" (default), "spans", or "metrics".
+    pub dataset: Option<String>,
     /// Whether auto-tuning is enabled for this rule
     pub auto_tuning_enabled: Option<bool>,
     /// Minimum confidence threshold for auto-tuning (0.0-1.0)
@@ -385,6 +402,8 @@ pub enum FieldValidationError {
     SpecificPlaybookWithoutId,
     /// playbook_id provided but playbook_selector_mode is not 'specific'
     PlaybookIdWithoutSpecificMode,
+    /// dataset has an invalid value (must be 'logs', 'spans', or 'metrics')
+    InvalidDataset(String),
 }
 
 impl std::fmt::Display for RiskValidationError {
@@ -460,6 +479,9 @@ impl std::fmt::Display for FieldValidationError {
             FieldValidationError::PlaybookIdWithoutSpecificMode => {
                 write!(f, "playbook_id provided but playbook_selector_mode is not 'specific'")
             }
+            FieldValidationError::InvalidDataset(value) => {
+                write!(f, "Invalid dataset '{}' (must be 'logs', 'spans', or 'metrics')", value)
+            }
         }
     }
 }
@@ -477,6 +499,10 @@ pub const MAX_LOOKBACK_MINUTES: i32 = 10080;
 
 /// Valid playbook selector modes (rule → playbook assignment at firing time)
 pub const VALID_PLAYBOOK_SELECTOR_MODES: &[&str] = &["none", "specific", "adaptive"];
+
+/// Valid dataset values for a detection rule (NAN-1561). NULL/"logs" = default
+/// UDM/OCSF logs; "spans"/"metrics" = OTLP datasets (scheduled-only).
+pub const VALID_DATASETS: &[&str] = &["logs", "spans", "metrics"];
 
 impl NewDetectionRule {
     /// Validate risk-related fields
@@ -580,6 +606,14 @@ impl NewDetectionRule {
                 return Err(FieldValidationError::PlaybookIdWithoutSpecificMode)
             }
             _ => {}
+        }
+
+        // Validate dataset (NAN-1561). An unknown value would otherwise silently
+        // degrade to a logs scan via Dataset::from_selector, so reject it here.
+        if let Some(ref ds) = self.dataset {
+            if !VALID_DATASETS.contains(&ds.as_str()) {
+                return Err(FieldValidationError::InvalidDataset(ds.clone()));
+            }
         }
 
         Ok(())
@@ -695,6 +729,13 @@ impl UpdateDetectionRule {
             }
         }
 
+        // Validate dataset (NAN-1561) if it is being set in this patch.
+        if let Some(ref ds) = self.dataset {
+            if !VALID_DATASETS.contains(&ds.as_str()) {
+                return Err(FieldValidationError::InvalidDataset(ds.clone()));
+            }
+        }
+
         Ok(())
     }
 }
@@ -750,6 +791,7 @@ mod tests {
             risk_entity_field: None,
             risk_modifiers: None,
             lookback_minutes: None,
+            dataset: None,
             auto_tuning_enabled: None,
             auto_tuning_min_confidence: confidence,
             auto_tuning_critical: None,

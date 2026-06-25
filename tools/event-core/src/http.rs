@@ -73,6 +73,58 @@ pub enum Transport {
     /// `source_type`, parses `message`, and maps to OCSF (NAN-1402). The
     /// listener is a local validation rig, so there is no auth token.
     Tenzir { url: String },
+    /// OTLP/HTTP JSON to Vector's `opentelemetry` receiver (NAN-1533). The
+    /// realistic producer path: per-record OTLP/JSON is wrapped in the OTLP
+    /// export envelope (`resourceSpans`/`resourceMetrics`/`resourceLogs`) and
+    /// POSTed to `<base_url>/v1/{traces,metrics,logs}` with
+    /// `Content-Type: application/json`. `base_url` is the receiver root (no
+    /// `/v1/...` suffix — the signal-specific path is appended per send).
+    /// Default `http://localhost:4318`. The OTLP source has no shared-token
+    /// gate (auth terminates at the LB), so there is no token.
+    OtlpHttp { base_url: String },
+    /// Vector-INDEPENDENT direct OTLP path (NAN-1533) — mirrors Tenzir/Cribl
+    /// direct producers. Each per-record OTLP/JSON is INSERTed as one
+    /// `{event, timestamp, source_type}` row into the Null staging table
+    /// (`otel_spans_raw` / `otel_metrics_raw` / the UDM `logs` lane) via the
+    /// ClickHouse HTTP interface (`INSERT ... FORMAT JSONEachRow`, basic auth).
+    /// Deterministically exercises the derivation MVs regardless of Vector's
+    /// experimental OTLP decode. Default `http://localhost:8123` with the
+    /// docker-compose dev creds.
+    OtlpClickHouse {
+        url: String,
+        user: String,
+        password: String,
+    },
+}
+
+/// The three OTLP signal kinds log-blaster can emit. Selects the receiver path
+/// (`/v1/<signal>`), the export-envelope key, and the ClickHouse target table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtlpSignal {
+    Traces,
+    Metrics,
+    Logs,
+}
+
+impl OtlpSignal {
+    /// OTLP/HTTP path suffix (appended to `OtlpHttp::base_url`).
+    fn http_path(&self) -> &'static str {
+        match self {
+            OtlpSignal::Traces => "/v1/traces",
+            OtlpSignal::Metrics => "/v1/metrics",
+            OtlpSignal::Logs => "/v1/logs",
+        }
+    }
+
+    /// The `source_type` stamped on the raw-table row (matches the Vector
+    /// `*_prep` transforms in `config/vector/03-otlp-source.toml`).
+    fn source_type(&self) -> &'static str {
+        match self {
+            OtlpSignal::Traces => "otlp_trace",
+            OtlpSignal::Metrics => "otlp_metric",
+            OtlpSignal::Logs => "otlp_log",
+        }
+    }
 }
 
 impl Transport {
@@ -95,6 +147,8 @@ impl Transport {
             Transport::Vector { url, .. } => url,
             Transport::Hec { url, .. } => url,
             Transport::Tenzir { url } => url,
+            Transport::OtlpHttp { base_url } => base_url,
+            Transport::OtlpClickHouse { url, .. } => url,
         }
     }
 
@@ -103,6 +157,8 @@ impl Transport {
             Transport::Vector { token, .. } => token.as_deref(),
             Transport::Hec { token, .. } => token.as_deref(),
             Transport::Tenzir { .. } => None,
+            // OTLP receiver auth terminates at the LB; ClickHouse uses basic auth.
+            Transport::OtlpHttp { .. } | Transport::OtlpClickHouse { .. } => None,
         }
     }
 
@@ -112,8 +168,366 @@ impl Transport {
             Transport::Vector { .. } => "vector",
             Transport::Hec { .. } => "hec",
             Transport::Tenzir { .. } => "tenzir",
+            Transport::OtlpHttp { .. } => "otlp-http",
+            Transport::OtlpClickHouse { .. } => "otlp-clickhouse",
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// OTLP transports (NAN-1533)
+// ---------------------------------------------------------------------------
+//
+// Both OTLP transports ship the SAME per-record OTLP/JSON shape produced by
+// `event_core::otlp` (one span / data point / log record per Value). They
+// differ only in framing:
+//   * OtlpHttp        — wrap N records in the OTLP export envelope and POST to
+//                       the receiver's /v1/<signal> endpoint (Vector decodes).
+//   * OtlpClickHouse  — INSERT one {event, timestamp, source_type} row per
+//                       record into the Null staging table (MV derives columns).
+
+/// ClickHouse target table for a direct-OTLP signal. Traces and metrics ride
+/// their own raw lanes; logs ride the UDM `logs` lane. Database-qualified.
+fn otlp_ch_target(signal: OtlpSignal) -> &'static str {
+    match signal {
+        OtlpSignal::Traces => "nanosiem.otel_spans_raw",
+        OtlpSignal::Metrics => "nanosiem.otel_metrics_raw",
+        // OTLP LogRecords are logs — they ride the existing UDM logs lane
+        // (clickhouse/141_logs_otel_correlation.sql). We map the record into a
+        // minimal logs row in `ch_logs_row` rather than the raw `event` blob.
+        OtlpSignal::Logs => "nanosiem.logs",
+    }
+}
+
+/// Build the OTLP/HTTP export envelope for a batch of per-record JSON values.
+/// Wraps records in the single-resource/single-scope envelope the OTLP spec
+/// uses: `resourceSpans[].scopeSpans[].spans[]` (and the metrics/logs analogues).
+/// One envelope per POST is valid OTLP — the receiver flattens it back out.
+fn otlp_envelope(signal: OtlpSignal, records: &[serde_json::Value]) -> serde_json::Value {
+    use serde_json::json;
+    match signal {
+        OtlpSignal::Traces => json!({
+            "resourceSpans": [{
+                "scopeSpans": [{
+                    "scope": { "name": "log-blaster", "version": "1" },
+                    "spans": records
+                }]
+            }]
+        }),
+        OtlpSignal::Metrics => json!({
+            "resourceMetrics": [{
+                "scopeMetrics": [{
+                    "scope": { "name": "log-blaster", "version": "1" },
+                    "metrics": records
+                }]
+            }]
+        }),
+        OtlpSignal::Logs => json!({
+            "resourceLogs": [{
+                "scopeLogs": [{
+                    "scope": { "name": "log-blaster", "version": "1" },
+                    "logRecords": records
+                }]
+            }]
+        }),
+    }
+}
+
+/// Ship a batch of per-record OTLP/JSON values for one signal over the
+/// configured OTLP transport, with per-attempt retry. No-op on an empty batch.
+pub async fn send_otlp_with_retry(
+    client: &Client,
+    transport: &Transport,
+    signal: OtlpSignal,
+    records: &[serde_json::Value],
+    max_retries: u32,
+) -> Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let mut last_err = None;
+    for attempt in 0..=max_retries {
+        if attempt > 0 {
+            let backoff = retry_backoff(attempt);
+            warn!(
+                "[{}] Retry {}/{} after {:?}",
+                transport.kind(),
+                attempt,
+                max_retries,
+                backoff
+            );
+            tokio::time::sleep(backoff).await;
+        }
+        let res = match transport {
+            Transport::OtlpHttp { .. } => {
+                send_otlp_http(client, transport, signal, records).await
+            }
+            Transport::OtlpClickHouse { .. } => {
+                send_otlp_clickhouse(client, transport, signal, records).await
+            }
+            other => {
+                return Err(anyhow::anyhow!(
+                    "send_otlp_with_retry called on non-OTLP transport: {}",
+                    other.kind()
+                ));
+            }
+        };
+        match res {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap())
+}
+
+/// OTLP/HTTP JSON to Vector's `opentelemetry` receiver.
+async fn send_otlp_http(
+    client: &Client,
+    transport: &Transport,
+    signal: OtlpSignal,
+    records: &[serde_json::Value],
+) -> Result<()> {
+    let base = transport.url().trim_end_matches('/');
+    let url = format!("{base}{}", signal.http_path());
+    let envelope = otlp_envelope(signal, records);
+    client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .json(&envelope)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+/// Render the JSONEachRow body for the direct-OTLP ClickHouse path.
+///
+/// Traces/metrics write the per-record OTLP JSON verbatim into the single
+/// `event` column (the MV derives the rest). Logs write a minimal UDM `logs`
+/// row instead — the logs lane is a wide UDM table, not a raw `event` blob, so
+/// we promote body -> message, severity, and trace_id/span_id (lowercased to
+/// match the `lower(col)` correlation convention) directly.
+fn otlp_ch_body(signal: OtlpSignal, records: &[serde_json::Value]) -> String {
+    let now = chrono::Utc::now();
+    match signal {
+        OtlpSignal::Traces | OtlpSignal::Metrics => records
+            .iter()
+            .map(|rec| {
+                // One {event, source_type} row. `event` is the OTLP JSON as a
+                // STRING (the MV's JSONExtract* reads it); timestamp is left to
+                // the raw table's DEFAULT (derived from start/timeUnixNano).
+                serde_json::json!({
+                    "event": serde_json::to_string(rec).unwrap(),
+                    "source_type": signal.source_type(),
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        OtlpSignal::Logs => records
+            .iter()
+            .map(|rec| ch_logs_row(rec, now).to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+/// Map one OTLP LogRecord JSON into a minimal UDM `logs` row (JSONEachRow).
+fn ch_logs_row(rec: &serde_json::Value, now: chrono::DateTime<chrono::Utc>) -> serde_json::Value {
+    // OTLP body is `{stringValue: "..."}`; fall back to the whole record.
+    let message = rec["body"]["stringValue"]
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| rec.to_string());
+    let sev_text = rec["severityText"].as_str().unwrap_or("INFO").to_lowercase();
+    let trace_id = rec["traceId"].as_str().unwrap_or("").to_lowercase();
+    let span_id = rec["spanId"].as_str().unwrap_or("").to_lowercase();
+
+    // Pull the entity-overlay semconv attrs the same way the UDM parse would.
+    let attr = |key: &str| -> String {
+        rec["attributes"]
+            .as_array()
+            .and_then(|arr| arr.iter().find(|kv| kv["key"] == key))
+            .and_then(|kv| kv["value"]["stringValue"].as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    serde_json::json!({
+        "timestamp": now.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
+        "message": message,
+        "source_type": "otlp_log",
+        "source": "otlp",
+        "severity": sev_text,
+        "trace_id": trace_id,
+        "span_id": span_id,
+        "src_ip": attr("client.address").to_lowercase(),
+        "user": attr("enduser.id"),
+        "src_host": attr("host.name"),
+        "url": attr("url.path"),
+    })
+}
+
+/// Direct INSERT into the ClickHouse Null staging table (or logs lane) via the
+/// HTTP interface, JSONEachRow body + basic auth.
+async fn send_otlp_clickhouse(
+    client: &Client,
+    transport: &Transport,
+    signal: OtlpSignal,
+    records: &[serde_json::Value],
+) -> Result<()> {
+    let (url, user, password) = match transport {
+        Transport::OtlpClickHouse {
+            url,
+            user,
+            password,
+        } => (url, user, password),
+        other => {
+            return Err(anyhow::anyhow!(
+                "send_otlp_clickhouse called on {} transport",
+                other.kind()
+            ))
+        }
+    };
+
+    let table = otlp_ch_target(signal);
+    let body = otlp_ch_body(signal, records);
+    // The column list mirrors the JSONEachRow keys we emit. For traces/metrics
+    // that is (event, source_type); for logs it is the promoted UDM subset.
+    // The query rides as a URL `?query=` param (ClickHouse HTTP interface); the
+    // JSONEachRow rows are the POST body.
+    // The query is a fixed-shape statement (`INSERT INTO <table> FORMAT
+    // JSONEachRow`) — only spaces need escaping for the URL `?query=` param;
+    // table names are ASCII identifiers with dots. Avoids pulling in a urlencode
+    // crate for a single space-replace.
+    let query = format!("INSERT INTO {table} FORMAT JSONEachRow");
+    let endpoint = format!(
+        "{}/?query={}",
+        url.trim_end_matches('/'),
+        query.replace(' ', "%20")
+    );
+
+    client
+        .post(endpoint)
+        .basic_auth(user, Some(password))
+        .header("Content-Type", "application/x-ndjson")
+        .body(body)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
+}
+
+/// One correlated security-signal UDM log row for the combo-join lane
+/// (NAN-1566). Shaped as an auth FAILURE so the spans<->logs correlation is a
+/// meaningful security pivot: `auth_result=failure` + a `user` + an `src_ip`,
+/// optionally carrying the `trace_id` of a just-emitted span.
+///
+/// `trace_id` is lowercased to match the `lower(col)` correlation convention and
+/// the lowercase-hex span ids the otel_spans MV writes; an empty `trace_id`
+/// yields a normal (uncorrelated) row.
+#[derive(Debug, Clone)]
+pub struct ComboLogRow {
+    pub trace_id: String,
+    pub user: String,
+    pub src_ip: String,
+    pub failure: bool,
+}
+
+/// INSERT a batch of combo-join security-signal log rows DIRECTLY into
+/// `nanosiem.logs` via the ClickHouse HTTP interface (JSONEachRow + basic auth).
+///
+/// combo-join uses the direct-CH path (mirroring `send_otlp_clickhouse`) on
+/// PURPOSE: `logs.trace_id` is a first-class UDM column, but the demo
+/// source-type parsers don't carry `trace_id` through the Vector pipeline, so a
+/// pipeline send would silently drop it. Writing the row straight to `logs`
+/// makes the spans<->logs trace_id overlap deterministic for validation. CH
+/// fills every other column from its DEFAULTs.
+pub async fn insert_combo_log_rows(
+    client: &Client,
+    transport: &Transport,
+    rows: &[ComboLogRow],
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let (url, user_cred, password) = match transport {
+        Transport::OtlpClickHouse {
+            url,
+            user,
+            password,
+        } => (url, user, password),
+        other => {
+            return Err(anyhow::anyhow!(
+                "insert_combo_log_rows requires the OtlpClickHouse transport, got {}",
+                other.kind()
+            ))
+        }
+    };
+
+    let now = chrono::Utc::now();
+    let ts = now.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+    let body: String = rows
+        .iter()
+        .map(|r| {
+            let (action, auth_result, status, severity, msg) = if r.failure {
+                (
+                    "auth_failure",
+                    "failure",
+                    "failure",
+                    "high",
+                    format!(
+                        "authentication failure for user {} from {}",
+                        r.user, r.src_ip
+                    ),
+                )
+            } else {
+                (
+                    "auth_success",
+                    "success",
+                    "success",
+                    "info",
+                    format!("authentication success for user {} from {}", r.user, r.src_ip),
+                )
+            };
+            serde_json::json!({
+                "timestamp": ts,
+                "message": msg,
+                "source_type": "combo_join_auth",
+                "source": "combo-join",
+                "trace_id": r.trace_id.to_lowercase(),
+                // Lowercase src_ip to match the ingest-lowercased raw-column
+                // convention for IP equality (CLAUDE.md ClickHouse notes).
+                "src_ip": r.src_ip.to_lowercase(),
+                "user": r.user,
+                "auth_type": "password",
+                "auth_result": auth_result,
+                "action": action,
+                "result": auth_result,
+                "status": status,
+                "severity": severity,
+                "category": "authentication",
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let query = "INSERT INTO nanosiem.logs FORMAT JSONEachRow";
+    let endpoint = format!(
+        "{}/?query={}",
+        url.trim_end_matches('/'),
+        query.replace(' ', "%20")
+    );
+    client
+        .post(endpoint)
+        .basic_auth(user_cred, Some(password))
+        .header("Content-Type", "application/x-ndjson")
+        .body(body)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
 }
 
 /// Send a batch of pre-shaped JSON records as NDJSON under a fixed
@@ -152,6 +566,12 @@ pub async fn send_event(client: &Client, transport: &Transport, event: &Event) -
         Transport::Vector { .. } => send_event_vector(client, transport, event).await,
         Transport::Hec { .. } => send_event_hec(client, transport, event).await,
         Transport::Tenzir { .. } => send_tenzir_batch(client, transport, &[event]).await,
+        // OTLP transports carry OTLP/JSON records, not raw `Event`s — callers
+        // use `send_otlp_with_retry`. Reaching here is a wiring bug.
+        Transport::OtlpHttp { .. } | Transport::OtlpClickHouse { .. } => Err(anyhow::anyhow!(
+            "send_event called on OTLP transport ({}); use send_otlp_with_retry",
+            transport.kind()
+        )),
     }
 }
 
@@ -173,6 +593,10 @@ pub async fn send_batch_with_retry(
         Transport::Tenzir { .. } => {
             send_batch_tenzir_with_retry(client, transport, events, max_retries).await
         }
+        Transport::OtlpHttp { .. } | Transport::OtlpClickHouse { .. } => Err(anyhow::anyhow!(
+            "send_batch_with_retry called on OTLP transport ({}); use send_otlp_with_retry",
+            transport.kind()
+        )),
     }
 }
 
@@ -322,6 +746,9 @@ fn hec_channel(transport: &Transport) -> &str {
         Transport::Hec { channel, .. } => channel,
         Transport::Vector { .. } => unreachable!("hec_channel called on Vector transport"),
         Transport::Tenzir { .. } => unreachable!("hec_channel called on Tenzir transport"),
+        Transport::OtlpHttp { .. } | Transport::OtlpClickHouse { .. } => {
+            unreachable!("hec_channel called on OTLP transport")
+        }
     }
 }
 

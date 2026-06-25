@@ -16,8 +16,8 @@ impl DetectionRuleRepository {
     ) -> Result<DetectionRule, DetectionRuleRepositoryError> {
         let result = sqlx::query_as::<_, DetectionRule>(
             r#"
-            INSERT INTO detection_rules (name, description, query, severity, mitre_tactics, mitre_techniques, schedule_cron, mode, narrative, reference_url, author, tags, ai_generated, realtime_enabled, risk_score, risk_entity_field, risk_modifiers, detection_mode, lookback_minutes, auto_tuning_enabled, auto_tuning_min_confidence, auto_tuning_critical, ai_triage_hints, folder, case_visibility, alert_mode, case_assigned_group, playbook_selector_mode, playbook_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
+            INSERT INTO detection_rules (name, description, query, severity, mitre_tactics, mitre_techniques, schedule_cron, mode, narrative, reference_url, author, tags, ai_generated, realtime_enabled, risk_score, risk_entity_field, risk_modifiers, detection_mode, lookback_minutes, auto_tuning_enabled, auto_tuning_min_confidence, auto_tuning_critical, ai_triage_hints, folder, case_visibility, alert_mode, case_assigned_group, playbook_selector_mode, playbook_id, dataset)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
             RETURNING *
             "#,
         )
@@ -50,6 +50,7 @@ impl DetectionRuleRepository {
         .bind(rule.case_assigned_group)
         .bind(rule.playbook_selector_mode.as_deref().unwrap_or("none"))
         .bind(rule.playbook_id)
+        .bind(&rule.dataset)
         .fetch_one(&self.pool)
         .await?;
 
@@ -145,6 +146,7 @@ impl DetectionRuleRepository {
                         THEN COALESCE($33, playbook_id)
                     ELSE NULL
                 END,
+                dataset = COALESCE($34, dataset),
                 updated_at = NOW()
             WHERE id = $1 AND updated_at = $31
             RETURNING *
@@ -188,6 +190,7 @@ impl DetectionRuleRepository {
         .bind(existing.updated_at) // $31: optimistic locking timestamp
         .bind(&update.playbook_selector_mode) // $32
         .bind(&update.playbook_id) // $33
+        .bind(&update.dataset) // $34
         .fetch_optional(&self.pool)
         .await?
         .ok_or(DetectionRuleRepositoryError::ConcurrentModification(id))?;

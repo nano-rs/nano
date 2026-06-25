@@ -239,6 +239,9 @@ export function Alerts() {
       setError(null);
       const params: Parameters<typeof api.listAlerts>[0] = {
         limit: PAGE_SIZE,
+        // NAN-1541: SIEM alerts view shows ONLY security detections.
+        // Observability monitor alerts (metric_monitor/slo/synthetic) live in their own surface.
+        kinds: ['detection'],
       };
       if (statusFilter !== 'all') params.status = statusFilter;
       if (severityFilter !== 'all') params.severity = severityFilter;
@@ -255,7 +258,7 @@ export function Alerts() {
 
   const fetchCounts = useCallback(async () => {
     try {
-      const data = await api.getAlertCounts();
+      const data = await api.getAlertCounts(['detection']);
       setCounts(data);
     } catch (err) {
       // eslint-disable-next-line no-console

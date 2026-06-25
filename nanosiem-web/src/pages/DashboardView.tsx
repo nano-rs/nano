@@ -11,7 +11,7 @@ import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
 import { Button } from '@/components/ui/button';
 import { DateTimeRangePicker } from '@/components/ui/date-time-range-picker';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { GridLayout, Panel, VisualizationRenderer, DashboardEditor, buildSearchUrl, VariableControls, DashboardShareDialog } from '@/components/dashboard';
+import { GridLayout, Panel, VisualizationRenderer, DashboardEditor, buildSearchUrl, VariableControls, DashboardShareDialog, ObsMetricWidget, metricSeriesToRows } from '@/components/dashboard';
 import type { PanelDataState, DrilldownFilter } from '@/components/dashboard';
 import {
   ArrowLeft,
@@ -48,6 +48,7 @@ import { useRecordActivity } from '@/hooks/useRecentActivity';
 import { formatRelativeUTC } from '@/lib/date-utils';
 import { cn } from '@/lib/utils';
 import type { Dashboard, PanelConfig, LayoutItem, DashboardShareResult } from '@/lib/api';
+import { api } from '@/lib/api';
 
 type AutoRefreshInterval = '30s' | '1m' | '5m' | '15m' | 'off';
 
@@ -283,6 +284,37 @@ export function DashboardView() {
       const effectiveTimeRange = panel.timeRangeMode === 'custom' && panel.customTimeRange
         ? panel.customTimeRange
         : toApiTimeRange(timeRange);
+
+      // NAN-1540: obs_metric widgets fetch from the metrics-v2 timeseries
+      // endpoint (not the nPL/SQL panel-query path). Series are stashed as one
+      // row per series so they ride the existing panelData Map; ObsMetricWidget
+      // reconstructs them via rowsToMetricSeries.
+      if (panel.visualizationType === 'obs_metric' && panel.metricConfig) {
+        const mc = panel.metricConfig;
+        const resp = await api.observability.queryMetricsV2({
+          metric_name: mc.metric_name,
+          time_range: effectiveTimeRange,
+          service_name: mc.service_name,
+          step_secs: mc.step_secs,
+          agg: mc.agg,
+          group_by: mc.group_by,
+          filters: mc.filters,
+        });
+        const rows = metricSeriesToRows(resp.series ?? []);
+        const hasPoints = rows.some(
+          r => Array.isArray(r.points) && (r.points as unknown[]).length > 0
+        );
+        setPanelData(prev => {
+          const newMap = new Map(prev);
+          newMap.set(panel.id, {
+            status: hasPoints ? 'success' : 'empty',
+            data: rows,
+            lastRefresh: new Date(),
+          });
+          return newMap;
+        });
+        return;
+      }
 
       // Substitute variables client-side to handle undefined vars with '*' fallback
       const substitutedQuery = substituteVariables(panel.query);
@@ -895,12 +927,16 @@ function DashboardGrid({
         hasRunOnce={hasRunOnce}
       >
         {data?.status === 'success' && data.data && (
-          <VisualizationRenderer
-            type={panel.visualizationType}
-            config={panel.visualizationConfig}
-            data={data.data}
-            onDrilldown={drilldownEnabled ? onDrilldown : undefined}
-          />
+          panel.visualizationType === 'obs_metric' && panel.metricConfig ? (
+            <ObsMetricWidget config={panel.metricConfig} data={data.data} />
+          ) : (
+            <VisualizationRenderer
+              type={panel.visualizationType}
+              config={panel.visualizationConfig}
+              data={data.data}
+              onDrilldown={drilldownEnabled ? onDrilldown : undefined}
+            />
+          )
         )}
       </Panel>
     );

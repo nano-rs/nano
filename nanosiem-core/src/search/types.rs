@@ -326,6 +326,15 @@ pub struct SearchRequest {
     /// Only "interactive" and "analytics" are accepted from API clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
+    /// Observability dataset to run the nPL pipeline against (NAN-1534).
+    /// `"logs"` (default) | `"spans"` | `"metrics"`. Selects the FROM table and
+    /// the time-bound column (spans → `start_time`, logs/metrics → `timestamp`)
+    /// in the SQL generator. Unknown values fall back to `logs` (never an error)
+    /// via [`Dataset::from_selector`](crate::query::Dataset::from_selector).
+    /// Omit for the default logs dataset — `with_dataset(Logs)` is byte-identical
+    /// to the prior generator, so existing clients are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<String>,
 }
 
 /// Input for raw SQL search requests
@@ -748,6 +757,14 @@ pub enum DisplayType {
     Cloud,
     /// Lateral movement trace view with hop-by-hop path visualization (lateral command)
     Lateral,
+    /// Observability services overview page (services command) — curated surface, no log scan
+    Services,
+    /// Single-service detail page (service command) — curated surface, no log scan
+    Service,
+    /// Distributed-trace waterfall page (trace command) — curated surface, no log scan
+    Trace,
+    /// Metric time-series page (metric command) — curated surface, no log scan
+    Metric,
 }
 
 /// Request for querying by UDM field

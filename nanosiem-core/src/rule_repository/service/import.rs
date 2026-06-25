@@ -276,6 +276,9 @@ impl RuleRepositoryService {
             // because the repo playbooks UUIDs are local-only.
             playbook_selector_mode: None,
             playbook_id: None,
+            // Repository-imported rules default to the logs dataset (NAN-1561);
+            // spans/metrics rules are authored via the editor today.
+            dataset: None,
         };
 
         // Check if a detection rule with this name already exists from this repo.

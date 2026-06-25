@@ -344,6 +344,8 @@ service_path,Endpoint
 service_signature_exists,Endpoint
 service_signature_verified,Endpoint
 session_id,Authentication
+trace_id,Custom
+span_id,Custom
 session_limit,Databases
 session_status,Databases
 sessions,Databases

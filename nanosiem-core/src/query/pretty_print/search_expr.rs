@@ -87,12 +87,21 @@ impl PrettyPrint for SearchExpr {
                 field,
                 subsearch,
                 negated,
+                subsearch_dataset,
             } => {
                 let not_str = if *negated { "NOT " } else { "" };
+                // NAN-1562: render the cross-dataset selector inside the brackets.
+                let ds_prefix = match subsearch_dataset {
+                    Some(ds) => {
+                        format!("dataset={} ", super::helpers::dataset_selector_str(*ds))
+                    }
+                    None => String::new(),
+                };
                 format!(
-                    "{} {}IN [{}]",
+                    "{} {}IN [{}{}]",
                     field,
                     not_str,
+                    ds_prefix,
                     subsearch.pretty_print()
                 )
             }

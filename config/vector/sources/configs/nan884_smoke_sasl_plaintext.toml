@@ -1,0 +1,35 @@
+# Auto-generated Vector configuration for source: nan884-smoke-sasl-plaintext
+# DO NOT EDIT - changes will be overwritten
+# Generated at: 2026-06-24T13:08:57.543668+00:00
+
+[sources.nan884_smoke_sasl_plaintext_source]
+auto_offset_reset = "earliest"
+bootstrap_servers = "kafka:9093"
+group_id = "nan884-smoke-1"
+topics = ["nano.logs.apache.access"]
+type = "kafka"
+
+[sources.nan884_smoke_sasl_plaintext_source.librdkafka_options]
+"security.protocol" = "SASL_PLAINTEXT"
+
+[sources.nan884_smoke_sasl_plaintext_source.sasl]
+enabled = true
+mechanism = "PLAIN"
+password = "admin-secret"
+username = "admin"
+
+[transforms.nan884_smoke_sasl_plaintext_route]
+inputs = ["nan884_smoke_sasl_plaintext_source"]
+source = """
+# Stamp ingestion path for downstream troubleshooting (NAN-884 K-6).
+# Matches the assignment 00-base.toml / 01-vector-source.toml /
+# 02-hec-source.toml do for the system-level sources.
+if !is_object(.metadata) {
+    .metadata = {}
+}
+.metadata.forwarded_via = "kafka"
+
+# Apply routing rules to set source_type
+.source_type = "apache_access"
+"""
+type = "remap"

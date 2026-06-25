@@ -3,7 +3,7 @@
 //! Pretty-print implementation for commands.
 
 use super::super::ast::*;
-use super::helpers::format_duration;
+use super::helpers::{dataset_selector_str, format_duration};
 use super::PrettyPrint;
 
 impl PrettyPrint for Command {
@@ -320,6 +320,7 @@ impl PrettyPrint for Command {
                 max,
                 overwrite,
                 maxout,
+                subsearch_dataset,
             } => {
                 let mut result = "join".to_string();
                 if *join_type != JoinType::Inner {
@@ -334,9 +335,15 @@ impl PrettyPrint for Command {
                 if !*overwrite {
                     result.push_str(" overwrite=false");
                 }
+                // NAN-1562: render the cross-dataset selector inside the brackets.
+                let ds_prefix = match subsearch_dataset {
+                    Some(ds) => format!("dataset={} ", dataset_selector_str(*ds)),
+                    None => String::new(),
+                };
                 result.push_str(&format!(
-                    " {} [{}]",
+                    " {} [{}{}]",
                     fields.join(", "),
+                    ds_prefix,
                     subsearch.pretty_print()
                 ));
                 result
@@ -649,6 +656,13 @@ impl PrettyPrint for Command {
             Command::Output { destination } => {
                 format!("output {}", destination)
             }
+            Command::Services => "services".to_string(),
+            Command::Service { name } => format!("service {}", name),
+            Command::Trace { trace_id } => format!("trace {}", trace_id),
+            Command::Metric { name, service } => match service {
+                Some(svc) => format!("metric {} service={}", name, svc),
+                None => format!("metric {}", name),
+            },
         }
     }
 }

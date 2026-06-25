@@ -151,6 +151,13 @@ mod tests {
             "/api/search/admin/stats",
             "/api/search/admin/jobs/{job_id}",
             "/api/identity/resolve",
+            "/api/search/traces",
+            "/api/search/metrics/names",
+            "/api/search/metrics/tags",
+            "/api/search/services",
+            "/api/search/services/{service}",
+            "/api/search/infra/hosts",
+            "/api/search/rum",
             "/health",
             "/ready",
         ];

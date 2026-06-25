@@ -62,8 +62,10 @@ export function Rules() {
   const { data: apiRules, loading, refetch } = useDetections();
   const { data: stats } = useDetectionStats(28);
   const { data: todayCounts, refetch: refetchTodayCounts } = useTodayCounts();
-  const { data: alertCounts } = useAlertCounts();
-  const { data: alertVelocity } = useAlertVelocity(24);
+  // NAN-1541: the rules page is a detection surface — scope alert counts/velocity to
+  // security detections so observability monitor alerts don't leak into these numbers.
+  const { data: alertCounts } = useAlertCounts(['detection']);
+  const { data: alertVelocity } = useAlertVelocity(24, ['detection']);
   const { data: fleetHealth } = useFleetHealth();
 
   const [sev, setSev] = useState<SevFilter>('all');

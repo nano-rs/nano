@@ -35,7 +35,8 @@ const SEVERITY_CONFIG = {
 } as const;
 
 export function AlertSummary() {
-  const { data: alertCounts, loading, error } = useAlertCounts();
+  // NAN-1541: security dashboard summary — detection alerts only.
+  const { data: alertCounts, loading, error } = useAlertCounts(['detection']);
 
   if (loading) {
     return (

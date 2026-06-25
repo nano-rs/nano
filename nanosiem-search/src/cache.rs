@@ -108,6 +108,11 @@ impl SearchResultCache {
             }
             .as_bytes(),
         );
+        hasher.update(b"|");
+        // NAN-1569: the same nPL string runs against different physical tables per
+        // dataset (logs / otel_spans / otel_metrics). Without this, a query cached
+        // for one dataset is served for another → cross-dataset cache poisoning.
+        hasher.update(request.dataset.as_deref().unwrap_or("logs").as_bytes());
         let hash = hasher.finalize();
         format!("search:{}", hex::encode(hash))
     }
@@ -340,6 +345,7 @@ mod tests {
             request_id: None,
             async_mode: false,
             priority: None,
+            dataset: None,
         };
         assert_ne!(
             SearchResultCache::cache_key(&mk(1)),
@@ -348,6 +354,44 @@ mod tests {
         assert_ne!(
             SearchResultCache::cache_key(&mk(2)),
             SearchResultCache::cache_key(&mk(3))
+        );
+    }
+
+    #[test]
+    fn cache_key_distinguishes_dataset() {
+        // NAN-1569: the same nPL string on different datasets hits different
+        // physical tables, so it must NOT share a cache entry.
+        let mk = |dataset: Option<&str>| SearchRequest {
+            query: "foo".into(),
+            time_range: TimeRangeInput {
+                start: chrono::Utc::now(),
+                end: chrono::Utc::now() + chrono::Duration::hours(1),
+            },
+            limit: Some(100),
+            offset: None,
+            include_sql: None,
+            skip_histogram: false,
+            skip_field_stats: false,
+            use_cache: false,
+            table_view: false,
+            request_id: None,
+            async_mode: false,
+            priority: None,
+            dataset: dataset.map(String::from),
+        };
+        // logs (None) vs spans vs metrics are all distinct.
+        assert_ne!(
+            SearchResultCache::cache_key(&mk(None)),
+            SearchResultCache::cache_key(&mk(Some("spans")))
+        );
+        assert_ne!(
+            SearchResultCache::cache_key(&mk(Some("spans"))),
+            SearchResultCache::cache_key(&mk(Some("metrics")))
+        );
+        // None and the explicit "logs" default collapse to the same key (byte-identical).
+        assert_eq!(
+            SearchResultCache::cache_key(&mk(None)),
+            SearchResultCache::cache_key(&mk(Some("logs")))
         );
     }
 }

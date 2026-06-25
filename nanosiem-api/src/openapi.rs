@@ -165,6 +165,9 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
         handlers::onboarding::OnboardingApiDoc::openapi(),
         handlers::siem_health::SiemHealthApiDoc::openapi(),
         handlers::siem_health_suppressions::SiemHealthSuppressionsApiDoc::openapi(),
+        handlers::observability_slos::ObservabilitySlosApiDoc::openapi(),
+        handlers::observability_synthetics::ObservabilitySyntheticsApiDoc::openapi(),
+        handlers::observability_metric_monitors::ObservabilityMetricMonitorsApiDoc::openapi(),
         handlers::system::SystemApiDoc::openapi(),
     ];
 
@@ -200,6 +203,10 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
         // Air-gapped rule + playbook bundle import (NAN-1220) — enterprise only.
         sub_docs.push(handlers::airgap::rules::AirgapRulesApiDoc::openapi());
         sub_docs.push(handlers::airgap::playbooks::AirgapPlaybooksApiDoc::openapi());
+        // Observability ↔ Security convergence cross-link (NAN-1542) — gated to
+        // enterprise in NAN-1544. The open spec omits this path entirely.
+        sub_docs
+            .push(handlers::observability_service_signals::ObservabilityServiceSignalsApiDoc::openapi());
     }
 
     for sub in sub_docs {
@@ -274,10 +281,31 @@ mod tests {
         // (profile-aware field universe), counted in both editions.
         // NAN-1519 added 1 shared path: /api/settings/ai-usage (AI usage ledger
         // detail — per-agent/daily/recent breakdowns), counted in both editions.
+        // NAN-1528 added 2 shared search-service paths (merged below):
+        // GET /api/search/trace/{trace_id} + POST /api/search/metrics/timeseries
+        // (OpenTelemetry trace waterfall + metric series), counted in both editions.
+        // NAN-1534 added 2 shared search-service paths (merged below):
+        // GET /api/search/traces (recent-traces list) + GET /api/search/metrics/names
+        // (OTLP explorers — Traces table + Metrics dropdown), counted in both editions.
+        // NAN-1536 added 4 shared paths (Observability console): 2 search-service
+        // (GET /api/search/services + GET /api/search/services/{service} — services
+        // overview + service detail, merged below) and 2 api-service SLO paths
+        // (/api/observability/slos + /api/observability/slos/{id} — SLO CRUD),
+        // counted in both editions.
+        // NAN-1538 added 2 shared api-service paths (Observability synthetics):
+        // /api/observability/synthetics + /api/observability/synthetics/{id}.
+        // NAN-1537 added 2 shared search-service paths: GET /api/search/infra/hosts
+        // + GET /api/search/rum.
+        // NAN-1540 added 3 shared paths (Metrics v2): GET /api/search/metrics/tags
+        // + /api/observability/metric-monitors + .../{id} (monitor CRUD).
+        // NAN-1542 added 1 api-service path (Observability ↔ Security
+        // convergence): GET /api/observability/services/{service}/security-signals.
+        // NAN-1544 re-gated that convergence path to ENTERPRISE only — it now
+        // counts in the enterprise spec only, dropping the open floor by 1.
         #[cfg(feature = "enterprise")]
-        let min_paths = 476;
+        let min_paths = 492;
         #[cfg(not(feature = "enterprise"))]
-        let min_paths = 367;
+        let min_paths = 382;
 
         assert!(
             path_count >= min_paths,

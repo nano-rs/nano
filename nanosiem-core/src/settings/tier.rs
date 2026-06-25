@@ -166,6 +166,12 @@ pub struct TierLimits {
     pub ai_credits_per_month: Option<u32>,
     /// AI model tier — controls which models are available
     pub ai_model_tier: AiModelTier,
+    /// Maximum number of Observability metric monitors (None = unlimited). (NAN-1544)
+    pub max_metric_monitors: Option<u32>,
+    /// Maximum number of Observability synthetic checks (None = unlimited). (NAN-1544)
+    pub max_synthetic_checks: Option<u32>,
+    /// Maximum number of Observability SLOs (None = unlimited). (NAN-1544)
+    pub max_slos: Option<u32>,
 }
 
 impl TierLimits {
@@ -185,6 +191,9 @@ impl TierLimits {
                 ha_enabled: true,
                 ai_credits_per_month: None,
                 ai_model_tier: AiModelTier::Full,
+                max_metric_monitors: None,
+                max_synthetic_checks: None,
+                max_slos: None,
             },
             OrganizationTier::Hobby => Self {
                 tier,
@@ -199,6 +208,10 @@ impl TierLimits {
                 ha_enabled: false,
                 ai_credits_per_month: Some(3_000),
                 ai_model_tier: AiModelTier::Economy,
+                // NAN-1544: open/hobby tier gets 5 of each observability monitor type.
+                max_metric_monitors: Some(5),
+                max_synthetic_checks: Some(5),
+                max_slos: Some(5),
             },
             OrganizationTier::Startup => Self {
                 tier,
@@ -213,6 +226,9 @@ impl TierLimits {
                 ha_enabled: false,
                 ai_credits_per_month: Some(10_000),
                 ai_model_tier: AiModelTier::Standard,
+                max_metric_monitors: Some(5),
+                max_synthetic_checks: Some(5),
+                max_slos: Some(5),
             },
             OrganizationTier::Growth => Self {
                 tier,
@@ -226,6 +242,10 @@ impl TierLimits {
                 ha_enabled: false,
                 ai_credits_per_month: Some(25_000),
                 ai_model_tier: AiModelTier::Full,
+                // NAN-1544: mid tiers get a wider 25-each allowance.
+                max_metric_monitors: Some(25),
+                max_synthetic_checks: Some(25),
+                max_slos: Some(25),
             },
             OrganizationTier::Team => Self {
                 tier,
@@ -239,6 +259,9 @@ impl TierLimits {
                 ha_enabled: true,
                 ai_credits_per_month: Some(50_000),
                 ai_model_tier: AiModelTier::Full,
+                max_metric_monitors: Some(25),
+                max_synthetic_checks: Some(25),
+                max_slos: Some(25),
             },
             // "Business" tier (canonical `tiers.ts` key `starter`). Sells at
             // 50 GB/day / 770 EPS — double Team. Do not copy Team's 25/385 here.
@@ -254,6 +277,10 @@ impl TierLimits {
                 ha_enabled: true,
                 ai_credits_per_month: Some(150_000),
                 ai_model_tier: AiModelTier::Full,
+                // NAN-1544: top tiers are uncapped on observability monitors.
+                max_metric_monitors: None,
+                max_synthetic_checks: None,
+                max_slos: None,
             },
             OrganizationTier::Pro => Self {
                 tier,
@@ -267,6 +294,9 @@ impl TierLimits {
                 ha_enabled: true,
                 ai_credits_per_month: Some(400_000),
                 ai_model_tier: AiModelTier::Full,
+                max_metric_monitors: None,
+                max_synthetic_checks: None,
+                max_slos: None,
             },
             OrganizationTier::Enterprise => Self {
                 tier,
@@ -280,6 +310,9 @@ impl TierLimits {
                 ha_enabled: true,
                 ai_credits_per_month: None,
                 ai_model_tier: AiModelTier::Full,
+                max_metric_monitors: None,
+                max_synthetic_checks: None,
+                max_slos: None,
             },
         }
     }
@@ -409,6 +442,11 @@ impl TierSettings {
                     ha_enabled: defaults.ha_enabled,
                     ai_credits_per_month: defaults.ai_credits_per_month,
                     ai_model_tier: defaults.ai_model_tier,
+                    // NAN-1544: observability monitor caps follow the tier
+                    // default (no per-org DB override column today).
+                    max_metric_monitors: defaults.max_metric_monitors,
+                    max_synthetic_checks: defaults.max_synthetic_checks,
+                    max_slos: defaults.max_slos,
                 })
             }
             None => Ok(TierLimits::for_tier(OrganizationTier::default())),
@@ -1099,6 +1137,10 @@ mod tests {
         assert!(limits.ha_enabled);
         assert_eq!(limits.ai_credits_per_month, None);
         assert_eq!(limits.ai_model_tier, AiModelTier::Full);
+        // NAN-1544: observability monitor caps unlimited on Unrestricted.
+        assert_eq!(limits.max_metric_monitors, None);
+        assert_eq!(limits.max_synthetic_checks, None);
+        assert_eq!(limits.max_slos, None);
         assert!(!limits.is_enforced());
     }
 
@@ -1115,6 +1157,10 @@ mod tests {
         assert!(!limits.ha_enabled);
         assert_eq!(limits.ai_credits_per_month, Some(3_000));
         assert_eq!(limits.ai_model_tier, AiModelTier::Economy);
+        // NAN-1544: open/hobby tier gets 5 of each observability monitor type.
+        assert_eq!(limits.max_metric_monitors, Some(5));
+        assert_eq!(limits.max_synthetic_checks, Some(5));
+        assert_eq!(limits.max_slos, Some(5));
         assert!(limits.is_enforced());
     }
 
@@ -1159,6 +1205,10 @@ mod tests {
         assert!(limits.ha_enabled);
         assert_eq!(limits.ai_credits_per_month, Some(50_000));
         assert_eq!(limits.ai_model_tier, AiModelTier::Full);
+        // NAN-1544: Team gets the wider 25-each allowance.
+        assert_eq!(limits.max_metric_monitors, Some(25));
+        assert_eq!(limits.max_synthetic_checks, Some(25));
+        assert_eq!(limits.max_slos, Some(25));
     }
 
     #[test]

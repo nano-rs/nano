@@ -331,6 +331,11 @@ impl AppState {
                 handles.push(self.start_model_catalog_sync_scheduler());
                 tracing::info!("Model catalog auto-sync scheduler started (leader-only)");
             }
+
+            // Synthetic-check runner (NAN-1538) — outbound HTTP probes, so it is
+            // egress-gated alongside the other internet-facing jobs.
+            handles.push(self.start_synthetics_runner());
+            tracing::info!("Synthetic-check runner started (leader-only, 15s tick)");
         }
 
         // Tuning scheduler (low-frequency singleton)
@@ -344,6 +349,19 @@ impl AppState {
         // SIEM health check (AI-driven data quality analysis, every 12 hours)
         handles.push(self.start_siem_health_check_scheduler());
         tracing::info!("SIEM health check scheduler started (leader-only, 12h interval)");
+
+        // Metric-monitor evaluator (NAN-1540) — threshold alerts on OTLP metric
+        // aggregates. Leader-only so a breach raises exactly one alert per due
+        // tick across the jobs fleet.
+        handles.push(self.start_metric_monitor_scheduler());
+        tracing::info!("Metric-monitor evaluator started (leader-only, 30s tick)");
+
+        // SLO burn-rate evaluator (NAN-1563) — recomputes each SLO's SLI/burn
+        // over its rolling window and raises a `kind:"slo"` alert on breach.
+        // ClickHouse-internal (no egress), leader-only so a breach raises exactly
+        // one alert per re-arm interval across the jobs fleet.
+        handles.push(self.start_slo_scheduler());
+        tracing::info!("SLO burn-rate evaluator started (leader-only, 60s tick)");
 
         // Cleanup tasks (leader-only to avoid duplicate work across nodes).
         // Job store / wizard session / melod session cleanups are enterprise-only —

@@ -77,7 +77,7 @@ import { useSearchHistory } from '@/hooks/useSearchHistory';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { Sheet, SheetContent, SheetTitle } from '@/components/ui/sheet';
 import { useNotebookCapture } from '@/enterprise/contexts/NotebookContext';
-import { TimelineVisualization, FieldsPanel, FIELD_STATS_PINNED_COLUMNS, SearchResults, SearchQueryInput, SavedQueriesPalette, SearchJobsModal, PrevalenceSlider, type FieldStat } from '@/components/search';
+import { TimelineVisualization, FieldsPanel, FIELD_STATS_PINNED_COLUMNS, SearchResults, SearchQueryInput, SavedQueriesPalette, SearchJobsModal, PrevalenceSlider, DatasetSelector, type FieldStat } from '@/components/search';
 import { AnalyzeView } from '@/enterprise/components/search/AnalyzeView';
 import { useHereCardOverride } from '@/contexts/PageContext';
 import type { SearchJobSummary } from '@/lib/api';
@@ -381,6 +381,14 @@ export function Search() {
 
   // Core state
   const [queryMode, setQueryMode] = useState<'piped' | 'sql'>(urlMode === 'natural' ? 'piped' : urlMode as 'piped' | 'sql');
+  // NAN-1534: observability dataset the nPL pipeline runs against. "logs" (the
+  // UDM lane) is the default; "spans"/"metrics" target the OTLP tables. The
+  // dedicated /observability explorers are the primary span/metric surfaces —
+  // this toggle lets analysts run ad-hoc nPL against those tables in-place.
+  const [dataset, setDataset] = useState<import('@/lib/api/types').SearchDataset>(() => {
+    const d = searchParams.get('dataset');
+    return d === 'spans' || d === 'metrics' ? d : 'logs';
+  });
   const [query, setQuery] = useState(urlQuery || '');
   const [executedQuery, setExecutedQuery] = useState(''); // Query that was actually executed (for highlighting)
   const [naturalLanguageQuery, setNaturalLanguageQuery] = useState(urlMode === 'natural' ? urlQuery : '');
@@ -576,7 +584,7 @@ export function Search() {
   // reduced (visible + pinned) column set — gates "Index all fields".
   const [fieldStatsReduced, setFieldStatsReduced] = useState(false);
   // Parameters of the last field-stats fetch, for the "Index all fields" refetch.
-  const lastFieldStatsRequestRef = useRef<{ query: string; start: string; end: string; request_id?: string } | null>(null);
+  const lastFieldStatsRequestRef = useRef<{ query: string; start: string; end: string; request_id?: string; dataset?: import('@/lib/api/types').SearchDataset } | null>(null);
 
   
   // Share state
@@ -1216,6 +1224,7 @@ export function Search() {
         start: apiTime.start,
         end: apiTime.end,
         request_id: currentRequestIdRef.current ?? undefined,
+        dataset, // NAN-1559: stats must enumerate the same dataset the search targeted
       };
       lastFieldStatsRequestRef.current = fsRequest;
       // Small, specific result set → fetch the FULL inventory directly (no
@@ -1355,7 +1364,7 @@ export function Search() {
 
   // Start streaming search via SSE (replaces async polling for better UX)
   const startStreamingSearch = useCallback((
-    request: { query: string; time_range: import('@/lib/api/types').TimeRange; limit: number; offset: number; skip_field_stats: boolean; table_view?: boolean },
+    request: { query: string; time_range: import('@/lib/api/types').TimeRange; limit: number; offset: number; skip_field_stats: boolean; table_view?: boolean; dataset?: import('@/lib/api/types').SearchDataset },
     currentQuery: string,
     currentTimeRange: TimeRangeValue,
     currentMode: 'piped' | 'sql',
@@ -1533,6 +1542,7 @@ export function Search() {
             start: apiTime.start,
             end: apiTime.end,
             request_id: currentRequestIdRef.current ?? undefined,
+            dataset, // NAN-1559: stats must enumerate the same dataset the search targeted
           };
           lastFieldStatsRequestRef.current = fsRequest;
           // NAN-1508/1509: the streaming path is the default piped-search path —
@@ -1711,7 +1721,7 @@ export function Search() {
       } else if (shouldUseStreaming) {
         // Use SSE streaming for live result delivery
         startStreamingSearch(
-          { query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset, skip_field_stats: true, table_view: true },
+          { query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset, skip_field_stats: true, table_view: true, dataset },
           currentQuery, currentTimeRange, currentMode, isAggregate
         );
         // Refresh SQL panel if visible (SSE returns early, so do it before exit)
@@ -1726,7 +1736,7 @@ export function Search() {
         // table_view: slim columns (id, timestamp, message, source_type + key UDM fields)
         // Full row data fetched on demand via fetchLog when user expands a row
         // Field stats come from separate async /api/search/field-stats endpoint
-        response = await search({ query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset, use_cache: useCache, skip_field_stats: true, table_view: true, request_id: requestId });
+        response = await search({ query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset, use_cache: useCache, skip_field_stats: true, table_view: true, request_id: requestId, dataset });
       }
 
       if (abortControllerRef.current?.signal.aborted) return;
@@ -1881,6 +1891,7 @@ export function Search() {
           start: apiTimeRange.start,
           end: apiTimeRange.end,
           request_id: requestId,
+          dataset, // NAN-1559: stats must enumerate the same dataset the search targeted
         };
         lastFieldStatsRequestRef.current = fsRequest;
         // Small, specific result set → full inventory directly; broad → reduced.
@@ -1946,7 +1957,7 @@ export function Search() {
       }
       setHasSearched(true);
     }
-  }, [query, queryMode, timeRange, pageSize, search, searchSql, updateUrl, addToSearchHistory, refreshHistory, captureSearch, prevalenceMax, showSql, explainQuery, startStreamingSearch, requestQueryCorrection]);
+  }, [query, queryMode, timeRange, pageSize, search, searchSql, updateUrl, addToSearchHistory, refreshHistory, captureSearch, prevalenceMax, showSql, explainQuery, startStreamingSearch, requestQueryCorrection, dataset]);
 
   const handleStopSearch = useCallback(() => {
     // Abort SSE stream (closes connection, backend detects disconnect and kills ClickHouse query)
@@ -2020,7 +2031,7 @@ export function Search() {
 
       const response = queryMode === 'sql'
         ? await searchSql({ sql: cleanQuery, time_range: apiTimeRange, limit: effectiveSize, offset })
-        : await search({ query: cleanQuery, time_range: apiTimeRange, limit: effectiveSize, offset, skip_field_stats: true });
+        : await search({ query: cleanQuery, time_range: apiTimeRange, limit: effectiveSize, offset, skip_field_stats: true, dataset });
 
       if (abortControllerRef.current?.signal.aborted) return;
 
@@ -2044,7 +2055,7 @@ export function Search() {
     } finally {
       setIsSearching(false);
     }
-  }, [isAggregateQuery, displayType, executedQuery, searchResults.length, timeRange, tablePageSize, totalCount, queryMode, prevalenceMax, search, searchSql]);
+  }, [isAggregateQuery, displayType, executedQuery, searchResults.length, timeRange, tablePageSize, totalCount, queryMode, prevalenceMax, search, searchSql, dataset]);
 
   const handleTablePageSizeChange = useCallback((newSize: number) => {
     setTablePageSize(newSize);
@@ -3205,6 +3216,10 @@ export function Search() {
             <span className="hidden md:inline text-muted-foreground search-console-time">UTC {new Date().toLocaleTimeString('en-US', { timeZone: 'UTC', hour: '2-digit', minute: '2-digit', hour12: false })}</span>
           </div>
 
+          {/* NAN-1555: the dataset selector moved into the footer chip row as a
+              compact dropdown card (DatasetSelector), next to Rarity — it no
+              longer consumes a full segmented row above the search bar. */}
+
           {/* Unified search bar with auto-detect query language.
               NOTE: the old "pivt — natural language in, query out" banner
               was replaced by the NATURAL LANGUAGE badge that sits above
@@ -3616,6 +3631,11 @@ export function Search() {
                 </button>
               </>
             )}
+
+            {/* Dataset selector — compact dropdown card (NAN-1555). Sits next to
+                Rarity in the footer chip row instead of a full segmented row. */}
+            <span aria-hidden className="mx-1.5 w-1 h-1 rounded-full bg-border shrink-0" />
+            <DatasetSelector value={dataset} onChange={setDataset} disabled={isSearching} />
 
             {/* Prevalence slider (piped mode only) — compact */}
             {queryMode === 'piped' && (
@@ -4067,7 +4087,7 @@ export function Search() {
             or don't benefit from a histogram (lateral DAG has no per-bucket
             event density to show; cloud overview/dossier ship their own
             activity timeline). */}
-        {!isTreeView && displayType !== 'timechart' && displayType !== 'ranked_bar' && displayType !== 'flow' && displayType !== 'asset' && displayType !== 'cloud' && displayType !== 'lateral' && (
+        {!isTreeView && displayType !== 'timechart' && displayType !== 'ranked_bar' && displayType !== 'flow' && displayType !== 'asset' && displayType !== 'cloud' && displayType !== 'lateral' && displayType !== 'services' && displayType !== 'service' && displayType !== 'trace' && displayType !== 'metric' && (
         <TimelineVisualization
           timelineData={timelineData}
           eventCount={histogramEventCount}
@@ -4117,7 +4137,7 @@ export function Search() {
             Results header via SearchResults' fieldsCollapsed prop. */}
 
         {/* Mobile Fields button - always visible on mobile when field data available */}
-        {isMobile && fieldsPanelVisible && !isTreeView && displayType !== 'timechart' && displayType !== 'ranked_bar' && displayType !== 'flow' && displayType !== 'cloud' && displayType !== 'lateral' && (
+        {isMobile && fieldsPanelVisible && !isTreeView && displayType !== 'timechart' && displayType !== 'ranked_bar' && displayType !== 'flow' && displayType !== 'cloud' && displayType !== 'lateral' && displayType !== 'services' && displayType !== 'service' && displayType !== 'trace' && displayType !== 'metric' && (
           <div className="animate-in fade-in slide-in-from-top-1 duration-300 px-4 py-3">
             <button
               onClick={() => setMobileFieldsOpen(true)}
@@ -4158,7 +4178,7 @@ export function Search() {
         {/* Fields panel + Results area - Fields panel hidden for full-width visualizations */}
         {!analyzeActive && (() => {
           const showFieldsPanel = fieldsPanelVisible && !isTreeView &&
-            displayType !== 'timechart' && displayType !== 'ranked_bar' && displayType !== 'flow' && displayType !== 'asset' && displayType !== 'cloud' && displayType !== 'lateral';
+            displayType !== 'timechart' && displayType !== 'ranked_bar' && displayType !== 'flow' && displayType !== 'asset' && displayType !== 'cloud' && displayType !== 'lateral' && displayType !== 'services' && displayType !== 'service' && displayType !== 'trace' && displayType !== 'metric';
           return (
             <div className={`flex w-full min-w-0 ${showFieldsPanel && fieldsPanelExpanded ? 'gap-2.5' : ''}`} style={{ minHeight: 0 }}>
               {/* Fields Panel - hidden on mobile */}
@@ -4185,7 +4205,12 @@ export function Search() {
                       query={query}
                       timeRange={apiTimeRange}
                       onFetchFieldValues={(field, q, start, end) =>
-                        fetchSearchFieldValues({ field, query: q, start, end, limit: 100 })
+                        // NAN-1559: drill-in must use the dataset the displayed
+                        // results were executed with (snapshotted at search time),
+                        // NOT the live selector — switching datasets without
+                        // re-running would otherwise resolve the field against the
+                        // wrong table.
+                        fetchSearchFieldValues({ field, query: q, start, end, limit: 100, dataset: lastFieldStatsRequestRef.current?.dataset ?? dataset })
                       }
                       isReducedFieldSet={fieldStatsReduced}
                       onLoadAllFields={loadAllFieldStats}
@@ -4269,7 +4294,9 @@ export function Search() {
             query={query}
             timeRange={apiTimeRange}
             onFetchFieldValues={(field, q, start, end) =>
-              fetchSearchFieldValues({ field, query: q, start, end, limit: 100 })
+              // NAN-1559: use the executed-search dataset (snapshotted at search
+              // time), not the live selector — see the panel above.
+              fetchSearchFieldValues({ field, query: q, start, end, limit: 100, dataset: lastFieldStatsRequestRef.current?.dataset ?? dataset })
             }
           />
         </SheetContent>

@@ -183,7 +183,9 @@ pub const OCSF_FILE_PREDICATE: &str = "(class_uid = 1001)";
 pub fn event_type_sql(profile: &dyn crate::schema::SchemaProfile) -> &'static str {
     match profile.id() {
         crate::schema::SchemaId::Ocsf => OCSF_EVENT_TYPE_SQL,
-        crate::schema::SchemaId::Udm => EVENT_TYPE_SQL,
+        crate::schema::SchemaId::Udm
+        | crate::schema::SchemaId::Spans
+        | crate::schema::SchemaId::Metrics => EVENT_TYPE_SQL,
     }
 }
 
@@ -191,7 +193,9 @@ pub fn event_type_sql(profile: &dyn crate::schema::SchemaProfile) -> &'static st
 pub fn lane_sql(profile: &dyn crate::schema::SchemaProfile) -> &'static str {
     match profile.id() {
         crate::schema::SchemaId::Ocsf => OCSF_LANE_SQL,
-        crate::schema::SchemaId::Udm => LANE_SQL,
+        crate::schema::SchemaId::Udm
+        | crate::schema::SchemaId::Spans
+        | crate::schema::SchemaId::Metrics => LANE_SQL,
     }
 }
 
@@ -199,7 +203,9 @@ pub fn lane_sql(profile: &dyn crate::schema::SchemaProfile) -> &'static str {
 pub fn auth_predicate(profile: &dyn crate::schema::SchemaProfile) -> &'static str {
     match profile.id() {
         crate::schema::SchemaId::Ocsf => OCSF_AUTH_PREDICATE,
-        crate::schema::SchemaId::Udm => AUTH_PREDICATE,
+        crate::schema::SchemaId::Udm
+        | crate::schema::SchemaId::Spans
+        | crate::schema::SchemaId::Metrics => AUTH_PREDICATE,
     }
 }
 
@@ -207,7 +213,9 @@ pub fn auth_predicate(profile: &dyn crate::schema::SchemaProfile) -> &'static st
 pub fn file_predicate(profile: &dyn crate::schema::SchemaProfile) -> &'static str {
     match profile.id() {
         crate::schema::SchemaId::Ocsf => OCSF_FILE_PREDICATE,
-        crate::schema::SchemaId::Udm => FILE_PREDICATE,
+        crate::schema::SchemaId::Udm
+        | crate::schema::SchemaId::Spans
+        | crate::schema::SchemaId::Metrics => FILE_PREDICATE,
     }
 }
 

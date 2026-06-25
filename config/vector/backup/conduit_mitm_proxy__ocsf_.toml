@@ -1,0 +1,295 @@
+# Auto-generated Vector configuration for parser: Conduit MITM Proxy (OCSF)
+# DO NOT EDIT - changes will be overwritten
+# Generated at: 2026-06-14T20:28:39.891801+00:00
+
+
+[transforms.conduit_mitm_proxy__ocsf__parse]
+type = "remap"
+inputs = ["source_router.conduit_mitm_proxy__ocsf_"]
+source = '''
+# Conduit proxy JSON access log -> OCSF 1.8.0 HTTP Activity (class_uid 4002).
+# Emits the COMPLETE OCSF record on the root.
+
+raw_log = string!(.message)
+parsed, err = parse_json(raw_log)
+
+if err == null && is_object(parsed) {
+    p = object!(parsed)
+
+    # ---- method -> activity_id (OCSF HTTP Activity enum, 1.8.0) ----
+    method = upcase(string(p.method) ?? "")
+    activity_id = 99
+    activity_name = "Other"
+    if method == "CONNECT" { activity_id = 1; activity_name = "Connect" }
+    if method == "DELETE"  { activity_id = 2; activity_name = "Delete" }
+    if method == "GET"     { activity_id = 3; activity_name = "Get" }
+    if method == "HEAD"    { activity_id = 4; activity_name = "Head" }
+    if method == "OPTIONS" { activity_id = 5; activity_name = "Options" }
+    if method == "POST"    { activity_id = 6; activity_name = "Post" }
+    if method == "PUT"     { activity_id = 7; activity_name = "Put" }
+    if method == "TRACE"   { activity_id = 8; activity_name = "Trace" }
+    if method == "PATCH"   { activity_id = 9; activity_name = "Patch" }
+
+    # ---- status_code -> status_id (2xx/3xx Success, else Failure) ----
+    code = to_int(p.status_code) ?? 0
+    status_id = 2
+    status_str = "Failure"
+    if code >= 200 && code < 400 { status_id = 1; status_str = "Success" }
+
+    # ---- severity: elevate when the proxy blocked the request ----
+    severity_id = 1
+    severity = "Informational"
+    blocked = if is_boolean(p.threat_blocked) { bool(p.threat_blocked) ?? false } else { false }
+    if blocked {
+        severity_id = 4
+        severity = "High"
+    }
+
+    # ---- time: ISO8601 (nanoseconds) -> epoch milliseconds ----
+    time_ms = 0
+    ts_str = string(p.timestamp) ?? ""
+    if ts_str != "" {
+        t, terr = parse_timestamp(ts_str, "%+")
+        if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+    }
+
+    # ---- upstream_addr "ip:port" -> dst_endpoint ip/port ----
+    dst_endpoint = {}
+    host = string(p.host) ?? ""
+    if host != "" { dst_endpoint.hostname = downcase(host) }
+    upstream = string(p.upstream_addr) ?? ""
+    if upstream != "" {
+        ua = split(upstream, ":")
+        if length(ua) >= 1 { dst_endpoint.ip = downcase(string(ua[0]) ?? "") }
+        if length(ua) >= 2 { dst_endpoint.port = to_int(ua[1]) ?? 0 }
+    }
+    if !exists(dst_endpoint.port) {
+        dport = to_int(p.port) ?? 0
+        if dport != 0 { dst_endpoint.port = dport }
+    }
+
+    class_uid = 4002
+
+    req_path = string(p.path) ?? ""
+    full_url = string(p.full_url) ?? ""
+
+    http_request = {
+        "http_method": method,
+        "url": {
+            "path": req_path,
+            "url_string": full_url,
+            "hostname": downcase(host)
+        }
+    }
+
+    http_response = {
+        "code": code,
+        "length": to_int(p.response_bytes) ?? 0,
+        "status": status_str
+    }
+
+    # threat_signals arrives as an array of {name, score, tier} objects, which
+    # is awkward to query (positional indices) and renders as a JSON blob in
+    # the record view. Reshape it into a name-keyed map so each detector is a
+    # first-class queryable JSON subcolumn under `unmapped`
+    # (e.g. unmapped.threat_signals.dga_entropy.score > 0.5) and flattens to
+    # leaf rows in the inspector. Detection rules ride the same nPL->SQL path,
+    # so signals are usable in rules directly. The raw array is preserved in
+    # the OCSF `message` (raw log), so nothing is lost.
+    threat_signals = {}
+    raw_signals = array(p.threat_signals) ?? []
+    for_each(raw_signals) -> |_i, sig| {
+        s = object(sig) ?? {}
+        sig_name = string(s.name) ?? ""
+        if sig_name != "" {
+            threat_signals = set(threat_signals, [sig_name], {
+                "score": s.score,
+                "tier": s.tier
+            }) ?? threat_signals
+        }
+    }
+
+    # Proxy-specific signals with no PROMOTED OCSF column -> standard
+    # `unmapped` (the OCSF extended-fields spill). NAN-1443 lean storage keeps
+    # only promoted columns + this object + raw `message`, so anything not
+    # promoted must land here to stay a queryable field rather than
+    # message-only. `scheme`/`auth_method` were previously dropped to
+    # message-only (NAN-1462); `url.scheme` is not a promoted column, so
+    # `scheme` belongs here, not at a non-promoted spec path.
+    unmapped = {
+        "category": string(p.category) ?? null,
+        "action": string(p.action) ?? null,
+        "scheme": string(p.scheme) ?? null,
+        "auth_method": string(p.auth_method) ?? null,
+        "cache_status": string(p.cache_status) ?? null,
+        "content_type": string(p.content_type) ?? null,
+        "tls_intercepted": p.tls_intercepted,
+        "threat_score": p.threat_score,
+        "threat_tier": string(p.threat_tier) ?? null,
+        "threat_blocked": p.threat_blocked,
+        "threat_signals": threat_signals,
+        "rule_id": p.rule_id,
+        "duration_ms": p.duration_ms
+    }
+
+    . = {
+        "class_uid": class_uid,
+        "class_name": "HTTP Activity",
+        "category_uid": 4,
+        "category_name": "Network Activity",
+        "activity_id": activity_id,
+        "activity_name": activity_name,
+        "type_uid": class_uid * 100 + activity_id,
+        "severity_id": severity_id,
+        "severity": severity,
+        "status_id": status_id,
+        "status": status_str,
+        "time": time_ms,
+        "message": raw_log,
+        "metadata": {
+            "version": "1.8.0",
+            "uid": string(p.id) ?? uuid_v4(),
+            "log_name": "conduit-proxy",
+            "product": {
+                "name": "Conduit Proxy",
+                "vendor_name": "Conduit"
+            }
+        },
+        "src_endpoint": {
+            "ip": downcase(string(p.client_ip) ?? "")
+        },
+        "dst_endpoint": dst_endpoint,
+        "http_request": http_request,
+        "http_response": http_response,
+        # OCSF: bytes_in = source(client)->destination, bytes_out = destination->source.
+        "traffic": {
+            "bytes_in": to_int(p.request_bytes) ?? 0,
+            "bytes_out": to_int(p.response_bytes) ?? 0
+        },
+        "unmapped": unmapped
+    }
+
+    # authenticated proxy user -> actor.user.name (+ top-level user.name),
+    # omit when absent/null.
+    auth_user = string(p.username) ?? ""
+    if auth_user != "" {
+        .actor = { "user": { "name": downcase(auth_user) } }
+        .user = { "name": downcase(auth_user) }
+    }
+} else {
+    # Non-access (internal/error) lines or parse failure: land a minimal,
+    # debuggable record rather than dropping the row.
+    . = {
+        "class_uid": 4002,
+        "category_uid": 4,
+        "activity_id": 99,
+        "type_uid": 400299,
+        "severity_id": 1,
+        "status_id": 0,
+        "time": 0,
+        "message": raw_log,
+        "metadata": {
+            "version": "1.8.0",
+            "uid": uuid_v4(),
+            "log_level": "error",
+            "product": {
+                "name": "Conduit Proxy",
+                "vendor_name": "Conduit"
+            }
+        }
+    }
+}
+
+'''
+
+[transforms.conduit_mitm_proxy__ocsf__ocsf_split]
+type = "route"
+inputs = ["conduit_mitm_proxy__ocsf__parse"]
+[transforms.conduit_mitm_proxy__ocsf__ocsf_split.route]
+ocsf = 'exists(.class_uid)'
+
+[transforms.conduit_mitm_proxy__ocsf__ocsf_prepare]
+type = "remap"
+inputs = ["conduit_mitm_proxy__ocsf__ocsf_split.ocsf"]
+source = '''
+ocsf_event = .
+time_ms = to_int(.time) ?? 0
+ts = now()
+if time_ms > 0 { ts = from_unix_timestamp!(time_ms, unit: "milliseconds") }
+src_type = downcase(to_string(%source_type) ?? "unknown")
+if src_type == "" { src_type = "unknown" }
+. = { "event": ocsf_event, "timestamp": format_timestamp!(ts, "%Y-%m-%d %H:%M:%S%.3f"), "source_type": src_type }
+'''
+
+[transforms.conduit_mitm_proxy__ocsf__output]
+type = "remap"
+inputs = ["conduit_mitm_proxy__ocsf__ocsf_split._unmatched"]
+source = '''
+# Flatten for ClickHouse - standard NanoSIEM format
+# Spread all .udm fields to top level, preserve .ext
+# The clickhouse_mapping transform handles final column assignment and ext capture
+
+# Handle timestamp - use udm.timestamp if set, otherwise now()
+ts_val = .udm.timestamp
+if ts_val == null {
+ts_val = now()
+}
+
+# Handle metadata - ensure it's an object
+meta_val = .metadata
+if meta_val == null {
+meta_val = {}
+}
+
+# Handle ext - preserve source-specific queryable fields
+# Parser sets fields like .ext.principal_id, .ext.bucket_name
+ext_val = .ext
+if ext_val == null {
+ext_val = {}
+}
+
+# Handle source_type - use .source_type if set, otherwise default
+st_val = .source_type
+if st_val == null {
+st_val = "conduit_mitm_proxy__ocsf_"
+}
+
+# Preserve message and udm object
+msg_val = .message
+udm_val = .udm
+if udm_val == null {
+udm_val = {}
+}
+
+# Start with base fields
+. = {
+"timestamp": ts_val,
+"message": msg_val,
+"metadata": encode_json(meta_val),
+"ext": ext_val,
+"source_type": st_val
+}
+
+# Inject vendor, product, and category from log_sources metadata
+# These are configured in the UI and don't require parser VRL to set them
+.vendor = "Conduit"
+.product = "Conduit Proxy"
+.vendor_product = "Conduit Conduit Proxy"
+.category = "network"
+.namespace = "default"
+
+# Spread ALL .udm fields to top level for clickhouse_mapping
+# This includes src_ip, action, user, category, user_type, etc.
+# Note: category from udm will override the default if parser sets it
+udm_keys, err = keys(udm_val)
+if err == null {
+for_each(udm_keys) -> |_idx, key| {
+if key != "timestamp" && key != "message" {
+val, get_err = get(udm_val, [key])
+if get_err == null && val != null {
+. = set!(., [key], val)
+}
+}
+}
+}
+'''

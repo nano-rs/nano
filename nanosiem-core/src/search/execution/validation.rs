@@ -31,6 +31,25 @@ const ALLOWED_TABLES: &[&str] = &[
     // panels reference it directly under NANO_SCHEMA_PROFILE=ocsf.
     "ocsf_logs",
     "ocsf_logs_distributed",
+    // OTLP spans dataset (NAN-1555) — `/search?dataset=spans` runs nPL over this
+    // native-storage table (migration 138). `_local`/`_distributed` follow the
+    // clustered-deployment naming convention so user-submitted SQL can reference
+    // the same tables the nPL generator targets.
+    "otel_spans",
+    "otel_spans_local",
+    "otel_spans_distributed",
+    // OTLP metrics dataset (NAN-1555 Phase 2) — raw data points (migration 140)
+    // plus the generic multi-resolution rollups (migration 144) that resolution
+    // routing reads for wide windows.
+    "otel_metrics",
+    "otel_metrics_local",
+    "otel_metrics_distributed",
+    "otel_metrics_1m",
+    "otel_metrics_1m_local",
+    "otel_metrics_1m_distributed",
+    "otel_metrics_1h",
+    "otel_metrics_1h_local",
+    "otel_metrics_1h_distributed",
     "signals",
     "signals_distributed",
     "ingestion_errors",

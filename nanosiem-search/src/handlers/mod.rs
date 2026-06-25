@@ -13,6 +13,7 @@ mod cloud_dossier;
 mod cloud_overview;
 mod health;
 pub(crate) mod identity;
+mod otel;
 mod saved_searches;
 mod search;
 mod search_jobs;
@@ -37,6 +38,10 @@ pub use cloud_dossier::get_cloud_dossier;
 pub use cloud_overview::get_cloud_overview;
 pub use health::{health, ready};
 pub use identity::resolve_identity;
+pub use otel::{
+    get_metric_timeseries, get_rum_summary, get_service_detail, get_trace, list_infra_hosts,
+    list_metric_names, list_metric_tags, list_services, list_traces,
+};
 pub use saved_searches::{
     create_saved_search, delete_saved_search, get_saved_search, list_my_saved_searches,
     list_saved_searches, list_shared_searches, share_saved_search, update_saved_search,
@@ -63,6 +68,11 @@ pub use assets::{
 };
 pub use health::{HealthResponse, ReadyResponse};
 pub use identity::IdentityResolveResponse;
+pub use otel::{
+    InfraHostsResponse, ListTracesResponse, MetricFilterInput, MetricNamesResponse, MetricSeries,
+    MetricTagsResponse, MetricTimeseriesRequest, MetricTimeseriesResponse, RumSummaryResponse,
+    ServiceDetailResponse, ServicesOverviewResponse, TraceResponse,
+};
 pub use search::{
     CancelSearchResponse, ExplainRequest, ExplainResponse, FetchLogRequest, FetchLogResponse,
     FieldStatsRequest, FieldStatsResponse, FieldValuesRequest, FieldValuesResponse,
@@ -120,6 +130,15 @@ pub enum SearchResultResponse {
         search_jobs::admin_get_stats,
         search_jobs::admin_cancel_search_job,
         identity::resolve_identity,
+        otel::get_trace,
+        otel::get_metric_timeseries,
+        otel::list_traces,
+        otel::list_metric_names,
+        otel::list_metric_tags,
+        otel::list_services,
+        otel::get_service_detail,
+        otel::list_infra_hosts,
+        otel::get_rum_summary,
     ),
     components(schemas(
         SearchResultResponse,
@@ -213,6 +232,18 @@ pub enum SearchResultResponse {
         AdmissionStats,
         QueryPriority,
         IdentityResolveResponse,
+        TraceResponse,
+        MetricTimeseriesRequest,
+        MetricFilterInput,
+        MetricSeries,
+        MetricTimeseriesResponse,
+        MetricTagsResponse,
+        ListTracesResponse,
+        MetricNamesResponse,
+        ServicesOverviewResponse,
+        ServiceDetailResponse,
+        InfraHostsResponse,
+        RumSummaryResponse,
         ErrorResponse,
     ))
 )]

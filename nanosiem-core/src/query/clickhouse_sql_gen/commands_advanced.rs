@@ -239,6 +239,17 @@ impl ClickHouseSqlGenerator {
                                 .into(),
                         ))
                     }
+                    // NAN-1528: rate()/histogram_quantile() are OTLP-metric stats
+                    // (need a min/max-over-window or quantileTDigest reduction);
+                    // they have no whole-partition window form. Use stats/timechart
+                    // on the `metrics` dataset instead.
+                    AggFunc::Rate | AggFunc::HistogramQuantile(_) => {
+                        return Err(SqlGenError::InvalidQuery(
+                            "eventstats does not support rate()/histogram_quantile() — use \
+                             stats or timechart on the metrics dataset instead"
+                                .into(),
+                        ))
+                    }
                 };
 
                 let alias = agg.alias.as_ref().cloned().unwrap_or_else(|| {
@@ -264,6 +275,8 @@ impl ClickHouseSqlGenerator {
                         AggFunc::Latest => "latest",
                         AggFunc::Mode => "mode",
                         AggFunc::Sparkline => "sparkline",
+                        AggFunc::Rate => "rate",
+                        AggFunc::HistogramQuantile(_) => "histogram_quantile",
                     };
                     match &agg.field {
                         Some(f) => format!("{}_{}", func_name, normalize_field_name(f)),

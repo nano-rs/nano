@@ -1,0 +1,247 @@
+# Auto-generated Vector configuration for parser: AWS CloudTrail (OCSF)
+# DO NOT EDIT - changes will be overwritten
+# Generated at: 2026-06-14T20:28:39.891602+00:00
+
+
+[transforms.aws_cloudtrail__ocsf__parse]
+type = "remap"
+inputs = ["source_router.aws_cloudtrail__ocsf_"]
+source = '''
+# AWS CloudTrail JSON -> OCSF 1.8.0 API Activity (class_uid 6003).
+raw_log = string!(.message)
+parsed, err = parse_json(raw_log)
+
+if err != null || !is_object(parsed) {
+    . = {
+        "class_uid": 6003,
+        "category_uid": 6,
+        "activity_id": 99,
+        "type_uid": 600399,
+        "severity_id": 1,
+        "status_id": 0,
+        "time": 0,
+        "message": raw_log,
+        "metadata": {
+            "version": "1.8.0",
+            "uid": uuid_v4(),
+            "log_level": "error",
+            "product": { "name": "AWS CloudTrail", "vendor_name": "Amazon" }
+        }
+    }
+} else {
+    p = object!(parsed)
+    ui = object(p.userIdentity) ?? {}
+    nano = object(p._nanosiem) ?? {}
+
+    class_uid = 6003
+
+    # ---- activity_id: CRUD from changeType / readOnly ----
+    change = downcase(string(nano.changeType) ?? "")
+    read_only = if is_boolean(p.readOnly) { bool(p.readOnly) ?? false } else { false }
+    activity_id = 99
+    activity_name = "Other"
+    if change == "create" { activity_id = 1; activity_name = "Create" }
+    if change == "read"   { activity_id = 2; activity_name = "Read" }
+    if change == "update" { activity_id = 3; activity_name = "Update" }
+    if change == "delete" { activity_id = 4; activity_name = "Delete" }
+    if activity_id == 99 && read_only { activity_id = 2; activity_name = "Read" }
+
+    # ---- AWS service token out of eventSource ("ec2.amazonaws.com" -> "ec2") ----
+    event_source = string(p.eventSource) ?? ""
+    svc = ""
+    sm, smerr = parse_regex(event_source, r'^(?P<s>[^.]+)')
+    if smerr == null { svc = string(sm.s) ?? "" }
+    if svc == "" { svc = string(nano.cloudService) ?? "" }
+
+    # ---- outcome: errorCode present -> Failure ----
+    error_code = string(p.errorCode) ?? ""
+    status_id = 1
+    status_str = string(nano.status) ?? "Success"
+    severity_id = 1
+    severity = "Informational"
+    if error_code != "" {
+        status_id = 2
+        status_str = "Failure"
+        severity_id = 2
+        severity = "Low"
+    }
+
+    # ---- time: eventTime ISO8601 -> epoch ms ----
+    time_ms = 0
+    ts_str = string(p.eventTime) ?? ""
+    if ts_str != "" {
+        t, terr = parse_timestamp(ts_str, "%+")
+        if terr == null { time_ms = to_unix_timestamp(t, unit: "milliseconds") }
+    }
+
+    # ---- resources[]: CloudTrail {type, ARN} -> OCSF {type, uid, name} ----
+    res_in = array(p.resources) ?? []
+    resources = map_values(res_in) -> |r| {
+        arn = string(r.ARN) ?? ""
+        rname = ""
+        rm, rmerr = parse_regex(arn, r'(?P<n>[^:/]+)$')
+        if rmerr == null { rname = string(rm.n) ?? "" }
+        { "type": string(r.type) ?? "", "uid": arn, "name": rname }
+    }
+
+    # ---- caller identity ----
+    caller = string(nano.callerName) ?? string(ui.userName) ?? ""
+    caller_uid = string(ui.arn) ?? string(ui.principalId) ?? ""
+
+    mfa = if is_boolean(nano.mfaAuthenticated) { bool(nano.mfaAuthenticated) ?? false } else { false }
+
+    ocsf = {
+        "class_uid": class_uid,
+        "class_name": "API Activity",
+        "category_uid": 6,
+        "category_name": "Application Activity",
+        "activity_id": activity_id,
+        "activity_name": activity_name,
+        "type_uid": class_uid * 100 + activity_id,
+        "severity_id": severity_id,
+        "severity": severity,
+        "status_id": status_id,
+        "status": status_str,
+        "time": time_ms,
+        "message": raw_log,
+        "metadata": {
+            "version": "1.8.0",
+            "uid": string(p.eventID) ?? uuid_v4(),
+            "log_name": "CloudTrail",
+            "log_provider": "AWS CloudTrail",
+            "correlation_uid": string(p.requestID) ?? "",
+            "product": { "name": "AWS CloudTrail", "vendor_name": "Amazon" }
+        },
+        "api": {
+            "operation": string(p.eventName) ?? "",
+            "service": { "name": svc }
+        },
+        "cloud": {
+            "provider": "AWS",
+            "region": string(p.awsRegion) ?? "",
+            "account": {
+                "uid": string(p.recipientAccountId) ?? string(ui.accountId) ?? "",
+                "name": string(nano.accountAlias) ?? ""
+            }
+        },
+        "actor": {
+            "user": {
+                "name": caller,
+                "uid": caller_uid,
+                "type": string(ui.type) ?? ""
+            }
+        }
+    }
+
+    # src_endpoint is REQUIRED on API Activity 6003 — always emit it.
+    ocsf.src_endpoint = { "ip": downcase(string(p.sourceIPAddress) ?? "") }
+
+    ua = string(p.userAgent) ?? ""
+    if ua != "" { ocsf.http_request = { "user_agent": ua } }
+
+    if length(resources) > 0 { ocsf.resources = resources }
+
+    # is_mfa is NOT an API Activity attribute (it's auth-specific) -> unmapped.
+    unmapped = { "mfa_authenticated": mfa }
+    if error_code != "" {
+        unmapped.error_code = error_code
+        unmapped.error_message = string(p.errorMessage) ?? null
+    }
+    ocsf.unmapped = unmapped
+
+    . = ocsf
+}
+
+'''
+
+[transforms.aws_cloudtrail__ocsf__ocsf_split]
+type = "route"
+inputs = ["aws_cloudtrail__ocsf__parse"]
+[transforms.aws_cloudtrail__ocsf__ocsf_split.route]
+ocsf = 'exists(.class_uid)'
+
+[transforms.aws_cloudtrail__ocsf__ocsf_prepare]
+type = "remap"
+inputs = ["aws_cloudtrail__ocsf__ocsf_split.ocsf"]
+source = '''
+ocsf_event = .
+time_ms = to_int(.time) ?? 0
+ts = now()
+if time_ms > 0 { ts = from_unix_timestamp!(time_ms, unit: "milliseconds") }
+src_type = downcase(to_string(%source_type) ?? "unknown")
+if src_type == "" { src_type = "unknown" }
+. = { "event": ocsf_event, "timestamp": format_timestamp!(ts, "%Y-%m-%d %H:%M:%S%.3f"), "source_type": src_type }
+'''
+
+[transforms.aws_cloudtrail__ocsf__output]
+type = "remap"
+inputs = ["aws_cloudtrail__ocsf__ocsf_split._unmatched"]
+source = '''
+# Flatten for ClickHouse - standard NanoSIEM format
+# Spread all .udm fields to top level, preserve .ext
+# The clickhouse_mapping transform handles final column assignment and ext capture
+
+# Handle timestamp - use udm.timestamp if set, otherwise now()
+ts_val = .udm.timestamp
+if ts_val == null {
+ts_val = now()
+}
+
+# Handle metadata - ensure it's an object
+meta_val = .metadata
+if meta_val == null {
+meta_val = {}
+}
+
+# Handle ext - preserve source-specific queryable fields
+# Parser sets fields like .ext.principal_id, .ext.bucket_name
+ext_val = .ext
+if ext_val == null {
+ext_val = {}
+}
+
+# Handle source_type - use .source_type if set, otherwise default
+st_val = .source_type
+if st_val == null {
+st_val = "aws_cloudtrail__ocsf_"
+}
+
+# Preserve message and udm object
+msg_val = .message
+udm_val = .udm
+if udm_val == null {
+udm_val = {}
+}
+
+# Start with base fields
+. = {
+"timestamp": ts_val,
+"message": msg_val,
+"metadata": encode_json(meta_val),
+"ext": ext_val,
+"source_type": st_val
+}
+
+# Inject vendor, product, and category from log_sources metadata
+# These are configured in the UI and don't require parser VRL to set them
+.vendor = "Amazon"
+.product = "AWS CloudTrail"
+.vendor_product = "Amazon AWS CloudTrail"
+.category = "cloud"
+.namespace = "default"
+
+# Spread ALL .udm fields to top level for clickhouse_mapping
+# This includes src_ip, action, user, category, user_type, etc.
+# Note: category from udm will override the default if parser sets it
+udm_keys, err = keys(udm_val)
+if err == null {
+for_each(udm_keys) -> |_idx, key| {
+if key != "timestamp" && key != "message" {
+val, get_err = get(udm_val, [key])
+if get_err == null && val != null {
+. = set!(., [key], val)
+}
+}
+}
+}
+'''

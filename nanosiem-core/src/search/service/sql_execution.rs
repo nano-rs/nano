@@ -73,9 +73,15 @@ impl SearchService {
         query: &str,
         time_range: &TimeRangeInput,
         table_view: bool,
+        dataset: Option<&str>,
     ) -> Result<String, SearchError> {
         // Validate time range
         time_range.validate()?;
+
+        // NAN-1569: resolve the per-query dataset profile so explain matches the
+        // executed path — without this, "Inspect SQL" validates against and
+        // renders the logs table for a spans/metrics query (misleading FROM logs).
+        let query_profile = self.dataset_profile(dataset);
 
         // Extract time modifiers and clean the query
         let (cleaned_query, _, _) = extract_time_modifiers(query);
@@ -85,7 +91,7 @@ impl SearchService {
 
         // NAN-1354: input-side field-name validation (defense-in-depth behind
         // codegen escaping). Keep `explain` consistent with the executed path.
-        validate_query_field_names(&parsed, self.active_profile.as_ref())?;
+        validate_query_field_names(&parsed, query_profile.as_ref())?;
 
         // NAN-806: keep `explain` honest — the executed query has implicit
         // top-N sorting injected after a trailing `stats … by …`, and the
@@ -127,7 +133,7 @@ impl SearchService {
             ..Default::default()
         };
         let mut sql = self
-            .ch_sql_generator
+            .dataset_generator(dataset)
             .generate_with_options(&query_for_sql, &tr, &options)
             .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
 

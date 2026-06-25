@@ -81,6 +81,15 @@ pub(super) fn command(input: &str) -> ParseResult<'_, Command> {
             super::commands_enrichment::cloud_command,
             super::commands_security::lateral_command,
             super::commands_enrichment::ai_command,
+            // Command-page directives (NAN-1560). Plural `services` BEFORE
+            // singular `service` so `| services` isn't mis-parsed as
+            // `service` with the literal token "services" as its name.
+            alt((
+                super::commands_enrichment::services_command,
+                super::commands_enrichment::service_command,
+                super::commands_enrichment::trace_command,
+                super::commands_enrichment::metric_command,
+            )),
             super::commands_core::output_command,
         )),
     ))
@@ -689,6 +698,12 @@ pub(super) fn aggregation_list(input: &str) -> ParseResult<'_, Vec<Aggregation>>
 /// Parse aggregation: func([field]) [as alias] or percentile(field, N) [as alias]
 /// Also supports count without parentheses (e.g., "count" instead of "count()")
 fn aggregation(input: &str) -> ParseResult<'_, Aggregation> {
+    // histogram_quantile(field, N) — special two-arg syntax (NAN-1528). Must run
+    // before the generic path; `histogram_quantile` would otherwise mis-parse.
+    if let Ok((remaining, agg)) = histogram_quantile_aggregation(input) {
+        return Ok((remaining, agg));
+    }
+
     // Try percentile first (has special syntax with two args)
     if let Ok((remaining, agg)) = percentile_aggregation(input) {
         return Ok((remaining, agg));
@@ -819,6 +834,38 @@ fn percentile_aggregation(input: &str) -> ParseResult<'_, Aggregation> {
     ))
 }
 
+/// Parse histogram_quantile aggregation: histogram_quantile(field, N) [as alias]
+/// (NAN-1528, OTLP metrics). Mirrors [`percentile_aggregation`]'s two-arg shape;
+/// N is the percentile 0-100.
+fn histogram_quantile_aggregation(input: &str) -> ParseResult<'_, Aggregation> {
+    let (input, _) = tag_no_case("histogram_quantile").parse(input)?;
+    let (input, _) = char('(').parse(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, field) = alt((quoted_string, field_name)).parse(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = char(',').parse(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, pct) = map_res(digit1, |s: &str| s.parse::<u8>()).parse(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = char(')').parse(input)?;
+    let (input, alias) = opt(preceded(
+        delimited(multispace1, tag_no_case("as"), multispace1),
+        alt((quoted_string, field_name)),
+    ))
+    .parse(input)?;
+
+    Ok((
+        input,
+        Aggregation {
+            func: AggFunc::HistogramQuantile(pct),
+            field: Some(field),
+            alias,
+            condition: None,
+            field_expr: None,
+        },
+    ))
+}
+
 /// Parse aggregation function name
 fn agg_func(input: &str) -> ParseResult<'_, AggFunc> {
     alt((
@@ -851,6 +898,8 @@ fn agg_func(input: &str) -> ParseResult<'_, AggFunc> {
             value(AggFunc::Percentile(99), tag_no_case("p99")),
             value(AggFunc::Mode, tag_no_case("mode")),
             value(AggFunc::Sparkline, tag_no_case("sparkline")),
+            // NAN-1528 (OTLP metrics): per-second counter rate.
+            value(AggFunc::Rate, tag_no_case("rate")),
         )),
     ))
     .parse(input)

@@ -83,6 +83,30 @@ impl VectorConfigManager {
                 );
                 (config, filter_name)
             }
+            "opentelemetry" | "otlp" => {
+                // NAN-1528: OTLP events arrive on the OOTB `otlp_ingest` source
+                // (gRPC :4317 / HTTP :4318) declared in
+                // `config/vector/03-otlp-source.toml`. Like Splunk HEC (:8088),
+                // a per-parser `opentelemetry` source would collide on those
+                // ports and block Vector reload, so each OTLP parser instead
+                // fans out from `otlp_logs_prep` (the OOTB source's normalized
+                // logs output, which tags `.source_type = "otlp_log"`) through a
+                // per-parser filter on `.source_type`. Traces/metrics bypass
+                // parsers entirely — they go straight to the spans/metrics raw
+                // ClickHouse tables and are mapped by a MATERIALIZED VIEW.
+                let filter_name = format!("{}_filter", safe_name);
+                let match_values: &[String] = parser
+                    .match_values
+                    .as_deref()
+                    .unwrap_or(&[]);
+                let config = self.generate_dispatch_route_filter(
+                    &filter_name,
+                    "otlp_logs_prep",
+                    match_values,
+                    &parser.name,
+                );
+                (config, filter_name)
+            }
             "vector" => {
                 // Vector-to-Vector source is handled at infrastructure level in 01-vector-source.toml
                 // Events arrive with source_type already set by the upstream aggregator
@@ -631,6 +655,38 @@ mod dispatch_source_tests {
             !config.contains("type = \"filter\""),
             "must NOT emit a filter when no dispatch route is bound, got:\n{config}",
         );
+    }
+
+    /// NAN-1528: an `opentelemetry` parser fans out from the OOTB
+    /// `otlp_logs_prep` output via a per-parser filter — it must NOT declare
+    /// its own `opentelemetry` source (that would collide on :4317/:4318 and
+    /// block Vector reload, same failure class as the pre-NAN-921 HEC bug).
+    #[test]
+    fn opentelemetry_parser_emits_filter_on_otlp_logs_prep_not_owned_source() {
+        for source_type in ["opentelemetry", "otlp"] {
+            let parser = make_parser(source_type, None);
+            let (config, input_name) = run_generator(&parser);
+            assert!(
+                config.contains("type = \"filter\""),
+                "expected filter transform for {source_type}, got:\n{config}",
+            );
+            assert!(
+                config.contains("inputs = [\"otlp_logs_prep\"]"),
+                "expected filter to consume otlp_logs_prep for {source_type}, got:\n{config}",
+            );
+            assert!(
+                !config.contains("type = \"opentelemetry\""),
+                "must NOT emit a parser-owned opentelemetry source for {source_type}, got:\n{config}",
+            );
+            assert!(
+                !config.contains("4317") && !config.contains("4318"),
+                "must NOT carry OTLP port config — OOTB source owns it, got:\n{config}",
+            );
+            assert!(
+                input_name.ends_with("_filter"),
+                "input chain name should reference the filter transform, got: {input_name}",
+            );
+        }
     }
 
     /// The filter condition still matches against `.source_type` using the

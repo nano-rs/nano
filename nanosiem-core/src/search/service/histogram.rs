@@ -13,6 +13,7 @@ impl SearchService {
         query: &str,
         time_range: &TimeRangeInput,
         query_id: Option<&str>,
+        dataset: crate::query::Dataset,
     ) -> Result<Vec<HistogramBucket>, SearchError> {
         // Extract base filter (everything before the first pipe command)
         let base_query = extract_base_query(query);
@@ -33,7 +34,7 @@ impl SearchService {
         // Calculate appropriate bucket interval based on time range
         let duration_secs = (time_range.end - time_range.start).num_seconds();
 
-        self.generate_clickhouse_histogram(&parsed, &tr, duration_secs, query_id)
+        self.generate_clickhouse_histogram(&parsed, &tr, duration_secs, query_id, dataset)
             .await
     }
 
@@ -44,6 +45,7 @@ impl SearchService {
         time_range: &TimeRange,
         duration_secs: i64,
         query_id: Option<&str>,
+        dataset: crate::query::Dataset,
     ) -> Result<Vec<HistogramBucket>, SearchError> {
         // Verify ClickHouse client is configured
         if self.ch_client.is_none() {
@@ -52,38 +54,37 @@ impl SearchService {
             )));
         }
 
-        // Generate base SQL for the search expression
-        let base_sql = self
-            .ch_sql_generator
+        // Generate base SQL for the search expression. NAN-1557: thread the
+        // observability dataset so the timeline reads `otel_spans`/`otel_metrics`
+        // (not `logs`) and buckets on the dataset's own time column (`start_time`
+        // for spans). `Dataset::Logs` leaves the generator untouched (byte-identical).
+        let base_gen = if dataset == crate::query::Dataset::Logs {
+            self.ch_sql_generator.clone()
+        } else {
+            self.ch_sql_generator.clone().with_dataset(dataset)
+        };
+        let base_sql = base_gen
             .generate(query, time_range)
             .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
+
+        // The histogram buckets the BASE query's output, which carries the
+        // dataset's time column (spans → `start_time`).
+        let tc = dataset.time_column();
 
         // Determine the time bucket function and interval based on duration
         // Use finer granularity for better visualization
         let (time_bucket_func, interval_secs) = match duration_secs {
-            d if d <= 300 => (
-                "toStartOfInterval(timestamp, INTERVAL 5 SECOND)".to_string(),
-                5,
-            ),
-            d if d <= 900 => (
-                "toStartOfInterval(timestamp, INTERVAL 10 SECOND)".to_string(),
-                10,
-            ),
-            d if d <= 1800 => (
-                "toStartOfInterval(timestamp, INTERVAL 30 SECOND)".to_string(),
-                30,
-            ),
-            d if d <= 3600 => ("toStartOfMinute(timestamp)".to_string(), 60),
-            d if d <= 7200 => ("toStartOfMinute(timestamp)".to_string(), 60),
-            d if d <= 21600 => ("toStartOfFiveMinutes(timestamp)".to_string(), 300),
-            d if d <= 43200 => ("toStartOfFiveMinutes(timestamp)".to_string(), 300),
-            d if d <= 86400 => ("toStartOfFiveMinutes(timestamp)".to_string(), 300),
-            d if d <= 172800 => ("toStartOfTenMinutes(timestamp)".to_string(), 600),
-            d if d <= 604800 => (
-                "toStartOfInterval(timestamp, INTERVAL 30 MINUTE)".to_string(),
-                1800,
-            ),
-            _ => ("toStartOfHour(timestamp)".to_string(), 3600),
+            d if d <= 300 => (format!("toStartOfInterval({tc}, INTERVAL 5 SECOND)"), 5),
+            d if d <= 900 => (format!("toStartOfInterval({tc}, INTERVAL 10 SECOND)"), 10),
+            d if d <= 1800 => (format!("toStartOfInterval({tc}, INTERVAL 30 SECOND)"), 30),
+            d if d <= 3600 => (format!("toStartOfMinute({tc})"), 60),
+            d if d <= 7200 => (format!("toStartOfMinute({tc})"), 60),
+            d if d <= 21600 => (format!("toStartOfFiveMinutes({tc})"), 300),
+            d if d <= 43200 => (format!("toStartOfFiveMinutes({tc})"), 300),
+            d if d <= 86400 => (format!("toStartOfFiveMinutes({tc})"), 300),
+            d if d <= 172800 => (format!("toStartOfTenMinutes({tc})"), 600),
+            d if d <= 604800 => (format!("toStartOfInterval({tc}, INTERVAL 30 MINUTE)"), 1800),
+            _ => (format!("toStartOfHour({tc})"), 3600),
         };
 
         let histogram_sql = format!(
@@ -208,7 +209,8 @@ impl SearchService {
         settings: crate::search::admission::ClickHouseQuerySettings,
     ) -> Result<Vec<HistogramBucket>, SearchError> {
         self.active_ch_settings = Some(settings);
-        self.generate_histogram(query, time_range, None).await
+        self.generate_histogram(query, time_range, None, crate::query::Dataset::Logs)
+            .await
     }
 
     /// Generate histogram for a time range (used for raw SQL queries)

@@ -106,6 +106,10 @@ import Denied from '@/pages/Denied';
 // (recharts, @xyflow/react, react-markdown) that would bloat the main bundle
 const Dashboard = lazyWithRetryNamed(() => import('@/pages/Dashboard'), 'Dashboard');
 const Search = lazyWithRetryNamed(() => import('@/pages/Search'), 'Search');
+const TracePage = lazyWithRetryNamed(() => import('@/pages/TracePage'), 'TracePage');
+// NAN-1536: the standalone Traces/Metrics explorer pages are subsumed by the
+// tabbed Observability console; the log->trace pivot still routes to TracePage.
+const ObservabilityConsole = lazyWithRetryNamed(() => import('@/pages/observability/ObservabilityConsole'), 'ObservabilityConsole');
 
 // ============================================================================
 // LAZY IMPORTS - Tier 1: CodeMirror pages (highest impact ~500KB)
@@ -480,6 +484,34 @@ function ProtectedAppRoutes() {
             <PermissionRoute permission="search:view" element={
               <Suspense fallback={<PageLoadingFallback />}>
                 <Search key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          {/* OpenTelemetry distributed trace (NAN-1528) */}
+          <Route path="/trace/:traceId" element={
+            <PermissionRoute permission="search:view" element={
+              <Suspense fallback={<PageLoadingFallback />}>
+                <TracePage key={resetKey} />
+              </Suspense>
+            } />
+          } />
+
+          {/* Observability console (NAN-1536) — tabbed surface that subsumes the
+              standalone NAN-1534 traces/metrics explorers. The optional :tab
+              segment (services|traces|metrics|alerts|slos) drives tab + drill-in
+              state; bare /observability lands on Services. */}
+          <Route path="/observability" element={
+            <PermissionRoute permission="search:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <ObservabilityConsole key={resetKey} />
+              </Suspense>
+            } />
+          } />
+          <Route path="/observability/:tab" element={
+            <PermissionRoute permission="search:view" element={
+              <Suspense fallback={<ListPageLoadingFallback />}>
+                <ObservabilityConsole key={resetKey} />
               </Suspense>
             } />
           } />

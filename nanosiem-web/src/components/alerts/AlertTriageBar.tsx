@@ -50,6 +50,13 @@ interface AlertTriageBarProps {
   currentAssignee?: string | null;
   /** Called after a successful mutation so the page can refetch + reflect. */
   onActionComplete?: () => void;
+  /**
+   * NAN-1547: bypass the NAN-1066 Cases-suppression. Observability monitor
+   * alerts (metric_monitor/slo/synthetic) never enter the Cases workflow, so
+   * their ack/close/assign lifecycle must stay available even on cases-enabled
+   * tenants. Detection alerts leave this false (Cases is their triage path).
+   */
+  bypassCasesSuppression?: boolean;
 }
 
 export function AlertTriageBar({
@@ -58,6 +65,7 @@ export function AlertTriageBar({
   status,
   currentAssignee,
   onActionComplete,
+  bypassCasesSuppression = false,
 }: AlertTriageBarProps) {
   const { hasPermission } = useAuth();
   const { capabilities } = useCapabilities();
@@ -163,8 +171,10 @@ export function AlertTriageBar({
   }, [alertId, assignTo, onActionComplete, toast, users]);
 
   // NAN-1066: enterprise tenants have Cases; the single-alert lifecycle
-  // (ack/close/assign) is the open-core triage workflow only.
-  if (capabilities.cases) {
+  // (ack/close/assign) is the open-core triage workflow only — EXCEPT for
+  // observability monitor alerts (NAN-1547), which never enter Cases and so
+  // keep their direct lifecycle regardless of the cases capability.
+  if (capabilities.cases && !bypassCasesSuppression) {
     return null;
   }
 

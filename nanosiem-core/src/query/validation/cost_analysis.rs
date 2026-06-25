@@ -235,7 +235,39 @@ fn analyze_search_expr(
         SearchExpr::Not(inner) | SearchExpr::Group(inner) => {
             analyze_search_expr(inner, analysis, _context);
         }
+        // NAN-1562: cross-dataset `field IN [dataset=… …]` semi-join advisory.
+        // Suppress for `dataset=logs` from a logs query — the generator emits the
+        // byte-identical same-table form (no cross-dataset cost), so the advisory
+        // would be a false positive.
+        SearchExpr::InSubsearch {
+            subsearch_dataset: Some(ds),
+            ..
+        } if *ds != crate::query::clickhouse_sql_gen::otel::Dataset::Logs => {
+            analysis.warnings.push(QueryWarning {
+                severity: WarningSeverity::Info,
+                code: "CROSS_DATASET_CORRELATION".to_string(),
+                message: format!(
+                    "cross-dataset correlation (IN → {} subsearch) — bounded to {} subsearch rows",
+                    dataset_label(*ds),
+                    crate::query::clickhouse_sql_gen::SUBSEARCH_RESULT_LIMIT
+                ),
+                suggestion: Some(
+                    "Add a tighter filter to the subsearch if the correlation set is large; a dense key set defeats the index and degrades to a full-column scan".to_string()
+                ),
+                impact: None,
+            });
+        }
         _ => {}
+    }
+}
+
+/// Human-readable label for a subsearch [`Dataset`] (NAN-1562 cost advisory).
+fn dataset_label(ds: crate::query::clickhouse_sql_gen::otel::Dataset) -> &'static str {
+    use crate::query::clickhouse_sql_gen::otel::Dataset;
+    match ds {
+        Dataset::Logs => "logs",
+        Dataset::Spans => "spans",
+        Dataset::Metrics => "metrics",
     }
 }
 
@@ -477,7 +509,11 @@ fn analyze_command(
             }
         }
 
-        Command::Join { maxout, .. } => {
+        Command::Join {
+            maxout,
+            subsearch_dataset,
+            ..
+        } => {
             let effective = maxout.unwrap_or(10_000);
             analysis.warnings.push(QueryWarning {
                 severity: WarningSeverity::Info,
@@ -488,6 +524,28 @@ fn analyze_command(
                 ),
                 impact: None,
             });
+            // NAN-1562: cross-dataset correlation advisory. Surface (not block) so
+            // the analyst knows the subsearch hits a second dataset and is bounded.
+            // Suppress for `dataset=logs` from a logs query — the generator emits
+            // the byte-identical same-table form, so the advisory is a false positive.
+            if let Some(ds) = subsearch_dataset
+                .as_ref()
+                .filter(|ds| **ds != crate::query::clickhouse_sql_gen::otel::Dataset::Logs)
+            {
+                analysis.warnings.push(QueryWarning {
+                    severity: WarningSeverity::Info,
+                    code: "CROSS_DATASET_CORRELATION".to_string(),
+                    message: format!(
+                        "cross-dataset correlation (join → {} subsearch) — bounded to {} subsearch rows",
+                        dataset_label(*ds),
+                        effective
+                    ),
+                    suggestion: Some(
+                        "Add a tighter filter to the subsearch if the correlation set is large; a dense key set defeats the index and degrades to a full-column scan".to_string()
+                    ),
+                    impact: None,
+                });
+            }
         }
 
         Command::Append { maxout, .. } => {
@@ -720,5 +778,71 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.code == "EVENTSTATS_NO_PARTITION"));
+    }
+
+    // NAN-1562: cross-dataset correlation surfaces an INFO advisory (non-blocking).
+    #[test]
+    fn cross_dataset_join_emits_info_advisory() {
+        let query =
+            parse_query("error | join trace_id [dataset=spans service_name=checkout]").unwrap();
+        let analysis = analyze_query_cost(&query);
+        let w = analysis
+            .warnings
+            .iter()
+            .find(|w| w.code == "CROSS_DATASET_CORRELATION")
+            .expect("expected a cross-dataset advisory");
+        assert_eq!(w.severity, WarningSeverity::Info);
+        assert!(w.message.contains("spans"), "{}", w.message);
+        // Info, so it must NOT mark the query as blocking.
+        assert!(!analysis.has_errors());
+    }
+
+    #[test]
+    fn cross_dataset_in_emits_info_advisory() {
+        // A genuinely cross-dataset IN (spans) surfaces the advisory.
+        let query =
+            parse_query("trace_id IN [dataset=spans service_name=checkout | return trace_id]")
+                .unwrap();
+        let analysis = analyze_query_cost(&query);
+        assert!(analysis
+            .warnings
+            .iter()
+            .any(|w| w.code == "CROSS_DATASET_CORRELATION"
+                && w.severity == WarningSeverity::Info));
+    }
+
+    // Logs-only forms (no dataset token) must NOT emit the cross-dataset advisory.
+    #[test]
+    fn logs_only_emits_no_cross_dataset_advisory() {
+        let q1 = parse_query("error | join trace_id [search status_code=500]").unwrap();
+        let q2 = parse_query("trace_id IN [status_code=500 | return trace_id]").unwrap();
+        for q in [q1, q2] {
+            let analysis = analyze_query_cost(&q);
+            assert!(!analysis
+                .warnings
+                .iter()
+                .any(|w| w.code == "CROSS_DATASET_CORRELATION"));
+        }
+    }
+
+    // NAN-1562 FIX 5: an explicit `dataset=logs` from a logs query is generated
+    // byte-identically to the same-table form (no cross-dataset cost), so the
+    // CROSS_DATASET_CORRELATION advisory must be SUPPRESSED — firing it would be
+    // a false positive. Covers both the join and IN paths.
+    #[test]
+    fn explicit_dataset_logs_emits_no_cross_dataset_advisory() {
+        let q1 = parse_query("error | join trace_id [dataset=logs status_code=500]").unwrap();
+        let q2 =
+            parse_query("trace_id IN [dataset=logs status_code=500 | return trace_id]").unwrap();
+        for q in [q1, q2] {
+            let analysis = analyze_query_cost(&q);
+            assert!(
+                !analysis
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "CROSS_DATASET_CORRELATION"),
+                "dataset=logs from logs must not fire the cross-dataset advisory"
+            );
+        }
     }
 }

@@ -31,6 +31,7 @@ impl SearchService {
         request_id: Option<&str>,
         user_id: uuid::Uuid,
         priority: super::admission::QueryPriority,
+        dataset: Option<&str>,
     ) -> Result<Vec<FieldInfo>, SearchError> {
         let derived_qid = request_id.map(|r| format!("{r}-fstats"));
 
@@ -43,6 +44,7 @@ impl SearchService {
                     time_range,
                     requested_columns,
                     derived_qid.as_deref(),
+                    dataset,
                 )
                 .await;
         };
@@ -57,7 +59,13 @@ impl SearchService {
         service.active_ch_settings = Some(priority.to_ch_settings());
         // _permit drops at end of scope, freeing the slot.
         service
-            .get_field_stats_for_query(query, time_range, requested_columns, derived_qid.as_deref())
+            .get_field_stats_for_query(
+                query,
+                time_range,
+                requested_columns,
+                derived_qid.as_deref(),
+                dataset,
+            )
             .await
     }
 
@@ -81,6 +89,7 @@ impl SearchService {
         time_range: &TimeRangeInput,
         requested_columns: Option<&[String]>,
         query_id: Option<&str>,
+        dataset: Option<&str>,
     ) -> Result<Vec<FieldInfo>, SearchError> {
         // Only supported for ClickHouse backend
         if self.backend != SearchBackend::ClickHouse {
@@ -102,49 +111,37 @@ impl SearchService {
         // Build time range
         let tr = TimeRange::new(time_range.start, time_range.end);
 
-        // Generate base SQL for the query
+        // Generate base SQL for the query, retargeted to the per-query dataset's
+        // OTLP table (NAN-1559) — without this the spans/metrics base SQL was
+        // generated against `logs` and the companion enumerated UDM columns,
+        // producing ClickHouse 47 `Unknown expression identifier`. Logs unchanged.
         let base_sql = self
-            .ch_sql_generator
+            .dataset_generator(dataset)
             .generate(&base_query, &tr)
             .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
 
-        // Enumerate the columns of the ACTIVE schema's logs table, not a
-        // hardcoded `logs`. `system.columns` reflects the underlying local
-        // MergeTree, so pass the bare local table key (UDM `logs` / OCSF
-        // `ocsf_logs`) — never the `_distributed` read alias (NAN-1241).
-        let logs_table = Self::logs_table_key(self.active_profile.as_ref());
+        // Enumerate the columns of the per-query DATASET's table, not a hardcoded
+        // `logs`. `system.columns` reflects the underlying local MergeTree, so
+        // pass the bare local table name (UDM `logs` / OCSF `ocsf_logs` /
+        // `otel_spans` / `otel_metrics`) — never the `_distributed` read alias
+        // (NAN-1241/NAN-1559).
+        let profile = self.dataset_profile(dataset);
+        let logs_table = crate::schema::logs_table_for(profile.id());
         // Get column list dynamically. The profile's materialized re-add list
         // scopes the inventory to columns resolvable inside a CTE wrap and
         // keeps internal bookkeeping (e.g. OCSF `event_bytes`) out of the
         // analyst-facing field panel (NAN-1397).
         let columns = ch_executor
-            .get_table_columns(logs_table, self.active_profile.materialized_columns())
+            .get_table_columns(logs_table, profile.materialized_columns())
             .await
             .unwrap_or_else(|e| {
+            // NAN-1559: dataset-correct fallback — a UDM list here over an
+            // `otel_spans`/`otel_metrics` base would re-trigger CH 47.
             warn!(
-                "Failed to get table columns for field stats, using defaults: {}",
+                "Failed to get table columns for field stats, using dataset defaults: {}",
                 e
             );
-            vec![
-                "user",
-                "src_ip",
-                "dest_ip",
-                "src_host",
-                "dest_host",
-                "action",
-                "status",
-                "source_type",
-                "process_name",
-                "file_name",
-                "protocol",
-                "auth_type",
-                "auth_result",
-                "category",
-                "duration",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect()
+            Self::field_stats_fallback_columns(dataset)
         });
 
         // NAN-1427: reduce the column set to what the caller requested
@@ -198,6 +195,7 @@ impl SearchService {
         query: &str,
         time_range: &TimeRangeInput,
         limit: usize,
+        dataset: Option<&str>,
     ) -> Result<Vec<FieldValueInfo>, SearchError> {
         // Only supported for ClickHouse backend
         if self.backend != SearchBackend::ClickHouse {
@@ -221,18 +219,25 @@ impl SearchService {
         // Build time range
         let tr = TimeRange::new(time_range.start, time_range.end);
 
+        // Per-query dataset generator (NAN-1559): retargets the base SQL to
+        // `otel_spans`/`otel_metrics` AND resolves the field-access expression
+        // against the dataset profile (e.g. spans `attributes['k']` MapKey), so a
+        // sidebar field drill-in on a spans/metrics search reads the right table
+        // and column. Logs unchanged.
+        let generator = self.dataset_generator(dataset);
+
         // Generate base SQL for the query
-        let base_sql = self
-            .ch_sql_generator
+        let base_sql = generator
             .generate(&field_values_query, &tr)
             .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
 
-        // Resolve the field to its physical access expression via the ACTIVE
-        // schema profile (NAN-1241): OCSF promoted columns (`traffic.bytes_out`,
-        // `activity`) → the escaped dotted column / direct column, not the UDM
+        // Resolve the field to its physical access expression via the per-query
+        // dataset profile (NAN-1241/NAN-1559): OCSF promoted columns
+        // (`traffic.bytes_out`, `activity`) and spans/metrics map keys → the
+        // escaped dotted column / direct column / `attributes['k']`, not the UDM
         // `ext.{field}` spill. Byte-identical for UDM (ExplicitColumn → bare
         // column; Unknown → `ext.{field}`).
-        let field_expr = self.ch_sql_generator.field_access_expr(field, "String");
+        let field_expr = generator.field_access_expr(field, "String");
 
         // Build simple GROUP BY query for this single field
         let field_values_sql = ch_executor.build_field_values_sql(&base_sql, &field_expr, limit);

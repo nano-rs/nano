@@ -91,6 +91,19 @@
   --color-str: var(--str);
   --color-success: var(--success);
 
+  /* Observability console aliases (NAN-1536) — map the design-handoff token
+     names (fg/fg-2/fg-3/fg-4, bg, danger/warn/good) onto existing app tokens so
+     the ported obs surfaces resolve. fg-2/fg-4 are the only net-new base vars
+     (defined in :root/.dark). */
+  --color-fg: var(--foreground);
+  --color-fg-2: var(--fg-2);
+  --color-fg-3: var(--muted-foreground);
+  --color-fg-4: var(--fg-4);
+  --color-bg: var(--background);
+  --color-danger: var(--destructive);
+  --color-warn: var(--warning);
+  --color-good: var(--success);
+
   /* Border radius — kit scale: sharp, restrained */
   --radius-sm: 3px;
   --radius-md: 5px;
@@ -442,6 +455,9 @@ body {
     /* Muted = kit panel (softer bg), muted-fg = kit fg-3 */
     --muted: #F8FAFC;
     --muted-foreground: #64748B;
+    /* Obs console intermediate grays (NAN-1536): fg-2 between fg/fg-3, fg-4 faintest */
+    --fg-2: #334155;
+    --fg-4: #94A3B8;
 
     /* Accent = kit card-2 (hover/selected states) */
     --accent: #F1F5F9;
@@ -614,6 +630,9 @@ body {
     /* Muted = kit panel, muted-fg = kit fg-3 */
     --muted: #0F1319;
     --muted-foreground: #A8ACB4;
+    /* Obs console intermediate grays (NAN-1536): fg-2 between fg/fg-3, fg-4 faintest */
+    --fg-2: #C3C7CF;
+    --fg-4: #6B7280;
 
     /* Accent = kit card-2 (hover/selected) */
     --accent: #161B23;

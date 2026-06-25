@@ -9,6 +9,19 @@ use super::{
 use crate::query::ast::*;
 use std::collections::HashSet;
 
+/// NAN-1555: profile-aware field-name canonicalization for the collection
+/// helpers. Spans/metrics canonicalize through the profile (so `service_name`
+/// stays itself rather than becoming the UDM `cloud_service` alias); logs
+/// (UDM/OCSF) keep the exact free `normalize_field_name` alias map, byte-identical.
+fn canon_collect(field: &str, profile: &dyn crate::schema::SchemaProfile) -> String {
+    match profile.id() {
+        crate::schema::SchemaId::Spans | crate::schema::SchemaId::Metrics => {
+            profile.canonicalize(field).into_owned()
+        }
+        _ => normalize_field_name(field).to_string(),
+    }
+}
+
 /// Analyze query to determine which fields are actually needed
 /// Returns None if all fields are needed (SELECT *), or Some(set) for specific fields
 ///
@@ -22,17 +35,20 @@ pub(crate) fn analyze_required_fields(
     let mut fields = HashSet::new();
     let mut needs_all_fields = false;
 
-    collect_required_fields_from_query(query, &mut fields, &mut needs_all_fields);
+    collect_required_fields_from_query(query, &mut fields, &mut needs_all_fields, profile);
 
     // Remove fields that are added by post-processing (ai, anomaly, prevalence, risk).
     // These never exist in ClickHouse columns or ext JSON — they're computed at runtime.
     fields.retain(|f| !is_post_processing_field(f));
 
-    // Always include core fields needed for basic functionality
-    fields.insert("id".to_string());
-    fields.insert("timestamp".to_string());
-    fields.insert("message".to_string());
-    fields.insert("source_type".to_string());
+    // Always include core fields needed for basic functionality. Profile-driven
+    // (NAN-1555): UDM/OCSF logs default to id/timestamp/message/source_type;
+    // `otel_spans` has none of those columns and supplies its own identity/time/
+    // display core (trace_id/span_id/start_time/span_name/service_name). The
+    // default is byte-identical to the historical hard-coded list.
+    for f in profile.core_fields() {
+        fields.insert((*f).to_string());
+    }
 
     // In table_view mode, optimize column fetching:
     // - If the query has explicit field selection (| table, | fields), just use those
@@ -121,6 +137,33 @@ pub(crate) fn analyze_required_fields(
                         fields.insert(f.to_string());
                     }
                 }
+                // Spans (NAN-1555): the wide-event summary columns for the
+                // table-view grid. All are real `otel_spans` columns (no
+                // MATERIALIZED enrichment to name explicitly), so this just loads
+                // the analyst-facing span fields up front like the UDM/OCSF lists.
+                crate::schema::SchemaId::Spans => {
+                    for f in &[
+                        "service_name",
+                        "span_name",
+                        "span_kind",
+                        "status_code",
+                        "status_message",
+                        "duration_ns",
+                        "src_ip",
+                        "dest_ip",
+                        "user",
+                        "host",
+                    ] {
+                        fields.insert(f.to_string());
+                    }
+                }
+                // Metrics (NAN-1555 Phase 2): the wide-event summary for the
+                // table-view grid — all real `otel_metrics` columns.
+                crate::schema::SchemaId::Metrics => {
+                    for f in &["metric_name", "metric_type", "service_name", "value", "unit"] {
+                        fields.insert(f.to_string());
+                    }
+                }
             }
         }
         return Some(fields);
@@ -181,50 +224,55 @@ fn collect_required_fields_from_query(
     query: &Query,
     fields: &mut HashSet<String>,
     needs_all: &mut bool,
+    profile: &dyn crate::schema::SchemaProfile,
 ) {
     match query {
         Query::Search(expr) => {
-            collect_fields_from_search_expr(expr, fields);
+            collect_fields_from_search_expr(expr, fields, profile);
         }
         Query::Piped { source, command } => {
-            collect_required_fields_from_query(source, fields, needs_all);
-            collect_fields_from_command(command, fields, needs_all);
+            collect_required_fields_from_query(source, fields, needs_all, profile);
+            collect_fields_from_command(command, fields, needs_all, profile);
         }
     }
 }
 
 /// Collect fields from search expressions
-fn collect_fields_from_search_expr(expr: &SearchExpr, fields: &mut HashSet<String>) {
+fn collect_fields_from_search_expr(
+    expr: &SearchExpr,
+    fields: &mut HashSet<String>,
+    profile: &dyn crate::schema::SchemaProfile,
+) {
     match expr {
         SearchExpr::Keyword(_) => {
             // Keywords search message, already in core fields
         }
         SearchExpr::FieldFilter { field, .. } => {
-            fields.insert(normalize_field_name(field).to_string());
+            fields.insert(canon_collect(field, profile));
         }
         SearchExpr::FunctionFilter { function, .. } => {
             // Collect fields from function arguments
-            collect_fields_from_eval_expr(function, fields);
+            collect_fields_from_eval_expr(function, fields, profile);
         }
         SearchExpr::FieldFunctionFilter {
             field, function, ..
         } => {
             // Collect the field and fields from function arguments
-            fields.insert(normalize_field_name(field).to_string());
-            collect_fields_from_eval_expr(function, fields);
+            fields.insert(canon_collect(field, profile));
+            collect_fields_from_eval_expr(function, fields, profile);
         }
         SearchExpr::InList { field, .. } => {
-            fields.insert(normalize_field_name(field).to_string());
+            fields.insert(canon_collect(field, profile));
         }
         SearchExpr::And(left, right) | SearchExpr::Or(left, right) => {
-            collect_fields_from_search_expr(left, fields);
-            collect_fields_from_search_expr(right, fields);
+            collect_fields_from_search_expr(left, fields, profile);
+            collect_fields_from_search_expr(right, fields, profile);
         }
         SearchExpr::Not(inner) | SearchExpr::Group(inner) => {
-            collect_fields_from_search_expr(inner, fields);
+            collect_fields_from_search_expr(inner, fields, profile);
         }
         SearchExpr::BooleanFunction(function) => {
-            collect_fields_from_eval_expr(function, fields);
+            collect_fields_from_eval_expr(function, fields, profile);
         }
         SearchExpr::LiteralComparison { .. } => {
             // Literal comparisons don't reference any fields
@@ -236,7 +284,12 @@ fn collect_fields_from_search_expr(expr: &SearchExpr, fields: &mut HashSet<Strin
 }
 
 /// Collect fields from commands
-fn collect_fields_from_command(cmd: &Command, fields: &mut HashSet<String>, needs_all: &mut bool) {
+fn collect_fields_from_command(
+    cmd: &Command,
+    fields: &mut HashSet<String>,
+    needs_all: &mut bool,
+    profile: &dyn crate::schema::SchemaProfile,
+) {
     match cmd {
         Command::Table {
             fields: table_fields,
@@ -254,7 +307,7 @@ fn collect_fields_from_command(cmd: &Command, fields: &mut HashSet<String>, need
                     if tf.name.contains('*') {
                         *needs_all = true;
                     } else {
-                        fields.insert(normalize_field_name(&tf.name).to_string());
+                        fields.insert(canon_collect(&tf.name, profile));
                     }
                 }
             }
@@ -270,7 +323,7 @@ fn collect_fields_from_command(cmd: &Command, fields: &mut HashSet<String>, need
                     if f.contains('*') {
                         *needs_all = true;
                     } else {
-                        fields.insert(normalize_field_name(f).to_string());
+                        fields.insert(canon_collect(f, profile));
                     }
                 }
             } else {
@@ -289,17 +342,17 @@ fn collect_fields_from_command(cmd: &Command, fields: &mut HashSet<String>, need
             // Collect fields from aggregations
             for agg in aggregations {
                 if let Some(field) = &agg.field {
-                    fields.insert(normalize_field_name(field).to_string());
+                    fields.insert(canon_collect(field, profile));
                 }
                 // Extract fields from condition if present
                 if let Some(condition) = &agg.condition {
-                    collect_fields_from_eval_expr(condition, fields);
+                    collect_fields_from_eval_expr(condition, fields, profile);
                 }
             }
             // Collect group by fields
             if let Some(group_fields) = group_by {
                 for field in group_fields {
-                    fields.insert(normalize_field_name(field).to_string());
+                    fields.insert(canon_collect(field, profile));
                 }
             }
         }
@@ -313,12 +366,12 @@ fn collect_fields_from_command(cmd: &Command, fields: &mut HashSet<String>, need
             fields.insert("timestamp".to_string());
             for agg in aggregations {
                 if let Some(field) = &agg.field {
-                    fields.insert(normalize_field_name(field).to_string());
+                    fields.insert(canon_collect(field, profile));
                 }
             }
             if let Some(group_fields) = group_by {
                 for field in group_fields {
-                    fields.insert(normalize_field_name(field).to_string());
+                    fields.insert(canon_collect(field, profile));
                 }
             }
         }
@@ -330,17 +383,17 @@ fn collect_fields_from_command(cmd: &Command, fields: &mut HashSet<String>, need
             fields.insert("timestamp".to_string());
             for agg in aggregations {
                 if let Some(field) = &agg.field {
-                    fields.insert(normalize_field_name(field).to_string());
+                    fields.insert(canon_collect(field, profile));
                 }
             }
             for field in split_by {
-                fields.insert(normalize_field_name(field).to_string());
+                fields.insert(canon_collect(field, profile));
             }
         }
         Command::Where { condition } => {
             // Where clauses filter results but users expect to see all fields
             *needs_all = true;
-            collect_fields_from_search_expr(condition, fields);
+            collect_fields_from_search_expr(condition, fields, profile);
         }
         Command::Sort {
             fields: sort_fields,
@@ -349,21 +402,21 @@ fn collect_fields_from_command(cmd: &Command, fields: &mut HashSet<String>, need
             // Sort reorders results but users expect to see all fields
             *needs_all = true;
             for sf in sort_fields {
-                fields.insert(normalize_field_name(&sf.field).to_string());
+                fields.insert(canon_collect(&sf.field, profile));
             }
         }
         Command::Rename { mappings } => {
             // Rename transforms fields but users expect to see all fields
             *needs_all = true;
             for mapping in mappings {
-                fields.insert(normalize_field_name(&mapping.from).to_string());
+                fields.insert(canon_collect(&mapping.from, profile));
             }
         }
         Command::Eval { assignments } => {
             // Eval adds computed fields but users expect to see all fields plus new ones
             *needs_all = true;
             for assignment in assignments {
-                collect_fields_from_eval_expr(&assignment.expression, fields);
+                collect_fields_from_eval_expr(&assignment.expression, fields, profile);
             }
         }
         Command::Dedup {
@@ -373,14 +426,14 @@ fn collect_fields_from_command(cmd: &Command, fields: &mut HashSet<String>, need
             // Dedup removes duplicates but users expect to see all fields
             *needs_all = true;
             for field in dedup_fields {
-                fields.insert(normalize_field_name(field).to_string());
+                fields.insert(canon_collect(field, profile));
             }
         }
         Command::Bin { field, .. } => {
             // Bin modifies a field but users expect to see all fields
             *needs_all = true;
             if let Some(f) = field {
-                fields.insert(normalize_field_name(f).to_string());
+                fields.insert(canon_collect(f, profile));
             } else {
                 fields.insert("timestamp".to_string());
             }
@@ -391,9 +444,9 @@ fn collect_fields_from_command(cmd: &Command, fields: &mut HashSet<String>, need
         | Command::Rare {
             field, by_fields, ..
         } => {
-            fields.insert(normalize_field_name(field).to_string());
+            fields.insert(canon_collect(field, profile));
             for by in by_fields {
-                fields.insert(normalize_field_name(by).to_string());
+                fields.insert(canon_collect(by, profile));
             }
         }
         Command::Transaction {
@@ -403,13 +456,13 @@ fn collect_fields_from_command(cmd: &Command, fields: &mut HashSet<String>, need
             ..
         } => {
             for field in trans_fields {
-                fields.insert(normalize_field_name(field).to_string());
+                fields.insert(canon_collect(field, profile));
             }
             // startswith/endswith markers are evaluated as row flags inside the
             // transaction stage (NAN-1346 #6) — any fields they reference must
             // survive into stage_0 (keywords use the always-projected `message`).
             for marker in [startswith, endswith].into_iter().flatten() {
-                collect_fields_from_search_expr(marker, fields);
+                collect_fields_from_search_expr(marker, fields, profile);
             }
         }
         Command::Risk {
@@ -420,11 +473,11 @@ fn collect_fields_from_command(cmd: &Command, fields: &mut HashSet<String>, need
             // Risk adds computed fields, users expect to see all fields
             *needs_all = true;
             if let Some(field) = entity_field {
-                fields.insert(normalize_field_name(field).to_string());
+                fields.insert(canon_collect(field, profile));
             }
             // Extract fields from dynamic score expression
             if let RiskScoreExpr::Dynamic(expr) = score {
-                collect_fields_from_eval_expr(expr, fields);
+                collect_fields_from_eval_expr(expr, fields, profile);
             }
         }
         Command::Prevalence { .. } => {
@@ -457,13 +510,13 @@ fn collect_fields_from_command(cmd: &Command, fields: &mut HashSet<String>, need
             // Collect fields from aggregations
             for agg in aggregations {
                 if let Some(field) = &agg.field {
-                    fields.insert(normalize_field_name(field).to_string());
+                    fields.insert(canon_collect(field, profile));
                 }
             }
             // Collect fields from group by
             if let Some(group_fields) = group_by {
                 for field in group_fields {
-                    fields.insert(normalize_field_name(field).to_string());
+                    fields.insert(canon_collect(field, profile));
                 }
             }
             // EventStats preserves all rows, so we need all fields
@@ -477,15 +530,15 @@ fn collect_fields_from_command(cmd: &Command, fields: &mut HashSet<String>, need
         } => {
             // Collect group by fields
             for field in group_by {
-                fields.insert(normalize_field_name(field).to_string());
+                fields.insert(canon_collect(field, profile));
             }
             // Collect fields from conditions
             for condition in conditions {
-                collect_fields_from_search_expr(condition, fields);
+                collect_fields_from_search_expr(condition, fields, profile);
             }
             // Collect user-specified capture fields
             for field in capture_fields {
-                fields.insert(normalize_field_name(field).to_string());
+                fields.insert(canon_collect(field, profile));
             }
             // Need timestamp for sequenceMatch and id for event drill-down
             fields.insert("timestamp".to_string());
@@ -496,11 +549,11 @@ fn collect_fields_from_command(cmd: &Command, fields: &mut HashSet<String>, need
         } => {
             // Collect group by fields
             for field in group_by {
-                fields.insert(normalize_field_name(field).to_string());
+                fields.insert(canon_collect(field, profile));
             }
             // Collect fields from step conditions
             for (_, condition) in steps {
-                collect_fields_from_search_expr(condition, fields);
+                collect_fields_from_search_expr(condition, fields, profile);
             }
             // The funnel SQL gen argMax's a fixed set of "dropper attribute" columns
             // (process_name, dest_port, user, …) that never appear in the query text.
@@ -509,7 +562,7 @@ fn collect_fields_from_command(cmd: &Command, fields: &mut HashSet<String>, need
             // the argMax 500s with Code 47 (NAN-1346). Fields the active schema has no
             // column for resolve to harmless JSON-tail noise the funnel argMax skips.
             for name in crate::search::query_processing::FUNNEL_DROPPER_FIELDS {
-                fields.insert(normalize_field_name(name).to_string());
+                fields.insert(canon_collect(name, profile));
             }
             // Need timestamp for windowFunnel
             fields.insert("timestamp".to_string());
@@ -520,17 +573,17 @@ fn collect_fields_from_command(cmd: &Command, fields: &mut HashSet<String>, need
             // Skip aggregation expressions like "count()" — they're computed in the SQL gen,
             // not column references to project
             if !field.contains('(') {
-                fields.insert(normalize_field_name(field).to_string());
+                fields.insert(canon_collect(field, profile));
             }
             for by in by_fields {
-                fields.insert(normalize_field_name(by).to_string());
+                fields.insert(canon_collect(by, profile));
             }
             *needs_all = true; // Need all fields to show anomalous events
         }
         Command::ResolveIdentity { field, .. } => {
             // ResolveIdentity enriches with identity data via ASOF JOIN
             // Need the IP field being resolved plus timestamp for the join
-            fields.insert(normalize_field_name(field).to_string());
+            fields.insert(canon_collect(field, profile));
             fields.insert("timestamp".to_string());
             *needs_all = true; // Need all fields to enrich them
         }
@@ -540,7 +593,7 @@ fn collect_fields_from_command(cmd: &Command, fields: &mut HashSet<String>, need
             // Asset command creates a comprehensive view of an asset's activity
             // Need all fields for identity resolution and activity aggregation
             if let Some(field) = identifier_field {
-                fields.insert(normalize_field_name(field).to_string());
+                fields.insert(canon_collect(field, profile));
             }
             fields.insert("timestamp".to_string());
             *needs_all = true; // Need all fields for comprehensive asset view
@@ -562,23 +615,34 @@ fn collect_fields_from_command(cmd: &Command, fields: &mut HashSet<String>, need
         Command::Output { .. } => {
             // Output is a sink directive, doesn't affect field selection
         }
+        Command::Services
+        | Command::Service { .. }
+        | Command::Trace { .. }
+        | Command::Metric { .. } => {
+            // Command-page directives short-circuit before codegen (NAN-1560);
+            // they don't drive field selection.
+        }
     }
 }
 
 /// Collect fields from eval expressions
-fn collect_fields_from_eval_expr(expr: &EvalExpression, fields: &mut HashSet<String>) {
+fn collect_fields_from_eval_expr(
+    expr: &EvalExpression,
+    fields: &mut HashSet<String>,
+    profile: &dyn crate::schema::SchemaProfile,
+) {
     match expr {
         EvalExpression::Field(field) => {
-            fields.insert(normalize_field_name(field).to_string());
+            fields.insert(canon_collect(field, profile));
         }
         EvalExpression::Literal(_) => {}
         EvalExpression::BinaryOp { left, right, .. } => {
-            collect_fields_from_eval_expr(left, fields);
-            collect_fields_from_eval_expr(right, fields);
+            collect_fields_from_eval_expr(left, fields, profile);
+            collect_fields_from_eval_expr(right, fields, profile);
         }
         EvalExpression::FunctionCall { args, .. } => {
             for arg in args {
-                collect_fields_from_eval_expr(arg, fields);
+                collect_fields_from_eval_expr(arg, fields, profile);
             }
         }
     }
@@ -646,7 +710,7 @@ pub(crate) fn analyze_ext_fields(
 ) -> HashSet<String> {
     let mut all_fields = HashSet::new();
     let mut needs_all = false;
-    collect_required_fields_from_query(query, &mut all_fields, &mut needs_all);
+    collect_required_fields_from_query(query, &mut all_fields, &mut needs_all, profile);
 
     // Collect field names that are computed by the query pipeline (stats aliases,
     // sequence outputs, etc.) — these must NOT be materialized from ext JSON

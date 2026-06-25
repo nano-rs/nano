@@ -78,7 +78,9 @@ mod funnel_view;
 pub(crate) const FIELD_STATS_ROW_CAP: usize = 100_000;
 mod histogram;
 mod lateral;
+mod metrics_routing;
 mod lateral_graph;
+mod otel;
 mod prevalence_join;
 mod prevalence_processing;
 mod sql_execution;
@@ -106,6 +108,10 @@ fn determine_display_type(query: &Query) -> DisplayType {
         Some(Command::Asset { .. }) => DisplayType::Asset,
         Some(Command::Cloud { .. }) => DisplayType::Cloud,
         Some(Command::Lateral { .. }) => DisplayType::Lateral,
+        Some(Command::Services) => DisplayType::Services,
+        Some(Command::Service { .. }) => DisplayType::Service,
+        Some(Command::Trace { .. }) => DisplayType::Trace,
+        Some(Command::Metric { .. }) => DisplayType::Metric,
         Some(Command::Stats { .. })
         | Some(Command::Chart { .. })
         | Some(Command::EventStats { .. })
@@ -201,7 +207,7 @@ pub(crate) fn validate_query_field_names(
 
 /// Get the semantic terminal command, skipping formatting commands like sort/head/tail
 /// This finds the command that determines what kind of data we're displaying
-fn get_semantic_terminal_command(query: &Query) -> Option<&Command> {
+pub(super) fn get_semantic_terminal_command(query: &Query) -> Option<&Command> {
     match query {
         Query::Search(_) => None,
         Query::Piped { command, source } => {
@@ -612,7 +618,83 @@ impl SearchService {
     fn logs_table_key(profile: &dyn crate::schema::SchemaProfile) -> &'static str {
         match profile.id() {
             crate::schema::SchemaId::Ocsf => "ocsf_logs",
-            crate::schema::SchemaId::Udm => "logs",
+            crate::schema::SchemaId::Udm
+            | crate::schema::SchemaId::Spans
+            | crate::schema::SchemaId::Metrics => "logs",
+        }
+    }
+
+    /// Resolve the per-query DATASET profile (NAN-1559). Spans/Metrics carry their
+    /// own field universe and physical table (`otel_spans`/`otel_metrics`); Logs
+    /// keeps the active tenant profile (UDM/OCSF) unchanged. Used by the
+    /// field-stats / field-values companions to scope column enumeration and field
+    /// resolution to the dataset the search actually targets — otherwise an
+    /// `otel_spans` base SQL is wrapped with the UDM column list and ClickHouse
+    /// 47's `Unknown expression identifier 'action'`.
+    fn dataset_profile(
+        &self,
+        dataset: Option<&str>,
+    ) -> std::sync::Arc<dyn crate::schema::SchemaProfile> {
+        match crate::query::Dataset::from_selector(dataset.unwrap_or("logs")) {
+            crate::query::Dataset::Spans => {
+                crate::schema::profile_for_id(crate::schema::SchemaId::Spans)
+            }
+            crate::query::Dataset::Metrics => {
+                crate::schema::profile_for_id(crate::schema::SchemaId::Metrics)
+            }
+            crate::query::Dataset::Logs => self.active_profile.clone(),
+        }
+    }
+
+    /// Clone the SQL generator and retarget it to the per-query dataset's OTLP
+    /// table (NAN-1559). `Dataset::Logs` is left UNTOUCHED so the generator keeps
+    /// the tenant-aware logs table resolved by `with_table` (UDM `logs` / OCSF
+    /// `ocsf_logs` / tenant-prefixed) — mirrors the data-query path in
+    /// `core_search`; applying `with_dataset(Logs)` would clobber it to the
+    /// literal `"logs"`.
+    fn dataset_generator(&self, dataset: Option<&str>) -> ClickHouseSqlGenerator {
+        let ds = crate::query::Dataset::from_selector(dataset.unwrap_or("logs"));
+        let generator = self.ch_sql_generator.clone();
+        if ds == crate::query::Dataset::Logs {
+            generator
+        } else {
+            generator.with_dataset(ds)
+        }
+    }
+
+    /// Fallback field-stats column inventory used ONLY when `system.columns`
+    /// introspection fails (NAN-1559). It must be dataset-correct: a hardcoded
+    /// UDM list wrapped around an `otel_spans`/`otel_metrics` base SQL reintroduces
+    /// the exact ClickHouse 47 `Unknown expression identifier` this fix removes.
+    /// For spans/metrics the dataset's promoted columns are the safe minimum (they
+    /// are guaranteed to exist on the table); logs keep the curated high-value UDM
+    /// subset. Associated fn (no `self`) — depends only on the selector.
+    fn field_stats_fallback_columns(dataset: Option<&str>) -> Vec<String> {
+        let ds = crate::query::Dataset::from_selector(dataset.unwrap_or("logs"));
+        match ds {
+            crate::query::Dataset::Spans | crate::query::Dataset::Metrics => {
+                ds.columns().iter().map(|c| c.to_string()).collect()
+            }
+            crate::query::Dataset::Logs => [
+                "user",
+                "src_ip",
+                "dest_ip",
+                "src_host",
+                "dest_host",
+                "action",
+                "status",
+                "source_type",
+                "process_name",
+                "file_name",
+                "protocol",
+                "auth_type",
+                "auth_result",
+                "category",
+                "duration",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
         }
     }
 
@@ -862,6 +944,11 @@ mod tests {
             ("src_host=\"web01\" | asset", DisplayType::Asset),
             ("* | cloud", DisplayType::Cloud),
             ("* | lateral", DisplayType::Lateral),
+            // Command-page directives (NAN-1560) render their own curated views.
+            ("* | services", DisplayType::Services),
+            ("* | service checkout", DisplayType::Service),
+            ("* | trace deadbeef", DisplayType::Trace),
+            ("* | metric http.server.duration", DisplayType::Metric),
         ] {
             let q = parse_query(query).unwrap();
             let dt = determine_display_type(&q);

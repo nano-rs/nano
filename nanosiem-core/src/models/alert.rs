@@ -89,6 +89,24 @@ pub struct Alert {
     #[serde(skip_serializing_if = "Option::is_none", with = "typeid::case::opt")]
     #[schema(value_type = Option<String>)]
     pub case_id: Option<Uuid>,
+    /// NAN-1541: alert-spine discriminator — what produced this alert.
+    /// One of `detection`, `metric_monitor`, `slo`, `synthetic`. Defaults to
+    /// `detection` for every pre-spine row (migration 212).
+    #[sqlx(default)]
+    #[serde(default = "default_alert_kind")]
+    pub kind: String,
+    /// NAN-1541: the producer's identifier as text — the detection rule UUID
+    /// for `detection` alerts, or the monitor/check typeid for observability
+    /// alerts. NULL for legacy rows whose rule was deleted.
+    #[sqlx(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+}
+
+/// Default discriminator for alerts deserialized without an explicit `kind`
+/// (legacy payloads). Mirrors the migration-212 column default.
+fn default_alert_kind() -> String {
+    "detection".to_string()
 }
 
 /// Input for creating a new alert

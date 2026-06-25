@@ -9,7 +9,7 @@ use nom::{
     branch::alt,
     bytes::complete::{tag, tag_no_case, take_while1},
     character::complete::{char, multispace0, multispace1},
-    combinator::{map, value},
+    combinator::{map, opt, value},
     multi::{many0, separated_list0, separated_list1},
     sequence::{delimited, pair, preceded, terminated},
     Parser,
@@ -879,6 +879,12 @@ fn in_subsearch_filter(input: &str) -> ParseResult<'_, SearchExpr> {
     let (input, _) = char('[').parse(input)?;
     let (input, _) = multispace0(input)?;
 
+    // NAN-1562: optional leading `dataset=<logs|spans|metrics>` (or `from=`)
+    // token scopes the IN subsearch to a different dataset (cross-dataset semi-join).
+    let (input, subsearch_dataset) =
+        opt(super::commands_extended::subsearch_dataset_token).parse(input)?;
+    let (input, _) = multispace0(input)?;
+
     // Forward-declare query parser for recursive subsearch
     fn query(input: &str) -> super::ParseResult<'_, Query> {
         super::query(input)
@@ -894,6 +900,7 @@ fn in_subsearch_filter(input: &str) -> ParseResult<'_, SearchExpr> {
             field,
             subsearch: Box::new(subsearch),
             negated,
+            subsearch_dataset,
         },
     ))
 }

@@ -51,7 +51,8 @@ export function UnassignedAlerts() {
   const fetchAlerts = useCallback(async () => {
     try {
       // Fetch open alerts (new status = not acknowledged or closed)
-      const result = await api.listAlerts({ status: 'new', limit: 20 });
+      // NAN-1541: security triage widget — detection alerts only (no observability monitors).
+      const result = await api.listAlerts({ status: 'new', limit: 20, kinds: ['detection'] });
       // Filter to unassigned and sort by severity then time
       const unassigned = result
         .filter((a) => !a.assigned_to)

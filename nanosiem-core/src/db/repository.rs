@@ -26,7 +26,7 @@ pub mod saved_searches;
 pub mod search_history;
 pub mod shared_searches;
 
-pub use alerts::{compute_event_hash, AlertRepository, AlertRepositoryError};
+pub use alerts::{compute_event_hash, AlertInsert, AlertRepository, AlertRepositoryError};
 #[cfg(feature = "enterprise")]
 pub use cases::{CaseRepository, CaseRepositoryError, CaseWorkflowRepository};
 pub use dashboards::{DashboardRepository, DashboardRepositoryError};

@@ -814,7 +814,9 @@ impl LateralPredicateColumns {
     fn auth_where(&self) -> String {
         match self.schema_id {
             crate::schema::SchemaId::Ocsf => self.auth_where_ocsf(),
-            crate::schema::SchemaId::Udm => self.auth_where_udm(),
+            crate::schema::SchemaId::Udm
+            | crate::schema::SchemaId::Spans
+            | crate::schema::SchemaId::Metrics => self.auth_where_udm(),
         }
     }
 

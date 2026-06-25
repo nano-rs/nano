@@ -871,6 +871,10 @@ fn validate_command_fields(
         | Command::Cloud { .. }
         | Command::Lateral { .. }
         | Command::Ai { .. }
+        | Command::Services
+        | Command::Service { .. }
+        | Command::Trace { .. }
+        | Command::Metric { .. }
         | Command::Output { .. } => {
             // These commands don't reference UDM fields directly or are handled in post-processing
         }

@@ -34,11 +34,13 @@ import { toast } from 'sonner';
 import { GridLayout, compactLayout } from './GridLayout';
 import { Panel, type PanelDataState } from './Panel';
 import { VisualizationRenderer } from './VisualizationRenderer';
+import { ObsMetricWidget, metricSeriesToRows } from './ObsMetricWidget';
 import { PanelEditor } from './PanelEditor';
 import { VariableEditor } from './VariableEditor';
 import { DashboardShareDialog } from './DashboardShareDialog';
 import { useUpdateDashboard, useCreateDashboard, usePanelQuery, toApiTimeRange, type TimeRangeValue } from '@/hooks/use-api';
 import type { Dashboard, PanelConfig, LayoutItem, DashboardLayout, DashboardVariable, CreateDashboardRequest, DashboardVisibility, DashboardShareResult } from '@/lib/api';
+import { api } from '@/lib/api';
 import { DateTimeRangePicker } from '@/components/ui/date-time-range-picker';
 import {
   hydrateDashboardTimeRange,
@@ -260,6 +262,35 @@ export function DashboardEditor({
       const effectiveTimeRange = panel.timeRangeMode === 'custom' && panel.customTimeRange
         ? panel.customTimeRange
         : toApiTimeRange(timeRange);
+
+      // NAN-1540: obs_metric widgets fetch from the metrics-v2 endpoint, not the
+      // nPL/SQL panel-query path (mirrors DashboardView.fetchPanelData).
+      if (panel.visualizationType === 'obs_metric' && panel.metricConfig) {
+        const mc = panel.metricConfig;
+        const resp = await api.observability.queryMetricsV2({
+          metric_name: mc.metric_name,
+          time_range: effectiveTimeRange,
+          service_name: mc.service_name,
+          step_secs: mc.step_secs,
+          agg: mc.agg,
+          group_by: mc.group_by,
+          filters: mc.filters,
+        });
+        const rows = metricSeriesToRows(resp.series ?? []);
+        const hasPoints = rows.some(
+          r => Array.isArray(r.points) && (r.points as unknown[]).length > 0
+        );
+        setPanelData(prev => {
+          const newMap = new Map(prev);
+          newMap.set(panel.id, {
+            status: hasPoints ? 'success' : 'empty',
+            data: rows,
+            lastRefresh: new Date(),
+          });
+          return newMap;
+        });
+        return;
+      }
 
       // Substitute variables client-side to handle undefined vars with '*' fallback
       const substitutedQuery = substituteVariables(panel.query);
@@ -554,11 +585,15 @@ export function DashboardEditor({
         hasRunOnce
       >
         {data?.status === 'success' && data.data && (
-          <VisualizationRenderer
-            type={panel.visualizationType}
-            config={panel.visualizationConfig}
-            data={data.data}
-          />
+          panel.visualizationType === 'obs_metric' && panel.metricConfig ? (
+            <ObsMetricWidget config={panel.metricConfig} data={data.data} />
+          ) : (
+            <VisualizationRenderer
+              type={panel.visualizationType}
+              config={panel.visualizationConfig}
+              data={data.data}
+            />
+          )
         )}
       </Panel>
     );

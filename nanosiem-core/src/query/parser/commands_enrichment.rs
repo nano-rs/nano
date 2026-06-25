@@ -779,3 +779,93 @@ pub(super) fn ai_command(input: &str) -> ParseResult<'_, Command> {
 
     Ok((remaining, Command::Ai { prompt, max_rows }))
 }
+
+/// Parse services command (bare overview): | services
+/// Short-circuits to the observability services overview page (NAN-1560).
+pub(super) fn services_command(input: &str) -> ParseResult<'_, Command> {
+    let (input, _) = tag_no_case("services").parse(input)?;
+    // Must be at end / pipe / whitespace (not "services_foo").
+    if !input.is_empty() && !input.starts_with(|c: char| c.is_whitespace() || c == '|') {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )));
+    }
+    Ok((input, Command::Services))
+}
+
+/// Parse service command: | service <name>
+/// Short-circuits to the single-service detail page (NAN-1560).
+pub(super) fn service_command(input: &str) -> ParseResult<'_, Command> {
+    let (input, _) = tag_no_case("service").parse(input)?;
+    // Must be followed by whitespace (a name is required) — guards against
+    // "service" with no arg and against "service_name" identifier prefixes.
+    let (input, _) = multispace1(input)?;
+    // Service names span hyphens/dots/digits — use the permissive token parser.
+    let (input, name) = alt((quoted_string, unquoted_string)).parse(input)?;
+    if name.is_empty() {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )));
+    }
+    Ok((input, Command::Service { name }))
+}
+
+/// Parse trace command: | trace <trace_id>
+/// Short-circuits to the trace waterfall page (NAN-1560).
+pub(super) fn trace_command(input: &str) -> ParseResult<'_, Command> {
+    let (input, _) = tag_no_case("trace").parse(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, trace_id) = alt((quoted_string, unquoted_string)).parse(input)?;
+    if trace_id.is_empty() {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )));
+    }
+    Ok((input, Command::Trace { trace_id }))
+}
+
+/// Parse metric command: | metric <name> [service=<service_name>]
+/// Short-circuits to the metric time-series page (NAN-1560). The optional
+/// `service=<name>` scopes the chart to one OTLP service — it is carried on the
+/// marker and seeds MetricsExplorer's `service_name` query param (the promoted
+/// `otel_metrics.service_name` column), so the chart opens genuinely scoped
+/// rather than silently unscoped (NAN-1564).
+pub(super) fn metric_command(input: &str) -> ParseResult<'_, Command> {
+    let (input, _) = tag_no_case("metric").parse(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, name) = alt((quoted_string, unquoted_string)).parse(input)?;
+    if name.is_empty() {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )));
+    }
+
+    // Optional, bounded `service=<value>` scope. Skip leading space, then if a
+    // `service=` token is present consume its value. Anything else (e.g. a `|`
+    // boundary or end-of-input) leaves `service` as None — back-compatible.
+    let after_name = input;
+    let (input, service) = {
+        let trimmed = after_name.trim_start();
+        match tag_no_case::<_, _, nom::error::Error<&str>>("service=").parse(trimmed) {
+            Ok((rest, _)) => {
+                let (rest, value) = alt((quoted_string, unquoted_string)).parse(rest)?;
+                if value.is_empty() {
+                    return Err(nom::Err::Error(nom::error::Error::new(
+                        rest,
+                        nom::error::ErrorKind::Tag,
+                    )));
+                }
+                (rest, Some(value))
+            }
+            // No `service=` here — don't consume the trimmed whitespace, leave
+            // the original remainder for the pipe/EOF boundary.
+            Err(_) => (after_name, None),
+        }
+    };
+
+    Ok((input, Command::Metric { name, service }))
+}

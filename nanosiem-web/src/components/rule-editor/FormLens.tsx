@@ -31,6 +31,7 @@ interface FormLensProps {
 type SevKey = NonNullable<DetectionMetadata['severity']>;
 type ModeKey = NonNullable<DetectionMetadata['mode']>;
 type DetectionModeKey = NonNullable<DetectionMetadata['detection_mode']>;
+type DatasetKey = NonNullable<DetectionMetadata['dataset']>;
 type AlertModeKey = NonNullable<DetectionMetadata['alert_mode']>;
 
 function FormField({
@@ -247,21 +248,74 @@ export function FormLens({ value, onChange, readOnly }: FormLensProps) {
           <section className="mt-6">
             <SectionHead icon={<Clock className="w-3.5 h-3.5" strokeWidth={1.75} />} title="Schedule" />
             <div className="pt-1">
-              <FormField label="Detection mode" yamlKey="detection_mode">
+              {/* NAN-1561: dataset selector. Spans/metrics are scheduled-only —
+                  picking one forces detection_mode to 'scheduled' and the
+                  detection-mode control below is locked to scheduled. */}
+              <FormField
+                label="Dataset"
+                yamlKey="dataset"
+                hint="logs = UDM/OCSF events. spans/metrics query OTLP datasets and run scheduled-only."
+              >
                 <div className="inline-flex rounded-md border border-border p-0.5">
-                  {(['realtime', 'scheduled'] as DetectionModeKey[]).map((m) => {
-                    const active = (meta.detection_mode || 'realtime') === m;
+                  {(['logs', 'spans', 'metrics'] as DatasetKey[]).map((d) => {
+                    const active = (meta.dataset || 'logs') === d;
                     return (
                       <button
-                        key={m}
+                        key={d}
                         type="button"
-                        onClick={() => setField('detection_mode', m)}
+                        onClick={() => {
+                          if (readOnly) return;
+                          if (d !== 'logs') {
+                            // spans/metrics are scheduled-only — set both fields
+                            // in a single serialize so they stay consistent.
+                            const updated = {
+                              ...meta,
+                              dataset: d,
+                              detection_mode: 'scheduled' as DetectionModeKey,
+                            };
+                            onChange(serializeDetectionMetadata(updated, query));
+                          } else {
+                            setField('dataset', d);
+                          }
+                        }}
                         disabled={readOnly}
                         className={cn(
                           'h-7 px-2.5 rounded text-[11px] font-mono',
                           active
                             ? 'bg-[color-mix(in_srgb,var(--primary)_18%,transparent)] text-[var(--primary)]'
                             : 'text-muted-foreground hover:text-foreground',
+                        )}
+                      >
+                        {d}
+                      </button>
+                    );
+                  })}
+                </div>
+              </FormField>
+              <FormField label="Detection mode" yamlKey="detection_mode">
+                <div className="inline-flex rounded-md border border-border p-0.5">
+                  {(['realtime', 'scheduled'] as DetectionModeKey[]).map((m) => {
+                    const active = (meta.detection_mode || 'realtime') === m;
+                    // Lock to scheduled for non-logs datasets (spans/metrics
+                    // have no real-time materialized-view path).
+                    const datasetLocked = (meta.dataset || 'logs') !== 'logs';
+                    const lockedOut = datasetLocked && m === 'realtime';
+                    return (
+                      <button
+                        key={m}
+                        type="button"
+                        onClick={() => {
+                          if (lockedOut) return;
+                          setField('detection_mode', m);
+                        }}
+                        disabled={readOnly || lockedOut}
+                        title={lockedOut ? 'spans/metrics datasets are scheduled-only' : undefined}
+                        className={cn(
+                          'h-7 px-2.5 rounded text-[11px] font-mono',
+                          active
+                            ? 'bg-[color-mix(in_srgb,var(--primary)_18%,transparent)] text-[var(--primary)]'
+                            : 'text-muted-foreground hover:text-foreground',
+                          lockedOut && 'opacity-40 cursor-not-allowed',
                         )}
                       >
                         {m === 'realtime' ? 'real-time' : m}

@@ -53,6 +53,10 @@ pub struct Capabilities {
     pub siem_health: bool,
     /// SAML / OIDC SSO providers. Local credentials still work in open builds.
     pub sso: bool,
+    /// Observability ↔ Security convergence cross-link (NAN-1544) — the
+    /// service-detail "security signals against this service's hosts/IPs"
+    /// strip. Enterprise only; the FE hides the strip when false.
+    pub observability_convergence: bool,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -104,6 +108,7 @@ pub async fn get_capabilities() -> Json<CapabilitiesResponse> {
             incidents: ENTERPRISE,
             siem_health: ENTERPRISE,
             sso: ENTERPRISE,
+            observability_convergence: ENTERPRISE,
         },
     })
 }

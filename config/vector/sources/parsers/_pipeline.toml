@@ -57,7 +57,10 @@ source = '''
 .udm.src_user = .metadata.src_user
 .udm.dest_user = .metadata.dest_user
 .udm.user = .metadata.user
-.udm.action = .metadata.action
+# NAN-659: prefer event_type (canonical) over action (legacy synonym).
+# Plain field access is infallible in VRL, so `??` is rejected (E651) —
+# use an explicit null check instead.
+.udm.action = if .metadata.event_type != null { .metadata.event_type } else { .metadata.action }
 .udm.status = .metadata.status
 .udm.process_name = .metadata.process_name
 .udm.process_id = .metadata.process_id
@@ -197,7 +200,13 @@ if is_object(.metadata) {
 .src_user = downcase(to_string(.src_user) ?? "")
 .dest_user = to_string(.dest_user) ?? ""
 .user = downcase(to_string(.user) ?? "")
-.action = downcase(to_string(.action) ?? "")
+# NAN-659: parsers may emit .event_type (canonical) or .action (legacy) after udm flattening.
+# Both route to the action ClickHouse column (event_type is a read-only ALIAS for action).
+event_type_str = to_string(.event_type) ?? ""
+action_str = to_string(.action) ?? ""
+if event_type_str != "" { action_str = event_type_str }
+.action = downcase(action_str)
+del(.event_type)
 .status = to_string(.status) ?? ""
 .status_code = to_int(.status_code) ?? 0
 .auth_type = to_string(.auth_type) ?? ""

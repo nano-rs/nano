@@ -142,6 +142,7 @@ pub async fn test_detection(
                 time_range,
                 rule.schedule_cron.as_deref(),
                 rule.lookback_minutes.map(|m| m as i64),
+                rule.dataset.clone(),
             )
             .await?
     };
@@ -187,6 +188,19 @@ pub async fn test_query(
     let time_range = resolve_test_range(&request);
     let clean_query = strip_comments(&request.query);
 
+    // NAN-1561: validate the dataset selector up front. `Dataset::from_selector`
+    // maps any unknown string to `Logs`, so a typo (`sapns`) would otherwise
+    // silently preview the rule against logs and report wrong/zero matches —
+    // diverging from rule create/update, which DO validate. Reject here so the
+    // ad-hoc test and the saved rule agree.
+    if let Some(ref ds) = request.dataset {
+        if !nanosiem_core::models::detection_rule::VALID_DATASETS.contains(&ds.as_str()) {
+            return Err(ApiError::ValidationError(format!(
+                "invalid dataset '{ds}' (expected one of: logs, spans, metrics)"
+            )));
+        }
+    }
+
     let result = state
         .detection_service
         .analyze_query_stepped(
@@ -194,6 +208,7 @@ pub async fn test_query(
             time_range,
             request.schedule_cron.as_deref(),
             request.lookback_minutes,
+            request.dataset.clone(),
         )
         .await?;
     Ok(Json(result))

@@ -257,6 +257,11 @@ pub struct ExplainRequest {
     /// Show SQL with table_view field pruning (matches actual search behavior)
     #[serde(default)]
     pub table_view: bool,
+    /// Per-query dataset (`logs`/`spans`/`metrics`) so the explained SQL matches
+    /// the executed table — without it, Inspect SQL shows `FROM logs` for a
+    /// spans/metrics query (NAN-1569).
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 
 /// Response for explain endpoint
@@ -292,7 +297,12 @@ pub async fn explain(
     let start = Instant::now();
     let result = state
         .search
-        .explain(&request.query, &request.time_range, request.table_view);
+        .explain(
+            &request.query,
+            &request.time_range,
+            request.table_view,
+            request.dataset.as_deref(),
+        );
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     record_search_query("explain", duration_ms, result.is_ok());
@@ -491,6 +501,7 @@ pub async fn field_stats_for_query(
             request.request_id.as_deref(),
             auth.claims.sub,
             QueryPriority::Interactive,
+            request.dataset.as_deref(),
         )
         .await?;
     let total_events = fields.iter().map(|f| f.count).max().unwrap_or(0);
@@ -536,7 +547,13 @@ pub async fn field_values(
 
     let result = state
         .search
-        .get_field_values(&request.field, &query, &time_range, request.limit)
+        .get_field_values(
+            &request.field,
+            &query,
+            &time_range,
+            request.limit,
+            request.dataset.as_deref(),
+        )
         .await;
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -566,6 +583,12 @@ pub struct FieldValuesRequest {
     /// Maximum number of values to return (default 100)
     #[serde(default = "default_field_values_limit")]
     pub limit: usize,
+    /// Per-query dataset selector (NAN-1559): `logs` (default), `spans`, or
+    /// `metrics`. Drill-in must resolve the field and base table against the
+    /// same dataset the search targeted, else a spans/metrics field reads the
+    /// UDM `logs` table and returns nothing.
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 
 fn default_field_values_limit() -> usize {
@@ -605,6 +628,12 @@ pub struct FieldStatsRequest {
     /// falls back to the full set). Omit for the full column inventory.
     #[serde(default)]
     pub columns: Option<Vec<String>>,
+    /// Per-query dataset selector (NAN-1559): `logs` (default), `spans`, or
+    /// `metrics`. The companion enumerates the dataset's columns and wraps the
+    /// dataset's base SQL — without it a spans/metrics search's field panel
+    /// runs the UDM column list against `otel_spans` and ClickHouse 47's.
+    #[serde(default)]
+    pub dataset: Option<String>,
 }
 
 /// Response for field stats

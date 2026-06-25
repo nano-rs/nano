@@ -10,6 +10,7 @@ export { QueryLibrary } from './QueryLibrary';
 export { SavedQueriesPalette } from './SavedQueriesPalette';
 export { SearchJobsModal } from './SearchJobsModal';
 export { PrevalenceSlider } from './PrevalenceSlider';
+export { DatasetSelector } from './DatasetSelector';
 export { TreeVisualization } from './TreeVisualization';
 export { PaginatedTable } from './PaginatedTable';
 export { TimechartView } from './TimechartView';

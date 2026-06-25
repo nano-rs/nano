@@ -55,6 +55,7 @@ pub mod marketplace;
 pub mod mitre;
 pub mod models;
 pub mod namespace;
+pub mod observability;
 pub mod onboarding;
 pub mod parser_repository;
 pub mod parsers;

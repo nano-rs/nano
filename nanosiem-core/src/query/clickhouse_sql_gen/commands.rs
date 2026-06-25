@@ -1134,6 +1134,30 @@ impl ClickHouseSqlGenerator {
                 // Output command: pass through (write-back is a no-op in query execution)
                 Ok(format!("  SELECT * FROM {}", source))
             }
+            Command::Services
+            | Command::Service { .. }
+            | Command::Trace { .. }
+            | Command::Metric { .. } => {
+                // Command-page directives are PAGE directives, not data
+                // transforms. As the terminal command they short-circuit in the
+                // search service (NAN-1560) and never reach codegen. Reaching
+                // this arm means the directive appeared MID-pipeline (e.g.
+                // `… | service x | stats count`); a silent `SELECT *` pass-through
+                // there would scan logs and ignore the directive, so reject it
+                // and surface a 400 instead of a misleading full-table scan.
+                // Name the actual command so the message is actionable.
+                let name = match cmd {
+                    Command::Services => "services",
+                    Command::Service { .. } => "service",
+                    Command::Trace { .. } => "trace",
+                    Command::Metric { .. } => "metric",
+                    _ => "command-page",
+                };
+                Err(SqlGenError::InvalidQuery(format!(
+                    "`{name}` opens a page and must be the last command — it can't be \
+                     followed by other commands. Remove everything after `| {name}`."
+                )))
+            }
         }
     }
 }

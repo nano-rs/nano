@@ -222,6 +222,11 @@ const navigation: NavItem[] = [
   // The /alerts/:id detail page is also core; Cases (when on) keeps its own
   // /inbox + /cases entries below.
   { name: 'Alerts', href: '/alerts', icon: Bell, permissions: 'alerts:view' },
+  // Observability is a single top-level entry (NAN-1536) routing to the tabbed
+  // console at /observability (Services · Traces · Metrics · Alerts · SLOs).
+  // Collapsed the NAN-1534 expandable Traces/Metrics group. Gated on search:view
+  // (same as Search) — observability rides the search service.
+  { name: 'Observability', href: '/observability', icon: NavChart, permissions: 'search:view' },
 ];
 
 // Cases is an expandable group (per design-ref/shadcn/playbook-new-app.jsx)

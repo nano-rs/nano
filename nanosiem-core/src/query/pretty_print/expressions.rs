@@ -47,6 +47,11 @@ impl PrettyPrint for Aggregation {
         // Handle percentile specially since it has a parameter
         let base = match self.func {
             AggFunc::Percentile(pct) => format!("percentile({}, {})", field_str, pct),
+            // NAN-1528: histogram_quantile carries a percentile arg too; emit it
+            // so the query round-trips (parser expects `histogram_quantile(f, N)`).
+            AggFunc::HistogramQuantile(pct) => {
+                format!("histogram_quantile({}, {})", field_str, pct)
+            }
             _ => format!("{}({})", self.func.as_str(), field_str),
         };
 

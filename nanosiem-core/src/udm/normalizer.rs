@@ -498,6 +498,9 @@ pub fn create_json_mapping() -> FieldMapping {
         .map_field("auth_type", UdmField::AuthType)
         .map_field("auth_result", UdmField::AuthResult)
         .map_field("session_id", UdmField::SessionId)
+        // OpenTelemetry trace-correlation fields (NAN-1528)
+        .map_field("trace_id", UdmField::TraceId)
+        .map_field("span_id", UdmField::SpanId)
         // Process fields
         .map_field("process_name", UdmField::ProcessName)
         .map_field("process_id", UdmField::ProcessId)

@@ -207,7 +207,9 @@ impl MaterializedViewGenerator {
     fn logs_table_name(profile: &dyn crate::schema::SchemaProfile) -> &'static str {
         match profile.id() {
             crate::schema::SchemaId::Ocsf => "ocsf_logs",
-            crate::schema::SchemaId::Udm => "logs",
+            crate::schema::SchemaId::Udm
+            | crate::schema::SchemaId::Spans
+            | crate::schema::SchemaId::Metrics => "logs",
         }
     }
 
@@ -351,6 +353,20 @@ impl MaterializedViewGenerator {
     ///
     /// Requirements: 4.1
     pub fn generate_view_ddl(&self, rule: &DetectionRule) -> Result<String, MaterializedViewError> {
+        // NAN-1561: spans/metrics rules are scheduled-only. A materialized view
+        // reads FROM the logs table (logs_table_name only maps
+        // Udm/Ocsf/...→logs|ocsf_logs and has no otel_spans/otel_metrics arm),
+        // and the MV codegen assumes UDM/OCSF physical columns. Reject before
+        // any DDL is built.
+        if let Some(ds) = rule.dataset.as_deref() {
+            if crate::query::Dataset::from_selector(ds) != crate::query::Dataset::Logs {
+                return Err(MaterializedViewError::InvalidRule(format!(
+                    "Real-time rules cannot target dataset '{ds}' \
+                     (spans/metrics are scheduled-only). Use scheduled detection mode."
+                )));
+            }
+        }
+
         // Parse the rule query
         let query = parse_query(&rule.query).map_err(|e| {
             MaterializedViewError::QueryParseError(format!("Failed to parse rule query: {}", e))
@@ -593,6 +609,7 @@ mod tests {
             folder: None,
             ai_triage_hints: sqlx::types::Json(AiTriageHints::default()),
             lookback_minutes: None,
+            dataset: None,
             auto_tuning_enabled: true,
             auto_tuning_min_confidence: 0.8,
             auto_tuning_critical: false,
@@ -719,6 +736,41 @@ mod tests {
             generator.generate_view_ddl(&rule),
             Err(MaterializedViewError::InvalidRule(_))
         ));
+    }
+
+    #[test]
+    fn test_rejects_spans_metrics_dataset() {
+        // NAN-1561: spans/metrics rules are scheduled-only; the MV path must
+        // reject them before any DDL is built, even with a logs-shaped query.
+        for ds in ["spans", "metrics", "traces", "metric"] {
+            let mut rule = create_test_rule();
+            rule.dataset = Some(ds.to_string());
+            let generator = MaterializedViewGenerator::new(clickhouse::Client::default());
+            assert!(
+                matches!(
+                    generator.generate_view_ddl(&rule),
+                    Err(MaterializedViewError::InvalidRule(_))
+                ),
+                "dataset {ds} must be rejected for real-time"
+            );
+        }
+    }
+
+    #[test]
+    fn test_allows_logs_dataset() {
+        // An explicit "logs" dataset (or None) must NOT be rejected by the
+        // NAN-1561 guard — a logs rule stays byte-identical.
+        for ds in [Some("logs".to_string()), None] {
+            let mut rule = create_test_rule();
+            rule.dataset = ds.clone();
+            let generator = MaterializedViewGenerator::new(clickhouse::Client::default());
+            // Should pass the dataset guard (may fail later for other reasons,
+            // but create_test_rule is a valid logs rule, so it succeeds).
+            assert!(
+                generator.generate_view_ddl(&rule).is_ok(),
+                "dataset {ds:?} must be allowed for real-time"
+            );
+        }
     }
 
     #[test]

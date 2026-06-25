@@ -1195,6 +1195,7 @@ mod tests {
             request_id: None,
             async_mode: false,
             priority: None,
+            dataset: None,
         }
     }
 

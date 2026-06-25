@@ -126,6 +126,15 @@ fn build_optimized_regex_sql(
 }
 
 impl ClickHouseSqlGenerator {
+    /// Whether `field` is numeric under the active profile OR is a numeric column
+    /// of the active OTLP dataset (`duration_ns`, `value`, …) (NAN-1534). For the
+    /// default logs dataset the dataset set is empty, so this is exactly
+    /// `self.profile.is_numeric_field(field)` — byte-identical.
+    fn field_is_numeric(&self, field: &str) -> bool {
+        self.profile.is_numeric_field(field)
+            || self.is_dataset_numeric_column(super::normalize_field_name(field))
+    }
+
     /// True when `field` resolves to a plain String column — a UDM/OCSF promoted
     /// `ExplicitColumn` that is neither numeric nor UUID. For these, full-text
     /// substring search must use `lower(<col>)`, NOT `lower(toString(<col>))`:
@@ -224,8 +233,12 @@ impl ClickHouseSqlGenerator {
                 // scale vs 0.16–0.5s here. Bare keywords are now token-AND searches
                 // (Splunk parity); substring intent (CONTAINS / regex / `*kw*`)
                 // keeps its iLike form in its own arm. See
-                // `bare_keyword_message_predicate`.
-                Ok(bare_keyword_message_predicate(kw))
+                // `bare_keyword_predicate`. NAN-1555: the indexed text column is
+                // profile-driven (`message` for logs, `span_name` for spans).
+                Ok(bare_keyword_predicate(
+                    kw,
+                    self.profile.keyword_search_column(),
+                ))
             }
             SearchExpr::FieldFilter { field, op, value } => {
                 self.generate_field_filter(field, op, value)
@@ -318,7 +331,13 @@ impl ClickHouseSqlGenerator {
                 field,
                 subsearch,
                 negated,
-            } => self.generate_in_subsearch_filter(field, subsearch, *negated),
+                subsearch_dataset,
+            } => self.generate_in_subsearch_filter(
+                field,
+                subsearch,
+                *negated,
+                *subsearch_dataset,
+            ),
         }
     }
 
@@ -349,7 +368,16 @@ impl ClickHouseSqlGenerator {
         // the string verbs there. UDM has no enum-int columns → None → gate (and
         // everything below) byte-identical.
         let enum_mapping = self.profile.enum_int_mapping(field);
-        if self.profile.is_known_field(field) || is_class_split || enum_mapping.is_some() {
+        // NAN-1555: an un-promoted span/metrics attribute (`http.method`) is not a
+        // "known field" but resolves to the `Map` tail — route it through the
+        // column branch (→ `filter_field_expr` → `attributes['http.method']`)
+        // instead of the UDM `JSONExtractString(metadata, …)` spill branch below.
+        // UDM/OCSF never yield `MapKey`, so the gate is byte-identical for them.
+        if self.profile.is_known_field(field)
+            || is_class_split
+            || enum_mapping.is_some()
+            || self.resolves_to_map_key(field)
+        {
             // Determine the physical access expression via the active profile:
             // ExplicitColumn → escaped column, JsonPath → native `event` subcolumn
             // access (NAN-1426), Unknown → `ext.{field}` (UDM's spill). For OCSF a known field is always a
@@ -426,7 +454,7 @@ impl ClickHouseSqlGenerator {
                     .collect();
                 let values_list = values_sql.join(", ");
                 Ok(format!("toString({}) {} ({})", field_expr, op, values_list))
-            } else if self.profile.is_numeric_field(field) {
+            } else if self.field_is_numeric(field) {
                 // Numeric fields: never apply lower() — convert string values to numbers
                 let values_sql: Vec<String> = values
                     .iter()
@@ -503,8 +531,10 @@ impl ClickHouseSqlGenerator {
             validate_regex_pattern(pattern).map_err(|e| SqlGenError::InvalidQuery(e))?;
         }
 
-        // Normalize field name (apply aliases like sourcetype -> source_type)
-        let field = normalize_field_name(field);
+        // Normalize field name (apply aliases like sourcetype -> source_type).
+        // NAN-1555: profile-aware so spans keep `service_name` (not the UDM
+        // `cloud_service` alias); logs byte-identical via the free alias map.
+        let field = self.canonicalize_field(field);
 
         // Check if it's a UDM field (direct column) or metadata field (JSON)
         if self.profile.is_known_field(field) {
@@ -843,7 +873,8 @@ impl ClickHouseSqlGenerator {
                 let sql_op = comparator_to_sql(op);
 
                 // For numeric UDM fields, never apply lower() - compare as numbers
-                if self.profile.is_numeric_field(field) {
+                // (NAN-1534: also the active dataset's numeric columns, e.g. duration_ns).
+                if self.field_is_numeric(field) {
                     match value {
                         Value::String(s) => {
                             // Convert string to number for comparison (handles drilldown from UI)
@@ -1351,34 +1382,31 @@ impl ClickHouseSqlGenerator {
     /// - 2592000s (30d): toStartOfMonth
     pub fn generate_time_bucket(&self, span: &std::time::Duration) -> String {
         let secs = span.as_secs();
+        // NAN-1555: bucket on the active dataset's time column (`start_time` for
+        // spans). Logs/metrics keep `timestamp` → byte-identical.
+        let tc = self.time_column();
 
         match secs {
             s if s < 60 => {
                 // Use toStartOfInterval for sub-minute intervals
-                format!("toStartOfInterval(timestamp, INTERVAL {} SECOND)", s)
+                format!("toStartOfInterval({tc}, INTERVAL {} SECOND)", s)
             }
-            60 => "toStartOfMinute(timestamp)".to_string(),
-            300 => "toStartOfFiveMinutes(timestamp)".to_string(),
-            600 => "toStartOfTenMinutes(timestamp)".to_string(),
-            900 => "toStartOfFifteenMinutes(timestamp)".to_string(),
-            3600 => "toStartOfHour(timestamp)".to_string(),
-            86400 => "toStartOfDay(timestamp)".to_string(),
-            604800 => "toStartOfWeek(timestamp)".to_string(),
-            s if s >= 2592000 => "toStartOfMonth(timestamp)".to_string(),
+            60 => format!("toStartOfMinute({tc})"),
+            300 => format!("toStartOfFiveMinutes({tc})"),
+            600 => format!("toStartOfTenMinutes({tc})"),
+            900 => format!("toStartOfFifteenMinutes({tc})"),
+            3600 => format!("toStartOfHour({tc})"),
+            86400 => format!("toStartOfDay({tc})"),
+            604800 => format!("toStartOfWeek({tc})"),
+            s if s >= 2592000 => format!("toStartOfMonth({tc})"),
             _ => {
                 // For non-standard intervals, use toStartOfInterval
                 if secs % 3600 == 0 {
-                    format!(
-                        "toStartOfInterval(timestamp, INTERVAL {} HOUR)",
-                        secs / 3600
-                    )
+                    format!("toStartOfInterval({tc}, INTERVAL {} HOUR)", secs / 3600)
                 } else if secs % 60 == 0 {
-                    format!(
-                        "toStartOfInterval(timestamp, INTERVAL {} MINUTE)",
-                        secs / 60
-                    )
+                    format!("toStartOfInterval({tc}, INTERVAL {} MINUTE)", secs / 60)
                 } else {
-                    format!("toStartOfInterval(timestamp, INTERVAL {} SECOND)", secs)
+                    format!("toStartOfInterval({tc}, INTERVAL {} SECOND)", secs)
                 }
             }
         }
@@ -1404,12 +1432,17 @@ impl ClickHouseSqlGenerator {
                 // to the table read where idx_message_words serves it. After
                 // stats/timechart where message no longer exists, ClickHouse returns a
                 // clear "column not found" error — correct, since bare keyword searches
-                // don't make sense after aggregation.
-                Ok(bare_keyword_message_predicate(kw))
+                // don't make sense after aggregation. NAN-1555: the indexed text
+                // column is profile-driven (`span_name` for spans).
+                Ok(bare_keyword_predicate(
+                    kw,
+                    self.profile.keyword_search_column(),
+                ))
             }
             SearchExpr::FieldFilter { field, op, value } => {
-                // Normalize field name (apply aliases like command_line -> process)
-                let field = normalize_field_name(field);
+                // Normalize field name (apply aliases like command_line -> process).
+                // NAN-1555: profile-aware (spans keep `service_name`); logs identical.
+                let field = self.canonicalize_field(field);
                 // Check if field is an aggregation expression like "avg(bytes_out)"
                 // If so, extract the function name to use as the column reference
                 let column_ref = if field.contains('(') && field.contains(')') {
@@ -1439,6 +1472,19 @@ impl ClickHouseSqlGenerator {
                     // (NAN-1339): the output column is the bare func name.
                     if let Some(target) = self.agg_reference_alias(field) {
                         escape_identifier(&target)
+                    } else if self.resolves_to_map_key(field) && !self.is_computed_field(field) {
+                        // NAN-1555: a spans/metrics attribute tag in a `| where`
+                        // re-derives the `attributes['key']` Map subscript (the
+                        // `attributes`/`resource_attributes` columns pass through the
+                        // `SELECT *` that `Command::Where` forces), instead of a bare
+                        // column reference that does not exist → CH Code 47. UDM/OCSF
+                        // never yield MapKey, so the logs `where` path is unchanged.
+                        // NAN-1557: but a pipeline-computed name (a stats output like
+                        // `count` in `… | stats count by x | where count > N`) is a
+                        // real in-scope column of the upstream stage, NOT an
+                        // attribute — `is_computed_field` excludes it so it stays a
+                        // bare reference (the stats stage carries no `attributes`).
+                        self.field_access_expr(field, "String")
                     } else {
                         escape_identifier(field)
                     }
@@ -1739,17 +1785,33 @@ impl ClickHouseSqlGenerator {
                 field,
                 subsearch,
                 negated,
-            } => self.generate_in_subsearch_filter(field, subsearch, *negated),
+                subsearch_dataset,
+            } => self.generate_in_subsearch_filter(
+                field,
+                subsearch,
+                *negated,
+                *subsearch_dataset,
+            ),
         }
     }
 
     /// Generate SQL for `field IN [search ... | return field]` subsearch expressions.
-    /// Produces a ClickHouse subquery: `lower(field) IN (SELECT DISTINCT lower(return_field) FROM ... LIMIT 10000)`
+    /// Produces a ClickHouse subquery: `toString(field) IN (SELECT DISTINCT toString(return_field) FROM ... LIMIT 10000)`
+    /// when either side is non-numeric, or the bare numeric form when BOTH the
+    /// outer field and the return field are numeric under their profiles.
+    ///
+    /// NAN-1562: when `subsearch_dataset` selects a dataset whose storage table
+    /// differs from the outer query's, the subsearch FROM table, time column,
+    /// return-field resolution, and the subsearch's own search expression resolve
+    /// against that dataset via a SCOPED clone (`with_dataset`) — the outer field
+    /// (`field`) keeps resolving against `self`. The clone is local, so the
+    /// sub-dataset never leaks into the outer pipeline's field resolution.
     fn generate_in_subsearch_filter(
         &self,
         field: &str,
         subsearch: &Query,
         negated: bool,
+        subsearch_dataset: Option<crate::query::clickhouse_sql_gen::otel::Dataset>,
     ) -> Result<String, SqlGenError> {
         let time_range_guard = self
             .generation_time_range
@@ -1760,6 +1822,29 @@ impl ClickHouseSqlGenerator {
                 "Subsearch IN requires a time range context".to_string(),
             )
         })?;
+
+        // NAN-1562: scope the subsearch to its own dataset. Cross-dataset only
+        // when the selected dataset's table differs from the outer table —
+        // `dataset=logs` from a logs query stays byte-identical. The clone shares
+        // the Arc<profile> until `with_dataset` swaps it; its own
+        // `generation_time_range` starts empty, so seed it from the outer range
+        // for any nested subsearch resolution.
+        let cross_dataset = subsearch_dataset
+            .map(|ds| ds.table_name() != self.table_name)
+            .unwrap_or(false);
+        let sub_gen_owned: Option<ClickHouseSqlGenerator> = if cross_dataset {
+            let g = self.clone().with_dataset(subsearch_dataset.unwrap());
+            match g.generation_time_range.write() {
+                Ok(mut guard) => *guard = Some(time_range.clone()),
+                Err(poisoned) => *poisoned.into_inner() = Some(time_range.clone()),
+            }
+            Some(g)
+        } else {
+            None
+        };
+        // `sub_gen` resolves the subsearch side (table, time column, return field,
+        // search expr); `self` resolves the outer field.
+        let sub_gen: &ClickHouseSqlGenerator = sub_gen_owned.as_ref().unwrap_or(self);
 
         // Walk the subsearch Query to extract the search expression and return fields
         let stages = self.collect_stages(subsearch);
@@ -1790,48 +1875,73 @@ impl ClickHouseSqlGenerator {
             return_fields[0]
         };
 
+        // NAN-1562 bound: a cross-dataset IN needs a usable key — the equality
+        // bridge between the outer field and the subsearch return field. An empty
+        // outer field has no column to compare against; reject with an actionable
+        // error rather than emitting a nonsensical IN.
+        if cross_dataset && field.trim().is_empty() {
+            return Err(SqlGenError::UnsupportedOperation(
+                "cross-dataset correlation requires a join key, e.g. \
+                 `trace_id IN [dataset=logs … | return trace_id]`"
+                    .to_string(),
+            ));
+        }
+
         // Build a single WHERE with the time range and the subsearch's search
         // expression — `optimize_move_to_prewhere` does placement (NAN-1412).
+        // The time column is the SUBSEARCH dataset's (NAN-1562 fixes the
+        // pre-existing hardcoded `timestamp` that was wrong for spans `start_time`).
         let mut where_clause = format!(
-            "timestamp BETWEEN '{}' AND '{}'",
+            "{} BETWEEN '{}' AND '{}'",
+            sub_gen.time_column(),
             time_range.start.format("%Y-%m-%d %H:%M:%S%.6f"),
             time_range.end.format("%Y-%m-%d %H:%M:%S%.6f"),
         );
         if let Some(expr) = search_expr {
-            let where_sql = self.generate_search_expr(expr)?;
+            let where_sql = sub_gen.generate_search_expr(expr)?;
             where_clause = format!("{} AND ({})", where_clause, where_sql);
         }
 
-        // Build the SELECT expression for the return field (profile-aware: direct
-        // column for promoted/UDM columns, native `event` subcolumn access for an
-        // OCSF tail path (NAN-1426), `ext.{field}` for a UDM Unknown —
-        // byte-identical for UDM).
-        let return_field_expr = self.field_access_expr(return_field, "String");
+        // Build the SELECT expression for the return field against the SUBSEARCH
+        // dataset (profile-aware: direct column for promoted/UDM columns, native
+        // `event` subcolumn access for an OCSF tail path (NAN-1426),
+        // `ext.{field}` for a UDM Unknown — byte-identical for UDM).
+        let return_field_expr = sub_gen.field_access_expr(return_field, "String");
 
-        // Build the outer field expression (same profile-aware resolution).
+        // Build the outer field expression against the OUTER dataset (`self`).
         let outer_field_expr = self.field_access_expr(field, "String");
 
         let op = if negated { "NOT IN" } else { "IN" };
 
-        // Use case-insensitive matching for string fields, direct for numeric
-        let is_numeric = self.profile.is_numeric_field(field);
-        if is_numeric {
+        // Comparison form per side's type (NAN-1562). The outer field is typed
+        // under `self`'s profile; the RETURN field is typed under the SUBSEARCH
+        // dataset's profile (`sub_gen`) — they can differ across datasets. The
+        // numeric, no-coercion form is only safe when BOTH sides are numeric.
+        // Otherwise compare as strings: previously `lower(<numeric col>)` was
+        // emitted whenever the OUTER side was a string, which threw Code 43
+        // (`lower` wants String) for `user IN [dataset=spans … | return
+        // duration_ns]` (UInt64 sub side). `toString()` normalizes either type
+        // to a comparable String without presuming the column is already String
+        // (which `lower()` does).
+        let outer_numeric = self.profile.is_numeric_field(field);
+        let return_numeric = sub_gen.profile.is_numeric_field(return_field);
+        if outer_numeric && return_numeric {
             Ok(format!(
                 "{} {} (SELECT DISTINCT {} FROM {} WHERE {} LIMIT {})",
                 outer_field_expr,
                 op,
                 return_field_expr,
-                self.table_name,
+                sub_gen.table_name,
                 where_clause,
                 SUBSEARCH_RESULT_LIMIT,
             ))
         } else {
             Ok(format!(
-                "lower({}) {} (SELECT DISTINCT lower({}) FROM {} WHERE {} LIMIT {})",
+                "toString({}) {} (SELECT DISTINCT toString({}) FROM {} WHERE {} LIMIT {})",
                 outer_field_expr,
                 op,
                 return_field_expr,
-                self.table_name,
+                sub_gen.table_name,
                 where_clause,
                 SUBSEARCH_RESULT_LIMIT,
             ))

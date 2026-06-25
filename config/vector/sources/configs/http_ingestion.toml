@@ -1,16 +1,22 @@
 # Auto-generated routing rules for system-level source: HTTP Ingestion
 # DO NOT EDIT - changes will be overwritten
-# Generated at: 2026-04-18T01:38:15.146750+00:00
+# Generated at: 2026-06-24T13:08:57.536389+00:00
 
 [transforms.http_ingestion_route]
-type = "remap"
 inputs = ["source_type_extract"]
-source = '''
+source = """
 # Apply routing rules to set source_type
-if .source_type == "squid_proxy" {
-    .source_type = "squid_proxy"
+if .source_type == "apache_access" {
+    .source_type = "apache_access"
+} else if .source_type == "windows_sysmon" {
+    .source_type = "windows_sysmon"
 } else if .source_type == "aws_cloudtrail" {
     .source_type = "aws_cloudtrail"
+} else if .source_type == "conduit" {
+    .source_type = "conduit"
+} else if .source_type == "windows_event" {
+    .source_type = "windows_event"
 }
 # else: passthrough — keep existing .source_type
-'''
+"""
+type = "remap"

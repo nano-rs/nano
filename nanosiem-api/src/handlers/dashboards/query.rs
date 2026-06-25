@@ -111,6 +111,7 @@ pub async fn panel_query(
                 request_id: None,
                 async_mode: false,
                 priority: None,
+                dataset: None,
             };
 
             // NAN-708: parse once, then (a) reject surface-bound commands

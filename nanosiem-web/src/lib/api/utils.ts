@@ -32,6 +32,15 @@ export function getServiceUrl(path: string): string {
       path === '/api/search/asset-events' ||
       path === '/api/search/asset-true-time-range' ||
       path === '/api/search/asset-artifacts' ||
+      // OTel observability surfaces live on the search service (NAN-1534/1536):
+      // traces, metrics, and the RED services overview + per-service detail.
+      path === '/api/search/traces' ||
+      path.startsWith('/api/search/traces/') ||
+      path.startsWith('/api/search/traces?') ||
+      path.startsWith('/api/search/metrics') ||
+      path === '/api/search/services' ||
+      path.startsWith('/api/search/services/') ||
+      path.startsWith('/api/search/services?') ||
       path.startsWith('/api/search/saved') ||
       path.startsWith('/api/search/jobs') ||
       path.startsWith('/api/search/admin')) {

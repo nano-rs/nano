@@ -129,6 +129,12 @@ pub enum AggFunc {
     Mode,
     /// Sparkline (mini time-series chart, collects values into array)
     Sparkline,
+    /// Per-second rate of a (cumulative) counter over the group's time window
+    /// (NAN-1528, OTLP metrics). `rate(value)`.
+    Rate,
+    /// Histogram quantile (NAN-1528, OTLP metrics). The `u8` is the percentile
+    /// (0-100), mirroring [`AggFunc::Percentile`]. `histogram_quantile(value, N)`.
+    HistogramQuantile(u8),
 }
 
 impl AggFunc {
@@ -156,6 +162,8 @@ impl AggFunc {
             AggFunc::Percentile(_) => "percentile",
             AggFunc::Mode => "mode",
             AggFunc::Sparkline => "sparkline",
+            AggFunc::Rate => "rate",
+            AggFunc::HistogramQuantile(_) => "histogram_quantile",
         }
     }
 

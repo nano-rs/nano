@@ -267,6 +267,9 @@ export class DetectionsApi {
     status?: string;
     severity?: string;
     rule_id?: string;
+    /** NAN-1541: filter by alert kind(s). Omit for all kinds.
+     *  'detection' = security detections; 'metric_monitor'|'slo'|'synthetic' = observability monitors. */
+    kinds?: string[];
     limit?: number;
     offset?: number;
   }): Promise<Alert[]> {
@@ -274,6 +277,7 @@ export class DetectionsApi {
     if (params?.status) searchParams.set('status', params.status);
     if (params?.severity) searchParams.set('severity', params.severity);
     if (params?.rule_id) searchParams.set('rule_id', params.rule_id);
+    if (params?.kinds?.length) searchParams.set('kinds', params.kinds.join(','));
     if (params?.limit) searchParams.set('limit', String(params.limit));
     if (params?.offset) searchParams.set('offset', String(params.offset));
 
@@ -285,16 +289,21 @@ export class DetectionsApi {
     return this.request(`/api/alerts/${id}`);
   }
 
-  async getAlertCounts(): Promise<AlertCounts> {
-    return this.request('/api/alerts/counts');
+  async getAlertCounts(kinds?: string[]): Promise<AlertCounts> {
+    const q = kinds?.length ? `?kinds=${encodeURIComponent(kinds.join(','))}` : '';
+    return this.request(`/api/alerts/counts${q}`);
   }
 
   /** NAN-1019: hourly velocity histogram over the last N hours
    *  (default 24). Returns one bucket per hour including zero-count
-   *  ones, ordered chronologically. */
-  async getAlertVelocity(hours?: number): Promise<AlertVelocityBucket[]> {
-    const q = hours ? `?hours=${hours}` : '';
-    return this.request(`/api/alerts/velocity${q}`);
+   *  ones, ordered chronologically.
+   *  NAN-1541: optional kinds filter (detection vs monitor alerts). */
+  async getAlertVelocity(hours?: number, kinds?: string[]): Promise<AlertVelocityBucket[]> {
+    const searchParams = new URLSearchParams();
+    if (hours) searchParams.set('hours', String(hours));
+    if (kinds?.length) searchParams.set('kinds', kinds.join(','));
+    const query = searchParams.toString();
+    return this.request(`/api/alerts/velocity${query ? `?${query}` : ''}`);
   }
 
   async acknowledgeAlert(id: string): Promise<Alert> {

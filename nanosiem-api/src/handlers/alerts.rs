@@ -93,6 +93,12 @@ pub struct ListAlertsQuery {
     #[serde(default, with = "nanosiem_core::typeid::rule::opt")]
     #[param(value_type = Option<String>)]
     pub rule_id: Option<Uuid>,
+    /// NAN-1541: comma-separated alert-spine kinds to include
+    /// (`detection`, `metric_monitor`, `slo`, `synthetic`). Omitted = all
+    /// kinds. The SIEM Alerts view passes `detection`; the Observability
+    /// Alerts view passes the monitor kinds.
+    #[serde(default)]
+    pub kinds: Option<String>,
     #[serde(default = "default_limit")]
     pub limit: i64,
     #[serde(default)]
@@ -101,6 +107,24 @@ pub struct ListAlertsQuery {
 
 fn default_limit() -> i64 {
     100
+}
+
+/// Parse the comma-separated `kinds` query param into the slice form the
+/// repository expects. Empty / whitespace-only entries are dropped; an
+/// all-empty result yields `None` (= all kinds). NAN-1541.
+fn parse_kinds(kinds: &Option<String>) -> Option<Vec<String>> {
+    let raw = kinds.as_ref()?;
+    let parsed: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    if parsed.is_empty() {
+        None
+    } else {
+        Some(parsed)
+    }
 }
 
 /// Query parameters for streaming alerts
@@ -186,12 +210,19 @@ pub async fn list_alerts(
     check_permission(&auth, permissions::ALERTS_VIEW)
         .map_err(|_| ApiError::Forbidden("Missing permission: alerts:view".to_string()))?;
 
+    let kinds = parse_kinds(&query.kinds);
     let alerts = if let Some(rule_id) = query.rule_id {
         state.detection_service.list_alerts_by_rule(rule_id).await?
     } else {
         state
             .detection_service
-            .list_alerts(query.status, query.severity, query.limit, query.offset)
+            .list_alerts(
+                query.status,
+                query.severity,
+                kinds.as_deref(),
+                query.limit,
+                query.offset,
+            )
             .await?
     };
 
@@ -660,11 +691,20 @@ pub async fn bulk_alerts(
     Ok(Json(BulkResponse { affected }))
 }
 
+/// Query parameters for alert counts (NAN-1541: optional kind filter).
+#[derive(Debug, Deserialize, Default, utoipa::IntoParams)]
+pub struct AlertCountsQuery {
+    /// Comma-separated alert-spine kinds to include. Omitted = all kinds.
+    #[serde(default)]
+    pub kinds: Option<String>,
+}
+
 /// Get alert counts by status
 #[utoipa::path(
     get,
     path = "/api/alerts/counts",
     tag = "alerts",
+    params(AlertCountsQuery),
     responses(
         (status = 200, description = "Alert counts by status", body = AlertCounts),
         (status = 403, description = "Forbidden", body = ErrorResponse),
@@ -674,9 +714,12 @@ pub async fn bulk_alerts(
 pub async fn alert_counts(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
+    Query(query): Query<AlertCountsQuery>,
 ) -> Result<Json<AlertCounts>, ApiError> {
     check_permission(&auth, permissions::ALERTS_VIEW)
         .map_err(|_| ApiError::Forbidden("Missing permission: alerts:view".to_string()))?;
+
+    let kinds = parse_kinds(&query.kinds);
 
     // Demo isolation: compute filtered counts for demo users
     if auth.claims.roles.contains(&"demo_analyst".to_string()) {
@@ -686,7 +729,7 @@ pub async fn alert_counts(
         if !exclude_rule_ids.is_empty() {
             let all_alerts = state
                 .detection_service
-                .list_alerts(None, None, 10000, 0)
+                .list_alerts(None, None, kinds.as_deref(), 10000, 0)
                 .await?;
             let filtered: Vec<_> = all_alerts
                 .into_iter()
@@ -715,7 +758,10 @@ pub async fn alert_counts(
         }
     }
 
-    let counts = state.detection_service.get_alert_counts().await?;
+    let counts = state
+        .detection_service
+        .get_alert_counts(kinds.as_deref())
+        .await?;
 
     let mut total = 0i64;
     let mut new = 0i64;
@@ -760,6 +806,10 @@ pub struct VelocityBucket {
 pub struct VelocityQuery {
     #[serde(default = "default_velocity_hours")]
     pub hours: u32,
+    /// NAN-1541: comma-separated alert-spine kinds to include. Omitted = all
+    /// kinds. The SIEM Rules sparkline passes `detection`.
+    #[serde(default)]
+    pub kinds: Option<String>,
 }
 
 fn default_velocity_hours() -> u32 {
@@ -806,6 +856,8 @@ pub async fn alert_velocity(
     // No demo-isolation filter (cf. `alert_counts`): a 24-bucket hourly
     // histogram doesn't expose per-rule attribution, so the aggregate is
     // safe to surface across demo_analyst boundaries.
+    // NAN-1541: optional kind filter ($3::text[]; NULL = all kinds).
+    let kinds = parse_kinds(&query.kinds);
     let sql = r#"
         SELECT
             bucket as bucket_start,
@@ -819,6 +871,7 @@ pub async fn alert_velocity(
             SELECT date_trunc('hour', created_at) AS bucket_start, COUNT(*) AS count
             FROM alerts
             WHERE created_at >= $1 AND created_at < $2
+              AND ($3::text[] IS NULL OR kind = ANY($3))
             GROUP BY bucket_start
         ) c ON c.bucket_start = bucket
         ORDER BY bucket ASC
@@ -827,6 +880,7 @@ pub async fn alert_velocity(
     let rows = sqlx::query(sql)
         .bind(start)
         .bind(now)
+        .bind(kinds)
         .fetch_all(&state.pool)
         .await
         .map_err(|e| ApiError::DatabaseError(e.to_string()))?;

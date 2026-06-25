@@ -1,43 +1,29 @@
-# =============================================================================
-# Bootstrap dynamic router
-# =============================================================================
-# NAN-1083: ship a SIEM with no opinionated pre-seeded routes. This file is the
-# first-boot artifact used by Vector before any parser-deploy regenerates it
-# via `nanosiem-core::parsers::vector_config::router::write_router_config`.
-#
-# On a fresh install there are no deployed parsers and no source configs, so
-# `source_router` accepts the two always-present base inputs (`vector_merge`
-# from native Vector traffic, `http_ingestion_route` from the HTTP pipeline)
-# and offers only the `generic` catch-all route. Unmatched events fall through
-# to `generic_parser` in `_pipeline.toml` and are normalized as-is.
-#
-# `placeholder_combiner` is required because `_pipeline.toml`'s `normalize`
-# transform names it as an input. It's a no-op filter consuming from
-# `source_router.generic` and dropping every event via `condition = "false"`
-# — present-but-inert so the topology stays valid until a parser-deploy
-# rewrites this file with real placeholders for any installed parsers.
+# Auto-generated dynamic router for deployed parsers
+# DO NOT EDIT - changes will be overwritten by parser deployment
+# Generated at: 2026-06-24T13:08:57.367169+00:00
 
+# =============================================================================
+# Dynamic Source Type Router
+# =============================================================================
+# Accepts input from HTTP pipeline, Vector native protocol, and source configurations.
 [transforms.source_router]
 type = "route"
-inputs = ["vector_merge", "http_ingestion_route"]
+inputs = ["vector_merge", "otlp_logs_prep", "http_ingestion_route", "nan884_smoke_sasl_plaintext_route", "splunk_hec_route"]
 
 [transforms.source_router.route]
-# NAN-1124: exclude nano_enrich (push enrichment) so it never reaches the
-# generic log parser — enrichment_router below claims it instead.
-generic = '!starts_with(downcase(to_string(.source_type) ?? ""), "nano_enrich")'
+apache_http_server__ocsf_ = 'includes(["apache", "apache_access"], .source_type)'
+aws_cloudtrail__ocsf_ = 'includes(["aws_cloudtrail", "cloudtrail"], .source_type)'
+conduit_mitm_proxy__ocsf_ = 'includes(["conduit", "conduit_proxy", "conduit-proxy"], .source_type)'
+microsoft_sysmon__json__ocsf_ = 'includes(["sysmon", "windows_sysmon", "sysmon_json"], .source_type)'
+windows_event_log__ocsf_ = 'includes(["windows_event", "winlogbeat", "windows", "win_event", "winevent"], .source_type)'
+generic = '!includes(["apache", "apache_access", "aws_cloudtrail", "cloudtrail", "conduit", "conduit_proxy", "conduit-proxy", "sysmon", "windows_sysmon", "sysmon_json", "windows_event", "winlogbeat", "windows", "win_event", "winevent"], .source_type) && !starts_with(downcase(to_string(.source_type) ?? ""), "nano_enrich")'
 
 # =============================================================================
-# NAN-1124: Enrichment lane router (nano_enrich -> per-kind outputs)
+# NAN-1124/NAN-1151: Enrichment lane router (nano_enrich -> per-source outputs)
 # =============================================================================
-# Sibling to source_router with identical inputs; routes push-enrichment records
-# by `.kind` to the outputs consumed by config/vector/03-enrichment-lane.toml.
-# Non-enrichment events fall to enrichment_router._unmatched (dropped). Present
-# in this bootstrap so the lane file's `enrichment_router.<kind>` inputs never
-# dangle before the first parser-deploy regenerates this file. Kept in sync with
-# router::write_router_config (which emits the same block dynamically).
 [transforms.enrichment_router]
 type = "route"
-inputs = ["vector_merge", "http_ingestion_route"]
+inputs = ["vector_merge", "otlp_logs_prep", "http_ingestion_route", "nan884_smoke_sasl_plaintext_route", "splunk_hec_route"]
 
 [transforms.enrichment_router.route]
 identity = 'downcase(to_string(.source_type) ?? "") == "nano_enrich" && downcase(to_string(.kind) ?? "") == "identity"'
@@ -45,6 +31,13 @@ ip_context = 'downcase(to_string(.source_type) ?? "") == "nano_enrich" && downca
 ioc = 'downcase(to_string(.source_type) ?? "") == "nano_enrich" && downcase(to_string(.kind) ?? "") == "ioc"'
 asset = 'downcase(to_string(.source_type) ?? "") == "nano_enrich" && downcase(to_string(.kind) ?? "") == "asset"'
 
+# =============================================================================
+# Placeholder Transforms
+# =============================================================================
+
+# =============================================================================
+# Placeholder Combiner
+# =============================================================================
 [transforms.placeholder_combiner]
 type = "filter"
 inputs = ["source_router.generic"]

@@ -364,6 +364,7 @@ mod tests {
             materialized_view_name: None,
             archived: false,
             lookback_minutes: None,
+            dataset: None,
             auto_tuning_enabled: true,
             auto_tuning_min_confidence: 0.8,
             auto_tuning_critical: false,

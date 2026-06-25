@@ -80,6 +80,13 @@ pub mod mitre;
 #[cfg(feature = "enterprise")]
 pub use nanosiem_enterprise::handlers::notebooks;
 pub mod notifications;
+pub mod observability_metric_monitors;
+// Observability ↔ Security convergence cross-link (NAN-1542) — ENTERPRISE only
+// (NAN-1544). Open builds omit the route + spec path entirely.
+#[cfg(feature = "enterprise")]
+pub mod observability_service_signals;
+pub mod observability_slos;
+pub mod observability_synthetics;
 // OIDC handlers — lifted to nanosiem-enterprise in NAN-751 (Phase 2 of the
 // open-core split). Re-exported here so route registrations
 // (`handlers::oidc::list_providers`, etc.) continue to resolve.

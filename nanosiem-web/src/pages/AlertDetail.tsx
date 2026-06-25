@@ -11,6 +11,7 @@
 import { useEffect, useMemo } from 'react';
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import {
+  Activity,
   AlertTriangle,
   Calendar,
   Code,
@@ -32,7 +33,10 @@ import { cn } from '@/lib/utils';
 import { QueryHighlight } from '@/lib/syntax-highlight';
 
 import { AlertHero } from '@/components/alerts/AlertHero';
+import { MonitorAlertHero } from '@/components/alerts/MonitorAlertHero';
+import { parseMonitorAlert } from '@/components/alerts/monitorAlert';
 import { AlertTriageBar } from '@/components/alerts/AlertTriageBar';
+import { AssociateCaseButton } from '@/components/alerts/AssociateCaseButton';
 import { EventViewer } from '@/components/matches/EventViewer';
 
 type TabId = 'events' | 'rule' | 'timeline';
@@ -53,12 +57,22 @@ export function AlertDetail() {
   // capture, etc.).
   const alert = useMemo(() => (apiAlert ? fromApiAlert(apiAlert) : null), [apiAlert]);
 
+  // NAN-1547: observability monitor alerts (metric_monitor / slo / synthetic)
+  // ride the same alert spine but carry `rule_id = NULL` + a breach payload in
+  // matched_events. Branch on `kind` so they render a monitor surface instead
+  // of the rule-centric "Unknown Rule" view.
+  const monitor = useMemo(() => (apiAlert ? parseMonitorAlert(apiAlert) : null), [apiAlert]);
+  const isMonitor = monitor != null;
+  const displayName = monitor ? monitor.title : alert?.ruleName ?? null;
+
+  // Monitor alerts have no rule; `alert.ruleId` is undefined so `useDetection`
+  // no-ops. The rule fetch only matters for detection alerts.
   const { data: apiRule } = useDetection(alert?.ruleId);
   // The Rule tab pulls `query` and `narrative` directly off the raw API
   // type — `fromApiDetection` is unused here.
 
-  useDocumentTitle(alert?.ruleName ? `Alert · ${alert.ruleName}` : 'Alert', [alert?.id]);
-  useBreadcrumbTitle(alert?.ruleName ? `Alert · ${alert.ruleName}` : null);
+  useDocumentTitle(displayName ? `Alert · ${displayName}` : 'Alert', [alert?.id]);
+  useBreadcrumbTitle(displayName ? `Alert · ${displayName}` : null);
 
   const { recordView } = useRecordActivity();
 
@@ -70,13 +84,13 @@ export function AlertDetail() {
   // Track view for recent activity once per alert id.
   useEffect(() => {
     if (alert && id) {
-      recordView('alert', id, alert.ruleName || 'Unknown Rule', {
-        rule_name: alert.ruleName,
+      recordView('alert', id, displayName || 'Alert', {
+        rule_name: displayName,
         severity: alert.severity,
         status: alert.status,
       });
     }
-  }, [alert?.id, id, recordView, alert]);
+  }, [alert?.id, id, recordView, alert, displayName]);
 
   if (loading) {
     return (
@@ -111,12 +125,22 @@ export function AlertDetail() {
     );
   }
 
-  const tabs: Array<{ id: TabId; label: string; count?: number }> = [
-    { id: 'events',    label: 'Matched events',  count: matchedEvents.length },
-    { id: 'rule',      label: 'Rule logic' },
-    { id: 'timeline',  label: 'Timeline' },
-  ];
-  const activeTab = (searchParams.get('tab') || 'events') as TabId;
+  // Monitor alerts have no rule logic; the breach context lives in the hero +
+  // the payload. Detection alerts keep the full Matched events / Rule / Timeline
+  // set.
+  const tabs: Array<{ id: TabId; label: string; count?: number }> = isMonitor
+    ? [
+        { id: 'events',   label: 'Breach payload', count: matchedEvents.length },
+        { id: 'timeline', label: 'Timeline' },
+      ]
+    : [
+        { id: 'events',   label: 'Matched events', count: matchedEvents.length },
+        { id: 'rule',     label: 'Rule logic' },
+        { id: 'timeline', label: 'Timeline' },
+      ];
+  const requestedTab = (searchParams.get('tab') || 'events') as TabId;
+  // Guard against a stale ?tab=rule deep link on a monitor alert.
+  const activeTab: TabId = tabs.some((t) => t.id === requestedTab) ? requestedTab : 'events';
 
   return (
     <div
@@ -124,35 +148,59 @@ export function AlertDetail() {
       style={{ containerType: 'inline-size' }}
     >
       <div className="pt-3 pb-4 shrink-0 px-4">
-        <AlertHero
-          alert={{
-            id: alert.id,
-            ruleId: alert.ruleId,
-            ruleName: alert.ruleName,
-            severity: alert.severity,
-            status: alert.status as 'open' | 'acknowledged' | 'closed',
-            disposition: alert.disposition,
-            matchedEventCount: alert.matchedEventCount,
-            matchedEvents,
-            timestamp: alert.timestamp,
-            acknowledgedAt: alert.acknowledgedAt,
-            acknowledgedBy: alert.acknowledgedBy,
-            closedAt: alert.closedAt,
-            closedBy: alert.closedBy,
-            triageVerdict: alert.triageVerdict,
-          }}
-          rule={apiRule}
-          linkedNotebookCount={0}
-        />
+        {monitor ? (
+          <MonitorAlertHero
+            alert={{
+              id: alert.id,
+              severity: alert.severity,
+              status: alert.status as 'open' | 'acknowledged' | 'closed',
+              disposition: alert.disposition,
+              timestamp: alert.timestamp,
+              acknowledgedAt: alert.acknowledgedAt,
+              acknowledgedBy: alert.acknowledgedBy,
+              closedAt: alert.closedAt,
+              closedBy: alert.closedBy,
+              triageVerdict: alert.triageVerdict,
+            }}
+            monitor={monitor}
+          />
+        ) : (
+          <AlertHero
+            alert={{
+              id: alert.id,
+              ruleId: alert.ruleId,
+              ruleName: alert.ruleName,
+              severity: alert.severity,
+              status: alert.status as 'open' | 'acknowledged' | 'closed',
+              disposition: alert.disposition,
+              matchedEventCount: alert.matchedEventCount,
+              matchedEvents,
+              timestamp: alert.timestamp,
+              acknowledgedAt: alert.acknowledgedAt,
+              acknowledgedBy: alert.acknowledgedBy,
+              closedAt: alert.closedAt,
+              closedBy: alert.closedBy,
+              triageVerdict: alert.triageVerdict,
+            }}
+            rule={apiRule}
+            linkedNotebookCount={0}
+          />
+        )}
         {/* NAN-967: triage CTAs (Acknowledge / Assign / Close) — were
             previously only reachable from the /alerts list row icons. */}
-        <AlertTriageBar
-          alertId={alert.id}
-          ruleName={alert.ruleName}
-          status={alert.status as 'open' | 'acknowledged' | 'closed'}
-          currentAssignee={apiAlert?.assigned_to ?? null}
-          onActionComplete={refetchAlert}
-        />
+        <div className="flex items-center flex-wrap gap-2">
+          <AlertTriageBar
+            alertId={alert.id}
+            ruleName={displayName ?? 'Alert'}
+            status={alert.status as 'open' | 'acknowledged' | 'closed'}
+            currentAssignee={apiAlert?.assigned_to ?? null}
+            onActionComplete={refetchAlert}
+            bypassCasesSuppression={isMonitor}
+          />
+          {/* NAN-1552: reverse entry point — attach this alert to a case
+              (enterprise; self-gates). Works for detection + monitor alerts. */}
+          <AssociateCaseButton alertId={alert.id} onAssociated={refetchAlert} />
+        </div>
       </div>
 
       {/* Tab bar — sticky inside the page scroll container. */}
@@ -197,9 +245,12 @@ export function AlertDetail() {
 
       {/* Tab content */}
       <div className="flex-1 min-h-0 px-4 py-4">
-        {activeTab === 'events' && (
-          <EventsTab events={matchedEvents} alertTimestamp={alert.timestamp} />
-        )}
+        {activeTab === 'events' &&
+          (monitor ? (
+            <MonitorBreachTab events={matchedEvents} />
+          ) : (
+            <EventsTab events={matchedEvents} alertTimestamp={alert.timestamp} />
+          ))}
         {activeTab === 'rule' && (
           <RuleTab apiRule={apiRule} />
         )}
@@ -240,6 +291,71 @@ function EventsTab({
       hoveredId={null}
       onHover={() => {}}
     />
+  );
+}
+
+// NAN-1547: monitor alerts pack a single breach object in matched_events rather
+// than security log events. The EventViewer's "key fields" / latency framing is
+// meaningless for that, so render the payload as a plain key/value sheet.
+function fmtBreachValue(v: unknown): string {
+  if (v == null) return '—';
+  if (typeof v === 'string') return v.length ? v : '—';
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  return JSON.stringify(v);
+}
+
+function BreachCard({ payload, index }: { payload: Record<string, unknown>; index?: number }) {
+  const entries = Object.entries(payload);
+  return (
+    <div className="rounded-md border border-border bg-card overflow-hidden">
+      <div className="px-3.5 py-2.5 border-b border-border flex items-center gap-2">
+        <Activity className="w-3 h-3 text-muted-foreground" strokeWidth={2} />
+        <span className="font-mono text-[9.5px] uppercase tracking-[0.12em] text-muted-foreground font-semibold">
+          Breach payload{index ? ` · ${index}` : ''}
+        </span>
+      </div>
+      <div className="p-3.5 grid grid-cols-1 @min-[680px]:grid-cols-2 gap-x-10 font-mono text-[11px]">
+        {entries.map(([k, v]) => (
+          <div
+            key={k}
+            className="flex items-start justify-between gap-4 py-1.5 border-b border-border/40"
+          >
+            <span className="text-muted-foreground shrink-0">{k}</span>
+            <span className="text-foreground text-right break-all">{fmtBreachValue(v)}</span>
+          </div>
+        ))}
+      </div>
+      <details className="border-t border-border">
+        <summary className="px-3.5 py-2 cursor-pointer font-mono text-[9.5px] uppercase tracking-[0.12em] text-muted-foreground hover:text-foreground select-none">
+          Raw JSON
+        </summary>
+        <pre className="px-3.5 pb-3.5 pt-1 overflow-auto font-mono text-[10.5px] leading-[1.5] text-foreground/90">
+          {JSON.stringify(payload, null, 2)}
+        </pre>
+      </details>
+    </div>
+  );
+}
+
+function MonitorBreachTab({ events }: { events: Record<string, unknown>[] }) {
+  if (events.length === 0) {
+    return (
+      <div className="rounded-md border border-border bg-card p-8 text-center">
+        <Zap className="w-10 h-10 mx-auto text-muted-foreground/50 mb-3" strokeWidth={1.5} />
+        <p className="text-[12px] text-muted-foreground">No breach payload available.</p>
+      </div>
+    );
+  }
+  return (
+    <div className="flex flex-col gap-4">
+      {events.map((payload, i) => (
+        <BreachCard
+          key={i}
+          payload={payload}
+          index={events.length > 1 ? i + 1 : undefined}
+        />
+      ))}
+    </div>
   );
 }
 

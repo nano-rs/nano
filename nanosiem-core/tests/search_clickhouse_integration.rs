@@ -147,7 +147,7 @@ async fn test_search_service_with_clickhouse() {
         end: Utc::now() + Duration::hours(1),
     };
 
-    match search_service.explain("admin | stats count by src_ip", &time_range, false) {
+    match search_service.explain("admin | stats count by src_ip", &time_range, false, None) {
         Ok(sql) => {
             println!("Generated SQL for 'admin | stats count by src_ip':");
             println!("{}", sql);
@@ -254,7 +254,7 @@ async fn test_clickhouse_sql_generation() {
 
     for (query, description) in test_queries {
         print!("  {} ... ", description);
-        match search_service.explain(query, &time_range) {
+        match search_service.explain(query, &time_range, false, None) {
             Ok(sql) => {
                 // Verify SQL contains expected elements
                 assert!(sql.contains("SELECT"), "SQL should contain SELECT");

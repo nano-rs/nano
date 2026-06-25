@@ -4,7 +4,7 @@
  * UDM (Unified Data Model) field definitions
  *
  * AUTO-GENERATED — do not edit manually.
- * Source: nanosiem-core/docs/udmfields.csv (519 fields)
+ * Source: nanosiem-core/docs/udmfields.csv (521 fields)
  * Regenerate: npm run generate:udm
  */
 
@@ -88,10 +88,10 @@ export const UDM_COLUMNS = new Set([
   'sga_fixed_area_size', 'sga_free_memory', 'sga_library_cache_size',
   'sga_redo_log_buffer_size', 'sga_shared_pool_size', 'sga_sql_area_size', 'shell',
   'signature', 'signature_extra', 'signature_id', 'signature_version', 'site', 'size',
-  'snapshot', 'source', 'source_type', 'src', 'src_dns', 'src_host', 'src_interface',
-  'src_ip', 'src_ip_range', 'src_mac', 'src_nt_domain', 'src_nt_host', 'src_port',
-  'src_port_range', 'src_translated_ip', 'src_translated_port', 'src_type', 'src_user',
-  'src_user_domain', 'src_user_id', 'src_user_identity_account_status',
+  'snapshot', 'source', 'source_type', 'span_id', 'src', 'src_dns', 'src_host',
+  'src_interface', 'src_ip', 'src_ip_range', 'src_mac', 'src_nt_domain', 'src_nt_host',
+  'src_port', 'src_port_range', 'src_translated_ip', 'src_translated_port', 'src_type',
+  'src_user', 'src_user_domain', 'src_user_id', 'src_user_identity_account_status',
   'src_user_identity_company', 'src_user_identity_country', 'src_user_identity_department',
   'src_user_identity_display_name', 'src_user_identity_email',
   'src_user_identity_employee_id', 'src_user_identity_employee_type',
@@ -112,7 +112,7 @@ export const UDM_COLUMNS = new Set([
   'swap_free', 'swap_used', 'table_scans', 'tables_hit', 'tablespace_name',
   'tablespace_reads', 'tablespace_status', 'tablespace_used', 'tablespace_writes', 'tag',
   'tags', 'tcp_flag', 'temperature', 'thruput', 'thruput_max', 'time', 'timestamp', 'tos',
-  'transaction_id', 'transport', 'transport_dest_port', 'ttl', 'type', 'uri_path',
+  'trace_id', 'transaction_id', 'transport', 'transport_dest_port', 'ttl', 'type', 'uri_path',
   'uri_query', 'url', 'url_domain', 'url_length', 'user', 'user_agent', 'user_domain',
   'user_group', 'user_id', 'user_identity_account_status', 'user_identity_company',
   'user_identity_country', 'user_identity_department', 'user_identity_display_name',

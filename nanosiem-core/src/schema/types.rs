@@ -22,6 +22,20 @@ pub enum SchemaId {
     Udm,
     /// Open Cybersecurity Schema Framework.
     Ocsf,
+    /// OpenTelemetry spans (`otel_spans`) — a per-QUERY dataset profile, NOT a
+    /// tenant log schema (NAN-1555). Selected via `/search?dataset=spans` and
+    /// injected by the SQL generator's `with_dataset(Spans)`, never by the
+    /// `NANO_SCHEMA_PROFILE` env (`from_env_str` rejects it). Datasets are
+    /// orthogonal to the UDM-vs-OCSF logs choice: spans carry the entity overlay
+    /// (`src_ip`/`user`/`host`) and a CH `Map` attribute tail, so they are never
+    /// "OCSF-unmapped" — the cross-dataset bridge is entities, not schemas.
+    Spans,
+    /// OpenTelemetry metrics (`otel_metrics`) — a per-QUERY dataset profile like
+    /// [`Spans`](SchemaId::Spans), NOT a tenant log schema (NAN-1555 Phase 2).
+    /// A time-series model: `stats`/`timechart` over `value` map onto metric
+    /// aggregation, with gap-fill, counter-reset-aware rates, and resolution
+    /// routing to the `otel_metrics_1m/_1h` rollups handled in the SQL generator.
+    Metrics,
 }
 
 impl SchemaId {
@@ -84,6 +98,25 @@ pub enum FieldResolution {
     },
     /// A schema alias to another physical column (UDM `action AS event_type`).
     Alias(String),
+    /// A ClickHouse `Map(String, String)` subscript — the spans/metrics attribute
+    /// tail (NAN-1555). Unlike [`JsonPath`] (a JSON column the generator extracts
+    /// from), the tail is a native `Map` column, so access is `col['key']` with
+    /// the LITERAL dotted key preserved (`attributes['http.method']`, NOT the
+    /// dot-stripped `ext.httpmethod` the UDM `Unknown` arm emits). `fallback`, when
+    /// set, is a second `Map` column tried when `key` is absent in `col`
+    /// (`resource_attributes` for spans), so an OTel attribute matches regardless
+    /// of which map carries it.
+    ///
+    /// [`JsonPath`]: FieldResolution::JsonPath
+    MapKey {
+        /// The primary `Map` column (e.g. `attributes`).
+        col: String,
+        /// A secondary `Map` column to fall back to when `key` is absent in `col`
+        /// (e.g. `resource_attributes`), or `None` for no fallback.
+        fallback: Option<String>,
+        /// The literal map key (dotted OTel attribute name, e.g. `http.method`).
+        key: String,
+    },
     /// Field is not part of this schema's universe; falls to the overflow column
     /// (`ext` for UDM, `unmapped`/`event` tail for OCSF).
     Unknown,

@@ -730,7 +730,10 @@ impl SignalProcessor {
         // UDM carries the full original log in its `metadata` String column;
         // OCSF reads the JSON tail column (`unmapped` spill, NAN-1443).
         let metadata_expr = match profile.id() {
-            crate::schema::SchemaId::Udm => "metadata".to_string(),
+            // Spans/metrics are never a tenant detection schema (NAN-1555); UDM default.
+            crate::schema::SchemaId::Udm
+            | crate::schema::SchemaId::Spans
+            | crate::schema::SchemaId::Metrics => "metadata".to_string(),
             crate::schema::SchemaId::Ocsf => {
                 format!("toString({}) AS metadata", profile.json_tail_column())
             }
@@ -785,7 +788,9 @@ impl SignalProcessor {
         // `ocsf_logs`, UDM reads `logs`, both through the tenant-aware registry.
         let logs_table_key = match profile.id() {
             crate::schema::SchemaId::Ocsf => "ocsf_logs",
-            crate::schema::SchemaId::Udm => "logs",
+            crate::schema::SchemaId::Udm
+            | crate::schema::SchemaId::Spans
+            | crate::schema::SchemaId::Metrics => "logs",
         };
         let logs_table = dual_pool.table_names().read(logs_table_key);
 

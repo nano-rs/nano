@@ -286,12 +286,14 @@ export function useAlerts(params?: {
   status?: string;
   severity?: string;
   rule_id?: string;
+  /** NAN-1541: alert-kind filter ('detection' vs observability monitors). */
+  kinds?: string[];
   limit?: number;
   offset?: number;
 }, options?: UseQueryOptions) {
   return useQuery(
     () => api.listAlerts(params),
-    [params?.status, params?.severity, params?.rule_id, params?.limit, params?.offset],
+    [params?.status, params?.severity, params?.rule_id, params?.kinds?.join(','), params?.limit, params?.offset],
     options
   );
 }
@@ -303,14 +305,15 @@ export function useAlert(id: string | undefined) {
   );
 }
 
-export function useAlertCounts(options?: UseQueryOptions) {
-  return useQuery(() => api.getAlertCounts(), [], options);
+export function useAlertCounts(kinds?: string[], options?: UseQueryOptions) {
+  return useQuery(() => api.getAlertCounts(kinds), [kinds?.join(',')], options);
 }
 
 /** NAN-1019: hourly alert-velocity histogram over the last N hours
- *  (default 24). Powers the FIRING NOW sparkline on /rules. */
-export function useAlertVelocity(hours: number = 24, options?: UseQueryOptions) {
-  return useQuery(() => api.getAlertVelocity(hours), [hours], options);
+ *  (default 24). Powers the FIRING NOW sparkline on /rules.
+ *  NAN-1541: optional kinds filter (detection vs observability monitors). */
+export function useAlertVelocity(hours: number = 24, kinds?: string[], options?: UseQueryOptions) {
+  return useQuery(() => api.getAlertVelocity(hours, kinds), [hours, kinds?.join(',')], options);
 }
 
 export function useAcknowledgeAlert() {
@@ -361,8 +364,10 @@ export function useFieldStats() {
 // On-demand search field values (Kibana-style, fetched when user expands a field)
 export function useSearchFieldValues() {
   return useMutation(
-    ({ field, query, start, end, limit }: { field: string; query: string; start: string; end: string; limit?: number }) =>
-      api.getSearchFieldValues({ field, query, start, end, limit })
+    ({ field, query, start, end, limit, dataset }: { field: string; query: string; start: string; end: string; limit?: number; dataset?: import('@/lib/api/types').SearchDataset }) =>
+      // NAN-1559: forward the per-query dataset so a spans/metrics field drill-in
+      // resolves the field + base table against the dataset, not UDM `logs`.
+      api.getSearchFieldValues({ field, query, start, end, limit, dataset })
   );
 }
 
@@ -648,6 +653,10 @@ export function fromApiAlert(alert: Alert) {
     // AI Triage status
     triageStatus: alert.triage_status,
     triageVerdict: alert.triage_verdict,
+    // NAN-1541 alert-spine: discriminator + producer id. `detection` for rule
+    // alerts; metric_monitor/slo/synthetic for observability monitor alerts.
+    kind: alert.kind ?? 'detection',
+    sourceId: alert.source_id,
   };
 }
 

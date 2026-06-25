@@ -1,0 +1,39 @@
+# Auto-generated OCSF ingestion sink (NAN-1246)
+# DO NOT EDIT - regenerated on every parser deploy.
+# Each parser's generated `_ocsf_prepare` fork feeds nanosiem.ocsf_logs.
+# Emitted only under NANO_SCHEMA_PROFILE=ocsf; mirrors clickhouse_logs.
+# Durability ACK (NAN-1406): the server-side profile sets
+# wait_for_async_insert=1, so HTTP 200 means the flush succeeded —
+# a flush failure (NAN-1404 class) is a visible, retryable sink
+# error instead of a silently discarded pre-ACKed batch.
+[sinks.clickhouse_ocsf_logs]
+type = "clickhouse"
+inputs = ["apache_http_server__ocsf__ocsf_prepare", "aws_cloudtrail__ocsf__ocsf_prepare", "conduit_mitm_proxy__ocsf__ocsf_prepare", "microsoft_sysmon__json__ocsf__ocsf_prepare", "windows_event_log__ocsf__ocsf_prepare", "generic_ocsf_prepare"]
+endpoint = "${CLICKHOUSE_URL:-http://clickhouse:8123}"
+database = "${CLICKHOUSE_DATABASE:-nanosiem}"
+table = "${CLICKHOUSE_OCSF_LOGS_TABLE:-ocsf_logs_raw}"
+auth.strategy = "basic"
+auth.user = "${CLICKHOUSE_USER:-nanosiem}"
+auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
+compression = "gzip"
+date_time_best_effort = true
+skip_unknown_fields = true
+
+[sinks.clickhouse_ocsf_logs.buffer]
+type = "memory"
+max_events = 100000
+when_full = "drop_newest"
+
+[sinks.clickhouse_ocsf_logs.acknowledgements]
+enabled = false
+
+[sinks.clickhouse_ocsf_logs.batch]
+max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}
+max_events = ${VECTOR_BATCH_MAX_EVENTS:-50000}
+timeout_secs = ${VECTOR_BATCH_TIMEOUT_SECS:-10}
+
+[sinks.clickhouse_ocsf_logs.request]
+concurrency = "adaptive"
+timeout_secs = 120
+retry_initial_backoff_secs = 1
+retry_max_duration_secs = 300

@@ -24,7 +24,17 @@ export interface SearchRequest {
   async_mode?: boolean;
   /** Query priority for admission control: "interactive" (default) or "analytics" (long-running) */
   priority?: 'interactive' | 'analytics';
+  /**
+   * Observability dataset selector (NAN-1534). The nPL search terms + pipeline
+   * run against the selected ClickHouse table. Omitted/"logs" = the UDM logs
+   * lane (default); "spans" = otel_spans; "metrics" = otel_metrics. Unknown
+   * values fall back to logs server-side (never an error).
+   */
+  dataset?: SearchDataset;
 }
+
+/** Observability dataset a search runs against (NAN-1534). */
+export type SearchDataset = 'logs' | 'spans' | 'metrics';
 
 // ============================================================================
 // Async Search Types
@@ -196,7 +206,275 @@ export type DisplayType =
   | 'tree'        // Hierarchical tree visualization (tree command)
   | 'asset'       // Asset-centric view with identity resolution (asset command)
   | 'cloud'       // Cloud investigation view with faceted summaries (cloud command)
-  | 'lateral';    // Lateral movement trace with hop-by-hop paths (lateral command)
+  | 'lateral'     // Lateral movement trace with hop-by-hop paths (lateral command)
+  | 'services'    // OTLP services overview (services command) — reuses ServicesTab
+  | 'service'     // OTLP service RED drill-in (service command) — reuses ServiceDetail
+  | 'trace'       // OTLP distributed-trace waterfall (trace command) — reuses TraceWaterfall
+  | 'metric';     // OTLP metrics explorer (metric command) — reuses MetricsExplorer
+
+// ============================================================================
+// OpenTelemetry observability (NAN-1528)
+//
+// Spans/metrics are stored RAW/native in ClickHouse (otel_spans, otel_metrics)
+// — OTLP semconv attributes preserved losslessly in Map columns, with a thin
+// security-correlation entity overlay promoted to indexed columns. Logs ride
+// the existing UDM/OCSF lane and only gain trace_id/span_id correlation cols.
+// ============================================================================
+
+/** One OTLP span, flattened to the otel_spans row shape (lowercased-hex ids). */
+export interface OtelSpan {
+  trace_id: string;
+  span_id: string;
+  parent_span_id: string;
+  start_time: string;   // RFC3339 / ISO-8601 (DateTime64(9))
+  end_time: string;
+  duration_ns: number;
+  service_name: string;
+  span_name: string;
+  span_kind: string;    // INTERNAL | SERVER | CLIENT | PRODUCER | CONSUMER
+  status_code: string;  // UNSET | OK | ERROR
+  status_message: string;
+  attributes: Record<string, string>;
+  resource_attributes: Record<string, string>;
+  // thin security-correlation entity overlay
+  src_ip: string;
+  dest_ip: string;
+  user: string;
+  host: string;
+}
+
+/** GET trace-by-id → spans ordered by start_time, plus the resolved window. */
+export interface TraceResponse {
+  trace_id: string;
+  spans: OtelSpan[];
+  start_time: string;
+  end_time: string;
+  duration_ns: number;
+}
+
+/**
+ * One point in a metric timeseries (value already aggregated server-side).
+ *
+ * NAN-1534: reconciled with the real backend `MetricTimeseriesResponse` shape —
+ * the backend emits `{bucket, value}` per point (bucket = ISO-8601 interval
+ * start from `toStartOfInterval`), NOT `{timestamp, value}`. `timestamp` is kept
+ * as an optional alias so any older callers keep type-checking; readers should
+ * prefer `bucket ?? timestamp`.
+ */
+export interface MetricPoint {
+  /** ISO-8601 bucket start (backend field). */
+  bucket?: string;
+  /** Legacy alias for `bucket` — prefer `bucket`. */
+  timestamp?: string;
+  value: number;
+}
+
+/**
+ * Request for an OTLP metric time series.
+ * Matches backend `MetricTimeseriesRequest` (POST /api/search/metrics/timeseries):
+ * `{ metric_name, service_name?, time_range, step_secs? }`. The backend buckets
+ * by `step_secs` (default 60) and returns `avg(value)` per bucket.
+ */
+export interface MetricsQueryRequest {
+  metric_name: string;
+  time_range: TimeRange;
+  /** Optional service_name filter. */
+  service_name?: string;
+  /** Bucket width in seconds (clamped to >= 1 server-side; defaults to 60). */
+  step_secs?: number;
+}
+
+/**
+ * Response for a metric time series.
+ * Matches backend `MetricTimeseriesResponse`: `{ metric_name, points, step_secs }`.
+ */
+export interface MetricsQueryResponse {
+  metric_name: string;
+  /** Bucketed points (`{bucket, value}`), ordered by bucket. */
+  points: MetricPoint[];
+  /** Bucket width applied (after the >= 1 clamp). */
+  step_secs: number;
+}
+
+// ---------------------------------------------------------------------------
+// Metrics v2 (NAN-1540) — multi-series timeseries with agg / group_by / filters
+// ---------------------------------------------------------------------------
+
+/** Aggregation applied per bucket. Validated server-side against an allowlist. */
+export type MetricAgg =
+  | 'avg'
+  | 'sum'
+  | 'min'
+  | 'max'
+  | 'count'
+  | 'rate'
+  | 'p50'
+  | 'p95'
+  | 'p99';
+
+/** A single attribute/resource-attribute equality filter. */
+export interface MetricFilter {
+  key: string;
+  value: string;
+}
+
+/** One time-bucketed scalar point. `t` is RFC3339, `v` the aggregated value. */
+export interface MetricSeriesPoint {
+  t: string;
+  v: number;
+}
+
+/** One series in a metrics-v2 response. `key` is "" when no group_by. */
+export interface MetricSeries {
+  key: string;
+  points: MetricSeriesPoint[];
+}
+
+/**
+ * Request for a metrics-v2 timeseries (POST /api/search/metrics/timeseries).
+ * Superset of the legacy single-series request: `agg` defaults to "avg" and an
+ * absent `group_by` yields a single series, so omitting both is back-compatible.
+ */
+export interface MetricTimeseriesV2Request {
+  metric_name: string;
+  time_range: TimeRange;
+  service_name?: string;
+  /** Bucket width in seconds (clamped to >= 1 server-side; defaults to 60). */
+  step_secs?: number;
+  /** Aggregation; defaults to "avg" server-side. */
+  agg?: MetricAgg;
+  /** A tag/attribute key that splits the result into one series per value. */
+  group_by?: string;
+  /** Attribute/resource-attribute equality filters (ANDed). */
+  filters?: MetricFilter[];
+}
+
+/** Response for a metrics-v2 timeseries — one or more aligned series. */
+export interface MetricTimeseriesV2Response {
+  metric_name: string;
+  agg: MetricAgg;
+  group_by?: string;
+  series: MetricSeries[];
+  step_secs: number;
+}
+
+/**
+ * GET /api/search/metrics/tags — distinct tag keys (key omitted) or the distinct
+ * values for one key (key given) present on a metric over the window.
+ */
+export interface MetricTagsResponse {
+  tag_keys?: string[];
+  tag_values?: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Metric monitors (NAN-1540) — saved metrics-v2 query + breach test, evaluated
+// by the jobs runner. CRUD lives on the main api service
+// (GET/POST/PUT/DELETE /api/observability/metric-monitors).
+// ---------------------------------------------------------------------------
+
+/** Breach comparator: `value <comparator> threshold`. */
+export type MetricMonitorComparator = 'gt' | 'gte' | 'lt' | 'lte';
+
+/** A stored metric-monitor definition. Breach *state* is not part of the row. */
+export interface MetricMonitor {
+  /** typeid (`mon_<base32>`). */
+  id: string;
+  name: string;
+  metric_name: string;
+  agg: MetricAgg;
+  /** Splits the evaluation into one series per value of this tag key. */
+  group_by?: string;
+  filters: MetricFilter[];
+  comparator: MetricMonitorComparator;
+  threshold: number;
+  /** Trailing window (seconds) the aggregate is computed over. */
+  window_secs: number;
+  /** Runner cadence in seconds (30..=3600). */
+  eval_interval_secs: number;
+  enabled: boolean;
+  created_by?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Create/update payload (server-derived fields like id/timestamps are never sent). */
+export interface MetricMonitorRequest {
+  name: string;
+  metric_name: string;
+  agg: MetricAgg;
+  group_by?: string;
+  filters: MetricFilter[];
+  comparator: MetricMonitorComparator;
+  threshold: number;
+  /** 1..=86400. */
+  window_secs: number;
+  /** 30..=3600. */
+  eval_interval_secs: number;
+  enabled: boolean;
+}
+
+export interface MetricMonitorListResponse {
+  monitors: MetricMonitor[];
+}
+
+/** Filters for the recent-traces list (GET /api/search/traces, NAN-1534). */
+export interface ListTracesRequest {
+  time_range: TimeRange;
+  /** Optional substring/exact service_name filter. */
+  service?: string;
+  /** Only return traces that contain at least one ERROR span. */
+  errors_only?: boolean;
+  /** Minimum root/span duration in nanoseconds. */
+  min_duration_ns?: number;
+  /** Max traces to return (page size; backend clamps to 1000, default 200). */
+  limit?: number;
+  /**
+   * Keyset pagination cursor (NAN-1539, RFC3339). When set, only traces whose
+   * `start_time` is strictly before this instant are returned. Pass the last
+   * row's `start_time` from the previous page to load the next page (the list
+   * is most-recent-first).
+   */
+  before?: string;
+}
+
+/**
+ * One row in the recent-traces list. Aggregated per trace_id from otel_spans.
+ * Field names match the backend `list_traces` response verbatim (reconciled in
+ * the NAN-1534 verify stage): the SQL builder emits `root_service` / `root_name`
+ * (via argMin on the parent-less span), not `service_name` / `root_span_name`.
+ */
+export interface RecentTrace {
+  trace_id: string;
+  /** Root (parent-less) span's service.name. */
+  root_service: string;
+  /** Root span name. */
+  root_name: string;
+  span_count: number;
+  error_count: number;
+  /** Root-span duration in nanoseconds (the trace's wall-clock span). */
+  duration_ns: number;
+  /** Trace start_time (ISO-8601). */
+  start_time: string;
+}
+
+export interface ListTracesResponse {
+  traces: RecentTrace[];
+  /** Number of traces returned (mirrors backend `count`). */
+  count?: number;
+}
+
+/** One row in the metric-names list — backend emits `{metric_name}` objects. */
+export interface MetricName {
+  metric_name: string;
+}
+
+/** Distinct metric names for the Metrics explorer dropdown (GET /api/search/metrics/names). */
+export interface MetricNamesResponse {
+  names: MetricName[];
+  /** Number of distinct metric names returned (mirrors backend `count`). */
+  count?: number;
+}
 
 export interface SearchResponse {
   results: Record<string, unknown>[];
@@ -247,6 +525,8 @@ export interface FieldStatsRequest {
   request_id?: string;
   /** Column subset to compute stats for; omit for the full table inventory (NAN-1427) */
   columns?: string[];
+  /** Per-query dataset; must match the search's dataset so stats enumerate the right table/columns (NAN-1559) */
+  dataset?: SearchDataset;
 }
 
 export interface FieldStatsResponse {
@@ -261,6 +541,8 @@ export interface FieldValuesRequest {
   start: string;
   end: string;
   limit?: number;
+  /** Per-query dataset; must match the search's dataset so drill-in reads the right table/column (NAN-1559) */
+  dataset?: SearchDataset;
 }
 
 export interface FieldValueInfo {
@@ -594,6 +876,9 @@ export interface DetectionRule {
   materialized_view_name?: string;
   schedule_cron?: string;
   lookback_minutes?: number;
+  // NAN-1561: dataset this rule queries ('logs' default; 'spans'/'metrics' are
+  // scheduled-only). Mirrors the search dataset selector.
+  dataset?: SearchDataset;
   mitre_tactics: string[];
   mitre_techniques: string[];
   narrative?: string;
@@ -639,6 +924,9 @@ export interface CreateDetectionRequest {
   detection_mode?: 'real-time' | 'scheduled';
   schedule_cron?: string;
   lookback_minutes?: number; // Custom lookback period in minutes
+  // NAN-1561: dataset this rule queries ('logs' default; 'spans'/'metrics' are
+  // scheduled-only).
+  dataset?: SearchDataset;
   mitre_tactics?: string[];
   mitre_techniques?: string[];
   narrative?: string;
@@ -688,7 +976,16 @@ export interface Alert {
   triage_status?: 'pending' | 'running' | 'in_progress' | 'completed' | 'failed';
   triage_verdict?: 'true_positive' | 'false_positive' | 'likely_true_positive' | 'likely_false_positive' | 'needs_investigation' | 'benign';
   created_at: string;
+  // NAN-1541 alert-spine discriminator — what produced this alert. The backend
+  // always serializes it (defaulting legacy rows to `detection`).
+  kind?: AlertKind;
+  // NAN-1541 producer id as text — the detection rule UUID for `detection`
+  // alerts, or the monitor/check typeid for observability (monitor) alerts.
+  source_id?: string;
 }
+
+/** NAN-1541 alert-spine kinds. `detection` → SIEM; the rest → Observability. */
+export type AlertKind = 'detection' | 'metric_monitor' | 'slo' | 'synthetic';
 
 export interface AlertCounts {
   total: number;
@@ -2426,7 +2723,35 @@ export type VisualizationType =
   | 'tree'
   | 'ranked_bar'
   | 'transaction'
-  | 'flow';
+  | 'flow'
+  // NAN-1540: an OTel-metrics-backed widget. Its data comes from the metrics
+  // timeseries endpoint (driven by `PanelConfig.metricConfig`), NOT the nPL/SQL
+  // panel-query path, and it renders via the observability charts module.
+  | 'obs_metric';
+
+/** How an `obs_metric` widget renders its series (NAN-1540). */
+export type MetricWidgetViz = 'timeseries' | 'toplist' | 'query_value';
+
+/**
+ * Config for an `obs_metric` dashboard widget (NAN-1540). When present on a
+ * `PanelConfig` (with `visualizationType === 'obs_metric'`), the dashboard
+ * fetches via the metrics timeseries endpoint instead of running `query`.
+ */
+export interface MetricWidgetConfig {
+  metric_name: string;
+  agg: MetricAgg;
+  /** Splits into one series per value of this tag/attribute key. */
+  group_by?: string;
+  filters?: MetricFilter[];
+  /** Optional service_name filter. */
+  service_name?: string;
+  /** How to render the returned series. Defaults to "timeseries". */
+  viz: MetricWidgetViz;
+  /** Bucket width in seconds; defaults to a range-derived value when absent. */
+  step_secs?: number;
+  /** Display unit (e.g. "ms", "req/s"); cosmetic. */
+  unit?: string;
+}
 
 export interface VisualizationConfig {
   orientation?: 'horizontal' | 'vertical';
@@ -2478,6 +2803,13 @@ export interface PanelConfig {
   customTimeRange?: TimeRange;
   drilldownEnabled: boolean;
   drilldownTemplate?: string;
+  /**
+   * NAN-1540: present only when `visualizationType === 'obs_metric'`. Carries
+   * the OTel-metrics query (metric_name / agg / group_by / filters / viz). For
+   * metric widgets `query` is left empty and the panel data is fetched from the
+   * metrics timeseries endpoint instead of the nPL/SQL panel-query path.
+   */
+  metricConfig?: MetricWidgetConfig;
 }
 
 export interface CreateDashboardRequest {

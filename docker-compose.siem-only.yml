@@ -1,0 +1,456 @@
+# nano — SIEM-only (bring-your-own-aggregator) open-source compose
+#
+# Same stack as docker-compose.opensource.yml MINUS Vector: there is no nano
+# log-collection pipeline. Ingestion is delegated to a third-party data
+# aggregator (Tenzir, Cribl, a custom forwarder, …) that parses + shapes events
+# to OCSF and writes them DIRECTLY into ClickHouse, bypassing Vector entirely.
+# See docs: "Direct OCSF ingestion — Tenzir, Cribl, custom forwarders".
+#
+# This is for the BYO-pipeline deployment model. The default open-core install
+# (docker-compose.opensource.yml, which bundles Vector) is unchanged — pick this
+# file explicitly:
+#
+#   docker compose -f docker-compose.siem-only.yml up -d
+#
+# Requirements / notes:
+#   - Intended for the OCSF schema profile. Set NANO_SCHEMA_PROFILE=ocsf in .env
+#     (install.sh prompts for this — NAN-1474). The UDM `logs` table is not
+#     direct-writable; only `ocsf_logs_raw` is. Booting this with profile=udm
+#     gives you a working SIEM with no ingestion path at all.
+#   - Your aggregator writes as the INSERT-only `nanosiem_ingest` ClickHouse user
+#     (CLICKHOUSE_INGEST_PASSWORD, NAN-1444) into nanosiem.ocsf_logs_raw over the
+#     ClickHouse HTTP interface. That port (8123) is PUBLISHED below — see the
+#     security note on the clickhouse service before exposing this host.
+#
+# Required .env keys are identical to docker-compose.opensource.yml EXCEPT
+# VECTOR_AUTH_TOKEN is unused here (harmless if present).
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
+x-logging-verbose: &verbose-logging
+  driver: json-file
+  options:
+    max-size: "100m"
+    max-file: "3"
+
+services:
+  postgres:
+    # Pinned by digest (NAN-1258): a tag alone (`postgres:17`) can be silently
+    # re-pushed with different content; the @sha256 makes `docker pull` refuse
+    # anything but this exact manifest. Keep in sync with images.lock — bump the
+    # tag AND the digest together (resolve with `docker buildx imagetools inspect`).
+    image: postgres:17@sha256:0027bef26712baaee437a4ea48fdf3d2d2e2bc5f0d81615374408ca320f3c7e3
+    container_name: nano-postgres
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
+    command: ["-c", "max_connections=200", "-c", "shared_buffers=128MB"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nanosiem}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-nanosiem}
+    volumes:
+      - nano-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nanosiem}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  clickhouse:
+    # Digest-pinned — see the note on the postgres service (NAN-1258).
+    image: clickhouse/clickhouse-server:26.5@sha256:07afc18d8a9706eb9d85c5c5d2752e5270f91bbc2894caeaecb73e4d0f603bf5
+    container_name: nano-clickhouse
+    restart: unless-stopped
+    logging: *verbose-logging
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      # NAN-810: do NOT set CLICKHOUSE_DB here. The upstream entrypoint reacts
+      # to it by running `clickhouse-client -u default -q "CREATE DATABASE …"`,
+      # which fails against our default-profile users (allow_ddl=0 in
+      # users.d/query_limits.xml). clickhouse/init.sql already creates the
+      # nanosiem database via the clickhouse-migrate service, which runs as
+      # the admin user — the entrypoint's create is redundant.
+      #
+      # NAN-809: do NOT set CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT here. The upstream
+      # entrypoint reacts to that env by writing a generated default-user.xml into
+      # /etc/clickhouse-server/users.d/, which conflicts with our :ro bind mount and
+      # puts the container in a restart loop. Our users.d/default-user.xml already
+      # sets <access_management>1</access_management> directly, so the env is
+      # redundant.
+      # Pass per-deployment passwords into users.d/*.xml via from_env="..." (NAN-807 bug #2).
+      CLICKHOUSE_NANOSIEM_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD}
+      # NAN-1384 (G18): INSERT-only credential for direct OCSF writers
+      # (users.d/nanosiem-users.xml `nanosiem_ingest`). install.sh generates
+      # CLICKHOUSE_INGEST_PASSWORD for new installs; pre-NAN-1384 .env files
+      # fall back to the app password so an upgrade never resolves from_env
+      # to "" (an empty-password user). In SIEM-only mode this is the credential
+      # your external aggregator authenticates with.
+      CLICKHOUSE_INGEST_PASSWORD: ${CLICKHOUSE_INGEST_PASSWORD:-${CLICKHOUSE_PASSWORD}}
+    # SIEM-only divergence: the ClickHouse HTTP interface is PUBLISHED so an
+    # external aggregator (Tenzir/Cribl/forwarder) can INSERT directly into
+    # nanosiem.ocsf_logs_raw. The full-stack opensource compose keeps this port
+    # internal because Vector (same network) is the only writer.
+    #
+    # Bound to 127.0.0.1 by default — safe for an aggregator running on THIS host
+    # (or, better, as a container on this compose network, which reaches
+    # `clickhouse:8123` internally and needs no published port at all).
+    #
+    # SECURITY: the nanosiem_ingest (INSERT-only), nanosiem (app r/w), and
+    # nanosiem_admin (DDL) users all accept connections from any network
+    # (users.d/nanosiem-users.xml, <ip>::/0</ip>) — only `default` is
+    # localhost-only. So if your aggregator is on ANOTHER host and you must widen
+    # this bind (e.g. "8123:8123"), you are exposing the admin + app users too,
+    # not just the ingest user. Widen ONLY behind a firewall / IP-allowlist; never
+    # leave :8123 open to the internet.
+    ports:
+      - "127.0.0.1:8123:8123"
+    volumes:
+      - nano-clickhouse-data:/var/lib/clickhouse
+      - nano-clickhouse-logs:/var/log/clickhouse-server
+      - ./clickhouse/config.d:/etc/clickhouse-server/config.d:ro
+      - ./clickhouse/users.d:/etc/clickhouse-server/users.d:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- 'http://127.0.0.1:8123/?query=SELECT+1' 2>/dev/null | grep -q 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  dragonfly:
+    # Was `:latest` (NAN-1258): a floating tag on a security product is the
+    # easiest silent-mutation vector. Pinned to a concrete version + digest.
+    image: docker.dragonflydb.io/dragonflydb/dragonfly:v1.38.1@sha256:baf70ba7ad182a992b988497cfa31a488978c8fab7712079784c2401f447e402
+    container_name: nano-dragonfly
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
+    command: ["--maxmemory", "512mb", "--proactor_threads", "2"]
+    # No `ulimits: memlock: -1` — unlimited memlock can't be set in an
+    # unprivileged LXC (Docker can't exceed the container's 8MB memlock hard
+    # cap → "error setting rlimit type 8: operation not permitted", container
+    # won't start). Dragonfly runs fine without it at this maxmemory cap; the
+    # ulimit was only relevant for io_uring on pre-5.12 kernels (no longer
+    # charged against RLIMIT_MEMLOCK since Linux 5.12).
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  clickhouse-migrate:
+    image: ghcr.io/nano-rs/nano-api:${NANO_VERSION:-latest}
+    container_name: nano-clickhouse-migrate
+    command: ["clickhouse_migrator"]
+    restart: "no"
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-nanosiem}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nanosiem}
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: nanosiem
+      CLICKHOUSE_CLUSTER: ""
+      CLICKHOUSE_USER: nanosiem
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_ADMIN_USER: nanosiem_admin
+      CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD}
+      CLICKHOUSE_SELF_USER: nanosiem
+      # NAN-1476: must match api/search/jobs — when ocsf, the migrator applies
+      # the clickhouse/ocsf/init.sql overlay so ocsf_logs exists before boot.
+      # In SIEM-only mode this should be `ocsf` (set NANO_SCHEMA_PROFILE in .env).
+      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-udm}
+      # The migrator substitutes these into {pg_dict_*} placeholders in
+      # clickhouse/init.sql so the PG-sourced dictionaries can authenticate
+      # without hardcoded creds (NAN-807 bug #3).
+      POSTGRES_DICT_HOST: postgres
+      POSTGRES_DICT_PASSWORD: ${POSTGRES_PASSWORD}
+      RUST_LOG: ${RUST_LOG:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+  nano-api:
+    image: ghcr.io/nano-rs/nano-api:${NANO_VERSION:-latest}
+    container_name: nano-api
+    restart: unless-stopped
+    logging: *verbose-logging
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-nanosiem}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nanosiem}
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: nanosiem
+      CLICKHOUSE_CLUSTER: ""
+      CLICKHOUSE_USER: nanosiem
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_ADMIN_USER: nanosiem_admin
+      CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD}
+      CLICKHOUSE_SELF_USER: nanosiem
+      POSTGRES_DICT_HOST: postgres
+      POSTGRES_DICT_PASSWORD: ${POSTGRES_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      NANOSIEM_ENCRYPTION_KEY: ${NANOSIEM_ENCRYPTION_KEY}
+      CORS_ORIGINS: ${BASE_URL:-http://localhost}
+      AUTH_ENABLED: "true"
+      # install.sh flips this to "true" when BASE_URL is http:// so the refresh
+      # cookie is set without the Secure flag (NAN-807 bug #12).
+      NANOSIEM_DEV_MODE: ${NANOSIEM_DEV_MODE:-false}
+      API_HOST: 0.0.0.0
+      API_PORT: "3000"
+      # Storage schema profile (udm | ocsf). Fixed at install time by install.sh.
+      # Must match nano-search or the two services read different CH tables.
+      # SIEM-only / direct-ingestion deployments should run `ocsf`.
+      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-udm}
+      RUST_LOG: ${RUST_LOG:-info}
+      # Parser config staging. With no Vector to consume them, the parser-editor
+      # surface still writes here harmlessly (a no-op in BYO-aggregator mode —
+      # parsing is owned by your external pipeline). Kept so parser CRUD doesn't
+      # error on a missing path.
+      VECTOR_CONFIG_DIR: /app/config/vector
+      VECTOR_SOURCES_RUNTIME_PATH: /etc/vector/dynamic
+      VECTOR_CONTAINER_NAME: nano-vector
+      # Skip docker-exec'd `vector validate` (the api image has no docker CLI;
+      # and there is no Vector container here anyway).
+      SKIP_VECTOR_VALIDATION: "true"
+      NANOSIEM_DATA_DIR: /app/data
+      NRT_MAX_CONCURRENT_RULES: "50"
+      NRT_JITTER_MAX_SECS: "30"
+      HOT_RETENTION_DAYS: ${HOT_RETENTION_DAYS:-90}
+      WARM_RETENTION_DAYS: ${WARM_RETENTION_DAYS:-30}
+      COLD_STORAGE_ENABLED: "false"
+      NANO_TIER: ${NANO_TIER:-unrestricted}
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-}
+      REDIS_URL: redis://dragonfly:6379
+      LOG_FORMAT: ${LOG_FORMAT:-}
+      SIEM_FORWARD_URL: ${SIEM_FORWARD_URL:-}
+      SIEM_FORWARD_TOKEN: ${SIEM_FORWARD_TOKEN:-}
+    volumes:
+      - nano-api-data:/app/data
+      - nano-parser-staging:/etc/vector/dynamic
+      - nano-parser-staging:/app/config/vector
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      dragonfly:
+        condition: service_healthy
+      clickhouse-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/health 2>/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  nano-jobs:
+    image: ghcr.io/nano-rs/nano-jobs:${NANO_VERSION:-latest}
+    container_name: nano-jobs
+    restart: unless-stopped
+    logging: *verbose-logging
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-nanosiem}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nanosiem}
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: nanosiem
+      CLICKHOUSE_CLUSTER: ""
+      CLICKHOUSE_USER: nanosiem
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_ADMIN_USER: nanosiem_admin
+      CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD}
+      CLICKHOUSE_SELF_USER: nanosiem
+      POSTGRES_DICT_HOST: postgres
+      POSTGRES_DICT_PASSWORD: ${POSTGRES_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      NANOSIEM_ENCRYPTION_KEY: ${NANOSIEM_ENCRYPTION_KEY}
+      NANOSIEM_DEV_MODE: ${NANOSIEM_DEV_MODE:-false}
+      JOBS_PORT: "3003"
+      LEADER_ELECTION_ENABLED: "true"
+      # Storage schema profile (udm | ocsf). Must match nano-api/nano-search —
+      # the detection runner and repo sync resolve the rules repo + target
+      # table from this, so a mismatch syncs the wrong rules.
+      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-udm}
+      RUST_LOG: ${RUST_LOG:-info}
+      VECTOR_CONFIG_DIR: /app/config/vector
+      VECTOR_SOURCES_RUNTIME_PATH: /etc/vector/dynamic
+      VECTOR_CONTAINER_NAME: nano-vector
+      SKIP_VECTOR_VALIDATION: "true"
+      NANOSIEM_DATA_DIR: /app/data
+      NRT_MAX_CONCURRENT_RULES: "50"
+      NRT_JITTER_MAX_SECS: "30"
+      HOT_RETENTION_DAYS: ${HOT_RETENTION_DAYS:-90}
+      WARM_RETENTION_DAYS: ${WARM_RETENTION_DAYS:-30}
+      COLD_STORAGE_ENABLED: "false"
+      NANO_TIER: ${NANO_TIER:-unrestricted}
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-}
+      REDIS_URL: redis://dragonfly:6379
+      LOG_FORMAT: ${LOG_FORMAT:-}
+      SIEM_FORWARD_URL: ${SIEM_FORWARD_URL:-}
+      SIEM_FORWARD_TOKEN: ${SIEM_FORWARD_TOKEN:-}
+    volumes:
+      - nano-api-data:/app/data
+      - nano-parser-staging:/etc/vector/dynamic
+      - nano-parser-staging:/app/config/vector
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      dragonfly:
+        condition: service_healthy
+      clickhouse-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3003/health 2>/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  nano-search:
+    image: ghcr.io/nano-rs/nano-search:${NANO_VERSION:-latest}
+    container_name: nano-search
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-nanosiem}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nanosiem}
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: nanosiem
+      CLICKHOUSE_CLUSTER: ""
+      CLICKHOUSE_USER: nanosiem
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      SEARCH_PORT: "3002"
+      JWT_SECRET: ${JWT_SECRET}
+      NANOSIEM_ENCRYPTION_KEY: ${NANOSIEM_ENCRYPTION_KEY}
+      CORS_ORIGINS: ${BASE_URL:-http://localhost}
+      AUTH_ENABLED: "true"
+      NANOSIEM_DEV_MODE: ${NANOSIEM_DEV_MODE:-false}
+      # Storage schema profile (udm | ocsf). Must match nano-api (above).
+      NANO_SCHEMA_PROFILE: ${NANO_SCHEMA_PROFILE:-udm}
+      REDIS_URL: redis://dragonfly:6379
+      RUST_LOG: ${RUST_LOG:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-}
+      SIEM_FORWARD_URL: ${SIEM_FORWARD_URL:-}
+      SIEM_FORWARD_TOKEN: ${SIEM_FORWARD_TOKEN:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      dragonfly:
+        condition: service_healthy
+      clickhouse-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3002/health 2>/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  nano-web:
+    image: ghcr.io/nano-rs/nano-web:${NANO_VERSION:-latest}
+    container_name: nano-web
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
+    # No healthcheck — the image's embedded nginx only binds IPv4 on :5173,
+    # but Alpine wget resolves "localhost" to ::1 and fails. Enterprise has
+    # no healthcheck either; nginx depends on web with service_started.
+    # NAN-807 bug #4.
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  nginx:
+    # Was `:alpine` (NAN-1258) — floating tag pinned to its digest. The tag is
+    # kept for human readability; the @sha256 is what `docker pull` enforces.
+    image: nginx:alpine@sha256:8b1e78743a03dbb2c95171cc58639fef29abc8816598e27fb910ed2e621e589a
+    container_name: nano-nginx
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
+    # Reuses the full-stack nginx config. Its /ingest location proxies to the
+    # (absent) Vector via a runtime-resolved variable, so nginx still starts
+    # cleanly — a request to /ingest would 502, but BYO-aggregator deployments
+    # don't use it (your aggregator writes straight to ClickHouse :8123).
+    volumes:
+      - ./config/nginx/nginx.opensource.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "80:80"
+    depends_on:
+      nano-api:
+        condition: service_healthy
+      nano-web:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:80/api/health 2>/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+volumes:
+  nano-postgres-data:
+  nano-clickhouse-data:
+  nano-clickhouse-logs:
+  nano-api-data:
+  # Parser-config staging shared by api + jobs. In the full stack this is the
+  # Vector dynamic-config volume; here nothing consumes it (parsing is owned by
+  # your external aggregator), but api/jobs still write to it harmlessly.
+  nano-parser-staging:
