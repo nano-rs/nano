@@ -661,8 +661,22 @@ if src_type == null { src_type = "unknown" }
 raw_message = .message
 if raw_message == null { raw_message = "" }
 
+# NAN-1556: carry OTLP-mapped fields through the `. = {...}` rebuild below.
+# otlp_logs_prep (config/vector/03-otlp-source.toml) sets these at the top
+# level; without capturing them here the reset would drop them on the generic
+# path (the lane OTLP logs ride with no deployed parser). Null/empty for every
+# non-OTLP source, so behavior for HTTP/HEC/Vector/parsers is unchanged.
+otlp_severity = .severity
+otlp_ext = .ext
+otlp_trace_id = .trace_id
+otlp_span_id = .span_id
+
 . = {
     "timestamp": .udm.timestamp,
+    "severity": otlp_severity,
+    "ext": otlp_ext,
+    "trace_id": otlp_trace_id,
+    "span_id": otlp_span_id,
     "message": raw_message,
     "raw_content": .raw_content,
     "metadata": encode_json(.metadata),
@@ -822,6 +836,12 @@ if pcmd_val == null || pcmd_val == "" { pcmd_val = .parent_process }
 .user_type = to_string(.user_type) ?? ""
 .result = to_string(.result) ?? ""
 .severity = to_string(.severity) ?? ""
+# NAN-1556: OTLP log correlation ids (set by otlp_logs_prep, carried through
+# prepare_output). Downcased to match the lower(col) convention; empty for
+# non-correlated logs. Listed in explicit_columns below so they map to their
+# own columns instead of being swept into ext.
+.trace_id = downcase(to_string(.trace_id) ?? "")
+.span_id = downcase(to_string(.span_id) ?? "")
 .category = to_string(.category) ?? ""
 .authentication_method = to_string(.authentication_method) ?? ""
 .file_size = to_int(.file_size) ?? 0
@@ -853,6 +873,7 @@ explicit_columns = [
     "bytes_in", "bytes_out", "packets_in", "packets_out", "direction", "src_mac", "dest_mac", "vlan",
     "user", "src_user", "dest_user", "user_id", "user_name", "user_domain", "user_type",
     "action", "status", "status_code", "result", "severity", "category",
+    "trace_id", "span_id",
     "auth_type", "auth_result", "session_id", "authentication_method",
     "process_name", "process_id", "process_path", "process_hash",
     "command_line", "parent_command_line", "parent_process_name", "parent_process_id", "parent_process_path",
@@ -966,6 +987,29 @@ msg = to_string(.message) ?? ""
 if msg == "" { msg = encode_json(ocsf_event) }
 ocsf_event.class_uid = 0
 ocsf_event.message = msg
+
+# NAN-1556: OTLP LogRecords (source_type=otlp_log) reach this generic lane with
+# canonical fields already set by otlp_logs_prep (.severity, .metadata.src_host
+# from resource service.name, .trace_id/.span_id). Promote them to OCSF Base
+# Event keys inside `event` so the ocsf_logs MATERIALIZED columns
+# (severity_id / severity / src_endpoint.hostname / time, all JSONExtract'd from
+# `event`) populate. Each map is gated on presence, so non-OTLP parserless
+# events are byte-unchanged (their severity/src_host are unset).
+sev_str = to_string(.severity) ?? ""
+if sev_str != "" {
+    ocsf_event.severity = sev_str
+    sl = downcase(sev_str)
+    ocsf_event.severity_id = if sl == "fatal" { 6 } else if sl == "critical" { 5 } else if sl == "error" { 4 } else if sl == "warn" || sl == "warning" { 3 } else if sl == "info" || sl == "informational" || sl == "debug" || sl == "trace" { 1 } else { 0 }
+}
+otlp_host = to_string(.metadata.src_host) ?? ""
+if otlp_host != "" {
+    ocsf_event.src_endpoint.hostname = downcase(otlp_host)
+}
+otlp_time = to_string(.timestamp) ?? ""
+if otlp_time != "" {
+    ocsf_event.time = otlp_time
+}
+
 . = { "event": ocsf_event, "timestamp": format_timestamp!(now(), "%Y-%m-%d %H:%M:%S%.3f"), "source_type": src_type }
 '''
 "#;
@@ -1558,6 +1602,114 @@ mod tests {
             failures.is_empty(),
             "00-base.toml VRL failed to compile:\n{}",
             failures.join("\n----\n")
+        );
+    }
+
+    /// NAN-1556: same guard as `base_config_vrl_blocks_compile`, for the OTLP
+    /// source (config/vector/03-otlp-source.toml). `otlp_logs_prep` maps the OTLP
+    /// LogRecord envelope (severity / service / attributes / trace ids); a VRL
+    /// diagnostic here would take OTLP ingestion down on the next Vector reload.
+    #[test]
+    fn otlp_source_vrl_blocks_compile() {
+        use vrl::compiler::compile;
+        use vrl::diagnostic::Formatter;
+
+        let content = include_str!("../../../../config/vector/03-otlp-source.toml");
+        let blocks = extract_vrl_blocks(content);
+        assert!(
+            !blocks.is_empty(),
+            "expected ≥1 VRL block in 03-otlp-source.toml"
+        );
+
+        let fns = vrl::stdlib::all();
+        let failures: Vec<String> = blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, block)| {
+                compile(block, &fns).err().map(|diagnostics| {
+                    let formatted = Formatter::new(block, diagnostics).to_string();
+                    format!("block #{idx}:\n{formatted}")
+                })
+            })
+            .collect();
+
+        assert!(
+            failures.is_empty(),
+            "03-otlp-source.toml VRL failed to compile:\n{}",
+            failures.join("\n----\n")
+        );
+    }
+
+    /// NAN-1556: pin the OTLP envelope→column wiring. `otlp_logs_prep` must set
+    /// severity, route resource `service.name` → src_host, and build the `ext`
+    /// tail; and the static pipeline must carry severity/ext/trace_id/span_id
+    /// through `prepare_output` (the generic OTLP-log path) or those columns
+    /// silently drop (the bug NAN-1556 fixes). Pin both halves so a refactor
+    /// can't quietly regress the mapping.
+    #[test]
+    fn otlp_envelope_mapping_is_wired() {
+        let otlp = include_str!("../../../../config/vector/03-otlp-source.toml");
+        assert!(
+            otlp.contains(".severity = sev"),
+            "otlp_logs_prep must set .severity from severity_text/number"
+        );
+        assert!(
+            otlp.contains(r#".resources."service.name""#),
+            "otlp_logs_prep must read resource service.name -> src_host"
+        );
+        assert!(
+            otlp.contains(".ext = tail"),
+            "otlp_logs_prep must build the ext tail from attributes + resources"
+        );
+
+        let pipeline = VectorConfigManager::pipeline_config_content();
+        assert!(
+            pipeline.contains("otlp_severity = .severity"),
+            "prepare_output must carry .severity through the rebuild"
+        );
+        assert!(
+            pipeline.contains("otlp_ext = .ext"),
+            "prepare_output must carry .ext through the rebuild"
+        );
+        assert!(
+            pipeline.contains("\"trace_id\", \"span_id\","),
+            "trace_id/span_id must be explicit_columns (mapped to columns, not swept into ext)"
+        );
+    }
+
+    /// NAN-1576: pin the traces/metrics ingest wiring. Vector's `opentelemetry`
+    /// source emits spans as TRACE events and metrics as METRIC events, but the
+    /// `clickhouse` sink only accepts LOG events and silently drops the others
+    /// (the sink's received_events_total stays 0 — nothing reaches otel_spans /
+    /// otel_metrics). The `trace_to_log` / `metric_to_log` converters are the
+    /// load-bearing fix; without them ingestion regresses to a silent zero. Also
+    /// pin that the preps re-encode into the OTLP/JSON shape the MVs read
+    /// (camelCase `traceId`/`startTimeUnixNano`, epoch-nano `timeUnixNano`), since
+    /// Vector decodes into snake_case/RFC3339/flat-map and the MV's JSONExtract
+    /// path would silently extract nothing from the native shape.
+    #[test]
+    fn otlp_traces_metrics_ingest_is_wired() {
+        let otlp = include_str!("../../../../config/vector/03-otlp-source.toml");
+
+        // Event-type conversion (the whole bug: TRACE/METRIC events can't enter a
+        // log-only clickhouse sink).
+        assert!(
+            otlp.contains(r#"type = "trace_to_log""#),
+            "spans must pass through trace_to_log or the clickhouse sink drops them (recv=0)"
+        );
+        assert!(
+            otlp.contains(r#"type = "metric_to_log""#),
+            "metrics must pass through metric_to_log or the clickhouse sink drops them (recv=0)"
+        );
+
+        // Reshape to the OTLP/JSON the MVs (clickhouse/138, /140) read.
+        assert!(
+            otlp.contains(r#""traceId""#) && otlp.contains(r#""startTimeUnixNano""#),
+            "otlp_traces_prep must emit camelCase OTLP/JSON span keys the otel_spans MV reads"
+        );
+        assert!(
+            otlp.contains(r#""timeUnixNano""#),
+            "otlp_metrics_prep must emit epoch-nano timeUnixNano the otel_metrics MV reads"
         );
     }
 

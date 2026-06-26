@@ -77,7 +77,7 @@ pub enum Transport {
     /// realistic producer path: per-record OTLP/JSON is wrapped in the OTLP
     /// export envelope (`resourceSpans`/`resourceMetrics`/`resourceLogs`) and
     /// POSTed to `<base_url>/v1/{traces,metrics,logs}` with
-    /// `Content-Type: application/json`. `base_url` is the receiver root (no
+    /// protobuf (`application/x-protobuf`). `base_url` is the receiver root (no
     /// `/v1/...` suffix — the signal-specific path is appended per send).
     /// Default `http://localhost:4318`. The OTLP source has no shared-token
     /// gate (auth terminates at the LB), so there is no token.
@@ -203,34 +203,106 @@ fn otlp_ch_target(signal: OtlpSignal) -> &'static str {
 /// Wraps records in the single-resource/single-scope envelope the OTLP spec
 /// uses: `resourceSpans[].scopeSpans[].spans[]` (and the metrics/logs analogues).
 /// One envelope per POST is valid OTLP — the receiver flattens it back out.
-fn otlp_envelope(signal: OtlpSignal, records: &[serde_json::Value]) -> serde_json::Value {
-    use serde_json::json;
-    match signal {
-        OtlpSignal::Traces => json!({
-            "resourceSpans": [{
-                "scopeSpans": [{
-                    "scope": { "name": "log-blaster", "version": "1" },
-                    "spans": records
-                }]
-            }]
-        }),
-        OtlpSignal::Metrics => json!({
-            "resourceMetrics": [{
-                "scopeMetrics": [{
-                    "scope": { "name": "log-blaster", "version": "1" },
-                    "metrics": records
-                }]
-            }]
-        }),
-        OtlpSignal::Logs => json!({
-            "resourceLogs": [{
-                "scopeLogs": [{
-                    "scope": { "name": "log-blaster", "version": "1" },
-                    "logRecords": records
-                }]
-            }]
-        }),
+/// NAN-1575: reshape a FLAT log-blaster metric record into the standard OTLP
+/// `Metric` the proto expects. Our generators emit flat points
+/// (`{name, unit, type, timeUnixNano, asInt|asDouble | count/sum/bucketCounts/
+/// explicitBounds, attributes}`) tailored to the direct-CH MV, but proto
+/// `Metric` nests a single data oneof (`gauge`/`sum`/`histogram`) each with a
+/// `dataPoints[]`. Without this, `from_value` yields a `Metric` with name/unit
+/// but NO data points (the flat fields aren't proto Metric fields → dropped).
+/// `resource` must already be stripped by the caller. Returns the input
+/// unchanged for an unrecognized/absent `type` (fail-open).
+fn flat_metric_to_otlp(rec: serde_json::Value) -> serde_json::Value {
+    use serde_json::{json, Map, Value};
+    let mut obj = match rec {
+        Value::Object(o) => o,
+        other => return other,
+    };
+    let kind = match obj.get("type").and_then(Value::as_str) {
+        Some(k) => k.to_string(),
+        None => return Value::Object(obj),
+    };
+    let name = obj.remove("name").unwrap_or(Value::Null);
+    let unit = obj.remove("unit").unwrap_or(Value::Null);
+    obj.remove("type");
+    // `opentelemetry-proto` 0.27 `with-serde` decodes `HistogramDataPoint.bucketCounts`
+    // (repeated u64) as JSON NUMBERS, but the generator emits the OTLP/JSON string
+    // form. A string there fails the flattened decode and the whole metric is swept
+    // to `data: None`. Coerce to numbers. (`count` is already a number; `asInt`/
+    // `timeUnixNano` are strings which the proto's u64 deserializers accept.)
+    if let Some(Value::Array(arr)) = obj.get_mut("bucketCounts") {
+        for v in arr.iter_mut() {
+            if let Some(n) = v.as_str().and_then(|s| s.parse::<u64>().ok()) {
+                *v = Value::from(n);
+            }
+        }
     }
+    // Whatever remains (timeUnixNano, asInt/asDouble or count/sum/bucketCounts/
+    // explicitBounds, attributes) is the single data point.
+    let datapoint = Value::Object(obj);
+    let data = match kind.as_str() {
+        "gauge" => json!({ "gauge": { "dataPoints": [datapoint] } }),
+        // CUMULATIVE (2) monotonic counter.
+        "sum" => json!({ "sum": {
+            "dataPoints": [datapoint],
+            "aggregationTemporality": 2,
+            "isMonotonic": true,
+        }}),
+        "histogram" => json!({ "histogram": {
+            "dataPoints": [datapoint],
+            "aggregationTemporality": 2,
+        }}),
+        _ => return datapoint,
+    };
+    let mut out = Map::new();
+    out.insert("name".to_string(), name);
+    out.insert("unit".to_string(), unit);
+    if let Value::Object(d) = data {
+        out.extend(d);
+    }
+    Value::Object(out)
+}
+
+fn otlp_envelope(signal: OtlpSignal, records: &[serde_json::Value]) -> serde_json::Value {
+    use serde_json::{json, Map, Value};
+    let (resource_key, scope_key, records_key) = match signal {
+        OtlpSignal::Traces => ("resourceSpans", "scopeSpans", "spans"),
+        OtlpSignal::Metrics => ("resourceMetrics", "scopeMetrics", "metrics"),
+        OtlpSignal::Logs => ("resourceLogs", "scopeLogs", "logRecords"),
+    };
+    // NAN-1575: in OTLP the `resource` lives at the `resourceX[]` level — the
+    // span/metric/log-record proto messages have NO `resource` field. Our
+    // generators embed `resource` (with `service.name`) ON each record, which
+    // the direct-CH path reads from the `event` blob, but the proto/HTTP export
+    // would silently drop it. Lift each record's `resource` up to its own
+    // resourceX entry (one per record; receivers flatten) so the wire carries
+    // service.name and Vector's `.resources` populates.
+    let scope = json!({ "name": "log-blaster", "version": "1" });
+    let entries: Vec<Value> = records
+        .iter()
+        .map(|rec| {
+            let mut rec = rec.clone();
+            let resource = rec
+                .as_object_mut()
+                .and_then(|o| o.remove("resource"))
+                .unwrap_or_else(|| json!({}));
+            // NAN-1575: flat metric points -> nested OTLP Metric (gauge/sum/
+            // histogram + dataPoints) so the proto carries data, not just name.
+            if signal == OtlpSignal::Metrics {
+                rec = flat_metric_to_otlp(rec);
+            }
+            let mut scope_entry = Map::new();
+            scope_entry.insert("scope".to_string(), scope.clone());
+            scope_entry.insert(records_key.to_string(), json!([rec]));
+            let mut entry = Map::new();
+            entry.insert("resource".to_string(), resource);
+            entry.insert(scope_key.to_string(), Value::Array(vec![Value::Object(scope_entry)]));
+            Value::Object(entry)
+        })
+        .collect();
+    let mut top = Map::new();
+    top.insert(resource_key.to_string(), Value::Array(entries));
+    Value::Object(top)
 }
 
 /// Ship a batch of per-record OTLP/JSON values for one signal over the
@@ -280,20 +352,107 @@ pub async fn send_otlp_with_retry(
     Err(last_err.unwrap())
 }
 
-/// OTLP/HTTP JSON to Vector's `opentelemetry` receiver.
+/// NAN-1575: assemble the OTLP metrics export request from individually-decoded
+/// metrics. `serde_json` decodes the doubly-nested `#[serde(flatten)]` oneof
+/// (`Metric.data` -> `NumberDataPoint.value`) for a metric at the TOP level, but
+/// NOT when the metric is an array element inside the full envelope — the array
+/// buffering defeats the inner flatten and `data` comes back `None`. So decode
+/// each flat metric record standalone and build the ResourceMetrics tree from
+/// proto structs. (Logs/traces only have a single flatten level, so they decode
+/// fine straight from the envelope.)
+fn build_metrics_request(
+    records: &[serde_json::Value],
+) -> Result<opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest> {
+    use anyhow::Context;
+    use opentelemetry_proto::tonic::{
+        collector::metrics::v1::ExportMetricsServiceRequest,
+        common::v1::InstrumentationScope,
+        metrics::v1::{Metric, ResourceMetrics, ScopeMetrics},
+        resource::v1::Resource,
+    };
+
+    let scope = InstrumentationScope {
+        name: "log-blaster".to_string(),
+        version: "1".to_string(),
+        attributes: vec![],
+        dropped_attributes_count: 0,
+    };
+    let mut resource_metrics = Vec::with_capacity(records.len());
+    for rec in records {
+        let mut rec = rec.clone();
+        let resource_json = rec.as_object_mut().and_then(|o| o.remove("resource"));
+        let metric_json = flat_metric_to_otlp(rec);
+        // Top-level decode — the flatten oneofs resolve here.
+        let metric: Metric = serde_json::from_str(&serde_json::to_string(&metric_json)?)
+            .context("decode OTLP metric")?;
+        let resource: Option<Resource> = match resource_json {
+            Some(r) => Some(
+                serde_json::from_str(&serde_json::to_string(&r)?).context("decode OTLP resource")?,
+            ),
+            None => None,
+        };
+        resource_metrics.push(ResourceMetrics {
+            resource,
+            scope_metrics: vec![ScopeMetrics {
+                scope: Some(scope.clone()),
+                metrics: vec![metric],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        });
+    }
+    Ok(ExportMetricsServiceRequest { resource_metrics })
+}
+
+/// OTLP/HTTP protobuf to Vector's `opentelemetry` receiver.
+///
+/// NAN-1575: Vector's `opentelemetry` source only accepts
+/// `application/x-protobuf` — POSTing `application/json` is rejected with
+/// `Rejection(InvalidHeader { name: "content-type" })` and the batch is
+/// silently dropped. `with-serde` maps our OTLP/JSON envelope (camelCase fields,
+/// hex trace/span ids, string-encoded u64 nanos) onto the proto export request;
+/// prost encodes the wire bytes the receiver decodes.
 async fn send_otlp_http(
     client: &Client,
     transport: &Transport,
     signal: OtlpSignal,
     records: &[serde_json::Value],
 ) -> Result<()> {
+    use anyhow::Context;
+    use opentelemetry_proto::tonic::collector::{
+        logs::v1::ExportLogsServiceRequest, trace::v1::ExportTraceServiceRequest,
+    };
+    use prost::Message;
+
     let base = transport.url().trim_end_matches('/');
     let url = format!("{base}{}", signal.http_path());
-    let envelope = otlp_envelope(signal, records);
+    // Logs/traces: deserialize via the STRING/byte path (`from_slice`), NOT
+    // `from_value` — serde_json's `from_value` mis-handles `#[serde(flatten)]`
+    // oneofs (drops them to `None`). The streaming deserializer decodes the
+    // single-flatten-level logs/traces correctly. Metrics have a doubly-nested
+    // flatten that fails inside the envelope array, so they're assembled from
+    // individually-decoded metrics in `build_metrics_request`.
+    let body: Vec<u8> = match signal {
+        OtlpSignal::Logs => {
+            let json = serde_json::to_vec(&otlp_envelope(signal, records))
+                .context("serialize OTLP logs envelope")?;
+            serde_json::from_slice::<ExportLogsServiceRequest>(&json)
+                .context("build OTLP logs export protobuf")?
+                .encode_to_vec()
+        }
+        OtlpSignal::Traces => {
+            let json = serde_json::to_vec(&otlp_envelope(signal, records))
+                .context("serialize OTLP traces envelope")?;
+            serde_json::from_slice::<ExportTraceServiceRequest>(&json)
+                .context("build OTLP traces export protobuf")?
+                .encode_to_vec()
+        }
+        OtlpSignal::Metrics => build_metrics_request(records)?.encode_to_vec(),
+    };
     client
         .post(url)
-        .header("Content-Type", "application/json")
-        .json(&envelope)
+        .header("Content-Type", "application/x-protobuf")
+        .body(body)
         .send()
         .await?
         .error_for_status()?;
@@ -1048,5 +1207,114 @@ mod tests {
             token: None,
         };
         let _ = hec_channel(&v);
+    }
+
+    /// Realistic post-generator OTLP/JSON log record: hex trace/span ids,
+    /// string-encoded `timeUnixNano`, an embedded per-record `resource` with
+    /// `service.name` (the shape `gen_log` produces).
+    fn sample_log_record() -> serde_json::Value {
+        serde_json::json!({
+            "timeUnixNano": "1700000000000000000",
+            "observedTimeUnixNano": "1700000000000000000",
+            "severityNumber": 9,
+            "severityText": "INFO",
+            "body": { "stringValue": "handled request (/api/x)" },
+            "traceId": "5b8efff798038103d269b633813fc60c",
+            "spanId": "eee19b7ec3c1b174",
+            "attributes": [{ "key": "url.path", "value": { "stringValue": "/api/x" } }],
+            "resource": { "attributes": [
+                { "key": "service.name", "value": { "stringValue": "frontend" } }
+            ] }
+        })
+    }
+
+    /// NAN-1575: the proto LogRecord has no `resource` field — resource lives at
+    /// the resourceLogs[] level. `otlp_envelope` must lift the per-record
+    /// `resource` up there (and strip it from the record) or service.name is
+    /// dropped on the proto/HTTP export.
+    #[test]
+    fn otlp_envelope_lifts_resource_to_resource_level() {
+        let env = otlp_envelope(OtlpSignal::Logs, &[sample_log_record()]);
+        let rl = &env["resourceLogs"][0];
+        assert_eq!(
+            rl["resource"]["attributes"][0]["key"], "service.name",
+            "resource must be lifted to the resourceLogs[] entry"
+        );
+        let lr = &rl["scopeLogs"][0]["logRecords"][0];
+        assert!(
+            lr.get("resource").is_none(),
+            "the per-record `resource` must be stripped after lifting"
+        );
+        assert_eq!(lr["severityText"], "INFO");
+    }
+
+    /// NAN-1575: the load-bearing conversion — our OTLP/JSON envelope must
+    /// deserialize into the proto export request via `with-serde` (honoring hex
+    /// trace/span ids + string-encoded u64 nanos) and prost-encode to non-empty
+    /// bytes. A regression here = `--otlp` silently drops every batch again.
+    #[test]
+    fn otlp_logs_envelope_round_trips_to_protobuf() {
+        use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
+        use prost::Message;
+
+        let env = otlp_envelope(OtlpSignal::Logs, &[sample_log_record()]);
+        let json = serde_json::to_vec(&env).unwrap();
+        let req: ExportLogsServiceRequest =
+            serde_json::from_slice(&json).expect("OTLP/JSON envelope must parse into the proto");
+        let bytes = req.encode_to_vec();
+        assert!(!bytes.is_empty(), "encoded protobuf must be non-empty");
+
+        assert_eq!(req.resource_logs.len(), 1);
+        let rl = &req.resource_logs[0];
+        // service.name survived at the resource level.
+        let res = rl.resource.as_ref().expect("resource present");
+        assert!(res.attributes.iter().any(|kv| kv.key == "service.name"));
+        let lr = &rl.scope_logs[0].log_records[0];
+        assert_eq!(lr.severity_number, 9, "INFO severity number");
+        assert_eq!(lr.severity_text, "INFO");
+        // hex trace id decoded to the 16 raw bytes.
+        assert_eq!(lr.trace_id.len(), 16, "hex traceId -> 16 bytes");
+        assert_eq!(lr.span_id.len(), 8, "hex spanId -> 8 bytes");
+    }
+
+    /// NAN-1575: flat metric records must reshape into proto `Metric`s that
+    /// actually carry data points (gauge/sum/histogram), not name-only shells.
+    /// Guards the from_value path for the metrics signal (the bug codex caught).
+    #[test]
+    fn otlp_metrics_envelope_round_trips_with_datapoints() {
+        use opentelemetry_proto::tonic::metrics::v1::metric::Data;
+        use prost::Message;
+        use serde_json::json;
+
+        let gauge = json!({ "name": "inflight", "unit": "1", "type": "gauge",
+            "timeUnixNano": "1", "asDouble": 3.0, "attributes": [],
+            "resource": { "attributes": [
+                { "key": "service.name", "value": { "stringValue": "checkout" } }] } });
+        let sum = json!({ "name": "requests", "unit": "1", "type": "sum",
+            "timeUnixNano": "1", "asInt": "42", "attributes": [], "resource": { "attributes": [] } });
+        let hist = json!({ "name": "latency", "unit": "ms", "type": "histogram",
+            "timeUnixNano": "1", "count": 3, "sum": 12.0,
+            "bucketCounts": ["1", "2"], "explicitBounds": [5.0],
+            "attributes": [], "resource": { "attributes": [] } });
+
+        let req = build_metrics_request(&[gauge, sum, hist]).expect("build metrics request");
+        let metrics: Vec<_> = req
+            .resource_metrics
+            .iter()
+            .flat_map(|rm| rm.scope_metrics.iter().flat_map(|sm| sm.metrics.iter()))
+            .collect();
+        assert_eq!(metrics.len(), 3, "one proto Metric per flat record");
+        for m in &metrics {
+            match m.data.as_ref().expect("metric carries a data oneof") {
+                Data::Gauge(g) => assert_eq!(g.data_points.len(), 1, "gauge data point"),
+                Data::Sum(s) => {
+                    assert_eq!(s.data_points.len(), 1, "sum data point");
+                    assert!(s.is_monotonic, "counter is monotonic");
+                }
+                Data::Histogram(h) => assert_eq!(h.data_points.len(), 1, "histogram data point"),
+                other => panic!("unexpected metric data oneof: {other:?}"),
+            }
+        }
+        assert!(!req.encode_to_vec().is_empty());
     }
 }

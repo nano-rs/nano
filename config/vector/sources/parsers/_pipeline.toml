@@ -106,8 +106,22 @@ if src_type == null { src_type = "unknown" }
 raw_message = .message
 if raw_message == null { raw_message = "" }
 
+# NAN-1556: carry OTLP-mapped fields through the `. = {...}` rebuild below.
+# otlp_logs_prep (config/vector/03-otlp-source.toml) sets these at the top
+# level; without capturing them here the reset would drop them on the generic
+# path (the lane OTLP logs ride with no deployed parser). Null/empty for every
+# non-OTLP source, so behavior for HTTP/HEC/Vector/parsers is unchanged.
+otlp_severity = .severity
+otlp_ext = .ext
+otlp_trace_id = .trace_id
+otlp_span_id = .span_id
+
 . = {
     "timestamp": .udm.timestamp,
+    "severity": otlp_severity,
+    "ext": otlp_ext,
+    "trace_id": otlp_trace_id,
+    "span_id": otlp_span_id,
     "message": raw_message,
     "raw_content": .raw_content,
     "metadata": encode_json(.metadata),
@@ -267,6 +281,12 @@ if pcmd_val == null || pcmd_val == "" { pcmd_val = .parent_process }
 .user_type = to_string(.user_type) ?? ""
 .result = to_string(.result) ?? ""
 .severity = to_string(.severity) ?? ""
+# NAN-1556: OTLP log correlation ids (set by otlp_logs_prep, carried through
+# prepare_output). Downcased to match the lower(col) convention; empty for
+# non-correlated logs. Listed in explicit_columns below so they map to their
+# own columns instead of being swept into ext.
+.trace_id = downcase(to_string(.trace_id) ?? "")
+.span_id = downcase(to_string(.span_id) ?? "")
 .category = to_string(.category) ?? ""
 .authentication_method = to_string(.authentication_method) ?? ""
 .file_size = to_int(.file_size) ?? 0
@@ -298,6 +318,7 @@ explicit_columns = [
     "bytes_in", "bytes_out", "packets_in", "packets_out", "direction", "src_mac", "dest_mac", "vlan",
     "user", "src_user", "dest_user", "user_id", "user_name", "user_domain", "user_type",
     "action", "status", "status_code", "result", "severity", "category",
+    "trace_id", "span_id",
     "auth_type", "auth_result", "session_id", "authentication_method",
     "process_name", "process_id", "process_path", "process_hash",
     "command_line", "parent_command_line", "parent_process_name", "parent_process_id", "parent_process_path",

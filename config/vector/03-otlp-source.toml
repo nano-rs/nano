@@ -1,5 +1,11 @@
 # OpenTelemetry (OTLP) Source — NAN-1528
 # =============================================================================
+# SYNC: the managed product generates its own copy of the traces/metrics
+# event-type conversion + OTLP/JSON reshape (NAN-1576) in the nano-main repo
+# (apps/api/src/services/vector-otlp.ts, which adds TLS + a token gate). The two
+# repos can't share a literal — KEEP THEM IN SYNC. This copy is pinned by the
+# `otlp_traces_metrics_ingest_is_wired` test in deploy.rs.
+# =============================================================================
 # Receives OTLP over gRPC (:4317) and HTTP (:4318) — the two standard OTLP
 # ports. Vector's `opentelemetry` source decodes the protobuf/JSON payloads and
 # fans them out onto three named outputs: `.logs`, `.traces`, `.metrics`.
@@ -39,40 +45,163 @@ address = "0.0.0.0:4317"
 address = "0.0.0.0:4318"
 
 # =============================================================================
-# Traces -> spans raw table
-# Near-passthrough: wrap the decoded span record as the raw-table row shape.
-# `encode_json(.)` preserves the FULL OTLP span (attributes, events, status,
-# resource) losslessly — the MV extracts promoted columns but the raw map is
-# never discarded.
+# Traces -> spans raw table (NAN-1576)
+# Vector's `opentelemetry` source decodes OTLP spans into a Vector-native shape:
+# snake_case keys (`trace_id`/`span_id`/`parent_span_id`/`start_time_unix_nano`),
+# RFC3339-string timestamps, and FLAT attribute maps (`{k: v}`) rather than the
+# OTLP/JSON the `otel_spans` MV (clickhouse/138_otel_spans.sql) reads (camelCase
+# `traceId`/`startTimeUnixNano`, epoch-nano strings, KeyValue ARRAYS). Translate
+# back to OTLP/JSON so the MV's JSONExtract mapping fires. `encode_json` of the
+# rebuilt object is the raw-table contract.
 # =============================================================================
+# Vector's `opentelemetry` source emits spans as TRACE-type events, but the
+# `clickhouse` sink only accepts LOG events and silently filters traces out at
+# its input (confirmed: sink received_events_total stays 0; `remap` preserves
+# the event type so it can't bridge the gap). `trace_to_log` is the dedicated
+# converter — re-emit each span as a LOG event, then reshape to OTLP/JSON below.
+[transforms.otlp_traces_to_log]
+type = "trace_to_log"
+inputs = ["otlp_ingest.traces"]
+
 [transforms.otlp_traces_prep]
 type = "remap"
-inputs = ["otlp_ingest.traces"]
+inputs = ["otlp_traces_to_log"]
 source = '''
 ts = .timestamp
-if ts == null { ts = .start_timestamp }
-if ts == null { ts = now() }
+if !is_timestamp(ts) { ts = .start_time_unix_nano }
+if !is_timestamp(ts) { ts = now() }
+
+# RFC3339/timestamp -> epoch-nanos string (the MV parses with
+# toUInt64OrZero(JSONExtractString(...)) so a numeric string is required).
+start_nanos = "0"
+st = .start_time_unix_nano
+if is_timestamp(st) {
+    start_nanos = to_string(to_unix_timestamp(st, unit: "nanoseconds") ?? 0)
+} else if is_integer(st) {
+    start_nanos = to_string(st) ?? "0"
+} else if is_string(st) {
+    pt, err = parse_timestamp(st, "%Y-%m-%dT%H:%M:%S%.fZ")
+    if err == null { start_nanos = to_string(to_unix_timestamp(pt, unit: "nanoseconds")) }
+}
+
+end_nanos = "0"
+et = .end_time_unix_nano
+if is_timestamp(et) {
+    end_nanos = to_string(to_unix_timestamp(et, unit: "nanoseconds") ?? 0)
+} else if is_integer(et) {
+    end_nanos = to_string(et) ?? "0"
+} else if is_string(et) {
+    pt2, err2 = parse_timestamp(et, "%Y-%m-%dT%H:%M:%S%.fZ")
+    if err2 == null { end_nanos = to_string(to_unix_timestamp(pt2, unit: "nanoseconds")) }
+}
+
+# Flat attribute maps -> OTLP KeyValue arrays the MV's arrayFirst()/JSONExtract
+# idiom understands. Span attributes and resource attributes are separate arrays.
+attrs = []
+for_each(object(.attributes) ?? {}) -> |k, v| {
+    attrs = push(attrs, { "key": k, "value": { "stringValue": to_string(v) ?? "" } })
+}
+res_attrs = []
+for_each(object(.resources) ?? {}) -> |k, v| {
+    res_attrs = push(res_attrs, { "key": k, "value": { "stringValue": to_string(v) ?? "" } })
+}
+
+otlp = {
+    "traceId": to_string(.trace_id) ?? "",
+    "spanId": to_string(.span_id) ?? "",
+    "parentSpanId": to_string(.parent_span_id) ?? "",
+    "name": to_string(.name) ?? "",
+    "kind": to_int(.kind) ?? 0,
+    "startTimeUnixNano": start_nanos,
+    "endTimeUnixNano": end_nanos,
+    "status": {
+        "code": to_int(.status.code) ?? 0,
+        "message": to_string(.status.message) ?? ""
+    },
+    "attributes": attrs,
+    "resource": { "attributes": res_attrs }
+}
+
 . = {
-    "event": encode_json(.),
+    "event": encode_json(otlp),
     "timestamp": ts,
     "source_type": "otlp_trace"
 }
 '''
 
 # =============================================================================
-# Metrics -> metrics raw table
-# One data point per row. Vector's opentelemetry source already flattens
-# multi-datapoint metrics into individual metric events, so each event maps to
-# exactly one `otel_metrics` row.
+# Metrics -> metrics raw table (NAN-1576)
+# Vector's `opentelemetry` source decodes OTLP metrics into Vector-native METRIC
+# events (`{name, tags, timestamp, kind, gauge|counter|... :{value}}`), NOT the
+# OTLP/JSON the `otel_metrics` MV (clickhouse/140_otel_metrics.sql) reads — and a
+# `clickhouse` (logs) sink can't ingest metric events at all. So `metric_to_log`
+# turns each metric into a log event, then `otlp_metrics_prep` reshapes Vector's
+# metric shape back into the OTLP/JSON `event` the MV expects (camelCase keys,
+# epoch-nanos `timeUnixNano`, KeyValue-array attributes). One data point per row.
 # =============================================================================
+[transforms.otlp_metrics_to_log]
+type = "metric_to_log"
+inputs = ["otlp_ingest.metrics"]
+
 [transforms.otlp_metrics_prep]
 type = "remap"
-inputs = ["otlp_ingest.metrics"]
+inputs = ["otlp_metrics_to_log"]
 source = '''
 ts = .timestamp
-if ts == null { ts = now() }
+if !is_timestamp(ts) { ts = now() }
+nanos = to_string(to_unix_timestamp(ts, unit: "nanoseconds") ?? 0)
+
+# Vector flattens metric labels into `.tags`; `resource.<k>` tags are resource
+# attributes, the rest are data-point attributes. Rebuild both as OTLP KeyValue
+# arrays the MV's JSONExtract path understands.
+attrs = []
+res_attrs = []
+tags = object(.tags) ?? {}
+for_each(tags) -> |k, v| {
+    if starts_with(k, "resource.") {
+        rk = replace(k, "resource.", "")
+        res_attrs = push(res_attrs, { "key": rk, "value": { "stringValue": to_string(v) ?? "" } })
+    } else {
+        attrs = push(attrs, { "key": k, "value": { "stringValue": to_string(v) ?? "" } })
+    }
+}
+
+otlp = {
+    "name": to_string(.name) ?? "",
+    "timeUnixNano": nanos,
+    "attributes": attrs,
+    "resource": { "attributes": res_attrs }
+}
+
+# metric_to_log emits the value under .gauge / .counter / .histogram keyed by the
+# metric kind. Map to the OTLP `type` discriminator + value the MV reads.
+if exists(.gauge) {
+    otlp = set!(otlp, ["type"], "gauge")
+    otlp = set!(otlp, ["asDouble"], to_float(.gauge.value) ?? 0.0)
+} else if exists(.counter) {
+    otlp = set!(otlp, ["type"], "sum")
+    otlp = set!(otlp, ["asDouble"], to_float(.counter.value) ?? 0.0)
+# metric_to_log emits histograms under `aggregated_histogram`
+# ({buckets:[{count, upper_limit}], count, sum}).
+} else if exists(.aggregated_histogram) {
+    otlp = set!(otlp, ["type"], "histogram")
+    otlp = set!(otlp, ["count"], to_int(.aggregated_histogram.count) ?? 0)
+    otlp = set!(otlp, ["sum"], to_float(.aggregated_histogram.sum) ?? 0.0)
+    bc = []
+    eb = []
+    for_each(array(.aggregated_histogram.buckets) ?? []) -> |_i, b| {
+        bc = push(bc, to_int(b.count) ?? 0)
+        eb = push(eb, to_float(b.upper_limit) ?? 0.0)
+    }
+    otlp = set!(otlp, ["bucketCounts"], bc)
+    otlp = set!(otlp, ["explicitBounds"], eb)
+} else {
+    otlp = set!(otlp, ["type"], "gauge")
+    otlp = set!(otlp, ["asDouble"], 0.0)
+}
+
 . = {
-    "event": encode_json(.),
+    "event": encode_json(otlp),
     "timestamp": ts,
     "source_type": "otlp_metric"
 }
@@ -102,14 +231,41 @@ if !exists(.message) || !is_string(.message) {
     .message = encode_json(.)
 }
 
+# NAN-1556: severity. Prefer the textual level; else map the numeric OTLP
+# SeverityNumber (1-24) to the canonical band. Lands in the `severity` column
+# (carried through the generic path by prepare_output / clickhouse_mapping).
+sev = to_string(.severity_text) ?? ""
+if sev == "" {
+    sn = to_int(.severity_number) ?? 0
+    sev = if sn >= 21 { "Fatal" } else if sn >= 17 { "Error" } else if sn >= 13 { "Warn" } else if sn >= 9 { "Info" } else if sn >= 5 { "Debug" } else if sn >= 1 { "Trace" } else { "" }
+}
+.severity = sev
+
+if !is_object(.metadata) {
+    .metadata = {}
+}
+
+# NAN-1556: resource service.name -> src_host (the canonical UDM host slot the
+# normalize pipeline already resolves to the src_host column — reuse, don't
+# special-case a new column).
+svc = .resources."service.name"
+if svc != null {
+    .metadata.src_host = to_string(svc) ?? ""
+}
+
+# NAN-1556: resource + log-record attributes -> the `ext` JSON tail (searchable
+# by key, no enumeration). Resource attrs first so a same-named log attribute
+# wins. Values may be nested; the JSON ext column stores them as-is.
+tail = {}
+if is_object(.resources) { tail = merge(tail, object!(.resources)) }
+if is_object(.attributes) { tail = merge(tail, object!(.attributes)) }
+.ext = tail
+
 # Correlation ids — OTLP carries them as `.trace_id` / `.span_id`. Downcase to
 # match the lower(col) convention the logs table compares on.
 .trace_id = downcase(to_string(.trace_id) ?? "")
 .span_id = downcase(to_string(.span_id) ?? "")
 
-if !is_object(.metadata) {
-    .metadata = {}
-}
 .metadata.forwarded_via = "otlp"
 '''
 

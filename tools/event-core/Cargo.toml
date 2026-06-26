@@ -18,6 +18,14 @@ anyhow.workspace = true
 # HTTP client
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 
+# OTLP/HTTP protobuf encoding (NAN-1575). Vector's `opentelemetry` source only
+# accepts application/x-protobuf, not application/json — so the OTLP/HTTP path
+# re-encodes our OTLP/JSON records into the proto export request via `with-serde`
+# (which honors the OTLP/JSON conventions: hex trace/span ids, string-encoded
+# u64 timestamps) and prost-encodes the bytes.
+opentelemetry-proto = { version = "0.27", default-features = false, features = ["gen-tonic-messages", "logs", "trace", "metrics", "with-serde"] }
+prost = "0.13"
+
 # RNG
 rand = "0.9"
 
