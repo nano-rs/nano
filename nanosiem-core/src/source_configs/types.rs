@@ -27,6 +27,8 @@ pub enum SourceConfigType {
     SplunkHec,
     /// Vector-to-Vector native protocol (system-level)
     Vector,
+    /// OpenTelemetry (OTLP) over gRPC (:4317) / HTTP (:4318) (system-level)
+    Otlp,
 }
 
 impl SourceConfigType {
@@ -38,6 +40,7 @@ impl SourceConfigType {
             Self::GcpPubSub => "gcp_pubsub",
             Self::SplunkHec => "splunk_hec",
             Self::Vector => "vector",
+            Self::Otlp => "otlp",
         }
     }
 
@@ -49,6 +52,7 @@ impl SourceConfigType {
             "gcp_pubsub" | "pubsub" => Some(Self::GcpPubSub),
             "splunk_hec" | "splunk" | "hec" => Some(Self::SplunkHec),
             "vector" => Some(Self::Vector),
+            "otlp" | "opentelemetry" | "otel" => Some(Self::Otlp),
             _ => None,
         }
     }
@@ -67,6 +71,7 @@ impl SourceConfigType {
             Self::GcpPubSub => "GCP Pub/Sub",
             Self::SplunkHec => "Splunk HEC",
             Self::Vector => "Vector",
+            Self::Otlp => "OpenTelemetry (OTLP)",
         }
     }
 
@@ -79,6 +84,9 @@ impl SourceConfigType {
             Self::GcpPubSub => "Subscribe to GCP Pub/Sub with attribute-based routing",
             Self::SplunkHec => "Receive logs via Splunk HEC with sourcetype-based routing",
             Self::Vector => "Receive from on-prem Vector aggregator (system-level)",
+            Self::Otlp => {
+                "Receive OpenTelemetry (OTLP) logs via gRPC (:4317) / HTTP (:4318) (system-level)"
+            }
         }
     }
 
@@ -91,6 +99,7 @@ impl SourceConfigType {
             Self::GcpPubSub,
             Self::SplunkHec,
             Self::Vector,
+            Self::Otlp,
         ]
     }
 
@@ -103,6 +112,7 @@ impl SourceConfigType {
             Self::GcpPubSub => "subscription",
             Self::SplunkHec => "sourcetype",
             Self::Vector => "source_type",
+            Self::Otlp => "source_type",
         }
     }
 
@@ -143,6 +153,15 @@ impl SourceConfigType {
                 path: "source_type".to_string(),
                 description:
                     "Routes from the .source_type tag set by the upstream Vector aggregator."
+                        .to_string(),
+            }],
+            Self::Otlp => vec![MatchFieldPreset {
+                label: "Source type tag".to_string(),
+                path: "source_type".to_string(),
+                description:
+                    "Routes from the .source_type tag set by the OTLP logs preprocessor \
+                     (otlp_logs_prep, config/vector/03-otlp-source.toml — `otlp_log` today; \
+                     per-service source_types arrive with the OTLP-log envelope mapping)."
                         .to_string(),
             }],
             Self::GcpPubSub => vec![

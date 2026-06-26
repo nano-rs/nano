@@ -29,7 +29,11 @@ use crate::parsers::types::Parser;
 pub(super) fn enrichment_lane_backpressure_violations(candidate_enrichment_toml: &str) -> Vec<String> {
     use std::collections::{HashMap, HashSet};
 
-    const INGEST_SOURCE_TYPES: &[&str] = &["http_server", "vector", "splunk_hec"];
+    // NAN-1572: `opentelemetry` is the Vector source `type` of the OOTB OTLP
+    // ingest source (`otlp_ingest`, config/vector/03-otlp-source.toml). It's a
+    // shared LOG ingest source like http/vector/hec, so an enrichment-lane sink
+    // that backpressures into it would stall OTLP ingestion (NAN-1120 class).
+    const INGEST_SOURCE_TYPES: &[&str] = &["http_server", "vector", "splunk_hec", "opentelemetry"];
     // Sources with their own backpressure domain (none today; add the dedicated
     // enrichment `:8090` source here if it ships).
     const DEDICATED_ENRICHMENT_SOURCES: &[&str] = &[];

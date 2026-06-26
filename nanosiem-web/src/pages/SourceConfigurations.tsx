@@ -80,11 +80,14 @@ interface TransportSpec {
 // shared `${VECTOR_AUTH_TOKEN}`. A user HEC source config is just a routing
 // profile — two of them would emit colliding `splunk_hec_route` transforms.
 // Gate the picker (and the backend rejects duplicates with 409).
-const SINGLE_INSTANCE_TYPES: SourceConfigType[] = ['splunk_hec'];
+// NAN-1572: OTLP is also single-instance — the OOTB :4317/:4318 listener is
+// shared, so a second otlp config would emit colliding `otlp_route` transforms.
+const SINGLE_INSTANCE_TYPES: SourceConfigType[] = ['splunk_hec', 'otlp'];
 
 const TRANSPORTS: TransportSpec[] = [
   { value: 'http', label: 'HTTP', icon: Globe, description: 'Generic HTTP POST endpoint with X-Source-Type header routing.', popular: true },
   { value: 'vector', label: 'Vector', icon: Radio, description: 'Upstream Vector forwarders over the native Vector protocol.', popular: true },
+  { value: 'otlp', label: 'OpenTelemetry (OTLP)', icon: Plug, description: 'OTLP logs over gRPC (:4317) / HTTP (:4318).', popular: true },
   { value: 'aws_s3', label: 'AWS S3', icon: Cloud, description: 'Ingest objects from S3 via SQS notifications.', popular: true },
   { value: 'gcp_pubsub', label: 'GCP Pub/Sub', icon: Cloud, description: 'Subscribe to a Google Cloud Pub/Sub topic.' },
   { value: 'kafka', label: 'Kafka', icon: Database, description: 'Consume events from one or more Kafka topics.' },

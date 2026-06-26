@@ -82,6 +82,21 @@ export function SourceConfigForm({
         />
       );
 
+    case 'otlp':
+      return (
+        <div className="p-4 bg-muted/30 rounded-md text-center text-muted-foreground">
+          <Radio className="w-8 h-8 mx-auto mb-2 opacity-50" />
+          <p className="text-[12px]">
+            OTLP sources receive OpenTelemetry logs over gRPC (:4317) and HTTP (:4318).
+          </p>
+          <p className="text-[10.5px] mt-2">
+            No additional configuration required. Logs are routed by the{' '}
+            <code className="font-mono bg-muted px-1 rounded">source_type</code> tag set by the
+            OTLP preprocessor.
+          </p>
+        </div>
+      );
+
     case 'routed':
     default:
       return (

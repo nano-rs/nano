@@ -31,6 +31,12 @@ use crate::parsers::types::Parser;
 ///   `source_type_extract` instead. Emitting `hec_normalize` when absent
 ///   makes Vector 0.55 reject the config on startup (`Input "hec_normalize"
 ///   for transform "source_router" doesn't match any components`). NAN-867.
+/// - `otlp_logs_prep_covered`: an `otlp` routing config is deployed (NAN-1572).
+///   `otlp_logs_prep` (config/vector/03-otlp-source.toml) normally feeds
+///   `source_router` directly as a base input, but when a meaningful OTLP
+///   routing transform is on disk it intermediates that channel — suppress
+///   the direct input so OTLP logs don't reach `source_router` twice (the
+///   NAN-1442 Saturn 2× double-write class).
 ///
 /// `vector_merge` has no per-config intermediary (the Vector-native protocol
 /// is always direct), so it stays unconditionally present.
@@ -42,6 +48,7 @@ pub fn base_router_inputs(
     source_type_extract_covered: bool,
     hec_normalize_covered: bool,
     hec_normalize_present: bool,
+    otlp_logs_prep_covered: bool,
 ) -> Vec<&'static str> {
     let mut inputs = Vec::with_capacity(4);
     if !source_type_extract_covered {
@@ -58,7 +65,9 @@ pub fn base_router_inputs(
     // source_type. Gated on presence (same dangling-input class as
     // `hec_normalize_present`, NAN-867) so deployments without the OTLP source
     // file don't reference a non-existent component and crashloop Vector 0.55.
-    if otlp_source_present() {
+    // NAN-1572: also suppressed when an `otlp` source-config route intermediates
+    // the channel (otlp_logs_prep_covered) so the stream isn't double-written.
+    if otlp_source_present() && !otlp_logs_prep_covered {
         inputs.push("otlp_logs_prep");
     }
     inputs
@@ -461,12 +470,13 @@ impl VectorConfigManager {
     /// When a channel is covered, the per-config route consumes it and feeds
     /// `source_router`, so the base router inputs must NOT also include the
     /// channel directly — otherwise events arrive at `source_router` twice.
-    pub(super) async fn source_config_intermediary_coverage(&self) -> (bool, bool) {
+    pub(super) async fn source_config_intermediary_coverage(&self) -> (bool, bool, bool) {
         let configs_dir = self.source_configs_dir();
         let mut source_type_extract = false;
         let mut hec_normalize = false;
+        let mut otlp_logs_prep = false;
         if !configs_dir.exists() {
-            return (source_type_extract, hec_normalize);
+            return (source_type_extract, hec_normalize, otlp_logs_prep);
         }
 
         if let Ok(mut entries) = fs::read_dir(&configs_dir).await {
@@ -487,16 +497,21 @@ impl VectorConfigManager {
                             if line.contains("inputs = [\"hec_normalize\"]") {
                                 hec_normalize = true;
                             }
+                            // NAN-1572: an otlp routing config intermediates the
+                            // otlp_logs_prep channel.
+                            if line.contains("inputs = [\"otlp_logs_prep\"]") {
+                                otlp_logs_prep = true;
+                            }
                         }
-                        if source_type_extract && hec_normalize {
-                            return (true, true);
+                        if source_type_extract && hec_normalize && otlp_logs_prep {
+                            return (true, true, true);
                         }
                     }
                 }
             }
         }
 
-        (source_type_extract, hec_normalize)
+        (source_type_extract, hec_normalize, otlp_logs_prep)
     }
 
     /// Write the dynamic router config based on deployed parsers
@@ -600,12 +615,13 @@ impl VectorConfigManager {
         // Rewrite the router section with all routes
         config.clear();
 
-        let (source_type_extract_covered, hec_normalize_covered) =
+        let (source_type_extract_covered, hec_normalize_covered, otlp_logs_prep_covered) =
             self.source_config_intermediary_coverage().await;
         let mut router_inputs: Vec<String> = base_router_inputs(
             source_type_extract_covered,
             hec_normalize_covered,
             hec_normalize_present(),
+            otlp_logs_prep_covered,
         )
         .into_iter()
         .map(String::from)
@@ -906,7 +922,7 @@ source = ".source_type = \"foo\""
             for hec_covered in [true, false] {
                 for hec_present in [true, false] {
                     assert!(
-                        base_router_inputs(src_covered, hec_covered, hec_present)
+                        base_router_inputs(src_covered, hec_covered, hec_present, false)
                             .contains(&"vector_merge"),
                         "vector_merge missing for ({src_covered}, {hec_covered}, {hec_present})"
                     );
@@ -921,8 +937,8 @@ source = ".source_type = \"foo\""
     /// the router.
     #[test]
     fn base_router_inputs_includes_hec_normalize_when_uncovered_and_present() {
-        assert!(base_router_inputs(false, false, true).contains(&"hec_normalize"));
-        assert!(base_router_inputs(true, false, true).contains(&"hec_normalize"));
+        assert!(base_router_inputs(false, false, true, false).contains(&"hec_normalize"));
+        assert!(base_router_inputs(true, false, true, false).contains(&"hec_normalize"));
     }
 
     /// NAN-857: when a splunk_hec route is deployed, `hec_normalize` must NOT
@@ -932,8 +948,8 @@ source = ".source_type = \"foo\""
     #[test]
     fn base_router_inputs_excludes_hec_normalize_when_covered() {
         for hec_present in [true, false] {
-            assert!(!base_router_inputs(false, true, hec_present).contains(&"hec_normalize"));
-            assert!(!base_router_inputs(true, true, hec_present).contains(&"hec_normalize"));
+            assert!(!base_router_inputs(false, true, hec_present, false).contains(&"hec_normalize"));
+            assert!(!base_router_inputs(true, true, hec_present, false).contains(&"hec_normalize"));
         }
     }
 
@@ -945,7 +961,7 @@ source = ".source_type = \"foo\""
         for src_covered in [true, false] {
             for hec_covered in [true, false] {
                 assert!(
-                    !base_router_inputs(src_covered, hec_covered, false).contains(&"hec_normalize"),
+                    !base_router_inputs(src_covered, hec_covered, false, false).contains(&"hec_normalize"),
                     "hec_normalize emitted with hec_normalize_present=false ({src_covered}, {hec_covered})"
                 );
             }
@@ -958,9 +974,9 @@ source = ".source_type = \"foo\""
     fn base_router_inputs_excludes_source_type_extract_when_covered() {
         for hec_present in [true, false] {
             assert!(
-                !base_router_inputs(true, false, hec_present).contains(&"source_type_extract")
+                !base_router_inputs(true, false, hec_present, false).contains(&"source_type_extract")
             );
-            assert!(!base_router_inputs(true, true, hec_present).contains(&"source_type_extract"));
+            assert!(!base_router_inputs(true, true, hec_present, false).contains(&"source_type_extract"));
         }
     }
 
@@ -968,9 +984,44 @@ source = ".source_type = \"foo\""
     fn base_router_inputs_includes_source_type_extract_when_uncovered() {
         for hec_present in [true, false] {
             assert!(
-                base_router_inputs(false, false, hec_present).contains(&"source_type_extract")
+                base_router_inputs(false, false, hec_present, false).contains(&"source_type_extract")
             );
-            assert!(base_router_inputs(false, true, hec_present).contains(&"source_type_extract"));
+            assert!(base_router_inputs(false, true, hec_present, false).contains(&"source_type_extract"));
+        }
+    }
+
+    /// NAN-1572: OTLP OOTB invariant — when the OTLP source is present and no
+    /// otlp route is deployed, `otlp_logs_prep` feeds `source_router` directly
+    /// so OTLP logs reach the router. (Gated on `otlp_source_present()`, which
+    /// defaults true; this test runs in the default OOTB env.)
+    #[test]
+    fn base_router_inputs_includes_otlp_logs_prep_when_uncovered() {
+        // serial guard not needed: otlp_source_present() reads env, default true.
+        if !otlp_source_present() {
+            return;
+        }
+        for hec_present in [true, false] {
+            assert!(base_router_inputs(false, false, hec_present, false).contains(&"otlp_logs_prep"));
+            assert!(base_router_inputs(true, true, hec_present, false).contains(&"otlp_logs_prep"));
+        }
+    }
+
+    /// NAN-1572: when an otlp route is deployed (`otlp_logs_prep_covered`), the
+    /// direct `otlp_logs_prep` base input must be suppressed — otherwise OTLP
+    /// logs reach `source_router` twice (direct + via the route), the NAN-1442
+    /// Saturn 2× double-write class.
+    #[test]
+    fn base_router_inputs_excludes_otlp_logs_prep_when_covered() {
+        for src_covered in [true, false] {
+            for hec_covered in [true, false] {
+                for hec_present in [true, false] {
+                    assert!(
+                        !base_router_inputs(src_covered, hec_covered, hec_present, true)
+                            .contains(&"otlp_logs_prep"),
+                        "otlp_logs_prep emitted when covered ({src_covered}, {hec_covered}, {hec_present})"
+                    );
+                }
+            }
         }
     }
 

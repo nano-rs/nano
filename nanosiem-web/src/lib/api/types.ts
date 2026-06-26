@@ -5023,7 +5023,7 @@ export interface LogSourceWithDraftStatus extends LogSource {
 // Source Configurations (Infrastructure + Routing)
 // ============================================================================
 
-export type SourceConfigType = 'http' | 'kafka' | 'aws_s3' | 'gcp_pubsub' | 'splunk_hec' | 'vector';
+export type SourceConfigType = 'http' | 'kafka' | 'aws_s3' | 'gcp_pubsub' | 'splunk_hec' | 'vector' | 'otlp';
 export type MatchType = 'exact' | 'prefix' | 'suffix' | 'regex' | 'contains' | 'default';
 
 export interface RoutingRule {

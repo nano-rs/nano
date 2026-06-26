@@ -219,9 +219,11 @@ impl SourceConfigService {
     /// NAN-883: drivers where only one source configuration may exist per
     /// deployment. Today: `splunk_hec` (the OOTB `splunk_hec_ingest` listener
     /// is shared, and a user config is just a routing profile over it — two
-    /// would emit colliding `splunk_hec_route` transforms).
+    /// would emit colliding `splunk_hec_route` transforms) and `otlp` (the
+    /// OOTB `otlp_ingest` listener on :4317/:4318 is shared the same way —
+    /// two would emit colliding `otlp_route` transforms over `otlp_logs_prep`).
     fn is_single_instance_driver(config_type: &str) -> bool {
-        matches!(config_type, "splunk_hec")
+        matches!(config_type, "splunk_hec" | "otlp")
     }
 
     /// Pure decision helper for the single-instance check. Returns
@@ -871,8 +873,13 @@ impl SourceConfigService {
     /// the inbound `.sourcetype` envelope field before this routing
     /// transform runs — so source_type rules on HEC are legitimate
     /// (matches HTTP / Vector).
+    ///
+    /// NAN-1572: `otlp` is excluded for the same reason — `otlp_logs_prep`
+    /// (`config/vector/03-otlp-source.toml`) sets `.source_type` before the
+    /// routing transform runs, so source_type rules on OTLP are legitimate.
     fn is_pull_source_source_type_match(config_type: &str, match_field: &str) -> bool {
-        !matches!(config_type, "http" | "vector" | "splunk_hec") && match_field == "source_type"
+        !matches!(config_type, "http" | "vector" | "splunk_hec" | "otlp")
+            && match_field == "source_type"
     }
 
     /// Coerce `match_type` to `"default"` when the rule shape would otherwise
@@ -926,10 +933,17 @@ impl SourceConfigService {
     /// `splunk_hec` → `hec_normalize` (`splunk_hec_ingest` on :8088 is OOTB
     /// per NAN-836; redeclaring the source would claim the same port twice
     /// and abort Vector reload).
+    /// `otlp` → `otlp_logs_prep` (NAN-1572; `otlp_ingest` on :4317/:4318 is
+    /// OOTB per NAN-1528. `otlp_logs_prep` tags `.source_type` and already
+    /// feeds `source_router` directly as a base input — when a meaningful
+    /// OTLP routing config is on disk, `base_router_inputs`'
+    /// `otlp_logs_prep_covered` flag suppresses that direct input so the
+    /// stream isn't double-written).
     fn system_intermediary_source(config_type: &str) -> Option<&'static str> {
         match config_type {
             "http" | "vector" => Some("source_type_extract"),
             "splunk_hec" => Some("hec_normalize"),
+            "otlp" => Some("otlp_logs_prep"),
             _ => None,
         }
     }
@@ -940,7 +954,22 @@ impl SourceConfigService {
     /// passthrough no-ops (the routing transform emits
     /// `# passthrough — keep existing .source_type`), so a config with
     /// only defaults adds nothing — we skip the file write entirely.
+    ///
+    /// NAN-1572: OTLP is always treated as no-meaningful-rules (never writes an
+    /// `otlp_route`). OTLP logs route to parsers via their `match_values`
+    /// claiming `otlp_logs_prep` directly (`parser_claimed_route`), not via a
+    /// system route. Writing an `otlp_route` over `otlp_logs_prep` would
+    /// double-write parser-claimed events — `otlp_logs_prep` is both the
+    /// claimed channel and the would-be system-route upstream, so the route
+    /// carries the full stream into `source_router` alongside the parser
+    /// pipeline (the NAN-930/NAN-1442 class). Per-source_type OTLP routing
+    /// arrives with the OTLP-log envelope mapping (NAN-1556); until then OTLP
+    /// stays default-passthrough and `otlp_logs_prep` remains a direct base
+    /// input that the claim-dedupe filters correctly.
     fn has_meaningful_routing_rules(config: &SourceConfigurationWithRules) -> bool {
+        if config.config.config_type == "otlp" {
+            return false;
+        }
         config
             .routing_rules
             .iter()
@@ -1889,6 +1918,7 @@ impl SourceConfigService {
     {
         let mut source_type_extract_covered = false;
         let mut hec_normalize_covered = false;
+        let mut otlp_logs_prep_covered = false;
         let mut source_config_routes: Vec<String> = Vec::new();
         // NAN-1442: at most ONE route per shared always-on channel may feed
         // `source_router`. `http` and `vector` BOTH intermediate
@@ -1925,6 +1955,7 @@ impl SourceConfigService {
                 match intermediary {
                     "source_type_extract" => source_type_extract_covered = true,
                     "hec_normalize" => hec_normalize_covered = true,
+                    "otlp_logs_prep" => otlp_logs_prep_covered = true,
                     _ => {}
                 }
             }
@@ -1935,6 +1966,7 @@ impl SourceConfigService {
             source_type_extract_covered,
             hec_normalize_covered,
             hec_normalize_present,
+            otlp_logs_prep_covered,
         )
         .into_iter()
         .map(String::from)
@@ -2259,10 +2291,13 @@ impl SourceConfigService {
     /// `Some(stem)` overrides the rename-derived `safe_name` so an admin
     /// renaming the OOTB row can't break HEC routing. NAN-940.
     ///
-    /// Today only `splunk_hec` is a singleton (paired with
-    /// `is_single_instance_driver` and the partial unique index from
-    /// migration 184). Adding a new singleton driver here also requires
-    /// adding it to `is_single_instance_driver`.
+    /// Only `splunk_hec` is *pinned* here, because HEC parsers hardcode the
+    /// `splunk_hec_route` transform name. `otlp` is also a single-instance
+    /// driver (`is_single_instance_driver`, migration 214) but is intentionally
+    /// NOT pinned: OTLP parsers claim the OOTB `otlp_logs_prep` transform
+    /// directly (`parser_claimed_route`), never a config-derived `*_route`, so
+    /// there's nothing for a rename to break. Adding a *pinned* singleton here
+    /// also requires adding it to `is_single_instance_driver`.
     fn system_singleton_stem(config_type: &str) -> Option<&'static str> {
         match config_type {
             "splunk_hec" => Some("splunk_hec"),
@@ -4035,7 +4070,13 @@ mod tests {
         let inputs = SourceConfigService::compute_router_inputs(&configs, |_| false, true);
         assert_eq!(
             inputs,
-            vec!["source_type_extract", "vector_merge", "hec_normalize", "kafka_audit_route"]
+            vec![
+                "source_type_extract",
+                "vector_merge",
+                "hec_normalize",
+                "otlp_logs_prep",
+                "kafka_audit_route"
+            ]
         );
     }
 
@@ -4043,14 +4084,20 @@ mod tests {
     fn compute_router_inputs_drops_source_type_extract_when_system_route_on_disk() {
         let configs = vec![bare_config("http_main", "http")];
         let inputs = SourceConfigService::compute_router_inputs(&configs, |_| true, true);
-        assert_eq!(inputs, vec!["vector_merge", "hec_normalize", "http_main_route"]);
+        assert_eq!(
+            inputs,
+            vec!["vector_merge", "hec_normalize", "otlp_logs_prep", "http_main_route"]
+        );
     }
 
     #[test]
     fn compute_router_inputs_skips_system_route_when_no_file_on_disk() {
         let configs = vec![bare_config("http_main", "http")];
         let inputs = SourceConfigService::compute_router_inputs(&configs, |_| false, true);
-        assert_eq!(inputs, vec!["source_type_extract", "vector_merge", "hec_normalize"]);
+        assert_eq!(
+            inputs,
+            vec!["source_type_extract", "vector_merge", "hec_normalize", "otlp_logs_prep"]
+        );
     }
 
     /// NAN-1442 (Saturn 2× ingestion): `http` and `vector` configs BOTH
@@ -4274,6 +4321,19 @@ mod tests {
         assert!(SourceConfigService::has_meaningful_routing_rules(&cfg));
     }
 
+    /// NAN-1572: OTLP is always default-passthrough — even a non-default rule
+    /// must NOT make it write an `otlp_route` (which would double-write
+    /// parser-claimed events off `otlp_logs_prep`). OTLP logs route via parser
+    /// match_values until the envelope mapping (NAN-1556).
+    #[test]
+    fn has_meaningful_routing_rules_false_for_otlp_even_with_non_default_rule() {
+        let cfg = make_config(
+            "otlp",
+            vec![make_rule(10, "source_type", "exact", Some("otlp_log"), "json_generic")],
+        );
+        assert!(!SourceConfigService::has_meaningful_routing_rules(&cfg));
+    }
+
     /// NAN-857: when a splunk_hec route IS on disk, `hec_normalize` must be
     /// suppressed from base inputs — the route consumes hec_normalize and
     /// feeds source_router, so keeping hec_normalize as a direct base input
@@ -4291,7 +4351,7 @@ mod tests {
         let inputs = SourceConfigService::compute_router_inputs(&configs, |_| true, true);
         assert_eq!(
             inputs,
-            vec!["source_type_extract", "vector_merge", "splunk_hec_route"],
+            vec!["source_type_extract", "vector_merge", "otlp_logs_prep", "splunk_hec_route"],
             "hec_normalize must be intermediated by the splunk_hec route, not also direct"
         );
     }
@@ -4308,7 +4368,42 @@ mod tests {
         let inputs = SourceConfigService::compute_router_inputs(&configs, |_| true, true);
         assert_eq!(
             inputs,
-            vec!["vector_merge", "http_main_route", "splunk_hec_route"]
+            vec!["vector_merge", "otlp_logs_prep", "http_main_route", "splunk_hec_route"]
+        );
+    }
+
+    /// NAN-1572: defensive coverage of the `otlp_logs_prep_covered` flag in
+    /// `compute_router_inputs` — IF an otlp route were on disk, `otlp_logs_prep`
+    /// must be suppressed from base inputs so the channel doesn't reach
+    /// `source_router` twice (NAN-1442 Saturn 2× class). In practice
+    /// `has_meaningful_routing_rules` keeps OTLP default-passthrough so no otlp
+    /// route file is written (see that test); this exercises the pure suppression
+    /// path directly. The otlp route name is rename-derived (not pinned).
+    #[test]
+    fn compute_router_inputs_suppresses_otlp_logs_prep_when_otlp_route_on_disk() {
+        let configs = vec![bare_config("otlp_main", "otlp")];
+        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| true, true);
+        assert_eq!(
+            inputs,
+            vec!["source_type_extract", "vector_merge", "hec_normalize", "otlp_main_route"],
+            "otlp_logs_prep must be intermediated by the otlp route, not also direct"
+        );
+    }
+
+    /// NAN-1572: an otlp config with NO route file on disk (default-only rules)
+    /// must NOT suppress `otlp_logs_prep` — the direct base input is the only
+    /// path OTLP logs reach source_router, mirroring the splunk_hec skip case.
+    #[test]
+    fn compute_router_inputs_keeps_otlp_logs_prep_when_no_otlp_file_on_disk() {
+        let configs = vec![bare_config("otlp_main", "otlp")];
+        let inputs = SourceConfigService::compute_router_inputs(&configs, |_| false, true);
+        assert!(
+            inputs.iter().any(|s| s == "otlp_logs_prep"),
+            "otlp_logs_prep must stay a direct base input when no otlp route is on disk: {inputs:?}"
+        );
+        assert!(
+            !inputs.iter().any(|s| s == "otlp_route"),
+            "no otlp route should be wired when its file isn't on disk: {inputs:?}"
         );
     }
 

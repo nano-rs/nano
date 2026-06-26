@@ -134,12 +134,13 @@ impl VectorConfigManager {
             .filter(|p| p.enabled && (p.source_type == "routed" || p.source_type == "vector"))
             .collect();
 
-        let (source_type_extract_covered, hec_normalize_covered) =
+        let (source_type_extract_covered, hec_normalize_covered, otlp_logs_prep_covered) =
             self.source_config_intermediary_coverage().await;
         let base_inputs: Vec<String> = base_router_inputs(
             source_type_extract_covered,
             hec_normalize_covered,
             hec_normalize_present(),
+            otlp_logs_prep_covered,
         )
         .into_iter()
         .map(String::from)
