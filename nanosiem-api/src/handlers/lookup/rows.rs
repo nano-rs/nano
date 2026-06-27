@@ -12,7 +12,7 @@ use nanosiem_core::audit::{
     LOOKUP_ROW_UPDATED,
 };
 use nanosiem_core::auth::permissions;
-use nanosiem_core::{LookupRepository, LookupRowsPage, LookupService};
+use nanosiem_core::LookupRowsPage;
 
 use super::lookup_error_to_api;
 use super::types::{
@@ -48,8 +48,7 @@ pub async fn list_lookup_rows(
     check_permission(&auth, permissions::LOOKUP_VIEW)
         .map_err(|_| ApiError::Forbidden("Missing permission: lookup:view".to_string()))?;
 
-    let lookup_repo = LookupRepository::new(state.pool.clone());
-    let lookup_service = LookupService::new(lookup_repo);
+    let lookup_service = state.lookup_service.clone();
 
     let page = params.page.unwrap_or(1);
     let page_size = params.page_size.unwrap_or(50);
@@ -100,8 +99,7 @@ pub async fn add_lookup_rows(
         ));
     }
 
-    let lookup_repo = LookupRepository::new(state.pool.clone());
-    let lookup_service = LookupService::new(lookup_repo);
+    let lookup_service = state.lookup_service.clone();
 
     let row_ids = lookup_service
         .insert_rows(&name, req.rows)
@@ -151,8 +149,7 @@ pub async fn update_lookup_row(
     check_permission(&auth, permissions::LOOKUP_EDIT)
         .map_err(|_| ApiError::Forbidden("Missing permission: lookup:edit".to_string()))?;
 
-    let lookup_repo = LookupRepository::new(state.pool.clone());
-    let lookup_service = LookupService::new(lookup_repo);
+    let lookup_service = state.lookup_service.clone();
 
     lookup_service
         .update_row(&name, row_id, req.fields)
@@ -197,8 +194,7 @@ pub async fn delete_lookup_row(
     check_permission(&auth, permissions::LOOKUP_EDIT)
         .map_err(|_| ApiError::Forbidden("Missing permission: lookup:edit".to_string()))?;
 
-    let lookup_repo = LookupRepository::new(state.pool.clone());
-    let lookup_service = LookupService::new(lookup_repo);
+    let lookup_service = state.lookup_service.clone();
 
     lookup_service
         .delete_row(&name, row_id)
@@ -244,8 +240,7 @@ pub async fn delete_lookup_rows(
     check_permission(&auth, permissions::LOOKUP_EDIT)
         .map_err(|_| ApiError::Forbidden("Missing permission: lookup:edit".to_string()))?;
 
-    let lookup_repo = LookupRepository::new(state.pool.clone());
-    let lookup_service = LookupService::new(lookup_repo);
+    let lookup_service = state.lookup_service.clone();
 
     let deleted = lookup_service
         .delete_rows(&name, &req.row_ids)

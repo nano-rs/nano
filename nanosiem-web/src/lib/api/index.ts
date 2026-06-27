@@ -539,6 +539,11 @@ class ApiClient {
     return this._search.getCloudOverview(request);
   }
 
+  // IOC retro-hunt summary / campaign-list / pivot rollup (NAN-1580)
+  async getRetro(request: import('./types').RetroRequest): Promise<import('./types').RetroResponse> {
+    return this._search.getRetro(request);
+  }
+
   // Cloud principal dossier aggregates for `| cloud principal=X` (NAN-395)
   async getCloudDossier(request: import('./types').CloudDossierRequest): Promise<import('./types').CloudDossierResponse> {
     return this._search.getCloudDossier(request);

@@ -96,6 +96,12 @@ fn reject_unsupported_for_realtime(expr: &SearchExpr) -> Result<(), Materialized
         SearchExpr::InSubsearch { .. } => Err(MaterializedViewError::InvalidRule(
             "Real-time rules cannot use subsearch (IN [...])".to_string(),
         )),
+        // NAN-1580: the `ioc` observable-anywhere term expands across many
+        // columns (and can be feed-sourced) — not a simple-column predicate, so
+        // it is excluded from the real-time materialized-view path.
+        SearchExpr::IocMatch { .. } => Err(MaterializedViewError::InvalidRule(
+            "Real-time rules cannot use the ioc retro-hunt term".to_string(),
+        )),
         SearchExpr::And(left, right) | SearchExpr::Or(left, right) => {
             reject_unsupported_for_realtime(left)?;
             reject_unsupported_for_realtime(right)

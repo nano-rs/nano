@@ -64,6 +64,7 @@ pub use types::{
     parse_clickhouse_error, AssetEventFilters, AssetFacets, AssetPagination, CloudEventFilters,
     CloudFacets, CloudUserActivity, CloudUserSessionSummary, DisplayType, EntityCrossReference,
     FieldInfo, FieldStatistics, FieldValueInfo, HistogramBucket, QueryWarningOutput, RawSqlRequest,
-    SearchError, SearchRequest, SearchResponse, TimeRangeInput, UdmFieldQueryRequest,
+    RetroIndicatorSummary, RetroListRow, RetroPivotRow, RetroRequest, RetroResponse, RetroTopEntity,
+    RetroVerdict, SearchError, SearchRequest, SearchResponse, TimeRangeInput, UdmFieldQueryRequest,
     UdmQueryOperator,
 };

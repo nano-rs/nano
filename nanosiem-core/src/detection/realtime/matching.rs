@@ -94,6 +94,11 @@ fn evaluate_search_expr(expr: &SearchExpr, event: &serde_json::Value) -> bool {
             // Subsearch IN cannot be evaluated in real-time matching
             false
         }
+        SearchExpr::IocMatch { .. } => {
+            // NAN-1580: the ioc retro-hunt term is a search-time directive, not a
+            // real-time rule predicate — never matches in real-time evaluation.
+            false
+        }
     }
 }
 

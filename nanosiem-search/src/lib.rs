@@ -34,8 +34,8 @@ use tower_http::trace::TraceLayer;
 
 use nanosiem_core::audit::{AuditEmitter, AuditEvent};
 use nanosiem_core::{
-    DualPool, InputLookupConfig, InputLookupService, IpAllowlistService, LookupRepository,
-    LookupService, PrevalenceService, SearchService,
+    DualPool, InputLookupConfig, InputLookupService, IpAllowlistService, LookupService,
+    PrevalenceService, SearchService,
     ip_allowlist::IpAllowlistScope,
     search::{AdmissionConfig, AdmissionController, RedisJobStore},
     settings::{SearchAdmissionSettings, SearchQueryLimitsSettings},
@@ -79,9 +79,14 @@ pub struct SearchState {
 impl SearchState {
     /// Create a new SearchState with the given DualPool
     pub async fn new(dual_pool: DualPool, auth_state: AuthState) -> Self {
-        // Create lookup service
-        let lookup_repo = LookupRepository::new(dual_pool.postgres().clone());
-        let lookup = Arc::new(LookupService::new(lookup_repo));
+        // Create lookup service. NAN-1581: row-data backend selected by
+        // LOOKUP_STORAGE_BACKEND (default ClickHouse); registry stays in Postgres.
+        // Must match the API's selection so reads/writes agree on a backend.
+        let lookup = Arc::new(LookupService::with_backend(
+            nanosiem_core::lookup::LookupStorageBackend::from_env(),
+            dual_pool.postgres().clone(),
+            dual_pool.clickhouse().clone(),
+        ));
 
         // Create prevalence service (uses ClickHouse client directly)
         let prevalence = Arc::new(PrevalenceService::new(
@@ -126,8 +131,11 @@ impl SearchState {
         // Start background config polling (checks PostgreSQL every 60s for admin changes)
         Self::start_config_polling(dual_pool.clone(), admission_controller.clone());
 
-        // Add inputlookup service for URL-based enrichment
-        let inputlookup_service = InputLookupService::new(InputLookupConfig::default());
+        // Add inputlookup service for URL-based enrichment. Wire the internal
+        // lookup layer so `| inputlookup <internal_table>` reads the CH/PG-backed
+        // lookup table directly (NAN-1581 Phase 5).
+        let inputlookup_service = InputLookupService::new(InputLookupConfig::default())
+            .with_lookup_service(lookup.clone());
         search_svc.set_inputlookup_service(inputlookup_service);
         tracing::info!("InputLookup service configured for Search Service");
 
@@ -556,6 +564,8 @@ pub fn create_router(
             post(handlers::field_stats_for_query),
         )
         .route("/api/search/field-values", post(handlers::field_values))
+        // IOC retro-hunt rollup (NAN-1580): companion to the `/api/search` retro marker
+        .route("/api/search/retro", post(handlers::retro))
         // OpenTelemetry observability (NAN-1528): trace waterfall + metric series
         .route("/api/search/trace/{trace_id}", get(handlers::get_trace))
         .route(

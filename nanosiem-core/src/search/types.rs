@@ -765,6 +765,215 @@ pub enum DisplayType {
     Trace,
     /// Metric time-series page (metric command) — curated surface, no log scan
     Metric,
+    /// IOC retro-hunt view (`ioc=… | retro`) — summary / list / pivot surface
+    /// fetched from the companion `/api/search/retro` endpoint (NAN-1580).
+    Retro,
+}
+
+// ============================================================================
+// IOC Retro-Hunt Types (NAN-1580)
+// ============================================================================
+
+/// Request for the IOC retro-hunt companion endpoint (`POST /api/search/retro`).
+///
+/// The `query` carries the full nPL (`ioc=… | retro [by asset|user]`); the
+/// service re-parses it to recover the indicator/feed and submode. `axis`
+/// mirrors the parsed `RetroAxis` (`indicator` | `asset` | `user`) so the client
+/// can request a pivot without re-deriving it. Pagination + sort apply to the
+/// list/pivot rollups.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RetroRequest {
+    /// The full nPL query string (`ioc=… | retro [by asset|user]`).
+    pub query: String,
+    /// Time range; the engine widens the floor to full retention internally.
+    pub time_range: TimeRangeInput,
+    /// Pivot axis: `indicator` (default) | `asset` | `user`.
+    #[serde(default)]
+    pub axis: String,
+    /// Row offset for list/pivot pagination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+    /// Page size for list/pivot pagination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    /// Optional explicit sort key override (engine picks a sensible default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<String>,
+}
+
+/// Verdict rarity band for a retro indicator/entity (NAN-1580).
+///
+/// `ratio = distinct_hosts_touched / total_hosts_in_env`; `rare <= 0.02`,
+/// `uncommon <= 0.15`, else `common`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RetroVerdict {
+    /// Touched <= 2% of hosts in the environment.
+    Rare,
+    /// Touched <= 15% of hosts.
+    Uncommon,
+    /// Touched > 15% of hosts.
+    Common,
+}
+
+impl RetroVerdict {
+    /// Band a host-ratio into a verdict (rare<=0.02, uncommon<=0.15, else common).
+    pub fn from_ratio(ratio: f64) -> Self {
+        if ratio <= 0.02 {
+            RetroVerdict::Rare
+        } else if ratio <= 0.15 {
+            RetroVerdict::Uncommon
+        } else {
+            RetroVerdict::Common
+        }
+    }
+
+    /// String form used in the response payload.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RetroVerdict::Rare => "rare",
+            RetroVerdict::Uncommon => "uncommon",
+            RetroVerdict::Common => "common",
+        }
+    }
+}
+
+/// A top entity (asset/user) touched by a single indicator (summary submode).
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RetroTopEntity {
+    /// Canonical entity identifier (host / ip / user).
+    pub id: String,
+    /// Hit count for this entity against the indicator.
+    pub hits: u64,
+    /// Entity kind: `asset` | `user`.
+    pub kind: String,
+}
+
+/// Summary submode payload — a single indicator's environment-wide footprint.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RetroIndicatorSummary {
+    /// The indicator value.
+    pub value: String,
+    /// Inferred indicator type (ip | hash | domain | url | user | other).
+    #[serde(rename = "type")]
+    pub indicator_type: String,
+    /// Intel source (feed name, or `query` for a typed literal).
+    pub source: String,
+    /// Campaign / actor association (from feed tags), if known.
+    pub campaign: Option<String>,
+    /// Intel confidence (0-100), 0 when not enriched.
+    pub confidence: u32,
+    /// Total event hits across all observable columns.
+    pub hits: u64,
+    /// First seen (ISO-8601) across retention.
+    pub first_seen: Option<String>,
+    /// Last seen (ISO-8601) across retention.
+    pub last_seen: Option<String>,
+    /// Per-observable-column match counts: `[field, count]`.
+    pub matched_fields: Vec<(String, u64)>,
+    /// Distinct hosts the indicator touched.
+    pub distinct_hosts: u64,
+    /// Total distinct hosts in the environment (verdict denominator).
+    pub total_hosts: u64,
+    /// Rarity verdict band.
+    pub verdict: String,
+    /// Top entities by hit count.
+    pub top_entities: Vec<RetroTopEntity>,
+}
+
+/// A single indicator row in the list submode (campaign / multi-value).
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RetroListRow {
+    /// The indicator value.
+    pub value: String,
+    /// Inferred indicator type.
+    #[serde(rename = "type")]
+    pub indicator_type: String,
+    /// Event hits across observable columns.
+    pub hits: u64,
+    /// Distinct hosts touched.
+    pub hosts: u64,
+    /// Total hosts in the environment.
+    pub total_hosts: u64,
+    /// First seen (ISO-8601).
+    pub first_seen: Option<String>,
+    /// Last seen (ISO-8601).
+    pub last_seen: Option<String>,
+    /// Observable column the indicator predominantly matched.
+    pub field: String,
+    /// Rarity verdict band.
+    pub verdict: String,
+}
+
+/// A single entity row in the pivot submode (axis = asset | user).
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RetroPivotRow {
+    /// Canonical entity identifier.
+    pub id: String,
+    /// Display name (resolved identity, or the id when unresolved).
+    pub name: String,
+    /// Secondary label (e.g. department / ip), when resolved.
+    pub sub: Option<String>,
+    /// Distinct indicators this entity was touched by.
+    pub iocs: u64,
+    /// The matched indicator values (capped sample).
+    pub indicators: Vec<String>,
+    /// First seen (ISO-8601).
+    pub first_seen: Option<String>,
+    /// Last seen (ISO-8601).
+    pub last_seen: Option<String>,
+    /// Worst (rarest) verdict across the entity's indicators.
+    pub worst_verdict: String,
+}
+
+/// Response from the IOC retro-hunt companion endpoint (NAN-1580).
+///
+/// Shaped by `submode`: `summary` populates `indicator`; `list` populates
+/// `rows`/`no_hits`/`total_indicators`; `pivot` populates `pivot_rows`. Common
+/// fields (`submode`, `axis`, `total_hosts`, `generated_sql`) are always set.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RetroResponse {
+    /// Submode: `summary` | `list` | `pivot`.
+    pub submode: String,
+    /// Resolved axis: `indicator` | `asset` | `user`.
+    pub axis: String,
+    /// Total distinct hosts in the environment (verdict denominator).
+    pub total_hosts: u64,
+    /// The generated rollup SQL (always included for transparency).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generated_sql: Option<String>,
+
+    // ── summary submode ──
+    /// Single-indicator summary (summary submode only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indicator: Option<RetroIndicatorSummary>,
+
+    // ── list submode ──
+    /// Total indicators with at least one hit (list submode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_indicators: Option<u64>,
+    /// Indicator rows, rarest-first (list submode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows: Option<Vec<RetroListRow>>,
+    /// Indicators with zero hits in the environment (list submode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_hits: Option<Vec<String>>,
+
+    // ── pivot submode ──
+    /// Entity rows (pivot submode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pivot_rows: Option<Vec<RetroPivotRow>>,
+
+    // ── pagination (list + pivot) ──
+    /// Row offset applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+    /// Page size applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    /// Whether more rows exist past this page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_more: Option<bool>,
 }
 
 /// Request for querying by UDM field

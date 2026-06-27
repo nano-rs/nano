@@ -4,6 +4,253 @@ mod error_messages;
 mod syntax_fixes;
 
 use crate::query::{parse_query, Command, Query};
+// NAN-1580 retro-hunt parser tests use these AST types directly.
+use crate::query::{RetroAxis, SearchExpr, Value};
+
+// === NAN-1580: `ioc` observable term + `retro` command parsing ===
+
+#[test]
+fn test_parse_ioc_equals_single_value() {
+    let result = parse_query(r#"ioc="1.2.3.4""#).unwrap();
+    match result {
+        Query::Search(SearchExpr::IocMatch { values, feed, lookup }) => {
+            assert_eq!(values, vec![Value::String("1.2.3.4".to_string())]);
+            assert_eq!(feed, None);
+            assert_eq!(lookup, None);
+        }
+        other => panic!("Expected IocMatch single value, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_ioc_unquoted_hash_starting_with_digit() {
+    // Regression: an unquoted hash starting with a digit must capture the WHOLE
+    // token, not number-match the leading digit (most hashes start with a digit).
+    let hash = "5fb90fd28458d16e61a7d6e08ae2ed28cb9b35e535aa6bc0e5a487f7c7702288";
+    let result = parse_query(&format!("ioc={hash} | retro")).unwrap();
+    // `ioc=<hash> | retro` → Piped { Search(IocMatch), Retro }
+    match result {
+        Query::Piped { source, .. } => match *source {
+            Query::Search(SearchExpr::IocMatch { values, .. }) => {
+                assert_eq!(values, vec![Value::String(hash.to_string())]);
+            }
+            other => panic!("Expected IocMatch source, got {other:?}"),
+        },
+        other => panic!("Expected piped retro query, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_ioc_in_list_unquoted_mixed() {
+    // Unquoted IP + digit-leading hash + domain in one list.
+    let result =
+        parse_query("ioc in [1.2.3.4, 5fb90fde, evil.com]").unwrap();
+    match result {
+        Query::Search(SearchExpr::IocMatch { values, .. }) => {
+            assert_eq!(
+                values,
+                vec![
+                    Value::String("1.2.3.4".to_string()),
+                    Value::String("5fb90fde".to_string()),
+                    Value::String("evil.com".to_string()),
+                ]
+            );
+        }
+        other => panic!("Expected IocMatch list, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_ioc_in_list() {
+    let result = parse_query(r#"ioc in ["1.2.3.4", "evil.com", "deadbeef"]"#).unwrap();
+    match result {
+        Query::Search(SearchExpr::IocMatch { values, feed, lookup }) => {
+            assert_eq!(
+                values,
+                vec![
+                    Value::String("1.2.3.4".to_string()),
+                    Value::String("evil.com".to_string()),
+                    Value::String("deadbeef".to_string()),
+                ]
+            );
+            assert_eq!(feed, None);
+            assert_eq!(lookup, None);
+        }
+        other => panic!("Expected IocMatch list, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_ioc_in_list_parens() {
+    // Parenthesized list form is also accepted.
+    let result = parse_query(r#"ioc in ("a", "b")"#).unwrap();
+    match result {
+        Query::Search(SearchExpr::IocMatch { values, feed, lookup }) => {
+            assert_eq!(values.len(), 2);
+            assert_eq!(feed, None);
+            assert_eq!(lookup, None);
+        }
+        other => panic!("Expected IocMatch paren list, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_ioc_in_feed() {
+    let result = parse_query(r#"ioc in threatfox("apt29")"#).unwrap();
+    match result {
+        Query::Search(SearchExpr::IocMatch { values, feed, lookup }) => {
+            assert!(values.is_empty());
+            assert_eq!(lookup, None);
+            let feed = feed.expect("expected feed source");
+            assert_eq!(feed.name, "threatfox");
+            assert_eq!(feed.arg, "apt29");
+        }
+        other => panic!("Expected IocMatch feed, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_ioc_in_lookup() {
+    let result = parse_query(r#"ioc in lookup("threat_iocs")"#).unwrap();
+    match result {
+        Query::Search(SearchExpr::IocMatch { values, feed, lookup }) => {
+            assert!(values.is_empty());
+            assert_eq!(feed, None);
+            let lookup = lookup.expect("expected lookup source");
+            assert_eq!(lookup.table, "threat_iocs");
+            assert_eq!(lookup.column, None);
+        }
+        other => panic!("Expected IocMatch lookup, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_ioc_in_lookup_with_column() {
+    let result = parse_query(r#"ioc in lookup("threat_iocs", "indicator")"#).unwrap();
+    match result {
+        Query::Search(SearchExpr::IocMatch { values, feed, lookup }) => {
+            assert!(values.is_empty());
+            assert_eq!(feed, None);
+            let lookup = lookup.expect("expected lookup source");
+            assert_eq!(lookup.table, "threat_iocs");
+            assert_eq!(lookup.column.as_deref(), Some("indicator"));
+        }
+        other => panic!("Expected IocMatch lookup with column, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_ioc_in_inputlookup_alias() {
+    // `ioc in [inputlookup <name>]` aliases to the same lookup source.
+    let result = parse_query(r#"ioc in [inputlookup threat_iocs]"#).unwrap();
+    match result {
+        Query::Search(SearchExpr::IocMatch { values, feed, lookup }) => {
+            assert!(values.is_empty());
+            assert_eq!(feed, None);
+            let lookup = lookup.expect("expected lookup source");
+            assert_eq!(lookup.table, "threat_iocs");
+            assert_eq!(lookup.column, None);
+        }
+        other => panic!("Expected IocMatch inputlookup alias, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_ioc_in_lookup_with_retro_pipeline() {
+    let result = parse_query(r#"ioc in lookup("threat_iocs") | retro"#).unwrap();
+    match result {
+        Query::Piped { source, command } => {
+            assert_eq!(command, Command::Retro { axis: RetroAxis::Indicator });
+            match *source {
+                Query::Search(SearchExpr::IocMatch { lookup: Some(l), .. }) => {
+                    assert_eq!(l.table, "threat_iocs");
+                }
+                other => panic!("Expected IocMatch lookup source, got {other:?}"),
+            }
+        }
+        other => panic!("Expected piped ioc|retro, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_ioc_not_confused_with_ioc_prefixed_field() {
+    // `ioc_score=5` must NOT parse as the ioc pseudo-field — it's a normal field.
+    let result = parse_query("ioc_score=5").unwrap();
+    match result {
+        Query::Search(SearchExpr::FieldFilter { field, .. }) => {
+            assert_eq!(field, "ioc_score");
+        }
+        other => panic!("Expected FieldFilter on ioc_score, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_retro_bare_defaults_to_indicator() {
+    let result = parse_query(r#"ioc="1.2.3.4" | retro"#).unwrap();
+    match result {
+        Query::Piped {
+            command: Command::Retro { axis },
+            ..
+        } => assert_eq!(axis, RetroAxis::Indicator),
+        other => panic!("Expected bare retro command, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_retro_by_asset() {
+    let result = parse_query(r#"ioc="1.2.3.4" | retro by asset"#).unwrap();
+    match result {
+        Query::Piped {
+            command: Command::Retro { axis },
+            ..
+        } => assert_eq!(axis, RetroAxis::Asset),
+        other => panic!("Expected retro by asset, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_retro_by_user() {
+    let result = parse_query(r#"ioc="jsmith" | retro by user"#).unwrap();
+    match result {
+        Query::Piped {
+            command: Command::Retro { axis },
+            ..
+        } => assert_eq!(axis, RetroAxis::User),
+        other => panic!("Expected retro by user, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_parse_retro_axis_aliases_normalize_to_asset() {
+    // host / ip / entity / account all normalize to the Asset axis.
+    for kw in ["host", "ip", "entity", "account"] {
+        let q = format!(r#"ioc="x" | retro by {kw}"#);
+        let result = parse_query(&q).unwrap();
+        match result {
+            Query::Piped {
+                command: Command::Retro { axis },
+                ..
+            } => assert_eq!(axis, RetroAxis::Asset, "axis for `by {kw}`"),
+            other => panic!("Expected retro by {kw}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_parse_ioc_feed_with_retro_pipeline() {
+    // End-to-end: feed-sourced ioc term feeds a retro pivot command.
+    let result = parse_query(r#"ioc in threatfox("apt29") | retro by asset"#).unwrap();
+    match result {
+        Query::Piped { source, command } => {
+            assert_eq!(command, Command::Retro { axis: RetroAxis::Asset });
+            match *source {
+                Query::Search(SearchExpr::IocMatch { feed: Some(_), .. }) => {}
+                other => panic!("Expected IocMatch feed source, got {other:?}"),
+            }
+        }
+        other => panic!("Expected piped ioc|retro, got {other:?}"),
+    }
+}
 
 #[test]
 fn test_ai_command_basic() {

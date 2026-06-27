@@ -169,6 +169,25 @@ pub enum SearchExpr {
         op: Comparator,
         right: Value,
     },
+    /// IOC observable match (NAN-1580): match a value (or list of values, or
+    /// values sourced from an enrichment feed) across ALL observable columns
+    /// (src_ip, dest_ip, file_hash, url, query, user_id, sender, cve, …).
+    /// Parsed from the `ioc=<v>` / `ioc in [v1, v2]` / `ioc in feed("arg")`
+    /// surface forms. Usable on its own as a normal observable term; when paired
+    /// with `| retro` it drives the retro-hunt display.
+    IocMatch {
+        /// Literal indicator values. Empty when sourced from a feed or lookup.
+        values: Vec<Value>,
+        /// Enrichment-feed source (`ioc in threatfox("apt29")`). `None` for
+        /// literal value / list / lookup forms.
+        feed: Option<IocFeed>,
+        /// Internal lookup-table source (`ioc in lookup("threat_iocs")`).
+        /// `None` for literal value / list / feed forms (NAN-1581 Phase 6).
+        /// Mutually exclusive with `feed`. The service layer PRE-RESOLVES this to
+        /// concrete `values` (via `LookupService`) before SQL generation, so the
+        /// sql-gen never sees an unresolved lookup source.
+        lookup: Option<IocLookup>,
+    },
     /// Field IN [search ...] subsearch filter
     InSubsearch {
         field: String,
@@ -180,6 +199,35 @@ pub enum SearchExpr {
         /// outer query's dataset (the pre-existing, byte-identical behavior).
         subsearch_dataset: Option<crate::query::clickhouse_sql_gen::otel::Dataset>,
     },
+}
+
+/// Enrichment-feed source for an IOC observable match (NAN-1580).
+///
+/// Built from the `ioc in <feed>("<arg>")` surface form, where `feed` is one of
+/// the recognized threat-intel feeds (threatfox, misp, otx, feodo, abuse) and
+/// `arg` is the feed-specific query argument (e.g. an actor/campaign name).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IocFeed {
+    /// Feed name (threatfox | misp | otx | feodo | abuse).
+    pub name: String,
+    /// Feed-specific query argument (e.g. "apt29").
+    pub arg: String,
+}
+
+/// Internal lookup-table source for an IOC observable match (NAN-1581 Phase 6).
+///
+/// Built from the `ioc in lookup("<table>")` / `ioc in lookup("<table>",
+/// "<column>")` surface forms (and the `ioc in [inputlookup <table>]` alias). The
+/// indicator values are read from the named lookup table's `column` (defaulting
+/// to the table's registry primary-key column when omitted) and pre-resolved to
+/// concrete `IocMatch::values` by the service layer before SQL generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IocLookup {
+    /// Logical lookup-table name (as registered in the lookup registry).
+    pub table: String,
+    /// Optional column to read indicator values from. `None` ⇒ the table's
+    /// registry primary-key column.
+    pub column: Option<String>,
 }
 
 /// Comparison operators for field filters

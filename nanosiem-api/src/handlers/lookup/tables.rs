@@ -15,7 +15,7 @@ use nanosiem_core::audit::{
 use nanosiem_core::auth::permissions;
 use nanosiem_core::{
     sanitize_identifiers, ColumnType, FileFormat, FileParser, LookupColumn, LookupMode,
-    LookupRepository, LookupService, LookupTable, NewLookupTable, UploadParserConfig,
+    LookupService, LookupTable, NewLookupTable, UploadParserConfig,
 };
 
 use super::lookup_error_to_api;
@@ -250,8 +250,7 @@ pub async fn create_lookup_table(
     );
 
     // Create lookup service
-    let lookup_repo = LookupRepository::new(state.pool.clone());
-    let lookup_service = LookupService::new(lookup_repo);
+    let lookup_service = state.lookup_service.clone();
 
     // Check if table exists
     let table_exists = lookup_service
@@ -381,8 +380,7 @@ pub async fn list_lookup_tables(
     check_permission(&auth, permissions::LOOKUP_VIEW)
         .map_err(|_| ApiError::Forbidden("Missing permission: lookup:view".to_string()))?;
 
-    let lookup_repo = LookupRepository::new(state.pool.clone());
-    let lookup_service = LookupService::new(lookup_repo);
+    let lookup_service = state.lookup_service.clone();
 
     let tables = lookup_service
         .list_tables()
@@ -417,8 +415,7 @@ pub async fn get_lookup_table(
     check_permission(&auth, permissions::LOOKUP_VIEW)
         .map_err(|_| ApiError::Forbidden("Missing permission: lookup:view".to_string()))?;
 
-    let lookup_repo = LookupRepository::new(state.pool.clone());
-    let lookup_service = LookupService::new(lookup_repo);
+    let lookup_service = state.lookup_service.clone();
 
     let table = lookup_service
         .get_table(&name)
@@ -458,8 +455,7 @@ pub async fn get_lookup_table_sample(
     check_permission(&auth, permissions::LOOKUP_VIEW)
         .map_err(|_| ApiError::Forbidden("Missing permission: lookup:view".to_string()))?;
 
-    let lookup_repo = LookupRepository::new(state.pool.clone());
-    let lookup_service = LookupService::new(lookup_repo);
+    let lookup_service = state.lookup_service.clone();
 
     let limit = params.limit.unwrap_or(20).min(100);
 
@@ -497,8 +493,7 @@ pub async fn delete_lookup_table(
     check_permission(&auth, permissions::LOOKUP_DELETE)
         .map_err(|_| ApiError::Forbidden("Missing permission: lookup:delete".to_string()))?;
 
-    let lookup_repo = LookupRepository::new(state.pool.clone());
-    let lookup_service = LookupService::new(lookup_repo);
+    let lookup_service = state.lookup_service.clone();
 
     lookup_service
         .drop_table(&name)
@@ -572,8 +567,7 @@ pub async fn create_lookup_table_from_schema(
 
     info!(table_name = %req.name, column_count = columns.len(), "Creating lookup table from schema");
 
-    let lookup_repo = LookupRepository::new(state.pool.clone());
-    let lookup_service = LookupService::new(lookup_repo);
+    let lookup_service = state.lookup_service.clone();
 
     let new_table = NewLookupTable {
         name: req.name,

@@ -302,10 +302,12 @@ mod tests {
         // convergence): GET /api/observability/services/{service}/security-signals.
         // NAN-1544 re-gated that convergence path to ENTERPRISE only — it now
         // counts in the enterprise spec only, dropping the open floor by 1.
+        // NAN-1580 added 1 shared search-service path (merged below):
+        // POST /api/search/retro (IOC retro-hunt rollup), counted in both editions.
         #[cfg(feature = "enterprise")]
-        let min_paths = 492;
+        let min_paths = 493;
         #[cfg(not(feature = "enterprise"))]
-        let min_paths = 382;
+        let min_paths = 383;
 
         assert!(
             path_count >= min_paths,

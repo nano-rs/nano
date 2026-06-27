@@ -329,6 +329,11 @@ pub fn evaluate_condition_on_json(condition: &SearchExpr, row: &serde_json::Valu
             // Subsearch conditions cannot be evaluated in post-processing
             false
         }
+        SearchExpr::IocMatch { .. } => {
+            // NAN-1580: the ioc retro-hunt term is resolved in SQL/at the retro
+            // endpoint, not in JSON post-processing — treat as non-matching here.
+            false
+        }
     }
 }
 

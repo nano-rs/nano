@@ -876,6 +876,7 @@ async fn run_otlp_entry(args: Args) -> Result<()> {
     } else {
         Transport::OtlpHttp {
             base_url: otlp_http_base,
+            token: args.token.clone(),
         }
     };
 
@@ -1019,7 +1020,7 @@ async fn ship_otlp_lanes(
 /// Human-readable target for OTLP log lines.
 fn transport_target(t: &Transport) -> String {
     match t {
-        Transport::OtlpHttp { base_url } => base_url.clone(),
+        Transport::OtlpHttp { base_url, .. } => base_url.clone(),
         Transport::OtlpClickHouse { url, .. } => url.clone(),
         _ => "?".to_string(),
     }

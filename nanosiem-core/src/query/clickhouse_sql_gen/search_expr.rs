@@ -12,6 +12,112 @@ use super::{ClickHouseSqlGenerator, SUBSEARCH_RESULT_LIMIT};
 use crate::query::ast::*;
 use crate::query::sql_gen::SqlGenError;
 
+/// Observable LOGICAL UDM field names compared RAW (`<col> = '<lowered>'`) for
+/// the `ioc` term (NAN-1580). These resolve (per the active schema profile) to a
+/// physical column that is ingest-lowercased, so the whole-value bloom on the raw
+/// column prunes (CLAUDE.md QO rule #2). Under UDM the logical name IS the column
+/// (`src_ip`/`dest_ip` are in `LOWERCASE_NORMALIZED_FIELDS`; `dvc_ip` is downcased
+/// on the same lane). Under OCSF they resolve to the promoted, ingest-lowercased
+/// OCSF columns (`src_endpoint.ip`, `dst_endpoint.ip`, …) via the profile's
+/// `udm_column_sql`. The raw-vs-lower decision is attached to the LOGICAL
+/// observable: IPs/host/mac are lowercase-normalized on both schemas.
+pub(crate) const IOC_OBSERVABLE_RAW_COLUMNS: &[&str] = &["src_ip", "dest_ip", "dvc_ip"];
+
+/// Observable LOGICAL UDM field names compared via `lower(<col>) = '<lowered>'`
+/// for the `ioc` term (NAN-1580). Mixed-case stored history (vendor hashes,
+/// urls/domains, DNS query + DNS answers, device host/mac, email parties, cve,
+/// rule/signature ids, user ids). Under UDM each is served by a migration-132/145
+/// `idx_*_lower` expression bloom or migration-119 text index. Under OCSF they
+/// resolve to the promoted OCSF columns (`file.hashes.sha256`, the `*_unified`
+/// class-split columns, …) via the profile; observables OCSF has no column for
+/// resolve to `None` and are SKIPPED (no dead column → no CH error).
+pub(crate) const IOC_OBSERVABLE_LOWER_COLUMNS: &[&str] = &[
+    "file_hash",
+    "process_hash",
+    "url",
+    "url_domain",
+    "query",
+    "user_id",
+    "sender",
+    "recipient",
+    "sender_domain",
+    "recipient_domain",
+    "cve",
+    "rule_id",
+    "signature_id",
+    "dvc",
+    "dvc_mac",
+    "dns_answers",
+];
+
+/// A single resolved observable: the stable LOGICAL UDM field name (kept for UI
+/// attribution — see `RetroListRow.field` / summary `matched_fields` — so the
+/// analyst sees a consistent label regardless of profile), the active-profile
+/// physical column SQL it resolves to (already escaped/quoted — OCSF columns are
+/// dotted), and whether it compares RAW vs `lower()`.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedObservable {
+    /// Stable logical UDM observable name (e.g. `src_ip`) — the UI label.
+    pub logical: &'static str,
+    /// Profile-resolved, properly-escaped physical column SQL (e.g.
+    /// `` `src_endpoint.ip` `` under OCSF, `src_ip` under UDM).
+    pub col_sql: String,
+    /// `true` → compare RAW (`<col> = 'v'`); `false` → `lower(<col>) = 'v'`.
+    pub raw: bool,
+}
+
+/// Resolve the LOGICAL observable lists to the active profile's physical columns
+/// (NAN-1580 OCSF-awareness). Each logical UDM observable name is mapped to its
+/// physical column via [`crate::schema::SchemaProfile::udm_column_sql`] — the SAME
+/// resolver the query generator's `field_to_sql_expr` uses — so UDM tenants emit
+/// the UDM columns (the resolution is the identity) and OCSF tenants emit the
+/// promoted OCSF columns (`src_endpoint.ip`, `file.hashes.sha256`, the `*_unified`
+/// class-split columns). Observables the active profile has NO column for resolve
+/// to `None` and are SKIPPED — so an OCSF sweep never emits a non-existent column
+/// (which would 500 in ClickHouse) and simply doesn't scan that observable. The
+/// raw-vs-lower compare mode stays attached to the LOGICAL observable (IPs/host/mac
+/// → raw on both schemas; hashes/urls/text → lower).
+pub(crate) fn resolve_ioc_observables(
+    profile: &dyn crate::schema::SchemaProfile,
+) -> Vec<ResolvedObservable> {
+    let mut out = Vec::new();
+    for (raw, names) in [
+        (true, IOC_OBSERVABLE_RAW_COLUMNS),
+        (false, IOC_OBSERVABLE_LOWER_COLUMNS),
+    ] {
+        for &logical in names {
+            if let Some(col_sql) = profile.udm_column_sql(logical) {
+                out.push(ResolvedObservable {
+                    logical,
+                    col_sql,
+                    raw,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Build the `SELECT lower(key_value) FROM custom_enrichment_results …`
+/// subquery that resolves a feed-sourced IOC indicator set (NAN-1580).
+///
+/// Live IOC rows only: `is_ioc = 1 AND expires_at > now()`. The feed `arg`
+/// matches either the enrichment name (substring, case-insensitive) or a tag
+/// (exact membership), so `threatfox("apt29")` finds rows tagged `apt29` or
+/// whose feed name contains `apt29`. `lower(key_value)` aligns with the
+/// `lower(col)` comparison legs and the raw ingest-lowercased columns.
+pub(crate) fn ioc_feed_indicator_subquery(feed: &IocFeed) -> String {
+    let name = escape_string(&feed.name.to_lowercase());
+    let arg = escape_string(&feed.arg.to_lowercase());
+    let arg_raw = escape_string(&feed.arg);
+    format!(
+        "SELECT lower(key_value) FROM nanosiem.custom_enrichment_results \
+         WHERE is_ioc = 1 AND expires_at > now() \
+         AND (lower(enrichment_name) LIKE '%{name}%' \
+         OR lower(enrichment_name) LIKE '%{arg}%' OR has(tags, '{arg_raw}'))"
+    )
+}
+
 /// Build optimized SQL for a regex match against a field expression.
 ///
 /// Applies optimizations in priority order:
@@ -338,7 +444,122 @@ impl ClickHouseSqlGenerator {
                 *negated,
                 *subsearch_dataset,
             ),
+            // NAN-1580: observable-anywhere IOC term. Expands literal indicator
+            // values across the full UDM observable column set (per-column index-
+            // prunable equality), and for feed-sourced terms resolves the
+            // indicator set from `custom_enrichment_results` via an IN-subquery.
+            SearchExpr::IocMatch { values, feed, lookup } => {
+                self.generate_ioc_match_filter(values, feed.as_ref(), lookup.as_ref())
+            }
         }
+    }
+
+    /// SQL for the `ioc` observable-anywhere term (NAN-1580).
+    ///
+    /// Builds an OR of per-observable-column IN-lists — ONE predicate per
+    /// observable carrying all values (`col IN ('v1','v2',…)`), not value×column
+    /// equalities. A lookup-sourced term can carry tens of thousands of values;
+    /// the per-value expansion blew up to ~800k OR clauses. IN on an indexed
+    /// column prunes via the bloom/skip index exactly like equality (NAN-1412 /
+    /// migration-132 lower-blooms + migration-119 text indexes), so ClickHouse can
+    /// still skip granules per leg while the clause count collapses to one per
+    /// observable (NAN-1580 P1-f):
+    ///
+    /// * Ingest-lowercased columns (`src_ip`, `dest_ip`, `dvc_ip`) compare RAW
+    ///   (`col IN ('<lowered>',…)`) so their whole-value bloom on the raw column
+    ///   prunes (CLAUDE.md QO rule #2).
+    /// * Mixed-case-history columns (hashes, url/domain, dns query, email, cve,
+    ///   rule/signature ids, user_id) compare via `lower(col) IN ('<lowered>',…)`,
+    ///   served by the migration-132 `idx_*_lower` expression blooms.
+    ///
+    /// For a feed-sourced term (`ioc in threatfox("apt29")`) the values list is
+    /// empty and `feed` is set: each observable column is matched via an
+    /// `IN (<feed indicator subquery>)` against `custom_enrichment_results`,
+    /// filtered to live IOC rows whose feed name / tags match the arg. The
+    /// service layer (`build_retro_view`) ALSO resolves the concrete indicator
+    /// list for the summary/list rollups; this SQL keeps the standalone term
+    /// (`ioc in feed(...)` with no `| retro`) self-contained.
+    fn generate_ioc_match_filter(
+        &self,
+        values: &[Value],
+        feed: Option<&IocFeed>,
+        lookup: Option<&IocLookup>,
+    ) -> Result<String, SqlGenError> {
+        // Feed-sourced with no concrete values: match each observable column
+        // against the feed's resolved indicator set.
+        if values.is_empty() {
+            return match (feed, lookup) {
+                (Some(f), _) => Ok(self.ioc_feed_match_filter(f)),
+                // A lookup source reaching SQL generation unresolved means the
+                // service layer's pre-resolution (`resolve_ioc_lookup_sources`)
+                // was skipped — and an EMPTY lookup also resolves to no values.
+                // Either way it matches nothing rather than scanning everything.
+                (None, Some(_)) => Ok("0".to_string()),
+                // No values AND no feed/lookup — a malformed/empty term.
+                (None, None) => Ok("0".to_string()),
+            };
+        }
+
+        // NAN-1580 (OCSF-aware): resolve the LOGICAL observable names to the
+        // active profile's physical columns. UDM → src_ip…; OCSF →
+        // `src_endpoint.ip`/`file.hashes.sha256`/`*_unified`; observables with no
+        // column under the profile are skipped (no dead column → no CH 500).
+        let observables = resolve_ioc_observables(self.profile.as_ref());
+
+        // Build a single IN-list of all (lowercased, escaped) values and emit ONE
+        // predicate per observable column (`col IN (…)` / `lower(col) IN (…)`)
+        // rather than values×columns equalities. A lookup-sourced term can carry
+        // tens of thousands of values; the per-value-per-column expansion blew up
+        // to ~800k OR clauses. IN on an indexed column prunes via the bloom/skip
+        // index exactly like equality, so this keeps pruning while collapsing the
+        // clause count to one-per-observable.
+        let in_list = values
+            .iter()
+            .map(|value| {
+                let lowered = match value {
+                    Value::String(s) => s.to_lowercase(),
+                    other => other.to_string().to_lowercase(),
+                };
+                format!("'{}'", escape_string(&lowered))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let mut clauses = Vec::new();
+        for obs in &observables {
+            if obs.raw {
+                clauses.push(format!("{} IN ({})", obs.col_sql, in_list));
+            } else {
+                clauses.push(format!("lower({}) IN ({})", obs.col_sql, in_list));
+            }
+        }
+
+        // No resolvable observable (degenerate profile) — never matches.
+        if clauses.is_empty() {
+            return Ok("0".to_string());
+        }
+        Ok(format!("({})", clauses.join(" OR ")))
+    }
+
+    /// Subquery-backed observable match for a feed-sourced IOC term (NAN-1580).
+    /// Each observable column is compared against the indicator set pulled from
+    /// `custom_enrichment_results` for the named feed (live IOC rows only).
+    /// OCSF-aware: columns resolve per the active profile (NAN-1580).
+    fn ioc_feed_match_filter(&self, feed: &IocFeed) -> String {
+        let subquery = ioc_feed_indicator_subquery(feed);
+        let observables = resolve_ioc_observables(self.profile.as_ref());
+        let mut clauses = Vec::new();
+        for obs in &observables {
+            if obs.raw {
+                clauses.push(format!("{} IN ({})", obs.col_sql, subquery));
+            } else {
+                clauses.push(format!("lower({}) IN ({})", obs.col_sql, subquery));
+            }
+        }
+        if clauses.is_empty() {
+            return "0".to_string();
+        }
+        format!("({})", clauses.join(" OR "))
     }
 
     /// Generate SQL for IN list filter (case-insensitive for strings)
@@ -1792,6 +2013,10 @@ impl ClickHouseSqlGenerator {
                 *negated,
                 *subsearch_dataset,
             ),
+            // NAN-1580: same observable-anywhere expansion as the top-level arm.
+            SearchExpr::IocMatch { values, feed, lookup } => {
+                self.generate_ioc_match_filter(values, feed.as_ref(), lookup.as_ref())
+            }
         }
     }
 

@@ -62,6 +62,7 @@ const AssetView = lazy(() => import('./asset').then(m => ({ default: m.AssetView
 const CloudOverviewView = lazy(() => import('./cloud-overview').then(m => ({ default: m.CloudOverviewView })));
 const CloudPrincipalDossier = lazy(() => import('./cloud-dossier').then(m => ({ default: m.CloudPrincipalDossier })));
 const LateralView = lazy(() => import('./lateral').then(m => ({ default: m.LateralView })));
+const RetroView = lazy(() => import('./retro').then(m => ({ default: m.RetroView })));
 const StatsView = lazy(() => import('./StatsView').then(m => ({ default: m.StatsView })));
 // Command-page views (NAN-1560) — reuse the curated observability surfaces.
 const ServicePageView = lazy(() => import('./service-page').then(m => ({ default: m.ServicePageView })));
@@ -299,6 +300,8 @@ interface SearchResultsProps {
   executedQuery?: string; // The query that was actually executed (for highlighting)
   onAddToQuery: (field: string, value: string, exclude: boolean) => void;
   onSetQuery?: (query: string) => void;
+  /** Replace the running query AND jump the time window in one search (retro entity drill-down). */
+  onSetQueryWithTime?: (query: string, startIso: string, endIso: string) => void;
   onLoadMore: () => void;
   onDrilldown?: (filters: Record<string, unknown>) => void;
   // Pagination for tabular views
@@ -932,6 +935,7 @@ export function SearchResults({
   executedQuery,
   onAddToQuery,
   onSetQuery,
+  onSetQueryWithTime,
   onLoadMore,
   onDrilldown,
   currentPage,
@@ -1547,6 +1551,22 @@ export function SearchResults({
               onAddToQuery={onAddToQuery}
               fieldsCount={fieldsCollapsed ? fieldsCount : undefined}
               onExpandFields={onExpandFields}
+            />
+          ) : effectiveDisplayType === 'retro' || results[0]?.fields?._display_type === 'retro' ? (
+            // IOC retro-hunt for `ioc=… | retro` (NAN-1580). The marker row carries
+            // `_retro_submode` / `_retro_axis` / `_retro_indicator` / `_retro_feed`;
+            // RetroView fetches the actual summary / campaign / pivot payload from
+            // POST /api/search/retro and rewrites the query for view switches.
+            <RetroView
+              results={results}
+              query={executedQuery ?? query}
+              timeRange={timeRange}
+              fieldsCollapsed={fieldsCollapsed}
+              fieldsCount={fieldsCount}
+              onExpandFields={onExpandFields}
+              onSetQuery={onSetQuery}
+              onSetQueryWithTime={onSetQueryWithTime}
+              onAddToQuery={onAddToQuery}
             />
           ) : effectiveDisplayType === 'services' || results[0]?.fields?._display_type === 'services' ? (
             // Observability services overview for `| services`. Marker row carries

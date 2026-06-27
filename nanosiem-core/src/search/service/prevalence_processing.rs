@@ -36,6 +36,9 @@ impl SearchService {
             SearchExpr::Keyword(_) => false,
             SearchExpr::LiteralComparison { .. } => false,
             SearchExpr::InSubsearch { .. } => false,
+            // NAN-1580: the ioc term references observable columns, never the
+            // `_prevalence.*` nested fields.
+            SearchExpr::IocMatch { .. } => false,
         }
     }
 

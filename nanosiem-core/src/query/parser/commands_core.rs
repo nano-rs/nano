@@ -80,6 +80,7 @@ pub(super) fn command(input: &str) -> ParseResult<'_, Command> {
             super::commands_enrichment::asset_command,
             super::commands_enrichment::cloud_command,
             super::commands_security::lateral_command,
+            super::commands_enrichment::retro_command,
             super::commands_enrichment::ai_command,
             // Command-page directives (NAN-1560). Plural `services` BEFORE
             // singular `service` so `| services` isn't mis-parsed as

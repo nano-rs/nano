@@ -409,6 +409,11 @@ fn validate_search_expr_fields(
         SearchExpr::LiteralComparison { .. } => {
             // Literal comparisons don't reference fields
         }
+        SearchExpr::IocMatch { .. } => {
+            // NAN-1580: the `ioc` pseudo-field is an observable-anywhere term —
+            // it doesn't reference a named column, so there is nothing to
+            // validate (and `ioc` is intentionally permitted as a pseudo-field).
+        }
         SearchExpr::InSubsearch { field, subsearch, .. } => {
             if let Err(err) = is_valid_field(field, derived, profile) {
                 errors.push(err);
@@ -875,6 +880,9 @@ fn validate_command_fields(
         | Command::Service { .. }
         | Command::Trace { .. }
         | Command::Metric { .. }
+        // NAN-1580: retro references no UDM fields directly (its observable
+        // expansion targets the base columns).
+        | Command::Retro { .. }
         | Command::Output { .. } => {
             // These commands don't reference UDM fields directly or are handled in post-processing
         }

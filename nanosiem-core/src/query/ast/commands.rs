@@ -477,6 +477,57 @@ pub enum Command {
         /// ⇒ unscoped (all services).
         service: Option<String>,
     },
+    /// retro command: IOC retro-hunt over the time range (NAN-1580).
+    /// Paired with a leading `ioc=…` / `ioc in […]` / `ioc in feed("arg")`
+    /// observable term, it switches the Search result pane to the retro-hunt
+    /// surface (summary / list / pivot submodes are derived downstream from the
+    /// ioc term and this axis).
+    /// Syntax: ioc=<v> | retro [by asset|user]
+    /// Example: ioc="1.2.3.4" | retro
+    /// Example: ioc in threatfox("apt29") | retro by asset
+    Retro {
+        /// Pivot axis: `Indicator` (default, no `by`), `Asset` (`by
+        /// asset|host|ip|entity|account`), or `User` (`by user`).
+        axis: RetroAxis,
+    },
+}
+
+/// Pivot axis for the retro-hunt command (NAN-1580).
+///
+/// Surface keywords normalize as: absent ⇒ `Indicator`; `asset`/`host`/`ip`/
+/// `entity`/`account` ⇒ `Asset`; `user` ⇒ `User`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum RetroAxis {
+    /// Indicator-centric (default): summary or rarest-first list.
+    #[default]
+    Indicator,
+    /// Asset-centric pivot (host / ip / entity / account).
+    Asset,
+    /// User-centric pivot.
+    User,
+}
+
+impl RetroAxis {
+    /// Returns the string representation of the axis.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RetroAxis::Indicator => "indicator",
+            RetroAxis::Asset => "asset",
+            RetroAxis::User => "user",
+        }
+    }
+
+    /// Parse an axis from a `by <keyword>` token, normalizing aliases.
+    /// `host`/`ip`/`entity`/`account` ⇒ `Asset`; `user` ⇒ `User`;
+    /// `asset` ⇒ `Asset`. Unknown tokens return `None`.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "asset" | "host" | "ip" | "entity" | "account" => Some(RetroAxis::Asset),
+            "user" => Some(RetroAxis::User),
+            "indicator" => Some(RetroAxis::Indicator),
+            _ => None,
+        }
+    }
 }
 
 /// Method for anomaly detection

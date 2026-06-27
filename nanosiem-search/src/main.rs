@@ -111,6 +111,40 @@ async fn main() -> Result<()> {
 
     let mut state = SearchState::new(dual_pool.clone(), auth_state).await;
 
+    // NAN-1582: when lookup row data lives in ClickHouse (the default), don't
+    // serve `| lookup` / `inputlookup` / `ioc in lookup()` reads until the
+    // one-time PG→CH backfill has finished — otherwise we'd read a partially
+    // migrated `lookup_rows`. The search service never RUNS the backfill (single
+    // runner via the PG sentinel, owned by the api/jobs pod); it only WAITS for
+    // the claim to be released. Bounded so a stuck claim can't hang boot forever.
+    if matches!(
+        nanosiem_core::lookup::LookupStorageBackend::from_env(),
+        nanosiem_core::lookup::LookupStorageBackend::ClickHouse
+    ) && nanosiem_core::lookup::is_backfill_in_progress(dual_pool.postgres()).await
+    {
+        const BACKFILL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+        const BACKFILL_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+        tracing::info!(
+            "Lookup backfill in progress — waiting up to {}s before serving CH lookup reads...",
+            BACKFILL_WAIT_TIMEOUT.as_secs()
+        );
+        let deadline = std::time::Instant::now() + BACKFILL_WAIT_TIMEOUT;
+        loop {
+            tokio::time::sleep(BACKFILL_POLL_INTERVAL).await;
+            if !nanosiem_core::lookup::is_backfill_in_progress(dual_pool.postgres()).await {
+                tracing::info!("Lookup backfill complete; proceeding to serve.");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(anyhow::anyhow!(
+                    "Lookup backfill did not complete within {}s; refusing to serve stale ClickHouse lookup data",
+                    BACKFILL_WAIT_TIMEOUT.as_secs()
+                ));
+            }
+            tracing::info!("Still waiting for lookup backfill to complete...");
+        }
+    }
+
     // Leader election for active/standby (gates readiness probe)
     // Default to false (active/active mode). Set to true for legacy active/standby.
     let leader_election_enabled = std::env::var("SEARCH_LEADER_ELECTION_ENABLED")

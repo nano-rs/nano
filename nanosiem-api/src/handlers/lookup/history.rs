@@ -24,7 +24,7 @@ use utoipa::IntoParams;
 use nanosiem_core::audit::ClickHouseAuditQuery;
 use nanosiem_core::auth::permissions;
 use nanosiem_core::{
-    LookupHistoryEntry, LookupHistoryKind, LookupRepository, LookupService, SchedulerService,
+    LookupHistoryEntry, LookupHistoryKind, SchedulerService,
 };
 
 use super::lookup_error_to_api;
@@ -97,8 +97,7 @@ pub async fn get_lookup_table_ingestion_history(
 
     // 404 if the table doesn't exist — preserves the "endpoint is scoped to a
     // real table" contract and matches GET /:name behavior.
-    let lookup_repo = LookupRepository::new(state.pool.clone());
-    let lookup_service = LookupService::new(lookup_repo);
+    let lookup_service = state.lookup_service.clone();
     let _table = lookup_service
         .get_table(&name)
         .await

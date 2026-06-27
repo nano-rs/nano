@@ -5,7 +5,7 @@
 use axum::{extract::State, Extension, Json};
 
 use nanosiem_core::auth::permissions;
-use nanosiem_core::{BatchLookupQuery, LookupQuery, LookupRepository, LookupService};
+use nanosiem_core::{BatchLookupQuery, LookupQuery};
 
 use super::lookup_error_to_api;
 use super::types::{LookupQueryRequest, LookupQueryResponse};
@@ -36,8 +36,7 @@ pub async fn lookup_query(
     check_permission(&auth, permissions::LOOKUP_VIEW)
         .map_err(|_| ApiError::Forbidden("Missing permission: lookup:view".to_string()))?;
 
-    let lookup_repo = LookupRepository::new(state.pool.clone());
-    let lookup_service = LookupService::new(lookup_repo);
+    let lookup_service = state.lookup_service.clone();
 
     // Handle single or batch lookup
     if let Some(key_values) = query.key_values {

@@ -170,6 +170,10 @@ fn primary_expr(input: &str) -> ParseResult<'_, SearchExpr> {
     // since the former is more specific; boolean_function_expr catches the standalone case
     alt((
         grouped_expr,
+        // `ioc=` / `ioc in [...]` / `ioc in feed("arg")` are special-cased ahead
+        // of the generic field/in-list filters so the `ioc` pseudo-field expands
+        // to an observable-anywhere match (NAN-1580).
+        ioc_filter,
         in_cidr_filter,
         in_subsearch_filter,
         in_list_filter,
@@ -608,6 +612,214 @@ fn in_list_filter(input: &str) -> ParseResult<'_, SearchExpr> {
             negated,
         },
     ))
+}
+
+/// Parse the `ioc` observable term (NAN-1580 / NAN-1581 Phase 6). Surface forms:
+///   - `ioc = <value>`             -> IocMatch { values: [value] }
+///   - `ioc in [v1, v2, ...]`      -> IocMatch { values } (also `( )`)
+///   - `ioc in <feed>("arg")`      -> IocMatch { feed: Some(..) }
+///     where feed in {threatfox, misp, otx, feodo, abuse}.
+///   - `ioc in lookup("name")`     -> IocMatch { lookup: Some(..) }
+///   - `ioc in lookup("name","col")` -> IocMatch { lookup: Some(.. column) }
+///   - `ioc in [inputlookup name]` -> IocMatch { lookup: Some(..) } (alias)
+/// The `ioc` keyword is matched as a whole word (not "ioc_score" etc.). When
+/// used without a trailing `| retro` it is still a normal observable-anywhere
+/// match — the AST node is reusable on its own. The lookup/feed sources are
+/// PRE-RESOLVED to concrete `values` by the service layer before SQL generation.
+///
+/// Parse a single bare IOC observable value: a quoted string, or a token that
+/// runs to whitespace / `|`. Unlike `filter_value`, it does NOT number-match a
+/// leading digit — `ioc=5fb90fd…` (a hash, which most are) must capture the
+/// WHOLE token, not just the leading `5`. IOC values are compared as strings.
+fn ioc_single_value(input: &str) -> ParseResult<'_, Value> {
+    alt((
+        map(quoted_string, Value::String),
+        map(
+            take_while1(|c: char| !c.is_whitespace() && c != '|'),
+            |s: &str| Value::String(s.to_string()),
+        ),
+    ))
+    .parse(input)
+}
+
+/// Parse one IOC value inside a `[ ]` / `( )` list — same as `ioc_single_value`
+/// but also stops at the list delimiters `, ] ) [ (`.
+fn ioc_list_value(input: &str) -> ParseResult<'_, Value> {
+    alt((
+        map(quoted_string, Value::String),
+        map(
+            take_while1(|c: char| {
+                !c.is_whitespace()
+                    && c != ','
+                    && c != ']'
+                    && c != ')'
+                    && c != '['
+                    && c != '('
+            }),
+            |s: &str| Value::String(s.to_string()),
+        ),
+    ))
+    .parse(input)
+}
+
+fn ioc_filter(input: &str) -> ParseResult<'_, SearchExpr> {
+    // Match `ioc` as a complete identifier — reject `ioc_foo`, `iocx`, etc.
+    let (input, _) = tag_no_case("ioc").parse(input)?;
+    if input
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )));
+    }
+
+    let (input, _) = multispace0(input)?;
+
+    // Form 1: ioc = <value>
+    if let Ok((rest, _)) = char::<&str, nom::error::Error<&str>>('=').parse(input) {
+        let (rest, _) = multispace0(rest)?;
+        let (rest, val) = ioc_single_value(rest)?;
+        return Ok((
+            rest,
+            SearchExpr::IocMatch {
+                values: vec![val],
+                feed: None,
+                lookup: None,
+            },
+        ));
+    }
+
+    // Forms 2–5 all start with `in`.
+    let (input, _) = tag_no_case("in").parse(input)?;
+    let (input, _) = multispace1(input)?;
+
+    // Form 2 / alias: ioc in [...]  — either a literal value list, OR the
+    // `[inputlookup <name>]` lookup-source alias. Parens accept value lists only.
+    let open = input.chars().next();
+    if open == Some('[') || open == Some('(') {
+        let close = if open == Some('[') { ']' } else { ')' };
+        let (after_open, _) = char(open.unwrap()).parse(input)?;
+        let (after_open, _) = multispace0(after_open)?;
+
+        // Alias: `ioc in [inputlookup <name>]` → lookup source. Only inside `[ ]`.
+        if open == Some('[') {
+            if let Ok((rest, _)) =
+                tag_no_case::<&str, &str, nom::error::Error<&str>>("inputlookup").parse(after_open)
+            {
+                let (rest, _) = multispace1(rest)?;
+                let (rest, table) = alt((quoted_string, lookup_table_ident)).parse(rest)?;
+                let (rest, _) = multispace0(rest)?;
+                let (rest, _) = char(']').parse(rest)?;
+                return Ok((
+                    rest,
+                    SearchExpr::IocMatch {
+                        values: vec![],
+                        feed: None,
+                        lookup: Some(IocLookup {
+                            table,
+                            column: None,
+                        }),
+                    },
+                ));
+            }
+        }
+
+        // Literal value list.
+        let (input, values) = separated_list1(
+            delimited(multispace0, char(','), multispace0),
+            ioc_list_value,
+        )
+        .parse(after_open)?;
+        let (input, _) = multispace0(input)?;
+        let (input, _) = char(close).parse(input)?;
+        return Ok((
+            input,
+            SearchExpr::IocMatch {
+                values,
+                feed: None,
+                lookup: None,
+            },
+        ));
+    }
+
+    // Form 4: ioc in lookup("name") / ioc in lookup("name", "column")
+    if let Ok((rest, _)) =
+        tag_no_case::<&str, &str, nom::error::Error<&str>>("lookup").parse(input)
+    {
+        // Guard against a feed/identifier that merely starts with "lookup".
+        if !rest
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            let (rest, _) = multispace0(rest)?;
+            let (rest, _) = char('(').parse(rest)?;
+            let (rest, _) = multispace0(rest)?;
+            let (rest, table) = quoted_string(rest)?;
+            let (rest, _) = multispace0(rest)?;
+            // Optional second arg: the column to read indicator values from.
+            let (rest, column) = opt(preceded(
+                delimited(multispace0, char(','), multispace0),
+                quoted_string,
+            ))
+            .parse(rest)?;
+            let (rest, _) = multispace0(rest)?;
+            let (rest, _) = char(')').parse(rest)?;
+            return Ok((
+                rest,
+                SearchExpr::IocMatch {
+                    values: vec![],
+                    feed: None,
+                    lookup: Some(IocLookup { table, column }),
+                },
+            ));
+        }
+    }
+
+    // Form 3: ioc in <feed>("arg")
+    let (input, feed_name) =
+        take_while1(|c: char| c.is_alphanumeric() || c == '_').parse(input)?;
+    let lower = feed_name.to_lowercase();
+    if !matches!(
+        lower.as_str(),
+        "threatfox" | "misp" | "otx" | "feodo" | "abuse"
+    ) {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
+    let (input, _) = multispace0(input)?;
+    let (input, _) = char('(').parse(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, arg) = quoted_string(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = char(')').parse(input)?;
+
+    Ok((
+        input,
+        SearchExpr::IocMatch {
+            values: vec![],
+            feed: Some(IocFeed {
+                name: lower,
+                arg,
+            }),
+            lookup: None,
+        },
+    ))
+}
+
+/// Parse a bare (unquoted) lookup-table identifier for the
+/// `[inputlookup <name>]` alias: alphanumerics, `_`, `-`, `.`.
+fn lookup_table_ident(input: &str) -> ParseResult<'_, String> {
+    map(
+        take_while1(|c: char| c.is_alphanumeric() || c == '_' || c == '-' || c == '.'),
+        |s: &str| s.to_string(),
+    )
+    .parse(input)
 }
 
 /// Parse word-based comparators: field LIKE "pattern", field CONTAINS "value", etc.

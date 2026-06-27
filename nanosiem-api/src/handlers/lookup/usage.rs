@@ -12,7 +12,7 @@ use axum::{
 use tracing::instrument;
 
 use nanosiem_core::auth::permissions;
-use nanosiem_core::{LookupRepository, LookupService, LookupUsage, RuleReferenceRow};
+use nanosiem_core::{LookupUsage, RuleReferenceRow};
 
 use super::lookup_error_to_api;
 use crate::middleware::{check_permission, AuthContext};
@@ -59,8 +59,7 @@ pub async fn get_lookup_table_usage(
     check_permission(&auth, permissions::LOOKUP_VIEW)
         .map_err(|_| ApiError::Forbidden("Missing permission: lookup:view".to_string()))?;
 
-    let lookup_repo = LookupRepository::new(state.pool.clone());
-    let lookup_service = LookupService::new(lookup_repo);
+    let lookup_service = state.lookup_service.clone();
 
     // 404 if the table doesn't exist — this preserves the contract "the
     // endpoint is scoped to a real table" and matches GET /:name behavior.

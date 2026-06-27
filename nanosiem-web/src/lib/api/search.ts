@@ -54,6 +54,8 @@ import type {
   ListTracesRequest,
   ListTracesResponse,
   MetricNamesResponse,
+  RetroRequest,
+  RetroResponse,
 } from './types';
 
 export class SearchApi {
@@ -264,6 +266,23 @@ export class SearchApi {
     if (service) params.set('service', service);
     const qs = params.toString();
     return this.request(`/api/search/metrics/names${qs ? `?${qs}` : ''}`);
+  }
+
+  // IOC retro-hunt (NAN-1580)
+
+  /**
+   * Run an IOC retro-hunt against the value-sorted observables projection.
+   * The initial `/api/search` response is only a marker carrying the parsed
+   * retro request (`_retro_*` fields); this endpoint returns the actual
+   * summary / campaign-list / pivot-rollup payload shaped by `axis`.
+   * Campaign + pivot tables paginate via `offset`/`limit` (+ `has_more`);
+   * the summary is single-shot.
+   */
+  async getRetro(request: RetroRequest): Promise<RetroResponse> {
+    return this.request('/api/search/retro', {
+      method: 'POST',
+      body: JSON.stringify(request),
+    });
   }
 
   // Saved searches

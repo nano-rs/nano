@@ -8,10 +8,13 @@
 //! Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.7, 3.1, 3.2, 3.3, 3.4, 3.5, 5.3, 5.4
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use thiserror::Error;
 use tracing::instrument;
 
-use super::repository::{LookupRepository, LookupRepositoryError, RuleReferenceRow};
+use super::clickhouse_repository::ClickHouseLookupRepository;
+use super::postgres_repository::PostgresLookupRepository;
+use super::repository::{LookupRepositoryError, LookupStorageBackend, LookupStore, RuleReferenceRow};
 use super::types::*;
 use crate::upload::ColumnType;
 
@@ -61,6 +64,16 @@ impl From<LookupRepositoryError> for LookupError {
                     None => LookupError::RepositoryError(e.to_string()),
                 }
             }
+            // ClickHouse-backed storage errors (NAN-1581). Mirror the Postgres
+            // SQLSTATE classifier: a CH exception caused by the uploaded
+            // data/types (TYPE_MISMATCH / CANNOT_PARSE_*) is a 4xx user error;
+            // anything else is treated as a 500-class infra failure.
+            LookupRepositoryError::ClickHouseError(msg) => {
+                match ch_input_error_message(&msg) {
+                    Some(m) => LookupError::InvalidData(m.to_string()),
+                    None => LookupError::RepositoryError(msg),
+                }
+            }
         }
     }
 }
@@ -90,16 +103,81 @@ fn input_error_message(sqlstate: &str) -> Option<&'static str> {
     }
 }
 
-/// Service for lookup table operations
+/// Map a ClickHouse exception message to a user-facing validation message when
+/// the error is caused by the uploaded data/types rather than infrastructure
+/// (NAN-1581 — the CH analogue of [`input_error_message`]).
+///
+/// The `clickhouse` crate surfaces server errors as a string carrying the
+/// ClickHouse error NAME and/or numeric code (e.g. `Code: 53. DB::Exception ...
+/// TYPE_MISMATCH`). We classify the data-caused families — TYPE_MISMATCH (53),
+/// the CANNOT_PARSE_* family (6/27/38/41/72/...), CANNOT_CONVERT_TYPE (70),
+/// VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE (69), ILLEGAL_TYPE_OF_ARGUMENT (43) — as a
+/// 4xx; everything else (connection failures, memory limits, unknown table,
+/// etc.) stays a 500.
+fn ch_input_error_message(msg: &str) -> Option<&'static str> {
+    let upper = msg.to_ascii_uppercase();
+    // Name-based detection (preferred — stable across CH versions).
+    const DATA_ERROR_NAMES: &[&str] = &[
+        "TYPE_MISMATCH",
+        "CANNOT_PARSE_",
+        "CANNOT_CONVERT_TYPE",
+        "VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE",
+        "ILLEGAL_TYPE_OF_ARGUMENT",
+        "DUPLICATE_COLUMN",
+    ];
+    if DATA_ERROR_NAMES.iter().any(|n| upper.contains(n)) {
+        return Some("a value in the upload is not valid for its column type");
+    }
+    None
+}
+
+/// Service for lookup table operations.
+///
+/// Holds a backend-agnostic [`LookupStore`] (NAN-1581). The active backend is
+/// chosen at construction — `new(..)` keeps the legacy
+/// `LookupService::new(LookupRepository::new(pg))` call sites working
+/// (PostgreSQL), while [`LookupService::with_backend`] selects per the
+/// `LOOKUP_STORAGE_BACKEND` flag.
 #[derive(Clone)]
 pub struct LookupService {
-    repository: LookupRepository,
+    repository: Arc<dyn LookupStore>,
 }
 
 impl LookupService {
-    /// Create a new lookup service
-    pub fn new(repository: LookupRepository) -> Self {
+    /// Create a new lookup service from any storage backend.
+    ///
+    /// Backward-compatible: existing callers pass a `LookupRepository`
+    /// (= `PostgresLookupRepository`), which implements `LookupStore`.
+    pub fn new<S: LookupStore + 'static>(repository: S) -> Self {
+        Self {
+            repository: Arc::new(repository),
+        }
+    }
+
+    /// Create a lookup service from an already-shared store handle.
+    pub fn from_store(repository: Arc<dyn LookupStore>) -> Self {
         Self { repository }
+    }
+
+    /// Create a lookup service whose ROW-DATA backend is selected by the given
+    /// [`LookupStorageBackend`] (registry always stays in Postgres).
+    ///
+    /// `pg` backs the registry (and the Postgres row data when selected); `ch`
+    /// backs the ClickHouse row data when selected. Defaulting to
+    /// `LookupStorageBackend::from_env()` (default `postgres`) preserves
+    /// existing behavior.
+    pub fn with_backend(
+        backend: LookupStorageBackend,
+        pg: sqlx::PgPool,
+        ch: clickhouse::Client,
+    ) -> Self {
+        let store: Arc<dyn LookupStore> = match backend {
+            LookupStorageBackend::Postgres => Arc::new(PostgresLookupRepository::new(pg)),
+            LookupStorageBackend::ClickHouse => {
+                Arc::new(ClickHouseLookupRepository::new(pg, ch))
+            }
+        };
+        Self { repository: store }
     }
 
     // ========================================================================
@@ -401,6 +479,56 @@ impl LookupService {
             page_size,
             total_pages,
         })
+    }
+
+    /// Internal columns injected by the storage backends that must never leak
+    /// into search results (`inputlookup`) or other consumer surfaces.
+    ///
+    /// Postgres surfaces `_row_id` (BIGSERIAL surrogate); the ClickHouse backend
+    /// exposes the same `_row_id` plus carries `row_id`/`version`/`deleted`/
+    /// `key_lc`/`lookup_table_name` internally — but those never reach the
+    /// decoded HashMap (see `ClickHouseLookupRepository::decode_row`). We strip
+    /// the full set defensively so a future backend change can't leak them.
+    const INTERNAL_ROW_COLUMNS: &'static [&'static str] = &[
+        "_row_id",
+        "row_id",
+        "version",
+        "deleted",
+        "key_lc",
+        "lookup_table_name",
+    ];
+
+    /// Read EVERY live (deduped, non-tombstoned) row of a lookup table as
+    /// user-column-only records — the full-table read backing
+    /// `| inputlookup <internal_table>` (NAN-1581 Phase 5).
+    ///
+    /// Reuses the backend's deduped `list_rows` read (argMax/GROUP BY on the
+    /// ClickHouse backend; a single deduped `SELECT *` on Postgres) rather than
+    /// hand-rolling a raw query — so duplicate versions and tombstones are never
+    /// returned. Internal columns (`_row_id` et al.) are stripped from every
+    /// row. Bounded by [`MAX_LOOKUP_TABLE_ROWS`].
+    #[instrument(skip(self))]
+    pub async fn read_all_rows(
+        &self,
+        table_name: &str,
+    ) -> Result<Vec<HashMap<String, serde_json::Value>>, LookupError> {
+        // Resolve the physical table name via the registry; surfaces
+        // TableNotFound for an unknown logical name.
+        let table = self.repository.get_table(table_name).await?;
+
+        // Single deduped read of the whole table (bounded). offset = 0.
+        let (mut rows, _total) = self
+            .repository
+            .list_rows(&table.table_name, MAX_LOOKUP_TABLE_ROWS, 0)
+            .await?;
+
+        for row in &mut rows {
+            for col in Self::INTERNAL_ROW_COLUMNS {
+                row.remove(*col);
+            }
+        }
+
+        Ok(rows)
     }
 
     /// Insert a single row and return the assigned _row_id
@@ -818,6 +946,36 @@ mod tests {
         // ...but the rest of class 42 stays a 500 (real bug, not bad input).
         assert!(input_error_message("42601").is_none()); // syntax_error
         assert!(input_error_message("42P01").is_none()); // undefined_table
+    }
+
+    #[test]
+    fn ch_input_error_message_maps_type_mismatch_to_4xx() {
+        // Data-caused CH exceptions -> a user-facing message (=> 4xx).
+        assert!(ch_input_error_message(
+            "Code: 53. DB::Exception: Type mismatch ... TYPE_MISMATCH"
+        )
+        .is_some());
+        assert!(ch_input_error_message(
+            "Code: 6. DB::Exception: Cannot parse ... CANNOT_PARSE_NUMBER"
+        )
+        .is_some());
+        assert!(ch_input_error_message(
+            "VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE"
+        )
+        .is_some());
+        assert!(ch_input_error_message("ILLEGAL_TYPE_OF_ARGUMENT").is_some());
+    }
+
+    #[test]
+    fn ch_input_error_message_leaves_infra_as_500() {
+        // Infra / unknown CH failures -> None (=> stays a 500).
+        assert!(ch_input_error_message("Connection refused (os error 111)").is_none());
+        assert!(ch_input_error_message(
+            "Code: 241. DB::Exception: Memory limit exceeded ... MEMORY_LIMIT_EXCEEDED"
+        )
+        .is_none());
+        assert!(ch_input_error_message("Code: 60. UNKNOWN_TABLE").is_none());
+        assert!(ch_input_error_message("").is_none());
     }
 
     #[test]

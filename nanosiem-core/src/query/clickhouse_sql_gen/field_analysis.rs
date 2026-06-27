@@ -277,6 +277,10 @@ fn collect_fields_from_search_expr(
         SearchExpr::LiteralComparison { .. } => {
             // Literal comparisons don't reference any fields
         }
+        SearchExpr::IocMatch { .. } => {
+            // NAN-1580: observable-anywhere match — no single field to collect;
+            // its expansion targets the base observable columns directly.
+        }
         SearchExpr::InSubsearch { field, .. } => {
             fields.insert(field.clone());
         }
@@ -622,6 +626,9 @@ fn collect_fields_from_command(
             // Command-page directives short-circuit before codegen (NAN-1560);
             // they don't drive field selection.
         }
+        // NAN-1580: the retro directive drives the retro-hunt surface, not the
+        // base log projection — it doesn't add required fields here.
+        Command::Retro { .. } => {}
     }
 }
 

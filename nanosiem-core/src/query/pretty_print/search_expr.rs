@@ -83,6 +83,26 @@ impl PrettyPrint for SearchExpr {
             SearchExpr::LiteralComparison { left, op, right } => {
                 format!("\"{}\"{}\"{}\"", left, op.as_str(), right)
             }
+            // NAN-1580 / NAN-1581: render the `ioc` surface forms back out.
+            SearchExpr::IocMatch { values, feed, lookup } => {
+                if let Some(f) = feed {
+                    format!("ioc in {}(\"{}\")", f.name, f.arg)
+                } else if let Some(l) = lookup {
+                    match &l.column {
+                        Some(col) => format!("ioc in lookup(\"{}\", \"{}\")", l.table, col),
+                        None => format!("ioc in lookup(\"{}\")", l.table),
+                    }
+                } else if values.len() == 1 {
+                    format!("ioc={}", format_value_for_filter(&values[0]))
+                } else {
+                    let values_str = values
+                        .iter()
+                        .map(format_value_for_filter)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("ioc in [{}]", values_str)
+                }
+            }
             SearchExpr::InSubsearch {
                 field,
                 subsearch,

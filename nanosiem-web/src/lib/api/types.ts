@@ -210,7 +210,110 @@ export type DisplayType =
   | 'services'    // OTLP services overview (services command) — reuses ServicesTab
   | 'service'     // OTLP service RED drill-in (service command) — reuses ServiceDetail
   | 'trace'       // OTLP distributed-trace waterfall (trace command) — reuses TraceWaterfall
-  | 'metric';     // OTLP metrics explorer (metric command) — reuses MetricsExplorer
+  | 'metric'      // OTLP metrics explorer (metric command) — reuses MetricsExplorer
+  | 'retro';      // IOC retro-hunt view (`ioc=… | retro`, NAN-1580) — reuses RetroView
+
+// ============================================================================
+// IOC retro-hunt (NAN-1580)
+//
+// `ioc=<value> | retro` (summary), `ioc in [..]|feed() | retro` (campaign list),
+// `… | retro by asset|user` (pivot rollup). The initial /api/search response is a
+// MARKER carrying the parsed retro request (`_retro_*` fields on results[0].fields);
+// the real data is fetched from POST /api/search/retro. Verdict bands reuse the
+// prevalence rarity logic — ratio = distinct_hosts_touched / total_hosts_in_env;
+// rare ≤ 0.02, uncommon ≤ 0.15, else common.
+// ============================================================================
+
+/** Retro hunt submode, derived from the nPL `| retro` shape. */
+export type RetroSubmode = 'summary' | 'list' | 'pivot';
+
+/** Retro hunt pivot axis. host/ip/entity/account all normalize to "asset". */
+export type RetroAxis = 'indicator' | 'asset' | 'user';
+
+/** Prevalence verdict band (rarest = rare). */
+export type RetroVerdict = 'rare' | 'uncommon' | 'common';
+
+export interface RetroRequest {
+  query: string;
+  time_range: TimeRange;
+  /** "indicator" | "asset" | "user" — drives the submode/projection server-side. */
+  axis: string;
+  offset?: number;
+  limit?: number;
+  sort?: string;
+}
+
+/** One [field, count] pair for the summary's matched-fields breakdown. */
+export type RetroMatchedField = [string, number];
+
+/** A pivot/entity target the indicator landed on (summary top_entities). */
+export interface RetroTopEntity {
+  id: string;
+  hits: number;
+  kind: string;
+}
+
+/** Single-indicator summary payload (summary submode). */
+export interface RetroIndicator {
+  value: string;
+  type: string;
+  source: string | null;
+  campaign: string | null;
+  confidence: number;
+  hits: number;
+  first_seen: string | null;
+  last_seen: string | null;
+  matched_fields: RetroMatchedField[];
+  distinct_hosts: number;
+  total_hosts: number;
+  verdict: RetroVerdict;
+  top_entities: RetroTopEntity[];
+}
+
+/** One row of the campaign list (list submode). */
+export interface RetroListRow {
+  value: string;
+  type: string;
+  hits: number;
+  hosts: number;
+  total_hosts: number;
+  first_seen: string | null;
+  last_seen: string | null;
+  field: string;
+  verdict: RetroVerdict;
+}
+
+/** One row of the asset/user pivot rollup (pivot submode). */
+export interface RetroPivotRow {
+  id: string;
+  name: string;
+  sub: string | null;
+  iocs: number;
+  indicators: string[];
+  first_seen: string | null;
+  last_seen: string | null;
+  worst_verdict: RetroVerdict;
+}
+
+export interface RetroResponse {
+  submode: RetroSubmode;
+  axis: RetroAxis;
+  total_hosts: number;
+  generated_sql?: string;
+  // summary submode
+  indicator?: RetroIndicator;
+  // list submode
+  total_indicators?: number;
+  rows?: RetroListRow[] | RetroPivotRow[];
+  no_hits?: string[];
+  // pivot submode — backend serializes pivot rows under a distinct field
+  // (a single struct can't carry two typed `rows`); useRetro normalizes
+  // these into `rows` so the views read one field. (NAN-1580)
+  pivot_rows?: RetroPivotRow[];
+  offset?: number;
+  limit?: number;
+  has_more?: boolean;
+}
 
 // ============================================================================
 // OpenTelemetry observability (NAN-1528)

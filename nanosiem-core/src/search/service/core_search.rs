@@ -392,10 +392,33 @@ impl SearchService {
         }
 
         // Parse the cleaned query
-        let query = match parse_query(&cleaned_query) {
+        let mut query = match parse_query(&cleaned_query) {
             Ok(q) => q,
             Err(e) => return Err(convert_parse_error(e)),
         };
+
+        // NAN-1581 Phase 6: pre-resolve `ioc in lookup("table")` sources to
+        // concrete indicator values BEFORE SQL generation. This is backend-
+        // agnostic (works whether lookups are PG- or CH-backed) and keeps the
+        // SQL generator unaware of lookup tables — once substituted, the existing
+        // OCSF/UDM-aware observable matchset handles column resolution. An unknown
+        // lookup errors here (clear 400); an empty lookup yields a never-match
+        // term plus a warning surfaced in the response below.
+        // A `… | retro` query short-circuits to a marker below and resolves its
+        // lookup/feed sources inside `build_retro_view` (which re-parses the raw
+        // query). Skip pre-resolution here so the retro marker keeps the lookup
+        // source visible and we don't resolve twice.
+        let is_retro_query =
+            matches!(get_semantic_terminal_command(&query), Some(Command::Retro { .. }));
+        let mut ioc_lookup_warnings: Vec<String> = Vec::new();
+        if !is_retro_query && ioc_lookup_resolve::query_has_ioc_lookup(&query) {
+            ioc_lookup_resolve::resolve_ioc_lookup_sources(
+                &mut query,
+                self.lookup_service.as_ref(),
+                &mut ioc_lookup_warnings,
+            )
+            .await?;
+        }
 
         // NAN-1354: input-side field-name validation (defense-in-depth behind
         // codegen escaping). Reject malformed / typo'd field references early.
@@ -441,13 +464,7 @@ impl SearchService {
         // Placement is load-bearing: this MUST sit after the OOM guard but
         // BEFORE any extraction / limit / count fan-out, or these pages
         // silently scan logs (the count companion is NOT display-type-gated).
-        if matches!(
-            display_type,
-            DisplayType::Services
-                | DisplayType::Service
-                | DisplayType::Trace
-                | DisplayType::Metric
-        ) {
+        if is_command_page_marker(display_type) {
             let marker = match get_semantic_terminal_command(&query) {
                 Some(Command::Services) => serde_json::json!({
                     "_display_type": "services",
@@ -466,6 +483,23 @@ impl SearchService {
                     // Empty string ⇒ unscoped explorer (frontend treats "" as None).
                     "_metric_service": service.clone().unwrap_or_default(),
                 }),
+                // NAN-1580: `ioc=… | retro` — the marker carries the parsed retro
+                // request so the frontend fetches the rollup from the companion
+                // `/api/search/retro` endpoint. NO log scan here (the heavy
+                // aggregation is the companion's job — mirrors the cloud/asset
+                // marker pattern).
+                Some(Command::Retro { .. }) => match super::retro::extract_retro_plan(&query) {
+                    Some(plan) => super::retro::build_retro_marker(&plan),
+                    // `retro` without a feeding `ioc` term — surface guidance.
+                    None => {
+                        return Err(SearchError::SqlValidationError(
+                            "`retro` needs a leading `ioc` term — e.g. \
+                             `ioc=\"1.2.3.4\" | retro` or `ioc in threatfox(\"apt29\") | \
+                             retro by asset`."
+                                .to_string(),
+                        ));
+                    }
+                },
                 // determine_display_type guarantees one of the above; defensive.
                 _ => serde_json::json!({ "_display_type": "events" }),
             };
@@ -957,6 +991,10 @@ impl SearchService {
         // the auto-sort warning has its own code and is emitted separately at
         // the merge point below to keep the labelling honest.
         let mut runtime_warnings: Vec<String> = Vec::new();
+
+        // NAN-1581 Phase 6: surface any empty-`ioc in lookup(...)` warnings raised
+        // during pre-resolution (a 0-row lookup yields a never-match term).
+        runtime_warnings.extend(ioc_lookup_warnings.drain(..));
 
         // Enrichment degradation warnings (e.g. a subset of inputlookup fetches
         // failed) get their own `ENRICHMENT_DEGRADED` code — they are not

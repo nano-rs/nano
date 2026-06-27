@@ -79,9 +79,14 @@ pub enum Transport {
     /// POSTed to `<base_url>/v1/{traces,metrics,logs}` with
     /// protobuf (`application/x-protobuf`). `base_url` is the receiver root (no
     /// `/v1/...` suffix — the signal-specific path is appended per send).
-    /// Default `http://localhost:4318`. The OTLP source has no shared-token
-    /// gate (auth terminates at the LB), so there is no token.
-    OtlpHttp { base_url: String },
+    /// Default `http://localhost:4318`. Open-core/local OTLP has no shared-token
+    /// gate (auth terminates at the LB); managed deploys token-gate the receiver
+    /// (FRO-518) and `abort` unauthenticated exports, so `token` carries the
+    /// Bearer when one is configured (sent as `Authorization: Bearer <token>`).
+    OtlpHttp {
+        base_url: String,
+        token: Option<String>,
+    },
     /// Vector-INDEPENDENT direct OTLP path (NAN-1533) — mirrors Tenzir/Cribl
     /// direct producers. Each per-record OTLP/JSON is INSERTed as one
     /// `{event, timestamp, source_type}` row into the Null staging table
@@ -147,7 +152,7 @@ impl Transport {
             Transport::Vector { url, .. } => url,
             Transport::Hec { url, .. } => url,
             Transport::Tenzir { url } => url,
-            Transport::OtlpHttp { base_url } => base_url,
+            Transport::OtlpHttp { base_url, .. } => base_url,
             Transport::OtlpClickHouse { url, .. } => url,
         }
     }
@@ -158,7 +163,8 @@ impl Transport {
             Transport::Hec { token, .. } => token.as_deref(),
             Transport::Tenzir { .. } => None,
             // OTLP receiver auth terminates at the LB; ClickHouse uses basic auth.
-            Transport::OtlpHttp { .. } | Transport::OtlpClickHouse { .. } => None,
+            Transport::OtlpHttp { token, .. } => token.as_deref(),
+            Transport::OtlpClickHouse { .. } => None,
         }
     }
 
@@ -449,13 +455,18 @@ async fn send_otlp_http(
         }
         OtlpSignal::Metrics => build_metrics_request(records)?.encode_to_vec(),
     };
-    client
+    let mut req = client
         .post(url)
         .header("Content-Type", "application/x-protobuf")
-        .body(body)
-        .send()
-        .await?
-        .error_for_status()?;
+        .body(body);
+    // Managed deploys token-gate the OTLP receiver (FRO-518) and `abort`
+    // unauthenticated exports — which a logs-style sink silently accepts (HTTP
+    // 200) while dropping every record. Attach the Bearer when a token is
+    // configured; open-core/local OTLP has no gate and ignores it.
+    if let Some(tok) = transport.token() {
+        req = req.bearer_auth(tok);
+    }
+    req.send().await?.error_for_status()?;
     Ok(())
 }
 

@@ -8,7 +8,9 @@ use nom::{
     branch::alt,
     bytes::complete::tag_no_case,
     character::complete::{char, multispace0, multispace1},
+    combinator::opt,
     multi::separated_list1,
+    sequence::{delimited, preceded},
     Parser,
 };
 use std::time::Duration;
@@ -868,4 +870,37 @@ pub(super) fn metric_command(input: &str) -> ParseResult<'_, Command> {
     };
 
     Ok((input, Command::Metric { name, service }))
+}
+
+/// Parse retro command: | retro [by asset|user|host|ip|entity|account]
+/// IOC retro-hunt directive (NAN-1580). The bare form pivots on the indicator;
+/// `by asset` (and aliases host/ip/entity/account) pivots on assets; `by user`
+/// pivots on users. Must be preceded by an `ioc=…` observable term upstream —
+/// the parser only builds the AST node; submode derivation happens downstream.
+pub(super) fn retro_command(input: &str) -> ParseResult<'_, Command> {
+    let (input, _) = tag_no_case("retro").parse(input)?;
+    // Must be followed by whitespace, pipe, or end of input (not "retrospect").
+    if !input.is_empty() && !input.starts_with(|c: char| c.is_whitespace() || c == '|') {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )));
+    }
+
+    // Optional `by <axis>` clause.
+    let (input, axis) = match opt(preceded(
+        delimited(multispace1, tag_no_case("by"), multispace1),
+        field_name,
+    ))
+    .parse(input)?
+    {
+        (rest, Some(axis_token)) => {
+            // Unknown axis tokens normalize to the default Indicator axis rather
+            // than failing the parse — keeps `| retro by <anything>` permissive.
+            (rest, RetroAxis::from_str(&axis_token).unwrap_or_default())
+        }
+        (rest, None) => (rest, RetroAxis::Indicator),
+    };
+
+    Ok((input, Command::Retro { axis }))
 }

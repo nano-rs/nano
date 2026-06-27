@@ -35,7 +35,7 @@ pub(crate) mod identity;
 // pub: the OTLP dataset selector + trace/metrics fetch helpers are called by the
 // search/api layer to target the `otel_spans`/`otel_metrics` tables (NAN-1528).
 pub mod otel;
-mod search_expr;
+pub(crate) mod search_expr;
 
 // Re-export helpers so submodules and external code can access them
 pub(crate) use helpers::*;
@@ -484,9 +484,11 @@ fn extract_fields_from_search_expr(expr: &SearchExpr) -> Vec<String> {
             fields.extend(extract_fields_from_search_expr(inner));
         }
         // These don't have specific fields we want to capture
+        // NAN-1580: IocMatch is an observable-anywhere term — no single field.
         SearchExpr::Keyword(_)
         | SearchExpr::FunctionFilter { .. }
         | SearchExpr::BooleanFunction(_)
+        | SearchExpr::IocMatch { .. }
         | SearchExpr::LiteralComparison { .. } => {}
         SearchExpr::InSubsearch { field, .. } => {
             fields.push(field.clone());
@@ -4878,6 +4880,140 @@ mod tests {
                 "{field} equality must emit `{expected}` (the indexed expression), got:\n{sql}"
             );
         }
+    }
+
+    // ── NAN-1580: IOC observable-anywhere term expansion ──────────────────
+
+    /// `ioc=<v>` emits ONE index-friendly predicate per observable column using
+    /// an IN-list of the (lowercased) values: RAW (`col IN ('<lowered>')`) for
+    /// the ingest-lowercased columns, `lower(col) IN (…)` for the mixed-case ones.
+    /// IN on an indexed column prunes like equality but collapses the clause count
+    /// from values×columns to columns (NAN-1580 P1-f).
+    #[test]
+    fn ioc_term_expands_across_observable_columns_index_friendly() {
+        let query = parse_query("ioc=\"1.2.3.4\"").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+
+        // Single WHERE, full partition-pruning time bound, NO explicit PREWHERE.
+        assert!(
+            sql.contains("WHERE timestamp BETWEEN") && !sql.contains("PREWHERE"),
+            "ioc term must emit a single WHERE with no PREWHERE, got:\n{sql}"
+        );
+
+        // RAW-compared ingest-lowercased observable columns (bloom prunes).
+        for raw in [
+            "src_ip IN ('1.2.3.4')",
+            "dest_ip IN ('1.2.3.4')",
+            "dvc_ip IN ('1.2.3.4')",
+        ] {
+            assert!(sql.contains(raw), "missing raw observable leg `{raw}`, got:\n{sql}");
+        }
+
+        // lower(col) IN-list form for mixed-case-history observable columns.
+        for lowered in [
+            "lower(file_hash) IN ('1.2.3.4')",
+            "lower(url_domain) IN ('1.2.3.4')",
+            "lower(query) IN ('1.2.3.4')",
+            "lower(user_id) IN ('1.2.3.4')",
+            "lower(sender) IN ('1.2.3.4')",
+            "lower(cve) IN ('1.2.3.4')",
+            "lower(signature_id) IN ('1.2.3.4')",
+        ] {
+            assert!(
+                sql.contains(lowered),
+                "missing lowered observable leg `{lowered}`, got:\n{sql}"
+            );
+        }
+
+        // The per-observable legs are OR'd (single disjunctive matchset).
+        assert!(sql.contains(" OR "), "observable legs must be OR'd, got:\n{sql}");
+    }
+
+    /// NAN-1580 (OCSF-aware): under an `OcsfProfile`-configured generator the
+    /// `ioc` term must resolve the LOGICAL observable names to the promoted OCSF
+    /// physical columns (dotted → backtick-quoted), never the raw UDM column
+    /// names — those don't exist on `ocsf_logs`, so emitting them would 500.
+    /// Observables OCSF has no column for (`dvc_ip`, …) are silently skipped.
+    #[test]
+    fn ioc_term_resolves_ocsf_columns_under_ocsf_profile() {
+        use crate::schema::OcsfProfile;
+        use std::sync::Arc;
+        let query = parse_query("ioc=\"1.2.3.4\"").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .with_profile(Arc::new(OcsfProfile::new()))
+            .generate(&query, &time_range())
+            .unwrap();
+
+        assert!(
+            sql.contains("WHERE timestamp BETWEEN") && !sql.contains("PREWHERE"),
+            "single WHERE, no PREWHERE, got:\n{sql}"
+        );
+        // RAW ingest-lowercased OCSF ip columns as IN-lists (escape_identifier
+        // double-quotes dotted names).
+        assert!(
+            sql.contains("\"src_endpoint.ip\" IN ('1.2.3.4')"),
+            "src_ip must resolve to src_endpoint.ip, got:\n{sql}"
+        );
+        assert!(
+            sql.contains("\"dst_endpoint.ip\" IN ('1.2.3.4')"),
+            "dest_ip must resolve to dst_endpoint.ip, got:\n{sql}"
+        );
+        // lower() OCSF hash column as an IN-list.
+        assert!(
+            sql.contains("lower(\"file.hashes.sha256\") IN ('1.2.3.4')"),
+            "file_hash must resolve to file.hashes.sha256, got:\n{sql}"
+        );
+        // No bare UDM observable column leaks through.
+        assert!(!sql.contains("src_ip IN ('1.2.3.4')"), "raw UDM src_ip leaked, got:\n{sql}");
+        assert!(!sql.contains("lower(file_hash)"), "raw UDM file_hash leaked, got:\n{sql}");
+        // dvc_ip has no OCSF mapping → skipped.
+        assert!(!sql.contains("dvc_ip"), "dvc_ip should be skipped under OCSF, got:\n{sql}");
+    }
+
+    /// `ioc in [a, b]` emits ONE IN-list per observable column carrying every
+    /// value (not value×column equalities).
+    #[test]
+    fn ioc_in_list_expands_each_value() {
+        let query = parse_query("ioc in [\"evil.com\", \"bad.net\"]").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        // Both values in a single IN-list on each observable column.
+        assert!(
+            sql.contains("lower(url_domain) IN ('evil.com', 'bad.net')"),
+            "values must collapse into one IN-list per observable, got:\n{sql}"
+        );
+        assert!(
+            sql.contains("src_ip IN ('evil.com', 'bad.net')"),
+            "values must collapse into one IN-list per observable, got:\n{sql}"
+        );
+    }
+
+    /// `ioc in feed("arg")` resolves the indicator set via a
+    /// `custom_enrichment_results` IN-subquery (live IOC rows only).
+    #[test]
+    fn ioc_feed_term_emits_enrichment_subquery() {
+        let query = parse_query("ioc in threatfox(\"apt29\")").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("custom_enrichment_results")
+                && sql.contains("is_ioc = 1")
+                && sql.contains("expires_at > now()"),
+            "feed term must pull live IOCs from custom_enrichment_results, got:\n{sql}"
+        );
+        assert!(
+            sql.contains("has(tags, 'apt29')") || sql.contains("LIKE '%apt29%'"),
+            "feed arg must filter by tag or name, got:\n{sql}"
+        );
+        // Subquery wired into the observable columns via IN (…).
+        assert!(
+            sql.contains("src_ip IN (") && sql.contains("lower(file_hash) IN ("),
+            "feed indicators must match each observable column via IN, got:\n{sql}"
+        );
     }
 }
 

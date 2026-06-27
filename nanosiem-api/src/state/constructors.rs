@@ -14,7 +14,7 @@ use nanosiem_core::detection::{
 use nanosiem_core::enrichment::{EnrichmentRepository, EnrichmentService};
 use nanosiem_core::identity::{IdentityRepository, IdentitySyncService};
 use nanosiem_core::inputlookup::{InputLookupConfig, InputLookupService};
-use nanosiem_core::lookup::{LookupRepository, LookupService};
+use nanosiem_core::lookup::LookupService;
 #[cfg(feature = "enterprise")]
 use nanosiem_enterprise::melod::{
     AgentConfigRegistry, MelodJobRepository, MelodService, MelodSessionRepository,
@@ -71,9 +71,20 @@ impl AppState {
             nanosiem_core::enrichment::EnrichmentLaneClient::from_env(),
         ));
 
-        // Create lookup service for search enrichment (uses PostgreSQL)
-        let lookup_repo = LookupRepository::new(pg_pool.clone());
-        let lookup_service = LookupService::new(lookup_repo);
+        // Create lookup service for search enrichment. NAN-1581: lookup row data
+        // lives in ClickHouse by default (LOOKUP_STORAGE_BACKEND, default
+        // clickhouse); the registry always stays in Postgres. The backfill
+        // migrates existing PG rows on cutover; `postgres` is rollback-only.
+        let lookup_service = LookupService::with_backend(
+            nanosiem_core::lookup::LookupStorageBackend::from_env(),
+            pg_pool.clone(),
+            dual_pool.clickhouse().clone(),
+        );
+        // NAN-1581: the lookup MANAGEMENT handlers (create/upload/rows) must use
+        // this same flag-aware instance so LOOKUP_STORAGE_BACKEND applies. Clone
+        // it now (cheap — Arc inside) for AppState before `lookup_service` is
+        // moved into `search_service` below.
+        let lookup_service_for_state = lookup_service.clone();
 
         // Create prevalence service for search enrichment (uses ClickHouse)
         let prevalence_service =
@@ -134,8 +145,11 @@ impl AppState {
         let audit_emitter = Arc::new(AuditEmitter::new(dual_pool.clone()));
         let audit_query_service = AuditQueryService::new(dual_pool.clone());
 
-        // Create inputlookup service for URL-based enrichment
-        let inputlookup_service = InputLookupService::new(InputLookupConfig::default());
+        // Create inputlookup service for URL-based enrichment. The internal
+        // lookup layer is wired so `| inputlookup <internal_table>` reads the
+        // CH/PG-backed lookup table directly (NAN-1581 Phase 5).
+        let inputlookup_service = InputLookupService::new(InputLookupConfig::default())
+            .with_lookup_service(Arc::new(lookup_service.clone()));
 
         // Create search service and add inputlookup. The active schema profile
         // (UDM default | OCSF, from NANO_SCHEMA_PROFILE) selects the FROM logs
@@ -304,6 +318,9 @@ impl AppState {
             // Services using DualPool for ClickHouse log queries
             search_service,
             detection_service,
+            // NAN-1581: flag-aware lookup service shared with the management
+            // handlers so create/upload/row ops follow LOOKUP_STORAGE_BACKEND.
+            lookup_service: lookup_service_for_state,
             realtime_evaluator: Arc::new(realtime_evaluator),
             feed_service: FeedService::with_dual_pool(&dual_pool),
 

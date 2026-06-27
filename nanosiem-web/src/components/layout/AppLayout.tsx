@@ -50,6 +50,7 @@ import {
   NavShield,
   NavList,
   NavChart,
+  NavActivity,
   NavBars,
   NavInfo,
   NavSquares,
@@ -226,7 +227,7 @@ const navigation: NavItem[] = [
   // console at /observability (Services · Traces · Metrics · Alerts · SLOs).
   // Collapsed the NAN-1534 expandable Traces/Metrics group. Gated on search:view
   // (same as Search) — observability rides the search service.
-  { name: 'Observability', href: '/observability', icon: NavChart, permissions: 'search:view' },
+  { name: 'Observability', href: '/observability', icon: NavActivity, permissions: 'search:view' },
 ];
 
 // Cases is an expandable group (per design-ref/shadcn/playbook-new-app.jsx)

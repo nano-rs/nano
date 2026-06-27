@@ -601,6 +601,10 @@ export function Search() {
   // Detect tree visualization mode - hide fields panel when in tree mode
   const isTreeView = searchResults.length > 0 && searchResults[0]?.fields?._display_type === 'tree';
 
+  // Detect retro (IOC retrohunt) page view - fields panel stays eligible but
+  // defaults to collapsed (restore-pill UX), like aggregate queries
+  const isRetroView = searchResults.length > 0 && searchResults[0]?.fields?._display_type === 'retro';
+
   // Track previous query for breadcrumb navigation (before tree view)
   const [previousQuery, setPreviousQuery] = useState<string | null>(null);
   const previousQueryRef = useRef<string | null>(null);
@@ -621,6 +625,15 @@ export function Search() {
 
     previousQueryRef.current = query;
   }, [query]);
+
+  // Retro results default the fields panel to collapsed (restore-pill UX).
+  // The display type only surfaces once results arrive, so collapse here —
+  // but respect a manual user toggle so expanding sticks.
+  useEffect(() => {
+    if (isRetroView && !userToggledFieldsPanel.current) {
+      setFieldsPanelExpanded(false);
+    }
+  }, [isRetroView]);
 
   // Helper function to convert errors to ApiError format
   const handleError = (err: unknown, fallbackMessage: string): ApiError => {
@@ -4087,7 +4100,7 @@ export function Search() {
             or don't benefit from a histogram (lateral DAG has no per-bucket
             event density to show; cloud overview/dossier ship their own
             activity timeline). */}
-        {!isTreeView && displayType !== 'timechart' && displayType !== 'ranked_bar' && displayType !== 'flow' && displayType !== 'asset' && displayType !== 'cloud' && displayType !== 'lateral' && displayType !== 'services' && displayType !== 'service' && displayType !== 'trace' && displayType !== 'metric' && (
+        {!isTreeView && displayType !== 'timechart' && displayType !== 'ranked_bar' && displayType !== 'flow' && displayType !== 'asset' && displayType !== 'cloud' && displayType !== 'lateral' && displayType !== 'services' && displayType !== 'service' && displayType !== 'trace' && displayType !== 'metric' && displayType !== 'retro' && (
         <TimelineVisualization
           timelineData={timelineData}
           eventCount={histogramEventCount}
@@ -4137,7 +4150,7 @@ export function Search() {
             Results header via SearchResults' fieldsCollapsed prop. */}
 
         {/* Mobile Fields button - always visible on mobile when field data available */}
-        {isMobile && fieldsPanelVisible && !isTreeView && displayType !== 'timechart' && displayType !== 'ranked_bar' && displayType !== 'flow' && displayType !== 'cloud' && displayType !== 'lateral' && displayType !== 'services' && displayType !== 'service' && displayType !== 'trace' && displayType !== 'metric' && (
+        {isMobile && fieldsPanelVisible && !isTreeView && displayType !== 'timechart' && displayType !== 'ranked_bar' && displayType !== 'flow' && displayType !== 'cloud' && displayType !== 'lateral' && displayType !== 'services' && displayType !== 'service' && displayType !== 'trace' && displayType !== 'metric' && displayType !== 'retro' && (
           <div className="animate-in fade-in slide-in-from-top-1 duration-300 px-4 py-3">
             <button
               onClick={() => setMobileFieldsOpen(true)}
@@ -4236,6 +4249,12 @@ export function Search() {
                     onSetQuery={(newQuery) => {
                       setQuery(newQuery);
                       handleSearch(1, false, newQuery, queryMode, timeRange);
+                    }}
+                    onSetQueryWithTime={(q, startIso, endIso) => {
+                      const tr = { type: 'custom' as const, start: new Date(startIso), end: new Date(endIso) };
+                      setQuery(q);
+                      setTimeRange(tr);
+                      handleSearch(1, false, q, queryMode, tr);
                     }}
                     onLoadMore={loadMore}
                     onDrilldown={handleDrilldown}

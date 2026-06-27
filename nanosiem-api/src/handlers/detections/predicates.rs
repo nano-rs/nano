@@ -265,6 +265,20 @@ fn walk_search_expr(
             negated,
             connector: connector.map(String::from),
         }),
+        // NAN-1580: IOC observable-anywhere term — summarized as an `ioc`
+        // pseudo-field matching the literal value set (or the feed source).
+        SearchExpr::IocMatch { values, feed, lookup } => out.push(Predicate {
+            kind: PredicateKind::InList,
+            field: Some("ioc".to_string()),
+            operator: Some("MATCHES".to_string()),
+            value: feed
+                .as_ref()
+                .map(|f| format!("{}(\"{}\")", f.name, f.arg))
+                .or_else(|| lookup.as_ref().map(|l| format!("lookup(\"{}\")", l.table))),
+            values: values.iter().map(format_value).collect(),
+            negated,
+            connector: connector.map(String::from),
+        }),
     }
 }
 

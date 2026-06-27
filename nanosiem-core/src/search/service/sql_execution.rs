@@ -126,6 +126,28 @@ impl SearchService {
             query_for_sql
         };
 
+        // Strip a TERMINAL `| retro` page directive: it short-circuits to a
+        // prevalence-weighted hunt-summary page view in the search service and
+        // has no single SQL, so codegen rejects it (NAN-1580). Explaining the
+        // base query shows the underlying observable scan instead of a 400. A
+        // MID-pipeline `retro` is not stripped (the terminal command differs),
+        // so it still correctly surfaces the "must be last" rejection.
+        let retro_page = matches!(
+            &query_for_sql,
+            Query::Piped {
+                command: Command::Retro { .. },
+                ..
+            }
+        );
+        let query_for_sql = if retro_page {
+            match query_for_sql {
+                Query::Piped { source, .. } => *source,
+                other => other,
+            }
+        } else {
+            query_for_sql
+        };
+
         // Generate SQL based on backend
         let tr = TimeRange::new(time_range.start, time_range.end);
         let options = crate::query::QueryOptions {
@@ -159,6 +181,11 @@ impl SearchService {
         // Add a note about AI commands if any were stripped
         if has_ai {
             sql.push_str("\n\n-- Note: | ai command will enrich results with LLM classification in post-processing");
+        }
+
+        // Note the stripped retro page directive.
+        if retro_page {
+            sql.push_str("\n\n-- Note: `| retro` renders a prevalence-weighted hunt summary (page view); the SQL above is the underlying observable scan it sweeps.");
         }
 
         // Disclose the implicit auto-sort so the explained SQL is self-documenting.

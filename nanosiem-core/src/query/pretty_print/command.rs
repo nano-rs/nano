@@ -663,6 +663,11 @@ impl PrettyPrint for Command {
                 Some(svc) => format!("metric {} service={}", name, svc),
                 None => format!("metric {}", name),
             },
+            // NAN-1580: bare `retro` or `retro by <axis>`.
+            Command::Retro { axis } => match axis {
+                RetroAxis::Indicator => "retro".to_string(),
+                other => format!("retro by {}", other.as_str()),
+            },
         }
     }
 }

@@ -70,6 +70,10 @@ pub struct AppState {
     pub dual_pool: DualPool,
     /// Search service
     pub search_service: SearchService,
+    /// Flag-aware lookup service (NAN-1581). Shared with the lookup MANAGEMENT
+    /// handlers so create/upload/row ops honor LOOKUP_STORAGE_BACKEND (registry
+    /// ops always stay in Postgres; row ops follow the backend).
+    pub lookup_service: nanosiem_core::lookup::LookupService,
     /// Detection service
     pub detection_service: DetectionService,
     /// Detection scheduler (legacy, kept for trigger_rule API)

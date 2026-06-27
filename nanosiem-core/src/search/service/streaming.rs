@@ -106,14 +106,9 @@ impl SearchService {
         let funnel_command = extract_funnel_command(&query);
 
         // Command-page directives (NAN-1560) short-circuit to a synthetic marker
-        // in core_search — force them onto the non-streaming path.
-        let is_command_page = matches!(
-            determine_display_type(&query),
-            crate::search::types::DisplayType::Services
-                | crate::search::types::DisplayType::Service
-                | crate::search::types::DisplayType::Trace
-                | crate::search::types::DisplayType::Metric
-        );
+        // in core_search — force them onto the non-streaming (buffered) path.
+        // Single source of truth so a new marker page can't fall through here.
+        let is_command_page = is_command_page_marker(determine_display_type(&query));
 
         let streamable = is_query_streamable(
             &query,

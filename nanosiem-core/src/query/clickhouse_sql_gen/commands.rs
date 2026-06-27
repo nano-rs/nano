@@ -1137,7 +1137,13 @@ impl ClickHouseSqlGenerator {
             Command::Services
             | Command::Service { .. }
             | Command::Trace { .. }
-            | Command::Metric { .. } => {
+            | Command::Metric { .. }
+            // NAN-1580 STAGE2: `retro` is a terminal page directive like the
+            // command-page set — it short-circuits in the search service (the
+            // /api/search marker carries the parsed retro request) and never
+            // reaches real codegen. Reaching this arm means it appeared
+            // mid-pipeline, which is rejected the same way.
+            | Command::Retro { .. } => {
                 // Command-page directives are PAGE directives, not data
                 // transforms. As the terminal command they short-circuit in the
                 // search service (NAN-1560) and never reach codegen. Reaching
@@ -1151,6 +1157,7 @@ impl ClickHouseSqlGenerator {
                     Command::Service { .. } => "service",
                     Command::Trace { .. } => "trace",
                     Command::Metric { .. } => "metric",
+                    Command::Retro { .. } => "retro",
                     _ => "command-page",
                 };
                 Err(SqlGenError::InvalidQuery(format!(

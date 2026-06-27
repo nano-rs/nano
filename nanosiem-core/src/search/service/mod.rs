@@ -77,12 +77,14 @@ mod funnel_view;
 /// drill-in (`get_field_values`) stays exact and unbounded.
 pub(crate) const FIELD_STATS_ROW_CAP: usize = 100_000;
 mod histogram;
+mod ioc_lookup_resolve;
 mod lateral;
 mod metrics_routing;
 mod lateral_graph;
 mod otel;
 mod prevalence_join;
 mod prevalence_processing;
+mod retro;
 mod sql_execution;
 mod streaming;
 mod tree_view;
@@ -112,6 +114,7 @@ fn determine_display_type(query: &Query) -> DisplayType {
         Some(Command::Service { .. }) => DisplayType::Service,
         Some(Command::Trace { .. }) => DisplayType::Trace,
         Some(Command::Metric { .. }) => DisplayType::Metric,
+        Some(Command::Retro { .. }) => DisplayType::Retro,
         Some(Command::Stats { .. })
         | Some(Command::Chart { .. })
         | Some(Command::EventStats { .. })
@@ -168,6 +171,27 @@ fn display_type_renders_timeline(display_type: DisplayType) -> bool {
     matches!(
         display_type,
         DisplayType::Events | DisplayType::Table | DisplayType::Transaction
+    )
+}
+
+/// Page directives that emit a synthetic single-row marker (no ClickHouse scan)
+/// and let the frontend fetch detail from a companion endpoint. This is the ONE
+/// list — referenced by both the `core_search` short-circuit (which builds the
+/// marker) and the streaming router (which keeps these off the incremental-row
+/// path). Add a new marker page here only.
+///
+/// NAN-1580: `retro` originally slipped through the streaming path because these
+/// two sites hand-rolled this list independently and only one was updated.
+/// (Asset/cloud/lateral/tree are deliberately NOT here — they render richer
+/// dossier fast-paths, detected via their own `extract_*_command` flags.)
+pub(super) fn is_command_page_marker(display_type: DisplayType) -> bool {
+    matches!(
+        display_type,
+        DisplayType::Services
+            | DisplayType::Service
+            | DisplayType::Trace
+            | DisplayType::Metric
+            | DisplayType::Retro
     )
 }
 

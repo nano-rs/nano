@@ -18,7 +18,7 @@ use nanosiem_core::auth::permissions;
 use nanosiem_core::upload::{LookupMode, ParserConfig, UploadDestination};
 use nanosiem_core::{
     calculate_next_runs, describe_cron, merge_auth_headers, redact_auth_headers, validate_cron,
-    JobExecution, LookupRepository, LookupService, NewScheduledJob, ScheduledJob, SchedulerError,
+    JobExecution, NewScheduledJob, ScheduledJob, SchedulerError,
     SchedulerService, SsrfConfig, SsrfError, SsrfValidator, UpdateScheduledJob,
 };
 
@@ -144,8 +144,7 @@ pub async fn upsert_lookup_ingestion(
     let scheduler_service = SchedulerService::new(state.pool.clone());
 
     // Look up the table's primary_key from the registry so the destination is accurate
-    let lookup_repo = LookupRepository::new(state.pool.clone());
-    let lookup_service = LookupService::new(lookup_repo);
+    let lookup_service = state.lookup_service.clone();
     let table_info = lookup_service
         .get_table(&name)
         .await

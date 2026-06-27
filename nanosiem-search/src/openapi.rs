@@ -131,6 +131,7 @@ mod tests {
             "/api/search/prevalence-artifacts",
             "/api/search/field-stats",
             "/api/search/field-values",
+            "/api/search/retro",
             "/api/search/saved",
             "/api/search/saved/shared",
             "/api/search/saved/mine",

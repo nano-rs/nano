@@ -14,6 +14,7 @@ mod cloud_overview;
 mod health;
 pub(crate) mod identity;
 mod otel;
+mod retro;
 mod saved_searches;
 mod search;
 mod search_jobs;
@@ -42,6 +43,7 @@ pub use otel::{
     get_metric_timeseries, get_rum_summary, get_service_detail, get_trace, list_infra_hosts,
     list_metric_names, list_metric_tags, list_services, list_traces,
 };
+pub use retro::retro;
 pub use saved_searches::{
     create_saved_search, delete_saved_search, get_saved_search, list_my_saved_searches,
     list_saved_searches, list_shared_searches, share_saved_search, update_saved_search,
@@ -114,6 +116,7 @@ pub enum SearchResultResponse {
         saved_searches::share_saved_search,
         health::health,
         health::ready,
+        retro::retro,
         assets::get_asset_events,
         assets::get_cloud_events,
         assets::get_cloud_user_timeline,
@@ -153,6 +156,13 @@ pub enum SearchResultResponse {
         FieldStatsResponse,
         HealthResponse,
         ReadyResponse,
+        nanosiem_core::search::RetroRequest,
+        nanosiem_core::search::RetroResponse,
+        nanosiem_core::search::RetroIndicatorSummary,
+        nanosiem_core::search::RetroListRow,
+        nanosiem_core::search::RetroPivotRow,
+        nanosiem_core::search::RetroTopEntity,
+        nanosiem_core::search::RetroVerdict,
         AssetEventsRequest,
         AssetEventsResponse,
         CloudEventsRequest,

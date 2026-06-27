@@ -11,7 +11,7 @@
 //!   `TimeRange`/`SqlGenError` types)
 
 mod ast;
-mod clickhouse_sql_gen;
+pub(crate) mod clickhouse_sql_gen;
 mod parser;
 mod pretty_print;
 mod sql_gen;

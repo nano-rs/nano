@@ -50,6 +50,83 @@ async fn main() -> Result<()> {
 
     tracing::info!("Running in dual-mode (ClickHouse + PostgreSQL)");
 
+    // === One-time PG→ClickHouse lookup row-data backfill (NAN-1581 Phase 2/3) ===
+    // Only when LOOKUP_STORAGE_BACKEND=clickhouse: migrate every existing
+    // Postgres `lookup_<name>` table's rows into the shared ClickHouse
+    // `lookup_rows` table BEFORE the service serves lookup reads from CH (lookup
+    // data has no upstream re-sync). Multi-pod-safe via a transactional claim in
+    // `lookup_backfill_state`; per-table done-markers make it resumable; re-runs
+    // are dedup-safe. The default (postgres) path skips this entirely.
+    if matches!(
+        nanosiem_core::lookup::LookupStorageBackend::from_env(),
+        nanosiem_core::lookup::LookupStorageBackend::ClickHouse
+    ) {
+        tracing::info!("LOOKUP_STORAGE_BACKEND=clickhouse — running lookup backfill check...");
+        match nanosiem_core::lookup::backfill_pg_to_clickhouse(
+            state.pool.clone(),
+            state.dual_pool.clickhouse().clone(),
+        )
+        .await
+        {
+            Ok(report) if report.ran => {
+                let mismatches = report.mismatches().len();
+                if mismatches > 0 {
+                    tracing::error!(
+                        "Lookup backfill completed with {} count mismatch(es); manual review required",
+                        mismatches
+                    );
+                } else {
+                    tracing::info!(
+                        "Lookup backfill complete: {} table(s) processed",
+                        report.tables.len()
+                    );
+                }
+            }
+            Ok(_) => {
+                // This pod did NOT win the claim. Another pod may still be copying
+                // the snapshot — if we boot straight into serving CH lookup reads
+                // now, we'd serve an incomplete table. Wait for the global claim to
+                // be released (backfill done) before proceeding to axum::serve.
+                // Bounded so a stuck claim can't hang the pod forever; if it
+                // elapses we fail readiness rather than serve stale data.
+                const BACKFILL_POLL_INTERVAL: std::time::Duration =
+                    std::time::Duration::from_secs(2);
+                const BACKFILL_WAIT_TIMEOUT: std::time::Duration =
+                    std::time::Duration::from_secs(300);
+
+                if nanosiem_core::lookup::is_backfill_in_progress(&state.pool).await {
+                    tracing::info!(
+                        "Lookup backfill owned by another pod — waiting up to {}s for completion before serving CH lookup reads...",
+                        BACKFILL_WAIT_TIMEOUT.as_secs()
+                    );
+                    let deadline = std::time::Instant::now() + BACKFILL_WAIT_TIMEOUT;
+                    loop {
+                        tokio::time::sleep(BACKFILL_POLL_INTERVAL).await;
+                        if !nanosiem_core::lookup::is_backfill_in_progress(&state.pool).await {
+                            tracing::info!(
+                                "Lookup backfill completed by owning pod; proceeding to serve."
+                            );
+                            break;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            return Err(anyhow::anyhow!(
+                                "Lookup backfill did not complete within {}s; refusing to serve stale ClickHouse lookup data",
+                                BACKFILL_WAIT_TIMEOUT.as_secs()
+                            ));
+                        }
+                        tracing::info!("Still waiting for lookup backfill to complete...");
+                    }
+                } else {
+                    tracing::info!("Lookup backfill already complete; proceeding.");
+                }
+            }
+            Err(e) => tracing::error!(
+                "Lookup backfill failed: {}. Lookup reads from ClickHouse may be incomplete.",
+                e
+            ),
+        }
+    }
+
     // Initialize meloD AI service if configured. The reload path lives in
     // the enterprise crate; open-core builds simply skip AI initialization.
     #[cfg(feature = "enterprise")]

@@ -83,6 +83,13 @@ export const NavChart = (p: IconProps) => (
   </Ic>
 );
 
+// Pulse / activity line — the observability glyph (distinct from NavChart's bar/line).
+export const NavActivity = (p: IconProps) => (
+  <Ic {...p}>
+    <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+  </Ic>
+);
+
 export const NavBars = (p: IconProps) => (
   <Ic {...p}>
     <path d="M4 20V10M10 20V4M16 20v-8M22 20h-20" />
