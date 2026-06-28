@@ -207,6 +207,64 @@ fn classify_indicator(value: &str) -> &'static str {
     "other"
 }
 
+/// LOGICAL UDM observable columns worth scanning for an indicator of the given
+/// coarse type (from [`classify_indicator`]).
+///
+/// The retro match OR-expands the indicator across the observable set. Scanning
+/// columns that can't hold the indicator's type is pure waste: for an IP the
+/// `lower(file_hash)`/`lower(url)`/… legs never match AND don't index-prune for
+/// an IP value, so they force column scans — measured 8.1s vs 2.0s (IP-only)
+/// over 24h on a 1.7B-row tenant, and retro runs the scan ~3x, blowing the 60s
+/// gateway timeout (NAN-1589). Restricting to the type's columns turns each
+/// scan back into a bloom-pruned read. An empty slice means "type unknown —
+/// keep the full observable set" (the caller's safe fallback).
+fn observable_logicals_for_type(indicator_type: &str) -> &'static [&'static str] {
+    match indicator_type {
+        "ip" => &["src_ip", "dest_ip", "dvc_ip"],
+        "hash" => &["file_hash", "process_hash"],
+        // a domain can surface as a URL host, an email party domain, or a DNS query
+        "domain" => &["url_domain", "sender_domain", "recipient_domain", "query"],
+        "url" => &["url"],
+        "cve" => &["cve"],
+        "user" => &["user_id", "sender", "recipient"],
+        _ => &[],
+    }
+}
+
+/// Restrict the resolved observable set to the columns relevant to the
+/// indicators' types (union across all indicators). Falls back to the FULL set
+/// when any indicator is of unknown type, when nothing is known, or when the
+/// filter would leave zero columns — a retro must never scan an empty predicate
+/// (that yields a false "0 hits"). For a single-IP summary this collapses ~17
+/// observable legs to 3 (NAN-1589).
+fn scope_observables(
+    all: &[ResolvedObservable],
+    indicators: &[String],
+) -> Vec<ResolvedObservable> {
+    let mut wanted: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for ind in indicators {
+        let logicals = observable_logicals_for_type(classify_indicator(ind));
+        if logicals.is_empty() {
+            // Unknown type → don't narrow; scan everything (current behavior).
+            return all.to_vec();
+        }
+        wanted.extend(logicals.iter().copied());
+    }
+    if wanted.is_empty() {
+        return all.to_vec();
+    }
+    let scoped: Vec<ResolvedObservable> = all
+        .iter()
+        .filter(|o| wanted.contains(o.logical))
+        .cloned()
+        .collect();
+    if scoped.is_empty() {
+        all.to_vec()
+    } else {
+        scoped
+    }
+}
+
 /// The canonical host expression used to count distinct hosts touched and to
 /// pivot by asset. First non-empty of the host/ip identity columns, RESOLVED to
 /// the active profile's physical columns (NAN-1580 OCSF-awareness): UDM →
@@ -503,8 +561,7 @@ impl SearchService {
             .cloned()
             .or_else(|| indicators.first().cloned())
             .unwrap_or_default();
-        let observables = self.retro_observables();
-        let predicate = Self::retro_match_predicate(&observables, indicators);
+        let observables = scope_observables(&self.retro_observables(), indicators);
         let logs_table = self
             .table_names
             .read(Self::logs_table_key(self.active_profile.as_ref()));
@@ -514,7 +571,6 @@ impl SearchService {
             &observables,
             &logs_table,
             &value,
-            &predicate,
             range,
         );
 
@@ -523,7 +579,7 @@ impl SearchService {
             self.retro_summary_agg(&sql).await?;
 
         let top_entities = self
-            .retro_top_entities(&predicate, range)
+            .retro_top_entities(&observables, &value, range)
             .await
             .unwrap_or_default();
 
@@ -601,10 +657,14 @@ impl SearchService {
         ))
     }
 
-    /// Top entities (hosts) for an indicator predicate, by hit count.
+    /// Top entities (hosts) for an indicator, by hit count. Uses the same
+    /// per-column UNION ALL as the summary (NAN-1589) so each leg is
+    /// index-pruned, then groups by host. `uniqExact(_rid)` gives exact per-host
+    /// hit counts (a row matching the indicator in two columns counts once).
     async fn retro_top_entities(
         &self,
-        predicate: &str,
+        observables: &[ResolvedObservable],
+        value: &str,
         range: &TimeRange,
     ) -> Result<Vec<RetroTopEntity>, SearchError> {
         let clickhouse = match &self.ch_client {
@@ -614,15 +674,11 @@ impl SearchService {
         let logs_table = self
             .table_names
             .read(Self::logs_table_key(self.active_profile.as_ref()));
+        let host = host_expr(self.active_profile.as_ref());
+        let union = union_match_legs(observables, &logs_table, value, range, &host);
         let sql = format!(
-            "SELECT {host} AS id, count() AS hits FROM {table} \
-             WHERE timestamp BETWEEN '{start}' AND '{end}' AND {pred} \
-             AND id != '' GROUP BY id ORDER BY hits DESC LIMIT 10",
-            host = host_expr(self.active_profile.as_ref()),
-            table = logs_table,
-            start = range.start.format("%Y-%m-%d %H:%M:%S"),
-            end = range.end.format("%Y-%m-%d %H:%M:%S"),
-            pred = predicate,
+            "SELECT _host AS id, uniqExact(_rid) AS hits FROM ({union}) \
+             WHERE _host != '' GROUP BY _host ORDER BY hits DESC LIMIT 10",
         );
         match clickhouse.query(&sql).fetch_all::<(String, u64)>().await {
             Ok(rows) => Ok(rows
@@ -694,7 +750,7 @@ impl SearchService {
             .table_names
             .read(Self::logs_table_key(self.active_profile.as_ref()));
 
-        let observables = self.retro_observables();
+        let observables = scope_observables(&self.retro_observables(), indicators);
         let predicate = Self::retro_match_predicate(&observables, indicators);
         // The campaign rollup GROUPs by indicator value, so the FULL result is
         // bounded by indicators.len() (<= RETRO_MAX_INDICATORS) — small. Fetch
@@ -787,7 +843,7 @@ impl SearchService {
         let logs_table = self
             .table_names
             .read(Self::logs_table_key(self.active_profile.as_ref()));
-        let observables = self.retro_observables();
+        let observables = scope_observables(&self.retro_observables(), indicators);
         let predicate = Self::retro_match_predicate(&observables, indicators);
 
         let sql = build_pivot_sql(
@@ -895,54 +951,89 @@ fn observable_value_exprs(observables: &[ResolvedObservable]) -> Vec<String> {
         .collect()
 }
 
-/// Summary submode SQL (NAN-1580): single-scan environment footprint for one
-/// indicator. Single WHERE (`timestamp BETWEEN … AND <ioc match>`), no PREWHERE.
-/// Per-observable match counts surfaced as a fixed-shape `Array((field, count))`,
-/// where `field` is the stable LOGICAL UDM observable name (so the UI shows a
-/// consistent label regardless of profile) and the count is over the
-/// profile-resolved physical column. `observables` is the active profile's
-/// resolved observable set.
+/// Summary submode SQL: environment footprint for one indicator.
+///
+/// PER-COLUMN UNION ALL, not a single OR. ClickHouse does NOT combine *different
+/// columns'* skip indexes across an `OR` — `src_ip='v' OR dest_ip='v' OR ...`
+/// degrades to a near-full scan (measured 8.7s @7d / 20.8s @30d on Saturn, vs
+/// each column alone pruning to <3% of granules). A `UNION ALL` of single-column
+/// equality legs lets each leg use its own bloom (1.6s @7d / 2.7s @30d) —
+/// NAN-1589. Each leg projects the row `id`, timestamp, the resolved host
+/// expression, and a literal `_mf` = the LOGICAL observable name (stable UI
+/// label across profiles). The outer aggregate dedups with `uniqExact(id)` so a
+/// row carrying the indicator in two columns counts as ONE hit (exact parity
+/// with the old `count()` over the OR); `_mf` field-counts intentionally count
+/// per matching field. No PREWHERE — each leg's single WHERE lets
+/// `optimize_move_to_prewhere` place the bound.
 fn build_summary_sql(
     profile: &dyn SchemaProfile,
     observables: &[ResolvedObservable],
     table: &str,
     value: &str,
-    predicate: &str,
     range: &TimeRange,
 ) -> String {
-    let escaped_val = escape_sql_string(&value.to_lowercase());
+    let host = host_expr(profile);
+    let union = union_match_legs(observables, table, value, range, &host);
     let count_tuples: Vec<String> = observables
         .iter()
-        .map(|obs| {
-            let leg = if obs.raw {
-                format!("countIf({} = '{escaped_val}')", obs.col_sql)
-            } else {
-                format!("countIf(lower({}) = '{escaped_val}')", obs.col_sql)
-            };
-            // Attribute to the LOGICAL UDM observable name (stable UI label).
-            format!("('{}', {leg})", obs.logical)
-        })
+        .map(|obs| format!("('{l}', toUInt64(countIf(_mf = '{l}')))", l = obs.logical))
         .collect();
-    // A degenerate profile with no resolvable observable would emit an empty
-    // `[]` array literal (CH can't infer its type); fall back to a typed empty.
     let counts = if count_tuples.is_empty() {
         "CAST([], 'Array(Tuple(String, UInt64))')".to_string()
     } else {
         format!("[{}]", count_tuples.join(", "))
     };
     format!(
-        "SELECT count() AS hits, \
-         uniqExact({host}) AS distinct_hosts, \
-         formatDateTime(min(timestamp), '%Y-%m-%dT%H:%i:%sZ') AS first_seen, \
-         formatDateTime(max(timestamp), '%Y-%m-%dT%H:%i:%sZ') AS last_seen, \
+        "SELECT uniqExact(_rid) AS hits, \
+         uniqExact(_host) AS distinct_hosts, \
+         formatDateTime(min(_ts), '%Y-%m-%dT%H:%i:%sZ') AS first_seen, \
+         formatDateTime(max(_ts), '%Y-%m-%dT%H:%i:%sZ') AS last_seen, \
          {counts} AS field_counts \
-         FROM {table} \
-         WHERE timestamp BETWEEN '{start}' AND '{end}' AND {pred}",
-        host = host_expr(profile),
-        start = ts(&range.start),
-        end = ts(&range.end),
-        pred = predicate,
+         FROM ({union})",
     )
+}
+
+/// Build the per-observable `UNION ALL` body that the summary + top-entities
+/// scans share. Each leg: `SELECT id AS _rid, timestamp AS _ts, <host> AS _host,
+/// '<logical>' AS _mf FROM <table> WHERE timestamp BETWEEN … AND <col>=<v>`. The
+/// single-column equality per leg is what makes each leg index-prunable
+/// (NAN-1589). `value` is lowercased to match ingest-lowercased raw columns and
+/// the `lower()` expression indexes. When no observable resolves (degenerate
+/// profile / empty scope), emits a typed zero-row leg so the outer aggregate
+/// returns hits=0 instead of an invalid empty UNION.
+fn union_match_legs(
+    observables: &[ResolvedObservable],
+    table: &str,
+    value: &str,
+    range: &TimeRange,
+    host: &str,
+) -> String {
+    let escaped_val = escape_sql_string(&value.to_lowercase());
+    let start = ts(&range.start);
+    let end = ts(&range.end);
+    let legs: Vec<String> = observables
+        .iter()
+        .map(|obs| {
+            let cmp = if obs.raw {
+                format!("{} = '{escaped_val}'", obs.col_sql)
+            } else {
+                format!("lower({}) = '{escaped_val}'", obs.col_sql)
+            };
+            format!(
+                "SELECT id AS _rid, timestamp AS _ts, {host} AS _host, '{l}' AS _mf \
+                 FROM {table} WHERE timestamp BETWEEN '{start}' AND '{end}' AND {cmp}",
+                l = obs.logical,
+            )
+        })
+        .collect();
+    if legs.is_empty() {
+        format!(
+            "SELECT generateUUIDv7() AS _rid, now() AS _ts, '' AS _host, '' AS _mf \
+             FROM {table} WHERE 1 = 0"
+        )
+    } else {
+        legs.join(" UNION ALL ")
+    }
 }
 
 /// List submode SQL (NAN-1580): rarest-first per-indicator rollup. An
@@ -1274,40 +1365,49 @@ mod tests {
     }
 
     #[test]
-    fn summary_sql_is_single_where_no_prewhere() {
+    fn summary_sql_is_per_column_union_no_prewhere() {
+        // NAN-1589: the summary is a per-column UNION ALL (each leg index-prunable),
+        // not a single OR (which can't combine skip indexes across columns).
         let obs = udm_obs();
-        let pred = SearchService::retro_match_predicate(&obs, &["1.2.3.4".to_string()]);
-        let sql = build_summary_sql(&udm(), &obs, "logs", "1.2.3.4", &pred, &range());
+        let sql = build_summary_sql(&udm(), &obs, "logs", "1.2.3.4", &range());
+        assert!(sql.contains("UNION ALL"), "must be a per-column union: {sql}");
         assert!(sql.contains("WHERE timestamp BETWEEN"));
         assert!(!sql.contains("PREWHERE"));
-        assert!(sql.contains("count() AS hits"));
-        assert!(sql.contains("uniqExact("));
-        assert!(sql.contains("min(timestamp)") && sql.contains("max(timestamp)"));
-        // Per-field counts surfaced as a fixed-shape array.
+        // exact hits via row-id dedup (parity with the old count() over the OR).
+        assert!(sql.contains("uniqExact(_rid) AS hits"), "got: {sql}");
+        assert!(sql.contains("uniqExact(_host) AS distinct_hosts"));
+        assert!(sql.contains("min(_ts)") && sql.contains("max(_ts)"));
         assert!(sql.contains("AS field_counts"));
-        assert!(sql.contains("countIf(src_ip = '1.2.3.4')"));
-        assert!(sql.contains("countIf(lower(file_hash) = '1.2.3.4')"));
+        // one single-column equality leg per observable...
+        assert!(sql.contains("AND src_ip = '1.2.3.4'"), "got: {sql}");
+        assert!(sql.contains("AND lower(file_hash) = '1.2.3.4'"), "got: {sql}");
+        // ...NOT a single OR-ed predicate.
+        assert!(!sql.contains(" OR "), "summary must not OR the columns: {sql}");
+        // field counts attributed by the LOGICAL observable name via _mf.
+        assert!(sql.contains("countIf(_mf = 'src_ip')"), "got: {sql}");
+        assert!(sql.contains("countIf(_mf = 'file_hash')"), "got: {sql}");
     }
 
     #[test]
     fn summary_sql_resolves_ocsf_columns_keeps_logical_labels() {
-        // NAN-1580: counts target the OCSF physical columns, but the per-field
-        // attribution tuple key stays the LOGICAL UDM name (stable UI label).
+        // NAN-1580/1589: each UNION leg matches the resolved OCSF physical column,
+        // but the _mf field-count label stays the LOGICAL UDM name (stable UI label).
         let obs = ocsf_obs();
-        let pred = SearchService::retro_match_predicate(&obs, &["1.2.3.4".to_string()]);
-        let sql = build_summary_sql(&ocsf(), &obs, "ocsf_logs", "1.2.3.4", &pred, &range());
-        // Count over the resolved OCSF column...
+        let sql = build_summary_sql(&ocsf(), &obs, "ocsf_logs", "1.2.3.4", &range());
+        assert!(sql.contains("UNION ALL"), "got: {sql}");
+        // leg matches the resolved OCSF column...
         assert!(
-            sql.contains("countIf(\"src_endpoint.ip\" = '1.2.3.4')"),
+            sql.contains("AND \"src_endpoint.ip\" = '1.2.3.4'"),
             "got: {sql}"
         );
         assert!(
-            sql.contains("countIf(lower(\"file.hashes.sha256\") = '1.2.3.4')"),
+            sql.contains("AND lower(\"file.hashes.sha256\") = '1.2.3.4'"),
             "got: {sql}"
         );
         // ...labelled by the LOGICAL observable name for the UI.
-        assert!(sql.contains("('src_ip', countIf("), "got: {sql}");
-        assert!(sql.contains("('file_hash', countIf("), "got: {sql}");
+        assert!(sql.contains("'src_ip' AS _mf"), "got: {sql}");
+        assert!(sql.contains("'file_hash' AS _mf"), "got: {sql}");
+        assert!(sql.contains("countIf(_mf = 'src_ip')"), "got: {sql}");
         // host_expr resolved to OCSF identity columns.
         assert!(sql.contains("\"src_endpoint.ip\"") && !sql.contains("nullIf(src_ip"));
     }
@@ -1418,5 +1518,45 @@ mod tests {
         assert_eq!(classify_indicator("CVE-2024-1234"), "cve");
         assert_eq!(classify_indicator("user@corp.test"), "user");
         assert_eq!(classify_indicator("evil.test"), "domain");
+    }
+
+    #[test]
+    fn scope_observables_narrows_to_indicator_type() {
+        let all = udm_obs();
+        // An IP collapses to exactly the 3 raw IP columns — no lower(text) legs.
+        let ip = scope_observables(&all, &["37.27.197.191".to_string()]);
+        let cols: std::collections::HashSet<&str> = ip.iter().map(|o| o.logical).collect();
+        assert_eq!(
+            cols,
+            ["src_ip", "dest_ip", "dvc_ip"].into_iter().collect()
+        );
+        assert!(ip.len() < all.len(), "IP scope must drop the irrelevant legs");
+
+        // A hash collapses to the hash columns.
+        let hash = scope_observables(&all, &["44d88612fea8a8f36de82e1278abb02f".to_string()]);
+        let hcols: std::collections::HashSet<&str> = hash.iter().map(|o| o.logical).collect();
+        assert_eq!(hcols, ["file_hash", "process_hash"].into_iter().collect());
+
+        // The scoped predicate for an IP must NOT contain any text-column leg.
+        let pred = SearchService::retro_match_predicate(&ip, &["37.27.197.191".to_string()]);
+        assert!(pred.contains("src_ip = '37.27.197.191'"));
+        assert!(!pred.contains("file_hash"), "got: {pred}");
+        assert!(!pred.contains("lower("), "IP scope must emit no lower() legs: {pred}");
+    }
+
+    #[test]
+    fn scope_observables_falls_back_to_all_for_unknown_or_mixed() {
+        let all = udm_obs();
+        // Unknown type ("other") → keep the full set (never narrow to nothing).
+        let unknown = scope_observables(&all, &["some random thing".to_string()]);
+        assert_eq!(unknown.len(), all.len());
+        // A mix that includes an unknown also falls back to all.
+        let mixed = scope_observables(
+            &all,
+            &["37.27.197.191".to_string(), "some random thing".to_string()],
+        );
+        assert_eq!(mixed.len(), all.len());
+        // Empty indicator set → full set (defensive; never an empty predicate).
+        assert_eq!(scope_observables(&all, &[]).len(), all.len());
     }
 }
