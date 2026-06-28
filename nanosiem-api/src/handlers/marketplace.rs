@@ -14,7 +14,9 @@ use axum::{
 // lifted custom_enrichment to the enterprise crate. Catalog list / install /
 // uninstall / repo sync paths stay open since they only touch PG.
 #[cfg(feature = "enterprise")]
-use nanosiem_enterprise::custom_enrichment::{execute_agent_enrichment, SandboxExecutor};
+use nanosiem_enterprise::custom_enrichment::{
+    execute_agent_enrichment, execute_data_enrichment, SandboxExecutor,
+};
 use nanosiem_core::audit::{
     AuditEvent, AuditSource, ClientContext, MARKETPLACE_CONFIGURED, MARKETPLACE_INSTALLED,
     MARKETPLACE_REPO_CREATED, MARKETPLACE_REPO_SYNCED, MARKETPLACE_REPO_UPDATED,
@@ -964,20 +966,45 @@ pub async fn preview_enrichment(
 
     // 4. Invoke the sandbox. 5s timeout — preview is interactive, not the
     // 30s+ that the real enrichment scheduler tolerates.
+    //
+    // Data (bulk feed) and agent (on-demand lookup) enrichments have different
+    // entrypoints: data scripts export `enrich(context)`, agent scripts export
+    // `enrich(artifact, type, creds)`. The Deno wrapper picks the branch by
+    // whether `NANOSIEM_ARTIFACT` is set, so we MUST call the matching executor
+    // for the entry's functional type. Always running the agent executor fed the
+    // artifact string into a data feed's `context` param, so `context.credentials`
+    // was undefined and preview crashed with "reading 'API_KEY'" (NAN-1585).
     const PREVIEW_TIMEOUT_SECS: u64 = 5;
     let executor = SandboxExecutor::new();
     let started = std::time::Instant::now();
-    let result = execute_agent_enrichment(
-        &executor,
-        code,
-        credentials,
-        entry.allowed_domains.clone(),
-        &artifact,
-        &artifact_type,
-        None,
-        PREVIEW_TIMEOUT_SECS,
-    )
-    .await;
+    let result = if nanosiem_core::marketplace::infer_enrichment_type(&entry.category, &entry.config.0)
+        == "data"
+    {
+        // Bulk feed: pass a watermark so the script fetches the incremental
+        // (not full-backfill) window, keeping interactive preview light.
+        execute_data_enrichment(
+            &executor,
+            code,
+            credentials,
+            entry.allowed_domains.clone(),
+            Some(chrono::Utc::now().to_rfc3339()),
+            None,
+            PREVIEW_TIMEOUT_SECS,
+        )
+        .await
+    } else {
+        execute_agent_enrichment(
+            &executor,
+            code,
+            credentials,
+            entry.allowed_domains.clone(),
+            &artifact,
+            &artifact_type,
+            None,
+            PREVIEW_TIMEOUT_SECS,
+        )
+        .await
+    };
 
     Ok(Json(match result {
         Ok(r) => PreviewResponse {

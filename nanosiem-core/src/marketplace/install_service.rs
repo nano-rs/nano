@@ -398,11 +398,10 @@ impl MarketplaceInstallService {
         let code = entry.code.as_deref().unwrap_or("");
         let config = request.config.as_ref().unwrap_or(&entry.config.0);
 
-        // Determine enrichment type from category
-        let enrichment_type = match entry.category.as_str() {
-            "data" => "data",
-            _ => "agent",
-        };
+        // Determine the functional enrichment type from category + config.
+        // `category` alone is unreliable: the 'security' UI grouping spans both
+        // bulk data feeds and on-demand agent lookups (NAN-1585).
+        let enrichment_type = infer_enrichment_type(&entry.category, config);
 
         // Get default namespace
         let namespace_id: Uuid = sqlx::query_scalar("SELECT id FROM namespaces LIMIT 1")

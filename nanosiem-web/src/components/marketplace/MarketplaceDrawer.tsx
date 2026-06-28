@@ -19,7 +19,7 @@ import type { CredentialFieldDef, MarketplaceCatalogEntry } from '@/lib/api/mark
 import { useToast } from '@/hooks/use-toast';
 import { formatNumber, formatUTCCompact } from '@/lib/date-utils';
 import { cn } from '@/lib/utils';
-import { isIpInfoEntry } from '@/lib/api/marketplace';
+import { isDataFeed, isIpInfoEntry } from '@/lib/api/marketplace';
 import { MonoSwatch, getCategoryTone } from './MonoSwatch';
 import { StateBadge, getIntegrationState, IpInfoCredit } from './IntegrationCard';
 
@@ -504,9 +504,9 @@ function ConfigTab(props: ConfigTabProps) {
       )}
 
       {/* Status + record_count + last_sync + last_error */}
-      {entry.installed && (entry.category === 'data' || entry.last_sync_at || entry.last_error) && (
+      {entry.installed && (isDataFeed(entry) || entry.last_sync_at || entry.last_error) && (
         <div className="rounded-md border border-border/60 bg-card divide-y divide-border/60">
-          {entry.category === 'data' && entry.record_count > 0 && (
+          {isDataFeed(entry) && entry.record_count > 0 && (
             <div className="px-3 py-2.5 flex items-center justify-between">
               <span className="text-[12px] text-muted-foreground">Records</span>
               <span className="font-mono text-[12px] text-foreground">{formatNumber(entry.record_count)}</span>
@@ -661,7 +661,7 @@ function ConfigTab(props: ConfigTabProps) {
               <Zap className="w-[12px] h-[12px] mr-1" />
               {entry.enabled ? 'Apply changes' : 'Activate'}
             </Button>
-            {entry.category === 'data' && (
+            {isDataFeed(entry) && (
               egressBlocked ? (
                 <Link to="/settings/airgap-import">
                   <Button
@@ -783,9 +783,9 @@ function PermissionsTab({ entry }: { entry: MarketplaceCatalogEntry }) {
         <div className="space-y-1.5">
           {[
             'read events.artifacts.*',
-            entry.category === 'data' ? 'write enrichments.cache.*' : null,
+            isDataFeed(entry) ? 'write enrichments.cache.*' : null,
             entry.category === 'identity' ? 'write identity.users.*' : null,
-            entry.category === 'agent' ? 'invoke detection-rule.context.*' : null,
+            !isDataFeed(entry) && entry.category !== 'identity' ? 'invoke detection-rule.context.*' : null,
           ].filter((p): p is string => !!p).map(p => (
             <div key={p} className="flex items-center gap-2 text-[12px] text-foreground">
               <Check className="w-[12px] h-[12px] text-emerald-500" /> <span className="font-mono">{p}</span>

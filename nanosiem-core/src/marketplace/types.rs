@@ -497,3 +497,71 @@ pub struct RepoBrowseEntry {
     pub entry_type: String,
     pub has_manifest: bool,
 }
+
+/// Determine the functional enrichment type (`"data"` vs `"agent"`) for a
+/// marketplace entry from its `category` and manifest `config`.
+///
+/// `category` is a *UI grouping*, not a functional type: NAN-572 added a
+/// `"security"` category that spans BOTH bulk data feeds (ThreatFox, Tor exit
+/// nodes — `enrich(context)`) and on-demand agent lookups (urlhaus, shodan,
+/// malwarebazaar — `enrich(artifact, type, creds)`). Deriving the type from
+/// category alone mislabels the data feeds as `agent`, so they never get
+/// scheduled, hide their "Sync now" button, and crash preview (NAN-1585).
+///
+/// The manifest `config` carries the reliable signal:
+/// - on-demand AGENT lookups declare `artifact_types`
+/// - bulk DATA feeds declare `key_field`
+///
+/// Checked in that order so an entry declaring both is treated as an agent
+/// lookup. Falls back to `category` for legacy entries whose config carries
+/// neither marker.
+pub fn infer_enrichment_type(category: &str, config: &serde_json::Value) -> &'static str {
+    if config.get("artifact_types").is_some() {
+        "agent"
+    } else if config.get("key_field").is_some() {
+        "data"
+    } else if category == "data" {
+        "data"
+    } else {
+        "agent"
+    }
+}
+
+#[cfg(test)]
+mod infer_type_tests {
+    use super::infer_enrichment_type;
+    use serde_json::json;
+
+    #[test]
+    fn data_feed_with_key_field_is_data_even_under_security_category() {
+        // ThreatFox / Tor: category 'security' (UI), but a bulk feed.
+        assert_eq!(
+            infer_enrichment_type("security", &json!({"key_field": "ioc", "key_type": "ip"})),
+            "data"
+        );
+    }
+
+    #[test]
+    fn agent_lookup_with_artifact_types_is_agent_even_under_security_category() {
+        // urlhaus / shodan / malwarebazaar: category 'security' (UI), on-demand lookup.
+        assert_eq!(
+            infer_enrichment_type("security", &json!({"artifact_types": ["url"]})),
+            "agent"
+        );
+    }
+
+    #[test]
+    fn artifact_types_wins_when_both_markers_present() {
+        assert_eq!(
+            infer_enrichment_type("security", &json!({"artifact_types": ["ip"], "key_field": "x"})),
+            "agent"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_category_without_config_markers() {
+        assert_eq!(infer_enrichment_type("data", &json!({})), "data");
+        assert_eq!(infer_enrichment_type("agent", &json!({})), "agent");
+        assert_eq!(infer_enrichment_type("security", &json!({})), "agent");
+    }
+}

@@ -58,6 +58,24 @@ export interface MarketplaceCatalogEntry {
   updated_at: string;
 }
 
+/**
+ * Whether an entry is a bulk *data* feed (scheduled sync into ClickHouse) vs an
+ * on-demand *agent* lookup or identity provider.
+ *
+ * `category` is a UI grouping, not a functional type: the 'security' category
+ * spans both bulk feeds (ThreatFox, Tor exit nodes) and on-demand lookups
+ * (urlhaus, shodan, malwarebazaar). Gating sync UI on `category === 'data'`
+ * therefore hid the "Sync now" button for the security-tab data feeds
+ * (NAN-1585). Mirror the backend's `infer_enrichment_type`: prefer the config
+ * markers (`artifact_types` ⇒ agent, `key_field` ⇒ data), fall back to category.
+ */
+export function isDataFeed(entry: MarketplaceCatalogEntry): boolean {
+  const config = entry.config ?? {};
+  if ('artifact_types' in config) return false;
+  if ('key_field' in config) return true;
+  return entry.category === 'data';
+}
+
 export interface CredentialFieldDef {
   name: string;
   label: string;
