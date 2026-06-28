@@ -65,6 +65,15 @@ impl VectorConfigManager {
         // Stage the static pipeline config (normalization, CH mapping, sink)
         self.write_staged_pipeline_config().await?;
 
+        // NAN-1584: stage the OCSF ingestion sink too. Without this, a
+        // single-source publish (log_sources::deploy → stage_parsers →
+        // promote_staged) regenerated the combiner/router/pipeline but left the
+        // active `_ocsf_sink.toml` at its last full-deploy state, so a freshly
+        // published parser's `_ocsf_prepare` fork reached no sink and its OCSF
+        // events were silently dropped. promote_staged copies this to the active
+        // parsers dir. No-op under UDM.
+        self.write_staged_ocsf_sink_config(parsers).await?;
+
         // Stage the push enrichment lane (NAN-1124) so `vector validate` sees it
         // and promote_staged copies it to the active parsers dir. Pass parsers
         // so the staged lane is generated per-source (NAN-1151), matching the
@@ -78,6 +87,31 @@ impl VectorConfigManager {
             self.staging_dir.display()
         );
 
+        Ok(())
+    }
+
+    /// NAN-1584: stage the OCSF ingestion sink (`_ocsf_sink.toml`) so the
+    /// staged → promoted publish path re-wires it to every enabled parser's
+    /// `_ocsf_prepare` fork, exactly like the active `write_ocsf_sink_config`.
+    /// Uses the shared `ocsf_sink_inputs` / `ocsf_sink_content` helpers so the
+    /// staged and active forms cannot byte-drift. Under UDM (or no parsers) it
+    /// writes nothing and clears any stale staged sink.
+    async fn write_staged_ocsf_sink_config(
+        &self,
+        parsers: &[Parser],
+    ) -> Result<(), VectorConfigError> {
+        let staging_parsers_dir = self.staging_dir.join("sources").join("parsers");
+        let sink_path = staging_parsers_dir.join("_ocsf_sink.toml");
+
+        let inputs = Self::ocsf_sink_inputs(parsers);
+        if inputs.is_empty() {
+            if sink_path.exists() {
+                fs::remove_file(&sink_path).await?;
+            }
+            return Ok(());
+        }
+
+        fs::write(&sink_path, Self::ocsf_sink_content(&inputs)).await?;
         Ok(())
     }
 
@@ -406,6 +440,21 @@ impl VectorConfigManager {
                 let dest = self.parsers_dir.join(entry.file_name());
                 fs::copy(entry.path(), &dest).await?;
                 tracing::debug!("Promoted {} to {}", entry.path().display(), dest.display());
+            }
+        }
+
+        // NAN-1584: mirror write_ocsf_sink_config's UDM removal. promote_staged
+        // only copies staged files, so a publish under UDM after a prior OCSF
+        // deploy would otherwise leave a stale active `_ocsf_sink.toml` that
+        // references OCSF-only transforms (`*_ocsf_prepare`, `generic_ocsf_prepare`)
+        // which aren't emitted under UDM — a broken Vector config. Under OCSF the
+        // staged writer always emits the sink (already copied above); under UDM it
+        // must not exist, so drop any stale active copy.
+        if !Self::ocsf_mode() {
+            let active_sink = self.parsers_dir.join("_ocsf_sink.toml");
+            if active_sink.exists() {
+                fs::remove_file(&active_sink).await?;
+                tracing::info!("Removed stale active OCSF sink under UDM profile");
             }
         }
 

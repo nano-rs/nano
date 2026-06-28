@@ -420,21 +420,7 @@ impl VectorConfigManager {
 
         let sink_path = self.parsers_dir.join("_ocsf_sink.toml");
 
-        let inputs: Vec<String> = if Self::ocsf_mode() {
-            let mut v: Vec<String> = log_parsers
-                .iter()
-                .filter(|p| p.enabled)
-                .map(|p| format!("\"{}_ocsf_prepare\"", Self::safe_name(&p.name)))
-                .collect();
-            // NAN-1325: the generic Base Event lane always feeds ocsf_logs under OCSF
-            // — even with zero deployed parsers — so unconfigured/unknown source types
-            // are searchable (parity with the UDM `logs` unknown bucket). The
-            // `generic_ocsf_prepare` transform is emitted by `full_pipeline_config_content`.
-            v.push("\"generic_ocsf_prepare\"".to_string());
-            v
-        } else {
-            Vec::new()
-        };
+        let inputs = Self::ocsf_sink_inputs(log_parsers);
 
         // No OCSF sink under UDM, or before any parser is deployed.
         if inputs.is_empty() {
@@ -444,7 +430,46 @@ impl VectorConfigManager {
             return Ok(());
         }
 
-        let content = format!(
+        fs::write(&sink_path, Self::ocsf_sink_content(&inputs)).await?;
+        tracing::info!(
+            "Wrote OCSF ingestion sink ({} parser fork(s)) to {}",
+            inputs.len(),
+            sink_path.display()
+        );
+        Ok(())
+    }
+
+    /// NAN-1584: compute the `clickhouse_ocsf_logs` sink inputs from the deployed
+    /// parsers. Shared by the active writer ([`Self::write_ocsf_sink_config`]) and
+    /// the staged writer ([`super::VectorConfigManager::write_staged_ocsf_sink_config`])
+    /// so the two paths cannot byte-drift. Empty under UDM.
+    pub(super) fn ocsf_sink_inputs(parsers: &[Parser]) -> Vec<String> {
+        Self::ocsf_sink_inputs_for(Self::ocsf_mode(), parsers)
+    }
+
+    /// Pure variant of [`Self::ocsf_sink_inputs`] with the OCSF gate passed in
+    /// explicitly, so it is testable without the env-racy `ocsf_mode` read.
+    pub(super) fn ocsf_sink_inputs_for(ocsf: bool, parsers: &[Parser]) -> Vec<String> {
+        if !ocsf {
+            return Vec::new();
+        }
+        let mut v: Vec<String> = parsers
+            .iter()
+            .filter(|p| p.enabled && p.kind != "enrichment")
+            .map(|p| format!("\"{}_ocsf_prepare\"", Self::safe_name(&p.name)))
+            .collect();
+        // NAN-1325: the generic Base Event lane always feeds ocsf_logs under OCSF
+        // — even with zero deployed parsers — so unconfigured/unknown source types
+        // are searchable (parity with the UDM `logs` unknown bucket). The
+        // `generic_ocsf_prepare` transform is emitted by `full_pipeline_config_content`.
+        v.push("\"generic_ocsf_prepare\"".to_string());
+        v
+    }
+
+    /// NAN-1584: render the `clickhouse_ocsf_logs` sink TOML for the given inputs.
+    /// Shared by the active and staged writers.
+    pub(super) fn ocsf_sink_content(inputs: &[String]) -> String {
+        format!(
             "# Auto-generated OCSF ingestion sink (NAN-1246)\n\
              # DO NOT EDIT - regenerated on every parser deploy.\n\
              # Each parser's generated `_ocsf_prepare` fork feeds nanosiem.ocsf_logs.\n\
@@ -485,14 +510,7 @@ impl VectorConfigManager {
              retry_initial_backoff_secs = 1\n\
              retry_max_duration_secs = 300\n",
             inputs = inputs.join(", ")
-        );
-        fs::write(&sink_path, content).await?;
-        tracing::info!(
-            "Wrote OCSF ingestion sink ({} parser fork(s)) to {}",
-            inputs.len(),
-            sink_path.display()
-        );
-        Ok(())
+        )
     }
 
     /// Write the combiner config that unions all enabled parser outputs
@@ -1823,6 +1841,88 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
+    }
+
+    /// Build a minimal enabled/disabled log `Parser` for OCSF-sink wiring tests.
+    fn log_test_parser(name: &str, enabled: bool) -> Parser {
+        Parser {
+            id: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            description: None,
+            source_type: name.to_string(),
+            source_config: serde_json::json!({}),
+            parser_vrl: String::new(),
+            output_fields: None,
+            feed_id: None,
+            credential_id: None,
+            dispatch_source_config_id: None,
+            dispatch_route_name: None,
+            enabled,
+            validated: true,
+            validation_error: None,
+            category: None,
+            vendor: None,
+            product: None,
+            kind: "log".to_string(),
+            enrich_kind: None,
+            enrich_source: None,
+            target_table: None,
+            normalize_vrl: None,
+            namespace: "default".to_string(),
+            timezone: "UTC".to_string(),
+            match_values: None,
+            sampling_ratio: None,
+            sampling_exclude_condition: None,
+            extension_vrl: None,
+            extension_enabled: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// NAN-1584: the OCSF sink must fork every ENABLED, non-enrichment parser's
+    /// `_ocsf_prepare` output (plus the always-on generic Base Event lane). This
+    /// shared computation backs both the active `write_ocsf_sink_config` and the
+    /// staged `write_staged_ocsf_sink_config`; the staged path previously omitted
+    /// the sink entirely, so single-source publish dropped OCSF parser output.
+    /// (`_for` variant dodges the env-racy `ocsf_mode` gate.)
+    #[test]
+    fn ocsf_sink_wires_each_enabled_parser_fork() {
+        let parsers = vec![
+            log_test_parser("apache", true),
+            log_test_parser("sysmon_json", true),
+            log_test_parser("disabled_src", false),
+            enrichment_test_parser("identity", "user_registry", ""),
+        ];
+
+        // UDM: no OCSF sink at all.
+        assert!(
+            VectorConfigManager::ocsf_sink_inputs_for(false, &parsers).is_empty(),
+            "UDM must not emit an OCSF sink"
+        );
+
+        // OCSF: enabled log parsers' forks + generic; disabled + enrichment excluded.
+        let inputs = VectorConfigManager::ocsf_sink_inputs_for(true, &parsers);
+        assert_eq!(
+            inputs,
+            vec![
+                "\"apache_ocsf_prepare\"".to_string(),
+                "\"sysmon_json_ocsf_prepare\"".to_string(),
+                "\"generic_ocsf_prepare\"".to_string(),
+            ],
+            "OCSF sink must fork every enabled log parser + the generic lane, \
+             excluding disabled and enrichment parsers"
+        );
+
+        // The rendered sink wires exactly those inputs into the ocsf_logs sink.
+        let content = VectorConfigManager::ocsf_sink_content(&inputs);
+        assert!(content.contains("[sinks.clickhouse_ocsf_logs]"), "{content}");
+        assert!(
+            content.contains(
+                "inputs = [\"apache_ocsf_prepare\", \"sysmon_json_ocsf_prepare\", \"generic_ocsf_prepare\"]"
+            ),
+            "{content}"
+        );
     }
 
     /// NAN-1149: the dynamically-generated enrichment lane must produce a valid,
