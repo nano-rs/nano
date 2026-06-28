@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useRef, useCallback, useEffect, useState, useMemo } from 'react';
-import { Clock, Pin, Search, X, Settings2, Trash2 } from 'lucide-react';
+import { Clock, Pin, Search, X, Settings2, Trash2, Info } from 'lucide-react';
 import { PivtIcon } from '@/enterprise/icons/PivtIcon';
 import type { SearchHistoryEntry } from '@/hooks/useSearchHistory';
 import { formatRelativeCompact } from '@/lib/date-utils';
@@ -188,6 +188,14 @@ export function SearchQueryInput({
 
   // Show hint when focused and not dismissed (and no dropdowns open)
   const showNlHint = isFocused && !nlHintDismissed && !showHistorySuggestions && !aiMode;
+
+  // Retro hunts scan every event in the selected time range (no narrow-window
+  // shortcut), so surface that the moment a `| retro` command is typed — it tells
+  // analysts to widen the window deliberately AND keep it reasonable (NAN-1587).
+  const showRetroHint = useMemo(
+    () => queryMode === 'piped' && /\|\s*retro\b/i.test(query),
+    [queryMode, query]
+  );
 
   // Handle keyboard events from CodeMirror - return true to prevent CodeMirror from handling
   // Autocomplete keyboard navigation is now handled by CodeMirror's autocompletion extension
@@ -527,6 +535,21 @@ export function SearchQueryInput({
           </div>
         </div>
       )}
+      </div>
+
+      {/* Retro full-scan notice (NAN-1587): retro evaluates the indicator against
+          every event in the selected time range — make the cost model explicit so
+          analysts widen the window on purpose and keep it reasonable. */}
+      <div className={`overflow-hidden transition-all duration-300 ease-out ${
+        showRetroHint ? 'max-h-16 opacity-100 mt-1.5' : 'max-h-0 opacity-0 mt-0'
+      }`}>
+        <div className="flex items-start gap-1.5 px-1 text-[11px] text-muted-foreground">
+          <Info className="h-3 w-3 flex-shrink-0 mt-px text-brand" />
+          <span>
+            <span className="text-foreground font-medium">Retro hunt</span> scans every event in the selected time range.
+            Keep the window tight (a few days) for fast results — very wide ranges may time out.
+          </span>
+        </div>
       </div>
     </div>
   );

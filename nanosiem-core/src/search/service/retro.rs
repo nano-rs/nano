@@ -36,6 +36,12 @@ use crate::schema::SchemaProfile;
 /// Capped (not unbounded) so the scan still prunes partitions.
 const RETRO_RETENTION_DAYS: i64 = 365;
 
+/// Window over which the active-host population (the rarity-verdict denominator,
+/// `retro_total_hosts`) is measured. Decoupled from the user-selected match
+/// window: an unfiltered distinct-host count over a wide match window is a
+/// full-table scan that times out on a real tenant (see `retro_total_hosts`).
+const RETRO_PREVALENCE_WINDOW_HOURS: i64 = 24;
+
 /// Default page size for list/pivot rollups.
 const RETRO_PAGE_SIZE: usize = 50;
 
@@ -338,9 +344,19 @@ impl SearchService {
         }
     }
 
-    /// Total distinct hosts in the environment over the retention window — the
-    /// verdict denominator. Bounded by a row sample for cardinality safety.
-    async fn retro_total_hosts(&self, range: &TimeRange) -> u64 {
+    /// Active-host population — the rarity-verdict denominator.
+    ///
+    /// Measured with APPROXIMATE `uniq()` (fixed-memory HyperLogLog) over a
+    /// bounded recent window (`RETRO_PREVALENCE_WINDOW_HOURS`), NOT the retro
+    /// match range. The match range is user-controlled and can be wide; an
+    /// unfiltered exact distinct-host count over a wide window is a full-table
+    /// scan that OOMs/times out on a real tenant (`uniqExact` over retention hit
+    /// the 300s ceiling on Saturn — 1.7B rows × a 5-column `lower()` host coalesce).
+    /// A coarse rarity band only needs an approximate, recent "how big is the
+    /// environment" figure, so a small fixed window keeps this cheap (~sub-4s).
+    /// A numerator host outside this window can push the ratio >1 → `Common`,
+    /// which [`RetroVerdict::from_ratio`] handles as a safe non-rare result.
+    async fn retro_total_hosts(&self) -> u64 {
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
             None => return 0,
@@ -348,13 +364,15 @@ impl SearchService {
         let logs_table = self
             .table_names
             .read(Self::logs_table_key(self.active_profile.as_ref()));
+        let now = chrono::Utc::now();
+        let start = now - chrono::Duration::hours(RETRO_PREVALENCE_WINDOW_HOURS);
         let sql = format!(
-            "SELECT uniqExact({host}) FROM {table} \
+            "SELECT uniq({host}) FROM {table} \
              WHERE timestamp BETWEEN '{start}' AND '{end}'",
             host = host_expr(self.active_profile.as_ref()),
             table = logs_table,
-            start = range.start.format("%Y-%m-%d %H:%M:%S"),
-            end = range.end.format("%Y-%m-%d %H:%M:%S"),
+            start = start.format("%Y-%m-%d %H:%M:%S"),
+            end = now.format("%Y-%m-%d %H:%M:%S"),
         );
         clickhouse
             .query(&sql)
@@ -450,7 +468,7 @@ impl SearchService {
             req.time_range.end,
         ));
         let indicators = self.resolve_retro_indicators(&plan).await?;
-        let total_hosts = self.retro_total_hosts(&range).await;
+        let total_hosts = self.retro_total_hosts().await;
 
         let offset = req.offset.unwrap_or(0);
         let limit = req.limit.unwrap_or(RETRO_PAGE_SIZE).clamp(1, 500);

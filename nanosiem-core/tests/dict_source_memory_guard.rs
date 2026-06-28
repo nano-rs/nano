@@ -75,6 +75,16 @@ const MIGRATION_137: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../clickhouse/137_lengthen_dict_refresh_mv_cadence.sql"
 ));
+/// NAN-1588 lowercased the IOC dict keys (`lower(ioc_value)` / `lower(key_value)`
+/// in the SOURCE query) so ingest-time matching is case-insensitive — the log
+/// side already looks up with `lower(...)`. The dict bodies are otherwise
+/// byte-identical to 133; this migration is the canonical definition for the
+/// dicts in `DICTS_REDEFINED_BY_148`. The staging tables + refresh MVs are
+/// untouched (the dict reloads off the existing staging).
+const MIGRATION_148: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../clickhouse/148_lowercase_ioc_dict_keys.sql"
+));
 
 /// The first numbered migration written under the NAN-1404 rule. Migrations
 /// before this predate it and are immutable (editing them trips
@@ -98,6 +108,15 @@ const STAGED_DICTS: &[&str] = &[
 /// must match the LATER migration; their staging table + refresh MV still match
 /// 133 (those objects were not touched). Migration 133 stays immutable history.
 const DICTS_REDEFINED_BY_136: &[&str] = &["nanosiem.ip_enrichment_dict"];
+
+/// Staged dicts whose canonical CREATE OR REPLACE moved off migration 133 to
+/// migration 148 (only the SOURCE query key was lowercased — NAN-1588). For
+/// these, init.sql must match migration 148; their staging table + refresh MV
+/// still match 133 (those objects were not touched).
+const DICTS_REDEFINED_BY_148: &[&str] = &[
+    "nanosiem.custom_ioc_enrichment_dict",
+    "nanosiem.ioc_enrichment_dict",
+];
 
 /// The prevalence CACHE dicts keep migration-130 key-pushdown sources and
 /// must NEVER grow staging/refresh objects (NAN-1440 — the full-keyspace
@@ -370,6 +389,7 @@ fn migration_133_matches_init_definitions() {
     let ocsf_dicts = create_dictionary_statements(OCSF_INIT);
     let mig_dicts = create_dictionary_statements(MIGRATION_133);
     let mig136_dicts = create_dictionary_statements(MIGRATION_136);
+    let mig148_dicts = create_dictionary_statements(MIGRATION_148);
 
     // Migration 136 must redefine exactly the dicts it claims to (catches an
     // accidental extra/missing CREATE OR REPLACE).
@@ -378,11 +398,20 @@ fn migration_133_matches_init_definitions() {
         DICTS_REDEFINED_BY_136.to_vec(),
         "migration 136 redefines a different dict set than DICTS_REDEFINED_BY_136"
     );
+    // Same pin for migration 148 (NAN-1588).
+    assert_eq!(
+        mig148_dicts.keys().map(String::as_str).collect::<Vec<_>>(),
+        DICTS_REDEFINED_BY_148.to_vec(),
+        "migration 148 redefines a different dict set than DICTS_REDEFINED_BY_148"
+    );
 
     for name in STAGED_DICTS {
-        // Redefined dicts' canonical body lives in the later migration; the
-        // rest stay pinned to 133. init.sql must match whichever is canonical.
-        let (canonical, source) = if DICTS_REDEFINED_BY_136.contains(name) {
+        // Redefined dicts' canonical body lives in the latest migration that
+        // recreated them; the rest stay pinned to 133. init.sql must match
+        // whichever is canonical.
+        let (canonical, source) = if DICTS_REDEFINED_BY_148.contains(name) {
+            (mig148_dicts.get(*name), "migration 148")
+        } else if DICTS_REDEFINED_BY_136.contains(name) {
             (mig136_dicts.get(*name), "migration 136")
         } else {
             (mig_dicts.get(*name), "migration 133")

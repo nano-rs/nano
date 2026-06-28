@@ -209,7 +209,7 @@ SOURCE(CLICKHOUSE(
     USER '{clickhouse_self_user}'
     PASSWORD '{clickhouse_self_password}'
     DB 'nanosiem'
-    QUERY 'SELECT ioc_value, ioc_type, source_id, threat_type, malware, confidence_level, tags FROM nanosiem.ioc_enrichment_dict_staging'
+    QUERY 'SELECT lower(ioc_value) AS ioc_value, ioc_type, source_id, threat_type, malware, confidence_level, tags FROM nanosiem.ioc_enrichment_dict_staging'
 ))
 LIFETIME(MIN 60 MAX 300)
 LAYOUT(HASHED());
@@ -453,7 +453,7 @@ SOURCE(CLICKHOUSE(
     USER '{clickhouse_self_user}'
     PASSWORD '{clickhouse_self_password}'
     DB 'nanosiem'
-    QUERY 'SELECT key_type, key_value, threat_type, malware, confidence, tags, enrichment_names FROM nanosiem.custom_ioc_enrichment_dict_staging'
+    QUERY 'SELECT key_type, lower(key_value) AS key_value, threat_type, malware, confidence, tags, enrichment_names FROM nanosiem.custom_ioc_enrichment_dict_staging'
 ))
 LAYOUT(COMPLEX_KEY_HASHED())
 LIFETIME(MIN 60 MAX 300);
