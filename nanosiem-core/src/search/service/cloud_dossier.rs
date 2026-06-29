@@ -1305,6 +1305,10 @@ impl SearchService {
         let posture_fut = fetch_rows(bind_posture_query(), "cloud_dossier.posture");
         let stream_fut = fetch_rows(bind_principal_query(&stream_sql), "cloud_dossier.stream");
 
+        // Each subquery future yields `Result<_, SearchError>`; `tokio::join!`
+        // preserves the concurrency, then we propagate any transient ClickHouse
+        // failure with `?` so a partial/empty dossier is never returned (and
+        // therefore never cached) on error.
         let (
             identity_rows,
             ua_rows,
@@ -1334,6 +1338,20 @@ impl SearchService {
             posture_fut,
             stream_fut,
         );
+
+        let identity_rows = identity_rows?;
+        let ua_rows = ua_rows?;
+        let ip_rows = ip_rows?;
+        let facet_rows = facet_rows?;
+        let chain_rows = chain_rows?;
+        let key_action_rows = key_action_rows?;
+        let timeline_rows = timeline_rows?;
+        let action_rows = action_rows?;
+        let resource_rows = resource_rows?;
+        let error_rate_rows = error_rate_rows?;
+        let error_code_rows = error_code_rows?;
+        let posture_rows = posture_rows?;
+        let stream_rows = stream_rows?;
 
         // --- Risk (Postgres fan-out) ----------------------------------------
         let risk_window = if span_secs <= 26 * 3_600 {
@@ -1402,12 +1420,14 @@ impl SearchService {
 async fn fetch_rows(
     query: clickhouse::query::Query,
     subquery: &'static str,
-) -> Vec<serde_json::Value> {
+) -> Result<Vec<serde_json::Value>, SearchError> {
     let mut cursor = match query.fetch_bytes("JSONEachRow") {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(subquery, error = %e, "Cloud dossier subquery failed to start");
-            return Vec::new();
+            return Err(SearchError::DatabaseError(sqlx::Error::Protocol(format!(
+                "cloud dossier subquery {subquery} failed to start: {e}"
+            ))));
         }
     };
     let mut bytes = Vec::new();
@@ -1417,7 +1437,9 @@ async fn fetch_rows(
             Ok(None) => break,
             Err(e) => {
                 tracing::error!(subquery, error = %e, "Cloud dossier subquery stream error");
-                return Vec::new();
+                return Err(SearchError::DatabaseError(sqlx::Error::Protocol(format!(
+                    "cloud dossier subquery {subquery} stream error: {e}"
+                ))));
             }
         }
     }
@@ -1425,13 +1447,16 @@ async fn fetch_rows(
         Ok(s) => s,
         Err(e) => {
             tracing::error!(subquery, error = %e, "Cloud dossier subquery non-utf8 bytes");
-            return Vec::new();
+            return Err(SearchError::DatabaseError(sqlx::Error::Protocol(format!(
+                "cloud dossier subquery {subquery} non-utf8 bytes: {e}"
+            ))));
         }
     };
-    text.lines()
+    Ok(text
+        .lines()
         .filter(|l| !l.is_empty())
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .collect()
+        .collect())
 }
 
 // ============================================================================

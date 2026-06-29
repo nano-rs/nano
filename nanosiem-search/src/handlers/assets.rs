@@ -41,7 +41,7 @@ fn default_asset_limit() -> usize {
 }
 
 /// Response for paginated asset events
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AssetEventsResponse {
     /// The events for this page
     pub events: Vec<serde_json::Value>,
@@ -79,6 +79,30 @@ pub async fn get_asset_events(
 ) -> Result<Json<AssetEventsResponse>, SearchError> {
     let start = Instant::now();
 
+    let cache_key = crate::cache::SearchResultCache::companion_key(
+        "aevents",
+        &[
+            request.identifier_field.as_bytes(),
+            request.identifier_value.as_bytes(),
+            serde_json::to_string(&request.identities)
+                .unwrap_or_default()
+                .as_bytes(),
+            request.time_range.start.timestamp_micros().to_string().as_bytes(),
+            request.time_range.end.timestamp_micros().to_string().as_bytes(),
+            request.offset.to_string().as_bytes(),
+            request.limit.to_string().as_bytes(),
+            serde_json::to_string(&request.filters)
+                .unwrap_or_default()
+                .as_bytes(),
+        ],
+    );
+    if let Some(cache) = state.result_cache.as_ref() {
+        if let Some(cached) = cache.get_cached::<AssetEventsResponse>(&cache_key).await {
+            record_search_query("asset_events_cached", 0.0, true);
+            return Ok(Json(cached));
+        }
+    }
+
     // Convert TimeRangeInput to TimeRange (the internal type)
     let time_range =
         nanosiem_core::query::TimeRange::new(request.time_range.start, request.time_range.end);
@@ -106,14 +130,22 @@ pub async fn get_asset_events(
 
     let has_more = request.offset + events.len() < total_count as usize;
 
-    Ok(Json(AssetEventsResponse {
+    let response = AssetEventsResponse {
         events,
         total_count,
         facets,
         offset: request.offset,
         limit: request.limit,
         has_more,
-    }))
+    };
+    if let Some(cache) = state.result_cache.as_ref() {
+        let cache = cache.clone();
+        let resp = response.clone();
+        tokio::spawn(async move {
+            cache.set_cached(&cache_key, &resp).await;
+        });
+    }
+    Ok(Json(response))
 }
 
 // ============================================================================
@@ -143,7 +175,7 @@ fn default_cloud_limit() -> usize {
 }
 
 /// Response for paginated cloud events
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CloudEventsResponse {
     /// The events for this page
     pub events: Vec<serde_json::Value>,
@@ -187,6 +219,26 @@ pub async fn get_cloud_events(
 ) -> Result<Json<CloudEventsResponse>, SearchError> {
     let start = Instant::now();
 
+    let cache_key = crate::cache::SearchResultCache::companion_key(
+        "cevents",
+        &[
+            request.query.as_bytes(),
+            request.time_range.start.timestamp_micros().to_string().as_bytes(),
+            request.time_range.end.timestamp_micros().to_string().as_bytes(),
+            request.offset.to_string().as_bytes(),
+            request.limit.to_string().as_bytes(),
+            serde_json::to_string(&request.filters)
+                .unwrap_or_default()
+                .as_bytes(),
+        ],
+    );
+    if let Some(cache) = state.result_cache.as_ref() {
+        if let Some(cached) = cache.get_cached::<CloudEventsResponse>(&cache_key).await {
+            record_search_query("cloud_events_cached", 0.0, true);
+            return Ok(Json(cached));
+        }
+    }
+
     let time_range =
         nanosiem_core::query::TimeRange::new(request.time_range.start, request.time_range.end);
 
@@ -211,7 +263,7 @@ pub async fn get_cloud_events(
 
     let has_more = request.offset + events.len() < total_count as usize;
 
-    Ok(Json(CloudEventsResponse {
+    let response = CloudEventsResponse {
         events,
         total_count,
         facets,
@@ -220,7 +272,15 @@ pub async fn get_cloud_events(
         has_more,
         resources,
         user_activity,
-    }))
+    };
+    if let Some(cache) = state.result_cache.as_ref() {
+        let cache = cache.clone();
+        let resp = response.clone();
+        tokio::spawn(async move {
+            cache.set_cached(&cache_key, &resp).await;
+        });
+    }
+    Ok(Json(response))
 }
 
 // ============================================================================
@@ -239,7 +299,7 @@ pub struct CloudUserTimelineRequest {
 }
 
 /// Response for cloud user timeline
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CloudUserTimelineResponse {
     /// Chronological events for this user
     pub events: Vec<serde_json::Value>,
@@ -269,6 +329,25 @@ pub async fn get_cloud_user_timeline(
 ) -> Result<Json<CloudUserTimelineResponse>, SearchError> {
     let start = Instant::now();
 
+    let cache_key = crate::cache::SearchResultCache::companion_key(
+        "cusertl",
+        &[
+            request.query.as_bytes(),
+            request.time_range.start.timestamp_micros().to_string().as_bytes(),
+            request.time_range.end.timestamp_micros().to_string().as_bytes(),
+            request.user.as_bytes(),
+        ],
+    );
+    if let Some(cache) = state.result_cache.as_ref() {
+        if let Some(cached) = cache
+            .get_cached::<CloudUserTimelineResponse>(&cache_key)
+            .await
+        {
+            record_search_query("cloud_user_timeline_cached", 0.0, true);
+            return Ok(Json(cached));
+        }
+    }
+
     let time_range =
         nanosiem_core::query::TimeRange::new(request.time_range.start, request.time_range.end);
 
@@ -285,7 +364,15 @@ pub async fn get_cloud_user_timeline(
         SearchError::QueryError("Failed to fetch cloud user timeline".to_string())
     })?;
 
-    Ok(Json(CloudUserTimelineResponse { events, summary }))
+    let response = CloudUserTimelineResponse { events, summary };
+    if let Some(cache) = state.result_cache.as_ref() {
+        let cache = cache.clone();
+        let resp = response.clone();
+        tokio::spawn(async move {
+            cache.set_cached(&cache_key, &resp).await;
+        });
+    }
+    Ok(Json(response))
 }
 
 // ============================================================================
@@ -306,7 +393,7 @@ pub struct CloudEntityPivotRequest {
 }
 
 /// Response for entity pivot
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CloudEntityPivotResponse {
     /// Chronological events involving this entity
     pub events: Vec<serde_json::Value>,
@@ -338,6 +425,26 @@ pub async fn get_cloud_entity_pivot(
 ) -> Result<Json<CloudEntityPivotResponse>, SearchError> {
     let start = Instant::now();
 
+    let cache_key = crate::cache::SearchResultCache::companion_key(
+        "centity",
+        &[
+            request.query.as_bytes(),
+            request.time_range.start.timestamp_micros().to_string().as_bytes(),
+            request.time_range.end.timestamp_micros().to_string().as_bytes(),
+            request.entity_type.as_bytes(),
+            request.entity_value.as_bytes(),
+        ],
+    );
+    if let Some(cache) = state.result_cache.as_ref() {
+        if let Some(cached) = cache
+            .get_cached::<CloudEntityPivotResponse>(&cache_key)
+            .await
+        {
+            record_search_query("cloud_entity_pivot_cached", 0.0, true);
+            return Ok(Json(cached));
+        }
+    }
+
     let time_range =
         nanosiem_core::query::TimeRange::new(request.time_range.start, request.time_range.end);
 
@@ -359,11 +466,19 @@ pub async fn get_cloud_entity_pivot(
         SearchError::QueryError("Failed to fetch entity pivot".to_string())
     })?;
 
-    Ok(Json(CloudEntityPivotResponse {
+    let response = CloudEntityPivotResponse {
         events,
         cross_references,
         entity_summary,
-    }))
+    };
+    if let Some(cache) = state.result_cache.as_ref() {
+        let cache = cache.clone();
+        let resp = response.clone();
+        tokio::spawn(async move {
+            cache.set_cached(&cache_key, &resp).await;
+        });
+    }
+    Ok(Json(response))
 }
 
 // ============================================================================
@@ -382,7 +497,7 @@ pub struct AssetTrueTimeRangeRequest {
 }
 
 /// Response with first/last seen timestamps
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AssetTrueTimeRangeResponse {
     /// First event timestamp for this asset (across all time)
     pub first_seen: Option<String>,
@@ -412,6 +527,26 @@ pub async fn get_asset_true_time_range(
 ) -> Result<Json<AssetTrueTimeRangeResponse>, SearchError> {
     let start = Instant::now();
 
+    let cache_key = crate::cache::SearchResultCache::companion_key(
+        "atruerange",
+        &[
+            request.identifier_field.as_bytes(),
+            request.identifier_value.as_bytes(),
+            serde_json::to_string(&request.identities)
+                .unwrap_or_default()
+                .as_bytes(),
+        ],
+    );
+    if let Some(cache) = state.result_cache.as_ref() {
+        if let Some(cached) = cache
+            .get_cached::<AssetTrueTimeRangeResponse>(&cache_key)
+            .await
+        {
+            record_search_query("asset_true_time_range_cached", 0.0, true);
+            return Ok(Json(cached));
+        }
+    }
+
     let (first_seen, last_seen) = state
         .search
         .query_asset_true_time_range(
@@ -419,15 +554,28 @@ pub async fn get_asset_true_time_range(
             &request.identifier_value,
             &request.identities,
         )
-        .await;
+        .await?;
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
     record_search_query("asset_true_time_range", duration_ms, true);
 
-    Ok(Json(AssetTrueTimeRangeResponse {
+    let response = AssetTrueTimeRangeResponse {
         first_seen,
         last_seen,
-    }))
+    };
+    // NAN-1593: a transient ClickHouse failure now propagates as an error from
+    // `query_asset_true_time_range` (it no longer collapses into (None, None)),
+    // so the `?` above means only a genuine, successful result reaches here and
+    // a (None, None) legitimately means "never seen" — safe to cache like any
+    // other empty-but-complete companion result.
+    if let Some(cache) = state.result_cache.as_ref() {
+        let cache = cache.clone();
+        let resp = response.clone();
+        tokio::spawn(async move {
+            cache.set_cached(&cache_key, &resp).await;
+        });
+    }
+    Ok(Json(response))
 }
 
 // ============================================================================
@@ -462,7 +610,7 @@ fn default_prevalence_window() -> String {
 }
 
 /// A single artifact occurrence with its event timestamp
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ArtifactOccurrence {
     /// The artifact value (hash or domain)
     pub artifact: String,
@@ -471,7 +619,7 @@ pub struct ArtifactOccurrence {
 }
 
 /// Prevalence info for a unique artifact
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ArtifactPrevalence {
     /// The artifact value
     pub artifact: String,
@@ -488,7 +636,7 @@ pub struct ArtifactPrevalence {
 }
 
 /// Response with per-event occurrences and prevalence metadata
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AssetArtifactsResponse {
     /// Hash occurrences (one per event, filtered by max_host_count)
     pub hashes: Vec<ArtifactOccurrence>,
@@ -529,6 +677,30 @@ pub async fn get_asset_artifacts(
 ) -> Result<Json<AssetArtifactsResponse>, SearchError> {
     let start = Instant::now();
 
+    let cache_key = crate::cache::SearchResultCache::companion_key(
+        "aartifacts",
+        &[
+            request.identifier_field.as_bytes(),
+            request.identifier_value.as_bytes(),
+            serde_json::to_string(&request.identities)
+                .unwrap_or_default()
+                .as_bytes(),
+            request.time_range.start.timestamp_micros().to_string().as_bytes(),
+            request.time_range.end.timestamp_micros().to_string().as_bytes(),
+            request.max_host_count.to_string().as_bytes(),
+            request.prevalence_window.as_bytes(),
+        ],
+    );
+    if let Some(cache) = state.result_cache.as_ref() {
+        if let Some(cached) = cache
+            .get_cached::<AssetArtifactsResponse>(&cache_key)
+            .await
+        {
+            record_search_query("asset_artifacts_cached", 0.0, true);
+            return Ok(Json(cached));
+        }
+    }
+
     let time_range =
         nanosiem_core::query::TimeRange::new(request.time_range.start, request.time_range.end);
 
@@ -541,7 +713,7 @@ pub async fn get_asset_artifacts(
             &request.identities,
             &time_range,
         )
-        .await;
+        .await?;
 
     let rarity_threshold = state.prevalence.get_config().await.rarity_threshold;
 
@@ -636,7 +808,7 @@ pub async fn get_asset_artifacts(
             Some(&hash_filter),
             Some(&domain_filter),
         )
-        .await;
+        .await?;
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
     record_search_query("asset_artifacts", duration_ms, true);
@@ -680,11 +852,19 @@ pub async fn get_asset_artifacts(
         request.max_host_count,
     );
 
-    Ok(Json(AssetArtifactsResponse {
+    let response = AssetArtifactsResponse {
         hashes,
         domains,
         hash_prevalence: all_hash_prevalence,
         domain_prevalence: all_domain_prevalence,
         rarity_threshold: rarity_threshold,
-    }))
+    };
+    if let Some(cache) = state.result_cache.as_ref() {
+        let cache = cache.clone();
+        let resp = response.clone();
+        tokio::spawn(async move {
+            cache.set_cached(&cache_key, &resp).await;
+        });
+    }
+    Ok(Json(response))
 }

@@ -17,7 +17,7 @@ use super::SearchService;
 use crate::extensions::CloudRiskProvider;
 use crate::query::TimeRange;
 use crate::risk::{EntityRiskSummary, RiskFilter, RiskTimeWindow};
-use crate::search::SearchError;
+use crate::search::{parse_clickhouse_error, SearchError};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
@@ -948,6 +948,18 @@ impl SearchService {
             anomalies_fut,
         );
 
+        // Propagate any transient ClickHouse failure so an upstream cache never
+        // stores a partial/empty overview as "successful" (NAN: swallow→propagate).
+        let header_rows = header_rows?;
+        let provider_rows = provider_rows?;
+        let account_rows = account_rows?;
+        let principal_rows = principal_rows?;
+        let timeline_rows = timeline_rows?;
+        let service_health_rows = service_health_rows?;
+        let service_trend_rows = service_trend_rows?;
+        let changes_rows = changes_rows?;
+        let anomaly_rows = anomaly_rows?;
+
         // --- Risk fan-out (post-query, Postgres) ----------------------------
         // Pick the risk rollup window closest to the user's search span so
         // posture/band matches what they see below. The risk service only
@@ -1103,12 +1115,14 @@ struct HeaderRow {
 async fn fetch_rows(
     query: clickhouse::query::Query,
     subquery: &'static str,
-) -> Vec<serde_json::Value> {
+) -> Result<Vec<serde_json::Value>, SearchError> {
     let mut cursor = match query.fetch_bytes("JSONEachRow") {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(subquery, error = %e, "Cloud overview subquery failed to start");
-            return Vec::new();
+            return Err(parse_clickhouse_error(&format!(
+                "cloud overview subquery {subquery} failed: {e}"
+            )));
         }
     };
     let mut bytes = Vec::new();
@@ -1118,7 +1132,9 @@ async fn fetch_rows(
             Ok(None) => break,
             Err(e) => {
                 tracing::error!(subquery, error = %e, "Cloud overview subquery stream error");
-                return Vec::new();
+                return Err(parse_clickhouse_error(&format!(
+                    "cloud overview subquery {subquery} failed: {e}"
+                )));
             }
         }
     }
@@ -1126,13 +1142,16 @@ async fn fetch_rows(
         Ok(s) => s,
         Err(e) => {
             tracing::error!(subquery, error = %e, "Cloud overview subquery non-utf8 bytes");
-            return Vec::new();
+            return Err(parse_clickhouse_error(&format!(
+                "cloud overview subquery {subquery} failed: {e}"
+            )));
         }
     };
-    text.lines()
+    Ok(text
+        .lines()
         .filter(|l| !l.is_empty())
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .collect()
+        .collect())
 }
 
 // ============================================================================

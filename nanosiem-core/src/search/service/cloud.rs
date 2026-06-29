@@ -521,10 +521,12 @@ impl SearchService {
                 .fetch_all::<(String, String, u64)>()
                 .await
             {
-                Ok(rows) => rows,
+                Ok(rows) => Ok(rows),
                 Err(e) => {
+                    // NAN-1593: propagate so a transient failure isn't cached as
+                    // a degraded (empty-facet) cloud view by the main search cache.
                     tracing::warn!("Cloud facet query failed: {}", e);
-                    Vec::new()
+                    Err(parse_clickhouse_error(&e.to_string()))
                 }
             }
         };
@@ -568,10 +570,10 @@ impl SearchService {
 
         let count_future = async {
             match clickhouse.query(&count_sql).fetch_one::<u64>().await {
-                Ok(cnt) => cnt,
+                Ok(cnt) => Ok(cnt),
                 Err(e) => {
                     tracing::warn!("Cloud count query failed: {}", e);
-                    0u64
+                    Err(parse_clickhouse_error(&e.to_string()))
                 }
             }
         };
@@ -592,7 +594,7 @@ impl SearchService {
                 .fetch_all::<ResourceRow>()
                 .await
             {
-                Ok(rows) => rows
+                Ok(rows) => Ok(rows
                     .into_iter()
                     .map(|r| {
                         json!({
@@ -605,10 +607,10 @@ impl SearchService {
                             "change_types": r.change_types,
                         })
                     })
-                    .collect(),
+                    .collect::<Vec<_>>()),
                 Err(e) => {
                     tracing::warn!("Cloud resource query failed: {}", e);
-                    Vec::new()
+                    Err(parse_clickhouse_error(&e.to_string()))
                 }
             }
         };
@@ -623,7 +625,7 @@ impl SearchService {
                     no_mfa_count: u64,
                 }
                 match clickhouse.query(sql).fetch_all::<MfaRow>().await {
-                    Ok(rows) => Some(
+                    Ok(rows) => Ok(Some(
                         rows.into_iter()
                             .map(|r| {
                                 json!({
@@ -634,14 +636,14 @@ impl SearchService {
                                 })
                             })
                             .collect::<Vec<_>>(),
-                    ),
+                    )),
                     Err(e) => {
                         tracing::warn!("Cloud MFA query failed: {}", e);
-                        None
+                        Err(parse_clickhouse_error(&e.to_string()))
                     }
                 }
             } else {
-                None
+                Ok(None)
             }
         };
 
@@ -682,7 +684,7 @@ impl SearchService {
 
         let user_activity_future = async {
             let Some(ref sql) = user_activity_sql else {
-                return Vec::new();
+                return Ok(Vec::new());
             };
             #[derive(Debug, clickhouse::Row, serde::Deserialize)]
             struct UserActivityRow {
@@ -703,7 +705,8 @@ impl SearchService {
                 .await
             {
                 Ok(rows) => {
-                    rows.into_iter()
+                    let activity = rows
+                        .into_iter()
                         .map(|r| {
                             let total = r.event_count;
                             let mut risk_indicators = Vec::new();
@@ -741,11 +744,12 @@ impl SearchService {
                                 risk_indicators,
                             }
                         })
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>();
+                    Ok(activity)
                 }
                 Err(e) => {
                     tracing::warn!("Cloud user activity query failed: {}", e);
-                    Vec::new()
+                    Err(parse_clickhouse_error(&e.to_string()))
                 }
             }
         };
@@ -758,7 +762,14 @@ impl SearchService {
             mfa_future,
             user_activity_future
         );
+        // NAN-1593: propagate any transient sub-query failure so a degraded
+        // cloud view is never cached by the main search cache.
+        let facet_rows = facet_rows?;
         let events = events?;
+        let total_count = total_count?;
+        let resources = resources?;
+        let mfa_users = mfa_users?;
+        let user_activity = user_activity?;
 
         // Build facet summary from UNION ALL results
         let mut summary = serde_json::Map::new();
@@ -1124,14 +1135,14 @@ impl SearchService {
                     q = q.bind(val);
                 }
                 match q.fetch_all::<(String, String, u64)>().await {
-                    Ok(rows) => rows,
+                    Ok(rows) => Ok(rows),
                     Err(e) => {
                         tracing::warn!("Cloud paginated facet query failed: {}", e);
-                        Vec::new()
+                        Err(parse_clickhouse_error(&e.to_string()))
                     }
                 }
             } else {
-                Vec::new()
+                Ok::<Vec<(String, String, u64)>, SearchError>(Vec::new())
             }
         };
 
@@ -1181,10 +1192,10 @@ impl SearchService {
                 q = q.bind(val);
             }
             match q.fetch_one::<u64>().await {
-                Ok(cnt) => cnt,
+                Ok(cnt) => Ok(cnt),
                 Err(e) => {
                     tracing::warn!("Cloud paginated count query failed: {}", e);
-                    0u64
+                    Err(parse_clickhouse_error(&e.to_string()))
                 }
             }
         };
@@ -1206,7 +1217,7 @@ impl SearchService {
                     q = q.bind(val);
                 }
                 match q.fetch_all::<ResourceRow>().await {
-                    Ok(rows) => Some(
+                    Ok(rows) => Ok(Some(
                         rows.into_iter()
                             .map(|r| {
                                 serde_json::json!({
@@ -1220,14 +1231,14 @@ impl SearchService {
                                 })
                             })
                             .collect::<Vec<_>>(),
-                    ),
+                    )),
                     Err(e) => {
                         tracing::warn!("Cloud paginated resource query failed: {}", e);
-                        None
+                        Err(parse_clickhouse_error(&e.to_string()))
                     }
                 }
             } else {
-                None
+                Ok::<Option<Vec<serde_json::Value>>, SearchError>(None)
             }
         };
 
@@ -1251,7 +1262,7 @@ impl SearchService {
                     q = q.bind(val);
                 }
                 match q.fetch_all::<UserActivityRow>().await {
-                    Ok(rows) => Some(
+                    Ok(rows) => Ok(Some(
                         rows.into_iter()
                             .map(|r| {
                                 let total = r.event_count;
@@ -1286,14 +1297,14 @@ impl SearchService {
                                 }
                             })
                             .collect::<Vec<_>>(),
-                    ),
+                    )),
                     Err(e) => {
                         tracing::warn!("Cloud paginated user activity query failed: {}", e);
-                        None
+                        Err(parse_clickhouse_error(&e.to_string()))
                     }
                 }
             } else {
-                None
+                Ok::<Option<Vec<CloudUserActivity>>, SearchError>(None)
             }
         };
 
@@ -1304,7 +1315,11 @@ impl SearchService {
             resources_future,
             user_activity_future
         );
+        let facet_rows = facet_rows?;
         let events = events?;
+        let total_count = total_count?;
+        let resources = resources?;
+        let user_activity = user_activity?;
 
         // Build CloudFacets from UNION ALL results
         let mut facets = CloudFacets::default();
@@ -1507,7 +1522,7 @@ impl SearchService {
                     if r.delete_count > 5 {
                         risk_indicators.push("high_delete".to_string());
                     }
-                    CloudUserSessionSummary {
+                    Ok(CloudUserSessionSummary {
                         services: r.services,
                         regions: r.regions,
                         ips: r.ips,
@@ -1517,9 +1532,10 @@ impl SearchService {
                         delete_count: r.delete_count,
                         has_no_mfa: r.no_mfa_count > 0,
                         risk_indicators,
-                    }
+                    })
                 }
-                _ => CloudUserSessionSummary {
+                // Genuine no-data: the user simply has no events in range.
+                Ok(None) => Ok(CloudUserSessionSummary {
                     services: vec![],
                     regions: vec![],
                     ips: vec![],
@@ -1529,12 +1545,17 @@ impl SearchService {
                     delete_count: 0,
                     has_no_mfa: false,
                     risk_indicators: vec![],
-                },
+                }),
+                Err(e) => {
+                    tracing::warn!("Cloud user timeline summary query failed: {}", e);
+                    Err(parse_clickhouse_error(&e.to_string()))
+                }
             }
         };
 
         let (events, summary) = tokio::join!(events_future, summary_future);
         let events = events?;
+        let summary = summary?;
 
         tracing::info!(
             "Cloud user timeline for '{}': {} events, {} risk indicators",
@@ -1749,22 +1770,29 @@ impl SearchService {
         };
 
         let xref_future = async {
+            // NAN-1593: with no cross-ref branches the SQL is just `WITH <cte>`
+            // (no SELECT) — a genuine "nothing to query", not a failure. Return
+            // empty rather than executing invalid SQL (which, now that errors
+            // propagate, would surface as a spurious 500).
+            if branches.is_empty() {
+                return Ok::<Vec<EntityCrossReference>, SearchError>(Vec::new());
+            }
             let mut q = clickhouse.query(&xref_sql);
             for val in &xref_binds {
                 q = q.bind(val);
             }
             match q.fetch_all::<(String, String, u64)>().await {
-                Ok(rows) => rows
+                Ok(rows) => Ok(rows
                     .into_iter()
                     .map(|(et, ev, ec)| EntityCrossReference {
                         entity_type: et,
                         entity_value: ev,
                         event_count: ec,
                     })
-                    .collect(),
+                    .collect::<Vec<_>>()),
                 Err(e) => {
                     tracing::warn!("Cloud entity pivot cross-ref query failed: {}", e);
-                    Vec::new()
+                    Err(parse_clickhouse_error(&e.to_string()))
                 }
             }
         };
@@ -1784,21 +1812,28 @@ impl SearchService {
                 q = q.bind(val);
             }
             match q.fetch_optional::<SummaryRow>().await {
-                Ok(Some(r)) => json!({
+                Ok(Some(r)) => Ok(json!({
                     "event_count": r.event_count,
                     "fail_count": r.fail_count,
                     "first_seen": r.first_seen,
                     "last_seen": r.last_seen,
                     "change_types": r.change_types,
                     "services": r.services,
-                }),
-                _ => json!({}),
+                })),
+                // Genuine no-data: the entity simply has no matching events.
+                Ok(None) => Ok(json!({})),
+                Err(e) => {
+                    tracing::warn!("Cloud entity pivot summary query failed: {}", e);
+                    Err(parse_clickhouse_error(&e.to_string()))
+                }
             }
         };
 
         let (events, cross_references, entity_summary) =
             tokio::join!(events_future, xref_future, summary_future);
         let events = events?;
+        let cross_references = cross_references?;
+        let entity_summary = entity_summary?;
 
         tracing::info!(
             "Cloud entity pivot for {}='{}': {} events, {} cross-refs",

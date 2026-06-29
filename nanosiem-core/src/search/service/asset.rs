@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use super::*;
+use crate::search::parse_clickhouse_error;
 
 /// Parse an asset time-range timestamp (`query_asset_true_time_range` emits
 /// RFC3339-ish `%Y-%m-%dT%H:%M:%SZ`) into a UTC instant. Returns None on any
@@ -281,7 +282,8 @@ impl SearchService {
         if total_count == 0 {
             let (_first_seen, last_seen) = self
                 .query_asset_true_time_range(&identifier_field, &identifier_value, &identities)
-                .await;
+                .await
+                .unwrap_or((None, None));
             if let Some(ls) = last_seen.as_deref().and_then(parse_asset_timestamp) {
                 if ls < time_range.start || ls > time_range.end {
                     let anchored = TimeRange::new(
@@ -740,7 +742,7 @@ impl SearchService {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!("Asset events query failed to start: {}", e);
-                    return events;
+                    return Err(parse_clickhouse_error(&e.to_string()));
                 }
             };
 
@@ -751,7 +753,7 @@ impl SearchService {
                     Ok(None) => break,
                     Err(e) => {
                         tracing::warn!("Asset events query error reading chunk: {}", e);
-                        break;
+                        return Err(parse_clickhouse_error(&e.to_string()));
                     }
                 }
             }
@@ -763,7 +765,7 @@ impl SearchService {
                     .filter_map(|line| serde_json::from_str(line).ok())
                     .collect();
             }
-            events
+            Ok::<Vec<serde_json::Value>, SearchError>(events)
         };
 
         let has_filters = !filter_conditions.is_empty();
@@ -789,15 +791,17 @@ impl SearchService {
                     .fetch_one::<u64>()
                     .await
                 {
-                    Ok(count) => count,
+                    Ok(count) => Ok(count),
                     Err(e) => {
                         tracing::warn!("Asset count query failed: {}", e);
-                        0
+                        Err(parse_clickhouse_error(&e.to_string()))
                     }
                 }
             };
 
             let (total_count, events) = tokio::join!(count_future, events_future);
+            let total_count = total_count?;
+            let events = events?;
 
             // Return empty facets — frontend keeps its cached initialFacets
             Ok((events, total_count, AssetFacets::default()))
@@ -844,10 +848,10 @@ impl SearchService {
                     .fetch_all::<(String, String, u64)>()
                     .await
                 {
-                    Ok(rows) => rows,
+                    Ok(rows) => Ok(rows),
                     Err(e) => {
                         tracing::warn!("Asset combined facet query failed: {}", e);
-                        Vec::new()
+                        Err(parse_clickhouse_error(&e.to_string()))
                     }
                 }
             };
@@ -865,9 +869,12 @@ impl SearchService {
                             }
                         }
                     }
-                    Err(e) => tracing::warn!("Asset user facet query failed: {}", e),
+                    Err(e) => {
+                        tracing::warn!("Asset user facet query failed: {}", e);
+                        return Err(parse_clickhouse_error(&e.to_string()));
+                    }
                 }
-                facets
+                Ok::<Vec<(String, u64)>, SearchError>(facets)
             };
 
             let count_future = async {
@@ -875,10 +882,10 @@ impl SearchService {
                     .fetch_one::<u64>()
                     .await
                 {
-                    Ok(count) => count,
+                    Ok(count) => Ok(count),
                     Err(e) => {
                         tracing::warn!("Asset count query failed: {}", e);
-                        0
+                        Err(parse_clickhouse_error(&e.to_string()))
                     }
                 }
             };
@@ -890,6 +897,10 @@ impl SearchService {
                 count_future,
                 events_future
             );
+            let combined_facet_rows = combined_facet_rows?;
+            let user_facets = user_facets?;
+            let reliable_count = reliable_count?;
+            let events = events?;
 
             // Aggregate combined facet rows into facet_total, source_type_facets, event_type_facets
             let mut facet_total: u64 = 0;
@@ -1146,7 +1157,7 @@ impl SearchService {
         identifier_field: &str,
         identifier_value: &str,
         identities: &[serde_json::Value],
-    ) -> (Option<String>, Option<String>) {
+    ) -> Result<(Option<String>, Option<String>), SearchError> {
         #[derive(clickhouse::Row, serde::Deserialize)]
         struct AssetTimeRange {
             first_seen: String,
@@ -1155,7 +1166,7 @@ impl SearchService {
 
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
-            None => return (None, None),
+            None => return Ok((None, None)),
         };
 
         let (ips, hostnames, users) =
@@ -1163,7 +1174,7 @@ impl SearchService {
         let (identity_clause, identity_binds) =
             match Self::build_entity_identity_clause(&ips, &hostnames, &users) {
                 Some(pair) => pair,
-                None => return (None, None),
+                None => return Ok((None, None)),
             };
 
         let sql = format!(
@@ -1194,11 +1205,11 @@ impl SearchService {
                 } else {
                     Some(tr.last_seen)
                 };
-                (first_seen, last_seen)
+                Ok((first_seen, last_seen))
             }
             Err(e) => {
                 tracing::warn!("Failed to query true asset time range: {}", e);
-                (None, None)
+                Err(parse_clickhouse_error(&e.to_string()))
             }
         }
     }
@@ -1211,12 +1222,12 @@ impl SearchService {
         identifier_value: &str,
         identities: &[serde_json::Value],
         time_range: &TimeRange,
-    ) -> serde_json::Value {
+    ) -> Result<serde_json::Value, SearchError> {
         use serde_json::json;
 
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
-            None => return json!({ "hashes": [], "domains": [] }),
+            None => return Ok(json!({ "hashes": [], "domains": [] })),
         };
 
         let profile = self.active_profile.as_ref();
@@ -1225,7 +1236,7 @@ impl SearchService {
         let (identity_clause, identity_binds) =
             match Self::build_log_identity_clause_for(profile, &ips, &hostnames, &users) {
                 Some(pair) => pair,
-                None => return json!({ "hashes": [], "domains": [] }),
+                None => return Ok(json!({ "hashes": [], "domains": [] })),
             };
 
         let start_str = time_range.start.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
@@ -1365,7 +1376,7 @@ impl SearchService {
             }).collect(),
             Err(e) => {
                 tracing::warn!("Failed to query asset artifact hashes: {}", e);
-                vec![]
+                return Err(parse_clickhouse_error(&e.to_string()));
             }
         };
 
@@ -1375,11 +1386,11 @@ impl SearchService {
             }).collect(),
             Err(e) => {
                 tracing::warn!("Failed to query asset artifact domains: {}", e);
-                vec![]
+                return Err(parse_clickhouse_error(&e.to_string()));
             }
         };
 
-        json!({ "hashes": hashes, "domains": domains })
+        Ok(json!({ "hashes": hashes, "domains": domains }))
     }
 
     /// Query per-event artifact occurrences across the full search time range.
@@ -1394,12 +1405,12 @@ impl SearchService {
         time_range: &TimeRange,
         hash_filter: Option<&[String]>,
         domain_filter: Option<&[String]>,
-    ) -> serde_json::Value {
+    ) -> Result<serde_json::Value, SearchError> {
         use serde_json::json;
 
         let clickhouse = match &self.ch_client {
             Some(ch) => ch,
-            None => return json!({ "hashes": [], "domains": [] }),
+            None => return Ok(json!({ "hashes": [], "domains": [] })),
         };
 
         let profile = self.active_profile.as_ref();
@@ -1408,7 +1419,7 @@ impl SearchService {
         let (identity_clause, identity_binds) =
             match Self::build_log_identity_clause_for(profile, &ips, &hostnames, &users) {
                 Some(pair) => pair,
-                None => return json!({ "hashes": [], "domains": [] }),
+                None => return Ok(json!({ "hashes": [], "domains": [] })),
             };
 
         let start_str = time_range.start.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
@@ -1527,7 +1538,7 @@ impl SearchService {
                 }).collect(),
                 Err(e) => {
                     tracing::warn!("Failed to query asset artifact hash occurrences: {}", e);
-                    vec![]
+                    return Err(parse_clickhouse_error(&e.to_string()));
                 }
             }
         };
@@ -1545,12 +1556,12 @@ impl SearchService {
                 }).collect(),
                 Err(e) => {
                     tracing::warn!("Failed to query asset artifact domain occurrences: {}", e);
-                    vec![]
+                    return Err(parse_clickhouse_error(&e.to_string()));
                 }
             }
         };
 
-        json!({ "hashes": hashes, "domains": domains })
+        Ok(json!({ "hashes": hashes, "domains": domains }))
     }
 
     /// Detect event type from event fields for timeline display

@@ -46,6 +46,26 @@ pub async fn get_cloud_overview(
     State(state): State<SearchState>,
     Json(request): Json<CloudOverviewRequest>,
 ) -> Result<Json<CloudOverview>, SearchError> {
+    // NAN-1593: the cloud overview landing aggregate fires on every load /
+    // shared-link follow and runs many parallel ClickHouse aggregates — cache
+    // it through the same Dragonfly layer. Keyed on the provider / account
+    // scope and the time range.
+    let cache_key = crate::cache::SearchResultCache::companion_key(
+        "coverview",
+        &[
+            request.provider.as_deref().unwrap_or("").as_bytes(),
+            request.account.as_deref().unwrap_or("").as_bytes(),
+            request.time_range.start.timestamp_micros().to_string().as_bytes(),
+            request.time_range.end.timestamp_micros().to_string().as_bytes(),
+        ],
+    );
+    if let Some(cache) = state.result_cache.as_ref() {
+        if let Some(cached) = cache.get_cached::<CloudOverview>(&cache_key).await {
+            record_search_query("cloud_overview_cached", 0.0, true);
+            return Ok(Json(cached));
+        }
+    }
+
     let start = Instant::now();
 
     let time_range =
@@ -63,10 +83,18 @@ pub async fn get_cloud_overview(
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
     record_search_query("cloud_overview", duration_ms, result.is_ok());
 
-    let overview = result.map_err(|e| {
+    let response = result.map_err(|e| {
         tracing::error!(error = %e, "Cloud overview query failed");
         SearchError::QueryError("Failed to fetch cloud overview".to_string())
     })?;
 
-    Ok(Json(overview))
+    if let Some(cache) = state.result_cache.as_ref() {
+        let cache = cache.clone();
+        let resp = response.clone();
+        tokio::spawn(async move {
+            cache.set_cached(&cache_key, &resp).await;
+        });
+    }
+
+    Ok(Json(response))
 }

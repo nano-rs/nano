@@ -431,6 +431,29 @@ pub async fn prevalence_artifacts(
         request.query = enforce_non_audit_query(&request.query)?;
     }
 
+    // NAN-1593: the prevalence-artifacts scatter fires on every search-page
+    // load / shared-link follow, separately from the main search — cache it
+    // through the same Dragonfly layer so reloads don't re-extract artifacts
+    // and re-run their prevalence lookups. Keyed on the post-permission
+    // `query` (audit enforcement may rewrite it) plus the time range and
+    // dataset; `request_id` is excluded since it's a per-request cancellation
+    // handle, not part of result identity.
+    let cache_key = crate::cache::SearchResultCache::companion_key(
+        "prevart",
+        &[
+            request.query.as_bytes(),
+            request.time_range.start.timestamp_micros().to_string().as_bytes(),
+            request.time_range.end.timestamp_micros().to_string().as_bytes(),
+            request.dataset.as_deref().unwrap_or("logs").as_bytes(),
+        ],
+    );
+    if let Some(cache) = state.result_cache.as_ref() {
+        if let Some(cached) = cache.get_cached::<PrevalenceScatterData>(&cache_key).await {
+            record_search_query("prevalence_artifacts_cached", 0.0, true);
+            return Ok(Json(cached));
+        }
+    }
+
     let start = Instant::now();
     let result = state.search.get_prevalence_artifacts(&request).await;
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -442,7 +465,16 @@ pub async fn prevalence_artifacts(
         Err(e) => tracing::error!("Prevalence artifacts failed: {:?}", e),
     }
 
-    Ok(Json(result?))
+    let response = result?;
+    if let Some(cache) = state.result_cache.as_ref() {
+        let cache = cache.clone();
+        let resp = response.clone();
+        tokio::spawn(async move {
+            cache.set_cached(&cache_key, &resp).await;
+        });
+    }
+
+    Ok(Json(response))
 }
 
 /// Get field statistics for a search query (async, separate from main search)
@@ -479,6 +511,31 @@ pub async fn field_stats_for_query(
         end: request.end,
     };
 
+    // NAN-1593: the field-stats panel fires on every search-page load and
+    // shared-link follow, separately from the main search — cache it through
+    // the same Dragonfly layer so reloads don't re-run the aggregation. Keyed
+    // on the post-permission `query` (audit enforcement may rewrite it) plus
+    // the time range / column subset / dataset; `request_id` is excluded since
+    // it's a per-request cancellation handle, not part of result identity.
+    let cache_key = crate::cache::SearchResultCache::companion_key(
+        "fstats",
+        &[
+            query.as_bytes(),
+            request.start.timestamp_micros().to_string().as_bytes(),
+            request.end.timestamp_micros().to_string().as_bytes(),
+            // JSON-encode (not join) so a comma in a column name can't shift the
+            // boundary — ["a,b"] must not collide with ["a","b"] (NAN-1593 review).
+            serde_json::to_string(&request.columns).unwrap_or_default().as_bytes(),
+            request.dataset.as_deref().unwrap_or("logs").as_bytes(),
+        ],
+    );
+    if let Some(cache) = state.result_cache.as_ref() {
+        if let Some(cached) = cache.get_cached::<FieldStatsResponse>(&cache_key).await {
+            record_search_query("field_stats_cached", 0.0, true);
+            return Ok(Json(cached));
+        }
+    }
+
     // NAN-1428: reserve ownership of the request_id so the cancel endpoint
     // can authorize killing the derived `{request_id}-fstats` query even
     // after the main search has completed and unregistered the id.
@@ -506,10 +563,19 @@ pub async fn field_stats_for_query(
         .await?;
     let total_events = fields.iter().map(|f| f.count).max().unwrap_or(0);
 
-    Ok(Json(FieldStatsResponse {
+    let response = FieldStatsResponse {
         fields,
         total_events,
-    }))
+    };
+    if let Some(cache) = state.result_cache.as_ref() {
+        let cache = cache.clone();
+        let resp = response.clone();
+        tokio::spawn(async move {
+            cache.set_cached(&cache_key, &resp).await;
+        });
+    }
+
+    Ok(Json(response))
 }
 
 /// Get top values for a SINGLE field (on-demand, Kibana-style)
@@ -545,6 +611,29 @@ pub async fn field_values(
         end: request.end,
     };
 
+    // NAN-1593: drill-in field values are re-requested whenever the user
+    // re-expands a field, and re-fetched on shared-link follow — cache them
+    // through the same Dragonfly layer. Keyed on the post-permission `query`
+    // (audit enforcement may rewrite it) plus the field, time range, limit,
+    // and dataset.
+    let cache_key = crate::cache::SearchResultCache::companion_key(
+        "fvalues",
+        &[
+            request.field.as_bytes(),
+            query.as_bytes(),
+            request.start.timestamp_micros().to_string().as_bytes(),
+            request.end.timestamp_micros().to_string().as_bytes(),
+            request.limit.to_string().as_bytes(),
+            request.dataset.as_deref().unwrap_or("logs").as_bytes(),
+        ],
+    );
+    if let Some(cache) = state.result_cache.as_ref() {
+        if let Some(cached) = cache.get_cached::<FieldValuesResponse>(&cache_key).await {
+            record_search_query("field_values_cached", 0.0, true);
+            return Ok(Json(cached));
+        }
+    }
+
     let result = state
         .search
         .get_field_values(
@@ -562,11 +651,20 @@ pub async fn field_values(
     let values = result?;
     let total_count: u64 = values.iter().map(|v| v.count).sum();
 
-    Ok(Json(FieldValuesResponse {
+    let response = FieldValuesResponse {
         field: request.field,
         values,
         total_count,
-    }))
+    };
+    if let Some(cache) = state.result_cache.as_ref() {
+        let cache = cache.clone();
+        let resp = response.clone();
+        tokio::spawn(async move {
+            cache.set_cached(&cache_key, &resp).await;
+        });
+    }
+
+    Ok(Json(response))
 }
 
 /// Request for on-demand field values
@@ -596,7 +694,7 @@ fn default_field_values_limit() -> usize {
 }
 
 /// Response for field values
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct FieldValuesResponse {
     /// The field name
     pub field: String,
@@ -637,7 +735,7 @@ pub struct FieldStatsRequest {
 }
 
 /// Response for field stats
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct FieldStatsResponse {
     /// Field information list
     pub fields: Vec<nanosiem_core::search::FieldInfo>,

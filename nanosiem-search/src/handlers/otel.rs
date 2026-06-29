@@ -32,7 +32,7 @@ use crate::{SearchState, error::SearchError, metrics::record_search_query};
 /// caller can build the waterfall directly. Spans are returned as raw JSON
 /// objects (the full `otel_spans` column set incl. the `attributes` /
 /// `resource_attributes` maps and the entity overlay).
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TraceResponse {
     /// The trace id that was requested (lowercased hex).
     pub trace_id: String,
@@ -69,6 +69,19 @@ pub async fn get_trace(
 ) -> Result<Json<TraceResponse>, SearchError> {
     let start = Instant::now();
 
+    // NAN-1593: the trace waterfall re-fetches on every load / shared-link
+    // follow — cache it through the same Dragonfly layer as the main search.
+    let cache_key = crate::cache::SearchResultCache::companion_key(
+        "trace",
+        &[trace_id.to_ascii_lowercase().as_bytes()],
+    );
+    if let Some(cache) = state.result_cache.as_ref() {
+        if let Some(cached) = cache.get_cached::<TraceResponse>(&cache_key).await {
+            record_search_query("otel_trace_cached", 0.0, true);
+            return Ok(Json(cached));
+        }
+    }
+
     let result = state.search.query_otel_trace_by_id(&trace_id).await;
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -79,11 +92,20 @@ pub async fn get_trace(
         SearchError::QueryError("Failed to fetch trace".to_string())
     })?;
 
-    Ok(Json(TraceResponse {
+    let response = TraceResponse {
         trace_id: trace_id.to_ascii_lowercase(),
         span_count: spans.len(),
         spans,
-    }))
+    };
+    if let Some(cache) = state.result_cache.as_ref() {
+        let cache = cache.clone();
+        let resp = response.clone();
+        tokio::spawn(async move {
+            cache.set_cached(&cache_key, &resp).await;
+        });
+    }
+
+    Ok(Json(response))
 }
 
 // ============================================================================
@@ -147,7 +169,7 @@ pub struct MetricSeries {
 }
 
 /// Response for a metric time series: one or more labelled series (NAN-1540).
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MetricTimeseriesResponse {
     /// The metric name that was queried.
     pub metric_name: String,
@@ -231,6 +253,44 @@ pub async fn get_metric_timeseries(
         step_secs: request.step_secs,
     };
 
+    // NAN-1593: metric panels re-query on every dashboard render / shared-link
+    // follow — cache through the same Dragonfly layer. Keyed on the metric name,
+    // service, time range, bucket width, canonical aggregate, group_by, and the
+    // exact filter set (all of which change the series output). The filter set is
+    // JSON-encoded as ordered (key, value) pairs — `MetricTagFilter` isn't
+    // `Serialize`, but JSON-escaping the pairs (rather than joining on a
+    // delimiter) keeps a value containing `=` or the separator from colliding a
+    // single filter with two (NAN-1593 review).
+    let filters_key = serde_json::to_string(
+        &filters
+            .iter()
+            .map(|f| [f.key.as_str(), f.value.as_str()])
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_default();
+    let cache_key = crate::cache::SearchResultCache::companion_key(
+        "mts",
+        &[
+            request.metric_name.as_bytes(),
+            service.unwrap_or("").as_bytes(),
+            request.time_range.start.timestamp_micros().to_string().as_bytes(),
+            request.time_range.end.timestamp_micros().to_string().as_bytes(),
+            request.step_secs.to_string().as_bytes(),
+            agg.as_str().as_bytes(),
+            group_by.unwrap_or("").as_bytes(),
+            filters_key.as_bytes(),
+        ],
+    );
+    if let Some(cache) = state.result_cache.as_ref() {
+        if let Some(cached) = cache
+            .get_cached::<MetricTimeseriesResponse>(&cache_key)
+            .await
+        {
+            record_search_query("otel_metric_timeseries_cached", 0.0, true);
+            return Ok(Json(cached));
+        }
+    }
+
     let result = state
         .search
         .query_otel_metric_timeseries_v2(&query, &time_range)
@@ -244,13 +304,22 @@ pub async fn get_metric_timeseries(
         SearchError::QueryError("Failed to fetch metric time series".to_string())
     })?;
 
-    Ok(Json(MetricTimeseriesResponse {
+    let response = MetricTimeseriesResponse {
         metric_name: request.metric_name,
         agg: agg.as_str().to_string(),
         group_by: group_by.map(|s| s.to_string()),
         series,
         step_secs: request.step_secs.max(1),
-    }))
+    };
+    if let Some(cache) = state.result_cache.as_ref() {
+        let cache = cache.clone();
+        let resp = response.clone();
+        tokio::spawn(async move {
+            cache.set_cached(&cache_key, &resp).await;
+        });
+    }
+
+    Ok(Json(response))
 }
 
 // ============================================================================
@@ -276,7 +345,7 @@ pub struct MetricTagsParams {
 
 /// Response for the metric-tags endpoint. Exactly one of the two arrays is
 /// populated per request (keys when `key` is omitted, values when given).
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MetricTagsResponse {
     /// Distinct tag/attribute keys present for the metric (when `key` omitted).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -319,6 +388,25 @@ pub async fn list_metric_tags(
 
     let time_range = resolve_window(params.start, params.end, params.window_hours)?;
 
+    // NAN-1593: the group-by / filter-value pickers re-fetch on every metrics
+    // explorer load — cache through the same Dragonfly layer. Keyed on the
+    // metric name, the optional tag key, and the resolved window.
+    let cache_key = crate::cache::SearchResultCache::companion_key(
+        "mtags",
+        &[
+            params.metric_name.as_bytes(),
+            params.key.as_deref().unwrap_or("").as_bytes(),
+            time_range.start.timestamp_micros().to_string().as_bytes(),
+            time_range.end.timestamp_micros().to_string().as_bytes(),
+        ],
+    );
+    if let Some(cache) = state.result_cache.as_ref() {
+        if let Some(cached) = cache.get_cached::<MetricTagsResponse>(&cache_key).await {
+            record_search_query("otel_metric_tags_cached", 0.0, true);
+            return Ok(Json(cached));
+        }
+    }
+
     let response = match params.key.as_deref().filter(|s| !s.is_empty()) {
         None => {
             let result = state
@@ -356,6 +444,14 @@ pub async fn list_metric_tags(
             }
         }
     };
+
+    if let Some(cache) = state.result_cache.as_ref() {
+        let cache = cache.clone();
+        let resp = response.clone();
+        tokio::spawn(async move {
+            cache.set_cached(&cache_key, &resp).await;
+        });
+    }
 
     Ok(Json(response))
 }
@@ -397,7 +493,7 @@ pub struct ListTracesParams {
 }
 
 /// Response for the recent-traces list.
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ListTracesResponse {
     /// One object per trace, most-recent-first. Each carries `trace_id`,
     /// `root_service`, `root_name`, `span_count`, `error_count`, `duration_ns`,
@@ -457,6 +553,36 @@ pub async fn list_traces(
         before: params.before,
     };
 
+    // NAN-1593: the Traces explorer list re-fetches on every load / paging /
+    // shared-link follow — cache through the same Dragonfly layer. Keyed on the
+    // resolved window plus every filter + the keyset cursor that shapes the page.
+    let cache_key = crate::cache::SearchResultCache::companion_key(
+        "traces",
+        &[
+            time_range.start.timestamp_micros().to_string().as_bytes(),
+            time_range.end.timestamp_micros().to_string().as_bytes(),
+            service.unwrap_or("").as_bytes(),
+            if params.errors_only { "e1" } else { "e0" }.as_bytes(),
+            params
+                .min_duration_ns
+                .map(|v| v.to_string())
+                .unwrap_or_default()
+                .as_bytes(),
+            params.limit.map(|v| v.to_string()).unwrap_or_default().as_bytes(),
+            params
+                .before
+                .map(|t| t.timestamp_micros().to_string())
+                .unwrap_or_default()
+                .as_bytes(),
+        ],
+    );
+    if let Some(cache) = state.result_cache.as_ref() {
+        if let Some(cached) = cache.get_cached::<ListTracesResponse>(&cache_key).await {
+            record_search_query("otel_traces_list_cached", 0.0, true);
+            return Ok(Json(cached));
+        }
+    }
+
     let result = state.search.list_otel_traces(&time_range, &filters).await;
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -467,10 +593,19 @@ pub async fn list_traces(
         SearchError::QueryError("Failed to list traces".to_string())
     })?;
 
-    Ok(Json(ListTracesResponse {
+    let response = ListTracesResponse {
         count: traces.len(),
         traces,
-    }))
+    };
+    if let Some(cache) = state.result_cache.as_ref() {
+        let cache = cache.clone();
+        let resp = response.clone();
+        tokio::spawn(async move {
+            cache.set_cached(&cache_key, &resp).await;
+        });
+    }
+
+    Ok(Json(response))
 }
 
 // ============================================================================
@@ -485,7 +620,7 @@ pub struct MetricNamesParams {
 }
 
 /// Response for the metric-names list.
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct MetricNamesResponse {
     /// Distinct metric names, name-ordered. Each object is `{metric_name}`.
     pub names: Vec<serde_json::Value>,
@@ -517,6 +652,20 @@ pub async fn list_metric_names(
     let start = Instant::now();
 
     let service = params.service.as_deref().filter(|s| !s.is_empty());
+
+    // NAN-1593: the metrics-explorer dropdown re-fetches on every load — cache
+    // through the same Dragonfly layer. Keyed on the optional service filter.
+    let cache_key = crate::cache::SearchResultCache::companion_key(
+        "mnames",
+        &[service.unwrap_or("").as_bytes()],
+    );
+    if let Some(cache) = state.result_cache.as_ref() {
+        if let Some(cached) = cache.get_cached::<MetricNamesResponse>(&cache_key).await {
+            record_search_query("otel_metric_names_cached", 0.0, true);
+            return Ok(Json(cached));
+        }
+    }
+
     let result = state.search.list_otel_metric_names(service).await;
 
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -527,10 +676,19 @@ pub async fn list_metric_names(
         SearchError::QueryError("Failed to list metric names".to_string())
     })?;
 
-    Ok(Json(MetricNamesResponse {
+    let response = MetricNamesResponse {
         count: names.len(),
         names,
-    }))
+    };
+    if let Some(cache) = state.result_cache.as_ref() {
+        let cache = cache.clone();
+        let resp = response.clone();
+        tokio::spawn(async move {
+            cache.set_cached(&cache_key, &resp).await;
+        });
+    }
+
+    Ok(Json(response))
 }
 
 // ============================================================================
@@ -597,7 +755,7 @@ pub struct ServicesParams {
 }
 
 /// Response for the services overview: one RED summary row per service.
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ServicesOverviewResponse {
     /// One object per `service` with `request_count`, `rate_per_sec`,
     /// `error_rate` (0..1), `p50_ms`/`p95_ms`/`p99_ms`, `health`
@@ -659,6 +817,32 @@ pub async fn list_services(
         sort,
     };
 
+    // NAN-1593: the Services tab re-fetches on every console load / filter /
+    // paging — cache through the same Dragonfly layer. Keyed on the resolved
+    // window, bucket width, and every filter/sort/paging param.
+    let cache_key = crate::cache::SearchResultCache::companion_key(
+        "svcs",
+        &[
+            time_range.start.timestamp_micros().to_string().as_bytes(),
+            time_range.end.timestamp_micros().to_string().as_bytes(),
+            step.to_string().as_bytes(),
+            filters.q.unwrap_or("").as_bytes(),
+            health.as_deref().unwrap_or("").as_bytes(),
+            params.sort.as_deref().unwrap_or("").as_bytes(),
+            params.offset.to_string().as_bytes(),
+            params.limit.map(|v| v.to_string()).unwrap_or_default().as_bytes(),
+        ],
+    );
+    if let Some(cache) = state.result_cache.as_ref() {
+        if let Some(cached) = cache
+            .get_cached::<ServicesOverviewResponse>(&cache_key)
+            .await
+        {
+            record_search_query("otel_services_overview_cached", 0.0, true);
+            return Ok(Json(cached));
+        }
+    }
+
     let result = state
         .search
         .observability_services_overview(
@@ -680,11 +864,20 @@ pub async fn list_services(
     })?;
 
     let has_more = (params.offset as usize) + services.len() < total;
-    Ok(Json(ServicesOverviewResponse {
+    let response = ServicesOverviewResponse {
         services,
         total,
         has_more,
-    }))
+    };
+    if let Some(cache) = state.result_cache.as_ref() {
+        let cache = cache.clone();
+        let resp = response.clone();
+        tokio::spawn(async move {
+            cache.set_cached(&cache_key, &resp).await;
+        });
+    }
+
+    Ok(Json(response))
 }
 
 /// Default exemplar sample size for the service detail.
@@ -710,7 +903,7 @@ pub struct ServiceDetailParams {
 
 /// Response wrapper for the service detail. The body is the full detail object
 /// (`service`, `red`, `endpoints`, `exemplars`) assembled by the core glue.
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ServiceDetailResponse {
     /// Service-detail payload: `{ service, red:{rate,errors,latency},
     /// endpoints:[…], exemplars:[…] }`.
@@ -756,6 +949,26 @@ pub async fn get_service_detail(
     let time_range = resolve_window(params.start, params.end, params.window_hours)?;
     let step = step_for_window(&time_range);
 
+    // NAN-1593: the service-detail drill-in re-fetches on every open / shared-link
+    // follow — cache through the same Dragonfly layer. Keyed on the service name,
+    // resolved window, bucket width, and exemplar sample cap.
+    let cache_key = crate::cache::SearchResultCache::companion_key(
+        "svcdetail",
+        &[
+            service.as_bytes(),
+            time_range.start.timestamp_micros().to_string().as_bytes(),
+            time_range.end.timestamp_micros().to_string().as_bytes(),
+            step.to_string().as_bytes(),
+            params.exemplar_limit.to_string().as_bytes(),
+        ],
+    );
+    if let Some(cache) = state.result_cache.as_ref() {
+        if let Some(cached) = cache.get_cached::<ServiceDetailResponse>(&cache_key).await {
+            record_search_query("otel_service_detail_cached", 0.0, true);
+            return Ok(Json(cached));
+        }
+    }
+
     let result = state
         .search
         .observability_service_detail(&service, &time_range, step, Some(params.exemplar_limit))
@@ -769,7 +982,16 @@ pub async fn get_service_detail(
         SearchError::QueryError("Failed to fetch service detail".to_string())
     })?;
 
-    Ok(Json(ServiceDetailResponse { detail }))
+    let response = ServiceDetailResponse { detail };
+    if let Some(cache) = state.result_cache.as_ref() {
+        let cache = cache.clone();
+        let resp = response.clone();
+        tokio::spawn(async move {
+            cache.set_cached(&cache_key, &resp).await;
+        });
+    }
+
+    Ok(Json(response))
 }
 
 // ============================================================================
@@ -807,7 +1029,7 @@ pub struct InfraHostsParams {
 }
 
 /// Response for the infrastructure hosts overview: one row per host.
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct InfraHostsResponse {
     /// One object per host with `host`, `group` (`host.group` or service
     /// fallback, nullable), the latest gauge values `cpu_pct`/`mem_pct`/`load`/
@@ -865,6 +1087,29 @@ pub async fn list_infra_hosts(
         env: params.env.as_deref().filter(|s| !s.is_empty()),
     };
 
+    // NAN-1593: the Infra tab re-fetches on every console load / filter / paging
+    // — cache through the same Dragonfly layer. Keyed on the resolved window plus
+    // every filter/status/paging param.
+    let cache_key = crate::cache::SearchResultCache::companion_key(
+        "infra",
+        &[
+            time_range.start.timestamp_micros().to_string().as_bytes(),
+            time_range.end.timestamp_micros().to_string().as_bytes(),
+            filters.q.unwrap_or("").as_bytes(),
+            filters.group.unwrap_or("").as_bytes(),
+            filters.env.unwrap_or("").as_bytes(),
+            status.as_deref().unwrap_or("").as_bytes(),
+            params.offset.to_string().as_bytes(),
+            params.limit.map(|v| v.to_string()).unwrap_or_default().as_bytes(),
+        ],
+    );
+    if let Some(cache) = state.result_cache.as_ref() {
+        if let Some(cached) = cache.get_cached::<InfraHostsResponse>(&cache_key).await {
+            record_search_query("otel_infra_hosts_cached", 0.0, true);
+            return Ok(Json(cached));
+        }
+    }
+
     let result = state
         .search
         .observability_infra_hosts(&time_range, &filters, status.as_deref(), params.offset, params.limit)
@@ -879,11 +1124,20 @@ pub async fn list_infra_hosts(
     })?;
 
     let has_more = (params.offset as usize) + hosts.len() < total;
-    Ok(Json(InfraHostsResponse {
+    let response = InfraHostsResponse {
         hosts,
         total,
         has_more,
-    }))
+    };
+    if let Some(cache) = state.result_cache.as_ref() {
+        let cache = cache.clone();
+        let resp = response.clone();
+        tokio::spawn(async move {
+            cache.set_cached(&cache_key, &resp).await;
+        });
+    }
+
+    Ok(Json(response))
 }
 
 // ============================================================================
@@ -911,7 +1165,7 @@ pub struct RumParams {
 
 /// Response wrapper for the RUM summary. The body is the full RUM object
 /// assembled by the core glue.
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RumSummaryResponse {
     /// RUM payload: `{ web_vitals:{lcp_ms,inp_ms,cls}, page_views,
     /// page_views_series:[{t,v}], js_errors, top_pages:[{page,views,lcp_ms}],
@@ -955,6 +1209,27 @@ pub async fn get_rum_summary(
         env: params.env.as_deref().filter(|s| !s.is_empty()),
     };
 
+    // NAN-1593: the RUM tab re-fetches on every console load / filter / shared-link
+    // follow — cache through the same Dragonfly layer. Keyed on the resolved
+    // window, bucket width, and every filter param.
+    let cache_key = crate::cache::SearchResultCache::companion_key(
+        "rum",
+        &[
+            time_range.start.timestamp_micros().to_string().as_bytes(),
+            time_range.end.timestamp_micros().to_string().as_bytes(),
+            step.to_string().as_bytes(),
+            filters.page.unwrap_or("").as_bytes(),
+            filters.browser.unwrap_or("").as_bytes(),
+            filters.env.unwrap_or("").as_bytes(),
+        ],
+    );
+    if let Some(cache) = state.result_cache.as_ref() {
+        if let Some(cached) = cache.get_cached::<RumSummaryResponse>(&cache_key).await {
+            record_search_query("otel_rum_summary_cached", 0.0, true);
+            return Ok(Json(cached));
+        }
+    }
+
     let result = state
         .search
         .observability_rum_summary(&time_range, step, &filters)
@@ -968,5 +1243,14 @@ pub async fn get_rum_summary(
         SearchError::QueryError("Failed to fetch RUM summary".to_string())
     })?;
 
-    Ok(Json(RumSummaryResponse { rum }))
+    let response = RumSummaryResponse { rum };
+    if let Some(cache) = state.result_cache.as_ref() {
+        let cache = cache.clone();
+        let resp = response.clone();
+        tokio::spawn(async move {
+            cache.set_cached(&cache_key, &resp).await;
+        });
+    }
+
+    Ok(Json(response))
 }

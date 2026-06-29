@@ -10,6 +10,8 @@ use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use nanosiem_core::{SearchRequest, SearchResponse};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use sha2::{Digest, Sha256};
@@ -85,36 +87,26 @@ impl SearchResultCache {
     /// table_view, or skip_histogram settings produce distinct cache entries.
     /// Uses SHA-256 for collision resistance.
     pub fn cache_key(request: &SearchRequest) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(request.query.as_bytes());
-        hasher.update(b"|");
-        hasher.update(request.time_range.start.timestamp().to_string().as_bytes());
-        hasher.update(b"|");
-        hasher.update(request.time_range.end.timestamp().to_string().as_bytes());
-        hasher.update(b"|");
-        hasher.update(request.limit.unwrap_or(100).to_string().as_bytes());
-        hasher.update(b"|");
-        hasher.update(request.offset.unwrap_or(0).to_string().as_bytes());
-        hasher.update(b"|");
-        hasher.update(if request.table_view { "tv1" } else { "tv0" }.as_bytes());
-        hasher.update(b"|");
-        hasher.update(if request.skip_histogram { "sh1" } else { "sh0" }.as_bytes());
-        hasher.update(b"|");
-        hasher.update(
-            if request.skip_field_stats {
-                "sf1"
-            } else {
-                "sf0"
-            }
-            .as_bytes(),
-        );
-        hasher.update(b"|");
-        // NAN-1569: the same nPL string runs against different physical tables per
-        // dataset (logs / otel_spans / otel_metrics). Without this, a query cached
-        // for one dataset is served for another → cross-dataset cache poisoning.
-        hasher.update(request.dataset.as_deref().unwrap_or("logs").as_bytes());
-        let hash = hasher.finalize();
-        format!("search:{}", hex::encode(hash))
+        // Length-prefixed components (see `companion_key`): the query is
+        // free-form and contains `|`, so a delimiter join is collision-prone.
+        Self::companion_key(
+            "search",
+            &[
+                request.query.as_bytes(),
+                request.time_range.start.timestamp_micros().to_string().as_bytes(),
+                request.time_range.end.timestamp_micros().to_string().as_bytes(),
+                request.limit.unwrap_or(100).to_string().as_bytes(),
+                request.offset.unwrap_or(0).to_string().as_bytes(),
+                if request.table_view { b"tv1" } else { b"tv0" },
+                if request.skip_histogram { b"sh1" } else { b"sh0" },
+                if request.skip_field_stats { b"sf1" } else { b"sf0" },
+                // NAN-1569: the same nPL string runs against different physical
+                // tables per dataset (logs / otel_spans / otel_metrics). Without
+                // this, a query cached for one dataset is served for another →
+                // cross-dataset cache poisoning.
+                request.dataset.as_deref().unwrap_or("logs").as_bytes(),
+            ],
+        )
     }
 
     /// Try to get a cached search response.
@@ -259,6 +251,130 @@ impl SearchResultCache {
             }
         }
     }
+
+    // ── Generic companion-endpoint caching (NAN-1593) ──
+    //
+    // Only the main search response went through this cache. Companion
+    // endpoints the search page also fires on every load / shared-link follow
+    // — retro rollups (`/api/search/retro`) and field-stats (`/field-stats`) —
+    // bypassed it, so each reload re-ran their full SQL. These generic helpers
+    // give any serializable response the same compressed, TTL-bounded caching
+    // under a caller-chosen keyspace. Callers build a deterministic key with
+    // [`Self::companion_key`].
+    //
+    // Unlike NAN-1027's "never cache empties" rule for the main search, a
+    // *zero-result* companion is the EXPENSIVE case worth caching — a retro
+    // that scanned all data to prove a negative, or field-stats over a wide
+    // window — so companions cache unconditionally, with the same short TTL
+    // bounding staleness from late-arriving data.
+
+    /// Build a deterministic cache key from a keyspace prefix and ordered
+    /// components. The prefix keeps each companion's keyspace disjoint from
+    /// search (`search:`) and from the others.
+    ///
+    /// Components are **length-prefixed**, not delimiter-joined. A naive `|`
+    /// delimiter is unsafe here: nPL queries contain `|` (`ioc=x | retro`) and
+    /// several callers pass free-form JSON components (`filters`, `identities`),
+    /// so `["a|b","c"]` and `["a","b|c"]` would hash identically — a different
+    /// request served from the wrong cache entry (false results from a SIEM).
+    /// Prefixing each component with its byte length makes the boundary
+    /// unambiguous regardless of content.
+    pub fn companion_key(prefix: &str, components: &[&[u8]]) -> String {
+        let mut hasher = Sha256::new();
+        for c in components {
+            hasher.update((c.len() as u64).to_le_bytes());
+            hasher.update(c);
+        }
+        format!("{}:{}", prefix, hex::encode(hasher.finalize()))
+    }
+
+    /// Fetch and decompress a cached companion response. Returns `None` on
+    /// miss, connection error, or any decode failure (graceful degradation).
+    pub async fn get_cached<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
+        let mut conn = self.conn.clone();
+        let compressed: Vec<u8> = match conn.get::<_, Option<Vec<u8>>>(key).await {
+            Ok(Some(d)) => d,
+            Ok(None) => {
+                info!(cache_key = %key, "Companion cache MISS");
+                return None;
+            }
+            Err(e) => {
+                debug!("Companion cache GET error for {}: {}", key, e);
+                return None;
+            }
+        };
+
+        let mut decoder = GzDecoder::new(&compressed[..]);
+        let mut json_bytes = Vec::new();
+        if let Err(e) = decoder.read_to_end(&mut json_bytes) {
+            warn!("Companion cache decompression error for {}: {}", key, e);
+            return None;
+        }
+
+        match serde_json::from_slice::<T>(&json_bytes) {
+            Ok(value) => {
+                info!(
+                    cache_key = %key,
+                    compressed_kb = format_args!("{:.1}", compressed.len() as f64 / 1024.0),
+                    "Companion cache HIT"
+                );
+                Some(value)
+            }
+            Err(e) => {
+                warn!("Companion cache deserialization error for {}: {}", key, e);
+                None
+            }
+        }
+    }
+
+    /// Compress and store a companion response under `key` with the shared TTL.
+    pub async fn set_cached<T: Serialize>(&self, key: &str, value: &T) {
+        let mut conn = self.conn.clone();
+        let json_bytes = match serde_json::to_vec(value) {
+            Ok(b) => b,
+            Err(e) => {
+                debug!("Companion cache serialization error: {}", e);
+                return;
+            }
+        };
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        if encoder.write_all(&json_bytes).is_err() {
+            return;
+        }
+        let compressed = match encoder.finish() {
+            Ok(c) => c,
+            Err(e) => {
+                debug!("Companion cache compression finish error: {}", e);
+                return;
+            }
+        };
+
+        if compressed.len() > MAX_CACHE_SIZE {
+            debug!(
+                "Skipping companion cache: compressed size {}KB exceeds limit of {}KB",
+                compressed.len() / 1024,
+                MAX_CACHE_SIZE / 1024
+            );
+            return;
+        }
+
+        match conn
+            .set_ex::<_, _, ()>(key, &compressed[..], CACHE_TTL_SECS)
+            .await
+        {
+            Ok(()) => {
+                info!(
+                    cache_key = %key,
+                    compressed_kb = format_args!("{:.1}", compressed.len() as f64 / 1024.0),
+                    "Companion cache SET"
+                );
+            }
+            Err(e) => {
+                warn!("Companion cache SET error for {}: {}", key, e);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -361,11 +477,14 @@ mod tests {
     fn cache_key_distinguishes_dataset() {
         // NAN-1569: the same nPL string on different datasets hits different
         // physical tables, so it must NOT share a cache entry.
+        // Fixed timestamps: the key now uses microsecond precision, so two
+        // separate `Utc::now()` calls would differ and mask the dataset check.
+        let start = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
         let mk = |dataset: Option<&str>| SearchRequest {
             query: "foo".into(),
             time_range: TimeRangeInput {
-                start: chrono::Utc::now(),
-                end: chrono::Utc::now() + chrono::Duration::hours(1),
+                start,
+                end: start + chrono::Duration::hours(1),
             },
             limit: Some(100),
             offset: None,
@@ -392,6 +511,41 @@ mod tests {
         assert_eq!(
             SearchResultCache::cache_key(&mk(None)),
             SearchResultCache::cache_key(&mk(Some("logs")))
+        );
+    }
+
+    #[test]
+    fn companion_key_is_deterministic_and_keyspace_isolated() {
+        // NAN-1593: same prefix + same components → identical key.
+        let a = SearchResultCache::companion_key("retro", &[b"ioc=1.2.3.4", b"100", b"200"]);
+        let b = SearchResultCache::companion_key("retro", &[b"ioc=1.2.3.4", b"100", b"200"]);
+        assert_eq!(a, b);
+
+        // A changed component → different key.
+        let c = SearchResultCache::companion_key("retro", &[b"ioc=1.2.3.4", b"100", b"201"]);
+        assert_ne!(a, c);
+
+        // Different keyspace prefixes never collide, even with identical
+        // components — retro / field-stats / search stay disjoint.
+        let retro = SearchResultCache::companion_key("retro", &[b"q", b"t"]);
+        let fstats = SearchResultCache::companion_key("fstats", &[b"q", b"t"]);
+        assert_ne!(retro, fstats);
+        assert!(retro.starts_with("retro:"));
+        assert!(fstats.starts_with("fstats:"));
+
+        // Component boundaries are unambiguous: ["ab","c"] != ["a","bc"].
+        assert_ne!(
+            SearchResultCache::companion_key("x", &[b"ab", b"c"]),
+            SearchResultCache::companion_key("x", &[b"a", b"bc"]),
+        );
+
+        // Poisoning regression: a `|` inside a component (nPL queries contain
+        // pipes) must NOT shift the boundary. With a naive `|`-delimiter join
+        // these two would hash identically — a different query served from the
+        // wrong cache entry. Length-prefixing keeps them distinct.
+        assert_ne!(
+            SearchResultCache::companion_key("retro", &[b"ioc=x | retro", b"100"]),
+            SearchResultCache::companion_key("retro", &[b"ioc=x", b" retro|100"]),
         );
     }
 }

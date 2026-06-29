@@ -50,6 +50,30 @@ pub async fn get_asset_dossier(
     State(state): State<SearchState>,
     Json(request): Json<AssetDossierRequest>,
 ) -> Result<Json<AssetDossier>, SearchError> {
+    // NAN-1593: the asset dossier fires on every Asset-view load / shared-link
+    // follow and runs 8 parallel ClickHouse aggregates — cache it through the
+    // same Dragonfly layer so reloads return instantly. Keyed on the
+    // identifier, the resolved identities (they widen the match set), and the
+    // time range.
+    let cache_key = crate::cache::SearchResultCache::companion_key(
+        "adossier",
+        &[
+            request.identifier_field.as_bytes(),
+            request.identifier_value.as_bytes(),
+            serde_json::to_string(&request.identities)
+                .unwrap_or_default()
+                .as_bytes(),
+            request.time_range.start.timestamp_micros().to_string().as_bytes(),
+            request.time_range.end.timestamp_micros().to_string().as_bytes(),
+        ],
+    );
+    if let Some(cache) = state.result_cache.as_ref() {
+        if let Some(cached) = cache.get_cached::<AssetDossier>(&cache_key).await {
+            record_search_query("asset_dossier_cached", 0.0, true);
+            return Ok(Json(cached));
+        }
+    }
+
     let start = Instant::now();
 
     let time_range =
@@ -68,10 +92,18 @@ pub async fn get_asset_dossier(
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
     record_search_query("asset_dossier", duration_ms, result.is_ok());
 
-    let dossier = result.map_err(|e| {
+    let response = result.map_err(|e| {
         tracing::error!(error = %e, "Asset dossier query failed");
         SearchError::QueryError("Failed to fetch asset dossier".to_string())
     })?;
 
-    Ok(Json(dossier))
+    if let Some(cache) = state.result_cache.as_ref() {
+        let cache = cache.clone();
+        let resp = response.clone();
+        tokio::spawn(async move {
+            cache.set_cached(&cache_key, &resp).await;
+        });
+    }
+
+    Ok(Json(response))
 }

@@ -15,7 +15,7 @@
 use super::SearchService;
 use crate::query::TimeRange;
 use crate::schema::SchemaProfile;
-use crate::search::SearchError;
+use crate::search::{parse_clickhouse_error, SearchError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -338,7 +338,17 @@ impl SearchService {
             dns_fut,
         );
 
-        let mut identity = identity_res.unwrap_or_default();
+        // Propagate any subquery failure so a transient ClickHouse error aborts the
+        // dossier build instead of silently producing a partial/empty dossier that
+        // an upstream cache would store as "successful".
+        let mut identity = identity_res?.unwrap_or_default();
+        let log_sources = log_sources?;
+        let timeline = timeline?;
+        let processes = processes?;
+        let network = network?;
+        let auth = auth?;
+        let files = files?;
+        let dns = dns?;
         identity.log_sources = log_sources;
         if let Some(ref host) = identity.hostname {
             // Only derive a domain from a hostname — not from an IP literal
@@ -381,19 +391,23 @@ fn apply_binds(
 ///
 /// Failures are logged at `error` level with the `subquery` tag so a broken
 /// section (e.g. a misaligned alias, a changed column) surfaces in log
-/// aggregators even though we degrade gracefully by returning empty rows — the
-/// UI renders `—` placeholders when data is missing, so a silent failure would
-/// otherwise look identical to "entity has no events". The tag lets dashboards
-/// count failures per subquery.
+/// aggregators, AND propagated as a `SearchError` so a transient ClickHouse
+/// failure aborts the whole dossier build instead of silently degrading to an
+/// empty card. Previously these errors were swallowed into empty rows; the UI
+/// renders `—` placeholders when data is missing, so a silent failure looked
+/// identical to "entity has no events" — and worse, an upstream cache would
+/// store that partial/empty dossier as a "successful" result. Propagating means
+/// the partial result is never cached and the caller can retry. The `subquery`
+/// tag still lets dashboards count failures per subquery.
 async fn fetch_rows(
     query: clickhouse::query::Query,
     subquery: &'static str,
-) -> Vec<serde_json::Value> {
+) -> Result<Vec<serde_json::Value>, SearchError> {
     let mut cursor = match query.fetch_bytes("JSONEachRow") {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(subquery, error = %e, "Asset dossier subquery failed to start");
-            return Vec::new();
+            return Err(parse_clickhouse_error(&e.to_string()));
         }
     };
     let mut bytes = Vec::new();
@@ -403,19 +417,26 @@ async fn fetch_rows(
             Ok(None) => break,
             Err(e) => {
                 tracing::error!(subquery, error = %e, "Asset dossier subquery chunk read failed");
-                break;
+                return Err(parse_clickhouse_error(&e.to_string()));
             }
         }
     }
-    String::from_utf8(bytes)
-        .ok()
-        .map(|s| {
-            s.lines()
-                .filter(|l| !l.is_empty())
-                .filter_map(|l| serde_json::from_str(l).ok())
-                .collect()
-        })
-        .unwrap_or_default()
+    let text = match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(subquery, error = %e, "Asset dossier subquery non-utf8 bytes");
+            return Err(SearchError::DatabaseError(sqlx::Error::Protocol(format!(
+                "asset dossier subquery {} returned non-utf8 bytes: {}",
+                subquery, e
+            ))));
+        }
+    };
+    let rows = text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    Ok(rows)
 }
 
 async fn query_identity(
@@ -426,7 +447,7 @@ async fn query_identity(
     binds: &[String],
     start: &str,
     end: &str,
-) -> Option<AssetIdentity> {
+) -> Result<Option<AssetIdentity>, SearchError> {
     // Use argMaxIf with a non-empty filter rather than argMaxOrNull on nullIf(col, '').
     // With the old shape, if the row with the maximum timestamp happens to have the
     // column blank (common for log sources that partially populate UDM — e.g. squid_proxy
@@ -470,8 +491,8 @@ async fn query_identity(
             .map(String::from)
     };
 
-    let rows = fetch_rows(apply_binds(ch.query(&sql), binds), "identity").await;
-    rows.into_iter().next().map(|row| AssetIdentity {
+    let rows = fetch_rows(apply_binds(ch.query(&sql), binds), "identity").await?;
+    Ok(rows.into_iter().next().map(|row| AssetIdentity {
         hostname: str_or_none(&row, "hostname"),
         ip: str_or_none(&row, "ip"),
         mac: str_or_none(&row, "mac"),
@@ -481,7 +502,7 @@ async fn query_identity(
         last_seen_in_range: str_or_none(&row, "last_seen_in_range"),
         log_sources: Vec::new(),
         domain: None,
-    })
+    }))
 }
 
 async fn query_log_sources(
@@ -491,7 +512,7 @@ async fn query_log_sources(
     binds: &[String],
     start: &str,
     end: &str,
-) -> Vec<AssetLogSource> {
+) -> Result<Vec<AssetLogSource>, SearchError> {
     let sql = format!(
         r#"SELECT
             source_type AS name,
@@ -503,8 +524,8 @@ async fn query_log_sources(
         ORDER BY event_count DESC
         LIMIT 16"#
     );
-    fetch_rows(apply_binds(ch.query(&sql), binds), "log_sources")
-        .await
+    let rows = fetch_rows(apply_binds(ch.query(&sql), binds), "log_sources").await?;
+    Ok(rows
         .into_iter()
         .filter_map(|row| {
             Some(AssetLogSource {
@@ -513,7 +534,7 @@ async fn query_log_sources(
                 last_event: row.get("last_event")?.as_str()?.to_string(),
             })
         })
-        .collect()
+        .collect())
 }
 
 // Lane / auth / file classification is shared with `service::asset`'s
@@ -533,7 +554,7 @@ async fn query_timeline(
     end: &str,
     bucket_seconds: u32,
     unix_start: u64,
-) -> AssetActivityTimeline {
+) -> Result<AssetActivityTimeline, SearchError> {
     let sql = format!(
         r#"SELECT
             toUInt32(intDiv(toUnixTimestamp(timestamp) - {unix_start}, {bucket_seconds})) AS bucket,
@@ -546,7 +567,7 @@ async fn query_timeline(
         lane = lane_sql(profile),
         buckets = TIMELINE_BUCKETS,
     );
-    let rows = fetch_rows(apply_binds(ch.query(&sql), binds), "timeline").await;
+    let rows = fetch_rows(apply_binds(ch.query(&sql), binds), "timeline").await?;
 
     // Compute max count per lane so we can normalize weights to {1, 2, 3}
     let mut per_lane_max: BTreeMap<i32, u64> = BTreeMap::new();
@@ -585,7 +606,7 @@ async fn query_timeline(
 
     let _ = bucket_seconds;
 
-    AssetActivityTimeline {
+    Ok(AssetActivityTimeline {
         buckets: TIMELINE_BUCKETS,
         lanes: vec![
             "auth".into(),
@@ -595,7 +616,7 @@ async fn query_timeline(
             "alert".into(),
         ],
         points,
-    }
+    })
 }
 
 async fn query_processes(
@@ -606,12 +627,12 @@ async fn query_processes(
     binds: &[String],
     start: &str,
     end: &str,
-) -> AssetProcessesSummary {
+) -> Result<AssetProcessesSummary, SearchError> {
     // The processes card is built around `process_name`; if the schema does not
     // expose a process-name column there is nothing to summarize.
     let process_name = match profile.udm_column_sql("process_name") {
         Some(c) => c,
-        None => return AssetProcessesSummary::default(),
+        None => return Ok(AssetProcessesSummary::default()),
     };
     let prev_hash = profile.udm_column_sql("prevalence_process_hash");
     let parent = profile.udm_column_sql("parent_process_name");
@@ -702,6 +723,7 @@ async fn query_processes(
         fetch_rows(apply_binds(ch.query(&top_sql), binds), "processes_top"),
         fetch_rows(apply_binds(ch.query(&rare_sql), binds), "processes_rare"),
     );
+    let (scalars, tops, rares) = (scalars?, tops?, rares?);
 
     let (unique, rare, from_office) = scalars
         .into_iter()
@@ -750,14 +772,14 @@ async fn query_processes(
         })
         .collect();
 
-    AssetProcessesSummary {
+    Ok(AssetProcessesSummary {
         unique,
         rare,
         unsigned: 0, // no signing field in logs today — surfaced as 0 until we add it
         from_office,
         top,
         rare_list,
-    }
+    })
 }
 
 async fn query_network(
@@ -769,11 +791,11 @@ async fn query_network(
     start: &str,
     end: &str,
     self_hosts: &[String],
-) -> AssetNetworkSummary {
+) -> Result<AssetNetworkSummary, SearchError> {
     // The network card needs at least a destination host/IP to have any content.
     let dest_host = match profile.udm_column_sql("dest_host") {
         Some(c) => c,
-        None => return AssetNetworkSummary::default(),
+        None => return Ok(AssetNetworkSummary::default()),
     };
     // NAN-1327: a real destination hostname is non-empty AND not the `"-"`
     // placeholder Sysmon emits for an absent host (otherwise `dst_endpoint.hostname
@@ -865,6 +887,7 @@ async fn query_network(
         fetch_rows(apply_binds(ch.query(&top_sql), binds), "network_top"),
         fetch_rows(apply_binds(ch.query(&country_sql), binds), "network_countries"),
     );
+    let (scalars, tops, countries) = (scalars?, tops?, countries?);
 
     let (total_conns, bytes_in, bytes_out, unique_dsts, new_domains) = scalars
         .into_iter()
@@ -920,7 +943,7 @@ async fn query_network(
         })
         .collect();
 
-    AssetNetworkSummary {
+    Ok(AssetNetworkSummary {
         total_conns,
         bytes_in,
         bytes_out,
@@ -928,7 +951,7 @@ async fn query_network(
         new_domains,
         top_dsts,
         rare_countries,
-    }
+    })
 }
 
 async fn query_auth(
@@ -939,7 +962,7 @@ async fn query_auth(
     binds: &[String],
     start: &str,
     end: &str,
-) -> AssetAuthSummary {
+) -> Result<AssetAuthSummary, SearchError> {
     // Auth membership uses the shared classifier predicate so dossier counts
     // and drilldown queries operate on the same row set (NAN-1049). Refining
     // sub-predicates (interactive / network logon type) stay local because
@@ -1062,6 +1085,7 @@ async fn query_auth(
         fetch_rows(apply_binds(ch.query(&scalar_sql), binds), "auth_scalar"),
         fetch_rows(apply_binds(ch.query(&recent_sql), binds), "auth_recent"),
     );
+    let (scalars, recents) = (scalars?, recents?);
 
     let (success, failure, interactive, network, lateral) = scalars
         .into_iter()
@@ -1104,14 +1128,14 @@ async fn query_auth(
         })
         .collect();
 
-    AssetAuthSummary {
+    Ok(AssetAuthSummary {
         success,
         failure,
         interactive,
         network,
         lateral,
         recent,
-    }
+    })
 }
 
 async fn query_files(
@@ -1122,7 +1146,7 @@ async fn query_files(
     binds: &[String],
     start: &str,
     end: &str,
-) -> AssetFilesSummary {
+) -> Result<AssetFilesSummary, SearchError> {
     // File-event membership uses the shared classifier predicate so dossier
     // counts and the "All file events" drilldown operate on the same row set
     // (NAN-1049). Recent-list still narrows on `file_path != ''` so empty
@@ -1133,7 +1157,7 @@ async fn query_files(
     // files card has no events to render.
     let file_path = match profile.udm_column_sql("file_path") {
         Some(c) => c,
-        None => return AssetFilesSummary::default(),
+        None => return Ok(AssetFilesSummary::default()),
     };
     let file_action = profile.udm_column_sql("file_action");
     let file_name = profile.udm_column_sql("file_name");
@@ -1196,6 +1220,7 @@ async fn query_files(
         fetch_rows(apply_binds(ch.query(&scalar_sql), binds), "files_scalar"),
         fetch_rows(apply_binds(ch.query(&recent_sql), binds), "files_recent"),
     );
+    let (scalars, recents) = (scalars?, recents?);
 
     let (writes, sensitive, exec) = scalars
         .into_iter()
@@ -1226,12 +1251,12 @@ async fn query_files(
         })
         .collect();
 
-    AssetFilesSummary {
+    Ok(AssetFilesSummary {
         writes,
         sensitive,
         exec,
         recent,
-    }
+    })
 }
 
 async fn query_dns(
@@ -1242,12 +1267,12 @@ async fn query_dns(
     binds: &[String],
     start: &str,
     end: &str,
-) -> AssetDnsSummary {
+) -> Result<AssetDnsSummary, SearchError> {
     // The DNS card is built entirely around the `query` column; without it there
     // is nothing to aggregate.
     let query = match profile.udm_column_sql("query") {
         Some(c) => c,
-        None => return AssetDnsSummary::default(),
+        None => return Ok(AssetDnsSummary::default()),
     };
     let answer = profile.udm_column_sql("answer");
     // NX detection needs an `answer` column; without it nothing is NX.
@@ -1284,6 +1309,7 @@ async fn query_dns(
         fetch_rows(apply_binds(ch.query(&scalar_sql), binds), "dns_scalar"),
         fetch_rows(apply_binds(ch.query(&top_sql), binds), "dns_top"),
     );
+    let (scalars, tops) = (scalars?, tops?);
 
     let (queries, unique, nx, rare_tlds) = scalars
         .into_iter()
@@ -1309,13 +1335,13 @@ async fn query_dns(
         })
         .collect();
 
-    AssetDnsSummary {
+    Ok(AssetDnsSummary {
         queries,
         unique,
         nx,
         rare_tlds,
         top,
-    }
+    })
 }
 
 // ============================================================================

@@ -191,15 +191,17 @@ pub(crate) fn build_retro_marker(plan: &RetroPlan) -> serde_json::Value {
 /// wrappers stay on the host-name legs (mixed-case history) and are dropped on
 /// the ingest-lowercased ip legs to match each column's index form.
 fn host_expr(profile: &dyn SchemaProfile) -> String {
-    // (logical UDM field, wrap_in_lower) — host names are mixed-case, ips are
-    // ingest-lowercased (raw compare keeps the bloom).
-    let legs: &[(&str, bool)] = &[
-        ("src_host", true),
-        ("dest_host", true),
-        ("dvc", true),
-        ("src_ip", false),
-        ("dest_ip", false),
-    ];
+    // Named hosts ONLY (NAN-1592). This is the host identity for the rarity
+    // denominator (`retro_total_hosts`) and the matched `distinct_hosts`. We
+    // deliberately DON'T fall back to raw `src_ip`/`dest_ip`: a remote endpoint
+    // is not one of your assets, and that fallback counted every external
+    // internet IP as a "host" — on Saturn it inflated the denominator ~280x
+    // (1.78M, 99.8% public IPs, vs ~4.3K real hostnames). An RFC1918 filter was
+    // rejected because cloud assets run on PUBLIC IPs (Saturn's hosts are
+    // 104.130.x), so private-only would wrongly drop them. Host names are
+    // mixed-case → each leg is lowered. No-hostname events yield '' and are
+    // excluded from the host counts at the call sites.
+    let legs: &[(&str, bool)] = &[("src_host", true), ("dest_host", true), ("dvc", true)];
     coalesce_identity_expr(profile, legs)
 }
 
@@ -342,7 +344,7 @@ impl SearchService {
         let now = chrono::Utc::now();
         let start = now - chrono::Duration::hours(RETRO_PREVALENCE_WINDOW_HOURS);
         let sql = format!(
-            "SELECT uniq({host}) FROM {table} \
+            "SELECT uniq(nullIf({host}, '')) FROM {table} \
              WHERE timestamp BETWEEN '{start}' AND '{end}'",
             host = host_expr(self.active_profile.as_ref()),
             table = logs_table,
@@ -902,7 +904,7 @@ fn build_summary_sql(
     };
     format!(
         "SELECT uniqExact(_rid) AS hits, \
-         uniqExact(_host) AS distinct_hosts, \
+         uniqExact(nullIf(_host, '')) AS distinct_hosts, \
          formatDateTime(min(_ts), '%Y-%m-%dT%H:%i:%sZ') AS first_seen, \
          formatDateTime(max(_ts), '%Y-%m-%dT%H:%i:%sZ') AS last_seen, \
          {counts} AS field_counts \
@@ -983,7 +985,7 @@ fn build_list_sql(
     };
     format!(
         "SELECT obs.2 AS value, any(obs.1) AS field, count() AS hits, \
-         uniqExact({host}) AS hosts, \
+         uniqExact(nullIf({host}, '')) AS hosts, \
          formatDateTime(min(timestamp), '%Y-%m-%dT%H:%i:%sZ') AS first_seen, \
          formatDateTime(max(timestamp), '%Y-%m-%dT%H:%i:%sZ') AS last_seen \
          FROM {table} \
@@ -1292,7 +1294,7 @@ mod tests {
         assert!(!sql.contains("PREWHERE"));
         // exact hits via row-id dedup (parity with the old count() over the OR).
         assert!(sql.contains("uniqExact(_rid) AS hits"), "got: {sql}");
-        assert!(sql.contains("uniqExact(_host) AS distinct_hosts"));
+        assert!(sql.contains("uniqExact(nullIf(_host, '')) AS distinct_hosts"));
         assert!(sql.contains("min(_ts)") && sql.contains("max(_ts)"));
         assert!(sql.contains("AS field_counts"));
         // one single-column equality leg per observable...
