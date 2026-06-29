@@ -15,6 +15,7 @@
 import { useEffect, useState } from 'react';
 import { Search, ChevronRight, Box, List as ListIcon, LayoutGrid, RefreshCw } from 'lucide-react';
 import { api } from '@/lib/api';
+import { useReportPhase2Status } from '@/components/search/footer-reporter';
 import type { CacheMeta } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { CachedNotice } from '@/components/search/CachedNotice';
@@ -385,6 +386,16 @@ export function ServicesTab({ apiTimeRange, onOpenService }: ObservabilityTabPro
   // Health filter is post-aggregation server-side; for the loaded slice the
   // backend has already applied it, so the rows render as-returned.
   const rows = services ?? [];
+
+  // NAN-1600: when embedded in the search page (`| services`), report the real
+  // fetch to the footer (spinner → service count · query time). No-op in the
+  // Observability console, which owns its own loading UI.
+  useReportPhase2Status({
+    loading,
+    settled: services != null || error != null,
+    error,
+    totalCount: total,
+  });
 
   if (loading && services == null) {
     return (

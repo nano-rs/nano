@@ -28,6 +28,7 @@ import { api } from '@/lib/api';
 import type { CacheMeta } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { CachedNotice } from '@/components/search/CachedNotice';
+import { useReportPhase2Status } from '@/components/search/footer-reporter';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { REDChart, LatencyScatter, BudgetBar, type RedSeries, type ScatterTrace } from '@/components/observability/charts';
 import { ServiceSecuritySignals } from '@/components/observability/ServiceSecuritySignals';
@@ -387,6 +388,16 @@ export function ServiceDetail({ service, apiTimeRange, onBack, onOpenTrace }: Se
       <CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={refreshing} />
     </div>
   );
+
+  // NAN-1600: when embedded in the search page (`| service <name>`), report the
+  // real RED-detail fetch to the footer (spinner → endpoint count · query time).
+  // No-op in the Observability console.
+  useReportPhase2Status({
+    loading,
+    settled: detail != null || error != null,
+    error,
+    totalCount: detail?.endpoints.length,
+  });
 
   if (loading && !detail) {
     return (

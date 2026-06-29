@@ -6,6 +6,7 @@ import { api } from '@/lib/api';
 import type { CacheMeta } from '@/lib/api';
 import type { CloudDossierResponse, TimeRange } from '@/lib/api/types';
 import { CachedNotice } from '@/components/search/CachedNotice';
+import { useReportPhase2Status } from '@/components/search/footer-reporter';
 import { CloudDossierTopStrip } from './CloudDossierTopStrip';
 import { IdentityHeader } from './IdentityHeader';
 import { FacetsBand } from './FacetsBand';
@@ -131,6 +132,15 @@ export function CloudPrincipalDossier({
   const providerLabel = dossier?.facets.provider[0]?.name ?? provider ?? 'aws';
   const eventsTotal = dossier?.error_rate.events_total ?? 0;
   const accountId = dossier?.identity.account ?? account ?? null;
+
+  // NAN-1600: report the real dossier fetch to the search footer (spinner →
+  // events_total hits · query time), replacing the marker query's "0ms".
+  useReportPhase2Status({
+    loading,
+    settled: dossier != null || error != null,
+    error,
+    totalCount: dossier ? eventsTotal : undefined,
+  });
 
   const handleFacetClick = (dim: string, value: string) => {
     const key = facetDimToFilterKey(dim);

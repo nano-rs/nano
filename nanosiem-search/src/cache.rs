@@ -20,12 +20,21 @@ use tracing::{debug, info, warn};
 
 /// TTL for cached search results.
 ///
-/// NAN-1027: shortened from 7 days to 90 seconds. SIEM data is live —
-/// late-arriving events change query results constantly. A multi-day cache
-/// risks serving "we're clean" results long after a real detection lands
-/// in the data. 90s is enough to dedupe page refreshes / dashboard panel
-/// re-renders / shared-link follows within a working session.
-const CACHE_TTL_SECS: u64 = 90;
+/// NAN-1027: shortened from 7 days. SIEM data is live — late-arriving events
+/// change query results constantly. A multi-day cache risks serving "we're
+/// clean" results long after a real detection lands in the data.
+///
+/// NAN-1596: 90s → 300s. 90s deduped same-session patterns (page refreshes,
+/// dashboard panel re-renders, companion endpoints on one page load) but a
+/// copy/pasted/shared link (Slack, ticket, case note) is clicked minutes
+/// later, by which point the 90s entry has always expired — so the recipient
+/// paid a full SQL re-run and the "instant shared view" never fired. 300s
+/// keeps those links warm. Safe because (a) empty / "0 hits" results are
+/// still never cached (`skip_cache_reason`), so the most dangerous stale
+/// entry can't occur, and (b) the NAN-1595 "cached Ns ago · refresh" badge
+/// discloses staleness and offers a one-click live re-run. 300s is the
+/// guardrail ceiling — still far short of outliving a working session.
+const CACHE_TTL_SECS: u64 = 300;
 
 /// Max result size to cache (1MB compressed)
 const MAX_CACHE_SIZE: usize = 1_024 * 1_024;

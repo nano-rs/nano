@@ -109,7 +109,10 @@ pub async fn search_stream(
                 let _ = tx
                     .send(SearchStreamEvent::Metadata {
                         total_count: cached.total_count,
-                        execution_time_ms: 0,
+                        // NAN-1597: replay the original query's time so a cached
+                        // view shows e.g. "230ms" (paired with the cache-age
+                        // badge), not a misleading "0ms".
+                        execution_time_ms: cached.execution_time_ms,
                         fields: cached.fields,
                         histogram: cached.histogram,
                         warnings: None,
@@ -172,6 +175,10 @@ pub async fn search_stream(
         let mut all_rows: Vec<serde_json::Value> = Vec::new();
         let mut cache_overflow = false;
         let mut meta_total_count: u64 = 0;
+        // NAN-1597: capture the live query's execution time from the Metadata
+        // event so it can be persisted into the cached payload (and replayed on
+        // a later cache hit) instead of being dropped and stored as 0.
+        let mut meta_execution_time_ms: u64 = 0;
         let mut meta_fields: Vec<nanosiem_core::search::FieldInfo> = Vec::new();
         let mut meta_histogram: Option<Vec<nanosiem_core::search::HistogramBucket>> = None;
         let mut meta_display_type: Option<nanosiem_core::search::DisplayType> = None;
@@ -197,8 +204,9 @@ pub async fn search_stream(
                             }
                             ("rows", false)
                         }
-                        SearchStreamEvent::Metadata { total_count, ref fields, ref histogram, ref display_type, ref column_order, ref generated_sql, .. } => {
+                        SearchStreamEvent::Metadata { total_count, execution_time_ms, ref fields, ref histogram, ref display_type, ref column_order, ref generated_sql, .. } => {
                             meta_total_count = *total_count;
+                            meta_execution_time_ms = *execution_time_ms;
                             meta_fields = fields.clone();
                             meta_histogram = histogram.clone();
                             meta_display_type = display_type.clone();
@@ -238,7 +246,9 @@ pub async fn search_stream(
                 let response = SearchResponse {
                     results: all_rows,
                     total_count: meta_total_count,
-                    execution_time_ms: 0,
+                    // NAN-1597: persist the real query time so a later cache hit
+                    // replays it instead of "0ms".
+                    execution_time_ms: meta_execution_time_ms,
                     fields: meta_fields,
                     generated_sql: meta_generated_sql,
                     histogram: meta_histogram,

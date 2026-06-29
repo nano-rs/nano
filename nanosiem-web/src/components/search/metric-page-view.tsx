@@ -12,6 +12,7 @@ import { AlertCircle, LineChart, Loader2 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { MetricsExplorer } from '@/components/observability/MetricsExplorer';
 import { MetricMonitorsList } from '@/components/observability/MetricMonitorsList';
+import { useReportPhase2Status } from './footer-reporter';
 import type { TimeRange } from '@/lib/api/types';
 
 export interface MetricPageViewProps {
@@ -56,6 +57,18 @@ export function MetricPageView({ metric, service, timeRange }: MetricPageViewPro
   }, []);
 
   const apiTimeRange: TimeRange = timeRange ?? { start: '', end: '' };
+
+  // NAN-1600: MetricsExplorer is the phase-2 reporter for `| metric`, but it
+  // only mounts in the normal case — the catalog loading / error / no-metrics
+  // states return early before it. Report those terminal states here so the
+  // gated footer doesn't hang. In the normal case this is a no-op
+  // (loading=false, settled=false) and MetricsExplorer takes over reporting.
+  useReportPhase2Status({
+    loading: catalogLoading,
+    settled: !catalogLoading && (catalogError != null || metricNames.length === 0),
+    error: catalogError,
+    totalCount: 0,
+  });
 
   if (catalogLoading) {
     return (

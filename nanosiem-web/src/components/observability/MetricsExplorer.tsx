@@ -33,6 +33,7 @@ import {
 import { api } from '@/lib/api';
 import type { CacheMeta } from '@/lib/api';
 import { CachedNotice } from '@/components/search/CachedNotice';
+import { useReportPhase2Status } from '@/components/search/footer-reporter';
 import { cn } from '@/lib/utils';
 import {
   DropdownMenu,
@@ -228,6 +229,18 @@ export function MetricsExplorer({
   );
 
   const canActOnQuery = metric !== '' && series.length > 0;
+
+  // NAN-1600: when embedded in the search page (`| metric <name>`), report the
+  // real timeseries fetch to the footer (spinner → series count · query time).
+  // settled = !loading so an idle unscoped explorer reports done (no time → the
+  // footer simply shows nothing) rather than hanging on the spinner. No-op in
+  // the Observability console / Metrics tab.
+  useReportPhase2Status({
+    loading,
+    settled: !loading,
+    error,
+    totalCount: series.length,
+  });
 
   return (
     <div className="rounded-md border border-border bg-card overflow-hidden">

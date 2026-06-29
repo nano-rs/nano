@@ -20,6 +20,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '@/lib/api';
 import type { CacheMeta } from '@/lib/api';
+import { useReportPhase2Status } from '../footer-reporter';
 import type {
   RetroResponse,
   RetroAxis,
@@ -288,6 +289,24 @@ export function useRetro(
     offsetRef.current = 0;
     fetchPage(0, false, true);
   }, [fetchPage]);
+
+  // NAN-1600: report the real retro fetch to the search footer so it shows a
+  // spinner until the hunt loads, then the hit count + query time — instead of
+  // the phase-1 marker query's "0 hits · 0ms". Count is per submode.
+  const phase2Count =
+    data == null
+      ? undefined
+      : data.submode === 'summary'
+        ? data.indicator?.hits
+        : data.submode === 'list'
+          ? (data.total_indicators ?? data.rows?.length)
+          : data.rows?.length;
+  useReportPhase2Status({
+    loading,
+    settled: data != null || error != null,
+    error,
+    totalCount: phase2Count,
+  });
 
   return {
     data,

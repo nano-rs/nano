@@ -11,6 +11,7 @@ import type {
   TimeRange,
 } from '@/lib/api/types';
 import { CachedNotice } from '@/components/search/CachedNotice';
+import { useReportPhase2Status } from '@/components/search/footer-reporter';
 import { CloudOverviewTopStrip } from './CloudOverviewTopStrip';
 import { CloudOverviewHeader } from './CloudOverviewHeader';
 import { AccountsGrid } from './AccountsGrid';
@@ -111,6 +112,15 @@ export function CloudOverviewView({
   const refresh = useCallback(() => {
     void fetchOverview(true);
   }, [fetchOverview]);
+
+  // NAN-1600: report the real overview fetch to the search footer (spinner →
+  // events_total hits · query time), replacing the marker query's "0ms".
+  useReportPhase2Status({
+    loading,
+    settled: overview != null || error != null,
+    error,
+    totalCount: overview?.header.events_total,
+  });
 
   const handlePickAccount = (account: CloudOverviewAccount) => {
     // Account scope goes through the `| cloud` command's `account=` arg so the

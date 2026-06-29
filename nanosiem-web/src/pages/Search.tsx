@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { useState, useMemo, useRef, useCallback, useEffect } from 'react';
+import { SearchFooterProvider, PHASE2_REPORTING_MODES, type Phase2Status } from '@/components/search/footer-reporter';
 import { useQueryClient, useQuery } from '@tanstack/react-query';
 import { Link as RouterLink, useNavigate, useSearchParams } from 'react-router-dom';
 import { useUserPreferences } from '@/contexts/UserPreferencesContext';
@@ -551,6 +552,14 @@ export function Search() {
 
   // Query execution time
   const [executionTimeMs, setExecutionTimeMs] = useState<number | null>(null);
+
+  // NAN-1598: phase-2 footer status. Two-phase display modes (the primary
+  // /api/search returns a marker, then the view fetches the real data) publish
+  // their loading/time/count here via the SearchFooterProvider so the footer
+  // reflects the real work instead of the throwaway marker query. Null between
+  // searches and until the view reports.
+  const [phase2, setPhase2] = useState<Phase2Status | null>(null);
+  const reportPhase2 = useCallback((status: Phase2Status) => setPhase2(status), []);
   
   // Query cost score (for display in error messages)
   const [_queryCostScore, setQueryCostScore] = useState<number | null>(null);
@@ -1668,6 +1677,12 @@ export function Search() {
     setQueryReviewSuggestions([]);
     setLimitWarningDismissed(false);
     setIsSearching(true);
+    setPhase2(null); // NAN-1598: clear phase-2 footer status on a fresh search
+    // NAN-1598: also clear the (now stale) display type so a previous two-phase
+    // mode's footer gate can't persist into this search. Without this, a search
+    // that errors before metadata arrives (e.g. invalid nPL) would leave
+    // `footerGated` true with `phase2 == null`, hanging the footer on the spinner.
+    setDisplayType(undefined);
     setCachedResultsTimestamp(null); // Clear cache banner on fresh search
 
     // Clear AI conversation state when doing a regular search (not a refinement follow-up)
@@ -3210,6 +3225,17 @@ export function Search() {
     warningRowCount >= 1_000_000 && !isSearching && hasSearched && !limitWarningDismissed;
   const showErrorOrWarning = !!searchError || showLimitWarning;
 
+  // NAN-1598: for two-phase modes that adopt the phase-2 reporter, drive the
+  // footer from the phase-2 status (the real view fetch) instead of the
+  // throwaway marker query, and suppress "Query complete" until the view
+  // reports done (phase2 == null || loading => keep showing the spinner).
+  const footerGated = displayType != null && PHASE2_REPORTING_MODES.has(displayType);
+  const footerIsSearching = isSearching || (footerGated && (phase2 == null || phase2.loading));
+  const footerExecutionTimeMs = footerGated
+    ? (phase2 && !phase2.loading ? (phase2.executionTimeMs ?? null) : null)
+    : executionTimeMs;
+  const footerTotalCount = footerGated ? (phase2?.totalCount ?? 0) : totalCount;
+
   return (
     <div className={`search-console-page flex flex-col gap-2.5 w-full min-w-0 overflow-x-hidden md:[overflow-x:clip] ${hlWipe ? 'hl-wipe' : ''}`}>
       {/* Demo onboarding: sample queries */}
@@ -4245,6 +4271,7 @@ export function Search() {
               {/* Results Area */}
               <div className="flex-1 min-w-0">
                 <div className="w-full min-w-0 overflow-x-hidden md:[overflow-x:clip]">
+                  <SearchFooterProvider value={reportPhase2}>
                   <SearchResults
                     results={searchResults}
                     totalCount={totalCount}
@@ -4294,6 +4321,7 @@ export function Search() {
                     fieldsCount={fieldStats.length}
                     onExpandFields={() => { userToggledFieldsPanel.current = true; setFieldsPanelExpanded(true); }}
                   />
+                  </SearchFooterProvider>
                 </div>
               </div>
             </div>
@@ -4342,10 +4370,10 @@ export function Search() {
 
       {/* Search stats bar */}
       <SearchStatsBar
-        isSearching={isSearching}
+        isSearching={footerIsSearching}
         hasSearched={hasSearched}
-        totalCount={totalCount}
-        executionTimeMs={executionTimeMs}
+        totalCount={footerTotalCount}
+        executionTimeMs={footerExecutionTimeMs}
         asyncJobProgress={asyncJobProgress}
         asyncJobStatus={asyncJobStatus}
         queuePosition={queuePosition}

@@ -2,6 +2,19 @@
 
 use super::*;
 
+/// The asset view is a single synthetic row carrying the real event total in
+/// `_asset_pagination.total_count`. Lift it so `SearchResponse.total_count`
+/// (and therefore the footer "N hits") reflects the true count instead of the
+/// placeholder `1` / the initial-scan count (NAN-1601). Returns `None` when the
+/// results aren't an asset view.
+fn asset_view_total_count(results: &[serde_json::Value]) -> Option<u64> {
+    results
+        .first()
+        .and_then(|r| r.get("_asset_pagination"))
+        .and_then(|p| p.get("total_count"))
+        .and_then(|v| v.as_u64())
+}
+
 impl SearchService {
     /// Cancel a running query by its request ID
     ///
@@ -692,9 +705,10 @@ impl SearchService {
                 }
 
                 // Asset view is a single result containing nested _asset_pagination with the real count
+                let total_count = asset_view_total_count(&results).unwrap_or(1);
                 return Ok(SearchResponse {
                     results,
-                    total_count: 1,
+                    total_count,
                     execution_time_ms,
                     fields: Vec::new(),
                     generated_sql: None,
@@ -1390,6 +1404,9 @@ impl SearchService {
         } else {
             total_count
         };
+        // NAN-1601: for an asset view, report the real event total from the
+        // marker's _asset_pagination, not the initial-scan count.
+        let capped_total = asset_view_total_count(&results).unwrap_or(capped_total);
 
         Ok(SearchResponse {
             results,
