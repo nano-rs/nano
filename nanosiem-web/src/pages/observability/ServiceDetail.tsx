@@ -11,7 +11,7 @@
 // mock's TagSpotlight / ServiceMetaStrip rely on data the wire contract does not
 // carry, so they're omitted rather than faked).
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
   Box,
@@ -29,6 +29,7 @@ import type { CacheMeta } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { CachedNotice } from '@/components/search/CachedNotice';
 import { useReportPhase2Status } from '@/components/search/footer-reporter';
+import { useIsLiveRun } from '@/components/search/live-run-context';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { REDChart, LatencyScatter, BudgetBar, type RedSeries, type ScatterTrace } from '@/components/observability/charts';
 import { ServiceSecuritySignals } from '@/components/observability/ServiceSecuritySignals';
@@ -311,13 +312,19 @@ export function ServiceDetail({ service, apiTimeRange, onBack, onOpenTrace }: Se
   // absent (404) on open builds, so gate the render on the capability flag.
   const { capabilities } = useCapabilities();
 
+  // NAN-1602: a user-initiated search's first detail fetch is live (no "cached"
+  // badge); later window changes read cache. No-op in the console.
+  const liveOnceRef = useRef(useIsLiveRun());
+
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setError(null);
     setCacheMeta(null); // clear stale badge while the fresh detail loads
+    const bypass = liveOnceRef.current;
+    liveOnceRef.current = false;
     api.observability
-      .getServiceDetail(service, apiTimeRange, { onMeta: (m) => !cancelled && setCacheMeta(m) })
+      .getServiceDetail(service, apiTimeRange, { onMeta: (m) => !cancelled && setCacheMeta(m), bypass })
       .then((res) => {
         if (!cancelled) setDetail(res);
       })

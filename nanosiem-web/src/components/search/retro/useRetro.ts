@@ -21,6 +21,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '@/lib/api';
 import type { CacheMeta } from '@/lib/api';
 import { useReportPhase2Status } from '../footer-reporter';
+import { useIsLiveRun } from '../live-run-context';
 import type {
   RetroResponse,
   RetroAxis,
@@ -205,6 +206,10 @@ export function useRetro(
 
   const isPaged = marker.submode !== 'summary';
 
+  // NAN-1602: an explicit user run bypasses the cache on the initial page-0
+  // fetch (live data, no "cached" badge); passive loads fetch normally.
+  const isLiveRun = useIsLiveRun();
+
   const fetchPage = useCallback(
     async (offset: number, append: boolean, bypass = false) => {
       // Bump first so even a no-timeRange call invalidates any older in-flight response.
@@ -274,7 +279,7 @@ export function useRetro(
   // Reset + load whenever the query / axis / window changes.
   useEffect(() => {
     offsetRef.current = 0;
-    fetchPage(0, false);
+    fetchPage(0, false, isLiveRun);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [query, marker.axis, timeRange?.start, timeRange?.end]);
 

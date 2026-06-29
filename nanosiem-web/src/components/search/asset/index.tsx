@@ -5,6 +5,7 @@ import { useNavigate } from 'react-router-dom';
 import { AlertTriangle } from 'lucide-react';
 import { api } from '@/lib/api';
 import type { CacheMeta } from '@/lib/api';
+import { useIsLiveRun } from '@/components/search/live-run-context';
 import type {
   AssetDossierResponse,
   EntityContextResponse,
@@ -192,10 +193,16 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
     [dossierRequest],
   );
 
+  // NAN-1602: a user-initiated search's first dossier fetch is live (no "cached"
+  // badge); later window/entity changes read cache. No-op outside the search page.
+  const liveOnceRef = useRef(useIsLiveRun());
+
   // Reset + load whenever the request (entity / window / identities) changes.
   useEffect(() => {
     setDossier(null);
-    return loadDossier(false);
+    const bypass = liveOnceRef.current;
+    liveOnceRef.current = false;
+    return loadDossier(bypass);
   }, [loadDossier]);
 
   // NAN-1595: force a live re-fetch of the dossier, bypassing the server cache.

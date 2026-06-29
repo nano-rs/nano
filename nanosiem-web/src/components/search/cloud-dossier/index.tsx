@@ -7,6 +7,7 @@ import type { CacheMeta } from '@/lib/api';
 import type { CloudDossierResponse, TimeRange } from '@/lib/api/types';
 import { CachedNotice } from '@/components/search/CachedNotice';
 import { useReportPhase2Status } from '@/components/search/footer-reporter';
+import { useIsLiveRun } from '@/components/search/live-run-context';
 import { CloudDossierTopStrip } from './CloudDossierTopStrip';
 import { IdentityHeader } from './IdentityHeader';
 import { FacetsBand } from './FacetsBand';
@@ -86,7 +87,9 @@ export function CloudPrincipalDossier({
   // data / badge / loading state (or setState after unmount).
   const reqSeq = useRef(0);
   const fetchDossier = useCallback(
-    async (bypass: boolean) => {
+    // NAN-1602: `bypass` controls the cache; `asRefresh` controls the UI — a
+    // live initial load bypasses the cache but still shows loading.
+    async (bypass: boolean, asRefresh: boolean = bypass) => {
       // Bump first so even a no-request call invalidates any older in-flight response.
       const seq = ++reqSeq.current;
       if (!request) {
@@ -95,7 +98,7 @@ export function CloudPrincipalDossier({
         setCacheMeta(null);
         return;
       }
-      if (bypass) setRefreshing(true);
+      if (asRefresh) setRefreshing(true);
       else {
         setLoading(true);
         setCacheMeta(null); // clear stale badge while a fresh load runs
@@ -111,7 +114,7 @@ export function CloudPrincipalDossier({
         if (seq === reqSeq.current) setError(err instanceof Error ? err : new Error(String(err)));
       } finally {
         if (seq === reqSeq.current) {
-          if (bypass) setRefreshing(false);
+          if (asRefresh) setRefreshing(false);
           else setLoading(false);
         }
       }
@@ -119,10 +122,16 @@ export function CloudPrincipalDossier({
     [request]
   );
 
+  // NAN-1602: a user-initiated search's first dossier fetch is live (no "cached"
+  // badge); later facet/scope changes read cache. No-op outside the search page.
+  const liveOnceRef = useRef(useIsLiveRun());
+
   // Re-run on a fresh (non-refresh) load whenever the request changes
   // (principal / account / provider / window / facet filters).
   useEffect(() => {
-    fetchDossier(false);
+    const bypass = liveOnceRef.current;
+    liveOnceRef.current = false;
+    fetchDossier(bypass, false);
   }, [fetchDossier]);
 
   const refresh = useCallback(() => {

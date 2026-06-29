@@ -12,10 +12,11 @@
 // groups by service_name only), so this renders the list + grid views and omits
 // the topology map and synthetic metadata rather than faking it.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Search, ChevronRight, Box, List as ListIcon, LayoutGrid, RefreshCw } from 'lucide-react';
 import { api } from '@/lib/api';
 import { useReportPhase2Status } from '@/components/search/footer-reporter';
+import { useIsLiveRun } from '@/components/search/live-run-context';
 import type { CacheMeta } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { CachedNotice } from '@/components/search/CachedNotice';
@@ -301,12 +302,18 @@ export function ServicesTab({ apiTimeRange, onOpenService }: ObservabilityTabPro
     return () => clearTimeout(t);
   }, [q]);
 
+  // NAN-1602: a user-initiated search's first list fetch is live (no "cached"
+  // badge); later filter/sort changes read cache. No-op in the console.
+  const liveOnceRef = useRef(useIsLiveRun());
+
   // Reset + reload whenever the window or any filter/sort changes.
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     setError(null);
     setCacheMeta(null); // clear stale badge while the fresh (page-0) list loads
+    const bypass = liveOnceRef.current;
+    liveOnceRef.current = false;
     api.observability
       .listServices(
         apiTimeRange,
@@ -317,7 +324,7 @@ export function ServicesTab({ apiTimeRange, onOpenService }: ObservabilityTabPro
           limit: PAGE_SIZE,
           offset: 0,
         },
-        { onMeta: (m) => !cancelled && setCacheMeta(m) }
+        { onMeta: (m) => !cancelled && setCacheMeta(m), bypass }
       )
       .then((res) => {
         if (cancelled) return;

@@ -34,6 +34,7 @@ import { api } from '@/lib/api';
 import type { CacheMeta } from '@/lib/api';
 import { CachedNotice } from '@/components/search/CachedNotice';
 import { useReportPhase2Status } from '@/components/search/footer-reporter';
+import { useIsLiveRun } from '@/components/search/live-run-context';
 import { cn } from '@/lib/utils';
 import {
   DropdownMenu,
@@ -142,7 +143,10 @@ export function MetricsExplorer({
   // NAN-1595: server cache status for the timeseries fetch + refresh bypass.
   const [cacheMeta, setCacheMeta] = useState<CacheMeta | null>(null);
   const [refreshNonce, setRefreshNonce] = useState(0);
-  const bypassRef = useRef(false);
+  // NAN-1602: seed the bypass so a user-initiated search's first timeseries
+  // fetch is live (no "cached" badge); later fetches read cache. No-op in the
+  // Observability console (useIsLiveRun → false there).
+  const bypassRef = useRef(useIsLiveRun());
   const refresh = useCallback(() => {
     bypassRef.current = true;
     setRefreshNonce((n) => n + 1);

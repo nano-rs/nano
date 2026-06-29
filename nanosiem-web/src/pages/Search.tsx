@@ -2,6 +2,7 @@
 
 import { useState, useMemo, useRef, useCallback, useEffect } from 'react';
 import { SearchFooterProvider, PHASE2_REPORTING_MODES, type Phase2Status } from '@/components/search/footer-reporter';
+import { LiveRunProvider } from '@/components/search/live-run-context';
 import { useQueryClient, useQuery } from '@tanstack/react-query';
 import { Link as RouterLink, useNavigate, useSearchParams } from 'react-router-dom';
 import { useUserPreferences } from '@/contexts/UserPreferencesContext';
@@ -560,6 +561,12 @@ export function Search() {
   // searches and until the view reports.
   const [phase2, setPhase2] = useState<Phase2Status | null>(null);
   const reportPhase2 = useCallback((status: Phase2Status) => setPhase2(status), []);
+
+  // NAN-1602: true when the displayed search was an explicit user run (→ live,
+  // no "cached" badge). False on passive loads (shared link / URL restore),
+  // where the cache + badge are correct. Drives the special views' initial
+  // fetch bypass via LiveRunProvider.
+  const [liveRun, setLiveRun] = useState(false);
   
   // Query cost score (for display in error messages)
   const [_queryCostScore, setQueryCostScore] = useState<number | null>(null);
@@ -1605,8 +1612,9 @@ export function Search() {
         // Check if this is a network/connection error that should trigger fallback
         if (data.code === 'NETWORK_ERROR' || data.code === 'NO_BODY' || data.code === 'HTTP_ERROR') {
           console.warn('SSE streaming failed, falling back to async polling:', data.message);
-          // Fall back to async polling
-          api.searchAsync(request).then(asyncResponse => {
+          // Fall back to async polling — NAN-1602: carry the live-run intent so a
+          // user search stays live even when SSE is unavailable (use_cache=false).
+          api.searchAsync({ ...request, use_cache: !bypassCache }).then(asyncResponse => {
             if (asyncResponse.job_id) {
               setAsyncJobId(asyncResponse.job_id);
               queryClient.invalidateQueries({ queryKey: ['search-jobs'] });
@@ -1678,6 +1686,10 @@ export function Search() {
     setLimitWarningDismissed(false);
     setIsSearching(true);
     setPhase2(null); // NAN-1598: clear phase-2 footer status on a fresh search
+    // NAN-1602: an explicit user run is live (useCache !== true → bypass); the
+    // only passive caller that opts into the cache is the shared-search load.
+    // Drives both the main bypass below and the special views' initial fetch.
+    if (!append) setLiveRun(useCache !== true);
     // NAN-1598: also clear the (now stale) display type so a previous two-phase
     // mode's footer gate can't persist into this search. Without this, a search
     // that errors before metadata arrives (e.g. invalid nPL) would leave
@@ -1760,7 +1772,7 @@ export function Search() {
         startStreamingSearch(
           { query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset, skip_field_stats: true, table_view: true, dataset },
           currentQuery, currentTimeRange, currentMode, isAggregate,
-          useCache === false // NAN-1595: explicit refresh → bypass the server cache
+          useCache !== true // NAN-1602: user runs are live (bypass); only the shared-search load (useCache=true) reads cache
         );
         // Refresh SQL panel if visible (SSE returns early, so do it before exit)
         if (showSql) {
@@ -2948,7 +2960,7 @@ export function Search() {
 
       // Small delay to ensure state is ready
       const timer = setTimeout(() => {
-        handleSearch(1, false, urlQuery, queryMode, autoRunTimeRange);
+        handleSearch(1, false, urlQuery, queryMode, autoRunTimeRange, true); // NAN-1602: URL-driven (passive) load → use cache + badge
         // Clear the run and ai params from URL after execution
         const params = new URLSearchParams(searchParams);
         params.delete('run');
@@ -3055,7 +3067,7 @@ export function Search() {
           // No cached explanation - that's fine, just run the search
         });
       
-      const timer = setTimeout(() => handleSearch(1, false, urlQuery, queryMode, timeRange), 100);
+      const timer = setTimeout(() => handleSearch(1, false, urlQuery, queryMode, timeRange, true), 100); // NAN-1602: URL-driven (passive) load → use cache + badge
       return () => clearTimeout(timer);
     }
   }, []);
@@ -3120,6 +3132,7 @@ export function Search() {
         const cached = searchResultCache.get(cacheKey);
         if (cached && (Date.now() - cached.cachedAt) < CACHE_TTL_MS) {
           // Restore from cache — instant back-navigation
+          setLiveRun(false); // NAN-1602: passive restore → views use cache + badge, not a live re-fetch
           setSearchResults(cached.results);
           setHistogramData(cached.histogramData);
           setServerFieldStats(cached.serverFieldStats);
@@ -3149,7 +3162,7 @@ export function Search() {
           // Cache miss or expired — re-fetch
           if (cached) searchResultCache.delete(cacheKey);
           setTimeout(() => {
-            handleSearch(1, false, currentUrlQuery, normalizedMode, urlTimeRange);
+            handleSearch(1, false, currentUrlQuery, normalizedMode, urlTimeRange, true); // NAN-1602: URL-restore miss (passive) → use cache + badge
           }, 50);
         }
       } else {
@@ -4272,6 +4285,7 @@ export function Search() {
               <div className="flex-1 min-w-0">
                 <div className="w-full min-w-0 overflow-x-hidden md:[overflow-x:clip]">
                   <SearchFooterProvider value={reportPhase2}>
+                  <LiveRunProvider value={liveRun}>
                   <SearchResults
                     results={searchResults}
                     totalCount={totalCount}
@@ -4321,6 +4335,7 @@ export function Search() {
                     fieldsCount={fieldStats.length}
                     onExpandFields={() => { userToggledFieldsPanel.current = true; setFieldsPanelExpanded(true); }}
                   />
+                  </LiveRunProvider>
                   </SearchFooterProvider>
                 </div>
               </div>

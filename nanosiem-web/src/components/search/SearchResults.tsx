@@ -967,6 +967,17 @@ export function SearchResults({
   // Determine effective display type - prefer backend hint, fall back to isAggregateQuery
   const effectiveDisplayType: DisplayType = displayType ?? (isAggregateQuery ? 'table' : 'events');
 
+  // NAN-1602: two-phase modes render their own CachedNotice for the real data,
+  // so the results-header "cached … ago" badge (which reflects the throwaway
+  // marker query) is redundant — suppress it for those modes so cache status
+  // shows in exactly one place.
+  // NAN-1602: trace is excluded — TracePageView has no CachedNotice of its own,
+  // so the results-header badge is trace's only staleness indicator (keep it).
+  const SELF_CACHE_NOTICE_MODES = new Set<string>(['retro', 'cloud', 'asset', 'metric', 'service', 'services']);
+  const markerDisplayType = (results[0]?.fields?._display_type as string | undefined) ?? '';
+  const hasOwnCacheNotice =
+    SELF_CACHE_NOTICE_MODES.has(effectiveDisplayType) || SELF_CACHE_NOTICE_MODES.has(markerDisplayType);
+
   // Stats queries get a dedicated view (sortable bar-in-cell table) that owns its
   // own chrome — so when this is true we skip the outer card header and padding.
   const isStatsView =
@@ -1162,8 +1173,8 @@ export function SearchResults({
             </button>
           )}
           <div className="contents">
-            {/* Cached results indicator */}
-            {cachedAt && onRefreshCache && (
+            {/* Cached results indicator (suppressed for modes with their own CachedNotice — NAN-1602) */}
+            {cachedAt && onRefreshCache && !hasOwnCacheNotice && (
               <button
                 onClick={onRefreshCache}
                 className="text-amber-500 dark:text-amber-400 text-xs hover:underline cursor-pointer"

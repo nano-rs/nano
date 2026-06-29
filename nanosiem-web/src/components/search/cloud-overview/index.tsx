@@ -12,6 +12,7 @@ import type {
 } from '@/lib/api/types';
 import { CachedNotice } from '@/components/search/CachedNotice';
 import { useReportPhase2Status } from '@/components/search/footer-reporter';
+import { useIsLiveRun } from '@/components/search/live-run-context';
 import { CloudOverviewTopStrip } from './CloudOverviewTopStrip';
 import { CloudOverviewHeader } from './CloudOverviewHeader';
 import { AccountsGrid } from './AccountsGrid';
@@ -71,7 +72,10 @@ export function CloudOverviewView({
   // data / badge / loading state (or setState after unmount).
   const reqSeq = useRef(0);
   const fetchOverview = useCallback(
-    async (bypass: boolean) => {
+    // NAN-1602: `bypass` controls the cache; `asRefresh` controls the UI. They
+    // usually match (the refresh button), but a live INITIAL load bypasses the
+    // cache while still showing the loading state (asRefresh=false).
+    async (bypass: boolean, asRefresh: boolean = bypass) => {
       // Bump first so even a no-request call invalidates any older in-flight response.
       const seq = ++reqSeq.current;
       if (!request) {
@@ -80,7 +84,7 @@ export function CloudOverviewView({
         setCacheMeta(null);
         return;
       }
-      if (bypass) setRefreshing(true);
+      if (asRefresh) setRefreshing(true);
       else {
         setLoading(true);
         setCacheMeta(null); // clear stale badge while a fresh load runs
@@ -96,7 +100,7 @@ export function CloudOverviewView({
         if (seq === reqSeq.current) setError(err instanceof Error ? err : new Error(String(err)));
       } finally {
         if (seq === reqSeq.current) {
-          if (bypass) setRefreshing(false);
+          if (asRefresh) setRefreshing(false);
           else setLoading(false);
         }
       }
@@ -104,9 +108,15 @@ export function CloudOverviewView({
     [request]
   );
 
+  // NAN-1602: a user-initiated search's first overview fetch is live (no
+  // "cached" badge); later pivots read cache. No-op outside the search page.
+  const liveOnceRef = useRef(useIsLiveRun());
+
   // Re-run on a fresh (non-refresh) load whenever the request changes.
   useEffect(() => {
-    fetchOverview(false);
+    const bypass = liveOnceRef.current;
+    liveOnceRef.current = false;
+    fetchOverview(bypass, false);
   }, [fetchOverview]);
 
   const refresh = useCallback(() => {
