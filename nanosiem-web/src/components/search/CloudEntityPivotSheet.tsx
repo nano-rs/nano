@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useRef, useState, useEffect } from 'react';
 import { Globe, User, Server, Loader2, ArrowRight, ArrowLeft, ShieldAlert } from 'lucide-react';
 import { api } from '@/lib/api';
+import type { CacheMeta } from '@/lib/api';
 import type { CloudEntityPivotResponse, EntityCrossReference } from '@/lib/api/types';
+import { CachedNotice } from '@/components/search/CachedNotice';
 import { Badge } from '@/components/ui/badge';
 import {
   Sheet,
@@ -171,27 +173,59 @@ export function CloudEntityPivotSheet({
   const isMobile = useIsMobile();
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState<CloudEntityPivotResponse | null>(null);
+  // Server cache status of the displayed pivot context (NAN-1595).
+  const [cacheMeta, setCacheMeta] = useState<CacheMeta | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const reqSeq = useRef(0); // NAN-1595: drop stale out-of-order responses
+  const load = useCallback(
+    (bypass: boolean) => {
+      if (!entity) return;
+      const seq = ++reqSeq.current;
+      if (bypass) setRefreshing(true);
+      else {
+        setLoading(true);
+        setCacheMeta(null); // clear stale badge while a fresh load runs
+      }
+      api
+        .getCloudEntityPivot(
+          {
+            query,
+            time_range: { start: timeRange.start, end: timeRange.end },
+            entity_type: entity.type,
+            entity_value: entity.value,
+          },
+          { onMeta: (m) => { if (seq === reqSeq.current) setCacheMeta(m); }, bypass }
+        )
+        .then((response) => {
+          if (seq === reqSeq.current) setData(response);
+        })
+        .catch((err) => {
+          console.error('Failed to load entity pivot:', err);
+        })
+        .finally(() => {
+          if (seq === reqSeq.current) {
+            if (bypass) setRefreshing(false);
+            else setLoading(false);
+          }
+        });
+    },
+    [entity?.type, entity?.value, query, timeRange.start, timeRange.end]
+  );
 
   useEffect(() => {
     if (!entity) {
+      reqSeq.current++; // invalidate any in-flight load so it can't write after clear
       setData(null);
+      setCacheMeta(null);
+      setLoading(false);
+      setRefreshing(false);
       return;
     }
+    load(false);
+  }, [entity, load]);
 
-    setLoading(true);
-    api.getCloudEntityPivot({
-      query,
-      time_range: { start: timeRange.start, end: timeRange.end },
-      entity_type: entity.type,
-      entity_value: entity.value,
-    }).then((response) => {
-      setData(response);
-    }).catch((err) => {
-      console.error('Failed to load entity pivot:', err);
-    }).finally(() => {
-      setLoading(false);
-    });
-  }, [entity?.type, entity?.value, query, timeRange.start, timeRange.end]);
+  const refresh = useCallback(() => load(true), [load]);
 
   const events = (data?.events || []) as unknown as TimelineEvent[];
   const crossRefs = data?.cross_references || [];
@@ -270,6 +304,8 @@ export function CloudEntityPivotSheet({
                 {formatCompactNumber((summary as Record<string, unknown>).event_count as number)} events
               </Badge>
             )}
+            <span className="flex-1" />
+            <CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={refreshing} />
           </SheetTitle>
           <SheetDescription className="search-console-section-meta">
             Related entities, chronology, and cloud activity around the selected pivot

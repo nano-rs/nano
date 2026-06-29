@@ -66,7 +66,8 @@ pub struct TraceResponse {
 pub async fn get_trace(
     State(state): State<SearchState>,
     Path(trace_id): Path<String>,
-) -> Result<Json<TraceResponse>, SearchError> {
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
+) -> Result<(axum::http::HeaderMap, Json<TraceResponse>), SearchError> {
     let start = Instant::now();
 
     // NAN-1593: the trace waterfall re-fetches on every load / shared-link
@@ -75,10 +76,13 @@ pub async fn get_trace(
         "trace",
         &[trace_id.to_ascii_lowercase().as_bytes()],
     );
-    if let Some(cache) = state.result_cache.as_ref() {
-        if let Some(cached) = cache.get_cached::<TraceResponse>(&cache_key).await {
-            record_search_query("otel_trace_cached", 0.0, true);
-            return Ok(Json(cached));
+    if !bypass {
+        if let Some(cache) = state.result_cache.as_ref() {
+            if let Some(cached) = cache.get_cached::<TraceResponse>(&cache_key).await {
+                record_search_query("otel_trace_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
+                return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
+            }
         }
     }
 
@@ -105,7 +109,7 @@ pub async fn get_trace(
         });
     }
 
-    Ok(Json(response))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 // ============================================================================
@@ -204,8 +208,9 @@ pub struct MetricTimeseriesResponse {
 )]
 pub async fn get_metric_timeseries(
     State(state): State<SearchState>,
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<MetricTimeseriesRequest>,
-) -> Result<Json<MetricTimeseriesResponse>, SearchError> {
+) -> Result<(axum::http::HeaderMap, Json<MetricTimeseriesResponse>), SearchError> {
     let start = Instant::now();
 
     request.time_range.validate()?;
@@ -281,13 +286,16 @@ pub async fn get_metric_timeseries(
             filters_key.as_bytes(),
         ],
     );
-    if let Some(cache) = state.result_cache.as_ref() {
-        if let Some(cached) = cache
-            .get_cached::<MetricTimeseriesResponse>(&cache_key)
-            .await
-        {
-            record_search_query("otel_metric_timeseries_cached", 0.0, true);
-            return Ok(Json(cached));
+    if !bypass {
+        if let Some(cache) = state.result_cache.as_ref() {
+            if let Some(cached) = cache
+                .get_cached::<MetricTimeseriesResponse>(&cache_key)
+                .await
+            {
+                record_search_query("otel_metric_timeseries_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
+                return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
+            }
         }
     }
 
@@ -319,7 +327,7 @@ pub async fn get_metric_timeseries(
         });
     }
 
-    Ok(Json(response))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 // ============================================================================
@@ -377,7 +385,8 @@ pub struct MetricTagsResponse {
 pub async fn list_metric_tags(
     State(state): State<SearchState>,
     Query(params): Query<MetricTagsParams>,
-) -> Result<Json<MetricTagsResponse>, SearchError> {
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
+) -> Result<(axum::http::HeaderMap, Json<MetricTagsResponse>), SearchError> {
     let start = Instant::now();
 
     if params.metric_name.trim().is_empty() {
@@ -400,10 +409,13 @@ pub async fn list_metric_tags(
             time_range.end.timestamp_micros().to_string().as_bytes(),
         ],
     );
-    if let Some(cache) = state.result_cache.as_ref() {
-        if let Some(cached) = cache.get_cached::<MetricTagsResponse>(&cache_key).await {
-            record_search_query("otel_metric_tags_cached", 0.0, true);
-            return Ok(Json(cached));
+    if !bypass {
+        if let Some(cache) = state.result_cache.as_ref() {
+            if let Some(cached) = cache.get_cached::<MetricTagsResponse>(&cache_key).await {
+                record_search_query("otel_metric_tags_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
+                return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
+            }
         }
     }
 
@@ -453,7 +465,7 @@ pub async fn list_metric_tags(
         });
     }
 
-    Ok(Json(response))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 // ============================================================================
@@ -526,7 +538,8 @@ pub struct ListTracesResponse {
 pub async fn list_traces(
     State(state): State<SearchState>,
     Query(params): Query<ListTracesParams>,
-) -> Result<Json<ListTracesResponse>, SearchError> {
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
+) -> Result<(axum::http::HeaderMap, Json<ListTracesResponse>), SearchError> {
     let start = Instant::now();
 
     // Resolve the time window: explicit start/end win; otherwise look back
@@ -576,10 +589,13 @@ pub async fn list_traces(
                 .as_bytes(),
         ],
     );
-    if let Some(cache) = state.result_cache.as_ref() {
-        if let Some(cached) = cache.get_cached::<ListTracesResponse>(&cache_key).await {
-            record_search_query("otel_traces_list_cached", 0.0, true);
-            return Ok(Json(cached));
+    if !bypass {
+        if let Some(cache) = state.result_cache.as_ref() {
+            if let Some(cached) = cache.get_cached::<ListTracesResponse>(&cache_key).await {
+                record_search_query("otel_traces_list_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
+                return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
+            }
         }
     }
 
@@ -605,7 +621,7 @@ pub async fn list_traces(
         });
     }
 
-    Ok(Json(response))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 // ============================================================================
@@ -648,7 +664,8 @@ pub struct MetricNamesResponse {
 pub async fn list_metric_names(
     State(state): State<SearchState>,
     Query(params): Query<MetricNamesParams>,
-) -> Result<Json<MetricNamesResponse>, SearchError> {
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
+) -> Result<(axum::http::HeaderMap, Json<MetricNamesResponse>), SearchError> {
     let start = Instant::now();
 
     let service = params.service.as_deref().filter(|s| !s.is_empty());
@@ -659,10 +676,13 @@ pub async fn list_metric_names(
         "mnames",
         &[service.unwrap_or("").as_bytes()],
     );
-    if let Some(cache) = state.result_cache.as_ref() {
-        if let Some(cached) = cache.get_cached::<MetricNamesResponse>(&cache_key).await {
-            record_search_query("otel_metric_names_cached", 0.0, true);
-            return Ok(Json(cached));
+    if !bypass {
+        if let Some(cache) = state.result_cache.as_ref() {
+            if let Some(cached) = cache.get_cached::<MetricNamesResponse>(&cache_key).await {
+                record_search_query("otel_metric_names_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
+                return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
+            }
         }
     }
 
@@ -688,7 +708,7 @@ pub async fn list_metric_names(
         });
     }
 
-    Ok(Json(response))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 // ============================================================================
@@ -790,7 +810,8 @@ pub struct ServicesOverviewResponse {
 pub async fn list_services(
     State(state): State<SearchState>,
     Query(params): Query<ServicesParams>,
-) -> Result<Json<ServicesOverviewResponse>, SearchError> {
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
+) -> Result<(axum::http::HeaderMap, Json<ServicesOverviewResponse>), SearchError> {
     let start = Instant::now();
 
     let time_range = resolve_window(params.start, params.end, params.window_hours)?;
@@ -833,13 +854,16 @@ pub async fn list_services(
             params.limit.map(|v| v.to_string()).unwrap_or_default().as_bytes(),
         ],
     );
-    if let Some(cache) = state.result_cache.as_ref() {
-        if let Some(cached) = cache
-            .get_cached::<ServicesOverviewResponse>(&cache_key)
-            .await
-        {
-            record_search_query("otel_services_overview_cached", 0.0, true);
-            return Ok(Json(cached));
+    if !bypass {
+        if let Some(cache) = state.result_cache.as_ref() {
+            if let Some(cached) = cache
+                .get_cached::<ServicesOverviewResponse>(&cache_key)
+                .await
+            {
+                record_search_query("otel_services_overview_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
+                return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
+            }
         }
     }
 
@@ -877,7 +901,7 @@ pub async fn list_services(
         });
     }
 
-    Ok(Json(response))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 /// Default exemplar sample size for the service detail.
@@ -937,7 +961,8 @@ pub async fn get_service_detail(
     State(state): State<SearchState>,
     Path(service): Path<String>,
     Query(params): Query<ServiceDetailParams>,
-) -> Result<Json<ServiceDetailResponse>, SearchError> {
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
+) -> Result<(axum::http::HeaderMap, Json<ServiceDetailResponse>), SearchError> {
     let start = Instant::now();
 
     if service.trim().is_empty() {
@@ -962,10 +987,13 @@ pub async fn get_service_detail(
             params.exemplar_limit.to_string().as_bytes(),
         ],
     );
-    if let Some(cache) = state.result_cache.as_ref() {
-        if let Some(cached) = cache.get_cached::<ServiceDetailResponse>(&cache_key).await {
-            record_search_query("otel_service_detail_cached", 0.0, true);
-            return Ok(Json(cached));
+    if !bypass {
+        if let Some(cache) = state.result_cache.as_ref() {
+            if let Some(cached) = cache.get_cached::<ServiceDetailResponse>(&cache_key).await {
+                record_search_query("otel_service_detail_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
+                return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
+            }
         }
     }
 
@@ -991,7 +1019,7 @@ pub async fn get_service_detail(
         });
     }
 
-    Ok(Json(response))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 // ============================================================================
@@ -1067,7 +1095,8 @@ pub struct InfraHostsResponse {
 pub async fn list_infra_hosts(
     State(state): State<SearchState>,
     Query(params): Query<InfraHostsParams>,
-) -> Result<Json<InfraHostsResponse>, SearchError> {
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
+) -> Result<(axum::http::HeaderMap, Json<InfraHostsResponse>), SearchError> {
     let start = Instant::now();
 
     let time_range = resolve_window(params.start, params.end, params.window_hours)?;
@@ -1103,10 +1132,13 @@ pub async fn list_infra_hosts(
             params.limit.map(|v| v.to_string()).unwrap_or_default().as_bytes(),
         ],
     );
-    if let Some(cache) = state.result_cache.as_ref() {
-        if let Some(cached) = cache.get_cached::<InfraHostsResponse>(&cache_key).await {
-            record_search_query("otel_infra_hosts_cached", 0.0, true);
-            return Ok(Json(cached));
+    if !bypass {
+        if let Some(cache) = state.result_cache.as_ref() {
+            if let Some(cached) = cache.get_cached::<InfraHostsResponse>(&cache_key).await {
+                record_search_query("otel_infra_hosts_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
+                return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
+            }
         }
     }
 
@@ -1137,7 +1169,7 @@ pub async fn list_infra_hosts(
         });
     }
 
-    Ok(Json(response))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 // ============================================================================
@@ -1197,7 +1229,8 @@ pub struct RumSummaryResponse {
 pub async fn get_rum_summary(
     State(state): State<SearchState>,
     Query(params): Query<RumParams>,
-) -> Result<Json<RumSummaryResponse>, SearchError> {
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
+) -> Result<(axum::http::HeaderMap, Json<RumSummaryResponse>), SearchError> {
     let start = Instant::now();
 
     let time_range = resolve_window(params.start, params.end, params.window_hours)?;
@@ -1223,10 +1256,13 @@ pub async fn get_rum_summary(
             filters.env.unwrap_or("").as_bytes(),
         ],
     );
-    if let Some(cache) = state.result_cache.as_ref() {
-        if let Some(cached) = cache.get_cached::<RumSummaryResponse>(&cache_key).await {
-            record_search_query("otel_rum_summary_cached", 0.0, true);
-            return Ok(Json(cached));
+    if !bypass {
+        if let Some(cache) = state.result_cache.as_ref() {
+            if let Some(cached) = cache.get_cached::<RumSummaryResponse>(&cache_key).await {
+                record_search_query("otel_rum_summary_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
+                return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
+            }
         }
     }
 
@@ -1252,5 +1288,5 @@ pub async fn get_rum_summary(
         });
     }
 
-    Ok(Json(response))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }

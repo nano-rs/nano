@@ -59,8 +59,10 @@ fn enforce_non_audit_query(query: &str) -> Result<String, SearchError> {
 pub async fn search_stream(
     State(state): State<SearchState>,
     Extension(auth): Extension<crate::AuthContext>,
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(mut request): Json<SearchRequest>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, SearchError> {
+) -> Result<(axum::http::HeaderMap, Sse<impl Stream<Item = Result<Event, Infallible>>>), SearchError>
+{
     let user_id = auth.claims.sub;
 
     if !auth.claims.has_permission(permissions::AUDIT_VIEW) {
@@ -79,10 +81,17 @@ pub async fn search_stream(
 
     // Check search result cache (Dragonfly/Redis) — on hit, replay as SSE events via channel.
     // Rows are chunked into batches of 1000 to avoid SSE buffer overflow.
-    let cache_hit = if let Some(ref cache) = state.result_cache {
-        if let Some(cached) = cache.get(&request).await {
-            record_search_query("stream_cached", 0.0, true);
-            let tx = event_tx.clone();
+    // NAN-1595: skip the read on an explicit refresh (bypass), and capture the
+    // entry age so the response can carry `x-nano-cache: hit` + age for the UI.
+    let mut cache_age: Option<u64> = None;
+    let cache_hit = if !bypass {
+        if let Some(ref cache) = state.result_cache {
+            if let Some(cached) = cache.get(&request).await {
+                record_search_query("stream_cached", 0.0, true);
+                cache_age = cache
+                    .age_secs(&crate::cache::SearchResultCache::cache_key(&request))
+                    .await;
+                let tx = event_tx.clone();
             let total_row_count = cached.results.len() as u64;
             tokio::spawn(async move {
                 const REPLAY_BATCH_SIZE: usize = 1000;
@@ -115,8 +124,11 @@ pub async fn search_stream(
                         total_rows_delivered: total_row_count,
                     })
                     .await;
-            });
-            true
+                });
+                true
+            } else {
+                false
+            }
         } else {
             false
         }
@@ -248,5 +260,11 @@ pub async fn search_stream(
             .data(""));
     };
 
-    Ok(Sse::new(stream))
+    // NAN-1595: the frontend reads the stream via fetch + getReader(), so it can
+    // read these response headers — surfacing "served from cache + age" even on a
+    // shared-link follow (whose client cache is cold).
+    Ok((
+        crate::cache::cache_status_headers(cache_hit, cache_age),
+        Sse::new(stream),
+    ))
 }

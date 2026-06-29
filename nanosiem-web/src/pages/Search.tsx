@@ -1381,7 +1381,8 @@ export function Search() {
     currentQuery: string,
     currentTimeRange: TimeRangeValue,
     currentMode: 'piped' | 'sql',
-    isAggregate: boolean
+    isAggregate: boolean,
+    bypassCache: boolean = false
   ) => {
     // Abort any previous SSE stream
     if (sseControllerRef.current) {
@@ -1625,7 +1626,15 @@ export function Search() {
         clearAsyncJob();
         queryClient.invalidateQueries({ queryKey: ['search-jobs'] });
       },
-    });
+      // NAN-1595: surface the server cache status so the "cached Ns ago · refresh"
+      // banner shows even on a shared-link follow (cold client cache). The server
+      // age maps to a synthetic cachedAt the existing banner already renders.
+      onCacheMeta: (meta) => {
+        if (meta.hit) {
+          setCachedResultsTimestamp(Date.now() - (meta.ageSecs ?? 0) * 1000);
+        }
+      },
+    }, { bypass: bypassCache });
 
     sseControllerRef.current = controller;
   }, [clearAsyncJob, processAsyncJobResult, startAsyncJobPolling, queryClient, fetchFieldStats, toApiTimeRange, captureSearch, requestQueryCorrection]);
@@ -1735,7 +1744,8 @@ export function Search() {
         // Use SSE streaming for live result delivery
         startStreamingSearch(
           { query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset, skip_field_stats: true, table_view: true, dataset },
-          currentQuery, currentTimeRange, currentMode, isAggregate
+          currentQuery, currentTimeRange, currentMode, isAggregate,
+          useCache === false // NAN-1595: explicit refresh → bypass the server cache
         );
         // Refresh SQL panel if visible (SSE returns early, so do it before exit)
         if (showSql) {
@@ -4279,7 +4289,7 @@ export function Search() {
                     onCancelAsyncJob={handleCancelAsyncJob}
                     isStreamingResults={isStreamingResults}
                     cachedAt={cachedResultsTimestamp}
-                    onRefreshCache={() => { setCachedResultsTimestamp(null); handleSearch(); }}
+                    onRefreshCache={() => { setCachedResultsTimestamp(null); handleSearch(1, false, undefined, undefined, undefined, false); }}
                     fieldsCollapsed={showFieldsPanel && !fieldsPanelExpanded}
                     fieldsCount={fieldStats.length}
                     onExpandFields={() => { userToggledFieldsPanel.current = true; setFieldsPanelExpanded(true); }}

@@ -60,7 +60,11 @@ import type {
 
 export class SearchApi {
   constructor(
-    private request: <T>(endpoint: string, options?: RequestInit) => Promise<T>,
+    private request: <T>(
+      endpoint: string,
+      options?: RequestInit,
+      cacheOpts?: import('./index').CacheRequestOpts
+    ) => Promise<T>,
     private getAccessToken?: () => string | null,
     private searchBaseUrl?: string
   ) {}
@@ -100,91 +104,124 @@ export class SearchApi {
 
   // Async field stats (loaded separately from main search for better UX)
   // DEPRECATED: Use getFieldValues for on-demand per-field stats instead
-  async getFieldStats(request: FieldStatsRequest): Promise<FieldStatsResponse> {
+  async getFieldStats(
+    request: FieldStatsRequest,
+    cacheOpts?: import('./index').CacheRequestOpts
+  ): Promise<FieldStatsResponse> {
     return this.request('/api/search/field-stats', {
       method: 'POST',
       body: JSON.stringify(request),
-    });
+    }, cacheOpts);
   }
 
   // On-demand field values (Kibana-style, fetched when user expands a field)
-  async getSearchFieldValues(request: FieldValuesRequest): Promise<FieldValuesResponse> {
+  async getSearchFieldValues(
+    request: FieldValuesRequest,
+    cacheOpts?: import('./index').CacheRequestOpts
+  ): Promise<FieldValuesResponse> {
     return this.request('/api/search/field-values', {
       method: 'POST',
       body: JSON.stringify(request),
-    });
+    }, cacheOpts);
   }
 
   // Paginated asset events (for infinite scroll and server-side filtering)
-  async getAssetEvents(request: AssetEventsRequest): Promise<AssetEventsResponse> {
+  async getAssetEvents(
+    request: AssetEventsRequest,
+    cacheOpts?: import('./index').CacheRequestOpts
+  ): Promise<AssetEventsResponse> {
     return this.request('/api/search/asset-events', {
       method: 'POST',
       body: JSON.stringify(request),
-    });
+    }, cacheOpts);
   }
 
   // Lazy-loaded true time range (first/last seen) for asset view
-  async getAssetTrueTimeRange(request: AssetTrueTimeRangeRequest): Promise<AssetTrueTimeRangeResponse> {
+  async getAssetTrueTimeRange(
+    request: AssetTrueTimeRangeRequest,
+    cacheOpts?: import('./index').CacheRequestOpts
+  ): Promise<AssetTrueTimeRangeResponse> {
     return this.request('/api/search/asset-true-time-range', {
       method: 'POST',
       body: JSON.stringify(request),
-    });
+    }, cacheOpts);
   }
 
   // Paginated cloud events (for infinite scroll and server-side filtering)
-  async getCloudEvents(request: CloudEventsRequest): Promise<CloudEventsResponse> {
+  async getCloudEvents(
+    request: CloudEventsRequest,
+    cacheOpts?: import('./index').CacheRequestOpts
+  ): Promise<CloudEventsResponse> {
     return this.request('/api/search/cloud-events', {
       method: 'POST',
       body: JSON.stringify(request),
-    });
+    }, cacheOpts);
   }
 
   // Cloud user timeline (for user investigation sheet)
-  async getCloudUserTimeline(request: CloudUserTimelineRequest): Promise<CloudUserTimelineResponse> {
+  async getCloudUserTimeline(
+    request: CloudUserTimelineRequest,
+    cacheOpts?: import('./index').CacheRequestOpts
+  ): Promise<CloudUserTimelineResponse> {
     return this.request('/api/search/cloud-user-timeline', {
       method: 'POST',
       body: JSON.stringify(request),
-    });
+    }, cacheOpts);
   }
 
   // Cloud entity pivot (for entity correlation sheet)
-  async getCloudEntityPivot(request: CloudEntityPivotRequest): Promise<CloudEntityPivotResponse> {
+  async getCloudEntityPivot(
+    request: CloudEntityPivotRequest,
+    cacheOpts?: import('./index').CacheRequestOpts
+  ): Promise<CloudEntityPivotResponse> {
     return this.request('/api/search/cloud-entity-pivot', {
       method: 'POST',
       body: JSON.stringify(request),
-    });
+    }, cacheOpts);
   }
 
   // Lazy-loaded artifact summaries (hashes/domains) for asset prevalence scatter
-  async getAssetArtifacts(request: AssetArtifactsRequest): Promise<AssetArtifactsResponse> {
+  async getAssetArtifacts(
+    request: AssetArtifactsRequest,
+    cacheOpts?: import('./index').CacheRequestOpts
+  ): Promise<AssetArtifactsResponse> {
     return this.request('/api/search/asset-artifacts', {
       method: 'POST',
       body: JSON.stringify(request),
-    });
+    }, cacheOpts);
   }
 
   // Asset dossier aggregates for the redesigned Asset view (NAN-393)
-  async getAssetDossier(request: AssetDossierRequest): Promise<AssetDossierResponse> {
+  async getAssetDossier(
+    request: AssetDossierRequest,
+    cacheOpts?: import('./index').CacheRequestOpts
+  ): Promise<AssetDossierResponse> {
     return this.request('/api/search/asset-dossier', {
       method: 'POST',
       body: JSON.stringify(request),
-    });
+    }, cacheOpts);
   }
 
   // Cloud overview aggregates for the redesigned `| cloud` landing view (NAN-394)
-  async getCloudOverview(request: CloudOverviewRequest): Promise<CloudOverviewResponse> {
+  async getCloudOverview(
+    request: CloudOverviewRequest,
+    cacheOpts?: import('./index').CacheRequestOpts
+  ): Promise<CloudOverviewResponse> {
     return this.request('/api/search/cloud-overview', {
       method: 'POST',
       body: JSON.stringify(request),
-    });
+    }, cacheOpts);
   }
 
   // Cloud principal dossier aggregates for `| cloud principal=X` (NAN-395)
-  async getCloudDossier(request: CloudDossierRequest): Promise<CloudDossierResponse> {
+  async getCloudDossier(
+    request: CloudDossierRequest,
+    cacheOpts?: import('./index').CacheRequestOpts
+  ): Promise<CloudDossierResponse> {
     return this.request('/api/search/cloud-dossier', {
       method: 'POST',
       body: JSON.stringify(request),
-    });
+    }, cacheOpts);
   }
 
   // OpenTelemetry observability (NAN-1528)
@@ -217,12 +254,17 @@ export class SearchApi {
    * single avg series.
    */
   async queryMetricsV2(
-    request: MetricTimeseriesV2Request
+    request: MetricTimeseriesV2Request,
+    cacheOpts?: import('./index').CacheRequestOpts
   ): Promise<MetricTimeseriesV2Response> {
-    return this.request('/api/search/metrics/timeseries', {
-      method: 'POST',
-      body: JSON.stringify(request),
-    });
+    return this.request(
+      '/api/search/metrics/timeseries',
+      {
+        method: 'POST',
+        body: JSON.stringify(request),
+      },
+      cacheOpts
+    );
   }
 
   /**
@@ -242,7 +284,10 @@ export class SearchApi {
    * query params. Param names (start/end/service/errors_only/min_duration_ns)
    * match the backend `ListTracesParams` (reconciled in the verify stage).
    */
-  async listTraces(request: ListTracesRequest): Promise<ListTracesResponse> {
+  async listTraces(
+    request: ListTracesRequest,
+    cacheOpts?: import('./index').CacheRequestOpts
+  ): Promise<ListTracesResponse> {
     const params = new URLSearchParams();
     params.set('start', request.time_range.start);
     params.set('end', request.time_range.end);
@@ -254,7 +299,7 @@ export class SearchApi {
     if (request.limit != null) params.set('limit', String(request.limit));
     // Keyset pagination cursor (NAN-1539): the previous page's last start_time.
     if (request.before) params.set('before', request.before);
-    return this.request(`/api/search/traces?${params.toString()}`);
+    return this.request(`/api/search/traces?${params.toString()}`, undefined, cacheOpts);
   }
 
   /**
@@ -278,11 +323,18 @@ export class SearchApi {
    * Campaign + pivot tables paginate via `offset`/`limit` (+ `has_more`);
    * the summary is single-shot.
    */
-  async getRetro(request: RetroRequest): Promise<RetroResponse> {
-    return this.request('/api/search/retro', {
-      method: 'POST',
-      body: JSON.stringify(request),
-    });
+  async getRetro(
+    request: RetroRequest,
+    cacheOpts?: import('./index').CacheRequestOpts
+  ): Promise<RetroResponse> {
+    return this.request(
+      '/api/search/retro',
+      {
+        method: 'POST',
+        body: JSON.stringify(request),
+      },
+      cacheOpts
+    );
   }
 
   // Saved searches
@@ -432,7 +484,8 @@ export class SearchApi {
    */
   searchStreamSSE(
     request: Omit<SearchRequest, 'async_mode'>,
-    callbacks: SearchStreamCallbacks
+    callbacks: SearchStreamCallbacks,
+    opts?: { bypass?: boolean }
   ): AbortController {
     const controller = new AbortController();
 
@@ -441,6 +494,8 @@ export class SearchApi {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'Accept': 'text/event-stream',
+      // NAN-1595: refresh forces a live server recompute (bypasses Dragonfly).
+      ...(opts?.bypass ? { 'x-nano-cache-bypass': '1' } : {}),
     };
     if (token) {
       headers['Authorization'] = `Bearer ${token}`;
@@ -462,6 +517,14 @@ export class SearchApi {
         callbacks.onError?.({ code: 'HTTP_ERROR', message: errorMsg });
         return;
       }
+
+      // NAN-1595: surface server cache status off the stream response headers.
+      const ageRaw = response.headers.get('x-nano-cache-age');
+      const age = ageRaw != null ? Number(ageRaw) : NaN;
+      callbacks.onCacheMeta?.({
+        hit: response.headers.get('x-nano-cache') === 'hit',
+        ageSecs: Number.isFinite(age) ? age : null,
+      });
 
       const reader = response.body?.getReader();
       if (!reader) {

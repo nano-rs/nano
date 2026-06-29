@@ -14,7 +14,7 @@
  * prefilled from the query.
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   BarChart3,
@@ -31,6 +31,8 @@ import {
 } from 'lucide-react';
 
 import { api } from '@/lib/api';
+import type { CacheMeta } from '@/lib/api';
+import { CachedNotice } from '@/components/search/CachedNotice';
 import { cn } from '@/lib/utils';
 import {
   DropdownMenu,
@@ -136,6 +138,14 @@ export function MetricsExplorer({
   const [series, setSeries] = useState<MetricSeries[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // NAN-1595: server cache status for the timeseries fetch + refresh bypass.
+  const [cacheMeta, setCacheMeta] = useState<CacheMeta | null>(null);
+  const [refreshNonce, setRefreshNonce] = useState(0);
+  const bypassRef = useRef(false);
+  const refresh = useCallback(() => {
+    bypassRef.current = true;
+    setRefreshNonce((n) => n + 1);
+  }, []);
 
   // --- dialogs ---
   const [monitorOpen, setMonitorOpen] = useState(false);
@@ -174,16 +184,22 @@ export function MetricsExplorer({
     let cancelled = false;
     setLoading(true);
     setError(null);
+    setCacheMeta(null);
+    const bypass = bypassRef.current;
+    bypassRef.current = false;
     api.observability
-      .queryMetricsV2({
-        metric_name: metric,
-        time_range: { start, end },
-        step_secs: stepSecs,
-        agg,
-        group_by: groupBy === NO_GROUP ? undefined : groupBy,
-        filters: filters.length ? filters : undefined,
-        service_name: service || undefined,
-      })
+      .queryMetricsV2(
+        {
+          metric_name: metric,
+          time_range: { start, end },
+          step_secs: stepSecs,
+          agg,
+          group_by: groupBy === NO_GROUP ? undefined : groupBy,
+          filters: filters.length ? filters : undefined,
+          service_name: service || undefined,
+        },
+        { onMeta: (m) => { if (!cancelled) setCacheMeta(m); }, bypass }
+      )
       .then((r) => {
         if (!cancelled) setSeries(r.series ?? []);
       })
@@ -196,7 +212,7 @@ export function MetricsExplorer({
     return () => {
       cancelled = true;
     };
-  }, [metric, agg, groupBy, filters, stepSecs, start, end, service]);
+  }, [metric, agg, groupBy, filters, stepSecs, start, end, service, refreshNonce]);
 
   const metricConfig = useMemo<MetricWidgetConfig>(
     () => ({
@@ -290,6 +306,8 @@ export function MetricsExplorer({
         </div>
 
         {loading && <Loader2 className="w-3.5 h-3.5 animate-spin text-fg-4" />}
+        <span className="flex-1" />
+        <CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={loading} />
       </div>
 
       {/* ---- filters row ---- */}

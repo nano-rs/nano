@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useMemo } from 'react';
-import { useCloudOverview } from '@/hooks/use-api';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { api } from '@/lib/api';
+import type { CacheMeta } from '@/lib/api';
 import type {
   CloudOverviewAccount,
   CloudOverviewAnomaly,
   CloudOverviewPrincipal,
+  CloudOverviewResponse,
   TimeRange,
 } from '@/lib/api/types';
+import { CachedNotice } from '@/components/search/CachedNotice';
 import { CloudOverviewTopStrip } from './CloudOverviewTopStrip';
 import { CloudOverviewHeader } from './CloudOverviewHeader';
 import { AccountsGrid } from './AccountsGrid';
@@ -54,7 +57,60 @@ export function CloudOverviewView({
     };
   }, [timeRange]);
 
-  const { data: overview, loading, error } = useCloudOverview(request);
+  // Primary overview fetch (NAN-1595). Owned locally (rather than via the
+  // useCloudOverview hook) so we can capture the server cache status via
+  // `onMeta` and force a live re-fetch with `bypass` from the header notice.
+  const [overview, setOverview] = useState<CloudOverviewResponse | null>(null);
+  const [loading, setLoading] = useState(!!request);
+  const [error, setError] = useState<Error | null>(null);
+  const [cacheMeta, setCacheMeta] = useState<CacheMeta | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+
+  // NAN-1595: sequence guard so a slow older request can't overwrite newer
+  // data / badge / loading state (or setState after unmount).
+  const reqSeq = useRef(0);
+  const fetchOverview = useCallback(
+    async (bypass: boolean) => {
+      // Bump first so even a no-request call invalidates any older in-flight response.
+      const seq = ++reqSeq.current;
+      if (!request) {
+        setLoading(false);
+        setRefreshing(false);
+        setCacheMeta(null);
+        return;
+      }
+      if (bypass) setRefreshing(true);
+      else {
+        setLoading(true);
+        setCacheMeta(null); // clear stale badge while a fresh load runs
+      }
+      setError(null);
+      try {
+        const result = await api.getCloudOverview(request, {
+          onMeta: (m) => { if (seq === reqSeq.current) setCacheMeta(m); },
+          bypass,
+        });
+        if (seq === reqSeq.current) setOverview(result);
+      } catch (err) {
+        if (seq === reqSeq.current) setError(err instanceof Error ? err : new Error(String(err)));
+      } finally {
+        if (seq === reqSeq.current) {
+          if (bypass) setRefreshing(false);
+          else setLoading(false);
+        }
+      }
+    },
+    [request]
+  );
+
+  // Re-run on a fresh (non-refresh) load whenever the request changes.
+  useEffect(() => {
+    fetchOverview(false);
+  }, [fetchOverview]);
+
+  const refresh = useCallback(() => {
+    void fetchOverview(true);
+  }, [fetchOverview]);
 
   const handlePickAccount = (account: CloudOverviewAccount) => {
     // Account scope goes through the `| cloud` command's `account=` arg so the
@@ -123,7 +179,12 @@ export function CloudOverviewView({
 
           {overview && (
             <>
-              <CloudOverviewHeader data={overview.header} query={headerQuery} />
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0 flex-1">
+                  <CloudOverviewHeader data={overview.header} query={headerQuery} />
+                </div>
+                <CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={refreshing} />
+              </div>
 
               <div className="grid grid-cols-[1.1fr_1fr] gap-3">
                 <AccountsGrid accounts={overview.accounts} onPickAccount={handlePickAccount} />

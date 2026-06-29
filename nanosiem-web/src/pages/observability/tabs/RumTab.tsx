@@ -17,7 +17,9 @@ import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Globe, AlertTriangle, RefreshCw, MonitorSmartphone, Search } from 'lucide-react';
 import { api } from '@/lib/api';
+import type { CacheMeta } from '@/lib/api';
 import { cn } from '@/lib/utils';
+import { CachedNotice } from '@/components/search/CachedNotice';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { REDChart } from '@/components/observability/charts';
 import { WebVital } from '@/components/observability/web-vital';
@@ -194,6 +196,9 @@ export function RumTab({ apiTimeRange }: ObservabilityTabProps) {
   const [rum, setRum] = useState<RumResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // NAN-1595: server cache status of the displayed RUM payload.
+  const [cacheMeta, setCacheMeta] = useState<CacheMeta | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
 
   // Filters — page/route substring + browser + env, pushed to the backend
   // (NAN-1543). Text inputs are debounced into their `debounced*` mirrors.
@@ -221,12 +226,17 @@ export function RumTab({ apiTimeRange }: ObservabilityTabProps) {
     let cancelled = false;
     setLoading(true);
     setError(null);
+    setCacheMeta(null); // clear stale badge while the fresh payload loads
     api.observability
-      .getRum(apiTimeRange, {
-        page: debouncedPage || undefined,
-        browser: debouncedBrowser || undefined,
-        env: debouncedEnv || undefined,
-      })
+      .getRum(
+        apiTimeRange,
+        {
+          page: debouncedPage || undefined,
+          browser: debouncedBrowser || undefined,
+          env: debouncedEnv || undefined,
+        },
+        { onMeta: (m) => !cancelled && setCacheMeta(m) }
+      )
       .then((res) => {
         if (!cancelled) setRum(res);
       })
@@ -240,6 +250,26 @@ export function RumTab({ apiTimeRange }: ObservabilityTabProps) {
       cancelled = true;
     };
   }, [apiTimeRange, debouncedPage, debouncedBrowser, debouncedEnv]);
+
+  // NAN-1595: force a live re-fetch of the RUM payload, bypassing the server cache.
+  const refresh = () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    setError(null);
+    api.observability
+      .getRum(
+        apiTimeRange,
+        {
+          page: debouncedPage || undefined,
+          browser: debouncedBrowser || undefined,
+          env: debouncedEnv || undefined,
+        },
+        { onMeta: setCacheMeta, bypass: true }
+      )
+      .then((res) => setRum(res))
+      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+      .finally(() => setRefreshing(false));
+  };
 
   // Page-views series → REDChart inputs (buckets + values), memoized.
   const pv = useMemo(() => {
@@ -280,6 +310,8 @@ export function RumTab({ apiTimeRange }: ObservabilityTabProps) {
         className="h-8 w-[120px] rounded-md border border-border bg-transparent px-2.5 text-[12px] font-mono outline-none focus:border-brand/50 placeholder:text-fg-4"
       />
       {loading && rum != null && <RefreshCw className="w-3.5 h-3.5 text-fg-4 animate-spin" />}
+      <span className="flex-1" />
+      <CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={refreshing} />
     </div>
   );
 

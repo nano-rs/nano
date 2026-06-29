@@ -15,7 +15,9 @@
 import { useEffect, useState } from 'react';
 import { Search, ChevronRight, Box, List as ListIcon, LayoutGrid, RefreshCw } from 'lucide-react';
 import { api } from '@/lib/api';
+import type { CacheMeta } from '@/lib/api';
 import { cn } from '@/lib/utils';
+import { CachedNotice } from '@/components/search/CachedNotice';
 import { Sparkline } from '@/components/observability/charts';
 import { HEALTH, fmtNum, fmtRate, fmtMs, fmtPct, toDesignHealth, type DesignHealth } from '@/components/observability/format';
 import type { ServiceSummary, ServiceHealth, ServicesSort } from '@/lib/api/observability';
@@ -282,6 +284,9 @@ export function ServicesTab({ apiTimeRange, onOpenService }: ObservabilityTabPro
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<ViewMode>('list');
+  // NAN-1595: server cache status of the displayed (first-page) services list.
+  const [cacheMeta, setCacheMeta] = useState<CacheMeta | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
 
   // Filter / sort controls — pushed to the backend (NAN-1543). `q` is debounced
   // into `debouncedQ` so each keystroke doesn't fire a fetch.
@@ -300,14 +305,19 @@ export function ServicesTab({ apiTimeRange, onOpenService }: ObservabilityTabPro
     let cancelled = false;
     setLoading(true);
     setError(null);
+    setCacheMeta(null); // clear stale badge while the fresh (page-0) list loads
     api.observability
-      .listServices(apiTimeRange, {
-        q: debouncedQ || undefined,
-        health: health === 'all' ? undefined : health,
-        sort,
-        limit: PAGE_SIZE,
-        offset: 0,
-      })
+      .listServices(
+        apiTimeRange,
+        {
+          q: debouncedQ || undefined,
+          health: health === 'all' ? undefined : health,
+          sort,
+          limit: PAGE_SIZE,
+          offset: 0,
+        },
+        { onMeta: (m) => !cancelled && setCacheMeta(m) }
+      )
       .then((res) => {
         if (cancelled) return;
         setServices(res.services);
@@ -324,6 +334,32 @@ export function ServicesTab({ apiTimeRange, onOpenService }: ObservabilityTabPro
       cancelled = true;
     };
   }, [apiTimeRange, debouncedQ, health, sort]);
+
+  // NAN-1595: force a live re-fetch of the first page, bypassing the server cache.
+  const refresh = () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    setError(null);
+    api.observability
+      .listServices(
+        apiTimeRange,
+        {
+          q: debouncedQ || undefined,
+          health: health === 'all' ? undefined : health,
+          sort,
+          limit: PAGE_SIZE,
+          offset: 0,
+        },
+        { onMeta: setCacheMeta, bypass: true }
+      )
+      .then((res) => {
+        setServices(res.services);
+        setTotal(res.total ?? res.services.length);
+        setHasMore(res.has_more ?? false);
+      })
+      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+      .finally(() => setRefreshing(false));
+  };
 
   const loadMore = () => {
     if (loadingMore || !hasMore) return;
@@ -377,6 +413,7 @@ export function ServicesTab({ apiTimeRange, onOpenService }: ObservabilityTabPro
         <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-fg-3 tabular-nums">
           {total} {total === 1 ? 'service' : 'services'}
         </span>
+        <CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={refreshing} />
         <div className="flex-1" />
 
         {/* sort */}

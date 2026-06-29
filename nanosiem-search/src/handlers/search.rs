@@ -55,8 +55,10 @@ fn enforce_non_audit_query(query: &str) -> Result<String, SearchError> {
 pub async fn search(
     State(state): State<SearchState>,
     axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(mut request): Json<SearchRequest>,
-) -> Result<Json<SearchResultResponse>, SearchError> {
+) -> Result<(axum::http::HeaderMap, Json<SearchResultResponse>), SearchError> {
+    use crate::cache::cache_status_headers;
     use nanosiem_core::search::QueryPriority;
 
     // H1 fix: Users without audit:view permission cannot query audit source_type.
@@ -88,19 +90,29 @@ pub async fn search(
                 SearchError::QueryError("Failed to start search".to_string())
             })?;
 
-        return Ok(Json(SearchResultResponse::Async(
-            nanosiem_core::search::AsyncSearchResponse {
-                job_id,
-                status: "queued".to_string(),
-            },
-        )));
+        return Ok((
+            cache_status_headers(false, None),
+            Json(SearchResultResponse::Async(
+                nanosiem_core::search::AsyncSearchResponse {
+                    job_id,
+                    status: "queued".to_string(),
+                },
+            )),
+        ));
     }
 
-    // Check search result cache (Dragonfly/Redis)
-    if let Some(ref cache) = state.result_cache {
-        if let Some(cached) = cache.get(&request).await {
-            record_search_query("piped_cached", 0.0, true);
-            return Ok(Json(SearchResultResponse::Sync(cached)));
+    // Check search result cache (Dragonfly/Redis). NAN-1595: skip on refresh
+    // bypass; stamp x-nano-cache hit/age so the UI can show the cached notice.
+    if !bypass {
+        if let Some(ref cache) = state.result_cache {
+            if let Some(cached) = cache.get(&request).await {
+                record_search_query("piped_cached", 0.0, true);
+                let age = cache.age_secs(&crate::cache::SearchResultCache::cache_key(&request)).await;
+                return Ok((
+                    cache_status_headers(true, age),
+                    Json(SearchResultResponse::Sync(cached)),
+                ));
+            }
         }
     }
 
@@ -129,7 +141,10 @@ pub async fn search(
         }
     }
 
-    Ok(Json(SearchResultResponse::Sync(result?)))
+    Ok((
+        cache_status_headers(false, None),
+        Json(SearchResultResponse::Sync(result?)),
+    ))
 }
 
 /// Response for cancel_search endpoint
@@ -425,8 +440,9 @@ pub async fn fetch_log(
 pub async fn prevalence_artifacts(
     State(state): State<SearchState>,
     axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(mut request): Json<SearchRequest>,
-) -> Result<Json<PrevalenceScatterData>, SearchError> {
+) -> Result<(axum::http::HeaderMap, Json<PrevalenceScatterData>), SearchError> {
     if !auth.claims.has_permission(permissions::AUDIT_VIEW) {
         request.query = enforce_non_audit_query(&request.query)?;
     }
@@ -447,10 +463,13 @@ pub async fn prevalence_artifacts(
             request.dataset.as_deref().unwrap_or("logs").as_bytes(),
         ],
     );
-    if let Some(cache) = state.result_cache.as_ref() {
-        if let Some(cached) = cache.get_cached::<PrevalenceScatterData>(&cache_key).await {
-            record_search_query("prevalence_artifacts_cached", 0.0, true);
-            return Ok(Json(cached));
+    if !bypass {
+        if let Some(cache) = state.result_cache.as_ref() {
+            if let Some(cached) = cache.get_cached::<PrevalenceScatterData>(&cache_key).await {
+                record_search_query("prevalence_artifacts_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
+                return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
+            }
         }
     }
 
@@ -474,7 +493,7 @@ pub async fn prevalence_artifacts(
         });
     }
 
-    Ok(Json(response))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 /// Get field statistics for a search query (async, separate from main search)
@@ -496,8 +515,9 @@ pub async fn prevalence_artifacts(
 pub async fn field_stats_for_query(
     State(state): State<SearchState>,
     axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<FieldStatsRequest>,
-) -> Result<Json<FieldStatsResponse>, SearchError> {
+) -> Result<(axum::http::HeaderMap, Json<FieldStatsResponse>), SearchError> {
     use nanosiem_core::search::QueryPriority;
 
     let query = if !auth.claims.has_permission(permissions::AUDIT_VIEW) {
@@ -529,10 +549,13 @@ pub async fn field_stats_for_query(
             request.dataset.as_deref().unwrap_or("logs").as_bytes(),
         ],
     );
-    if let Some(cache) = state.result_cache.as_ref() {
-        if let Some(cached) = cache.get_cached::<FieldStatsResponse>(&cache_key).await {
-            record_search_query("field_stats_cached", 0.0, true);
-            return Ok(Json(cached));
+    if !bypass {
+        if let Some(cache) = state.result_cache.as_ref() {
+            if let Some(cached) = cache.get_cached::<FieldStatsResponse>(&cache_key).await {
+                record_search_query("field_stats_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
+                return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
+            }
         }
     }
 
@@ -575,7 +598,7 @@ pub async fn field_stats_for_query(
         });
     }
 
-    Ok(Json(response))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 /// Get top values for a SINGLE field (on-demand, Kibana-style)
@@ -596,8 +619,9 @@ pub async fn field_stats_for_query(
 pub async fn field_values(
     State(state): State<SearchState>,
     axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<FieldValuesRequest>,
-) -> Result<Json<FieldValuesResponse>, SearchError> {
+) -> Result<(axum::http::HeaderMap, Json<FieldValuesResponse>), SearchError> {
     let start = Instant::now();
 
     let query = if !auth.claims.has_permission(permissions::AUDIT_VIEW) {
@@ -627,10 +651,13 @@ pub async fn field_values(
             request.dataset.as_deref().unwrap_or("logs").as_bytes(),
         ],
     );
-    if let Some(cache) = state.result_cache.as_ref() {
-        if let Some(cached) = cache.get_cached::<FieldValuesResponse>(&cache_key).await {
-            record_search_query("field_values_cached", 0.0, true);
-            return Ok(Json(cached));
+    if !bypass {
+        if let Some(cache) = state.result_cache.as_ref() {
+            if let Some(cached) = cache.get_cached::<FieldValuesResponse>(&cache_key).await {
+                record_search_query("field_values_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
+                return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
+            }
         }
     }
 
@@ -664,7 +691,7 @@ pub async fn field_values(
         });
     }
 
-    Ok(Json(response))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 /// Request for on-demand field values

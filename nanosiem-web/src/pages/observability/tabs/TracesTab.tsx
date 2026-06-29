@@ -16,12 +16,14 @@
 //
 // Dense conventions: mono for ids/durations/counts, 11–13px text, 1px borders.
 
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
 import { ScatterChart, AlertTriangle, ChevronRight, Search } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { api } from '@/lib/api';
+import type { CacheMeta } from '@/lib/api';
 import { cn } from '@/lib/utils';
+import { CachedNotice } from '@/components/search/CachedNotice';
 import { formatTimeUTC, parseUTCTimestamp } from '@/lib/date-utils';
 import {
   DropdownMenu,
@@ -56,6 +58,14 @@ export function TracesTab({ apiTimeRange }: ObservabilityTabProps) {
   // Inline drill-in: when set, the tab body swaps to the trace waterfall.
   const [openTraceId, setOpenTraceId] = useState<string | null>(null);
 
+  // NAN-1595: server cache status of the displayed first page of traces. The
+  // list paginates via useInfiniteQuery, so only the page-0 fetch drives the
+  // badge; "load more" pages leave it untouched. `bypassRef` is read inside the
+  // queryFn so a refresh forces the next page-0 fetch live (bypassing the cache).
+  const [cacheMeta, setCacheMeta] = useState<CacheMeta | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const bypassRef = useRef(false);
+
   // Server-side filters (service / errors-only / min-duration) go on the list
   // request so the scatter+table reflect the filtered set without over-fetching.
   // Keyset pagination (NAN-1539): each page is fetched with a `before` cursor =
@@ -70,15 +80,26 @@ export function TracesTab({ apiTimeRange }: ObservabilityTabProps) {
       minDurMs,
     ],
     initialPageParam: undefined as string | undefined,
-    queryFn: ({ pageParam }) =>
-      api.observability.listTraces({
-        time_range: apiTimeRange,
-        service: svc || undefined,
-        errors_only: errOnly || undefined,
-        min_duration_ns: minDurMs ? Number(minDurMs) * NS_PER_MS : undefined,
-        limit: TRACE_PAGE_SIZE,
-        before: pageParam,
-      }),
+    queryFn: ({ pageParam }) => {
+      // Only the first page (no `before` cursor) drives the cache badge; "load
+      // more" pages are appends and shouldn't change it. A pending refresh
+      // bypasses the server cache for this page-0 fetch, then clears the flag.
+      const isFirstPage = pageParam == null;
+      const bypass = isFirstPage && bypassRef.current;
+      if (isFirstPage) bypassRef.current = false;
+      const cacheOpts = isFirstPage ? { onMeta: setCacheMeta, bypass } : undefined;
+      return api.observability.listTraces(
+        {
+          time_range: apiTimeRange,
+          service: svc || undefined,
+          errors_only: errOnly || undefined,
+          min_duration_ns: minDurMs ? Number(minDurMs) * NS_PER_MS : undefined,
+          limit: TRACE_PAGE_SIZE,
+          before: pageParam,
+        },
+        cacheOpts
+      );
+    },
     getNextPageParam: (lastPage) => {
       const rows = lastPage.traces ?? [];
       // A full page implies there may be more; the next cursor is the oldest
@@ -92,6 +113,16 @@ export function TracesTab({ apiTimeRange }: ObservabilityTabProps) {
     () => tracesQuery.data?.pages.flatMap((p) => p.traces ?? []) ?? [],
     [tracesQuery.data]
   );
+
+  // NAN-1595: force a live re-fetch, bypassing the server cache. Setting the
+  // bypass flag then refetching makes the page-0 queryFn re-request fresh; the
+  // refreshing flag drives the badge's spinner state until React Query settles.
+  const refresh = () => {
+    if (refreshing) return;
+    bypassRef.current = true;
+    setRefreshing(true);
+    void tracesQuery.refetch().finally(() => setRefreshing(false));
+  };
 
   // The service dropdown is populated from the root services actually present in
   // the (unfiltered-by-service window's) returned traces — no extra endpoint.
@@ -236,6 +267,7 @@ export function TracesTab({ apiTimeRange }: ObservabilityTabProps) {
         <span className="font-mono text-[11px] text-fg-3 tabular-nums">
           {traces.length} traces · <span className="text-danger">{erroredCount} errored</span>
         </span>
+        <CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={refreshing} />
         <Link
           to={exploreTo}
           className="inline-flex items-center gap-1.5 h-8 px-2.5 rounded-md border border-border text-[11.5px] text-fg-2 hover:border-border-2 hover:text-foreground"

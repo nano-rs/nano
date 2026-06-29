@@ -77,6 +77,35 @@ export type {
   CatalogListResponse, CredentialFieldDef,
 } from './marketplace';
 
+/**
+ * Cache transparency (NAN-1595). Parsed from the `x-nano-cache` / `x-nano-cache-age`
+ * response headers the search service stamps on every cacheable endpoint, so any
+ * view (including a shared-link follower whose client cache is cold) can show
+ * "cached Ns ago · refresh".
+ */
+export interface CacheMeta {
+  /** True when the body was served from the server cache. */
+  hit: boolean;
+  /** Age in seconds of the cache hit (null on a miss or when unknown). */
+  ageSecs: number | null;
+}
+
+/** Per-call cache controls threaded down to the low-level request. */
+export interface CacheRequestOpts {
+  /** Invoked with the server cache status parsed from response headers. */
+  onMeta?: (meta: CacheMeta) => void;
+  /** When true, send `x-nano-cache-bypass: 1` so the server recomputes live (refresh). */
+  bypass?: boolean;
+}
+
+/** Parse the cache-status headers off a fetch Response. */
+function parseCacheMeta(response: Response): CacheMeta {
+  const status = response.headers.get('x-nano-cache');
+  const ageRaw = response.headers.get('x-nano-cache-age');
+  const age = ageRaw != null ? Number(ageRaw) : NaN;
+  return { hit: status === 'hit', ageSecs: Number.isFinite(age) ? age : null };
+}
+
 // Re-export error class
 export class ApiClientError extends Error {
   constructor(
@@ -154,12 +183,12 @@ class ApiClient {
       this.request.bind(this),
       // Traces/Metrics passthroughs delegate to the SearchApi instance so the
       // console consumes a single `api.observability` facade (NAN-1536).
-      (req) => this._search.listTraces(req),
+      (req, cacheOpts) => this._search.listTraces(req, cacheOpts),
       (id) => this._search.getTrace(id),
       (service) => this._search.listMetricNames(service),
       (req) => this._search.queryMetrics(req),
       // NAN-1540: multi-series metrics + tag discovery.
-      (req) => this._search.queryMetricsV2(req),
+      (req, cacheOpts) => this._search.queryMetricsV2(req, cacheOpts),
       (metricName, key) => this._search.listMetricTags(metricName, key)
     );
     this._detections = new DetectionsApi(this.request.bind(this));
@@ -287,13 +316,16 @@ class ApiClient {
 
   private async request<T>(
     endpoint: string,
-    options: RequestInit = {}
+    options: RequestInit = {},
+    cacheOpts?: CacheRequestOpts
   ): Promise<T> {
     // Use service-aware routing for microservices architecture
     const serviceUrl = getServiceUrl(endpoint);
     const url = `${serviceUrl}${endpoint}`;
     const headers: HeadersInit = {
       'Content-Type': 'application/json',
+      // NAN-1595: refresh forces a live server recompute (bypasses Dragonfly).
+      ...(cacheOpts?.bypass ? { 'x-nano-cache-bypass': '1' } : {}),
       ...options.headers,
     };
 
@@ -333,6 +365,7 @@ class ApiClient {
               signal: controller.signal,
             });
             if (retryResponse.ok) {
+              cacheOpts?.onMeta?.(parseCacheMeta(retryResponse));
               if (retryResponse.status === 204) return undefined as T;
               return retryResponse.json();
             }
@@ -361,6 +394,9 @@ class ApiClient {
 
         throw new ApiClientError(error.message || 'Request failed', error.code, error.details, response.status);
       }
+
+      // NAN-1595: surface server cache status to the caller (badge driver).
+      cacheOpts?.onMeta?.(parseCacheMeta(response));
 
       // Handle 204 No Content responses (e.g., DELETE operations)
       if (response.status === 204) {
@@ -411,13 +447,19 @@ class ApiClient {
     return this._search.fetchLog(id, timeRange, sourceType);
   }
 
-  async getFieldStats(request: import('./types').FieldStatsRequest): Promise<import('./types').FieldStatsResponse> {
-    return this._search.getFieldStats(request);
+  async getFieldStats(
+    request: import('./types').FieldStatsRequest,
+    cacheOpts?: CacheRequestOpts
+  ): Promise<import('./types').FieldStatsResponse> {
+    return this._search.getFieldStats(request, cacheOpts);
   }
 
   // On-demand field values (Kibana-style)
-  async getSearchFieldValues(request: import('./types').FieldValuesRequest): Promise<import('./types').FieldValuesResponse> {
-    return this._search.getSearchFieldValues(request);
+  async getSearchFieldValues(
+    request: import('./types').FieldValuesRequest,
+    cacheOpts?: CacheRequestOpts
+  ): Promise<import('./types').FieldValuesResponse> {
+    return this._search.getSearchFieldValues(request, cacheOpts);
   }
 
   // OpenTelemetry observability (NAN-1528)
@@ -501,9 +543,10 @@ class ApiClient {
 
   searchStreamSSE(
     request: Omit<import('./types').SearchRequest, 'async_mode'>,
-    callbacks: import('./types').SearchStreamCallbacks
+    callbacks: import('./types').SearchStreamCallbacks,
+    opts?: { bypass?: boolean }
   ): AbortController {
-    return this._search.searchStreamSSE(request, callbacks);
+    return this._search.searchStreamSSE(request, callbacks, opts);
   }
 
   async getSearchJob(jobId: string): Promise<import('./types').SearchJobStatus> {
@@ -515,53 +558,83 @@ class ApiClient {
   }
 
   // Paginated asset events (for infinite scroll and server-side filtering)
-  async getAssetEvents(request: import('./types').AssetEventsRequest): Promise<import('./types').AssetEventsResponse> {
-    return this._search.getAssetEvents(request);
+  async getAssetEvents(
+    request: import('./types').AssetEventsRequest,
+    cacheOpts?: CacheRequestOpts
+  ): Promise<import('./types').AssetEventsResponse> {
+    return this._search.getAssetEvents(request, cacheOpts);
   }
 
   // Lazy-loaded true time range (first/last seen) for asset view
-  async getAssetTrueTimeRange(request: import('./types').AssetTrueTimeRangeRequest): Promise<import('./types').AssetTrueTimeRangeResponse> {
-    return this._search.getAssetTrueTimeRange(request);
+  async getAssetTrueTimeRange(
+    request: import('./types').AssetTrueTimeRangeRequest,
+    cacheOpts?: CacheRequestOpts
+  ): Promise<import('./types').AssetTrueTimeRangeResponse> {
+    return this._search.getAssetTrueTimeRange(request, cacheOpts);
   }
 
   // Lazy-loaded artifact summaries (hashes/domains) for asset prevalence scatter
-  async getAssetArtifacts(request: import('./types').AssetArtifactsRequest): Promise<import('./types').AssetArtifactsResponse> {
-    return this._search.getAssetArtifacts(request);
+  async getAssetArtifacts(
+    request: import('./types').AssetArtifactsRequest,
+    cacheOpts?: CacheRequestOpts
+  ): Promise<import('./types').AssetArtifactsResponse> {
+    return this._search.getAssetArtifacts(request, cacheOpts);
   }
 
   // Asset dossier aggregates for the redesigned Asset view (NAN-393)
-  async getAssetDossier(request: import('./types').AssetDossierRequest): Promise<import('./types').AssetDossierResponse> {
-    return this._search.getAssetDossier(request);
+  async getAssetDossier(
+    request: import('./types').AssetDossierRequest,
+    cacheOpts?: CacheRequestOpts
+  ): Promise<import('./types').AssetDossierResponse> {
+    return this._search.getAssetDossier(request, cacheOpts);
   }
 
   // Cloud overview aggregates for the redesigned `| cloud` landing view (NAN-394)
-  async getCloudOverview(request: import('./types').CloudOverviewRequest): Promise<import('./types').CloudOverviewResponse> {
-    return this._search.getCloudOverview(request);
+  async getCloudOverview(
+    request: import('./types').CloudOverviewRequest,
+    cacheOpts?: CacheRequestOpts
+  ): Promise<import('./types').CloudOverviewResponse> {
+    return this._search.getCloudOverview(request, cacheOpts);
   }
 
   // IOC retro-hunt summary / campaign-list / pivot rollup (NAN-1580)
-  async getRetro(request: import('./types').RetroRequest): Promise<import('./types').RetroResponse> {
-    return this._search.getRetro(request);
+  async getRetro(
+    request: import('./types').RetroRequest,
+    cacheOpts?: CacheRequestOpts
+  ): Promise<import('./types').RetroResponse> {
+    return this._search.getRetro(request, cacheOpts);
   }
 
   // Cloud principal dossier aggregates for `| cloud principal=X` (NAN-395)
-  async getCloudDossier(request: import('./types').CloudDossierRequest): Promise<import('./types').CloudDossierResponse> {
-    return this._search.getCloudDossier(request);
+  async getCloudDossier(
+    request: import('./types').CloudDossierRequest,
+    cacheOpts?: CacheRequestOpts
+  ): Promise<import('./types').CloudDossierResponse> {
+    return this._search.getCloudDossier(request, cacheOpts);
   }
 
   // Paginated cloud events (for infinite scroll and server-side filtering)
-  async getCloudEvents(request: import('./types').CloudEventsRequest): Promise<import('./types').CloudEventsResponse> {
-    return this._search.getCloudEvents(request);
+  async getCloudEvents(
+    request: import('./types').CloudEventsRequest,
+    cacheOpts?: CacheRequestOpts
+  ): Promise<import('./types').CloudEventsResponse> {
+    return this._search.getCloudEvents(request, cacheOpts);
   }
 
   // Cloud user timeline (for user investigation sheet)
-  async getCloudUserTimeline(request: import('./types').CloudUserTimelineRequest): Promise<import('./types').CloudUserTimelineResponse> {
-    return this._search.getCloudUserTimeline(request);
+  async getCloudUserTimeline(
+    request: import('./types').CloudUserTimelineRequest,
+    cacheOpts?: CacheRequestOpts
+  ): Promise<import('./types').CloudUserTimelineResponse> {
+    return this._search.getCloudUserTimeline(request, cacheOpts);
   }
 
   // Cloud entity pivot (for entity correlation sheet)
-  async getCloudEntityPivot(request: import('./types').CloudEntityPivotRequest): Promise<import('./types').CloudEntityPivotResponse> {
-    return this._search.getCloudEntityPivot(request);
+  async getCloudEntityPivot(
+    request: import('./types').CloudEntityPivotRequest,
+    cacheOpts?: CacheRequestOpts
+  ): Promise<import('./types').CloudEntityPivotResponse> {
+    return this._search.getCloudEntityPivot(request, cacheOpts);
   }
 
   // Authentication

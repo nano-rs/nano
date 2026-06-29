@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useRef, useState, useEffect } from 'react';
 import { MapPin, Globe, Server, AlertTriangle, Loader2, ShieldAlert, ArrowLeft } from 'lucide-react';
 import { api } from '@/lib/api';
+import type { CacheMeta } from '@/lib/api';
 import type { CloudUserTimelineResponse } from '@/lib/api/types';
+import { CachedNotice } from '@/components/search/CachedNotice';
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent } from '@/components/ui/card';
 import {
@@ -122,26 +124,58 @@ export function CloudUserTimelineSheet({
   const isMobile = useIsMobile();
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState<CloudUserTimelineResponse | null>(null);
+  // Server cache status of the displayed timeline (NAN-1595).
+  const [cacheMeta, setCacheMeta] = useState<CacheMeta | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const reqSeq = useRef(0); // NAN-1595: drop stale out-of-order responses
+  const load = useCallback(
+    (bypass: boolean) => {
+      if (!user) return;
+      const seq = ++reqSeq.current;
+      if (bypass) setRefreshing(true);
+      else {
+        setLoading(true);
+        setCacheMeta(null); // clear stale badge while a fresh load runs
+      }
+      api
+        .getCloudUserTimeline(
+          {
+            query,
+            time_range: { start: timeRange.start, end: timeRange.end },
+            user,
+          },
+          { onMeta: (m) => { if (seq === reqSeq.current) setCacheMeta(m); }, bypass }
+        )
+        .then((response) => {
+          if (seq === reqSeq.current) setData(response);
+        })
+        .catch((err) => {
+          console.error('Failed to load user timeline:', err);
+        })
+        .finally(() => {
+          if (seq === reqSeq.current) {
+            if (bypass) setRefreshing(false);
+            else setLoading(false);
+          }
+        });
+    },
+    [user, query, timeRange.start, timeRange.end]
+  );
 
   useEffect(() => {
     if (!user) {
+      reqSeq.current++; // invalidate any in-flight load so it can't write after clear
       setData(null);
+      setCacheMeta(null);
+      setLoading(false);
+      setRefreshing(false);
       return;
     }
+    load(false);
+  }, [user, load]);
 
-    setLoading(true);
-    api.getCloudUserTimeline({
-      query,
-      time_range: { start: timeRange.start, end: timeRange.end },
-      user,
-    }).then((response) => {
-      setData(response);
-    }).catch((err) => {
-      console.error('Failed to load user timeline:', err);
-    }).finally(() => {
-      setLoading(false);
-    });
-  }, [user, query, timeRange.start, timeRange.end]);
+  const refresh = useCallback(() => load(true), [load]);
 
   const events = (data?.events || []) as unknown as TimelineEvent[];
   const summary = data?.summary;
@@ -198,6 +232,8 @@ export function CloudUserTimelineSheet({
                 {RISK_LABELS[ri] || ri}
               </Badge>
             ))}
+            <span className="flex-1" />
+            <CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={refreshing} />
           </SheetTitle>
           <SheetDescription className="search-console-section-meta">
             User activity across cloud services, regions, and source IPs

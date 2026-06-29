@@ -48,8 +48,9 @@ pub struct AssetDossierRequest {
 )]
 pub async fn get_asset_dossier(
     State(state): State<SearchState>,
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<AssetDossierRequest>,
-) -> Result<Json<AssetDossier>, SearchError> {
+) -> Result<(axum::http::HeaderMap, Json<AssetDossier>), SearchError> {
     // NAN-1593: the asset dossier fires on every Asset-view load / shared-link
     // follow and runs 8 parallel ClickHouse aggregates — cache it through the
     // same Dragonfly layer so reloads return instantly. Keyed on the
@@ -67,10 +68,13 @@ pub async fn get_asset_dossier(
             request.time_range.end.timestamp_micros().to_string().as_bytes(),
         ],
     );
-    if let Some(cache) = state.result_cache.as_ref() {
-        if let Some(cached) = cache.get_cached::<AssetDossier>(&cache_key).await {
-            record_search_query("asset_dossier_cached", 0.0, true);
-            return Ok(Json(cached));
+    if !bypass {
+        if let Some(cache) = state.result_cache.as_ref() {
+            if let Some(cached) = cache.get_cached::<AssetDossier>(&cache_key).await {
+                record_search_query("asset_dossier_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
+                return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
+            }
         }
     }
 
@@ -105,5 +109,5 @@ pub async fn get_asset_dossier(
         });
     }
 
-    Ok(Json(response))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }

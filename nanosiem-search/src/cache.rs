@@ -375,6 +375,72 @@ impl SearchResultCache {
             }
         }
     }
+
+    /// Age (in whole seconds) of the cached entry under `key`, derived from its
+    /// remaining Redis TTL — no timestamp is stored in the payload. Returns
+    /// `None` when the key is absent (-2) or has no expiry (-1). Used to stamp
+    /// the `x-nano-cache-age` response header so every view (including a
+    /// shared-link follower whose client cache is cold) can show how stale a
+    /// served-from-cache result is (NAN-1595).
+    pub async fn age_secs(&self, key: &str) -> Option<u64> {
+        let mut conn = self.conn.clone();
+        let pttl_ms: i64 = conn.pttl(key).await.ok()?;
+        if pttl_ms < 0 {
+            return None;
+        }
+        let remaining_secs = (pttl_ms as u64).div_ceil(1000);
+        Some(CACHE_TTL_SECS.saturating_sub(remaining_secs))
+    }
+}
+
+// ── Cache-transparency HTTP contract (NAN-1595) ─────────────────────────────
+
+/// Response header: `hit` when the body was served from the cache, else `miss`.
+pub const HEADER_CACHE_STATUS: &str = "x-nano-cache";
+/// Response header: age in seconds of a cache `hit` (omitted on `miss`).
+pub const HEADER_CACHE_AGE: &str = "x-nano-cache-age";
+/// Request header: when `1`/`true`, skip the cache read and recompute live
+/// (the "refresh/reset" affordance), repopulating the cache for the next caller.
+pub const HEADER_CACHE_BYPASS: &str = "x-nano-cache-bypass";
+
+/// Build the cache-status response headers for a handler result.
+pub fn cache_status_headers(hit: bool, age_secs: Option<u64>) -> axum::http::HeaderMap {
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static(HEADER_CACHE_STATUS),
+        HeaderValue::from_static(if hit { "hit" } else { "miss" }),
+    );
+    if let Some(age) = age_secs {
+        headers.insert(HeaderName::from_static(HEADER_CACHE_AGE), HeaderValue::from(age));
+    }
+    headers
+}
+
+/// Axum extractor for the `x-nano-cache-bypass` request header. `CacheBypass(true)`
+/// means the caller asked for a live recompute (refresh), so the handler must
+/// skip its cache read.
+#[derive(Clone, Copy, Debug)]
+pub struct CacheBypass(pub bool);
+
+impl<S: Sync> axum::extract::FromRequestParts<S> for CacheBypass {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let bypass = parts
+            .headers
+            .get(HEADER_CACHE_BYPASS)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("true")
+            })
+            .unwrap_or(false);
+        Ok(CacheBypass(bypass))
+    }
 }
 
 #[cfg(test)]

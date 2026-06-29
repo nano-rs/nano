@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { AlertTriangle } from 'lucide-react';
 import { api } from '@/lib/api';
-import { useAssetDossier } from '@/hooks/use-api';
+import type { CacheMeta } from '@/lib/api';
 import type {
+  AssetDossierResponse,
   EntityContextResponse,
   TimeRange,
 } from '@/lib/api/types';
+import { CachedNotice } from '@/components/search/CachedNotice';
 import { AssetTopStrip } from './AssetTopStrip';
 import { AssetIdentityHeader } from './AssetIdentityHeader';
 import { AssetActivityTimeline } from './AssetActivityTimeline';
@@ -148,7 +150,58 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
       time_range: effectiveTimeRange,
     };
   }, [identifierField, identifierValue, identities, effectiveTimeRange]);
-  const { data: dossier, loading: dossierLoading } = useAssetDossier(dossierRequest);
+  // Primary dossier fetch (NAN-1595). Driven directly off the api client (rather
+  // than the useAssetDossier hook) so it can capture the server cache status via
+  // `onMeta` and support a `bypass` refresh — the hook doesn't thread cacheOpts.
+  const [dossier, setDossier] = useState<AssetDossierResponse | null>(null);
+  const [dossierLoading, setDossierLoading] = useState(false);
+  const [cacheMeta, setCacheMeta] = useState<CacheMeta | null>(null);
+
+  // NAN-1595: sequence guard so a slow older request (incl. a refresh racing a
+  // window/entity change) can't overwrite newer data/badge or setState after unmount.
+  const reqSeq = useRef(0);
+  const loadDossier = useCallback(
+    (bypass: boolean) => {
+      // Bump first so even a no-request call invalidates any older in-flight response.
+      const seq = ++reqSeq.current;
+      if (!dossierRequest) {
+        setDossier(null);
+        setCacheMeta(null);
+        setDossierLoading(false);
+        return;
+      }
+      // Fresh load clears the stale badge; refresh keeps the current data visible
+      // until the live result lands.
+      if (!bypass) setCacheMeta(null);
+      setDossierLoading(true);
+      api
+        .getAssetDossier(dossierRequest, {
+          onMeta: (m) => { if (seq === reqSeq.current) setCacheMeta(m); },
+          bypass,
+        })
+        .then((resp) => {
+          if (seq === reqSeq.current) setDossier(resp);
+        })
+        .catch(() => {
+          /* dossier failures surface as the empty/loading state below */
+        })
+        .finally(() => {
+          if (seq === reqSeq.current) setDossierLoading(false);
+        });
+    },
+    [dossierRequest],
+  );
+
+  // Reset + load whenever the request (entity / window / identities) changes.
+  useEffect(() => {
+    setDossier(null);
+    return loadDossier(false);
+  }, [loadDossier]);
+
+  // NAN-1595: force a live re-fetch of the dossier, bypassing the server cache.
+  const refresh = useCallback(() => {
+    loadDossier(true);
+  }, [loadDossier]);
 
   // Identity-aware drilldown — see `helpers.tsx:withAssetIdentity`. Wrapped in
   // a callback so each card can route clicks through one call.
@@ -285,6 +338,9 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
         onToggleFocus={() => setFocus((f) => !f)}
         resolvedSourcesLabel={resolvedSourcesLabel}
         lastObservationLabel={lastObservationLabel}
+        cachedNotice={
+          <CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={dossierLoading} />
+        }
       />
 
       <div className="flex-1 min-w-0 overflow-y-auto overflow-x-hidden">

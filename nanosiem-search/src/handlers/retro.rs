@@ -37,8 +37,10 @@ use crate::{SearchState, error::SearchError, metrics::record_search_query};
 pub async fn retro(
     State(state): State<SearchState>,
     axum::extract::Extension(auth): axum::extract::Extension<crate::AuthContext>,
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<RetroRequest>,
-) -> Result<Json<nanosiem_core::search::RetroResponse>, SearchError> {
+) -> Result<(axum::http::HeaderMap, Json<nanosiem_core::search::RetroResponse>), SearchError> {
+    use crate::cache::cache_status_headers;
     if !auth.claims.has_permission(permissions::SEARCH_EXECUTE) {
         return Err(SearchError::Forbidden(
             "Retro-hunt queries require the search:execute permission".to_string(),
@@ -48,14 +50,19 @@ pub async fn retro(
     // NAN-1593: dedupe page refreshes / shared-link follows through the same
     // Dragonfly cache regular search uses. Without this, every load re-ran the
     // full environment-wide rollup (multi-second UNION scans + host denominator).
+    // NAN-1595: skip the read on an explicit refresh (CacheBypass), and stamp
+    // x-nano-cache hit/age so the UI can show "cached Ns ago · refresh".
     let cache_key = retro_cache_key(&request);
-    if let Some(cache) = state.result_cache.as_ref() {
-        if let Some(cached) = cache
-            .get_cached::<nanosiem_core::search::RetroResponse>(&cache_key)
-            .await
-        {
-            record_search_query("retro_cached", 0.0, true);
-            return Ok(Json(cached));
+    if !bypass {
+        if let Some(cache) = state.result_cache.as_ref() {
+            if let Some(cached) = cache
+                .get_cached::<nanosiem_core::search::RetroResponse>(&cache_key)
+                .await
+            {
+                record_search_query("retro_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
+                return Ok((cache_status_headers(true, age), Json(cached)));
+            }
         }
     }
 
@@ -74,7 +81,7 @@ pub async fn retro(
         });
     }
 
-    Ok(Json(response))
+    Ok((cache_status_headers(false, None), Json(response)))
 }
 
 /// Deterministic cache key for a retro request. Excludes nothing that changes

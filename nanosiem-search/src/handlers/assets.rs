@@ -75,8 +75,9 @@ pub struct AssetEventsResponse {
 )]
 pub async fn get_asset_events(
     State(state): State<SearchState>,
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<AssetEventsRequest>,
-) -> Result<Json<AssetEventsResponse>, SearchError> {
+) -> Result<(axum::http::HeaderMap, Json<AssetEventsResponse>), SearchError> {
     let start = Instant::now();
 
     let cache_key = crate::cache::SearchResultCache::companion_key(
@@ -96,10 +97,13 @@ pub async fn get_asset_events(
                 .as_bytes(),
         ],
     );
-    if let Some(cache) = state.result_cache.as_ref() {
-        if let Some(cached) = cache.get_cached::<AssetEventsResponse>(&cache_key).await {
-            record_search_query("asset_events_cached", 0.0, true);
-            return Ok(Json(cached));
+    if !bypass {
+        if let Some(cache) = state.result_cache.as_ref() {
+            if let Some(cached) = cache.get_cached::<AssetEventsResponse>(&cache_key).await {
+                record_search_query("asset_events_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
+                return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
+            }
         }
     }
 
@@ -145,7 +149,7 @@ pub async fn get_asset_events(
             cache.set_cached(&cache_key, &resp).await;
         });
     }
-    Ok(Json(response))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 // ============================================================================
@@ -215,8 +219,9 @@ pub struct CloudEventsResponse {
 )]
 pub async fn get_cloud_events(
     State(state): State<SearchState>,
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<CloudEventsRequest>,
-) -> Result<Json<CloudEventsResponse>, SearchError> {
+) -> Result<(axum::http::HeaderMap, Json<CloudEventsResponse>), SearchError> {
     let start = Instant::now();
 
     let cache_key = crate::cache::SearchResultCache::companion_key(
@@ -232,10 +237,13 @@ pub async fn get_cloud_events(
                 .as_bytes(),
         ],
     );
-    if let Some(cache) = state.result_cache.as_ref() {
-        if let Some(cached) = cache.get_cached::<CloudEventsResponse>(&cache_key).await {
-            record_search_query("cloud_events_cached", 0.0, true);
-            return Ok(Json(cached));
+    if !bypass {
+        if let Some(cache) = state.result_cache.as_ref() {
+            if let Some(cached) = cache.get_cached::<CloudEventsResponse>(&cache_key).await {
+                record_search_query("cloud_events_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
+                return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
+            }
         }
     }
 
@@ -280,7 +288,7 @@ pub async fn get_cloud_events(
             cache.set_cached(&cache_key, &resp).await;
         });
     }
-    Ok(Json(response))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 // ============================================================================
@@ -325,8 +333,9 @@ pub struct CloudUserTimelineResponse {
 )]
 pub async fn get_cloud_user_timeline(
     State(state): State<SearchState>,
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<CloudUserTimelineRequest>,
-) -> Result<Json<CloudUserTimelineResponse>, SearchError> {
+) -> Result<(axum::http::HeaderMap, Json<CloudUserTimelineResponse>), SearchError> {
     let start = Instant::now();
 
     let cache_key = crate::cache::SearchResultCache::companion_key(
@@ -338,13 +347,16 @@ pub async fn get_cloud_user_timeline(
             request.user.as_bytes(),
         ],
     );
-    if let Some(cache) = state.result_cache.as_ref() {
-        if let Some(cached) = cache
-            .get_cached::<CloudUserTimelineResponse>(&cache_key)
-            .await
-        {
-            record_search_query("cloud_user_timeline_cached", 0.0, true);
-            return Ok(Json(cached));
+    if !bypass {
+        if let Some(cache) = state.result_cache.as_ref() {
+            if let Some(cached) = cache
+                .get_cached::<CloudUserTimelineResponse>(&cache_key)
+                .await
+            {
+                record_search_query("cloud_user_timeline_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
+                return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
+            }
         }
     }
 
@@ -372,7 +384,7 @@ pub async fn get_cloud_user_timeline(
             cache.set_cached(&cache_key, &resp).await;
         });
     }
-    Ok(Json(response))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 // ============================================================================
@@ -421,8 +433,9 @@ pub struct CloudEntityPivotResponse {
 )]
 pub async fn get_cloud_entity_pivot(
     State(state): State<SearchState>,
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<CloudEntityPivotRequest>,
-) -> Result<Json<CloudEntityPivotResponse>, SearchError> {
+) -> Result<(axum::http::HeaderMap, Json<CloudEntityPivotResponse>), SearchError> {
     let start = Instant::now();
 
     let cache_key = crate::cache::SearchResultCache::companion_key(
@@ -435,13 +448,16 @@ pub async fn get_cloud_entity_pivot(
             request.entity_value.as_bytes(),
         ],
     );
-    if let Some(cache) = state.result_cache.as_ref() {
-        if let Some(cached) = cache
-            .get_cached::<CloudEntityPivotResponse>(&cache_key)
-            .await
-        {
-            record_search_query("cloud_entity_pivot_cached", 0.0, true);
-            return Ok(Json(cached));
+    if !bypass {
+        if let Some(cache) = state.result_cache.as_ref() {
+            if let Some(cached) = cache
+                .get_cached::<CloudEntityPivotResponse>(&cache_key)
+                .await
+            {
+                record_search_query("cloud_entity_pivot_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
+                return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
+            }
         }
     }
 
@@ -478,7 +494,7 @@ pub async fn get_cloud_entity_pivot(
             cache.set_cached(&cache_key, &resp).await;
         });
     }
-    Ok(Json(response))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 // ============================================================================
@@ -523,8 +539,9 @@ pub struct AssetTrueTimeRangeResponse {
 )]
 pub async fn get_asset_true_time_range(
     State(state): State<SearchState>,
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<AssetTrueTimeRangeRequest>,
-) -> Result<Json<AssetTrueTimeRangeResponse>, SearchError> {
+) -> Result<(axum::http::HeaderMap, Json<AssetTrueTimeRangeResponse>), SearchError> {
     let start = Instant::now();
 
     let cache_key = crate::cache::SearchResultCache::companion_key(
@@ -537,13 +554,16 @@ pub async fn get_asset_true_time_range(
                 .as_bytes(),
         ],
     );
-    if let Some(cache) = state.result_cache.as_ref() {
-        if let Some(cached) = cache
-            .get_cached::<AssetTrueTimeRangeResponse>(&cache_key)
-            .await
-        {
-            record_search_query("asset_true_time_range_cached", 0.0, true);
-            return Ok(Json(cached));
+    if !bypass {
+        if let Some(cache) = state.result_cache.as_ref() {
+            if let Some(cached) = cache
+                .get_cached::<AssetTrueTimeRangeResponse>(&cache_key)
+                .await
+            {
+                record_search_query("asset_true_time_range_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
+                return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
+            }
         }
     }
 
@@ -575,7 +595,7 @@ pub async fn get_asset_true_time_range(
             cache.set_cached(&cache_key, &resp).await;
         });
     }
-    Ok(Json(response))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }
 
 // ============================================================================
@@ -673,8 +693,9 @@ pub struct AssetArtifactsResponse {
 )]
 pub async fn get_asset_artifacts(
     State(state): State<SearchState>,
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<AssetArtifactsRequest>,
-) -> Result<Json<AssetArtifactsResponse>, SearchError> {
+) -> Result<(axum::http::HeaderMap, Json<AssetArtifactsResponse>), SearchError> {
     let start = Instant::now();
 
     let cache_key = crate::cache::SearchResultCache::companion_key(
@@ -691,13 +712,16 @@ pub async fn get_asset_artifacts(
             request.prevalence_window.as_bytes(),
         ],
     );
-    if let Some(cache) = state.result_cache.as_ref() {
-        if let Some(cached) = cache
-            .get_cached::<AssetArtifactsResponse>(&cache_key)
-            .await
-        {
-            record_search_query("asset_artifacts_cached", 0.0, true);
-            return Ok(Json(cached));
+    if !bypass {
+        if let Some(cache) = state.result_cache.as_ref() {
+            if let Some(cached) = cache
+                .get_cached::<AssetArtifactsResponse>(&cache_key)
+                .await
+            {
+                record_search_query("asset_artifacts_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
+                return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
+            }
         }
     }
 
@@ -751,13 +775,16 @@ pub async fn get_asset_artifacts(
     let domain_summaries = parse_summaries("domains");
 
     if hash_summaries.is_empty() && domain_summaries.is_empty() {
-        return Ok(Json(AssetArtifactsResponse {
-            hashes: vec![],
-            domains: vec![],
-            hash_prevalence: vec![],
-            domain_prevalence: vec![],
-            rarity_threshold: 0,
-        }));
+        return Ok((
+            crate::cache::cache_status_headers(false, None),
+            Json(AssetArtifactsResponse {
+                hashes: vec![],
+                domains: vec![],
+                hash_prevalence: vec![],
+                domain_prevalence: vec![],
+                rarity_threshold: 0,
+            }),
+        ));
     }
 
     // Step 2: Build prevalence from pre-computed values (no agg table round-trip)
@@ -866,5 +893,5 @@ pub async fn get_asset_artifacts(
             cache.set_cached(&cache_key, &resp).await;
         });
     }
-    Ok(Json(response))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }

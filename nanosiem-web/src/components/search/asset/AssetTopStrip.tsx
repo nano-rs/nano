@@ -22,6 +22,8 @@ interface AssetTopStripProps {
   resolvedSourcesLabel?: string;
   /** Last observation timestamp label */
   lastObservationLabel?: string;
+  /** Cache-transparency notice (NAN-1595), rendered in the header meta row. */
+  cachedNotice?: React.ReactNode;
 }
 
 export function AssetTopStrip({
@@ -34,6 +36,7 @@ export function AssetTopStrip({
   onToggleFocus,
   resolvedSourcesLabel,
   lastObservationLabel,
+  cachedNotice,
 }: AssetTopStripProps) {
   return (
     <div className="py-2 px-3 border-b border-border flex items-center gap-2 font-mono text-[10.5px] tracking-[0.12em] uppercase text-foreground/70 font-semibold whitespace-nowrap shrink-0">
@@ -58,6 +61,10 @@ export function AssetTopStrip({
       )}
 
       <span className="flex-1" />
+
+      {cachedNotice && (
+        <span className="normal-case tracking-normal shrink-0">{cachedNotice}</span>
+      )}
 
       <button
         onClick={onToggleFocus}

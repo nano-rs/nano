@@ -156,6 +156,8 @@ export interface SearchStreamCallbacks {
   onMetadata?: (data: SearchStreamMetadata) => void;
   onCompleted?: (data: { total_rows_delivered: number }) => void;
   onError?: (data: { code: string; message: string }) => void;
+  // NAN-1595: server cache status parsed from the stream response headers.
+  onCacheMeta?: (meta: import('./index').CacheMeta) => void;
 }
 
 /** Metadata delivered after all rows (or with single batch for non-streaming queries) */

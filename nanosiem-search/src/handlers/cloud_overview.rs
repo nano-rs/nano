@@ -44,8 +44,9 @@ pub struct CloudOverviewRequest {
 )]
 pub async fn get_cloud_overview(
     State(state): State<SearchState>,
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<CloudOverviewRequest>,
-) -> Result<Json<CloudOverview>, SearchError> {
+) -> Result<(axum::http::HeaderMap, Json<CloudOverview>), SearchError> {
     // NAN-1593: the cloud overview landing aggregate fires on every load /
     // shared-link follow and runs many parallel ClickHouse aggregates — cache
     // it through the same Dragonfly layer. Keyed on the provider / account
@@ -59,10 +60,13 @@ pub async fn get_cloud_overview(
             request.time_range.end.timestamp_micros().to_string().as_bytes(),
         ],
     );
-    if let Some(cache) = state.result_cache.as_ref() {
-        if let Some(cached) = cache.get_cached::<CloudOverview>(&cache_key).await {
-            record_search_query("cloud_overview_cached", 0.0, true);
-            return Ok(Json(cached));
+    if !bypass {
+        if let Some(cache) = state.result_cache.as_ref() {
+            if let Some(cached) = cache.get_cached::<CloudOverview>(&cache_key).await {
+                record_search_query("cloud_overview_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
+                return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
+            }
         }
     }
 
@@ -96,5 +100,5 @@ pub async fn get_cloud_overview(
         });
     }
 
-    Ok(Json(response))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }

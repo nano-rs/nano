@@ -20,7 +20,9 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Server, Box, BarChart3, RefreshCw, Search } from 'lucide-react';
 import { api } from '@/lib/api';
+import type { CacheMeta } from '@/lib/api';
 import { cn } from '@/lib/utils';
+import { CachedNotice } from '@/components/search/CachedNotice';
 import { HEALTH, toDesignHealth } from '@/components/observability/format';
 import {
   INFRA_METRICS,
@@ -189,6 +191,9 @@ export function InfraTab({ apiTimeRange }: ObservabilityTabProps) {
   const [error, setError] = useState<string | null>(null);
   const [metricKey, setMetricKey] = useState<InfraMetricKey>('cpu');
   const [selected, setSelected] = useState<string | null>(null);
+  // NAN-1595: server cache status of the displayed (first-page) host inventory.
+  const [cacheMeta, setCacheMeta] = useState<CacheMeta | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
 
   // Filter controls — pushed to the backend (NAN-1543). `q` and `env` are
   // debounced into their `debounced*` mirrors so typing doesn't fire per key.
@@ -222,8 +227,13 @@ export function InfraTab({ apiTimeRange }: ObservabilityTabProps) {
     let cancelled = false;
     setLoading(true);
     setError(null);
+    setCacheMeta(null); // clear stale badge while the fresh (page-0) list loads
     api.observability
-      .getInfraHosts(apiTimeRange, { ...filterArgs, limit: PAGE_SIZE, offset: 0 })
+      .getInfraHosts(
+        apiTimeRange,
+        { ...filterArgs, limit: PAGE_SIZE, offset: 0 },
+        { onMeta: (m) => !cancelled && setCacheMeta(m) }
+      )
       .then((res) => {
         if (cancelled) return;
         setHosts(res.hosts);
@@ -241,6 +251,27 @@ export function InfraTab({ apiTimeRange }: ObservabilityTabProps) {
       cancelled = true;
     };
   }, [apiTimeRange, filterArgs]);
+
+  // NAN-1595: force a live re-fetch of the first page, bypassing the server cache.
+  const refresh = () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    setError(null);
+    api.observability
+      .getInfraHosts(
+        apiTimeRange,
+        { ...filterArgs, limit: PAGE_SIZE, offset: 0 },
+        { onMeta: setCacheMeta, bypass: true }
+      )
+      .then((res) => {
+        setHosts(res.hosts);
+        setTotal(res.total ?? res.hosts.length);
+        setHasMore(res.has_more ?? false);
+        setSelected(null);
+      })
+      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+      .finally(() => setRefreshing(false));
+  };
 
   const loadMore = () => {
     if (loadingMore || !hasMore) return;
@@ -329,6 +360,7 @@ export function InfraTab({ apiTimeRange }: ObservabilityTabProps) {
           {total > rows.length ? `${rows.length}/${total}` : rows.length} {total === 1 ? 'host' : 'hosts'}
           {summary.avg != null && ` · avg ${metric.label} ${metric.fmt(summary.avg)}`}
         </span>
+        <CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={refreshing} />
         <InfraLegend metric={metric} scaleMax={scaleMax} />
       </div>
 

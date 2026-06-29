@@ -25,7 +25,9 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import type { CacheMeta } from '@/lib/api';
 import { cn } from '@/lib/utils';
+import { CachedNotice } from '@/components/search/CachedNotice';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { REDChart, LatencyScatter, BudgetBar, type RedSeries, type ScatterTrace } from '@/components/observability/charts';
 import { ServiceSecuritySignals } from '@/components/observability/ServiceSecuritySignals';
@@ -301,6 +303,9 @@ export function ServiceDetail({ service, apiTimeRange, onBack, onOpenTrace }: Se
   const [slos, setSlos] = useState<Slo[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // NAN-1595: server cache status of the displayed RED detail.
+  const [cacheMeta, setCacheMeta] = useState<CacheMeta | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   // NAN-1544: the convergence strip is enterprise-only — its backing route is
   // absent (404) on open builds, so gate the render on the capability flag.
   const { capabilities } = useCapabilities();
@@ -309,8 +314,9 @@ export function ServiceDetail({ service, apiTimeRange, onBack, onOpenTrace }: Se
     let cancelled = false;
     setLoading(true);
     setError(null);
+    setCacheMeta(null); // clear stale badge while the fresh detail loads
     api.observability
-      .getServiceDetail(service, apiTimeRange)
+      .getServiceDetail(service, apiTimeRange, { onMeta: (m) => !cancelled && setCacheMeta(m) })
       .then((res) => {
         if (!cancelled) setDetail(res);
       })
@@ -324,6 +330,18 @@ export function ServiceDetail({ service, apiTimeRange, onBack, onOpenTrace }: Se
       cancelled = true;
     };
   }, [service, apiTimeRange]);
+
+  // NAN-1595: force a live re-fetch of the detail, bypassing the server cache.
+  const refresh = () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    setError(null);
+    api.observability
+      .getServiceDetail(service, apiTimeRange, { onMeta: setCacheMeta, bypass: true })
+      .then((res) => setDetail(res))
+      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+      .finally(() => setRefreshing(false));
+  };
 
   // SLOs are best-effort decoration — never block / error the detail on them.
   useEffect(() => {
@@ -365,6 +383,8 @@ export function ServiceDetail({ service, apiTimeRange, onBack, onOpenTrace }: Se
           {HEALTH[summarize(detail).health].label}
         </span>
       )}
+      <span className="flex-1" />
+      <CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={refreshing} />
     </div>
   );
 

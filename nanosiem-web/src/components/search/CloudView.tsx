@@ -3,7 +3,9 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { Cloud, Shield, ChevronDown, ChevronRight, Server, Globe, MapPin, User, KeyRound, Search, X, Loader2, AlertTriangle, Users } from 'lucide-react';
 import { api } from '@/lib/api';
+import type { CacheMeta } from '@/lib/api';
 import type { CloudEventFilters, CloudFacets, CloudEventsRequest, CloudUserActivity } from '@/lib/api/types';
+import { CachedNotice } from '@/components/search/CachedNotice';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Progress } from '@/components/ui/progress';
@@ -469,6 +471,14 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
   const [paginatedPagination, setPaginatedPagination] = useState<CloudPagination>(initialPagination);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
 
+  // Server cache status of the displayed events page (NAN-1595). The first page
+  // arrives in the search envelope (results[0].fields), which doesn't carry a
+  // cache header, so the badge starts empty and is populated by the offset-0
+  // getCloudEvents fetch behind any filter change or an explicit refresh.
+  const [cacheMeta, setCacheMeta] = useState<CacheMeta | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const applyFiltersSeq = useRef(0); // NAN-1595: drop stale out-of-order offset-0 fetches
+
   // Panel data state (resources, MFA, users) — updated when filters change
   const [resources, setResources] = useState<CloudResource[]>(initialResources);
   const [mfa, setMfa] = useState<CloudMfa | undefined>(initialMfa);
@@ -478,12 +488,18 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
   // Sync paginatedEvents when results prop changes (e.g. new search delivers new envelope)
   const eventsKey = initialEvents.length > 0 ? (initialEvents[0] as CloudEvent)?.timestamp : '';
   useEffect(() => {
+    // Invalidate any in-flight applyFilters so an older offset-0 response can't
+    // overwrite a fresh/cleared envelope's events/facets/badge after the reset.
+    applyFiltersSeq.current++;
     if (initialEvents.length > 0) {
       setPaginatedEvents(initialEvents);
       setPaginatedPagination(initialPagination);
       setResources(initialResources);
       setMfa(initialMfa);
       setUserActivity(initialUserActivity);
+      // Fresh envelope from a new `| cloud` run — clear any stale cache badge
+      // (the envelope page itself carries no cache header).
+      setCacheMeta(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [eventsKey]);
@@ -592,11 +608,17 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
     return filters;
   }, [initialFacets]);
 
-  // Apply filters — resets to offset 0, replaces events
-  const applyFilters = useCallback(async (filters: CloudEventFilters) => {
+  // Apply filters — resets to offset 0, replaces events. This offset-0 fetch is
+  // the events view's primary/header-defining load, so it captures the server
+  // cache status (NAN-1595). Pass `bypass` to force a live re-fetch.
+  const applyFilters = useCallback(async (filters: CloudEventFilters, bypass = false) => {
+    // NAN-1595: bump first so even a no-request call invalidates older in-flight
+    // offset-0 fetches; the seq guard then prevents stale events/facets/badge writes.
+    const seq = ++applyFiltersSeq.current;
     if (!cloudQuery || !timeRange) return;
-
+    if (bypass) setRefreshing(true);
     setIsLoadingMore(true);
+    if (!bypass) setCacheMeta(null); // clear stale badge while the fresh page loads
     try {
       const request: CloudEventsRequest = {
         query: cloudQuery,
@@ -609,7 +631,11 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
         filters: Object.keys(filters).length > 0 ? filters : undefined,
       };
 
-      const response = await api.getCloudEvents(request);
+      const response = await api.getCloudEvents(request, {
+        onMeta: (m) => { if (seq === applyFiltersSeq.current) setCacheMeta(m); },
+        bypass,
+      });
+      if (seq !== applyFiltersSeq.current) return; // a newer fetch superseded this one
       const events = (response.events || []) as unknown as CloudEvent[];
       setPaginatedEvents(events);
       setPaginatedPagination({
@@ -641,9 +667,19 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
     } catch (e) {
       console.error('Failed to apply cloud filters:', e);
     } finally {
-      setIsLoadingMore(false);
+      if (seq === applyFiltersSeq.current) {
+        setIsLoadingMore(false);
+        if (bypass) setRefreshing(false);
+      }
     }
   }, [cloudQuery, timeRange]);
+
+  // Force a live re-fetch of the events page (offset 0) bypassing the server
+  // cache, preserving the active facet/search filters (NAN-1595).
+  const refresh = useCallback(() => {
+    const filters = buildFiltersFromExclusions(excludedFacets, searchText || undefined);
+    void applyFilters(filters, true);
+  }, [applyFilters, buildFiltersFromExclusions, excludedFacets, searchText]);
 
   // Load more events (infinite scroll)
   const loadMore = useCallback(async () => {
@@ -895,6 +931,8 @@ export function CloudView({ results, onDrilldown: _onDrilldown, timeRange, query
           <div className="text-xs text-muted-foreground flex items-center gap-2">
             Showing {paginatedEvents.length} of {formatCompactNumber(displayTotalCount)} events
             {isLoadingMore && <Loader2 className="h-3 w-3 animate-spin" />}
+            <span className="flex-1" />
+            <CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={refreshing} />
           </div>
 
           <div className="border rounded-md overflow-x-auto">

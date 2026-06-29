@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { X } from 'lucide-react';
-import { useCloudDossier } from '@/hooks/use-api';
-import type { TimeRange } from '@/lib/api/types';
+import { api } from '@/lib/api';
+import type { CacheMeta } from '@/lib/api';
+import type { CloudDossierResponse, TimeRange } from '@/lib/api/types';
+import { CachedNotice } from '@/components/search/CachedNotice';
 import { CloudDossierTopStrip } from './CloudDossierTopStrip';
 import { IdentityHeader } from './IdentityHeader';
 import { FacetsBand } from './FacetsBand';
@@ -70,7 +72,61 @@ export function CloudPrincipalDossier({
     };
   }, [principal, account, provider, timeRange, filters]);
 
-  const { data: dossier, loading, error } = useCloudDossier(request);
+  // Primary dossier fetch (NAN-1595). Owned locally (rather than via the
+  // useCloudDossier hook) so we can capture the server cache status via
+  // `onMeta` and force a live re-fetch with `bypass` from the header notice.
+  const [dossier, setDossier] = useState<CloudDossierResponse | null>(null);
+  const [loading, setLoading] = useState(!!request);
+  const [error, setError] = useState<Error | null>(null);
+  const [cacheMeta, setCacheMeta] = useState<CacheMeta | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+
+  // NAN-1595: sequence guard so a slow older request can't overwrite newer
+  // data / badge / loading state (or setState after unmount).
+  const reqSeq = useRef(0);
+  const fetchDossier = useCallback(
+    async (bypass: boolean) => {
+      // Bump first so even a no-request call invalidates any older in-flight response.
+      const seq = ++reqSeq.current;
+      if (!request) {
+        setLoading(false);
+        setRefreshing(false);
+        setCacheMeta(null);
+        return;
+      }
+      if (bypass) setRefreshing(true);
+      else {
+        setLoading(true);
+        setCacheMeta(null); // clear stale badge while a fresh load runs
+      }
+      setError(null);
+      try {
+        const result = await api.getCloudDossier(request, {
+          onMeta: (m) => { if (seq === reqSeq.current) setCacheMeta(m); },
+          bypass,
+        });
+        if (seq === reqSeq.current) setDossier(result);
+      } catch (err) {
+        if (seq === reqSeq.current) setError(err instanceof Error ? err : new Error(String(err)));
+      } finally {
+        if (seq === reqSeq.current) {
+          if (bypass) setRefreshing(false);
+          else setLoading(false);
+        }
+      }
+    },
+    [request]
+  );
+
+  // Re-run on a fresh (non-refresh) load whenever the request changes
+  // (principal / account / provider / window / facet filters).
+  useEffect(() => {
+    fetchDossier(false);
+  }, [fetchDossier]);
+
+  const refresh = useCallback(() => {
+    void fetchDossier(true);
+  }, [fetchDossier]);
 
   const providerLabel = dossier?.facets.provider[0]?.name ?? provider ?? 'aws';
   const eventsTotal = dossier?.error_rate.events_total ?? 0;
@@ -183,14 +239,19 @@ export function CloudPrincipalDossier({
 
           {dossier && (
             <>
-              <IdentityHeader
-                identity={dossier.identity}
-                risk={dossier.risk}
-                eventsTotal={eventsTotal}
-                onPivotAccount={(id) => handleAddFilter('cloud_account_id', id)}
-                onPivotIp={(ip) => handleAddFilter('src_ip', ip)}
-                onPivotAssumedRole={handlePivotPrincipal}
-              />
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0 flex-1">
+                  <IdentityHeader
+                    identity={dossier.identity}
+                    risk={dossier.risk}
+                    eventsTotal={eventsTotal}
+                    onPivotAccount={(id) => handleAddFilter('cloud_account_id', id)}
+                    onPivotIp={(ip) => handleAddFilter('src_ip', ip)}
+                    onPivotAssumedRole={handlePivotPrincipal}
+                  />
+                </div>
+                <CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={refreshing} />
+              </div>
 
               {activeFilters.length > 0 && (
                 <div className="flex items-center gap-2 flex-wrap">

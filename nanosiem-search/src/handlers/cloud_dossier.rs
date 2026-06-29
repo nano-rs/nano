@@ -55,8 +55,9 @@ pub struct CloudDossierRequest {
 )]
 pub async fn get_cloud_dossier(
     State(state): State<SearchState>,
+    crate::cache::CacheBypass(bypass): crate::cache::CacheBypass,
     Json(request): Json<CloudDossierRequest>,
-) -> Result<Json<CloudDossier>, SearchError> {
+) -> Result<(axum::http::HeaderMap, Json<CloudDossier>), SearchError> {
     // NAN-1593: the cloud principal dossier fires on every load / shared-link
     // follow and runs many parallel ClickHouse aggregates — cache it through
     // the same Dragonfly layer. Every narrowing facet vec is applied to each
@@ -87,10 +88,13 @@ pub async fn get_cloud_dossier(
                 .as_bytes(),
         ],
     );
-    if let Some(cache) = state.result_cache.as_ref() {
-        if let Some(cached) = cache.get_cached::<CloudDossier>(&cache_key).await {
-            record_search_query("cloud_dossier_cached", 0.0, true);
-            return Ok(Json(cached));
+    if !bypass {
+        if let Some(cache) = state.result_cache.as_ref() {
+            if let Some(cached) = cache.get_cached::<CloudDossier>(&cache_key).await {
+                record_search_query("cloud_dossier_cached", 0.0, true);
+                let age = cache.age_secs(&cache_key).await;
+                return Ok((crate::cache::cache_status_headers(true, age), Json(cached)));
+            }
         }
     }
 
@@ -132,5 +136,5 @@ pub async fn get_cloud_dossier(
         });
     }
 
-    Ok(Json(response))
+    Ok((crate::cache::cache_status_headers(false, None), Json(response)))
 }

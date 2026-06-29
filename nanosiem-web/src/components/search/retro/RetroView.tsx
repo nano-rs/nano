@@ -14,7 +14,7 @@
  * events). Verdict = prevalence band (rare/uncommon/common).
  */
 
-import { useMemo } from 'react';
+import { useEffect, useMemo } from 'react';
 import { Crosshair, Clock, Download, ChevronRight, Loader2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type {
@@ -25,7 +25,8 @@ import type {
   RetroPivotRow,
   RetroIndicator,
 } from '@/lib/api/types';
-import { useRetro, readRetroMarker } from './useRetro';
+import { useRetro, readRetroMarker, prefetchRetro } from './useRetro';
+import { CachedNotice } from '../CachedNotice';
 import { RetroSummary } from './RetroSummary';
 import { RetroCampaign } from './RetroCampaign';
 import { RetroPivot } from './RetroPivot';
@@ -110,6 +111,7 @@ function RetroHeader({
   fieldsCount,
   onExpandFields,
   onPick,
+  cacheNotice,
 }: {
   scope: React.ReactNode;
   count?: string;
@@ -119,6 +121,7 @@ function RetroHeader({
   fieldsCount?: number;
   onExpandFields?: () => void;
   onPick: (id: ViewId) => void;
+  cacheNotice?: React.ReactNode;
 }) {
   return (
     <div className="py-2 px-3 border-b border-border flex items-center gap-2 font-mono text-[10.5px] tracking-[0.12em] uppercase text-fg/70 font-semibold whitespace-nowrap">
@@ -143,6 +146,7 @@ function RetroHeader({
         </button>
       )}
       <span className="flex-1" />
+      {cacheNotice && <span className="normal-case tracking-normal">{cacheNotice}</span>}
       {count && <span className="text-fg-3 font-mono normal-case tracking-normal">{count}</span>}
       {/* view switcher */}
       <div className="flex items-center gap-0.5 p-0.5 rounded-md border border-border bg-fg/3 normal-case tracking-normal">
@@ -178,11 +182,24 @@ export function RetroView({
   onAddToQuery,
 }: RetroViewProps) {
   const marker = useMemo(() => readRetroMarker(results?.[0]?.fields), [results]);
-  const { data, loading, loadingMore, error, hasMore, loadMore } = useRetro(query ?? '', timeRange, marker);
+  const { data, loading, loadingMore, error, hasMore, loadMore, cacheMeta, refresh } = useRetro(query ?? '', timeRange, marker);
 
   const submode: RetroSubmode = data?.submode ?? marker.submode;
   const axis: RetroAxis = data?.axis ?? marker.axis;
   const active: ViewId = submode === 'pivot' ? (axis === 'user' ? 'user' : 'asset') : (submode as ViewId);
+
+  // NAN-1594: once the active view has loaded, background-prefetch the other
+  // pivot axes (by asset / by user) so switching tabs is instant. Non-blocking
+  // and best-effort; uses the exact rewritten query the pivot will run so the
+  // prefetch cache key matches the live fetch (and warms the backend cache too).
+  useEffect(() => {
+    if (!data || loading || !timeRange) return;
+    for (const ax of ['asset', 'user'] as const) {
+      if (submode === 'pivot' && axis === ax) continue; // already showing this axis
+      prefetchRetro(rewriteRetroQuery(query, ax, marker.indicator), timeRange, ax);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data, loading, query, axis, submode, timeRange?.start, timeRange?.end]);
 
   // Summary (one indicator) and Campaign (a list/feed of indicators) are
   // mutually exclusive on the source — you can't toggle a single IOC into a
@@ -287,6 +304,7 @@ export function RetroView({
         fieldsCount={fieldsCount}
         onExpandFields={onExpandFields}
         onPick={pick}
+        cacheNotice={<CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={loading} />}
       />
 
       {error && (

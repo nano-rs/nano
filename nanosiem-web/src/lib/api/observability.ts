@@ -373,17 +373,25 @@ export interface SyntheticCheckUpdate {
 
 export class ObservabilityApi {
   constructor(
-    private request: <T>(endpoint: string, options?: RequestInit) => Promise<T>,
+    private request: <T>(
+      endpoint: string,
+      options?: RequestInit,
+      cacheOpts?: import('./index').CacheRequestOpts
+    ) => Promise<T>,
     // The traces/metrics passthroughs delegate to the existing SearchApi so we
     // don't duplicate URL-building (and the SSE/token plumbing it owns).
-    private listTracesImpl: (request: ListTracesRequest) => Promise<ListTracesResponse>,
+    private listTracesImpl: (
+      request: ListTracesRequest,
+      cacheOpts?: import('./index').CacheRequestOpts
+    ) => Promise<ListTracesResponse>,
     private getTraceImpl: (traceId: string) => Promise<TraceResponse>,
     private listMetricNamesImpl: (service?: string) => Promise<MetricNamesResponse>,
     private queryMetricsImpl: (request: MetricsQueryRequest) => Promise<MetricsQueryResponse>,
     // NAN-1540: multi-series metrics (agg / group_by / filters) + tag discovery,
     // delegated to SearchApi so the obs facade stays the single client surface.
     private queryMetricsV2Impl: (
-      request: MetricTimeseriesV2Request
+      request: MetricTimeseriesV2Request,
+      cacheOpts?: import('./index').CacheRequestOpts
     ) => Promise<MetricTimeseriesV2Response>,
     private listMetricTagsImpl: (
       metricName: string,
@@ -399,21 +407,31 @@ export class ObservabilityApi {
    * `query` (NAN-1543) carries optional name-substring / health / sort / paging.
    * Omitted entirely → backend default behavior (unfiltered, default sort).
    */
-  async listServices(timeRange: TimeRange, query?: ServicesQuery): Promise<ServicesResponse> {
+  async listServices(
+    timeRange: TimeRange,
+    query?: ServicesQuery,
+    cacheOpts?: import('./index').CacheRequestOpts
+  ): Promise<ServicesResponse> {
     const params = new URLSearchParams({ start: timeRange.start, end: timeRange.end });
     if (query?.q) params.set('q', query.q);
     if (query?.health) params.set('health', query.health);
     if (query?.sort) params.set('sort', query.sort);
     if (query?.limit != null) params.set('limit', String(query.limit));
     if (query?.offset != null) params.set('offset', String(query.offset));
-    return this.request(`/api/search/services?${params.toString()}`);
+    return this.request(`/api/search/services?${params.toString()}`, undefined, cacheOpts);
   }
 
   /** RED dashboards + endpoint breakdown + exemplars for one service. */
-  async getServiceDetail(service: string, timeRange: TimeRange): Promise<ServiceDetailResponse> {
+  async getServiceDetail(
+    service: string,
+    timeRange: TimeRange,
+    cacheOpts?: import('./index').CacheRequestOpts
+  ): Promise<ServiceDetailResponse> {
     const params = new URLSearchParams({ start: timeRange.start, end: timeRange.end });
     return this.request(
-      `/api/search/services/${encodeURIComponent(service)}?${params.toString()}`
+      `/api/search/services/${encodeURIComponent(service)}?${params.toString()}`,
+      undefined,
+      cacheOpts
     );
   }
 
@@ -451,7 +469,11 @@ export class ObservabilityApi {
    * `query` (NAN-1543) carries optional host-substring / group / env / status /
    * paging. Omitted → backend default behavior (bounded top set, unfiltered).
    */
-  async getInfraHosts(timeRange: TimeRange, query?: InfraHostsQuery): Promise<InfraHostsResponse> {
+  async getInfraHosts(
+    timeRange: TimeRange,
+    query?: InfraHostsQuery,
+    cacheOpts?: import('./index').CacheRequestOpts
+  ): Promise<InfraHostsResponse> {
     const params = new URLSearchParams({ start: timeRange.start, end: timeRange.end });
     if (query?.q) params.set('q', query.q);
     if (query?.group) params.set('group', query.group);
@@ -459,7 +481,7 @@ export class ObservabilityApi {
     if (query?.status) params.set('status', query.status);
     if (query?.limit != null) params.set('limit', String(query.limit));
     if (query?.offset != null) params.set('offset', String(query.offset));
-    return this.request(`/api/search/infra/hosts?${params.toString()}`);
+    return this.request(`/api/search/infra/hosts?${params.toString()}`, undefined, cacheOpts);
   }
 
   // --- RUM (NAN-1538) — search service ---
@@ -470,12 +492,16 @@ export class ObservabilityApi {
    * `query` (NAN-1543) carries optional page/route / browser / env filters that
    * narrow the payload. Omitted → backend default behavior (unfiltered).
    */
-  async getRum(timeRange: TimeRange, query?: RumQuery): Promise<RumResponse> {
+  async getRum(
+    timeRange: TimeRange,
+    query?: RumQuery,
+    cacheOpts?: import('./index').CacheRequestOpts
+  ): Promise<RumResponse> {
     const params = new URLSearchParams({ start: timeRange.start, end: timeRange.end });
     if (query?.page) params.set('page', query.page);
     if (query?.browser) params.set('browser', query.browser);
     if (query?.env) params.set('env', query.env);
-    return this.request(`/api/search/rum?${params.toString()}`);
+    return this.request(`/api/search/rum?${params.toString()}`, undefined, cacheOpts);
   }
 
   // --- Convergence cross-link (NAN-1542) — main api service ---
@@ -529,8 +555,11 @@ export class ObservabilityApi {
 
   // --- Traces / Metrics passthroughs (reuse existing NAN-1534 endpoints) ---
 
-  listTraces(request: ListTracesRequest): Promise<ListTracesResponse> {
-    return this.listTracesImpl(request);
+  listTraces(
+    request: ListTracesRequest,
+    cacheOpts?: import('./index').CacheRequestOpts
+  ): Promise<ListTracesResponse> {
+    return this.listTracesImpl(request, cacheOpts);
   }
 
   getTrace(traceId: string): Promise<TraceResponse> {
@@ -547,9 +576,10 @@ export class ObservabilityApi {
 
   /** Multi-series metrics query (agg / group_by / filters) — NAN-1540. */
   queryMetricsV2(
-    request: MetricTimeseriesV2Request
+    request: MetricTimeseriesV2Request,
+    cacheOpts?: import('./index').CacheRequestOpts
   ): Promise<MetricTimeseriesV2Response> {
-    return this.queryMetricsV2Impl(request);
+    return this.queryMetricsV2Impl(request, cacheOpts);
   }
 
   /** Distinct tag keys (no `key`) or values for one key — NAN-1540. */
