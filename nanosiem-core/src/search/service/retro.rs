@@ -25,7 +25,8 @@
 use super::*;
 use crate::query::{IocFeed, IocLookup, RetroAxis, SearchExpr, Value};
 use crate::query::clickhouse_sql_gen::search_expr::{
-    ioc_feed_indicator_subquery, resolve_ioc_observables, ResolvedObservable,
+    classify_indicator, ioc_feed_indicator_subquery, resolve_ioc_observables, scope_observables,
+    ResolvedObservable,
 };
 use crate::schema::SchemaProfile;
 
@@ -180,90 +181,6 @@ pub(crate) fn build_retro_marker(plan: &RetroPlan) -> serde_json::Value {
     })
 }
 
-/// Classify an indicator value into a coarse type for display.
-fn classify_indicator(value: &str) -> &'static str {
-    let v = value.trim();
-    if v.parse::<std::net::IpAddr>().is_ok() {
-        return "ip";
-    }
-    let hexlen = v.len();
-    if (hexlen == 32 || hexlen == 40 || hexlen == 64)
-        && v.chars().all(|c| c.is_ascii_hexdigit())
-    {
-        return "hash";
-    }
-    if v.starts_with("http://") || v.starts_with("https://") {
-        return "url";
-    }
-    if v.to_lowercase().starts_with("cve-") {
-        return "cve";
-    }
-    if v.contains('@') {
-        return "user";
-    }
-    if v.contains('.') && !v.contains(' ') {
-        return "domain";
-    }
-    "other"
-}
-
-/// LOGICAL UDM observable columns worth scanning for an indicator of the given
-/// coarse type (from [`classify_indicator`]).
-///
-/// The retro match OR-expands the indicator across the observable set. Scanning
-/// columns that can't hold the indicator's type is pure waste: for an IP the
-/// `lower(file_hash)`/`lower(url)`/… legs never match AND don't index-prune for
-/// an IP value, so they force column scans — measured 8.1s vs 2.0s (IP-only)
-/// over 24h on a 1.7B-row tenant, and retro runs the scan ~3x, blowing the 60s
-/// gateway timeout (NAN-1589). Restricting to the type's columns turns each
-/// scan back into a bloom-pruned read. An empty slice means "type unknown —
-/// keep the full observable set" (the caller's safe fallback).
-fn observable_logicals_for_type(indicator_type: &str) -> &'static [&'static str] {
-    match indicator_type {
-        "ip" => &["src_ip", "dest_ip", "dvc_ip"],
-        "hash" => &["file_hash", "process_hash"],
-        // a domain can surface as a URL host, an email party domain, or a DNS query
-        "domain" => &["url_domain", "sender_domain", "recipient_domain", "query"],
-        "url" => &["url"],
-        "cve" => &["cve"],
-        "user" => &["user_id", "sender", "recipient"],
-        _ => &[],
-    }
-}
-
-/// Restrict the resolved observable set to the columns relevant to the
-/// indicators' types (union across all indicators). Falls back to the FULL set
-/// when any indicator is of unknown type, when nothing is known, or when the
-/// filter would leave zero columns — a retro must never scan an empty predicate
-/// (that yields a false "0 hits"). For a single-IP summary this collapses ~17
-/// observable legs to 3 (NAN-1589).
-fn scope_observables(
-    all: &[ResolvedObservable],
-    indicators: &[String],
-) -> Vec<ResolvedObservable> {
-    let mut wanted: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for ind in indicators {
-        let logicals = observable_logicals_for_type(classify_indicator(ind));
-        if logicals.is_empty() {
-            // Unknown type → don't narrow; scan everything (current behavior).
-            return all.to_vec();
-        }
-        wanted.extend(logicals.iter().copied());
-    }
-    if wanted.is_empty() {
-        return all.to_vec();
-    }
-    let scoped: Vec<ResolvedObservable> = all
-        .iter()
-        .filter(|o| wanted.contains(o.logical))
-        .cloned()
-        .collect();
-    if scoped.is_empty() {
-        all.to_vec()
-    } else {
-        scoped
-    }
-}
 
 /// The canonical host expression used to count distinct hosts touched and to
 /// pivot by asset. First non-empty of the host/ip identity columns, RESOLVED to

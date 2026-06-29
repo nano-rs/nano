@@ -4902,7 +4902,8 @@ mod tests {
             "ioc term must emit a single WHERE with no PREWHERE, got:\n{sql}"
         );
 
-        // RAW-compared ingest-lowercased observable columns (bloom prunes).
+        // NAN-1590: an IP indicator type-scopes to the 3 IP columns (each bloom-
+        // pruned); the OR penalty + non-prunable lower(text) legs are gone.
         for raw in [
             "src_ip IN ('1.2.3.4')",
             "dest_ip IN ('1.2.3.4')",
@@ -4910,24 +4911,22 @@ mod tests {
         ] {
             assert!(sql.contains(raw), "missing raw observable leg `{raw}`, got:\n{sql}");
         }
-
-        // lower(col) IN-list form for mixed-case-history observable columns.
-        for lowered in [
-            "lower(file_hash) IN ('1.2.3.4')",
-            "lower(url_domain) IN ('1.2.3.4')",
-            "lower(query) IN ('1.2.3.4')",
-            "lower(user_id) IN ('1.2.3.4')",
-            "lower(sender) IN ('1.2.3.4')",
-            "lower(cve) IN ('1.2.3.4')",
-            "lower(signature_id) IN ('1.2.3.4')",
+        // The irrelevant `lower(text)` legs (a hash/url/user/cve column can't hold
+        // an IP) must NOT be emitted — that was the perf wall (NAN-1590).
+        for absent in [
+            "lower(file_hash)",
+            "lower(url_domain)",
+            "lower(query)",
+            "lower(user_id)",
+            "lower(cve)",
+            "lower(signature_id)",
         ] {
             assert!(
-                sql.contains(lowered),
-                "missing lowered observable leg `{lowered}`, got:\n{sql}"
+                !sql.contains(absent),
+                "IP scope must drop non-IP leg `{absent}`, got:\n{sql}"
             );
         }
-
-        // The per-observable legs are OR'd (single disjunctive matchset).
+        // The per-observable IP legs are OR'd (single disjunctive matchset).
         assert!(sql.contains(" OR "), "observable legs must be OR'd, got:\n{sql}");
     }
 
@@ -4960,34 +4959,42 @@ mod tests {
             sql.contains("\"dst_endpoint.ip\" IN ('1.2.3.4')"),
             "dest_ip must resolve to dst_endpoint.ip, got:\n{sql}"
         );
-        // lower() OCSF hash column as an IN-list.
+        // NAN-1590: an IP type-scopes to IP columns, so the hash MATCH leg must
+        // NOT be emitted (it can't hold an IP). (The bare column may still appear
+        // in the SELECT projection — assert on the predicate leg, not the column.)
         assert!(
-            sql.contains("lower(\"file.hashes.sha256\") IN ('1.2.3.4')"),
-            "file_hash must resolve to file.hashes.sha256, got:\n{sql}"
+            !sql.contains("lower(\"file.hashes.sha256\") IN"),
+            "IP scope must drop the hash match leg under OCSF, got:\n{sql}"
         );
         // No bare UDM observable column leaks through.
         assert!(!sql.contains("src_ip IN ('1.2.3.4')"), "raw UDM src_ip leaked, got:\n{sql}");
         assert!(!sql.contains("lower(file_hash)"), "raw UDM file_hash leaked, got:\n{sql}");
-        // dvc_ip has no OCSF mapping → skipped.
+        // dvc_ip has no OCSF mapping → skipped (and IP-scoped, so no UDM leak).
         assert!(!sql.contains("dvc_ip"), "dvc_ip should be skipped under OCSF, got:\n{sql}");
     }
 
     /// `ioc in [a, b]` emits ONE IN-list per observable column carrying every
-    /// value (not value×column equalities).
+    /// value (not value×column equalities). Both values are domains, so the term
+    /// type-scopes to the domain columns (NAN-1590) — IP columns are dropped.
     #[test]
     fn ioc_in_list_expands_each_value() {
         let query = parse_query("ioc in [\"evil.com\", \"bad.net\"]").unwrap();
         let sql = ClickHouseSqlGenerator::new()
             .generate(&query, &time_range())
             .unwrap();
-        // Both values in a single IN-list on each observable column.
+        // Both values in a single IN-list on each (domain) observable column.
         assert!(
             sql.contains("lower(url_domain) IN ('evil.com', 'bad.net')"),
             "values must collapse into one IN-list per observable, got:\n{sql}"
         );
         assert!(
-            sql.contains("src_ip IN ('evil.com', 'bad.net')"),
-            "values must collapse into one IN-list per observable, got:\n{sql}"
+            sql.contains("lower(sender_domain) IN ('evil.com', 'bad.net')"),
+            "values must collapse into one IN-list per (domain) observable, got:\n{sql}"
+        );
+        // Domain scope drops the IP columns (a domain can't be an IP).
+        assert!(
+            !sql.contains("src_ip IN ("),
+            "domain scope must drop IP legs, got:\n{sql}"
         );
     }
 

@@ -163,27 +163,55 @@ impl SearchService {
         // 22M rows on Saturn; timeout for the full inventory). Tight windows
         // (≤ cap matching rows) stay exact; large windows become a fast
         // PK-order sample. Per-field drill-in stays exact + unbounded.
-        let field_stats_sql =
-            ClickHouseExecutor::build_field_stats_sql(&base_sql, None, &columns, Some(FIELD_STATS_ROW_CAP));
-        info!(
-            "Executing async field stats query for {} columns",
-            columns.len()
-        );
-
-        let stats = ch_executor
-            .execute_field_stats_query(
-                &field_stats_sql,
+        //
+        // NAN-1591: a requested column can exist in the local-table inventory yet
+        // be unresolvable in the query's actual target — an ALIAS column
+        // (computed, not on the Distributed wrapper) or a column that drifted off
+        // the wrapper (span_id/tags/trace_id before a cluster re-sync). The field
+        // panel is best-effort, so a single bad column must NOT 400 the whole
+        // request: drop the offender ClickHouse names and retry, rather than
+        // failing every other column's stats. Bounded by the column count.
+        let mut columns = columns;
+        loop {
+            let field_stats_sql = ClickHouseExecutor::build_field_stats_sql(
+                &base_sql,
+                None,
                 &columns,
-                query_id,
-                self.active_ch_settings.as_ref(),
-            )
-            .await?;
-        info!(
-            "Async field stats returned {} fields with data",
-            stats.len()
-        );
-
-        Ok(stats)
+                Some(FIELD_STATS_ROW_CAP),
+            );
+            info!(
+                "Executing async field stats query for {} columns",
+                columns.len()
+            );
+            match ch_executor
+                .execute_field_stats_query(
+                    &field_stats_sql,
+                    &columns,
+                    query_id,
+                    self.active_ch_settings.as_ref(),
+                )
+                .await
+            {
+                Ok(stats) => {
+                    info!("Async field stats returned {} fields with data", stats.len());
+                    return Ok(stats);
+                }
+                Err(SearchError::FieldNotFound { field, .. })
+                    if columns.iter().any(|c| c == &field) =>
+                {
+                    warn!(
+                        "Field-stats: column '{}' not resolvable in the query target \
+                         (alias/schema drift); dropping it and retrying",
+                        field
+                    );
+                    columns.retain(|c| c != &field);
+                    if columns.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Get top values for a single field (on-demand, Kibana-style).

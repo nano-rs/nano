@@ -98,6 +98,88 @@ pub(crate) fn resolve_ioc_observables(
     out
 }
 
+/// Classify an indicator value into a coarse type (ip/hash/url/cve/user/domain).
+/// Shared by the retro rollup and the general `ioc=` SQL gen (NAN-1589/1590).
+pub(crate) fn classify_indicator(value: &str) -> &'static str {
+    let v = value.trim();
+    if v.parse::<std::net::IpAddr>().is_ok() {
+        return "ip";
+    }
+    let hexlen = v.len();
+    if (hexlen == 32 || hexlen == 40 || hexlen == 64) && v.chars().all(|c| c.is_ascii_hexdigit()) {
+        return "hash";
+    }
+    if v.starts_with("http://") || v.starts_with("https://") {
+        return "url";
+    }
+    if v.to_lowercase().starts_with("cve-") {
+        return "cve";
+    }
+    if v.contains('@') {
+        return "user";
+    }
+    if v.contains('.') && !v.contains(' ') {
+        return "domain";
+    }
+    "other"
+}
+
+/// LOGICAL UDM observable columns worth scanning for an indicator of the given
+/// coarse type (from [`classify_indicator`]).
+///
+/// The IOC match OR-expands the indicator across the observable set. Scanning
+/// columns that can't hold the indicator's type is pure waste: for an IP the
+/// `lower(file_hash)`/`lower(url)`/… legs never match AND don't index-prune for
+/// an IP value, so they force column scans (measured 8.1s vs 2.0s IP-only over
+/// 24h on a 1.7B-row tenant — NAN-1589). Restricting to the type's columns turns
+/// each leg back into a bloom-pruned read. An empty slice means "type unknown —
+/// keep the full observable set" (the caller's safe fallback).
+pub(crate) fn observable_logicals_for_type(indicator_type: &str) -> &'static [&'static str] {
+    match indicator_type {
+        "ip" => &["src_ip", "dest_ip", "dvc_ip"],
+        "hash" => &["file_hash", "process_hash"],
+        // a domain can surface as a URL host, an email party domain, or a DNS query
+        "domain" => &["url_domain", "sender_domain", "recipient_domain", "query"],
+        "url" => &["url"],
+        "cve" => &["cve"],
+        "user" => &["user_id", "sender", "recipient"],
+        _ => &[],
+    }
+}
+
+/// Restrict the resolved observable set to the columns relevant to the
+/// indicators' types (union across all indicators). Falls back to the FULL set
+/// when any indicator is of unknown type, when nothing is known, or when the
+/// filter would leave zero columns — the match must never scan an empty
+/// predicate (a false "0 hits"). For a single IP this collapses ~17 observable
+/// legs to 3 (NAN-1589/1590).
+pub(crate) fn scope_observables(
+    all: &[ResolvedObservable],
+    indicators: &[String],
+) -> Vec<ResolvedObservable> {
+    let mut wanted: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for ind in indicators {
+        let logicals = observable_logicals_for_type(classify_indicator(ind));
+        if logicals.is_empty() {
+            return all.to_vec();
+        }
+        wanted.extend(logicals.iter().copied());
+    }
+    if wanted.is_empty() {
+        return all.to_vec();
+    }
+    let scoped: Vec<ResolvedObservable> = all
+        .iter()
+        .filter(|o| wanted.contains(o.logical))
+        .cloned()
+        .collect();
+    if scoped.is_empty() {
+        all.to_vec()
+    } else {
+        scoped
+    }
+}
+
 /// Build the `SELECT lower(key_value) FROM custom_enrichment_results …`
 /// subquery that resolves a feed-sourced IOC indicator set (NAN-1580).
 ///
@@ -505,6 +587,21 @@ impl ClickHouseSqlGenerator {
         // `src_endpoint.ip`/`file.hashes.sha256`/`*_unified`; observables with no
         // column under the profile are skipped (no dead column → no CH 500).
         let observables = resolve_ioc_observables(self.profile.as_ref());
+
+        // NAN-1590: type-scope to the columns the indicator types can actually
+        // live in (ip → the 3 IP cols, etc). The full OR across ~17 columns
+        // includes non-prunable `lower(text)` legs that force scans — ~4x slower
+        // and, under the 10s ext-fields cap, a 500. Mixed/unknown types fall back
+        // to the full set (never an empty predicate). Same lever as the retro
+        // rollup; here it also speeds every normal `ioc=` search.
+        let value_strs: Vec<String> = values
+            .iter()
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .collect();
+        let observables = scope_observables(&observables, &value_strs);
 
         // Build a single IN-list of all (lowercased, escaped) values and emit ONE
         // predicate per observable column (`col IN (…)` / `lower(col) IN (…)`)
