@@ -208,6 +208,28 @@ ENGINE = Null
 ;
 
 -- =============================================================================
+-- NATIVE-PROTOCOL ENTRYPOINT  (nanosiem.ocsf_logs_native_raw — Null -> forward)
+-- =============================================================================
+-- NAN-1603: Tenzir's native `to_clickhouse` operator (v6.4.0+) CAN write to a
+-- ClickHouse `JSON` column, but its append mode validates EVERY column type on
+-- the target table — even DEFAULT columns the writer never sends — and rejects
+-- `LowCardinality(String)` and timezone-qualified `DateTime64(3, 'UTC')`. Both
+-- live on ocsf_logs_raw (source_type, timestamp), so to_clickhouse cannot target
+-- it directly. This thin entrypoint exposes ONLY to_clickhouse-compatible types
+-- (plain `String`, native `JSON`); its MV forwards (event, source_type) into
+-- ocsf_logs_raw, where the timestamp/id DEFAULTs fill in and ocsf_logs_raw_mv
+-- performs all promotion. ClickHouse cascades MVs through the Null table, so the
+-- full chain runs exactly as the HTTP path — no derivation is duplicated. Same
+-- wire shape as every direct writer: {event, source_type}.
+CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs_native_raw
+(
+    `event` JSON DEFAULT '{}',
+    `source_type` String DEFAULT 'unknown'
+)
+ENGINE = Null
+;
+
+-- =============================================================================
 -- STORAGE TABLE  (nanosiem.ocsf_logs — MergeTree; MV-populated promoted columns)
 -- =============================================================================
 -- NAN-1443: every promoted column below is now a PLAIN column populated by
@@ -1235,6 +1257,23 @@ AS SELECT
     JSONExtractString(event, 'metadata', 'correlation_uid') AS `metadata.correlation_uid`,
     length(toString(event)) AS `event_bytes`
 FROM nanosiem.ocsf_logs_raw
+;
+
+-- =============================================================================
+-- NATIVE-ENTRYPOINT FORWARDER  (nanosiem.ocsf_logs_native_raw_mv)
+-- =============================================================================
+-- NAN-1603: forwards native-protocol inserts (Tenzir `to_clickhouse`, port 9000)
+-- from the type-restricted ocsf_logs_native_raw entrypoint into ocsf_logs_raw,
+-- where the timestamp/id DEFAULTs fill in and ocsf_logs_raw_mv performs every
+-- promotion. NO projection is duplicated here — ocsf_logs_raw_mv stays the single
+-- source of truth for derivation. ClickHouse cascades the chain:
+--   ocsf_logs_native_raw -> (this MV) -> ocsf_logs_raw -> ocsf_logs_raw_mv -> ocsf_logs.
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_logs_native_raw_mv
+TO nanosiem.ocsf_logs_raw
+AS SELECT
+    event,
+    source_type
+FROM nanosiem.ocsf_logs_native_raw
 ;
 
 -- =============================================================================

@@ -6,8 +6,13 @@
 // 1.8.0 with the same class_uid/activity_id/promoted-field coverage as the
 // native Vector OCSF parsers (parsers-ocsf/{apache,aws_cloudtrail,
 // conduit_proxy,sysmon_json,windows_event}/parser.yaml), wraps each record in
-// the wire shape {event, source_type}, and INSERTs into nanosiem.ocsf_logs_raw
-// per the producer contract (docs/user-guide/direct-ocsf-ingestion.md).
+// the wire shape {event, source_type}, and streams it via the native
+// `to_clickhouse` operator into nanosiem.ocsf_logs_native_raw per the producer
+// contract (docs/user-guide/direct-ocsf-ingestion.md).
+//
+// NAN-1603: the legacy HTTP `to_http`-JSONEachRow sink is removed — native
+// `to_clickhouse` (requires Tenzir >= 6.4.0, which can write ClickHouse JSON
+// columns) is the only supported path.
 //
 // Run it (see tenzir/README.md for the full recipe):
 //
@@ -20,12 +25,14 @@
 //   NANO_CH_INGEST_PASSWORD  REQUIRED. The nanosiem_ingest password
 //                            (CLICKHOUSE_INGEST_PASSWORD; local dev default
 //                            is in docker-compose.yml).
-//   NANO_CH_URL              ClickHouse HTTP base. Default http://clickhouse:8123
-//   NANO_CH_INGEST_USER      INSERT-only user.     Default nanosiem_ingest
-//   NANO_TENZIR_LISTEN       Listener address.     Default 0.0.0.0:9095
+//   NANO_CH_INGEST_USER      INSERT-only user.            Default nanosiem_ingest
+//   NANO_CH_HOST             ClickHouse host.             Default clickhouse
+//   NANO_CH_NATIVE_PORT      ClickHouse native TCP port.  Default 9000
+//   NANO_TENZIR_LISTEN       Listener address.            Default 0.0.0.0:9095
 
-let $ch_url = env("NANO_CH_URL").otherwise("http://clickhouse:8123") + "/?query=INSERT%20INTO%20nanosiem.ocsf_logs_raw%20(event,%20source_type)%20FORMAT%20JSONEachRow&wait_for_async_insert=1"
-let $ch_auth = "Basic " + (env("NANO_CH_INGEST_USER").otherwise("nanosiem_ingest") + ":" + env("NANO_CH_INGEST_PASSWORD")).encode_base64()
+let $ch_user = env("NANO_CH_INGEST_USER").otherwise("nanosiem_ingest")
+let $ch_host = env("NANO_CH_HOST").otherwise("clickhouse")
+let $ch_port = int(env("NANO_CH_NATIVE_PORT").otherwise("9000"))
 let $listen = env("NANO_TENZIR_LISTEN").otherwise("0.0.0.0:9095")
 
 // max_connections raised above the default 10 so blast mode (threads ×
@@ -860,10 +867,11 @@ if src == "windows_sysmon" {
 
 // ---- producer-contract wire shape + sink ----------------------------------
 this = {event: ev, source_type: src}
-// `to_http` collects its whole input into a single request, which never
-// completes in a continuously-serving pipeline — `every 1s` closes the
-// request each second, turning the stream into 1 ClickHouse INSERT/s
-// micro-batches (async_insert coalesces them server-side anyway).
-every 1s {
-  to_http $ch_url, method="POST", headers={"Authorization": $ch_auth} { write_ndjson }
-}
+// NAN-1603: native `to_clickhouse` (Tenzir >= 6.4.0) streams straight into the
+// ocsf_logs_native_raw entrypoint over the native protocol — no HTTP shooter,
+// no per-second micro-batching. `mode="append"` writes the existing JSON
+// `event` column (the v6.4.0 fix); `tls=false` because the in-cluster CH port
+// is plaintext (the operator defaults to TLS otherwise). The native entrypoint
+// exists because to_clickhouse rejects ocsf_logs_raw's LowCardinality /
+// tz-qualified DateTime64 columns — see clickhouse/ocsf/init.sql.
+to_clickhouse table="nanosiem.ocsf_logs_native_raw", host=$ch_host, port=$ch_port, user=$ch_user, password=env("NANO_CH_INGEST_PASSWORD"), tls=false, mode="append"

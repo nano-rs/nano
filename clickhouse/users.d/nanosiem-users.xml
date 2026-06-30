@@ -120,6 +120,15 @@
              fails the direct path with ACCESS_DENIED on the unnameable subcolumn. -->
         <query>GRANT INSERT ON nanosiem.ocsf_logs_raw</query>
         <query>GRANT SELECT ON nanosiem.ocsf_logs_raw</query>
+        <!-- NAN-1603: native-protocol entrypoint for Tenzir `to_clickhouse`
+             (v6.4.0+, port 9000). ocsf_logs_native_raw_mv forwards (event,
+             source_type) into ocsf_logs_raw (granted above), so the inserting
+             user needs INSERT + table-level SELECT on the native entrypoint too.
+             ocsf_logs_native_raw is ENGINE=Null (stores nothing, SELECT always
+             empty) — table-level SELECT only satisfies the MV chain's insert-time
+             grant check and exposes no data. -->
+        <query>GRANT INSERT ON nanosiem.ocsf_logs_native_raw</query>
+        <query>GRANT SELECT ON nanosiem.ocsf_logs_native_raw</query>
         <query>GRANT INSERT ON nanosiem.ocsf_logs</query>
         <query>GRANT SELECT(`timestamp`, `src_endpoint.ip`, `dst_endpoint.ip`, `src_endpoint.hostname`, `dst_endpoint.hostname`, `query.hostname`, `url.hostname`, `file.hashes.sha256`, `process.file.hashes.sha256`, `actor.process.file.hashes.sha256`, `src_host_unified`, `user_unified`, `src_endpoint.mac`, `source_type`, `metadata.product.name`, `event_bytes`, `http_response.code`, `status_id`, `activity_id`, `class_uid`, `is_mfa`, `api.service.name`, `cloud.region`, `cloud.provider`) ON nanosiem.ocsf_logs</query>
         <!-- NAN-1400: nat_detection_mv chains off identity_observations (which

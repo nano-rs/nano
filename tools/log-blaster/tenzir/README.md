@@ -57,10 +57,24 @@ Producer contract: `docs/user-guide/direct-ocsf-ingestion.md`.
    docker rm -f tenzir-blaster
    ```
 
-Environment knobs on the pipeline: `NANO_CH_URL` (default
-`http://clickhouse:8123`), `NANO_CH_INGEST_USER` (default `nanosiem_ingest`),
-`NANO_CH_INGEST_PASSWORD` (**required**, never committed),
+Environment knobs on the pipeline: `NANO_CH_INGEST_USER` (default
+`nanosiem_ingest`), `NANO_CH_INGEST_PASSWORD` (**required**, never committed),
+`NANO_CH_HOST` (default `clickhouse`), `NANO_CH_NATIVE_PORT` (default `9000`),
 `NANO_TENZIR_LISTEN` (default `0.0.0.0:9095`).
+
+### Sink: native `to_clickhouse` (NAN-1603)
+
+The rig streams to ClickHouse via the native `to_clickhouse` operator over the
+native protocol (port 9000) into the dedicated `nanosiem.ocsf_logs_native_raw`
+entrypoint. **Requires Tenzir ≥ 6.4.0** (the first release whose `to_clickhouse`
+can write a ClickHouse `JSON` column). The legacy `to_http`-JSONEachRow shooter
+was removed — native is the only path.
+
+A separate entrypoint table is required because `to_clickhouse`'s append mode
+rejects `ocsf_logs_raw`'s `LowCardinality` / timezone-qualified `DateTime64`
+columns; `ocsf_logs_native_raw` exposes only `event JSON` + `source_type String`
+and forwards into the same `ocsf_logs_raw_mv` derivation chain. Full rationale:
+`docs/user-guide/direct-ocsf-ingestion.md`.
 
 ## Design notes
 
@@ -72,10 +86,10 @@ Environment knobs on the pipeline: `NANO_CH_URL` (default
 - **One router pipeline, not five**: a single `if src == … else if …` chain
   keeps the rig to one container/one port/one file, mirroring how the Vector
   router fans out to per-feed parsers.
-- **`every 1s { to_http … } `**: `to_http` collects its entire input into a
-  single request, which never completes for a continuously-serving pipeline;
-  the `every` wrapper closes the INSERT each second (async_insert coalesces
-  micro-batches server-side).
+- **Native sink, no batching wrapper**: `to_clickhouse` streams continuously
+  over the native protocol and manages its own inserts, so the pipeline drops
+  the old `every 1s { to_http … }` micro-batching wrapper the HTTP shooter
+  needed (NAN-1603).
 - **Mapping ground truth** is the OCSF parser set in the parsers repo
   (`parsers-ocsf/*/parser.yaml`). Known benign divergence: for Sysmon /
   Windows Event, the TQL emits `metadata.uid` = the Windows `record_id` (as
@@ -84,3 +98,7 @@ Environment knobs on the pipeline: `NANO_CH_URL` (default
   carry a random UUID there instead.
 - Validated against Tenzir v6.1 (`tenzir/tenzir` image). `from_http
   server=true` was removed in v6 — `accept_http` is the listener.
+
+For the sink rules, OCSF mapping conventions, validation recipe, and gotchas
+when authoring/fixing any Tenzir → OCSF → nano pipeline, see **`tenzir/AGENTS.md`**
+(repo root) — the canonical agent-facing guide.

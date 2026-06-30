@@ -485,6 +485,44 @@ services:
         limits:
           memory: 64M
 
+  # ── Optional: bundled Tenzir node (install.sh "ocsf+tenzir" option, NAN-1604).
+  # Gated behind the `tenzir` compose profile — enabled by COMPOSE_PROFILES=tenzir
+  # in .env (install.sh sets it). A Tenzir pipeline that listens for events, maps
+  # them to OCSF, and writes into nano over the native ClickHouse protocol (port
+  # 9000, internal network). The starter pipeline (./tenzir/pipeline.tql) is meant
+  # to be EDITED to add your sources + OCSF mapping; the sink is pre-wired.
+  # Requires Tenzir >= 6.4.0 (JSON-column support). OCSF schema profile only.
+  tenzir:
+    profiles: ["tenzir"]
+    # Pinned to v6.4.0 (first release whose to_clickhouse writes JSON columns).
+    # Tag kept for readability; the @sha256 is what `docker pull` enforces.
+    image: tenzir/tenzir:v6.4.0@sha256:a9db7f2e0bab2d212bf855a75b9f1e70f274a7f9c51cc9b5a9d25f6846f3fcf3
+    container_name: nano-tenzir
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
+    command: ["-f", "/pipeline.tql"]
+    environment:
+      # nanosiem_ingest password — same source as the clickhouse service.
+      CLICKHOUSE_INGEST_PASSWORD: ${CLICKHOUSE_INGEST_PASSWORD:-${CLICKHOUSE_PASSWORD}}
+    volumes:
+      - ./tenzir/pipeline.tql:/pipeline.tql:ro
+    ports:
+      # Listener for shipping events INTO the bundled node. Edit the pipeline to
+      # change/secure this. Send OCSF NDJSON: POST http://<host>:9095/
+      - "9095:9095"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      # Wait for the schema (incl. ocsf_logs_native_raw) before writing.
+      clickhouse-migrate:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
 volumes:
   nano-postgres-data:
   nano-clickhouse-data:

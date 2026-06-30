@@ -1,0 +1,53 @@
+// nano — bundled Tenzir → OCSF → ClickHouse starter pipeline (NAN-1604).
+//
+// This runs in the `nano-tenzir` container that `install.sh` adds when you pick
+// the "ocsf+tenzir" schema option. It is a STARTER you are meant to edit: it
+// stands a Tenzir node up, listening for events, and writes them into nano's
+// OCSF store over the native ClickHouse protocol. The SINK is pre-wired and
+// correct — you own the SOURCE and the OCSF MAPPING in between.
+//
+// As shipped it accepts newline-delimited JSON that is ALREADY OCSF 1.8.0 (each
+// record an `event` object carrying at least `class_uid` and `time` in epoch
+// ms) on :9095, and lands it in `nanosiem.ocsf_logs`. For raw logs, replace the
+// EDIT block with your own parsing + OCSF mapping.
+//
+// Editing this for your sources? Read tenzir/AGENTS.md (next to this file) — the
+// sink rules, OCSF mapping conventions, validation recipe, and gotchas.
+// Docs (worked examples for Sysmon, Windows Event, Apache, CloudTrail, proxy):
+//   https://nano.rs/docs/ocsf/integrations/direct-ocsf
+//
+// Connection is read from the environment (install.sh / compose set these):
+//   CLICKHOUSE_INGEST_PASSWORD  REQUIRED — the nanosiem_ingest password.
+//   NANO_CH_HOST                ClickHouse host.            Default clickhouse
+//   NANO_CH_NATIVE_PORT         ClickHouse native TCP port. Default 9000
+//   NANO_CH_INGEST_USER         INSERT-only user.           Default nanosiem_ingest
+//   NANO_TENZIR_LISTEN          Listener address.           Default 0.0.0.0:9095
+
+let $ch_host = env("NANO_CH_HOST").otherwise("clickhouse")
+let $ch_port = int(env("NANO_CH_NATIVE_PORT").otherwise("9000"))
+let $ch_user = env("NANO_CH_INGEST_USER").otherwise("nanosiem_ingest")
+let $listen  = env("NANO_TENZIR_LISTEN").otherwise("0.0.0.0:9095")
+
+// ── SOURCE ────────────────────────────────────────────────────────────────
+// Receive newline-delimited JSON over HTTP. Point your shipper at
+// http://<host>:9095/ — or swap this for any Tenzir source (`load_tcp`,
+// `load_kafka`, `load_file`, syslog, ...). The listener keeps the node alive.
+accept_http $listen { read_ndjson }
+
+// ── EDIT ME: parse + map your events to OCSF 1.8.0 ─────────────────────────
+// As shipped, records are assumed to ALREADY be OCSF objects, so we just wrap
+// them in nano's wire shape {event, source_type}. For raw logs, do your
+// parsing + OCSF mapping here and set a lowercase `source_type` per feed.
+// Every record's `event` must carry `class_uid` and `time` (epoch ms).
+this = { event: this, source_type: "tenzir" }
+// ───────────────────────────────────────────────────────────────────────────
+
+// ── SINK (pre-wired — keep the table) ──────────────────────────────────────
+// Native to_clickhouse into nano's OCSF entrypoint. nano's materialized-view
+// chain derives every promoted / enriched / prevalence column into
+// `nanosiem.ocsf_logs`. Requires Tenzir >= 6.4.0 (JSON-column support).
+// `tls=false` — the native port is plaintext on the internal docker network.
+to_clickhouse table="nanosiem.ocsf_logs_native_raw",
+  host=$ch_host, port=$ch_port,
+  user=$ch_user, password=env("CLICKHOUSE_INGEST_PASSWORD"),
+  tls=false, mode="append"
