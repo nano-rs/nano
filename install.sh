@@ -449,6 +449,15 @@ fi
 # ----------------------------------------------------------------------------
 # 4. Pull images + bring stack up
 # ----------------------------------------------------------------------------
+# NAN-1604: docker compose gives the *shell environment* precedence over .env when
+# interpolating ${NANO_SCHEMA_PROFILE}. A non-interactive install run with
+# NANO_SCHEMA_PROFILE=ocsf+tenzir would otherwise leak that raw token into the
+# api/jobs/search/migrate containers (which only accept udm|ocsf) and the migrator
+# fails. Re-export the *resolved* profile (and the compose profile) so the value
+# the containers see matches what we wrote to .env in both fresh and re-run paths.
+export NANO_SCHEMA_PROFILE="$SCHEMA_PROFILE"
+[[ "${BUNDLE_TENZIR:-0}" == "1" ]] && export COMPOSE_PROFILES=tenzir
+
 log "Pulling images from ghcr.io/nano-rs (this may take a minute on first run)"
 if ! docker compose -f "$COMPOSE_FILE" pull; then
     fail "docker compose pull failed. If you see '401 Unauthorized', the GHCR packages may still be private — run 'docker login ghcr.io' or wait for nano-rs to flip them public."
