@@ -178,15 +178,33 @@ impl DetectionService {
             }
         }
 
-        // Fire webhook notifications
+        // Fire webhook notifications. Scheduled detection alerts are always
+        // kind = "detection" (SIEM stream); the webhook service filters by each
+        // webhook's subscription + severity. The primary entity is pulled from
+        // the first matched event via the rule's risk-entity field so the
+        // consumer gets "who/what" without parsing the raw events.
         if let Some(ref webhook_service) = self.webhook_service {
             let severity_str = format!("{:?}", rule.severity).to_lowercase();
+            let entity = rule.risk_entity_field.as_deref().and_then(|field| {
+                alert
+                    .matched_events
+                    .as_array()
+                    .and_then(|arr| arr.first())
+                    .and_then(|ev| ev.get(field))
+                    .and_then(|v| match v {
+                        serde_json::Value::String(s) => Some(s.clone()),
+                        serde_json::Value::Null => None,
+                        other => Some(other.to_string()),
+                    })
+            });
             webhook_service
-                .fire_alert_created(
+                .fire_alert(
                     alert.id,
-                    rule.id,
+                    &alert.kind,
+                    Some(rule.id),
                     &rule.name,
                     &severity_str,
+                    entity,
                     &alert.matched_events,
                     alert.created_at,
                 )

@@ -58,6 +58,62 @@ pub enum SsrfError {
     BlockedRedirect(String),
 }
 
+/// An IPv4/IPv6 CIDR block used for the SSRF egress allowlist. Parsed from
+/// strings like `10.0.0.0/8`, `192.168.1.0/24`, `fd00::/8`, or a bare address
+/// (`10.1.2.3` → `/32`, `fd00::1` → `/128`). Kept dependency-free (no `ipnet`).
+#[derive(Debug, Clone)]
+pub struct IpCidr {
+    network: IpAddr,
+    prefix: u8,
+}
+
+impl IpCidr {
+    /// Parse `a.b.c.d/n`, `ipv6/n`, or a bare IP (implicit full-length prefix).
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        let (ip_str, prefix_opt) = match s.split_once('/') {
+            Some((ip, p)) => (ip.trim(), Some(p.trim())),
+            None => (s, None),
+        };
+        let ip: IpAddr = ip_str
+            .parse()
+            .map_err(|_| format!("invalid IP address in '{s}'"))?;
+        let max: u8 = if ip.is_ipv4() { 32 } else { 128 };
+        let prefix: u8 = match prefix_opt {
+            Some(p) => p.parse().map_err(|_| format!("invalid prefix in '{s}'"))?,
+            None => max,
+        };
+        if prefix > max {
+            return Err(format!("prefix /{prefix} too large for {ip}"));
+        }
+        Ok(Self {
+            network: ip,
+            prefix,
+        })
+    }
+
+    /// Whether `addr` falls inside this CIDR (family must match).
+    pub fn contains(&self, addr: IpAddr) -> bool {
+        match (self.network, addr) {
+            (IpAddr::V4(net), IpAddr::V4(a)) => {
+                if self.prefix == 0 {
+                    return true;
+                }
+                let mask = u32::MAX << (32 - self.prefix as u32);
+                (u32::from(net) & mask) == (u32::from(a) & mask)
+            }
+            (IpAddr::V6(net), IpAddr::V6(a)) => {
+                if self.prefix == 0 {
+                    return true;
+                }
+                let mask = u128::MAX << (128 - self.prefix as u32);
+                (u128::from(net) & mask) == (u128::from(a) & mask)
+            }
+            _ => false, // v4 CIDR never matches a v6 address or vice-versa
+        }
+    }
+}
+
 /// Configuration for SSRF validation
 #[derive(Debug, Clone)]
 pub struct SsrfConfig {
@@ -83,6 +139,12 @@ pub struct SsrfConfig {
     /// addresses stay blocked even when this is `true`, since they are never a
     /// legitimate target and are the highest-value SSRF objective.
     pub allow_private_networks: bool,
+    /// Egress allowlist: specific private CIDRs that ARE permitted even though
+    /// `allow_private_networks` is `false`. Rescues only the RFC1918 / CGNAT /
+    /// IPv6-ULA ranges — loopback, link-local, cloud-metadata, and
+    /// unspecified/broadcast/multicast stay blocked regardless (a resolved IP in
+    /// one of those classes is never legitimate). Empty = no exceptions.
+    pub allowed_cidrs: Vec<IpCidr>,
 }
 
 impl Default for SsrfConfig {
@@ -93,6 +155,7 @@ impl Default for SsrfConfig {
             max_redirects: 5,
             dns_timeout: None,
             allow_private_networks: false,
+            allowed_cidrs: Vec::new(),
         }
     }
 }
@@ -392,28 +455,39 @@ impl SsrfValidator {
             return Ok(());
         }
 
-        // Localhost (127.0.0.0/8)
+        // A resolved IP inside an egress-allowlisted CIDR bypasses ONLY the
+        // private-range blocks below (10/8, 172.16/12, 192.168/16, CGNAT).
+        // Loopback and link-local are never allowlist-rescued, and the
+        // metadata/unspecified/broadcast/multicast blocks above already returned.
+        let allowlisted = self
+            .config
+            .allowed_cidrs
+            .iter()
+            .any(|c| c.contains(IpAddr::V4(ip)));
+
+        // Localhost (127.0.0.0/8) — never allowlist-rescued.
         if octets[0] == 127 {
             return Err(SsrfError::LocalhostBlocked);
         }
         // 10.0.0.0/8
-        if octets[0] == 10 {
+        if octets[0] == 10 && !allowlisted {
             return Err(SsrfError::PrivateIpBlocked(IpAddr::V4(ip)));
         }
         // 172.16.0.0/12
-        if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+        if octets[0] == 172 && (16..=31).contains(&octets[1]) && !allowlisted {
             return Err(SsrfError::PrivateIpBlocked(IpAddr::V4(ip)));
         }
         // 192.168.0.0/16
-        if octets[0] == 192 && octets[1] == 168 {
+        if octets[0] == 192 && octets[1] == 168 && !allowlisted {
             return Err(SsrfError::PrivateIpBlocked(IpAddr::V4(ip)));
         }
         // CGNAT / shared address space (100.64.0.0/10) — routes to carrier /
         // internal infrastructure, treat like private.
-        if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
+        if octets[0] == 100 && (octets[1] & 0xC0) == 64 && !allowlisted {
             return Err(SsrfError::PrivateIpBlocked(IpAddr::V4(ip)));
         }
-        // Link-local (169.254.0.0/16); metadata already handled above
+        // Link-local (169.254.0.0/16); metadata already handled above.
+        // Never allowlist-rescued (metadata is a subset of this range).
         if octets[0] == 169 && octets[1] == 254 {
             return Err(SsrfError::LinkLocalBlocked(IpAddr::V4(ip)));
         }
@@ -439,18 +513,25 @@ impl SsrfValidator {
             return Ok(());
         }
 
-        // Loopback (::1)
+        let allowlisted = self
+            .config
+            .allowed_cidrs
+            .iter()
+            .any(|c| c.contains(IpAddr::V6(ip)));
+
+        // Loopback (::1) — never allowlist-rescued.
         if ip.is_loopback() {
             return Err(SsrfError::LocalhostBlocked);
         }
 
         let segments = ip.segments();
-        // Link-local (fe80::/10)
+        // Link-local (fe80::/10) — never allowlist-rescued.
         if (segments[0] & 0xffc0) == 0xfe80 {
             return Err(SsrfError::LinkLocalBlocked(IpAddr::V6(ip)));
         }
-        // Unique local addresses (fc00::/7) - similar to private IPv4
-        if (segments[0] & 0xfe00) == 0xfc00 {
+        // Unique local addresses (fc00::/7) — similar to private IPv4; rescuable
+        // via the egress allowlist.
+        if (segments[0] & 0xfe00) == 0xfc00 && !allowlisted {
             return Err(SsrfError::PrivateIpBlocked(IpAddr::V6(ip)));
         }
 
@@ -956,6 +1037,7 @@ mod tests {
             max_redirects: 0,
             dns_timeout: Some(Duration::from_millis(50)),
             allow_private_networks: false,
+            ..Default::default()
         });
 
         let start = std::time::Instant::now();
@@ -1056,5 +1138,92 @@ mod tests {
             v.validate_ip_address(addr.ip())
                 .expect("every pinned addr must pass the IP-class checks");
         }
+    }
+
+    // ---- Egress allowlist (NAN-1633) --------------------------------------
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn allowlisted(cidrs: &[&str]) -> SsrfValidator {
+        SsrfValidator::new(SsrfConfig {
+            allow_http: true,
+            allowed_cidrs: cidrs.iter().map(|c| IpCidr::parse(c).unwrap()).collect(),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn ipcidr_parse_and_contains() {
+        let c = IpCidr::parse("10.0.0.0/8").unwrap();
+        assert!(c.contains(ip("10.1.2.3")));
+        assert!(c.contains(ip("10.255.255.255")));
+        assert!(!c.contains(ip("11.0.0.1")));
+        // bare IP => host route
+        let host = IpCidr::parse("192.168.5.7").unwrap();
+        assert!(host.contains(ip("192.168.5.7")));
+        assert!(!host.contains(ip("192.168.5.8")));
+        // v4 CIDR never matches a v6 addr
+        assert!(!c.contains(ip("::1")));
+        // IPv6 ULA
+        let ula = IpCidr::parse("fd00::/8").unwrap();
+        assert!(ula.contains(ip("fd12:3456::1")));
+        assert!(!ula.contains(ip("fe80::1")));
+    }
+
+    #[test]
+    fn ipcidr_parse_rejects_garbage() {
+        assert!(IpCidr::parse("not-an-ip").is_err());
+        assert!(IpCidr::parse("10.0.0.0/33").is_err());
+        assert!(IpCidr::parse("::1/129").is_err());
+    }
+
+    #[test]
+    fn allowlist_rescues_only_listed_private_ranges() {
+        let v = allowlisted(&["10.0.0.0/8", "192.168.5.0/24"]);
+        // In-allowlist private IPs are permitted...
+        assert!(v.validate_ip_address(ip("10.1.2.3")).is_ok());
+        assert!(v.validate_ip_address(ip("192.168.5.20")).is_ok());
+        // ...but private IPs OUTSIDE the allowlist stay blocked.
+        assert!(v.validate_ip_address(ip("192.168.9.9")).is_err());
+        assert!(v.validate_ip_address(ip("172.16.0.1")).is_err());
+    }
+
+    #[test]
+    fn allowlist_never_rescues_loopback_linklocal_or_metadata() {
+        // Even if an operator (mistakenly) allowlists these ranges, the
+        // higher-severity classes must stay blocked.
+        let v = allowlisted(&["127.0.0.0/8", "169.254.0.0/16"]);
+        assert!(matches!(
+            v.validate_ip_address(ip("127.0.0.1")),
+            Err(SsrfError::LocalhostBlocked)
+        ));
+        assert!(matches!(
+            v.validate_ip_address(ip("169.254.1.1")),
+            Err(SsrfError::LinkLocalBlocked(_))
+        ));
+        // Cloud metadata is always blocked.
+        assert!(matches!(
+            v.validate_ip_address(ip("169.254.169.254")),
+            Err(SsrfError::MetadataEndpointBlocked(_))
+        ));
+    }
+
+    #[test]
+    fn allowlist_rescues_ipv6_ula_not_loopback() {
+        let v = allowlisted(&["fd00::/8"]);
+        assert!(v.validate_ip_address(ip("fd12:3456::99")).is_ok());
+        assert!(matches!(
+            v.validate_ip_address(ip("::1")),
+            Err(SsrfError::LocalhostBlocked)
+        ));
+    }
+
+    #[test]
+    fn empty_allowlist_is_secure_default() {
+        let v = SsrfValidator::http_allowed_validator();
+        assert!(v.validate_ip_address(ip("10.1.2.3")).is_err());
+        assert!(v.validate_ip_address(ip("192.168.1.1")).is_err());
     }
 }

@@ -80,6 +80,12 @@ enterprise = []
 proptest.workspace = true
 wiremock = "0.6"
 tokio = { workspace = true, features = ["test-util"] }
+# NAN-1546: recompute/verify the webhook HMAC signature in the delivery
+# integration test (these are non-dev deps too, but integration-test crates
+# only link the crate-under-test + dev-deps, so they must be listed here).
+hmac = "0.13"
+sha2 = "0.11"
+hex = "0.4"
 
 [[bin]]
 name = "parse_udm_csv"

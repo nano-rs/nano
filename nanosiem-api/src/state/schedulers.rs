@@ -390,7 +390,12 @@ impl AppState {
         let runner = nanosiem_core::observability::SyntheticRunner::new(
             self.pool.clone(),
             self.dual_pool.clickhouse().clone(),
-        );
+        )
+        // NAN-1546: forward synthetic-failure alerts to observability-subscribed
+        // webhooks (same wiring pattern as the detection service).
+        .with_webhook_service(nanosiem_core::webhooks::WebhookService::new(
+            nanosiem_core::webhooks::WebhookRepository::new(self.pool.clone()),
+        ));
         runner.start()
     }
 

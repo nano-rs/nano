@@ -52,7 +52,7 @@ impl WebhookRepository {
         let webhooks = sqlx::query_as::<_, Webhook>(
             r#"
             SELECT id, name, url, headers_encrypted, secret_encrypted,
-                   severity_filter, enabled, created_at, updated_at
+                   severity_filter, event_types, enabled, created_at, updated_at
             FROM webhooks
             ORDER BY name
             "#,
@@ -68,7 +68,7 @@ impl WebhookRepository {
         let webhooks = sqlx::query_as::<_, Webhook>(
             r#"
             SELECT id, name, url, headers_encrypted, secret_encrypted,
-                   severity_filter, enabled, created_at, updated_at
+                   severity_filter, event_types, enabled, created_at, updated_at
             FROM webhooks
             WHERE enabled = true
             ORDER BY name
@@ -85,7 +85,7 @@ impl WebhookRepository {
         sqlx::query_as::<_, Webhook>(
             r#"
             SELECT id, name, url, headers_encrypted, secret_encrypted,
-                   severity_filter, enabled, created_at, updated_at
+                   severity_filter, event_types, enabled, created_at, updated_at
             FROM webhooks
             WHERE id = $1
             "#,
@@ -122,13 +122,19 @@ impl WebhookRepository {
         };
 
         let enabled = request.enabled.unwrap_or(true);
+        // Omitted subscription set falls back to the shared default so the Rust
+        // and SQL defaults stay in lockstep (migration 217).
+        let event_types = request
+            .event_types
+            .clone()
+            .unwrap_or_else(default_event_types);
 
         let webhook = sqlx::query_as::<_, Webhook>(
             r#"
-            INSERT INTO webhooks (name, url, headers_encrypted, secret_encrypted, severity_filter, enabled)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO webhooks (name, url, headers_encrypted, secret_encrypted, severity_filter, event_types, enabled)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING id, name, url, headers_encrypted, secret_encrypted,
-                      severity_filter, enabled, created_at, updated_at
+                      severity_filter, event_types, enabled, created_at, updated_at
             "#
         )
         .bind(&request.name)
@@ -136,6 +142,7 @@ impl WebhookRepository {
         .bind(headers_encrypted.as_deref())
         .bind(secret_encrypted.as_deref())
         .bind(&request.severity_filter)
+        .bind(&event_types)
         .bind(enabled)
         .fetch_one(&self.pool)
         .await?;
@@ -182,10 +189,11 @@ impl WebhookRepository {
                 secret_encrypted = CASE WHEN $6 THEN $7 ELSE secret_encrypted END,
                 severity_filter = COALESCE($8, severity_filter),
                 enabled = COALESCE($9, enabled),
+                event_types = COALESCE($10, event_types),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING id, name, url, headers_encrypted, secret_encrypted,
-                      severity_filter, enabled, created_at, updated_at
+                      severity_filter, event_types, enabled, created_at, updated_at
             "#,
         )
         .bind(id)
@@ -197,6 +205,7 @@ impl WebhookRepository {
         .bind(secret_encrypted.as_ref().and_then(|s| s.as_deref())) // $7: new secret value
         .bind(&request.severity_filter)
         .bind(request.enabled)
+        .bind(&request.event_types) // $10: replace subscription set (None = no change)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(WebhookRepositoryError::NotFound(id))?;

@@ -5758,6 +5758,7 @@ export interface WebhookConfig {
   has_headers: boolean;
   has_secret: boolean;
   severity_filter: string[] | null;
+  event_types: string[];
   enabled: boolean;
   created_at: string;
   updated_at: string;
@@ -5769,6 +5770,7 @@ export interface CreateWebhookRequest {
   headers?: Record<string, string>;
   secret?: string;
   severity_filter?: string[];
+  event_types?: string[];
   enabled?: boolean;
 }
 
@@ -5778,6 +5780,7 @@ export interface UpdateWebhookRequest {
   headers?: Record<string, string>;
   secret?: string;
   severity_filter?: string[];
+  event_types?: string[];
   enabled?: boolean;
 }
 

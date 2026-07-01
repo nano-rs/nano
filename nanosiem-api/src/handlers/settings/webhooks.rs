@@ -74,6 +74,10 @@ pub async fn create_webhook(
         .await
         .map_err(|e| ApiError::BadRequest(e))?;
 
+    request
+        .validate_event_types()
+        .map_err(ApiError::BadRequest)?;
+
     let repo = nanosiem_core::webhooks::WebhookRepository::new(state.pool.clone());
     let webhook = repo
         .create(&request)
@@ -156,6 +160,10 @@ pub async fn update_webhook(
             .await
             .map_err(|e| ApiError::BadRequest(e))?;
     }
+
+    request
+        .validate_event_types()
+        .map_err(ApiError::BadRequest)?;
 
     let repo = nanosiem_core::webhooks::WebhookRepository::new(state.pool.clone());
     let webhook = repo.update(*id, &request).await.map_err(|e| match e {

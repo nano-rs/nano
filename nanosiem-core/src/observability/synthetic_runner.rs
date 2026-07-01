@@ -29,6 +29,7 @@ use super::synthetic_check_repository::{SyntheticCheck, SyntheticCheckRepository
 use crate::db::repository::{AlertInsert, AlertRepository};
 use crate::inputlookup::SsrfValidator;
 use crate::models::Severity;
+use crate::webhooks::WebhookService;
 
 /// How often the runner wakes to look for due checks. The minimum check
 /// interval is 30s (enforced at create/update), so a 15s tick guarantees a due
@@ -49,6 +50,9 @@ pub struct SyntheticRunner {
     /// than its `expected_status` (or errors out) raises one alert per failing
     /// probe through here with `kind = synthetic`.
     alert_repo: AlertRepository,
+    /// NAN-1546: fires the raised synthetic alert to webhooks subscribed to the
+    /// observability stream. `None` when no webhook service is wired (e.g. tests).
+    webhook_service: Option<WebhookService>,
 }
 
 impl SyntheticRunner {
@@ -60,7 +64,15 @@ impl SyntheticRunner {
             repo: SyntheticCheckRepository::new(pool.clone()),
             ch_client,
             alert_repo: AlertRepository::new(pool),
+            webhook_service: None,
         }
+    }
+
+    /// Wire the webhook service so failing-probe alerts (kind = synthetic) fire
+    /// webhooks subscribed to the observability stream (NAN-1546).
+    pub fn with_webhook_service(mut self, webhook_service: WebhookService) -> Self {
+        self.webhook_service = Some(webhook_service);
+        self
     }
 
     /// Spawn the runner loop. Returns the task handle for graceful shutdown.
@@ -275,7 +287,7 @@ impl SyntheticRunner {
             "evaluated_at": Utc::now().to_rfc3339(),
         }]);
 
-        if let Err(e) = self
+        match self
             .alert_repo
             .create_alert(AlertInsert {
                 kind: "synthetic",
@@ -287,18 +299,40 @@ impl SyntheticRunner {
             })
             .await
         {
-            warn!(
-                check = %check.id,
-                error = %e,
-                "Synthetic runner: failed to raise failure alert"
-            );
-        } else {
-            info!(
-                check = %check.id,
-                expected = check.expected_status,
-                observed = status_code,
-                "Synthetic check failed — alert raised"
-            );
+            Ok(alert) => {
+                info!(
+                    check = %check.id,
+                    expected = check.expected_status,
+                    observed = status_code,
+                    "Synthetic check failed — alert raised"
+                );
+
+                // NAN-1546: forward to webhooks on the observability stream.
+                // The probe target is the entity; the check name is the human
+                // label. Fire-and-forget (spawns internally) — never blocks the
+                // runner tick.
+                if let Some(ref webhooks) = self.webhook_service {
+                    webhooks
+                        .fire_alert(
+                            alert.id,
+                            "synthetic",
+                            None,
+                            &check.name,
+                            &format!("{:?}", severity).to_lowercase(),
+                            Some(check.target_url.clone()),
+                            &payload,
+                            alert.created_at,
+                        )
+                        .await;
+                }
+            }
+            Err(e) => {
+                warn!(
+                    check = %check.id,
+                    error = %e,
+                    "Synthetic runner: failed to raise failure alert"
+                );
+            }
         }
     }
 }

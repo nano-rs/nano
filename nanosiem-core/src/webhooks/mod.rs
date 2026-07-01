@@ -9,6 +9,9 @@ pub mod models;
 pub mod repository;
 pub mod service;
 
+#[cfg(test)]
+mod tests;
+
 pub use models::{
     CreateWebhookRequest, UpdateWebhookRequest, Webhook, WebhookDeliveryLog, WebhookPayload,
     WebhookResponse, WebhookTestResult,

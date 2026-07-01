@@ -124,12 +124,22 @@ impl AppState {
         // resolves fields under the active schema) and entity extraction
         // (auto-detect grouping/scoring uses the profile's entity-extraction
         // order). NAN-1241 Phase 5.
+        // NAN-1546: wire the webhook service so scheduled detection alerts
+        // actually fire webhooks. Before this, `with_webhook_service` had zero
+        // callers and `webhook_service` was always `None`, so real alerts fired
+        // nothing — only the manual "Send Test" path worked. The scheduler
+        // reuses this exact instance (schedulers.rs), so this is the single
+        // wiring point for the scheduled path. Uses the same env-derived
+        // encryption as the settings handler (decrypts headers/HMAC secrets).
         let detection_service = DetectionService::with_dual_pool_prevalence_and_profile(
             &dual_pool,
             lookup_service.clone(),
             prevalence_service.clone(),
             config.schema_profile(),
-        );
+        )
+        .with_webhook_service(nanosiem_core::webhooks::WebhookService::new(
+            nanosiem_core::webhooks::WebhookRepository::new(pg_pool.clone()),
+        ));
 
         // Create materialized view generator for real-time detection rules.
         // Uses admin client for DDL operations (CREATE/DROP MATERIALIZED VIEW).

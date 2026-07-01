@@ -48,6 +48,16 @@ import { formatUTC } from '@/lib/date-utils';
 
 const SEVERITY_OPTIONS = ['critical', 'high', 'medium', 'low', 'informational'];
 
+const EVENT_TYPE_OPTIONS: { value: string; label: string }[] = [
+  { value: 'siem_alert', label: 'SIEM alerts' },
+  { value: 'obs_alert', label: 'Observability alerts' },
+  { value: 'case', label: 'Cases' },
+];
+const EVENT_TYPE_LABEL: Record<string, string> = Object.fromEntries(
+  EVENT_TYPE_OPTIONS.map(o => [o.value, o.label]),
+);
+const DEFAULT_EVENT_TYPES = ['siem_alert', 'obs_alert'];
+
 interface HeaderRow {
   id: number;
   key: string;
@@ -85,6 +95,7 @@ function WebhookSettings() {
   const [formHeaders, setFormHeaders] = useState<HeaderRow[]>([]);
   const [formSecret, setFormSecret] = useState('');
   const [formSeverityFilter, setFormSeverityFilter] = useState<string[]>([]);
+  const [formEventTypes, setFormEventTypes] = useState<string[]>(DEFAULT_EVENT_TYPES);
   const [formEnabled, setFormEnabled] = useState(true);
 
   const loadWebhooks = useCallback(async () => {
@@ -108,6 +119,7 @@ function WebhookSettings() {
     setFormHeaders([]);
     setFormSecret('');
     setFormSeverityFilter([]);
+    setFormEventTypes(DEFAULT_EVENT_TYPES);
     setFormEnabled(true);
     setDialogOpen(true);
   };
@@ -119,6 +131,11 @@ function WebhookSettings() {
     setFormHeaders([]);
     setFormSecret('');
     setFormSeverityFilter(webhook.severity_filter || []);
+    setFormEventTypes(
+      webhook.event_types && webhook.event_types.length > 0
+        ? webhook.event_types
+        : DEFAULT_EVENT_TYPES,
+    );
     setFormEnabled(webhook.enabled);
     setDialogOpen(true);
   };
@@ -160,6 +177,7 @@ function WebhookSettings() {
           name: formName,
           url: formUrl,
           severity_filter: formSeverityFilter.length > 0 ? formSeverityFilter : undefined,
+          event_types: formEventTypes,
           enabled: formEnabled,
         };
         if (formHeaders.length > 0) request.headers = headersMap;
@@ -173,6 +191,7 @@ function WebhookSettings() {
           headers: Object.keys(headersMap).length > 0 ? headersMap : undefined,
           secret: formSecret || undefined,
           severity_filter: formSeverityFilter.length > 0 ? formSeverityFilter : undefined,
+          event_types: formEventTypes,
           enabled: formEnabled,
         };
         await api.webhooks.createWebhook(request);
@@ -257,6 +276,16 @@ function WebhookSettings() {
       prev.includes(severity) ? prev.filter(s => s !== severity) : [...prev, severity]
     );
   };
+  const toggleEventType = (eventType: string) => {
+    setFormEventTypes(prev => {
+      if (prev.includes(eventType)) {
+        // At least one event stream must remain selected — backend rejects an empty set.
+        if (prev.length === 1) return prev;
+        return prev.filter(t => t !== eventType);
+      }
+      return [...prev, eventType];
+    });
+  };
 
   if (loading) {
     return (
@@ -299,6 +328,7 @@ function WebhookSettings() {
                 <th className="text-left px-3 py-2 font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">Name</th>
                 <th className="text-left px-3 py-2 font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">URL</th>
                 <th className="text-left px-3 py-2 font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">Severity Filter</th>
+                <th className="text-left px-3 py-2 font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">Events</th>
                 <th className="text-left px-3 py-2 font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground w-20">Status</th>
                 <th className="text-right px-3 py-2 font-mono text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground w-32">Actions</th>
               </tr>
@@ -334,6 +364,19 @@ function WebhookSettings() {
                       </div>
                     ) : (
                       <span className="text-[11px] text-muted-foreground">All severities</span>
+                    )}
+                  </td>
+                  <td className="px-3 py-2">
+                    {webhook.event_types && webhook.event_types.length > 0 ? (
+                      <div className="flex flex-wrap gap-1">
+                        {webhook.event_types.map(t => (
+                          <span key={t} className="text-[11px] text-muted-foreground border border-border rounded px-1.5 py-0.5">
+                            {EVENT_TYPE_LABEL[t] || t}
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <span className="text-[11px] text-muted-foreground">—</span>
                     )}
                   </td>
                   <td className="px-3 py-2">
@@ -489,6 +532,29 @@ function WebhookSettings() {
               <p className="text-[10.5px] text-muted-foreground mt-1">
                 Used to sign request bodies with an <span className="font-mono">X-Webhook-Signature</span> header.
               </p>
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-medium text-foreground/80 mb-1.5">
+                Event types <span className="text-muted-foreground/70 font-normal ml-1">(at least one)</span>
+              </label>
+              <div className="flex flex-wrap gap-1.5">
+                {EVENT_TYPE_OPTIONS.map(({ value, label }) => (
+                  <button
+                    key={value}
+                    type="button"
+                    onClick={() => toggleEventType(value)}
+                    className={cn(
+                      'h-6 rounded-sm border px-2 text-[11px] font-medium transition-colors',
+                      formEventTypes.includes(value)
+                        ? 'border-primary bg-primary/15 text-primary'
+                        : 'border-border bg-card text-muted-foreground hover:text-foreground hover:bg-foreground/5',
+                    )}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
             </div>
 
             <div>
