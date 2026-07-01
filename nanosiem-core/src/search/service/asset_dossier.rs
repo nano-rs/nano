@@ -241,8 +241,8 @@ impl SearchService {
                 None => return Ok(AssetDossier::default()),
             };
 
-        let start_str = time_range.start.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
-        let end_str = time_range.end.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+        let start_str = crate::sql_hygiene::format_ch_bound_micros(&time_range.start).to_string();
+        let end_str = crate::sql_hygiene::format_ch_bound_micros(&time_range.end).to_string();
         let bucket_seconds = bucket_seconds_for_range(time_range);
         let unix_start = time_range.start.timestamp() as u64;
 

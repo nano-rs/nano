@@ -15,17 +15,10 @@ use super::models::{
 // Parser Repository Repository
 // =============================================================================
 
-#[derive(Debug, Error)]
-pub enum ParserRepositoryRepositoryError {
-    #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
-
-    #[error("Repository not found: {0}")]
-    NotFound(Uuid),
-
-    #[error("Repository already exists: {0}")]
-    AlreadyExists(String),
-}
+// NAN-1618: the byte-identical parser/playbook/rule repository-layer error is
+// consolidated into `crate::db::RepoError`; alias keeps the public name and the
+// `NotFound` / `AlreadyExists` variants used by service.rs `match` arms.
+pub use crate::db::repo_error::RepoError as ParserRepositoryRepositoryError;
 
 #[derive(Clone)]
 pub struct ParserRepositoryRepository {
@@ -42,15 +35,7 @@ impl ParserRepositoryRepository {
         repo: &NewParserRepository,
         created_by: Option<Uuid>,
     ) -> Result<ParserRepository, ParserRepositoryRepositoryError> {
-        let slug = repo.slug.clone().unwrap_or_else(|| {
-            repo.url
-                .trim_end_matches('/')
-                .trim_end_matches(".git")
-                .split("github.com/")
-                .last()
-                .unwrap_or(&repo.name)
-                .to_lowercase()
-        });
+        let slug = crate::db::repo_store::slug_from_url(&repo.url, &repo.name, repo.slug.as_deref());
 
         let result = sqlx::query_as::<_, ParserRepository>(
             r#"
@@ -74,14 +59,7 @@ impl ParserRepositoryRepository {
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {
-            if let sqlx::Error::Database(ref db_err) = e {
-                if db_err.constraint() == Some("parser_repositories_name_key")
-                    || db_err.constraint() == Some("parser_repositories_slug_key")
-                {
-                    return ParserRepositoryRepositoryError::AlreadyExists(repo.name.clone());
-                }
-            }
-            ParserRepositoryRepositoryError::Database(e)
+            crate::db::repo_store::map_unique_violation(e, "parser_repositories", &repo.name)
         })?;
 
         Ok(result)
@@ -91,68 +69,24 @@ impl ParserRepositoryRepository {
         &self,
         id: Uuid,
     ) -> Result<ParserRepository, ParserRepositoryRepositoryError> {
-        sqlx::query_as::<_, ParserRepository>("SELECT * FROM parser_repositories WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or(ParserRepositoryRepositoryError::NotFound(id))
+        crate::db::repo_store::find_by_id(&self.pool, "parser_repositories", id).await
     }
 
     pub async fn find_by_slug(
         &self,
         slug: &str,
     ) -> Result<ParserRepository, ParserRepositoryRepositoryError> {
-        sqlx::query_as::<_, ParserRepository>("SELECT * FROM parser_repositories WHERE slug = $1")
-            .bind(slug)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or_else(|| ParserRepositoryRepositoryError::NotFound(Uuid::nil()))
+        crate::db::repo_store::find_by_slug(&self.pool, "parser_repositories", slug).await
     }
 
     pub async fn list_for_auto_sync(
         &self,
     ) -> Result<Vec<ParserRepository>, ParserRepositoryRepositoryError> {
-        let repos = sqlx::query_as::<_, ParserRepository>(
-            r#"
-            SELECT * FROM parser_repositories
-            WHERE enabled = TRUE
-              AND auto_sync_enabled = TRUE
-              AND (
-                last_synced_at IS NULL
-                OR last_synced_at < NOW() - (sync_interval_hours || ' hours')::interval
-              )
-            ORDER BY last_synced_at ASC NULLS FIRST
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(repos)
+        crate::db::repo_store::list_for_auto_sync(&self.pool, "parser_repositories").await
     }
 
     pub async fn list(&self) -> Result<Vec<ParserRepository>, ParserRepositoryRepositoryError> {
-        // Clean up stuck "syncing" statuses
-        let _ = sqlx::query(
-            r#"
-            UPDATE parser_repositories
-            SET
-                last_sync_status = 'failed',
-                last_sync_error = 'Sync timed out or was interrupted',
-                updated_at = NOW()
-            WHERE last_sync_status = 'syncing'
-              AND updated_at < NOW() - INTERVAL '10 minutes'
-            "#,
-        )
-        .execute(&self.pool)
-        .await;
-
-        let repos = sqlx::query_as::<_, ParserRepository>(
-            "SELECT * FROM parser_repositories ORDER BY name ASC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(repos)
+        crate::db::repo_store::list(&self.pool, "parser_repositories").await
     }
 
     pub async fn update(
@@ -190,15 +124,7 @@ impl ParserRepositoryRepository {
     }
 
     pub async fn delete(&self, id: Uuid) -> Result<(), ParserRepositoryRepositoryError> {
-        let result = sqlx::query("DELETE FROM parser_repositories WHERE id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(ParserRepositoryRepositoryError::NotFound(id));
-        }
-        Ok(())
+        crate::db::repo_store::delete(&self.pool, "parser_repositories", id).await
     }
 
     pub async fn update_sync_status(
@@ -209,27 +135,17 @@ impl ParserRepositoryRepository {
         parser_count: Option<i32>,
         error: Option<&str>,
     ) -> Result<(), ParserRepositoryRepositoryError> {
-        sqlx::query(
-            r#"
-            UPDATE parser_repositories SET
-                last_sync_status = $2,
-                last_sync_commit = COALESCE($3, last_sync_commit),
-                last_synced_at = CASE WHEN $2 = 'success' THEN NOW() ELSE last_synced_at END,
-                parser_count = COALESCE($4, parser_count),
-                last_sync_error = $5,
-                updated_at = NOW()
-            WHERE id = $1
-            "#,
+        crate::db::repo_store::update_sync_status(
+            &self.pool,
+            "parser_repositories",
+            "parser_count",
+            id,
+            status,
+            commit,
+            parser_count,
+            error,
         )
-        .bind(id)
-        .bind(status)
-        .bind(commit)
-        .bind(parser_count)
-        .bind(error)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
+        .await
     }
 }
 
@@ -412,41 +328,41 @@ impl RepositoryParsersRepository {
         &self,
         repository_id: Uuid,
     ) -> Result<i64, RepositoryParsersRepositoryError> {
-        let count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM repository_parsers WHERE repository_id = $1")
-                .bind(repository_id)
-                .fetch_one(&self.pool)
-                .await?;
-
-        Ok(count.0)
+        Ok(crate::db::repo_store::count_for_repository(
+            &self.pool,
+            "repository_parsers",
+            repository_id,
+        )
+        .await?)
     }
 
     pub async fn delete_all(
         &self,
         repository_id: Uuid,
     ) -> Result<(), RepositoryParsersRepositoryError> {
-        sqlx::query("DELETE FROM repository_parsers WHERE repository_id = $1")
-            .bind(repository_id)
-            .execute(&self.pool)
+        // Discard the affected-row count to preserve the historical `()` return.
+        crate::db::repo_store::delete_by_repository(&self.pool, "repository_parsers", repository_id)
             .await?;
         Ok(())
     }
 
-    /// Delete parsers not in the given paths (cleanup after sync)
+    /// Delete parsers not in the given paths (cleanup after sync).
+    ///
+    /// NOTE: unlike the playbook/rule items-repos, this intentionally has no
+    /// empty-`paths` guard — `file_path != ALL('{}')` already deletes every row
+    /// for the repository, matching the original behavior.
     pub async fn delete_not_in_paths(
         &self,
         repository_id: Uuid,
         paths: &[String],
     ) -> Result<i64, RepositoryParsersRepositoryError> {
-        let result = sqlx::query(
-            "DELETE FROM repository_parsers WHERE repository_id = $1 AND file_path != ALL($2)",
+        Ok(crate::db::repo_store::prune_not_in_paths(
+            &self.pool,
+            "repository_parsers",
+            repository_id,
+            paths,
         )
-        .bind(repository_id)
-        .bind(paths)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(result.rows_affected() as i64)
+        .await?)
     }
 }
 

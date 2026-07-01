@@ -523,38 +523,6 @@ pub struct CreateApiKeyRequest {
     pub rate_limit: Option<i32>,
 }
 
-/// Audit log entry
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow, utoipa::ToSchema)]
-pub struct AuditLog {
-    #[serde(with = "typeid::audit")]
-    #[schema(value_type = String)]
-    pub id: Uuid,
-    pub timestamp: DateTime<Utc>,
-    #[serde(default, with = "typeid::user::opt")]
-    #[schema(value_type = Option<String>)]
-    pub user_id: Option<Uuid>,
-    #[serde(default, with = "typeid::api_key::opt")]
-    #[schema(value_type = Option<String>)]
-    pub api_key_id: Option<Uuid>,
-    pub action: String,
-    pub resource_type: Option<String>,
-    pub resource_id: Option<Uuid>,
-    pub details: Option<serde_json::Value>,
-    pub ip_address: Option<String>,
-    pub user_agent: Option<String>,
-    pub success: bool,
-}
-
-/// Audit log with user/api key names for display
-#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
-pub struct AuditLogWithNames {
-    #[serde(flatten)]
-    pub log: AuditLog,
-    pub user_name: Option<String>,
-    pub user_email: Option<String>,
-    pub api_key_name: Option<String>,
-}
-
 /// JWT token claims
 /// Requirements: 2.5
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]

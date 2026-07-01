@@ -203,7 +203,7 @@ impl LogSourceInfo {
             if !values.is_empty() {
                 let escaped: Vec<String> = values
                     .iter()
-                    .map(|v| format!("'{}'", v.replace('\'', "''")))
+                    .map(|v| format!("'{}'", crate::sql_hygiene::escape_sql_string(v)))
                     .collect();
                 return format!("source_type IN ({})", escaped.join(", "));
             }
@@ -218,6 +218,48 @@ impl LogSourceInfo {
         }
 
         // Fall back to exact match on log source name
-        format!("source_type = '{}'", self.name.replace('\'', "''"))
+        format!(
+            "source_type = '{}'",
+            crate::sql_hygiene::escape_sql_string(&self.name)
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(name: &str, match_values: Option<Vec<String>>) -> LogSourceInfo {
+        LogSourceInfo {
+            id: uuid::Uuid::nil(),
+            name: name.to_string(),
+            stale_threshold_minutes: 60,
+            match_pattern: None,
+            match_values,
+        }
+    }
+
+    /// NAN-1620: admin-controlled `match_values` go into a ClickHouse IN-list
+    /// string literal. A backslash must be doubled (`\` -> `\\`), otherwise a
+    /// value like a Windows source name corrupts/breaks the literal.
+    #[test]
+    fn match_values_in_list_escapes_backslashes() {
+        let sql = info(
+            "win",
+            Some(vec![r"win\evtx".to_string(), "o'brien".to_string()]),
+        )
+        .build_where_clause();
+        assert_eq!(
+            sql,
+            r"source_type IN ('win\\evtx', 'o''brien')",
+            "backslash must be doubled and quote doubled: {sql}"
+        );
+    }
+
+    /// Name fallback path also routes through the full escaper.
+    #[test]
+    fn name_fallback_escapes_backslashes() {
+        let sql = info(r"win\evtx", None).build_where_clause();
+        assert_eq!(sql, r"source_type = 'win\\evtx'", "{sql}");
     }
 }

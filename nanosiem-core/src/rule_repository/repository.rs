@@ -15,17 +15,9 @@ use super::models::{
 // Rule Repository Repository
 // =============================================================================
 
-#[derive(Debug, Error)]
-pub enum RuleRepositoryRepositoryError {
-    #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
-
-    #[error("Repository not found: {0}")]
-    NotFound(Uuid),
-
-    #[error("Repository already exists: {0}")]
-    AlreadyExists(String),
-}
+// NAN-1618: consolidated into `crate::db::RepoError` (alias preserves the
+// public name and the variants matched in service/crud.rs and service/import.rs).
+pub use crate::db::repo_error::RepoError as RuleRepositoryRepositoryError;
 
 #[derive(Clone)]
 pub struct RuleRepositoryRepository {
@@ -42,16 +34,8 @@ impl RuleRepositoryRepository {
         repo: &NewRuleRepository,
         created_by: Option<Uuid>,
     ) -> Result<RuleRepository, RuleRepositoryRepositoryError> {
-        let slug = repo.slug.clone().unwrap_or_else(|| {
-            // Generate slug from URL: github.com/owner/repo -> owner/repo
-            repo.url
-                .trim_end_matches('/')
-                .trim_end_matches(".git")
-                .split("github.com/")
-                .last()
-                .unwrap_or(&repo.name)
-                .to_lowercase()
-        });
+        // Generate slug from URL: github.com/owner/repo -> owner/repo
+        let slug = crate::db::repo_store::slug_from_url(&repo.url, &repo.name, repo.slug.as_deref());
 
         let result = sqlx::query_as::<_, RuleRepository>(
             r#"
@@ -76,14 +60,7 @@ impl RuleRepositoryRepository {
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {
-            if let sqlx::Error::Database(ref db_err) = e {
-                if db_err.constraint() == Some("rule_repositories_name_key")
-                    || db_err.constraint() == Some("rule_repositories_slug_key")
-                {
-                    return RuleRepositoryRepositoryError::AlreadyExists(repo.name.clone());
-                }
-            }
-            RuleRepositoryRepositoryError::Database(e)
+            crate::db::repo_store::map_unique_violation(e, "rule_repositories", &repo.name)
         })?;
 
         Ok(result)
@@ -93,47 +70,18 @@ impl RuleRepositoryRepository {
         &self,
         id: Uuid,
     ) -> Result<RuleRepository, RuleRepositoryRepositoryError> {
-        sqlx::query_as::<_, RuleRepository>("SELECT * FROM rule_repositories WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or(RuleRepositoryRepositoryError::NotFound(id))
+        crate::db::repo_store::find_by_id(&self.pool, "rule_repositories", id).await
     }
 
     pub async fn find_by_slug(
         &self,
         slug: &str,
     ) -> Result<RuleRepository, RuleRepositoryRepositoryError> {
-        sqlx::query_as::<_, RuleRepository>("SELECT * FROM rule_repositories WHERE slug = $1")
-            .bind(slug)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or_else(|| RuleRepositoryRepositoryError::NotFound(Uuid::nil()))
+        crate::db::repo_store::find_by_slug(&self.pool, "rule_repositories", slug).await
     }
 
     pub async fn list(&self) -> Result<Vec<RuleRepository>, RuleRepositoryRepositoryError> {
-        // First, clean up any stuck "syncing" statuses (syncing for > 10 minutes)
-        let _ = sqlx::query(
-            r#"
-            UPDATE rule_repositories
-            SET
-                last_sync_status = 'failed',
-                last_sync_error = 'Sync timed out or was interrupted',
-                updated_at = NOW()
-            WHERE last_sync_status = 'syncing'
-              AND updated_at < NOW() - INTERVAL '10 minutes'
-            "#,
-        )
-        .execute(&self.pool)
-        .await;
-
-        let repos = sqlx::query_as::<_, RuleRepository>(
-            "SELECT * FROM rule_repositories ORDER BY name ASC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(repos)
+        crate::db::repo_store::list(&self.pool, "rule_repositories").await
     }
 
     pub async fn list_enabled(&self) -> Result<Vec<RuleRepository>, RuleRepositoryRepositoryError> {
@@ -149,22 +97,7 @@ impl RuleRepositoryRepository {
     pub async fn list_for_auto_sync(
         &self,
     ) -> Result<Vec<RuleRepository>, RuleRepositoryRepositoryError> {
-        let repos = sqlx::query_as::<_, RuleRepository>(
-            r#"
-            SELECT * FROM rule_repositories
-            WHERE enabled = TRUE
-              AND auto_sync_enabled = TRUE
-              AND (
-                last_synced_at IS NULL
-                OR last_synced_at < NOW() - (sync_interval_hours || ' hours')::interval
-              )
-            ORDER BY last_synced_at ASC NULLS FIRST
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(repos)
+        crate::db::repo_store::list_for_auto_sync(&self.pool, "rule_repositories").await
     }
 
     pub async fn update(
@@ -231,41 +164,21 @@ impl RuleRepositoryRepository {
         rule_count: Option<i32>,
         error: Option<&str>,
     ) -> Result<(), RuleRepositoryRepositoryError> {
-        sqlx::query(
-            r#"
-            UPDATE rule_repositories
-            SET
-                last_sync_status = $2,
-                last_sync_commit = COALESCE($3, last_sync_commit),
-                last_synced_at = CASE WHEN $2 = 'success' THEN NOW() ELSE last_synced_at END,
-                rule_count = COALESCE($4, rule_count),
-                last_sync_error = $5,
-                updated_at = NOW()
-            WHERE id = $1
-            "#,
+        crate::db::repo_store::update_sync_status(
+            &self.pool,
+            "rule_repositories",
+            "rule_count",
+            id,
+            status,
+            commit,
+            rule_count,
+            error,
         )
-        .bind(id)
-        .bind(status)
-        .bind(commit)
-        .bind(rule_count)
-        .bind(error)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
+        .await
     }
 
     pub async fn delete(&self, id: Uuid) -> Result<(), RuleRepositoryRepositoryError> {
-        let result = sqlx::query("DELETE FROM rule_repositories WHERE id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(RuleRepositoryRepositoryError::NotFound(id));
-        }
-
-        Ok(())
+        crate::db::repo_store::delete(&self.pool, "rule_repositories", id).await
     }
 }
 
@@ -464,13 +377,12 @@ impl RepositoryRulesRepository {
     }
 
     pub async fn count(&self, repository_id: Uuid) -> Result<i64, RepositoryRulesRepositoryError> {
-        let count: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM repository_rules WHERE repository_id = $1")
-                .bind(repository_id)
-                .fetch_one(&self.pool)
-                .await?;
-
-        Ok(count.0)
+        Ok(crate::db::repo_store::count_for_repository(
+            &self.pool,
+            "repository_rules",
+            repository_id,
+        )
+        .await?)
     }
 
     pub async fn update_conversion(
@@ -536,12 +448,12 @@ impl RepositoryRulesRepository {
         &self,
         repository_id: Uuid,
     ) -> Result<i64, RepositoryRulesRepositoryError> {
-        let result = sqlx::query("DELETE FROM repository_rules WHERE repository_id = $1")
-            .bind(repository_id)
-            .execute(&self.pool)
-            .await?;
-
-        Ok(result.rows_affected() as i64)
+        Ok(crate::db::repo_store::delete_by_repository(
+            &self.pool,
+            "repository_rules",
+            repository_id,
+        )
+        .await?)
     }
 
     pub async fn delete_not_in_paths(
@@ -553,15 +465,13 @@ impl RepositoryRulesRepository {
             return self.delete_by_repository(repository_id).await;
         }
 
-        let result = sqlx::query(
-            "DELETE FROM repository_rules WHERE repository_id = $1 AND file_path != ALL($2)",
+        Ok(crate::db::repo_store::prune_not_in_paths(
+            &self.pool,
+            "repository_rules",
+            repository_id,
+            paths,
         )
-        .bind(repository_id)
-        .bind(paths)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(result.rows_affected() as i64)
+        .await?)
     }
 }
 

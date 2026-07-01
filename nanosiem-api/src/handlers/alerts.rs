@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::utils::BulkResponse;
 use crate::{
     error::{ApiError, ErrorResponse},
@@ -207,8 +207,7 @@ pub async fn list_alerts(
     Extension(auth): Extension<AuthContext>,
     Query(query): Query<ListAlertsQuery>,
 ) -> Result<Json<Vec<Alert>>, ApiError> {
-    check_permission(&auth, permissions::ALERTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: alerts:view".to_string()))?;
+    ensure_permission(&auth, permissions::ALERTS_VIEW)?;
 
     let kinds = parse_kinds(&query.kinds);
     let alerts = if let Some(rule_id) = query.rule_id {
@@ -264,8 +263,7 @@ pub async fn stream_alerts(
     Extension(auth): Extension<AuthContext>,
     Query(query): Query<StreamAlertsQuery>,
 ) -> Result<Json<AlertStreamResponse>, ApiError> {
-    check_permission(&auth, permissions::ALERTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: alerts:view".to_string()))?;
+    ensure_permission(&auth, permissions::ALERTS_VIEW)?;
 
     let (after_timestamp, after_id) = if let Some(cursor_str) = query.cursor {
         // Decode cursor: base64(rfc3339_timestamp|uuid)
@@ -362,8 +360,7 @@ pub async fn get_alert(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<Alert>, ApiError> {
-    check_permission(&auth, permissions::ALERTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: alerts:view".to_string()))?;
+    ensure_permission(&auth, permissions::ALERTS_VIEW)?;
 
     let alert = state.detection_service.get_alert(*id).await?;
 
@@ -402,8 +399,7 @@ pub async fn acknowledge_alert(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<Alert>, ApiError> {
-    check_permission(&auth, permissions::ALERTS_ACKNOWLEDGE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: alerts:acknowledge".to_string()))?;
+    ensure_permission(&auth, permissions::ALERTS_ACKNOWLEDGE)?;
 
     // Demo isolation: block access to alerts from other demo users' rules
     if auth.claims.roles.contains(&"demo_analyst".to_string()) {
@@ -457,8 +453,7 @@ pub async fn close_alert(
     Path(id): Path<TypeIdParam>,
     Json(request): Json<CloseRequest>,
 ) -> Result<Json<Alert>, ApiError> {
-    check_permission(&auth, permissions::ALERTS_CLOSE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: alerts:close".to_string()))?;
+    ensure_permission(&auth, permissions::ALERTS_CLOSE)?;
 
     // Demo isolation: block access to alerts from other demo users' rules
     if auth.claims.roles.contains(&"demo_analyst".to_string()) {
@@ -516,8 +511,7 @@ pub async fn assign_alert(
     use nanosiem_core::db::repository::NotificationRepository;
     use nanosiem_core::models::notification::{NewNotification, NotificationType};
 
-    check_permission(&auth, permissions::ALERTS_ASSIGN)
-        .map_err(|_| ApiError::Forbidden("Missing permission: alerts:assign".to_string()))?;
+    ensure_permission(&auth, permissions::ALERTS_ASSIGN)?;
 
     // Demo isolation: block access to alerts from other demo users' rules
     if auth.claims.roles.contains(&"demo_analyst".to_string()) {
@@ -624,13 +618,10 @@ pub async fn bulk_alerts(
     // Check appropriate permission based on action
     match request.action {
         BulkAction::Acknowledge => {
-            check_permission(&auth, permissions::ALERTS_ACKNOWLEDGE).map_err(|_| {
-                ApiError::Forbidden("Missing permission: alerts:acknowledge".to_string())
-            })?;
+            ensure_permission(&auth, permissions::ALERTS_ACKNOWLEDGE)?;
         }
         BulkAction::Close => {
-            check_permission(&auth, permissions::ALERTS_CLOSE)
-                .map_err(|_| ApiError::Forbidden("Missing permission: alerts:close".to_string()))?;
+            ensure_permission(&auth, permissions::ALERTS_CLOSE)?;
         }
     }
 
@@ -716,8 +707,7 @@ pub async fn alert_counts(
     Extension(auth): Extension<AuthContext>,
     Query(query): Query<AlertCountsQuery>,
 ) -> Result<Json<AlertCounts>, ApiError> {
-    check_permission(&auth, permissions::ALERTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: alerts:view".to_string()))?;
+    ensure_permission(&auth, permissions::ALERTS_VIEW)?;
 
     let kinds = parse_kinds(&query.kinds);
 
@@ -837,8 +827,7 @@ pub async fn alert_velocity(
     Extension(auth): Extension<AuthContext>,
     Query(query): Query<VelocityQuery>,
 ) -> Result<Json<Vec<VelocityBucket>>, ApiError> {
-    check_permission(&auth, permissions::ALERTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: alerts:view".to_string()))?;
+    ensure_permission(&auth, permissions::ALERTS_VIEW)?;
 
     let hours = query.hours.clamp(1, 168) as i64;
     let now = chrono::Utc::now();

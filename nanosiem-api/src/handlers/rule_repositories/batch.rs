@@ -19,7 +19,7 @@ use super::{
     },
     AuditExt,
 };
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 /// Batch import multiple rules from a repository
@@ -45,9 +45,7 @@ pub async fn batch_import_rules(
     Path(id): Path<TypeIdParam>,
     Json(req): Json<BatchImportRequest>,
 ) -> Result<Json<BatchImportResponse>, ApiError> {
-    check_permission(&auth, permissions::RULE_REPOSITORIES_IMPORT).map_err(|_| {
-        ApiError::Forbidden("Missing permission: rule_repositories:import".to_string())
-    })?;
+    ensure_permission(&auth, permissions::RULE_REPOSITORIES_IMPORT)?;
 
     if req.items.len() > 1000 {
         return Err(ApiError::BadRequest(format!(
@@ -162,9 +160,7 @@ pub async fn remove_all_imported(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<BatchRemoveResponse>, ApiError> {
-    check_permission(&auth, permissions::RULE_REPOSITORIES_MANAGE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: rule_repositories:manage".to_string())
-    })?;
+    ensure_permission(&auth, permissions::RULE_REPOSITORIES_MANAGE)?;
 
     let service = get_rule_repo_service(&state)?;
     let repo = service.get_repository(*id).await?;

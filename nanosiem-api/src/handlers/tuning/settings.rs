@@ -12,7 +12,7 @@ use nanosiem_core::typeid::TypeIdParam;
 use super::types::TuningSettings;
 use crate::error::ApiError;
 use crate::handlers::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::state::AppState;
 
 /// GET /api/tuning/settings/:rule_id
@@ -40,8 +40,7 @@ pub async fn get_tuning_settings(
     Extension(auth): Extension<AuthContext>,
     Path(rule_id): Path<TypeIdParam>,
 ) -> Result<Json<TuningSettings>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     // Get tuning settings from detection_rules table
     let settings: Option<(bool, f64, bool, Option<chrono::DateTime<chrono::Utc>>, bool)> =
@@ -104,8 +103,7 @@ pub async fn update_tuning_settings(
     Path(rule_id): Path<TypeIdParam>,
     Json(settings): Json<TuningSettings>,
 ) -> Result<Json<TuningSettings>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:edit".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_EDIT)?;
 
     // Validate confidence threshold
     if settings.auto_tuning_min_confidence < 0.0 || settings.auto_tuning_min_confidence > 1.0 {

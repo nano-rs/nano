@@ -6,8 +6,7 @@
 
 use anyhow::Result;
 use nanosiem_core::auth::{
-    repository::{ApiKeyRepository, AuditRepository},
-    ApiKeyService, PermissionResolver, TokenConfig, TokenService,
+    repository::ApiKeyRepository, ApiKeyService, PermissionResolver, TokenConfig, TokenService,
 };
 use nanosiem_core::db::repository::RateLimitRepository;
 use nanosiem_core::db::ClickHouseMigrator;
@@ -97,9 +96,8 @@ async fn main() -> Result<()> {
 
         // Create API key service for validating X-API-Key headers
         let api_key_repo = ApiKeyRepository::new(dual_pool.postgres().clone());
-        let audit_repo = AuditRepository::new(dual_pool.postgres().clone());
         let rate_limit_repo = RateLimitRepository::new(dual_pool.postgres().clone());
-        let api_key_service = ApiKeyService::new(api_key_repo, audit_repo, rate_limit_repo);
+        let api_key_service = ApiKeyService::new(api_key_repo, rate_limit_repo);
 
         let permission_resolver = PermissionResolver::new(dual_pool.postgres().clone());
         AuthState::new(token_service, Some(api_key_service), true)

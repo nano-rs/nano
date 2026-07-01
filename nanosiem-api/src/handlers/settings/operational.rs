@@ -16,7 +16,7 @@ use utoipa::ToSchema;
 
 use crate::error::{ApiError, ErrorResponse};
 use crate::handlers::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::state::AppState;
 
 // ============================================================================
@@ -171,8 +171,7 @@ pub async fn get_organizational_context(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<OrganizationalContextResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_AI)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_AI)?;
 
     let service = OrganizationalContextService::new(state.pool.clone());
     let context = service.get_context().await?;
@@ -204,8 +203,7 @@ pub async fn update_organizational_context(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<UpdateOrganizationalContextApiRequest>,
 ) -> Result<Json<OrganizationalContextResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_AI)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_AI)?;
 
     let service = OrganizationalContextService::new(state.pool.clone());
 
@@ -265,8 +263,7 @@ pub async fn get_health_monitoring_settings(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<HealthMonitoringSettingsResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let row = sqlx::query(
         "SELECT COALESCE(ai_monitoring_enabled, false) as ai_enabled, \
@@ -316,8 +313,7 @@ pub async fn update_health_monitoring_settings(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<UpdateHealthMonitoringSettingsRequest>,
 ) -> Result<Json<HealthMonitoringSettingsResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     // Handle legacy 'enabled' field - maps to ai_monitoring_enabled
     let ai_enabled = request.ai_monitoring_enabled.or(request.enabled);
@@ -414,8 +410,7 @@ pub async fn get_developer_settings(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<DeveloperSettingsResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let row = sqlx::query(
         r#"
@@ -483,8 +478,7 @@ pub async fn update_developer_settings(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<UpdateDeveloperSettingsRequest>,
 ) -> Result<Json<DeveloperSettingsResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     // Update each field if provided
     if let Some(enabled) = request.detection_scheduler_enabled {
@@ -676,8 +670,7 @@ pub async fn get_search_admission_settings(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<nanosiem_core::settings::SearchAdmissionConfig>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let settings = nanosiem_core::settings::SearchAdmissionSettings::new(state.pool.clone());
     let config = settings
@@ -709,8 +702,7 @@ pub async fn update_search_admission_settings(
     Extension(client): Extension<ClientContext>,
     Json(config): Json<nanosiem_core::settings::SearchAdmissionConfig>,
 ) -> Result<Json<nanosiem_core::settings::SearchAdmissionConfig>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let settings = nanosiem_core::settings::SearchAdmissionSettings::new(state.pool.clone());
     let updated = settings.update_config(config).await.map_err(|e| match e {
@@ -754,8 +746,7 @@ pub async fn get_search_query_limits(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<nanosiem_core::settings::SearchQueryLimitsConfig>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let settings = nanosiem_core::settings::SearchQueryLimitsSettings::new(state.pool.clone());
     let config = settings
@@ -787,8 +778,7 @@ pub async fn update_search_query_limits(
     Extension(client): Extension<ClientContext>,
     Json(config): Json<nanosiem_core::settings::SearchQueryLimitsConfig>,
 ) -> Result<Json<nanosiem_core::settings::SearchQueryLimitsConfig>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let settings = nanosiem_core::settings::SearchQueryLimitsSettings::new(state.pool.clone());
     let updated = settings.update_config(config).await.map_err(|e| match e {

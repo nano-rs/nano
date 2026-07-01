@@ -17,8 +17,8 @@ use thiserror::Error;
 
 use super::password::{validate_password, verify_password, PasswordError};
 use super::repository::{
-    audit_actions, AuditRepository, AuditRepositoryError, GroupRepository, GroupRepositoryError,
-    SessionRepository, SessionRepositoryError, UserRepository, UserRepositoryError,
+    GroupRepository, GroupRepositoryError, SessionRepository, SessionRepositoryError,
+    UserRepository, UserRepositoryError,
 };
 use super::token::{TokenError, TokenService};
 use super::types::{
@@ -102,12 +102,6 @@ impl From<GroupRepositoryError> for AuthError {
     }
 }
 
-impl From<AuditRepositoryError> for AuthError {
-    fn from(err: AuditRepositoryError) -> Self {
-        AuthError::DatabaseError(err.to_string())
-    }
-}
-
 impl From<TokenError> for AuthError {
     fn from(err: TokenError) -> Self {
         match err {
@@ -150,6 +144,18 @@ impl Default for AuthConfig {
     }
 }
 
+/// Outcome of a successful MFA challenge completion.
+///
+/// Carries the authenticated `response` plus whether a single-use backup code
+/// (rather than a live TOTP code) satisfied the challenge, so the caller can
+/// audit `mfa_backup_code_used` distinctly from a normal `mfa_challenge_success`.
+pub struct MfaCompletion {
+    /// The completed authentication response (tokens + user).
+    pub response: AuthResponse,
+    /// True when a backup code (not a TOTP code) satisfied the challenge.
+    pub used_backup_code: bool,
+}
+
 /// Authentication service
 ///
 /// Requirements: 1.2, 1.3, 1.5, 1.6, 2.3, 2.4, 2.6
@@ -157,7 +163,6 @@ pub struct AuthService {
     user_repo: UserRepository,
     session_repo: SessionRepository,
     group_repo: GroupRepository,
-    audit_repo: AuditRepository,
     token_service: TokenService,
     config: AuthConfig,
 }
@@ -168,7 +173,6 @@ impl AuthService {
         user_repo: UserRepository,
         session_repo: SessionRepository,
         group_repo: GroupRepository,
-        audit_repo: AuditRepository,
         token_service: TokenService,
         config: AuthConfig,
     ) -> Self {
@@ -176,7 +180,6 @@ impl AuthService {
             user_repo,
             session_repo,
             group_repo,
-            audit_repo,
             token_service,
             config,
         }
@@ -207,23 +210,6 @@ impl AuthService {
                     tokio::task::spawn_blocking(move || verify_password(&pwd, DUMMY_BCRYPT_HASH))
                         .await;
 
-                // Log failed attempt (no user_id since user doesn't exist)
-                let _ = self
-                    .audit_repo
-                    .log_event(
-                        None,
-                        None,
-                        audit_actions::LOGIN_FAILED,
-                        Some("user"),
-                        None,
-                        // SECURITY: Don't log "user_not_found" - just log generic failure
-                        Some(serde_json::json!({ "email": email })),
-                        ip_address,
-                        user_agent,
-                        false,
-                    )
-                    .await;
-
                 // Return generic error (Requirement 1.3)
                 return Err(AuthError::InvalidCredentials);
             }
@@ -239,22 +225,6 @@ impl AuthService {
                 let _ = tokio::task::spawn_blocking(move || verify_password(&pwd, &h)).await;
             }
 
-            let _ = self
-                .audit_repo
-                .log_event(
-                    Some(user.id),
-                    None,
-                    audit_actions::LOGIN_FAILED,
-                    Some("user"),
-                    Some(user.id),
-                    // SECURITY: Don't reveal specific reason in logs accessible to attackers
-                    None,
-                    ip_address,
-                    user_agent,
-                    false,
-                )
-                .await;
-
             // SECURITY: Return generic error to prevent account status enumeration
             return Err(AuthError::InvalidCredentials);
         }
@@ -267,22 +237,6 @@ impl AuthService {
                 let h = hash.clone();
                 let _ = tokio::task::spawn_blocking(move || verify_password(&pwd, &h)).await;
             }
-
-            let _ = self
-                .audit_repo
-                .log_event(
-                    Some(user.id),
-                    None,
-                    audit_actions::LOGIN_FAILED,
-                    Some("user"),
-                    Some(user.id),
-                    // SECURITY: Don't reveal specific reason in logs accessible to attackers
-                    None,
-                    ip_address,
-                    user_agent,
-                    false,
-                )
-                .await;
 
             // SECURITY: Return generic error to prevent account status enumeration
             return Err(AuthError::InvalidCredentials);
@@ -315,42 +269,21 @@ impl AuthService {
                 let backoff_secs = std::cmp::min(2u64.pow(exponent), 300);
                 tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
 
-                let _ = self
-                    .audit_repo
-                    .log_event(
-                        Some(user.id),
-                        None,
-                        audit_actions::USER_LOCK,
-                        Some("user"),
-                        Some(user.id),
-                        Some(serde_json::json!({
-                            "reason": "failed_login_backoff",
-                            "failed_attempts": failed_attempts,
-                            "backoff_secs": backoff_secs,
-                        })),
-                        ip_address,
-                        user_agent,
-                        true,
-                    )
-                    .await;
+                // Signal the lock ONLY on the crossing attempt — the one whose
+                // increment first reaches the threshold — so the login handler
+                // audits user_locked exactly once per lock episode (the counter
+                // resets to 0 on the next successful login). Subsequent attempts
+                // against the already-throttled account still back off but fall
+                // through to the generic InvalidCredentials below, so they are not
+                // re-audited as fresh locks. `increment_failed_attempts` is an
+                // atomic DB increment returning the new value, so concurrent
+                // failures each see a distinct count and exactly one hits `==`.
+                // `from_auth_error` normalizes AccountLocked to the same generic
+                // 401 as InvalidCredentials (no account enumeration).
+                if failed_attempts == self.config.lockout_threshold {
+                    return Err(AuthError::AccountLocked);
+                }
             }
-
-            let _ = self
-                .audit_repo
-                .log_event(
-                    Some(user.id),
-                    None,
-                    audit_actions::LOGIN_FAILED,
-                    Some("user"),
-                    Some(user.id),
-                    Some(serde_json::json!({
-                        "failed_attempts": failed_attempts
-                    })),
-                    ip_address,
-                    user_agent,
-                    false,
-                )
-                .await;
 
             // Return generic error (Requirement 1.3)
             return Err(AuthError::InvalidCredentials);
@@ -363,20 +296,6 @@ impl AuthService {
         // If user has MFA enabled, issue a challenge token instead of full auth
         if user.mfa_enabled {
             let challenge_token = self.token_service.create_mfa_challenge_token(user.id)?;
-            let _ = self
-                .audit_repo
-                .log_event(
-                    Some(user.id),
-                    None,
-                    audit_actions::MFA_CHALLENGE_ISSUED,
-                    Some("user"),
-                    Some(user.id),
-                    None,
-                    ip_address,
-                    user_agent,
-                    true,
-                )
-                .await;
             return Ok(LoginResult::MfaRequired { challenge_token });
         }
 
@@ -440,22 +359,6 @@ impl AuthService {
             )
             .await?;
 
-        // Log successful login
-        let _ = self
-            .audit_repo
-            .log_event(
-                Some(user.id),
-                None,
-                audit_actions::LOGIN_SUCCESS,
-                Some("user"),
-                Some(user.id),
-                None,
-                ip_address,
-                user_agent,
-                true,
-            )
-            .await;
-
         // Parse query mode preference (default to Standard if not set)
         let preferred_query_mode = user
             .preferred_query_mode
@@ -503,7 +406,7 @@ impl AuthService {
         encryption: &crate::crypto::EncryptionService,
         ip_address: Option<&str>,
         user_agent: Option<&str>,
-    ) -> Result<AuthResponse, AuthError> {
+    ) -> Result<MfaCompletion, AuthError> {
         // Validate the challenge token
         let claims = self
             .token_service
@@ -538,6 +441,7 @@ impl AuthService {
         // Try TOTP verification first
         let totp_valid = super::mfa::verify_totp(&secret, &user.email, code).unwrap_or(false);
 
+        let mut used_backup_code = false;
         if !totp_valid {
             // Try backup code
             if let (Some(backup_enc), Some(backup_nonce)) =
@@ -548,6 +452,7 @@ impl AuthService {
                         .map_err(|e| AuthError::InternalError(e.to_string()))?;
 
                 if let Some(idx) = super::mfa::verify_backup_code(code, &hashed_codes) {
+                    used_backup_code = true;
                     // Remove used backup code and re-encrypt
                     hashed_codes.remove(idx);
                     let new_encrypted = super::mfa::encrypt_backup_codes(&hashed_codes, encryption)
@@ -559,55 +464,12 @@ impl AuthService {
                         .user_repo
                         .update_backup_codes(user_id, &ciphertext, &new_encrypted.nonce)
                         .await;
-
-                    let _ = self
-                        .audit_repo
-                        .log_event(
-                            Some(user_id),
-                            None,
-                            audit_actions::MFA_BACKUP_CODE_USED,
-                            Some("user"),
-                            Some(user_id),
-                            Some(serde_json::json!({ "codes_remaining": hashed_codes.len() })),
-                            ip_address,
-                            user_agent,
-                            true,
-                        )
-                        .await;
                 } else {
                     // Neither TOTP nor backup code matched
-                    let _ = self
-                        .audit_repo
-                        .log_event(
-                            Some(user_id),
-                            None,
-                            audit_actions::MFA_CHALLENGE_FAILED,
-                            Some("user"),
-                            Some(user_id),
-                            None,
-                            ip_address,
-                            user_agent,
-                            false,
-                        )
-                        .await;
                     return Err(AuthError::InvalidCredentials);
                 }
             } else {
                 // No backup codes, TOTP failed
-                let _ = self
-                    .audit_repo
-                    .log_event(
-                        Some(user_id),
-                        None,
-                        audit_actions::MFA_CHALLENGE_FAILED,
-                        Some("user"),
-                        Some(user_id),
-                        None,
-                        ip_address,
-                        user_agent,
-                        false,
-                    )
-                    .await;
                 return Err(AuthError::InvalidCredentials);
             }
         }
@@ -616,21 +478,6 @@ impl AuthService {
         self.token_service.revoke_token(claims.jti, claims.exp).await;
 
         // MFA verified — now complete login (same flow as non-MFA)
-        let _ = self
-            .audit_repo
-            .log_event(
-                Some(user_id),
-                None,
-                audit_actions::MFA_CHALLENGE_SUCCESS,
-                Some("user"),
-                Some(user_id),
-                None,
-                ip_address,
-                user_agent,
-                true,
-            )
-            .await;
-
         let roles = self.group_repo.get_user_roles(user_id).await?;
         let permissions = self.group_repo.get_user_permissions(user_id).await?;
         let token_pair = self
@@ -664,21 +511,6 @@ impl AuthService {
             )
             .await?;
 
-        let _ = self
-            .audit_repo
-            .log_event(
-                Some(user_id),
-                None,
-                audit_actions::LOGIN_SUCCESS,
-                Some("user"),
-                Some(user_id),
-                Some(serde_json::json!({ "mfa_verified": true })),
-                ip_address,
-                user_agent,
-                true,
-            )
-            .await;
-
         let preferred_query_mode = user
             .preferred_query_mode
             .as_deref()
@@ -695,18 +527,21 @@ impl AuthService {
             .and_then(|s| s.parse().ok())
             .unwrap_or(LandingPage::Home);
 
-        Ok(AuthResponse {
-            user: UserInfo {
-                id: user.id,
-                email: user.email,
-                name: user.name,
-                roles,
-                permissions,
-                preferred_query_mode,
-                default_time_range,
-                landing_page,
+        Ok(MfaCompletion {
+            used_backup_code,
+            response: AuthResponse {
+                user: UserInfo {
+                    id: user.id,
+                    email: user.email,
+                    name: user.name,
+                    roles,
+                    permissions,
+                    preferred_query_mode,
+                    default_time_range,
+                    landing_page,
+                },
+                tokens: token_pair,
             },
-            tokens: token_pair,
         })
     }
 
@@ -716,43 +551,18 @@ impl AuthService {
     pub async fn logout(
         &self,
         refresh_token: &str,
-        ip_address: Option<&str>,
-        user_agent: Option<&str>,
+        _ip_address: Option<&str>,
+        _user_agent: Option<&str>,
     ) -> Result<(), AuthError> {
         let refresh_token_hash = hash_token(refresh_token);
 
-        // Find the session to get user_id for audit logging
-        let session = self
-            .session_repo
-            .get_session_by_token_hash(&refresh_token_hash)
-            .await;
-
-        let user_id = session.as_ref().ok().map(|s| s.user_id);
-
-        // Delete the session
-        let result = self
+        // Delete the session. Even if the session wasn't found, we consider
+        // logout successful (the token might have already expired).
+        let _ = self
             .session_repo
             .delete_session_by_token_hash(&refresh_token_hash)
             .await;
 
-        // Log logout event
-        let _ = self
-            .audit_repo
-            .log_event(
-                user_id,
-                None,
-                audit_actions::LOGOUT,
-                Some("session"),
-                None,
-                None,
-                ip_address,
-                user_agent,
-                result.is_ok(),
-            )
-            .await;
-
-        // Even if session wasn't found, we consider logout successful
-        // (token might have already expired)
         Ok(())
     }
 
@@ -764,8 +574,8 @@ impl AuthService {
     pub async fn refresh_token(
         &self,
         refresh_token: &str,
-        ip_address: Option<&str>,
-        user_agent: Option<&str>,
+        _ip_address: Option<&str>,
+        _user_agent: Option<&str>,
     ) -> Result<TokenPair, AuthError> {
         // Validate the refresh token JWT
         let claims = self.token_service.validate_refresh_token(refresh_token)?;
@@ -822,22 +632,6 @@ impl AuthService {
             )
             .await?;
 
-        // Log token refresh
-        let _ = self
-            .audit_repo
-            .log_event(
-                Some(user.id),
-                None,
-                audit_actions::TOKEN_REFRESH,
-                Some("session"),
-                Some(session.id),
-                None,
-                ip_address,
-                user_agent,
-                true,
-            )
-            .await;
-
         Ok(new_token_pair)
     }
 
@@ -847,30 +641,14 @@ impl AuthService {
     pub async fn request_password_reset(
         &self,
         email: &str,
-        ip_address: Option<&str>,
-        user_agent: Option<&str>,
+        _ip_address: Option<&str>,
+        _user_agent: Option<&str>,
     ) -> Result<String, AuthError> {
         // Try to find the user
         let user = match self.user_repo.get_user_by_email(email).await {
             Ok(user) => user,
             Err(UserRepositoryError::NotFoundByEmail(_)) => {
                 // SECURITY: Don't reveal whether user exists
-                // Log the attempt but don't include user_found status
-                let _ = self
-                    .audit_repo
-                    .log_event(
-                        None,
-                        None,
-                        audit_actions::PASSWORD_RESET_REQUEST,
-                        Some("user"),
-                        None,
-                        Some(serde_json::json!({ "email": email })),
-                        ip_address,
-                        user_agent,
-                        true, // Mark as success to not reveal user existence
-                    )
-                    .await;
-
                 // Return a dummy token (in production, you'd send an email regardless)
                 return Ok(generate_reset_token());
             }
@@ -886,22 +664,6 @@ impl AuthService {
             .set_password_reset_token(user.id, &reset_token, expires_at)
             .await?;
 
-        // Log the request
-        let _ = self
-            .audit_repo
-            .log_event(
-                Some(user.id),
-                None,
-                audit_actions::PASSWORD_RESET_REQUEST,
-                Some("user"),
-                Some(user.id),
-                None,
-                ip_address,
-                user_agent,
-                true,
-            )
-            .await;
-
         Ok(reset_token)
     }
 
@@ -912,8 +674,8 @@ impl AuthService {
         &self,
         token: &str,
         new_password: &str,
-        ip_address: Option<&str>,
-        user_agent: Option<&str>,
+        _ip_address: Option<&str>,
+        _user_agent: Option<&str>,
     ) -> Result<(), AuthError> {
         // Validate password complexity
         validate_password(new_password)?;
@@ -929,22 +691,6 @@ impl AuthService {
         // Invalidate all existing sessions for security
         self.session_repo.delete_user_sessions(user.id).await?;
 
-        // Log the password reset
-        let _ = self
-            .audit_repo
-            .log_event(
-                Some(user.id),
-                None,
-                audit_actions::PASSWORD_RESET_COMPLETE,
-                Some("user"),
-                Some(user.id),
-                None,
-                ip_address,
-                user_agent,
-                true,
-            )
-            .await;
-
         Ok(())
     }
 
@@ -957,8 +703,8 @@ impl AuthService {
         user_id: uuid::Uuid,
         current_password: &str,
         new_password: &str,
-        ip_address: Option<&str>,
-        user_agent: Option<&str>,
+        _ip_address: Option<&str>,
+        _user_agent: Option<&str>,
     ) -> Result<(), AuthError> {
         // Get the user
         let user = self.user_repo.get_user_by_id(user_id).await?;
@@ -989,22 +735,6 @@ impl AuthService {
 
         // Invalidate all existing sessions for security
         self.session_repo.delete_user_sessions(user_id).await?;
-
-        // Log the password change
-        let _ = self
-            .audit_repo
-            .log_event(
-                Some(user_id),
-                None,
-                audit_actions::PASSWORD_CHANGE,
-                Some("user"),
-                Some(user_id),
-                None,
-                ip_address,
-                user_agent,
-                true,
-            )
-            .await;
 
         Ok(())
     }

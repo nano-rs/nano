@@ -69,8 +69,9 @@ pub async fn get_rare_artifacts(
 
     let time_window = parse_time_window(params.window.as_deref());
     let artifact_type = parse_artifact_type(params.artifact_type.as_deref());
-    let limit = params.limit.unwrap_or(25).min(100); // Default 25, max 100
-    let offset = params.offset.unwrap_or(0).max(0);
+    // Default 25, max 100
+    let (limit, offset) = nanosiem_api_lib::Pagination::new(params.limit, params.offset)
+        .resolved_capped_floored_offset(25, 100);
 
     // Fetch one extra to determine if there are more results
     match prevalence_service
@@ -149,8 +150,9 @@ pub async fn get_new_artifacts(
         .unwrap_or_else(|| Utc::now() - Duration::hours(24));
 
     let artifact_type = parse_artifact_type(params.artifact_type.as_deref());
-    let limit = params.limit.unwrap_or(25).min(100); // Default 25, max 100
-    let offset = params.offset.unwrap_or(0).max(0);
+    // Default 25, max 100
+    let (limit, offset) = nanosiem_api_lib::Pagination::new(params.limit, params.offset)
+        .resolved_capped_floored_offset(25, 100);
 
     // Fetch extra to determine if there are more results
     match prevalence_service
@@ -222,8 +224,8 @@ pub async fn get_artifact_explorer(
     let artifact_type = parse_artifact_type(params.artifact_type.as_deref());
     let risk_filter = params.risk_level.as_deref();
     let search = params.search.as_deref();
-    let limit = params.limit.unwrap_or(50).min(200);
-    let offset = params.offset.unwrap_or(0).max(0);
+    let (limit, offset) = nanosiem_api_lib::Pagination::new(params.limit, params.offset)
+        .resolved_capped_floored_offset(50, 200);
     let logs_table = dual_pool
         .table_names()
         .read(nanosiem_core::schema::active_logs_table());

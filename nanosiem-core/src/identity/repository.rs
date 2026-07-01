@@ -5,9 +5,8 @@
 //! Database operations for identity providers and the user registry.
 
 use sqlx::PgPool;
-use std::collections::HashSet;
 use thiserror::Error;
-use tracing::{instrument, warn};
+use tracing::instrument;
 
 use super::types::*;
 use crate::crypto::EncryptionService;
@@ -289,61 +288,6 @@ impl IdentityRepository {
     // User Registry — Bulk Operations
     // ========================================================================
 
-    /// Upsert users from a sync into the ClickHouse user_registry table.
-    ///
-    /// NAN-1117: this used to be a PG `INSERT ... ON CONFLICT DO UPDATE WHERE
-    /// sync_hash IS DISTINCT FROM`. The payload now lives in a CH
-    /// ReplacingMergeTree(version) keyed (provider_id, external_id): every sync
-    /// row is appended with `version = now_ms` and the latest wins, so
-    /// change-detection is no longer needed for correctness (cheap append +
-    /// async merge replaces the no-op skip). `sync_hash` is still written so the
-    /// field round-trips. Returns (rows_written, 0) — CH can't distinguish
-    /// created vs updated, mirroring the prior PG behavior which returned
-    /// affected-as-created.
-    #[instrument(skip(self, records))]
-    pub async fn upsert_users(
-        &self,
-        provider_id: &str,
-        records: &[UserRecordUpsert],
-    ) -> Result<(u64, u64), IdentityRepositoryError> {
-        if records.is_empty() {
-            return Ok((0, 0));
-        }
-        let ch = self.ch()?;
-        let now_ms = chrono::Utc::now().timestamp_millis();
-
-        let mut written = 0u64;
-        for chunk in records.chunks(CH_INSERT_CHUNK) {
-            match Self::insert_user_rows(ch, provider_id, now_ms, chunk).await {
-                Ok(()) => written += chunk.len() as u64,
-                Err(e) => {
-                    warn!(
-                        chunk_size = chunk.len(),
-                        error = %e,
-                        "CH user_registry batch insert failed; retrying records individually"
-                    );
-                    for record in chunk {
-                        match Self::insert_user_rows(
-                            ch,
-                            provider_id,
-                            now_ms,
-                            std::slice::from_ref(record),
-                        )
-                        .await
-                        {
-                            Ok(()) => written += 1,
-                            Err(e) => {
-                                warn!(external_id = %record.external_id, error = %e, "Failed to store user_registry record");
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok((written, 0))
-    }
-
     /// Column list (and matching VALUES tuple) for a user_registry INSERT.
     /// `version` is the ReplacingMergeTree version (ms epoch); the materialized
     /// *_lc columns are NOT listed (CH computes them).
@@ -408,41 +352,6 @@ impl IdentityRepository {
                 .bind(version_ms);
         }
         q.execute().await
-    }
-
-    /// Mark users from this provider that are NOT in the given set of
-    /// external_ids as deleted (ClickHouse).
-    ///
-    /// ReplacingMergeTree has no in-place UPDATE, so we read the current
-    /// (deduped) live rows for the provider whose external_id is absent from the
-    /// present set and re-insert each as a NEW higher-version row with
-    /// account_status='deleted', account_enabled=0 — carrying forward the full
-    /// record so the browse UI keeps the other fields (the dict drops it via
-    /// HAVING). version is bumped so the deleted row wins the argMax.
-    #[instrument(skip(self, present_external_ids))]
-    pub async fn mark_absent_users(
-        &self,
-        provider_id: &str,
-        present_external_ids: &HashSet<String>,
-    ) -> Result<u64, IdentityRepositoryError> {
-        if present_external_ids.is_empty() {
-            return Ok(0);
-        }
-        let live = self.fetch_live_rows_for_provider(provider_id).await?;
-        let absent: Vec<UserRegistryRow> = live
-            .into_iter()
-            .filter(|r| !present_external_ids.contains(&r.external_id))
-            .collect();
-        self.soft_delete_rows(absent).await
-    }
-
-    /// Get the current database server time.
-    /// Use this instead of `chrono::Utc::now()` when comparing against DB-set timestamps
-    /// to avoid clock skew between application and database servers.
-    pub async fn db_now(&self) -> Result<chrono::DateTime<chrono::Utc>, IdentityRepositoryError> {
-        let (now,): (chrono::DateTime<chrono::Utc>,) =
-            sqlx::query_as("SELECT NOW()").fetch_one(&self.pool).await?;
-        Ok(now)
     }
 
     /// Mark users as deleted if they weren't touched during the current sync.

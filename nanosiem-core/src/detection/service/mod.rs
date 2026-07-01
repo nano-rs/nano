@@ -42,7 +42,6 @@ use crate::tuning::versions::RuleVersionManager;
 
 use super::error::DetectionError;
 use super::findings::FindingLogger;
-use super::prevalence::PrevalenceEvaluator;
 use super::risk::ScoreCalculator;
 use crate::webhooks::WebhookService;
 
@@ -138,8 +137,6 @@ pub struct DetectionService {
     pub(super) score_calculator: ScoreCalculator,
     /// PostgreSQL pool for loading settings
     pub(super) pg_pool: PgPool,
-    /// Optional prevalence evaluator for prevalence-based detection
-    pub(super) prevalence_evaluator: Option<Arc<PrevalenceEvaluator>>,
     /// Cached risk_weight value with TTL (value, cached_at)
     pub(super) risk_weight_cache: Arc<RwLock<Option<(f64, Instant)>>>,
     /// Version manager for tracking rule changes
@@ -213,7 +210,7 @@ impl DetectionService {
         let search_service = SearchService::with_dual_pool_lookup_and_prevalence_and_profile(
             dual_pool,
             lookup_service,
-            prevalence_service.clone(),
+            prevalence_service,
             profile.clone(),
         );
 
@@ -225,7 +222,6 @@ impl DetectionService {
             config: DetectionServiceConfig::default(),
             score_calculator: ScoreCalculator::new().with_profile(profile.clone()),
             pg_pool: pg_pool.clone(),
-            prevalence_evaluator: Some(Arc::new(PrevalenceEvaluator::new(prevalence_service))),
             risk_weight_cache: Arc::new(RwLock::new(None)),
             version_manager: RuleVersionManager::new(pg_pool),
             case_grouping: Arc::new(NoopCaseGroupingHook),
@@ -255,18 +251,6 @@ impl DetectionService {
         self
     }
 
-    /// Set the prevalence evaluator for prevalence-based detection conditions
-    ///
-    /// This enables detection rules to use prevalence conditions like:
-    /// - `hash_prevalence < 5` - Filter to hashes seen on fewer than 5 hosts
-    /// - `domain_first_seen > now() - 24h` - Filter to newly observed domains
-    ///
-    /// Requirements: 6.1, 6.2
-    pub fn with_prevalence_service(mut self, prevalence_service: PrevalenceService) -> Self {
-        self.prevalence_evaluator = Some(Arc::new(PrevalenceEvaluator::new(prevalence_service)));
-        self
-    }
-
     /// Set the webhook service for alert notifications
     pub fn with_webhook_service(mut self, webhook_service: WebhookService) -> Self {
         self.webhook_service = Some(webhook_service);
@@ -290,11 +274,6 @@ impl DetectionService {
     pub fn with_case_grouping(mut self, hook: Arc<dyn CaseGroupingHook>) -> Self {
         self.case_grouping = hook;
         self
-    }
-
-    /// Get a reference to the prevalence evaluator if configured
-    pub fn prevalence_evaluator(&self) -> Option<&Arc<PrevalenceEvaluator>> {
-        self.prevalence_evaluator.as_ref()
     }
 
     /// Load the global risk weight from system settings (with 5-minute cache)

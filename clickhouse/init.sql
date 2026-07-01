@@ -911,17 +911,6 @@ CREATE TABLE IF NOT EXISTS nanosiem.logs
         if(dest_host != '' AND NOT match(dest_host, '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$'), dictGetOrDefault('nanosiem.domain_prevalence_dict', 'host_count', lower(dest_host), toUInt16(9999)), toUInt16(9999)),
         if(dest_ip != '' AND NOT (startsWith(dest_ip, '10.') OR startsWith(dest_ip, '172.16.') OR startsWith(dest_ip, '192.168.') OR startsWith(dest_ip, '127.')), dictGetOrDefault('nanosiem.ip_prevalence_dict', 'host_count', dest_ip, toUInt16(9999)), toUInt16(9999))
     ) CODEC(T64, LZ4),
-    -- Flexible enrichment output columns
-    `enrichment_label_1` LowCardinality(String) DEFAULT '' CODEC(ZSTD(1)),
-    `enrichment_value_1` String DEFAULT '' CODEC(ZSTD(1)),
-    `enrichment_label_2` LowCardinality(String) DEFAULT '' CODEC(ZSTD(1)),
-    `enrichment_value_2` String DEFAULT '' CODEC(ZSTD(1)),
-    `enrichment_label_3` LowCardinality(String) DEFAULT '' CODEC(ZSTD(1)),
-    `enrichment_value_3` String DEFAULT '' CODEC(ZSTD(1)),
-    `enrichment_label_4` LowCardinality(String) DEFAULT '' CODEC(ZSTD(1)),
-    `enrichment_value_4` String DEFAULT '' CODEC(ZSTD(1)),
-    `enrichment_label_5` LowCardinality(String) DEFAULT '' CODEC(ZSTD(1)),
-    `enrichment_value_5` String DEFAULT '' CODEC(ZSTD(1)),
     INDEX idx_src_ip src_ip TYPE bloom_filter GRANULARITY 4,
     INDEX idx_dest_ip dest_ip TYPE bloom_filter GRANULARITY 4,
     INDEX idx_src_mac src_mac TYPE bloom_filter GRANULARITY 4,
@@ -1009,10 +998,7 @@ CREATE TABLE IF NOT EXISTS nanosiem.logs
     INDEX idx_src_host src_host TYPE bloom_filter GRANULARITY 4,
     INDEX idx_src_host_words lower(src_host) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_dest_host dest_host TYPE bloom_filter GRANULARITY 4,
-    INDEX idx_dest_host_words lower(dest_host) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
-    INDEX idx_enrichment_value_1 enrichment_value_1 TYPE bloom_filter GRANULARITY 4,
-    INDEX idx_enrichment_value_2 enrichment_value_2 TYPE bloom_filter GRANULARITY 4,
-    INDEX idx_enrichment_value_3 enrichment_value_3 TYPE bloom_filter GRANULARITY 4
+    INDEX idx_dest_host_words lower(dest_host) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(timestamp)

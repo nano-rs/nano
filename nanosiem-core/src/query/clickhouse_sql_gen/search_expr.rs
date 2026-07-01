@@ -2216,8 +2216,8 @@ impl ClickHouseSqlGenerator {
         let mut where_clause = format!(
             "{} BETWEEN '{}' AND '{}'",
             sub_gen.time_column(),
-            time_range.start.format("%Y-%m-%d %H:%M:%S%.6f"),
-            time_range.end.format("%Y-%m-%d %H:%M:%S%.6f"),
+            crate::sql_hygiene::format_ch_bound_micros(&time_range.start),
+            crate::sql_hygiene::format_ch_bound_micros(&time_range.end),
         );
         if let Some(expr) = search_expr {
             let where_sql = sub_gen.generate_search_expr(expr)?;

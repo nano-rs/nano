@@ -87,22 +87,8 @@ impl VectorConfigManager {
         Ok(())
     }
 
-    /// Check if a backup exists
-    pub fn has_backup(&self) -> bool {
-        self.backup_dir.exists()
-    }
-
     /// Get the backup directory path
     pub fn backup_dir(&self) -> &Path {
         &self.backup_dir
-    }
-
-    /// Clean up backup directory
-    pub async fn cleanup_backup(&self) -> Result<(), VectorConfigError> {
-        if self.backup_dir.exists() {
-            fs::remove_dir_all(&self.backup_dir).await?;
-            tracing::info!("Cleaned up backup directory: {}", self.backup_dir.display());
-        }
-        Ok(())
     }
 }

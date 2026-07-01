@@ -6,7 +6,7 @@ use axum::{extract::State, Extension, Json};
 use nanosiem_core::auth::permissions;
 
 use super::types::*;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 /// Run on-demand agent enrichment lookup across all installed Deno providers
@@ -34,9 +34,7 @@ pub async fn agent_lookup(
     use nanosiem_enterprise::custom_enrichment::sandbox::SandboxExecutor;
     use std::sync::Arc;
 
-    check_permission(&auth, permissions::ENRICHMENTS_CONFIGURE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: enrichments:configure".to_string())
-    })?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
     // Detect artifact type
     let artifact_type = if let Some(ref hint) = request.artifact_type {

@@ -17,7 +17,7 @@
 mod config;
 mod evaluator;
 mod matching;
-#[cfg(any())]
+#[cfg(test)]
 mod tests;
 
 pub use config::RealtimeConfig;

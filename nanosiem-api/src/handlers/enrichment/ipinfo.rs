@@ -15,7 +15,7 @@ use nanosiem_core::auth::permissions;
 use super::types::*;
 use super::AuditExt;
 use super::{is_sync_in_progress, validate_external_url};
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 /// Configure IPinfo Lite enrichment source
@@ -40,9 +40,7 @@ pub async fn configure_ipinfo(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<ConfigureEnrichmentRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_CONFIGURE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: enrichments:configure".to_string())
-    })?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
     // Validate URL to prevent SSRF attacks (DNS-aware: rejects hostnames that
     // resolve to loopback / private / link-local / metadata addresses).
@@ -99,9 +97,7 @@ pub async fn sync_ipinfo(
     Extension(auth): Extension<AuthContext>,
     Extension(client): Extension<ClientContext>,
 ) -> Result<(StatusCode, Json<AsyncSyncResponse>), ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_CONFIGURE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: enrichments:configure".to_string())
-    })?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
     const SOURCE_ID: &str = "ipinfo_lite";
 
@@ -211,8 +207,7 @@ pub async fn lookup_ip(
     Extension(auth): Extension<AuthContext>,
     Path(ip): Path<String>,
 ) -> Result<Json<IpLookupResponse>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:view".to_string()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_VIEW)?;
 
     // Validate IP format before hitting the database
     if ip.parse::<std::net::IpAddr>().is_err() {

@@ -57,7 +57,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use uuid::Uuid;
 
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 /// Max size of the `doc` field. Beyond this we return 413 — templating cost
@@ -153,8 +153,7 @@ pub async fn dry_resolve(
     // NAN-474: dry-resolve is an authoring-wizard surface, not a read
     // affordance. Gate on MANAGE, consistent with the rest of the playbook
     // authoring API.
-    check_permission(&auth, permissions::PLAYBOOKS_MANAGE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: playbooks:manage".to_string()))?;
+    ensure_permission(&auth, permissions::PLAYBOOKS_MANAGE)?;
 
     // NAN-474: doc size cap. The request body is already deserialized here,
     // so a transport-layer DefaultBodyLimit would still admit a small body —

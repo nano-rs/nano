@@ -2,7 +2,6 @@
 
 //! Parser management module
 
-mod auto_detect;
 mod credential_repository;
 mod repository;
 mod service;
@@ -10,14 +9,9 @@ mod types;
 mod validator;
 mod vector_config;
 
-pub use auto_detect::{
-    AutoDetectError, AutoDetectResult, AutoDetector, DetectionMatch, PatternMatchDetail,
-    DEFAULT_CONFIDENCE_THRESHOLD,
-};
 pub use credential_repository::{CredentialRepository, CredentialRepositoryError};
 pub use repository::{
-    resolve_parser_dispatch_routes, DetectionPatternRepository, ParserLibraryRepository,
-    ParserRepository, ParserRepositoryError,
+    resolve_parser_dispatch_routes, ParserRepository, ParserRepositoryError,
 };
 pub use service::{ParserService, ParserServiceError};
 pub use types::*;

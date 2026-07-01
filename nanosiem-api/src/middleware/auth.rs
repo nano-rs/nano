@@ -16,15 +16,14 @@ use axum::{
     http::{header, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
-    Extension, Json,
+    Json,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use nanosiem_core::audit::ClientContext;
 use nanosiem_core::auth::{
-    audit_actions, ApiKeyService, ApiKeyServiceError, AuditRepository, PermissionResolver,
-    TokenConfig, TokenService,
+    ApiKeyService, ApiKeyServiceError, PermissionResolver, TokenConfig, TokenService,
 };
 
 // AuthContext, AuthErrorResponse, and the check_*/require_* permission helpers
@@ -33,8 +32,8 @@ use nanosiem_core::auth::{
 // dependency. Re-exported here so downstream `use crate::middleware::*`
 // imports continue to resolve.
 pub use nanosiem_api_lib::{
-    check_all_permissions, check_any_permission, check_permission, require_session_auth,
-    require_session_or_self, AuthContext, AuthErrorResponse,
+    check_all_permissions, check_any_permission, check_permission, ensure_permission,
+    require_session_auth, require_session_or_self, AuthContext, AuthErrorResponse,
 };
 
 /// Public endpoints that don't require authentication.
@@ -163,7 +162,6 @@ fn extract_user_agent(request: &Request) -> Option<String> {
 pub struct AuthState {
     pub token_service: Arc<TokenService>,
     pub api_key_service: Option<Arc<ApiKeyService>>,
-    pub audit_repo: Arc<AuditRepository>,
     pub auth_enabled: bool,
     /// Resolves user permissions from PostgreSQL with caching.
     /// Populated after JWT validation to keep permissions out of the token.
@@ -175,13 +173,11 @@ impl AuthState {
     pub fn new(
         token_service: TokenService,
         api_key_service: Option<ApiKeyService>,
-        audit_repo: AuditRepository,
         auth_enabled: bool,
     ) -> Self {
         Self {
             token_service: Arc::new(token_service),
             api_key_service: api_key_service.map(Arc::new),
-            audit_repo: Arc::new(audit_repo),
             auth_enabled,
             permission_resolver: None,
         }
@@ -191,27 +187,24 @@ impl AuthState {
     pub fn from_arcs(
         token_service: Arc<TokenService>,
         api_key_service: Option<Arc<ApiKeyService>>,
-        audit_repo: Arc<AuditRepository>,
         auth_enabled: bool,
     ) -> Self {
         Self {
             token_service,
             api_key_service,
-            audit_repo,
             auth_enabled,
             permission_resolver: None,
         }
     }
 
     /// Create from JWT secret (minimal setup)
-    pub fn from_jwt_secret(jwt_secret: &str, audit_repo: AuditRepository) -> Self {
+    pub fn from_jwt_secret(jwt_secret: &str) -> Self {
         let token_config = TokenConfig::new(jwt_secret.to_string());
         let token_service = TokenService::new(token_config);
 
         Self {
             token_service: Arc::new(token_service),
             api_key_service: None,
-            audit_repo: Arc::new(audit_repo),
             auth_enabled: true,
             permission_resolver: None,
         }
@@ -459,176 +452,17 @@ pub async fn optional_auth_middleware(
     next.run(request).await
 }
 
-/// Permission guard that checks if the user has the required permission
-///
-/// Requirements: 5.2, 8.2, 8.5
-/// - 5.2: Return 403 Forbidden when user lacks required permission
-/// - 8.2: Extract user permissions from JWT and enforce on each endpoint
-/// - 8.5: Log all authorization failures
-pub async fn require_permission(
-    Extension(auth_context): Extension<AuthContext>,
-    State(auth_state): State<AuthState>,
-    request: Request,
-    permission: &'static str,
-) -> Result<(), Response> {
-    if auth_context.has_permission(permission) {
-        return Ok(());
-    }
-
-    // Log authorization failure
-    let connect_info = request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0);
-    let ip_address = extract_ip_address(&request, connect_info.as_ref());
-    let user_agent = extract_user_agent(&request);
-    let path = request.uri().path().to_string();
-
-    let _ = auth_state
-        .audit_repo
-        .log_event(
-            if auth_context.is_api_key {
-                None
-            } else {
-                Some(auth_context.user_id())
-            },
-            auth_context.api_key_id,
-            audit_actions::AUTH_DENIED,
-            Some("endpoint"),
-            None,
-            Some(serde_json::json!({
-                "path": path,
-                "required_permission": permission,
-                "user_permissions": auth_context.claims.permissions,
-            })),
-            ip_address.as_deref(),
-            user_agent.as_deref(),
-            false,
-        )
-        .await;
-
-    Err((
-        StatusCode::FORBIDDEN,
-        Json(AuthErrorResponse::forbidden(&format!(
-            "Missing required permission: {}",
-            permission
-        ))),
-    )
-        .into_response())
-}
+// Authorization denials are audited centrally by the `audit_authz_failures`
+// middleware (NAN-687), which captures every 403 from an authenticated caller
+// and emits an `auth_denied` event to the ClickHouse audit store. The former
+// `require_permission` guard and `PermissionGuard` struct wrote those denials
+// to the now-retired PostgreSQL `audit_logs` table and were unused — removed in
+// NAN-1622.
 
 // `check_permission`, `require_session_auth`, `require_session_or_self`,
 // `check_any_permission`, and `check_all_permissions` were lifted to
 // nanosiem-api-lib (NAN-751). They are re-exported at the top of this
 // module so existing `crate::middleware::*` import sites still resolve.
-
-/// Permission guard with audit logging
-///
-/// Requirements: 5.2, 8.2, 8.5
-/// - 5.2: Return 403 Forbidden when user lacks required permission
-/// - 8.2: Extract user permissions from JWT and enforce on each endpoint
-/// - 8.5: Log all authorization failures with user ID, endpoint, and required permission
-pub struct PermissionGuard {
-    audit_repo: Arc<AuditRepository>,
-}
-
-impl PermissionGuard {
-    pub fn new(audit_repo: Arc<AuditRepository>) -> Self {
-        Self { audit_repo }
-    }
-
-    /// Check permission and log failure if denied
-    pub async fn require(
-        &self,
-        auth: &AuthContext,
-        permission: &str,
-        endpoint: &str,
-        ip_address: Option<&str>,
-        user_agent: Option<&str>,
-    ) -> Result<(), (StatusCode, Json<AuthErrorResponse>)> {
-        if auth.has_permission(permission) {
-            return Ok(());
-        }
-
-        // Log authorization failure (Requirements: 8.5)
-        let _ = self
-            .audit_repo
-            .log_event(
-                if auth.is_api_key {
-                    None
-                } else {
-                    Some(auth.user_id())
-                },
-                auth.api_key_id,
-                audit_actions::AUTH_DENIED,
-                Some("endpoint"),
-                None,
-                Some(serde_json::json!({
-                    "endpoint": endpoint,
-                    "required_permission": permission,
-                    "user_permissions": auth.claims.permissions,
-                })),
-                ip_address,
-                user_agent,
-                false,
-            )
-            .await;
-
-        Err((
-            StatusCode::FORBIDDEN,
-            Json(AuthErrorResponse::forbidden(&format!(
-                "Missing required permission: {}",
-                permission
-            ))),
-        ))
-    }
-
-    /// Check any of multiple permissions and log failure if denied
-    pub async fn require_any(
-        &self,
-        auth: &AuthContext,
-        permissions: &[&str],
-        endpoint: &str,
-        ip_address: Option<&str>,
-        user_agent: Option<&str>,
-    ) -> Result<(), (StatusCode, Json<AuthErrorResponse>)> {
-        if auth.has_any_permission(permissions) {
-            return Ok(());
-        }
-
-        // Log authorization failure
-        let _ = self
-            .audit_repo
-            .log_event(
-                if auth.is_api_key {
-                    None
-                } else {
-                    Some(auth.user_id())
-                },
-                auth.api_key_id,
-                audit_actions::AUTH_DENIED,
-                Some("endpoint"),
-                None,
-                Some(serde_json::json!({
-                    "endpoint": endpoint,
-                    "required_permissions": permissions,
-                    "user_permissions": auth.claims.permissions,
-                })),
-                ip_address,
-                user_agent,
-                false,
-            )
-            .await;
-
-        Err((
-            StatusCode::FORBIDDEN,
-            Json(AuthErrorResponse::forbidden(&format!(
-                "Missing required permission: one of {:?}",
-                permissions
-            ))),
-        ))
-    }
-}
 
 /// Macro to create a permission guard layer for a specific permission
 ///

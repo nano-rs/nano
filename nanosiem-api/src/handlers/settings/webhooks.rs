@@ -13,7 +13,7 @@ use serde::Deserialize;
 
 use crate::error::{ApiError, ErrorResponse};
 use crate::handlers::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::state::AppState;
 
 // ============================================================================
@@ -35,8 +35,7 @@ pub async fn list_webhooks(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<nanosiem_core::webhooks::WebhookResponse>>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_WEBHOOKS)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:webhooks".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_WEBHOOKS)?;
 
     let repo = nanosiem_core::webhooks::WebhookRepository::new(state.pool.clone());
     let webhooks = repo
@@ -69,8 +68,7 @@ pub async fn create_webhook(
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<nanosiem_core::webhooks::CreateWebhookRequest>,
 ) -> Result<Json<nanosiem_core::webhooks::WebhookResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_WEBHOOKS)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:webhooks".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_WEBHOOKS)?;
 
     nanosiem_core::webhooks::WebhookService::validate_url(&request.url)
         .await
@@ -116,8 +114,7 @@ pub async fn get_webhook(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<nanosiem_core::webhooks::WebhookResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_WEBHOOKS)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:webhooks".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_WEBHOOKS)?;
 
     let repo = nanosiem_core::webhooks::WebhookRepository::new(state.pool.clone());
     let webhook = repo.get(*id).await.map_err(|e| match e {
@@ -152,8 +149,7 @@ pub async fn update_webhook(
     Path(id): Path<TypeIdParam>,
     Json(request): Json<nanosiem_core::webhooks::UpdateWebhookRequest>,
 ) -> Result<Json<nanosiem_core::webhooks::WebhookResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_WEBHOOKS)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:webhooks".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_WEBHOOKS)?;
 
     if let Some(ref url) = request.url {
         nanosiem_core::webhooks::WebhookService::validate_url(url)
@@ -203,8 +199,7 @@ pub async fn delete_webhook(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_WEBHOOKS)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:webhooks".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_WEBHOOKS)?;
 
     // Get name for audit before deleting
     let repo = nanosiem_core::webhooks::WebhookRepository::new(state.pool.clone());
@@ -250,8 +245,7 @@ pub async fn test_webhook(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<nanosiem_core::webhooks::WebhookTestResult>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_WEBHOOKS)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:webhooks".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_WEBHOOKS)?;
 
     let repo = nanosiem_core::webhooks::WebhookRepository::new(state.pool.clone());
     let svc = nanosiem_core::webhooks::WebhookService::new(repo);
@@ -294,8 +288,7 @@ pub async fn list_webhook_deliveries(
     Path(id): Path<TypeIdParam>,
     axum::extract::Query(params): axum::extract::Query<WebhookDeliveryParams>,
 ) -> Result<Json<Vec<nanosiem_core::webhooks::WebhookDeliveryLog>>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_WEBHOOKS)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:webhooks".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_WEBHOOKS)?;
 
     let repo = nanosiem_core::webhooks::WebhookRepository::new(state.pool.clone());
     let limit = params.limit.unwrap_or(50).max(1).min(200);

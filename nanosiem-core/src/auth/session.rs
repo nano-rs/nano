@@ -16,8 +16,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::repository::{
-    audit_actions, AuditRepository, AuditRepositoryError, SessionRepository,
-    SessionRepositoryError, UserRepository, UserRepositoryError,
+    SessionRepository, SessionRepositoryError, UserRepository, UserRepositoryError,
 };
 use super::types::{config_defaults, Session, SessionResponse};
 
@@ -66,12 +65,6 @@ impl From<UserRepositoryError> for SessionError {
     }
 }
 
-impl From<AuditRepositoryError> for SessionError {
-    fn from(err: AuditRepositoryError) -> Self {
-        SessionError::DatabaseError(err.to_string())
-    }
-}
-
 /// Configuration for the session service
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -96,7 +89,6 @@ impl Default for SessionConfig {
 pub struct SessionService {
     session_repo: SessionRepository,
     user_repo: UserRepository,
-    audit_repo: AuditRepository,
     config: SessionConfig,
 }
 
@@ -105,13 +97,11 @@ impl SessionService {
     pub fn new(
         session_repo: SessionRepository,
         user_repo: UserRepository,
-        audit_repo: AuditRepository,
         config: SessionConfig,
     ) -> Self {
         Self {
             session_repo,
             user_repo,
-            audit_repo,
             config,
         }
     }
@@ -147,25 +137,6 @@ impl SessionService {
             )
             .await?;
 
-        // Log session creation
-        let _ = self
-            .audit_repo
-            .log_event(
-                Some(user_id),
-                None,
-                audit_actions::SESSION_CREATE,
-                Some("session"),
-                Some(session.id),
-                Some(serde_json::json!({
-                    "ip_address": ip_address,
-                    "user_agent": user_agent
-                })),
-                ip_address,
-                user_agent,
-                true,
-            )
-            .await;
-
         Ok(session)
     }
 
@@ -186,8 +157,8 @@ impl SessionService {
         session_id: Uuid,
         requesting_user_id: Uuid,
         is_admin: bool,
-        ip_address: Option<&str>,
-        user_agent: Option<&str>,
+        _ip_address: Option<&str>,
+        _user_agent: Option<&str>,
     ) -> Result<(), SessionError> {
         // Get the session to check ownership
         let session = self.session_repo.get_session_by_id(session_id).await?;
@@ -195,48 +166,11 @@ impl SessionService {
         // Check permission: users can only terminate their own sessions unless admin
         // Requirements: 7.4 - Allow users to view and terminate their own sessions
         if session.user_id != requesting_user_id && !is_admin {
-            let _ = self
-                .audit_repo
-                .log_event(
-                    Some(requesting_user_id),
-                    None,
-                    audit_actions::SESSION_TERMINATE,
-                    Some("session"),
-                    Some(session_id),
-                    Some(serde_json::json!({
-                        "reason": "permission_denied",
-                        "target_user_id": session.user_id
-                    })),
-                    ip_address,
-                    user_agent,
-                    false,
-                )
-                .await;
-
             return Err(SessionError::PermissionDenied);
         }
 
         // Delete the session (this invalidates the refresh token)
         self.session_repo.delete_session(session_id).await?;
-
-        // Log session termination
-        let _ = self
-            .audit_repo
-            .log_event(
-                Some(requesting_user_id),
-                None,
-                audit_actions::SESSION_TERMINATE,
-                Some("session"),
-                Some(session_id),
-                Some(serde_json::json!({
-                    "target_user_id": session.user_id,
-                    "terminated_by_admin": is_admin && session.user_id != requesting_user_id
-                })),
-                ip_address,
-                user_agent,
-                true,
-            )
-            .await;
 
         Ok(())
     }
@@ -315,52 +249,16 @@ impl SessionService {
         user_id: Uuid,
         requesting_user_id: Uuid,
         is_admin: bool,
-        ip_address: Option<&str>,
-        user_agent: Option<&str>,
+        _ip_address: Option<&str>,
+        _user_agent: Option<&str>,
     ) -> Result<u64, SessionError> {
         // Check permission: users can only terminate their own sessions unless admin
         if user_id != requesting_user_id && !is_admin {
-            let _ = self
-                .audit_repo
-                .log_event(
-                    Some(requesting_user_id),
-                    None,
-                    audit_actions::SESSION_TERMINATE_ALL,
-                    Some("user"),
-                    Some(user_id),
-                    Some(serde_json::json!({
-                        "reason": "permission_denied"
-                    })),
-                    ip_address,
-                    user_agent,
-                    false,
-                )
-                .await;
-
             return Err(SessionError::PermissionDenied);
         }
 
         // Delete all sessions for the user
         let count = self.session_repo.delete_user_sessions(user_id).await?;
-
-        // Log the action
-        let _ = self
-            .audit_repo
-            .log_event(
-                Some(requesting_user_id),
-                None,
-                audit_actions::SESSION_TERMINATE_ALL,
-                Some("user"),
-                Some(user_id),
-                Some(serde_json::json!({
-                    "sessions_terminated": count,
-                    "terminated_by_admin": is_admin && user_id != requesting_user_id
-                })),
-                ip_address,
-                user_agent,
-                true,
-            )
-            .await;
 
         Ok(count)
     }
@@ -375,26 +273,6 @@ impl SessionService {
     /// Returns the number of sessions that were cleaned up.
     pub async fn cleanup_expired(&self) -> Result<u64, SessionError> {
         let count = self.session_repo.cleanup_expired_sessions().await?;
-
-        if count > 0 {
-            // Log cleanup action (no user context since this is a system action)
-            let _ = self
-                .audit_repo
-                .log_event(
-                    None,
-                    None,
-                    audit_actions::SESSION_CLEANUP,
-                    Some("session"),
-                    None,
-                    Some(serde_json::json!({
-                        "sessions_cleaned": count
-                    })),
-                    None,
-                    Some("system/session-cleanup"),
-                    true,
-                )
-                .await;
-        }
 
         Ok(count)
     }
@@ -450,18 +328,6 @@ impl SessionService {
     pub async fn touch_session(&self, session_id: Uuid) -> Result<(), SessionError> {
         self.session_repo
             .update_last_used(session_id)
-            .await
-            .map_err(|e| e.into())
-    }
-
-    /// Get session by refresh token
-    ///
-    /// Parameters:
-    /// - `refresh_token`: The refresh token to look up
-    pub async fn get_session_by_token(&self, refresh_token: &str) -> Result<Session, SessionError> {
-        let token_hash = hash_token(refresh_token);
-        self.session_repo
-            .get_session_by_token_hash(&token_hash)
             .await
             .map_err(|e| e.into())
     }

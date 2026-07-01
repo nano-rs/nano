@@ -196,10 +196,7 @@ pub async fn health_check_detailed(
     request_id: Option<Extension<RequestId>>,
 ) -> Result<Json<DualHealthResponse>, crate::error::ApiError> {
     // L2: Restrict detailed health to admin role — exposes internal service URLs
-    crate::middleware::check_permission(&auth, nanosiem_core::auth::permissions::SETTINGS_VIEW)
-        .map_err(|_| {
-            crate::error::ApiError::Forbidden("Missing permission: settings:view".to_string())
-        })?;
+    crate::middleware::ensure_permission(&auth, nanosiem_core::auth::permissions::SETTINGS_VIEW)?;
 
     // Get service URLs from environment or use defaults
     let ingest_url = std::env::var("INGEST_SERVICE_URL")

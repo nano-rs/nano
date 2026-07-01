@@ -2,7 +2,7 @@
 
 //! System metrics and dashboard data handlers
 
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 use axum::{
     extract::{Query, State},
@@ -83,8 +83,7 @@ pub async fn get_system_overview(
     Extension(auth): Extension<AuthContext>,
     Query(params): Query<SystemMetricsQuery>,
 ) -> Result<Json<SystemOverview>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:view".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_VIEW)?;
 
     let hours = params.hours.unwrap_or(24);
     let now = Utc::now();
@@ -371,8 +370,7 @@ pub async fn get_system_config(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<SystemConfig>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:view".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_VIEW)?;
 
     let is_managed = state.config.deployment_mode.is_managed();
 

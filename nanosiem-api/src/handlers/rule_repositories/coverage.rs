@@ -11,7 +11,7 @@ use super::get_rule_repo_service;
 use super::types::{ConvertSigmaRequest, ConvertSigmaResponse, CoverageQuery};
 #[cfg(feature = "enterprise")]
 use super::types::FieldMappingResponse;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 /// Get coverage analysis
@@ -31,9 +31,7 @@ pub async fn get_coverage(
     Extension(auth): Extension<AuthContext>,
     Query(query): Query<CoverageQuery>,
 ) -> Result<Json<CoverageAnalysis>, ApiError> {
-    check_permission(&auth, permissions::RULE_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: rule_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::RULE_REPOSITORIES_VIEW)?;
 
     let service = get_rule_repo_service(&state)?;
 
@@ -64,9 +62,7 @@ pub async fn refresh_coverage(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<(), ApiError> {
-    check_permission(&auth, permissions::RULE_REPOSITORIES_SYNC).map_err(|_| {
-        ApiError::Forbidden("Missing permission: rule_repositories:sync".to_string())
-    })?;
+    ensure_permission(&auth, permissions::RULE_REPOSITORIES_SYNC)?;
 
     let service = get_rule_repo_service(&state)?;
     service.refresh_coverage_data().await?;
@@ -93,9 +89,7 @@ pub async fn convert_sigma(
     Extension(auth): Extension<AuthContext>,
     Json(req): Json<ConvertSigmaRequest>,
 ) -> Result<Json<ConvertSigmaResponse>, ApiError> {
-    check_permission(&auth, permissions::RULE_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: rule_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::RULE_REPOSITORIES_VIEW)?;
 
     // AI credit rate limiting
     let cost = {
@@ -182,9 +176,7 @@ pub async fn convert_sigma(
     Extension(auth): Extension<AuthContext>,
     Json(_req): Json<ConvertSigmaRequest>,
 ) -> Result<Json<ConvertSigmaResponse>, ApiError> {
-    check_permission(&auth, permissions::RULE_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: rule_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::RULE_REPOSITORIES_VIEW)?;
     Err(ApiError::BadRequest(
         "Sigma → nPL conversion requires the enterprise build. \
         Provide `custom_npl` on the import endpoint instead."

@@ -15,14 +15,8 @@ pub mod types;
 pub use repository::{SourceConfigRepository, SourceConfigRepositoryError};
 pub use service::{SourceConfigService, SourceConfigServiceError};
 pub use types::{
-    AwsS3ConnectionConfig,
     // Deployment types
-    DeploymentAction,
     DeploymentResult,
-    DeploymentStatus,
-    GcpPubSubConnectionConfig,
-    // Connection configs
-    KafkaConnectionConfig,
     ListParams,
     MatchFieldPreset,
     MatchType,
@@ -36,9 +30,6 @@ pub use types::{
     // Core types
     SourceConfiguration,
     SourceConfigurationWithRules,
-    SplunkHecConnectionConfig,
-    TlsConfig,
     UpdateRoutingRule,
     UpdateSourceConfiguration,
-    VectorConnectionConfig,
 };

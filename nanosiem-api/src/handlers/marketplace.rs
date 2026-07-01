@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 
 use crate::handlers::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 // =============================================================================
@@ -127,8 +127,7 @@ pub async fn list_catalog(
     Extension(auth): Extension<AuthContext>,
     Query(filter): Query<CatalogFilter>,
 ) -> Result<Json<ListCatalogResponse>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:view".to_string()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_VIEW)?;
 
     let repo = MarketplaceRepository::new(state.pool.clone());
     let entries = repo.list_catalog(&filter).await?;
@@ -158,8 +157,7 @@ pub async fn get_catalog_entry(
     Extension(auth): Extension<AuthContext>,
     Path(slug): Path<String>,
 ) -> Result<Json<MarketplaceCatalogEntry>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:view".to_string()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_VIEW)?;
 
     let repo = MarketplaceRepository::new(state.pool.clone());
     let entry = repo.get_catalog_entry(&slug).await?;
@@ -187,9 +185,7 @@ pub async fn install_enrichment(
     Path(slug): Path<String>,
     Json(request): Json<InstallRequest>,
 ) -> Result<Json<MarketplaceCatalogEntry>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_CONFIGURE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: enrichments:configure".to_string())
-    })?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
     let service = MarketplaceInstallService::new(state.pool.clone());
     let entry = service.install(&slug, &request, auth.user_id()).await?;
@@ -224,9 +220,7 @@ pub async fn uninstall_enrichment(
     Extension(client): Extension<ClientContext>,
     Path(slug): Path<String>,
 ) -> Result<Json<MarketplaceCatalogEntry>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_CONFIGURE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: enrichments:configure".to_string())
-    })?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
     let service = MarketplaceInstallService::new(state.pool.clone());
     let entry = service.uninstall(&slug).await?;
@@ -263,9 +257,7 @@ pub async fn configure_enrichment(
     Path(slug): Path<String>,
     Json(request): Json<ConfigureRequest>,
 ) -> Result<Json<MarketplaceCatalogEntry>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_CONFIGURE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: enrichments:configure".to_string())
-    })?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
     let repo = MarketplaceRepository::new(state.pool.clone());
 
@@ -356,9 +348,7 @@ pub async fn update_enrichment(
     Extension(client): Extension<ClientContext>,
     Path(slug): Path<String>,
 ) -> Result<Json<MarketplaceCatalogEntry>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_CONFIGURE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: enrichments:configure".to_string())
-    })?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
     let service = MarketplaceInstallService::new(state.pool.clone());
     let entry = service.update(&slug).await?;
@@ -394,9 +384,7 @@ pub async fn sync_enrichment(
     Extension(client): Extension<ClientContext>,
     Path(slug): Path<String>,
 ) -> Result<Json<MessageResponse>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_CONFIGURE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: enrichments:configure".to_string())
-    })?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
     // Capture audit fields before auth is potentially moved
     let actor_id = auth.user_id();
@@ -540,8 +528,7 @@ pub async fn get_enrichment_status(
     Extension(auth): Extension<AuthContext>,
     Path(slug): Path<String>,
 ) -> Result<Json<EnrichmentStatus>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:view".to_string()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_VIEW)?;
 
     let repo = MarketplaceRepository::new(state.pool.clone());
     let entry = repo.get_catalog_entry(&slug).await?;
@@ -575,8 +562,7 @@ pub async fn export_enrichment(
     Extension(auth): Extension<AuthContext>,
     Path(slug): Path<String>,
 ) -> Result<Json<ExportResponse>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:view".to_string()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_VIEW)?;
 
     let repo = MarketplaceRepository::new(state.pool.clone());
     let entry = repo.get_catalog_entry(&slug).await?;
@@ -645,8 +631,7 @@ pub async fn list_repos(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<ListReposResponse>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:view".to_string()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_VIEW)?;
 
     let repo = MarketplaceRepository::new(state.pool.clone());
     let repos = repo.list_repos().await?;
@@ -671,9 +656,7 @@ pub async fn create_repo(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<CreateMarketplaceRepo>,
 ) -> Result<Json<EnrichmentMarketplaceRepo>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_CONFIGURE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: enrichments:configure".to_string())
-    })?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
     // Air-gap guard: a GitHub-backed repo only makes sense with outbound
     // internet (the create path validates the URL with a live DNS/SSRF check
@@ -725,9 +708,7 @@ pub async fn update_repo(
     Path(id): Path<TypeIdParam>,
     Json(request): Json<UpdateMarketplaceRepo>,
 ) -> Result<Json<EnrichmentMarketplaceRepo>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_CONFIGURE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: enrichments:configure".to_string())
-    })?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
     let repo = MarketplaceRepository::new(state.pool.clone());
     let updated = repo.update_repo(*id, &request).await?;
@@ -761,9 +742,7 @@ pub async fn delete_repo(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<MessageResponse>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_CONFIGURE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: enrichments:configure".to_string())
-    })?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
     let repo = MarketplaceRepository::new(state.pool.clone());
     repo.delete_repo(*id).await?;
@@ -790,9 +769,7 @@ pub async fn sync_repo(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<MessageResponse>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_CONFIGURE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: enrichments:configure".to_string())
-    })?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
     // Air-gap guard: a repo sync clones from GitHub — refuse before egress.
     if state.config.airgap {
@@ -836,8 +813,7 @@ pub async fn browse_repo(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<BrowseRepoResponse>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:view".to_string()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_VIEW)?;
 
     let sync_service = MarketplaceSyncService::new(state.pool.clone());
     let entries = sync_service.browse_repo(*id).await?;
@@ -896,8 +872,7 @@ pub async fn preview_enrichment(
     Path(slug): Path<String>,
     Json(req): Json<PreviewRequest>,
 ) -> Result<Json<PreviewResponse>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:view".to_string()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_VIEW)?;
 
     let repo = MarketplaceRepository::new(state.pool.clone());
     let entry = repo.get_catalog_entry(&slug).await?;
@@ -1055,8 +1030,7 @@ pub async fn get_coverage(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<MarketplaceCoverage>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:view".to_string()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_VIEW)?;
 
     let svc = build_coverage_service(&state);
     let coverage = svc.compute().await?;
@@ -1081,8 +1055,7 @@ pub async fn refresh_coverage(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<MarketplaceCoverage>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:view".to_string()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_VIEW)?;
 
     // Drop the cached entry so concurrent in-flight readers also miss and
     // recompute (last write wins — see cache.rs concurrency note).

@@ -70,8 +70,7 @@ pub async fn create_suppression(
     Extension(auth): Extension<AuthContext>,
     Json(req): Json<CreateSuppressionRequest>,
 ) -> Result<(StatusCode, Json<FindingSuppression>), ApiError> {
-    crate::middleware::check_permission(&auth, nanosiem_core::auth::permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    crate::middleware::ensure_permission(&auth, nanosiem_core::auth::permissions::SETTINGS_SYSTEM)?;
 
     let title = req.title.trim();
     let reason = req.reason.trim();
@@ -153,8 +152,7 @@ pub async fn deactivate_suppression(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<FindingSuppression>, ApiError> {
-    crate::middleware::check_permission(&auth, nanosiem_core::auth::permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    crate::middleware::ensure_permission(&auth, nanosiem_core::auth::permissions::SETTINGS_SYSTEM)?;
 
     let repo = SuppressionRepository::new(state.pool.clone());
     let suppression = repo

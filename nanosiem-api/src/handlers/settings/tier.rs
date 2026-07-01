@@ -10,7 +10,7 @@ use utoipa::ToSchema;
 
 use crate::error::{ApiError, ErrorResponse};
 use crate::handlers::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::state::AppState;
 
 // ============================================================================
@@ -106,8 +106,7 @@ pub async fn get_tier_status(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<TierStatusResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let tier_settings = nanosiem_core::TierSettings::new(state.pool.clone());
     let limits = tier_settings.get_tier_limits().await?;
@@ -188,8 +187,7 @@ pub async fn set_tier(
     Extension(client): Extension<ClientContext>,
     Json(req): Json<SetTierRequest>,
 ) -> Result<Json<nanosiem_core::TierLimits>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let tier: nanosiem_core::OrganizationTier = req
         .tier
@@ -232,8 +230,7 @@ pub async fn update_tier_limits(
     Extension(client): Extension<ClientContext>,
     Json(req): Json<nanosiem_core::UpdateTierLimits>,
 ) -> Result<Json<nanosiem_core::TierLimits>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let tier_settings = nanosiem_core::TierSettings::new(state.pool.clone());
     let limits = tier_settings.update_limits(req).await?;
@@ -270,8 +267,7 @@ pub async fn get_usage_history(
     Extension(auth): Extension<AuthContext>,
     axum::extract::Query(query): axum::extract::Query<UsageRangeQuery>,
 ) -> Result<Json<Vec<nanosiem_core::DailyUsage>>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let today = chrono::Utc::now().date_naive();
     let from = query
@@ -305,8 +301,7 @@ pub async fn get_ai_usage_detail(
 ) -> Result<Json<AiUsageDetailResponse>, ApiError> {
     use chrono::Datelike;
 
-    check_permission(&auth, permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let today = chrono::Utc::now().date_naive();
     let first_of_month = today.with_day(1).unwrap_or(today);

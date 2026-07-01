@@ -72,6 +72,7 @@ pub mod search;
 pub mod settings;
 pub mod siem_health;
 pub mod source_configs;
+pub mod sql_hygiene;
 pub mod telemetry;
 pub mod timezone;
 pub mod tuning;
@@ -155,13 +156,12 @@ pub use audit::{
 pub use auth::{
     permissions,
     repository::{
-        audit_actions, AuditRepository, AuditRepositoryError, GroupRepository,
-        GroupRepositoryError, RoleRepository, RoleRepositoryError, SessionRepository,
-        SessionRepositoryError, UserRepository, UserRepositoryError,
+        GroupRepository, GroupRepositoryError, RoleRepository, RoleRepositoryError,
+        SessionRepository, SessionRepositoryError, UserRepository, UserRepositoryError,
     },
     types::{
         builtin_groups, builtin_roles, config_defaults, config_keys, ApiKey, ApiKeyCreated,
-        AuditLog, AuditLogWithNames, AuthResponse, CreateApiKeyRequest,
+        AuthResponse, CreateApiKeyRequest,
         CreateGroupRequest, CreateOidcProviderRequest, CreateRoleRequest, CreateUserRequest, Group,
         GroupSummary, GroupWithDetails, LoginRequest, OidcGroupMapping, OidcProvider,
         PasswordResetCompletion, PasswordResetRequest, Permission, RefreshTokenRequest, Role,
@@ -202,7 +202,7 @@ pub use gdpr::{
     AnonymizationError, AnonymizationPreview, AnonymizationRequest, AnonymizationService,
     AnonymizationStatus, IdentifierType,
 };
-pub use ingestion::{LogParser, ParsedLog};
+pub use ingestion::ParsedLog;
 pub use inputlookup::{
     InputLookupConfig, InputLookupError, InputLookupFormat, InputLookupParams, InputLookupService,
     SsrfConfig, SsrfError, SsrfValidator, UrlTemplate,
@@ -223,14 +223,12 @@ pub use log_telemetry::{
     SourceTypeStats as LogTelemetrySourceTypeStats,
 };
 pub use log_sources::{
-    AiSuggestions, GcpPubSubSourceConfig as LogSourceGcpConfig,
-    HealthStatus as LogSourceHealthStatus, HistoryPoint, IngestionTrend, KafkaSourceConfig,
+    AiSuggestions, HealthStatus as LogSourceHealthStatus, HistoryPoint, IngestionTrend,
     ListParams as LogSourceListParams, LogSource, LogSourceCategory, LogSourceDeployment,
     LogSourceHealth, LogSourceHealthSummary, LogSourceRepository, LogSourceRepositoryError,
     LogSourceService, LogSourceServiceError, LogSourceVersion, LogSourceVersionError,
-    LogSourceVersionRepository, LogSourceWithDraftStatus, NewLogSource,
-    S3SourceConfig as LogSourceS3Config, SourceType, UpdateLogSource, VectorSourceConfig,
-    WizardEntry, WizardProgressEvent, WizardSession, WizardStep,
+    LogSourceVersionRepository, LogSourceWithDraftStatus, NewLogSource, SourceType,
+    UpdateLogSource, WizardEntry, WizardProgressEvent, WizardSession, WizardStep,
 };
 pub use lookup::{
     sanitize_identifier, sanitize_identifiers, BatchLookupQuery, BatchLookupResult,
@@ -275,18 +273,16 @@ pub use playbooks::{
     WhenClause, WhenOp, WhenResult,
 };
 pub use parsers::{
-    AutoDetectError, AutoDetectResult, AutoDetector, AwsS3Credentials, CloudCredential,
-    CloudProvider, CreateCloudCredential, CredentialRepository, CredentialRepositoryError,
-    DeploymentAction, DeploymentResult, DeploymentStatus, DetectionMatch, GcpPubSubCredentials,
-    GcpPubSubSourceConfig, KafkaCredentials, KafkaSourceConfig as ParserKafkaSourceConfig,
-    NewParser, Parser, ParserCategory, ParserDeployment, ParserLibraryEntry,
-    ParserLibraryRepository, ParserService, ParserServiceError, ParserTestResult,
-    PatternMatchDetail, S3SourceConfig, UpdateCloudCredential, UpdateParser, ValidationResult,
-    VrlValidationResult, DEFAULT_CONFIDENCE_THRESHOLD,
+    AwsS3Credentials, CloudCredential, CloudProvider, CreateCloudCredential, CredentialRepository,
+    CredentialRepositoryError, DeploymentAction, DeploymentResult, DeploymentStatus,
+    GcpPubSubCredentials, GcpPubSubSourceConfig, KafkaCredentials,
+    KafkaSourceConfig as ParserKafkaSourceConfig, NewParser, Parser, ParserCategory,
+    ParserDeployment, ParserService, ParserServiceError, ParserTestResult, S3SourceConfig,
+    UpdateCloudCredential, UpdateParser, ValidationResult, VrlValidationResult,
 };
 pub use prevalence::{
     ArtifactType, BulkPrevalenceRequest, ExportFormat, PrevalenceConfig, PrevalenceData,
-    PrevalenceError, PrevalenceFilter, PrevalenceRepository, PrevalenceScatterData,
+    PrevalenceError, PrevalenceRepository, PrevalenceScatterData,
     PrevalenceScatterPoint, PrevalenceService, TimeWindow, MAX_BULK_ARTIFACTS,
 };
 pub use query::{collect_derived_fields, parse_query, ParseError, PrettyPrint, Query};
@@ -330,13 +326,11 @@ pub use settings::{
     UpdateTierLimits, AI_CREDIT_FULL, AI_CREDIT_LITE,
 };
 pub use source_configs::{
-    AwsS3ConnectionConfig, DeploymentResult as SourceConfigDeploymentResult,
-    GcpPubSubConnectionConfig, KafkaConnectionConfig, ListParams as SourceConfigListParams,
+    DeploymentResult as SourceConfigDeploymentResult, ListParams as SourceConfigListParams,
     MatchType, NewRoutingRule, NewSourceConfiguration, RoutingRule, SourceConfigDeployment,
     SourceConfigRepository, SourceConfigRepositoryError, SourceConfigService,
     SourceConfigServiceError, SourceConfigType, SourceConfiguration, SourceConfigurationWithRules,
-    SplunkHecConnectionConfig, TlsConfig as SourceConfigTlsConfig, UpdateRoutingRule,
-    UpdateSourceConfiguration, VectorConnectionConfig,
+    UpdateRoutingRule, UpdateSourceConfiguration,
 };
 pub use tuning::{
     AlertPattern, Baseline, ComparisonMetrics, Notification, NotificationType, PatternChange,
@@ -347,6 +341,6 @@ pub use upload::{
     ColumnInfo, ColumnType, FileFormat, FileParser, LookupMode, ParseError as UploadParseError,
     ParseResult as UploadParseResult, ParsedRecord, ParserConfig as UploadParserConfig,
     PreviewResult, UploadDestination, UploadError, UploadFilter, UploadRecord, UploadRepository,
-    UploadRepositoryError, UploadRequest, UploadResult, UploadService, UploadStats, UploadStatus,
+    UploadRepositoryError, UploadRequest, UploadResult, UploadService, UploadStatus,
     DEFAULT_PREVIEW_ROWS, MAX_FILE_SIZE,
 };

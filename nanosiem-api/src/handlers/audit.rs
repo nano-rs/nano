@@ -5,7 +5,7 @@
 //! Requirements: 9.5, 11.6
 //!
 //! This module provides handlers for:
-//! - query_audit_logs() - Query audit logs with filtering (ClickHouse primary, PostgreSQL fallback)
+//! - query_audit_logs() - Query audit logs with filtering (ClickHouse)
 //! - export_audit_logs() - Export audit logs to CSV/JSON
 //! - get_action_types() - Get distinct action types
 //! - get_resource_types() - Get distinct resource types (now "sources")
@@ -24,7 +24,7 @@ use nanosiem_core::audit::{
     AuditEvent, AuditSource, ClickHouseAuditEntry, ClickHouseAuditQuery, ClientContext,
     AUDIT_LOGS_EXPORTED,
 };
-use nanosiem_core::auth::{permissions, AuditLogWithNames, AuditRepositoryError};
+use nanosiem_core::auth::permissions;
 
 use crate::handlers::AuditExt;
 use crate::middleware::{check_permission, AuthContext};
@@ -43,17 +43,6 @@ impl AuditApiError {
             error: error.to_string(),
             message: message.to_string(),
         }
-    }
-
-    pub fn from_repo_error(err: &AuditRepositoryError) -> (StatusCode, Self) {
-        let (status, error_type) = match err {
-            AuditRepositoryError::NotFound(_) => (StatusCode::NOT_FOUND, "audit_log_not_found"),
-            AuditRepositoryError::DatabaseError(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "database_error")
-            }
-        };
-
-        (status, Self::new(error_type, &err.to_string()))
     }
 }
 
@@ -83,7 +72,7 @@ pub struct AuditLogListResponse {
     pub offset: i64,
 }
 
-/// Unified audit log entry (works for both ClickHouse and PostgreSQL sources)
+/// Audit log entry (sourced from the ClickHouse audit store)
 ///
 /// `api_key_id` / `api_key_name` are populated when the action was performed
 /// via an API key. `user_id` / `user_name` then identify the *owning* user of
@@ -135,34 +124,9 @@ impl From<ClickHouseAuditEntry> for AuditLogEntry {
     }
 }
 
-impl From<AuditLogWithNames> for AuditLogEntry {
-    fn from(e: AuditLogWithNames) -> Self {
-        let api_key_id = e.log.api_key_id.map(|u| u.to_string());
-        let api_key_name = e.api_key_name.clone();
-        Self {
-            id: e.log.id.to_string(),
-            timestamp: e.log.timestamp,
-            user_id: e.log.user_id.map(|u| u.to_string()),
-            user_name: e.user_name.or(e.user_email),
-            action: Some(e.log.action),
-            source: None, // PostgreSQL audit_logs don't have source
-            resource_type: e.log.resource_type,
-            resource_id: e.log.resource_id.map(|u| u.to_string()),
-            resource_name: None,
-            ip_address: e.log.ip_address,
-            user_agent: e.log.user_agent,
-            success: e.log.success,
-            message: None,
-            details: e.log.details,
-            api_key_id,
-            api_key_name,
-        }
-    }
-}
-
 /// Query audit logs with filtering
 ///
-/// Queries ClickHouse (primary) with PostgreSQL fallback.
+/// Queries the ClickHouse audit store (`source_type='audit'`).
 ///
 /// SECURITY: Non-admin users can only view their own audit logs.
 /// Admin users (with settings:system permission) can view all audit logs.
@@ -195,8 +159,8 @@ pub async fn query_audit_logs(
         Some(auth.user_id())
     };
 
-    let limit = query.limit.unwrap_or(50).min(1000);
-    let offset = query.offset.unwrap_or(0);
+    let (limit, offset) =
+        nanosiem_api_lib::Pagination::new(query.limit, query.offset).resolved_capped(50, 1000);
 
     let ch_query = ClickHouseAuditQuery {
         actor_id: effective_user_id,
@@ -431,7 +395,7 @@ fn escape_csv_field(field: &str) -> String {
 
 /// Get available action types
 ///
-/// Returns distinct actions from ClickHouse (or PostgreSQL fallback).
+/// Returns distinct actions from the ClickHouse audit store.
 ///
 /// GET /api/audit/actions
 #[utoipa::path(
@@ -467,7 +431,7 @@ pub async fn get_action_types(
 
 /// Get available source types (audit subsystems)
 ///
-/// Returns distinct source values from ClickHouse (or resource_types from PostgreSQL fallback).
+/// Returns distinct source values from the ClickHouse audit store.
 ///
 /// GET /api/audit/resource-types
 #[utoipa::path(

@@ -599,7 +599,7 @@ impl AnonymizationService {
         // ClickHouse computes lower(hex(SHA256(concat(salt, lower(column)))) per row to
         // find matches — same function as Rust's salted_hash().
         let mutation_id = format!("gdpr_user_{}", Uuid::now_v7().simple());
-        let salt_escaped = salt.replace('\'', "\\'");
+        let salt_escaped = Self::escape_ch_string(salt);
         let user_columns: &[&str] = &[
             "user",
             "src_user",
@@ -725,7 +725,7 @@ impl AnonymizationService {
         mutation_ids: &mut Vec<String>,
     ) -> Result<(), AnonymizationError> {
         let mutation_id = format!("gdpr_ip_{}", Uuid::now_v7().simple());
-        let salt_escaped = salt.replace('\'', "\\'");
+        let salt_escaped = Self::escape_ch_string(salt);
         let ip_columns: &[&str] = &["src_ip", "dest_ip", "dvc_ip"];
         let sql = if self.profile.id() == SchemaId::Ocsf {
             // OCSF (NAN-1443): `event` is EPHEMERAL and the IP columns are
@@ -823,7 +823,7 @@ impl AnonymizationService {
         mutation_ids: &mut Vec<String>,
     ) -> Result<(), AnonymizationError> {
         let anon = &request.identifier_hash;
-        let salt_escaped = salt.replace('\'', "\\'");
+        let salt_escaped = Self::escape_ch_string(salt);
 
         // Anonymized identifiers are hex SHA256 — safe to splice, but escape
         // defensively to be uniform with the rest of this module.

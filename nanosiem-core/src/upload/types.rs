@@ -163,11 +163,6 @@ pub struct UploadRecord {
 }
 
 impl UploadRecord {
-    /// Get the upload status as an enum
-    pub fn status_enum(&self) -> Option<UploadStatus> {
-        UploadStatus::from_str(&self.status)
-    }
-
     /// Get the file format as an enum
     pub fn format_enum(&self) -> Option<FileFormat> {
         FileFormat::from_str(&self.file_format)

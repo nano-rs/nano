@@ -10,6 +10,7 @@ use axum::{http::StatusCode, Json};
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::api_error::ApiError;
 use nanosiem_core::auth::{ApiKeyInfo, TokenClaims};
 
 /// Error response for authentication/authorization failures
@@ -127,6 +128,40 @@ pub fn check_permission(
             ))),
         ))
     }
+}
+
+/// Enforce a single permission, returning [`ApiError::Forbidden`] on failure.
+///
+/// This is the ergonomic, DRY counterpart to [`check_permission`] for the
+/// pervasive handler shape that previously hand-rolled:
+///
+/// ```ignore
+/// check_permission(&auth, permissions::SEARCH_VIEW)
+///     .map_err(|_| ApiError::Forbidden("Missing permission: search:view".to_string()))?;
+/// ```
+///
+/// The Forbidden message is derived from the permission string itself
+/// (`format!("Missing permission: {permission}")`), so it stays in lock-step
+/// with the permission constant and cannot drift from a hand-written literal.
+/// For `permissions::*` constants this is byte-identical to the previous
+/// per-site message, since each constant's value is exactly its
+/// `"category:action"` string.
+///
+/// Named `ensure_permission` (not `require_permission`) to avoid colliding with
+/// the pre-existing async axum guard middleware of that name in nanosiem-api.
+///
+/// Usage:
+/// ```ignore
+/// pub async fn my_handler(
+///     Extension(auth): Extension<AuthContext>,
+/// ) -> Result<impl IntoResponse, ApiError> {
+///     ensure_permission(&auth, permissions::SEARCH_VIEW)?;
+///     // ... handler logic
+/// }
+/// ```
+pub fn ensure_permission(auth: &AuthContext, permission: &str) -> Result<(), ApiError> {
+    check_permission(auth, permission)
+        .map_err(|_| ApiError::Forbidden(format!("Missing permission: {}", permission)))
 }
 
 /// Reject api-key-authenticated callers.

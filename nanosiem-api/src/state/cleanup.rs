@@ -222,44 +222,6 @@ impl AppState {
         })
     }
 
-    /// Start the audit log cleanup task
-    ///
-    /// Deletes audit logs older than the configured retention period (default 90 days).
-    /// Runs every hour, deletes in batches to avoid long transactions.
-    pub fn start_audit_log_cleanup(&self) -> tokio::task::JoinHandle<()> {
-        let audit_repo = (*self.audit_repo).clone();
-
-        tokio::spawn(async move {
-            let retention_days: i64 = std::env::var("AUDIT_LOG_RETENTION_DAYS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(90);
-
-            // Cleanup every hour
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60 * 60));
-            interval.tick().await; // Skip initial tick
-
-            loop {
-                interval.tick().await;
-
-                match audit_repo.delete_old_logs(retention_days).await {
-                    Ok(removed) => {
-                        if removed > 0 {
-                            tracing::info!(
-                                "Audit log cleanup removed {} old logs (retention: {} days)",
-                                removed,
-                                retention_days
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Audit log cleanup failed: {}", e);
-                    }
-                }
-            }
-        })
-    }
-
     /// Start the query tracker stale entry cleanup task
     ///
     /// Removes QueryTracker entries older than 1 hour (queries that failed to unregister).

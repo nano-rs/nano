@@ -10,7 +10,7 @@ use nanosiem_core::typeid::TypeIdParam;
 
 use super::types::{ApprovalResponse, ListLogsQuery, RevertRequest};
 use crate::error::ApiError;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::state::AppState;
 
 /// GET /api/tuning/logs
@@ -35,8 +35,7 @@ pub async fn list_logs(
     Extension(auth): Extension<AuthContext>,
     Query(query): Query<ListLogsQuery>,
 ) -> Result<Json<Vec<TuningLogEntry>>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     // List tuning logs
     let logs = if let Some(rule_id) = query.rule_id {
@@ -97,8 +96,7 @@ pub async fn get_log(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<TuningLogEntry>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     // Get log entry by ID
     let log = state
@@ -137,8 +135,7 @@ pub async fn revert_tuning(
     Path(_id): Path<TypeIdParam>,
     Json(request): Json<RevertRequest>,
 ) -> Result<Json<ApprovalResponse>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:edit".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_EDIT)?;
 
     // TODO: Implement revert workflow
     // 1. Retrieve log entry

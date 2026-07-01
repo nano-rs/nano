@@ -18,7 +18,7 @@ use utoipa::ToSchema;
 
 use crate::error::{ApiError, ErrorResponse};
 use crate::handlers::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::state::AppState;
 
 // ============================================================================
@@ -171,8 +171,7 @@ pub async fn get_tiering_config(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<TieringConfigResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_RETENTION)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:retention".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_RETENTION)?;
 
     let service = get_tiering_service(&state)?;
     let config = service.get_config().await?;
@@ -205,8 +204,7 @@ pub async fn update_tiering_config(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<UpdateTieringRequest>,
 ) -> Result<Json<TieringConfigResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_RETENTION)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:retention".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_RETENTION)?;
 
     let service = get_tiering_service(&state)?;
     let config = service.update_config(request).await?;
@@ -254,8 +252,7 @@ pub async fn set_tiering_credentials(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<SetTieringCredentialsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_RETENTION)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:retention".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_RETENTION)?;
 
     let service = get_tiering_service(&state)?;
 
@@ -305,8 +302,7 @@ pub async fn test_tiering_connection(
     Extension(auth): Extension<AuthContext>,
     Extension(client): Extension<ClientContext>,
 ) -> Result<Json<TieringConnectionTestResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_RETENTION)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:retention".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_RETENTION)?;
 
     let service = get_tiering_service(&state)?;
     let result = service.test_connection().await?;
@@ -345,8 +341,7 @@ pub async fn apply_tiering_config(
     Extension(auth): Extension<AuthContext>,
     Extension(client): Extension<ClientContext>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_RETENTION)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:retention".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_RETENTION)?;
 
     let service = get_tiering_service(&state)?;
     service.apply_config().await?;
@@ -389,8 +384,7 @@ pub async fn get_tier_stats(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<TierStatsResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:view".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_VIEW)?;
 
     let service = get_tiering_service(&state)?;
     let stats = service.get_tier_stats().await?;

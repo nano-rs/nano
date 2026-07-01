@@ -20,7 +20,7 @@ use super::types::{
     VALID_QUERY_MODES, VALID_VIZ_TYPES,
 };
 use super::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 /// Export a dashboard as JSON
@@ -44,8 +44,7 @@ pub async fn export_dashboard(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<DashboardExport>, ApiError> {
-    check_permission(&auth, permissions::DASHBOARDS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: dashboards:view".to_string()))?;
+    ensure_permission(&auth, permissions::DASHBOARDS_VIEW)?;
 
     let repo = DashboardRepository::new(state.pool.clone());
     // Use find_by_id_for_user to ensure user can only export dashboards they have access to
@@ -94,8 +93,7 @@ pub async fn import_dashboard(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<ImportDashboardRequest>,
 ) -> Result<Json<Dashboard>, ApiError> {
-    check_permission(&auth, permissions::DASHBOARDS_CREATE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: dashboards:create".to_string()))?;
+    ensure_permission(&auth, permissions::DASHBOARDS_CREATE)?;
 
     // Check payload size before parsing
     if request.json.len() > MAX_IMPORT_PAYLOAD_SIZE {

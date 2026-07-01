@@ -24,7 +24,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ErrorResponse};
-use crate::middleware::{AuthContext, check_permission};
+use crate::middleware::{AuthContext, ensure_permission};
 use crate::state::AppState;
 use nanosiem_core::auth::permissions;
 use nanosiem_core::observability::{
@@ -265,8 +265,7 @@ pub async fn list_synthetics(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<ListChecksResponse>, ApiError> {
-    check_permission(&auth, permissions::SEARCH_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:view".to_string()))?;
+    ensure_permission(&auth, permissions::SEARCH_VIEW)?;
 
     let repo = SyntheticCheckRepository::new(state.pool.clone());
     let defs = repo.list().await.map_err(map_repo_err)?;
@@ -307,8 +306,7 @@ pub async fn create_synthetic(
     Extension(auth): Extension<AuthContext>,
     Json(req): Json<CheckRequest>,
 ) -> Result<(StatusCode, Json<Check>), ApiError> {
-    check_permission(&auth, permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let v = req.validate()?;
 
@@ -371,8 +369,7 @@ pub async fn update_synthetic(
     Path(id): Path<TypeIdParam>,
     Json(req): Json<UpdateCheckRequest>,
 ) -> Result<Json<Check>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let repo = SyntheticCheckRepository::new(state.pool.clone());
     // PATCH-style: merge the partial body onto the persisted definition so a
@@ -426,8 +423,7 @@ pub async fn delete_synthetic(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<StatusCode, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let repo = SyntheticCheckRepository::new(state.pool.clone());
     let deleted = repo.delete(*id).await.map_err(map_repo_err)?;

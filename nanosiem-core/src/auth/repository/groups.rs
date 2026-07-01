@@ -56,15 +56,6 @@ impl GroupRepository {
             .ok_or(GroupRepositoryError::NotFound(id))
     }
 
-    /// Get a group by name
-    pub async fn get_group_by_name(&self, name: &str) -> Result<Group, GroupRepositoryError> {
-        sqlx::query_as::<_, Group>("SELECT * FROM groups WHERE name = $1")
-            .bind(name)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or_else(|| GroupRepositoryError::NotFound(Uuid::nil()))
-    }
-
     /// Create a new group
     /// Requirements: 6.1
     pub async fn create_group(

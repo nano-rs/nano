@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use super::types::*;
 use super::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{
     error::{ApiError, ErrorResponse},
     state::AppState,
@@ -43,8 +43,7 @@ pub async fn trigger_detection(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_PROMOTE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:promote".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_PROMOTE)?;
 
     let rule = state.detection_service.get_rule(*id).await?;
 
@@ -90,8 +89,7 @@ pub async fn get_detection_stats(
     Extension(auth): Extension<AuthContext>,
     Query(params): Query<StatsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     let days = params.days.unwrap_or(28);
     let stats = state.detection_service.get_all_daily_stats(days).await?;
@@ -137,8 +135,7 @@ pub async fn get_today_counts(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<std::collections::HashMap<String, i64>>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     use chrono::{NaiveTime, Utc};
 
@@ -195,8 +192,7 @@ pub async fn get_detection_matches(
     Path(id): Path<TypeIdParam>,
     Query(query): Query<DetectionMatchesQuery>,
 ) -> Result<Json<DetectionMatchesResponse>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     // Build the base query from detection_matches table.
     // LEFT JOIN match_reviews so the UI can show a "reviewed" chip without an
@@ -348,8 +344,7 @@ pub async fn reload_realtime_rules(
     Extension(auth): Extension<AuthContext>,
     Extension(client): Extension<ClientContext>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:edit".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_EDIT)?;
 
     state
         .realtime_evaluator

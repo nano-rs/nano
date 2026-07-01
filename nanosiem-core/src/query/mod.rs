@@ -28,15 +28,21 @@ pub(crate) use clickhouse_sql_gen::json_tail_access_sql;
 // tail) emits the SAME native `Map` subscript as `field_access_expr` (NAN-1555
 // lockstep — mirrors the json_tail_access_sql lockstep above).
 pub(crate) use clickhouse_sql_gen::map_tail_access_sql;
-pub(crate) use clickhouse_sql_gen::MATERIALIZED_COLUMNS;
+// `pub` (not `pub(crate)`): the DDL↔Rust column drift gate
+// (`tests/logs_ddl_column_consistency.rs`, NAN-1623) is an integration test and
+// consumes this canonical list to assert it equals the DDL's MATERIALIZED set.
+pub use clickhouse_sql_gen::MATERIALIZED_COLUMNS;
 // Re-exported so `crate::schema::udm::UdmProfile::canonicalize` delegates to the
 // canonical alias map rather than duplicating it (OCSF Phase 2, NAN-1241).
 pub(crate) use clickhouse_sql_gen::normalize_field_name;
 // Re-exported for `crate::schema::udm::UdmProfile` so it references the canonical
 // const arrays for byte-for-byte parity rather than copying values (NAN-1244).
 pub(crate) use clickhouse_sql_gen::{
-    EXPLICIT_COLUMNS, LOWERCASE_NORMALIZED_FIELDS, NUMERIC_UDM_FIELDS, PREWHERE_FIELDS, UUID_FIELDS,
+    LOWERCASE_NORMALIZED_FIELDS, NUMERIC_UDM_FIELDS, PREWHERE_FIELDS, UUID_FIELDS,
 };
+// `pub` (not `pub(crate)`): consumed by the DDL↔Rust column drift gate
+// (`tests/logs_ddl_column_consistency.rs`, NAN-1623) — see MATERIALIZED_COLUMNS above.
+pub use clickhouse_sql_gen::EXPLICIT_COLUMNS;
 pub use clickhouse_sql_gen::{ClickHouseSqlGenerator, QueryOptions};
 // OTLP observability (NAN-1528): dataset selector + trace/metrics fetch SQL the
 // search/api layer calls to target the `otel_spans`/`otel_metrics` tables.

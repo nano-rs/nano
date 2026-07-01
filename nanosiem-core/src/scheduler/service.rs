@@ -13,7 +13,7 @@ use thiserror::Error;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
-use crate::inputlookup::{SsrfConfig, SsrfValidator};
+use crate::inputlookup::SsrfValidator;
 
 use super::repository::{JobStats, SchedulerRepository, SchedulerRepositoryError};
 use super::types::*;
@@ -326,15 +326,9 @@ impl SchedulerService {
     ) -> Result<(usize, usize), SchedulerError> {
         info!(job_id = %job.id, url = %job.url, "Fetching data from URL");
 
-        // Validate URL against SSRF attacks (blocks private IPs, localhost, metadata endpoints)
-        let ssrf_config = SsrfConfig {
-            allow_http: true, // Allow HTTP for internal/legacy feeds
-            blocked_domains: Vec::new(),
-            max_redirects: 5,
-            ..Default::default()
-        };
-        let ssrf_validator = SsrfValidator::new(ssrf_config);
-        ssrf_validator
+        // Validate URL against SSRF attacks (blocks private IPs, localhost, metadata endpoints).
+        // allow_http for internal/legacy feeds; private/metadata ranges stay blocked.
+        SsrfValidator::http_allowed_validator()
             .validate_with_dns(&job.url)
             .await
             .map_err(|e| SchedulerError::SsrfBlocked(e.to_string()))?;

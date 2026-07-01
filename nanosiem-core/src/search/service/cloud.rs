@@ -294,8 +294,8 @@ impl SearchService {
                     .read(Self::logs_table_key(self.active_profile.as_ref()));
                 format!(
                     "SELECT * FROM {logs_table} PREWHERE timestamp BETWEEN '{}' AND '{}' ORDER BY timestamp DESC",
-                    time_range.start.format("%Y-%m-%d %H:%M:%S%.6f"),
-                    time_range.end.format("%Y-%m-%d %H:%M:%S%.6f"),
+                    crate::sql_hygiene::format_ch_bound_micros(&time_range.start),
+                    crate::sql_hygiene::format_ch_bound_micros(&time_range.end),
                 )
             }
         };
@@ -677,8 +677,8 @@ impl SearchService {
             ORDER BY event_count DESC
             LIMIT 200"#,
             base_cte,
-            time_range.start.format("%Y-%m-%d %H:%M:%S"),
-            time_range.end.format("%Y-%m-%d %H:%M:%S"),
+            crate::sql_hygiene::format_ch_bound(&time_range.start),
+            crate::sql_hygiene::format_ch_bound(&time_range.end),
             cloud_user_activity_table = self.table_names.read("cloud_user_activity_agg"),
         ));
 
@@ -1120,8 +1120,8 @@ impl SearchService {
                 LIMIT 200"#,
                 filtered_cte,
                 source_table,
-                time_range.start.format("%Y-%m-%d %H:%M:%S"),
-                time_range.end.format("%Y-%m-%d %H:%M:%S"),
+                crate::sql_hygiene::format_ch_bound(&time_range.start),
+                crate::sql_hygiene::format_ch_bound(&time_range.end),
             )),
             _ => None,
         };

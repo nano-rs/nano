@@ -16,7 +16,7 @@ use nanosiem_core::typeid::TypeIdParam;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{
     error::{ApiError, ErrorResponse},
     state::AppState,
@@ -92,8 +92,7 @@ pub async fn get_rule_disposition_stats(
     Path(id): Path<TypeIdParam>,
     Query(params): Query<DispositionStatsQuery>,
 ) -> Result<Json<DispositionStatsResponse>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     let days = params.days.unwrap_or(28).clamp(1, 365);
     let window_end = Utc::now();
@@ -153,8 +152,7 @@ pub async fn set_match_disposition(
     Path(id): Path<TypeIdParam>,
     Json(body): Json<SetDispositionRequest>,
 ) -> Result<Json<MatchDispositionResponse>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:edit".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_EDIT)?;
 
     if !ALLOWED_DISPOSITIONS.contains(&body.disposition.as_str()) {
         return Err(ApiError::ValidationError(format!(

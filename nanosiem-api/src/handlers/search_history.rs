@@ -20,7 +20,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use uuid::Uuid;
 
 use crate::handlers::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 use nanosiem_core::typeid::TypeIdParam;
 
@@ -85,8 +85,7 @@ pub async fn list_history(
     Extension(auth): Extension<AuthContext>,
     Query(params): Query<ListHistoryParams>,
 ) -> Result<Json<ListHistoryResponse>, ApiError> {
-    check_permission(&auth, permissions::SEARCH_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:view".to_string()))?;
+    ensure_permission(&auth, permissions::SEARCH_VIEW)?;
 
     let user_id = auth.user_id();
     let repo = SearchHistoryRepository::new(state.pool.clone());
@@ -138,8 +137,7 @@ pub async fn add_history(
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<AddHistoryRequest>,
 ) -> Result<Json<SearchHistoryResponse>, ApiError> {
-    check_permission(&auth, permissions::SEARCH_EXECUTE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:execute".to_string()))?;
+    ensure_permission(&auth, permissions::SEARCH_EXECUTE)?;
 
     let user_id = auth.user_id();
     let repo = SearchHistoryRepository::new(state.pool.clone());
@@ -217,8 +215,7 @@ pub async fn delete_history_entry(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Mutating your history requires execute (the permission that creates it),
     // not just view — a view-only identity has no history to erase (NAN-1366).
-    check_permission(&auth, permissions::SEARCH_EXECUTE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:execute".to_string()))?;
+    ensure_permission(&auth, permissions::SEARCH_EXECUTE)?;
 
     let user_id = auth.user_id();
     let repo = SearchHistoryRepository::new(state.pool.clone());
@@ -262,8 +259,7 @@ pub async fn clear_history(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Mutating your history requires execute (the permission that creates it),
     // not just view — a view-only identity has no history to erase (NAN-1366).
-    check_permission(&auth, permissions::SEARCH_EXECUTE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:execute".to_string()))?;
+    ensure_permission(&auth, permissions::SEARCH_EXECUTE)?;
 
     let user_id = auth.user_id();
     let repo = SearchHistoryRepository::new(state.pool.clone());
@@ -306,8 +302,7 @@ pub async fn set_history_enabled(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Toggling tracking requires execute (the permission that creates history),
     // not just view — disabling it is the primary evasion lever (NAN-1366).
-    check_permission(&auth, permissions::SEARCH_EXECUTE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:execute".to_string()))?;
+    ensure_permission(&auth, permissions::SEARCH_EXECUTE)?;
 
     let user_id = auth.user_id();
     let repo = SearchHistoryRepository::new(state.pool.clone());

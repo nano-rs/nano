@@ -8,7 +8,7 @@ use nanosiem_core::auth::permissions;
 use nanosiem_core::models::detection_rule::RuleMode;
 
 use super::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{
     error::{ApiError, ErrorResponse},
     state::AppState,
@@ -68,8 +68,7 @@ pub async fn bulk_update_rules(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<BulkUpdateRulesRequest>,
 ) -> Result<Json<BulkUpdateRulesResponse>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_PROMOTE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:promote".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_PROMOTE)?;
 
     // Validate mode
     let target_mode = match request.mode.to_lowercase().as_str() {

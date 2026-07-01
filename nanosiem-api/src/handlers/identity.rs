@@ -28,8 +28,8 @@ use axum::{
     extract::{Path, Query, State},
 };
 use chrono::{DateTime, NaiveDateTime, Utc};
-use nanosiem_core::audit::{AuditEvent, AuditSource};
-use nanosiem_core::auth::{permissions, repository::audit_actions};
+use nanosiem_core::audit::{actions as audit_actions, AuditEvent, AuditSource};
+use nanosiem_core::auth::permissions;
 use nanosiem_core::identity::types::ConnectionTestResult;
 use nanosiem_core::identity::{
     CreateIdentityProvider, IdentityProviderSummary, IdentityStats, ListUsersParams,
@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::handlers::AuditExt;
-use crate::middleware::{AuthContext, check_permission};
+use crate::middleware::{AuthContext, ensure_permission};
 use crate::{error::ApiError, state::AppState};
 
 // Note: `From<IdentityServiceError> for ApiError` lifted to
@@ -125,8 +125,7 @@ pub async fn list_identity_providers(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<ListIdentityProvidersResponse>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:view".into()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_VIEW)?;
 
     let providers = state.identity_service.list_providers().await?;
     let summaries: Vec<IdentityProviderSummary> = providers.into_iter().map(Into::into).collect();
@@ -154,8 +153,7 @@ pub async fn get_identity_provider(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<String>,
 ) -> Result<Json<IdentityProviderSummary>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:view".into()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_VIEW)?;
 
     let provider = state.identity_service.get_provider(&id).await?;
     Ok(Json(IdentityProviderSummary::from(provider)))
@@ -180,8 +178,7 @@ pub async fn create_identity_provider(
     Extension(auth): Extension<AuthContext>,
     Json(req): Json<CreateIdentityProviderRequest>,
 ) -> Result<Json<IdentityProviderSummary>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:configure".into()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
     let create = CreateIdentityProvider {
         id: req.id,
@@ -230,8 +227,7 @@ pub async fn update_identity_provider(
     Path(id): Path<String>,
     Json(req): Json<UpdateIdentityProviderRequest>,
 ) -> Result<Json<IdentityProviderSummary>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:configure".into()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
     let update = UpdateIdentityProvider {
         name: req.name,
@@ -276,8 +272,7 @@ pub async fn delete_identity_provider(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:configure".into()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
     state.identity_service.delete_provider(&id).await?;
 
@@ -316,8 +311,7 @@ pub async fn update_identity_credentials(
     Path(id): Path<String>,
     Json(req): Json<UpdateIdentityCredentialsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:configure".into()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
     state
         .identity_service
@@ -357,8 +351,7 @@ pub async fn test_identity_connection(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<String>,
 ) -> Result<Json<IdentityConnectionTestResponse>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:configure".into()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
     let result = state.identity_service.test_connection(&id).await?;
     Ok(Json(IdentityConnectionTestResponse::from(result)))
@@ -383,8 +376,7 @@ pub async fn trigger_identity_sync(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<String>,
 ) -> Result<Json<SyncTriggerResponse>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:configure".into()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
     state.emit_audit(
         AuditEvent::builder(
@@ -528,8 +520,7 @@ pub async fn lookup_identity_user(
     Extension(auth): Extension<AuthContext>,
     Query(params): Query<LookupUserQuery>,
 ) -> Result<Json<UserRecord>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:view".into()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_VIEW)?;
 
     let user = state
         .identity_service
@@ -561,8 +552,7 @@ pub async fn resolve_identity_ip(
     Extension(auth): Extension<AuthContext>,
     Query(params): Query<ResolveIdentityQuery>,
 ) -> Result<Json<IdentityResolveResponse>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:view".into()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_VIEW)?;
 
     let ip = params.ip.trim().to_string();
     if ip.is_empty() {
@@ -693,8 +683,7 @@ pub async fn list_identity_users(
     Extension(auth): Extension<AuthContext>,
     Query(params): Query<ListUsersParams>,
 ) -> Result<Json<UserListResponse>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:view".into()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_VIEW)?;
 
     let result = state.identity_service.list_users(&params).await?;
     Ok(Json(result))
@@ -718,8 +707,7 @@ pub async fn get_identity_user(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<String>,
 ) -> Result<Json<UserRecord>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:view".into()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_VIEW)?;
 
     let user = state.identity_service.get_user(&id).await?;
     Ok(Json(user))
@@ -740,8 +728,7 @@ pub async fn get_identity_stats(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<IdentityStats>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:view".into()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_VIEW)?;
 
     let stats = state.identity_service.get_stats().await?;
     Ok(Json(stats))

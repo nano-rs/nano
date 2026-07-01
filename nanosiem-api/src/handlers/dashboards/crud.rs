@@ -21,7 +21,7 @@ use super::types::{
     CreateDashboardRequest, DashboardSummary, ListDashboardsQuery, UpdateDashboardRequest,
 };
 use super::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{check_permission, ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 /// List dashboards
@@ -44,8 +44,7 @@ pub async fn list_dashboards(
     Extension(auth): Extension<AuthContext>,
     Query(query): Query<ListDashboardsQuery>,
 ) -> Result<Json<Vec<DashboardSummary>>, ApiError> {
-    check_permission(&auth, permissions::DASHBOARDS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: dashboards:view".to_string()))?;
+    ensure_permission(&auth, permissions::DASHBOARDS_VIEW)?;
 
     let repo = DashboardRepository::new(state.pool.clone());
 
@@ -92,8 +91,7 @@ pub async fn create_dashboard(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<CreateDashboardRequest>,
 ) -> Result<Json<Dashboard>, ApiError> {
-    check_permission(&auth, permissions::DASHBOARDS_CREATE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: dashboards:create".to_string()))?;
+    ensure_permission(&auth, permissions::DASHBOARDS_CREATE)?;
 
     // Validate request
     if request.name.trim().is_empty() {
@@ -169,8 +167,7 @@ pub async fn get_dashboard(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<DashboardWithContext>, ApiError> {
-    check_permission(&auth, permissions::DASHBOARDS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: dashboards:view".to_string()))?;
+    ensure_permission(&auth, permissions::DASHBOARDS_VIEW)?;
 
     let repo = DashboardRepository::new(state.pool.clone());
     let dashboard = repo.find_by_id_for_user(*id, auth.user_id()).await?;
@@ -201,8 +198,7 @@ pub async fn update_dashboard(
     Path(id): Path<TypeIdParam>,
     Json(request): Json<UpdateDashboardRequest>,
 ) -> Result<Json<Dashboard>, ApiError> {
-    check_permission(&auth, permissions::DASHBOARDS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: dashboards:edit".to_string()))?;
+    ensure_permission(&auth, permissions::DASHBOARDS_EDIT)?;
 
     // Validate name if provided
     if let Some(ref name) = request.name {
@@ -268,8 +264,7 @@ pub async fn share_dashboard(
     Path(dashboard_id): Path<TypeIdParam>,
     Json(request): Json<ShareDashboardRequest>,
 ) -> Result<Json<DashboardShareResult>, ApiError> {
-    check_permission(&auth, permissions::DASHBOARDS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: dashboards:edit".to_string()))?;
+    ensure_permission(&auth, permissions::DASHBOARDS_EDIT)?;
 
     // Validate visibility
     let visibility = request.visibility.as_str();
@@ -349,8 +344,7 @@ pub async fn delete_dashboard(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::DASHBOARDS_DELETE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: dashboards:delete".to_string()))?;
+    ensure_permission(&auth, permissions::DASHBOARDS_DELETE)?;
 
     let repo = DashboardRepository::new(state.pool.clone());
     repo.delete_owned(*id, auth.user_id()).await?;

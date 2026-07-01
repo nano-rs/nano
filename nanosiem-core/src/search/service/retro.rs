@@ -348,8 +348,8 @@ impl SearchService {
              WHERE timestamp BETWEEN '{start}' AND '{end}'",
             host = host_expr(self.active_profile.as_ref()),
             table = logs_table,
-            start = start.format("%Y-%m-%d %H:%M:%S"),
-            end = now.format("%Y-%m-%d %H:%M:%S"),
+            start = crate::sql_hygiene::format_ch_bound(&start),
+            end = crate::sql_hygiene::format_ch_bound(&now),
         );
         clickhouse
             .query(&sql)
@@ -850,7 +850,7 @@ impl SearchService {
 
 /// Format a time-range bound for a ClickHouse `timestamp BETWEEN` clause.
 fn ts(t: &chrono::DateTime<chrono::Utc>) -> String {
-    t.format("%Y-%m-%d %H:%M:%S").to_string()
+    crate::sql_hygiene::format_ch_bound(t)
 }
 
 /// Per-observable comparison expression (RAW vs `lower()`) over the

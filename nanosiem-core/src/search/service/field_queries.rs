@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::query::escape_identifier;
+use crate::sql_hygiene::escape_sql_string;
 // `MATERIALIZED_COLUMNS` is only referenced by the unit tests below (the UDM
 // materialized set passed to `build_fetch_log_sql`); production callers pass the
 // active profile's columns. Scoped to test builds to avoid an unused-import warning.
@@ -459,8 +460,8 @@ impl SearchService {
         let time_only = |tr: &TimeRangeInput| {
             format!(
                 "timestamp BETWEEN '{}' AND '{}'",
-                tr.start.format("%Y-%m-%d %H:%M:%S%.6f"),
-                tr.end.format("%Y-%m-%d %H:%M:%S%.6f"),
+                crate::sql_hygiene::format_ch_bound_micros(&tr.start),
+                crate::sql_hygiene::format_ch_bound_micros(&tr.end),
             )
         };
         // Build the scan predicate.
@@ -632,8 +633,8 @@ impl SearchService {
               AND {}
             ORDER BY timestamp DESC
             "#,
-            request.time_range.start.format("%Y-%m-%d %H:%M:%S%.6f"),
-            request.time_range.end.format("%Y-%m-%d %H:%M:%S%.6f"),
+            crate::sql_hygiene::format_ch_bound_micros(&request.time_range.start),
+            crate::sql_hygiene::format_ch_bound_micros(&request.time_range.end),
             value_clause
         );
 
@@ -693,14 +694,14 @@ fn build_fetch_log_sql(
     exclude_audit: bool,
     materialized_cols: &[&str],
 ) -> String {
-    let escaped_id = id.replace('\'', "''");
+    let escaped_id = escape_sql_string(id);
     let audit_filter = if exclude_audit {
         " AND lower(source_type) != 'audit'"
     } else {
         ""
     };
     let source_type_filter = source_type
-        .map(|st| format!(" AND source_type = '{}'", st.replace('\'', "''")))
+        .map(|st| format!(" AND source_type = '{}'", escape_sql_string(st)))
         .unwrap_or_default();
     // ClickHouse's `SELECT *` excludes MATERIALIZED columns (enrichment, IOC,
     // prevalence, process-GUID, resolved-identity dict fills for UDM; the promoted
@@ -730,8 +731,8 @@ fn build_fetch_log_sql(
             escaped_id,
             source_type_filter,
             audit_filter,
-            tr.start.format("%Y-%m-%d %H:%M:%S%.6f"),
-            tr.end.format("%Y-%m-%d %H:%M:%S%.6f"),
+            crate::sql_hygiene::format_ch_bound_micros(&tr.start),
+            crate::sql_hygiene::format_ch_bound_micros(&tr.end),
         )
     } else {
         format!(
@@ -802,6 +803,29 @@ mod tests {
         assert!(
             sql.ends_with("FROM logs WHERE id = 'abc-123' LIMIT 1"),
             "{sql}"
+        );
+    }
+
+    /// NAN-1620: backslash-bearing values embedded in a CH string literal must
+    /// be escaped (`\` → `\\`), otherwise the literal is corrupted/broken. A
+    /// Windows-path-style id and the source_type filter both go into `'…'`.
+    #[test]
+    fn fetch_log_sql_escapes_backslashes_in_string_literals() {
+        let sql = build_fetch_log_sql(
+            "logs",
+            r"C:\Users\admin",
+            None,
+            Some(r"win\evtx"),
+            false,
+            MATERIALIZED_COLUMNS,
+        );
+        assert!(
+            sql.contains(r"WHERE id = 'C:\\Users\\admin'"),
+            "id backslashes must be doubled: {sql}"
+        );
+        assert!(
+            sql.contains(r"AND source_type = 'win\\evtx'"),
+            "source_type backslashes must be doubled: {sql}"
         );
     }
 

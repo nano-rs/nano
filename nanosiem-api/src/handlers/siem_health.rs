@@ -177,8 +177,7 @@ pub async fn trigger_health_check(
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<TriggerResponse>, ApiError> {
     // Require admin permission
-    crate::middleware::check_permission(&auth, nanosiem_core::auth::permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    crate::middleware::ensure_permission(&auth, nanosiem_core::auth::permissions::SETTINGS_SYSTEM)?;
 
     let repo = SiemHealthRepository::new(state.pool.clone());
 

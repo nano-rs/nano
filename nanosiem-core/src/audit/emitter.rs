@@ -30,6 +30,54 @@ pub struct AuditEmitter {
     mirror_to_ocsf: bool,
 }
 
+/// Process-global backstop bound on concurrent audit ClickHouse inserts
+/// (NAN-1625). EVERY audit insert — whether dispatched by the API layer
+/// (`AppState::emit_audit`) or issued by a DIRECT caller that holds its own
+/// `AuditEmitter` (the health scheduler, the disk-pressure monitor, …) — funnels
+/// through [`AuditEmitter::emit_batch_inner`], which acquires a permit here. That
+/// makes the whole audit subsystem provably bounded with no bypass: at most this
+/// many audit inserts hit ClickHouse concurrently, regardless of caller. It is a
+/// `static` (not a struct field) precisely because direct callers each construct
+/// their own emitter — a per-instance bound would not be global.
+///
+/// Sized well above the API-layer caps (`DURABLE_AUDIT_INSERTS` 12 +
+/// `ROUTINE_AUDIT_INSERTS` 64 = 76) so it never throttles the normal dispatch
+/// path; it is the ceiling that also covers the low-volume direct callers.
+static AUDIT_INSERT_BOUND: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(128);
+
+/// Backstop timeout for a single audit insert at the emitter level. Generous on
+/// purpose — API callers wrap their own tighter 4s/5s bounds on top of this; the
+/// backstop only exists so a slow/unresponsive ClickHouse can never hold a permit
+/// (or block a direct caller's background loop) indefinitely.
+const AUDIT_INSERT_BACKSTOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Record an audit event (or batch) dropped by the emitter-level backstop —
+/// loud + observable + log-recoverable, consistent with the API-layer drop
+/// semantics. Logs the FULL event and increments the shared
+/// `nanosiem_audit_emit_failures_total{action, critical, reason}` counter.
+/// `reason` is `emitter_saturated` (concurrency bound full) or `emitter_timeout`
+/// (insert exceeded the backstop timeout).
+fn record_dropped(events: &[AuditEvent], durable: bool, reason: &'static str) {
+    for event in events {
+        let event_json =
+            serde_json::to_string(event).unwrap_or_else(|_| "<unserializable>".to_string());
+        tracing::error!(
+            source = %event.source,
+            action = %event.action,
+            reason = %reason,
+            event = %event_json,
+            "Audit event dropped at emitter concurrency backstop — full event logged for recovery",
+        );
+        metrics::counter!(
+            "nanosiem_audit_emit_failures_total",
+            "action" => event.action.clone(),
+            "critical" => if durable { "true" } else { "false" },
+            "reason" => reason,
+        )
+        .increment(1);
+    }
+}
+
 impl AuditEmitter {
     /// Create a new audit emitter with DualPool for ClickHouse storage
     pub fn new(dual_pool: DualPool) -> Self {
@@ -45,7 +93,8 @@ impl AuditEmitter {
         }
     }
 
-    /// Emit an audit event to ClickHouse
+    /// Emit an audit event to ClickHouse (default fire-and-forget async-insert
+    /// semantics — see [`Self::emit_durable`] for the synchronous variant).
     pub async fn emit(&self, event: &AuditEvent) -> Result<(), AuditEmitError> {
         self.emit_batch(std::slice::from_ref(event)).await?;
 
@@ -58,12 +107,101 @@ impl AuditEmitter {
         Ok(())
     }
 
-    /// Emit multiple audit events in a batch
+    /// Emit a single audit event **durably** (NAN-1625).
+    ///
+    /// Unlike [`Self::emit`], this forces a *synchronous* ClickHouse write:
+    /// `async_insert=0` disables server-side insert buffering and
+    /// `wait_end_of_query=1` holds the HTTP response until the data has been
+    /// flushed to a part. Awaiting this call therefore genuinely guarantees the
+    /// row landed on disk.
+    ///
+    /// This is the key correctness point: under the *default* async-insert
+    /// path, ClickHouse acks on **receipt**, not flush (which is also why
+    /// `written_rows` is always 0), so merely awaiting `emit` does NOT prove
+    /// durability. Only `emit_durable` does.
+    ///
+    /// Reserved for the low-volume, non-floodable security actions in
+    /// [`crate::audit::SECURITY_CRITICAL_ACTIONS`]; routine events keep the
+    /// cheaper async-insert path.
+    pub async fn emit_durable(&self, event: &AuditEvent) -> Result<(), AuditEmitError> {
+        self.emit_batch_inner(std::slice::from_ref(event), true)
+            .await?;
+
+        tracing::debug!(
+            source = %event.source,
+            action = %event.action,
+            "Emitted audit event (durable, synchronous insert)"
+        );
+
+        Ok(())
+    }
+
+    /// Emit multiple audit events in a batch (async-insert / fire-and-forget).
     pub async fn emit_batch(&self, events: &[AuditEvent]) -> Result<(), AuditEmitError> {
+        self.emit_batch_inner(events, false).await
+    }
+
+    /// Shared batch-insert entry point — applies the emitter-level global
+    /// concurrency backstop ([`AUDIT_INSERT_BOUND`]) + timeout
+    /// ([`AUDIT_INSERT_BACKSTOP_TIMEOUT`]) around every audit insert, then
+    /// delegates to [`Self::perform_insert`]. This is the single chokepoint all
+    /// three public entry points (`emit`, `emit_batch`, `emit_durable`) funnel
+    /// through, so no caller can issue an unbounded audit insert.
+    ///
+    /// On saturation of the bound we DROP the batch (log full event + metric,
+    /// via [`record_dropped`]) rather than block/queue; on backstop-timeout we
+    /// likewise drop. Never blocks a caller's background loop on a slow CH.
+    async fn emit_batch_inner(
+        &self,
+        events: &[AuditEvent],
+        durable: bool,
+    ) -> Result<(), AuditEmitError> {
         if events.is_empty() {
             return Ok(());
         }
 
+        // Acquire the process-global backstop permit. `try_acquire` never
+        // blocks — on saturation drop-with-log+metric and return Ok (the event
+        // has been recorded to logs, so the caller neither blocks nor errors).
+        let _permit = match AUDIT_INSERT_BOUND.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => {
+                record_dropped(events, durable, "emitter_saturated");
+                return Ok(());
+            }
+        };
+
+        // Bound the insert in time so a stuck CH can't hold the permit or block
+        // a direct caller (health/disk-pressure loops) indefinitely.
+        match tokio::time::timeout(
+            AUDIT_INSERT_BACKSTOP_TIMEOUT,
+            self.perform_insert(events, durable),
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(_) => {
+                record_dropped(events, durable, "emitter_timeout");
+                Ok(())
+            }
+        }
+        // `_permit` released here.
+    }
+
+    /// Perform the actual ClickHouse insert(s) for a batch.
+    ///
+    /// When `durable` is true, both the UDM insert and the OCSF mirror write go
+    /// through a client cloned with synchronous-write options
+    /// (`async_insert=0` + `wait_end_of_query=1`) so the await blocks until the
+    /// write is flushed. When false, the ambient async-insert behavior applies.
+    ///
+    /// Callers reach this only via [`Self::emit_batch_inner`], which holds the
+    /// [`AUDIT_INSERT_BOUND`] permit and applies the backstop timeout.
+    async fn perform_insert(
+        &self,
+        events: &[AuditEvent],
+        durable: bool,
+    ) -> Result<(), AuditEmitError> {
         let ingest_time = Utc::now();
 
         // Convert all events to ClickHouse rows
@@ -78,7 +216,24 @@ impl AuditEmitter {
         // Insert into the cluster-aware UDM logs table ("logs_distributed" on
         // clustered deployments, "logs" otherwise) — previously hardcoded
         // "logs", which wrote to the local shard only under clustering.
-        let client = self.dual_pool.clickhouse();
+        //
+        // For the durable path, clone the client with synchronous-write options
+        // so the insert (and the OCSF mirror write below) genuinely block until
+        // the row is flushed to a part rather than merely received (NAN-1625).
+        // The options are HTTP query params applied to every request the client
+        // makes, so both writes inherit them.
+        let sync_client;
+        let client = if durable {
+            sync_client = self
+                .dual_pool
+                .clickhouse()
+                .clone()
+                .with_option("async_insert", "0")
+                .with_option("wait_end_of_query", "1");
+            &sync_client
+        } else {
+            self.dual_pool.clickhouse()
+        };
         let mut insert = client
             .insert::<ClickHouseLogRow>(self.dual_pool.logs_table())
             .await

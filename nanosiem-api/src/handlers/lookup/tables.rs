@@ -24,7 +24,7 @@ use super::types::{
     LookupDeleteResponse, RenamedColumn, SampleQueryParams, SampleRowsResponse,
 };
 use super::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 /// Create a lookup table from file upload
@@ -52,8 +52,7 @@ pub async fn create_lookup_table(
     Extension(client): Extension<ClientContext>,
     mut multipart: Multipart,
 ) -> Result<Json<CreateLookupTableResponse>, ApiError> {
-    check_permission(&auth, permissions::LOOKUP_CREATE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: lookup:create".to_string()))?;
+    ensure_permission(&auth, permissions::LOOKUP_CREATE)?;
 
     let mut file_content: Option<Vec<u8>> = None;
     let mut filename: Option<String> = None;
@@ -377,8 +376,7 @@ pub async fn list_lookup_tables(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<LookupTable>>, ApiError> {
-    check_permission(&auth, permissions::LOOKUP_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: lookup:view".to_string()))?;
+    ensure_permission(&auth, permissions::LOOKUP_VIEW)?;
 
     let lookup_service = state.lookup_service.clone();
 
@@ -412,8 +410,7 @@ pub async fn get_lookup_table(
     Extension(auth): Extension<AuthContext>,
     Path(name): Path<String>,
 ) -> Result<Json<LookupTable>, ApiError> {
-    check_permission(&auth, permissions::LOOKUP_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: lookup:view".to_string()))?;
+    ensure_permission(&auth, permissions::LOOKUP_VIEW)?;
 
     let lookup_service = state.lookup_service.clone();
 
@@ -452,8 +449,7 @@ pub async fn get_lookup_table_sample(
     Path(name): Path<String>,
     Query(params): Query<SampleQueryParams>,
 ) -> Result<Json<SampleRowsResponse>, ApiError> {
-    check_permission(&auth, permissions::LOOKUP_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: lookup:view".to_string()))?;
+    ensure_permission(&auth, permissions::LOOKUP_VIEW)?;
 
     let lookup_service = state.lookup_service.clone();
 
@@ -490,8 +486,7 @@ pub async fn delete_lookup_table(
     Extension(client): Extension<ClientContext>,
     Path(name): Path<String>,
 ) -> Result<Json<LookupDeleteResponse>, ApiError> {
-    check_permission(&auth, permissions::LOOKUP_DELETE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: lookup:delete".to_string()))?;
+    ensure_permission(&auth, permissions::LOOKUP_DELETE)?;
 
     let lookup_service = state.lookup_service.clone();
 
@@ -533,8 +528,7 @@ pub async fn create_lookup_table_from_schema(
     Extension(client): Extension<ClientContext>,
     Json(req): Json<CreateLookupTableFromSchemaRequest>,
 ) -> Result<Json<LookupTable>, ApiError> {
-    check_permission(&auth, permissions::LOOKUP_CREATE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: lookup:create".to_string()))?;
+    ensure_permission(&auth, permissions::LOOKUP_CREATE)?;
 
     if req.name.is_empty() {
         return Err(ApiError::BadRequest("Table name is required".to_string()));

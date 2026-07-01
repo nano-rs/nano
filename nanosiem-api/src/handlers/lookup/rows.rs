@@ -20,7 +20,7 @@ use super::types::{
     UpdateRowRequest,
 };
 use super::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 /// List rows from a lookup table with pagination
@@ -45,8 +45,7 @@ pub async fn list_lookup_rows(
     Path(name): Path<String>,
     Query(params): Query<RowListParams>,
 ) -> Result<Json<LookupRowsPage>, ApiError> {
-    check_permission(&auth, permissions::LOOKUP_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: lookup:view".to_string()))?;
+    ensure_permission(&auth, permissions::LOOKUP_VIEW)?;
 
     let lookup_service = state.lookup_service.clone();
 
@@ -85,8 +84,7 @@ pub async fn add_lookup_rows(
     Path(name): Path<String>,
     Json(req): Json<AddRowsRequest>,
 ) -> Result<Json<AddRowsResponse>, ApiError> {
-    check_permission(&auth, permissions::LOOKUP_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: lookup:edit".to_string()))?;
+    ensure_permission(&auth, permissions::LOOKUP_EDIT)?;
 
     if req.rows.is_empty() {
         return Err(ApiError::BadRequest(
@@ -146,8 +144,7 @@ pub async fn update_lookup_row(
     Path((name, row_id)): Path<(String, i64)>,
     Json(req): Json<UpdateRowRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::LOOKUP_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: lookup:edit".to_string()))?;
+    ensure_permission(&auth, permissions::LOOKUP_EDIT)?;
 
     let lookup_service = state.lookup_service.clone();
 
@@ -191,8 +188,7 @@ pub async fn delete_lookup_row(
     Extension(client): Extension<ClientContext>,
     Path((name, row_id)): Path<(String, i64)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::LOOKUP_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: lookup:edit".to_string()))?;
+    ensure_permission(&auth, permissions::LOOKUP_EDIT)?;
 
     let lookup_service = state.lookup_service.clone();
 
@@ -237,8 +233,7 @@ pub async fn delete_lookup_rows(
     Path(name): Path<String>,
     Json(req): Json<DeleteRowsRequest>,
 ) -> Result<Json<DeleteRowsResponse>, ApiError> {
-    check_permission(&auth, permissions::LOOKUP_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: lookup:edit".to_string()))?;
+    ensure_permission(&auth, permissions::LOOKUP_EDIT)?;
 
     let lookup_service = state.lookup_service.clone();
 

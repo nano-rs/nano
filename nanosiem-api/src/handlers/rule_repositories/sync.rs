@@ -13,7 +13,7 @@ use super::{
     types::{SyncStartResponse, SyncStatusResponse},
     AuditExt,
 };
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 /// Start syncing a repository from GitHub (async - returns immediately)
@@ -37,9 +37,7 @@ pub async fn sync_repository(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<SyncStartResponse>, ApiError> {
-    check_permission(&auth, permissions::RULE_REPOSITORIES_SYNC).map_err(|_| {
-        ApiError::Forbidden("Missing permission: rule_repositories:sync".to_string())
-    })?;
+    ensure_permission(&auth, permissions::RULE_REPOSITORIES_SYNC)?;
 
     let service = get_rule_repo_service(&state)?;
 
@@ -85,9 +83,7 @@ pub async fn get_sync_status(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<SyncStatusResponse>, ApiError> {
-    check_permission(&auth, permissions::RULE_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: rule_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::RULE_REPOSITORIES_VIEW)?;
 
     let service = get_rule_repo_service(&state)?;
     let repository = service.get_repository(*id).await?;

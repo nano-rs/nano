@@ -100,7 +100,6 @@ impl AppState {
             user_repo,
             group_repo,
             role_repo,
-            audit_repo,
             auth_enabled,
         ) = Self::init_auth_services(pg_pool.clone(), &config);
 
@@ -110,7 +109,6 @@ impl AppState {
             oidc_repo.clone(),
             user_repo.clone(),
             group_repo.clone(),
-            (*audit_repo).clone(),
         ));
 
         // Create notification service for tuning alerts
@@ -373,7 +371,6 @@ impl AppState {
             user_repo,
             group_repo,
             role_repo,
-            audit_repo,
             oidc_repo,
             oidc_service,
             auth_enabled,

@@ -16,7 +16,7 @@ use utoipa::ToSchema;
 
 use crate::error::{ApiError, ErrorResponse};
 use crate::handlers::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::state::AppState;
 
 // ============================================================================
@@ -178,8 +178,7 @@ pub async fn get_retention_config(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<RetentionConfigResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_RETENTION)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:retention".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_RETENTION)?;
 
     let settings = SystemSettings::new(state.pool.clone());
     let config = settings.get_retention_config().await?;
@@ -207,8 +206,7 @@ pub async fn update_retention_config(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<UpdateRetentionRequest>,
 ) -> Result<Json<RetentionConfigResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_RETENTION)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:retention".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_RETENTION)?;
 
     let settings = SystemSettings::new(state.pool.clone());
 
@@ -250,8 +248,7 @@ pub async fn get_storage_stats(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<StorageStatsResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:view".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_VIEW)?;
 
     let settings = SystemSettings::new(state.pool.clone());
     let stats = settings.get_storage_stats().await?;
@@ -277,8 +274,7 @@ pub async fn run_retention_now(
     Extension(auth): Extension<AuthContext>,
     Extension(client): Extension<ClientContext>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_RETENTION)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:retention".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_RETENTION)?;
 
     let settings = SystemSettings::new(state.pool.clone());
     let dropped = settings.run_retention_now().await?;
@@ -318,8 +314,7 @@ pub async fn get_storage_overview(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<StorageOverviewResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:view".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_VIEW)?;
 
     let dual_pool = state.dual_pool();
     let settings =
@@ -394,8 +389,7 @@ pub async fn get_clickhouse_storage_stats(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<ClickHouseStorageStatsResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:view".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_VIEW)?;
 
     let dual_pool = state.dual_pool();
     let settings =
@@ -429,8 +423,7 @@ pub async fn update_clickhouse_retention(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<UpdateClickHouseRetentionRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_RETENTION)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:retention".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_RETENTION)?;
 
     let dual_pool = state.dual_pool();
 
@@ -490,8 +483,7 @@ pub async fn run_clickhouse_retention_now(
     Extension(auth): Extension<AuthContext>,
     Extension(client): Extension<ClientContext>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_RETENTION)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:retention".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_RETENTION)?;
 
     let dual_pool = state.dual_pool();
 

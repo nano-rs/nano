@@ -398,7 +398,12 @@ impl LogSourceRepository {
             if !values.is_empty() {
                 let escaped: Vec<String> = values
                     .iter()
-                    .map(|v| format!("'{}'", v.to_lowercase().replace('\'', "''")))
+                    .map(|v| {
+                        format!(
+                            "'{}'",
+                            crate::sql_hygiene::escape_sql_string(v.to_lowercase())
+                        )
+                    })
                     .collect();
                 return format!("lower({}) IN ({})", field, escaped.join(", "));
             }
@@ -415,7 +420,7 @@ impl LogSourceRepository {
         // Default: case-insensitive match by log source name
         format!(
             "lower(source_type) = lower('{}')",
-            log_source.name.replace('\'', "''")
+            crate::sql_hygiene::escape_sql_string(&log_source.name)
         )
     }
 
@@ -467,7 +472,12 @@ impl LogSourceRepository {
 
         let escaped: Vec<String> = all_source_types
             .iter()
-            .map(|v| format!("'{}'", v.to_lowercase().replace('\'', "''")))
+            .map(|v| {
+                format!(
+                    "'{}'",
+                    crate::sql_hygiene::escape_sql_string(v.to_lowercase())
+                )
+            })
             .collect();
         let in_clause = escaped.join(", ");
 

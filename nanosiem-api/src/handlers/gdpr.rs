@@ -173,8 +173,8 @@ pub async fn list_anonymization_requests(
         .map_err(|(s, j)| (s, Json(GdprApiError::new(&j.error, &j.message))))?;
 
     let service = build_service(&state)?;
-    let limit = params.limit.unwrap_or(50).clamp(1, 100);
-    let offset = params.offset.unwrap_or(0).max(0);
+    let (limit, offset) =
+        nanosiem_api_lib::Pagination::new(params.limit, params.offset).resolved(50, 100);
 
     let (requests, total) = service
         .list_requests(limit, offset)

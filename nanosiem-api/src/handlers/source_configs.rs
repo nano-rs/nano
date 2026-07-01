@@ -43,7 +43,7 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use super::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 // Permission constants for source configurations
@@ -101,8 +101,7 @@ pub async fn list_source_configs(
     Extension(auth): Extension<AuthContext>,
     Query(query): Query<ListSourceConfigsQuery>,
 ) -> Result<Json<Vec<SourceConfiguration>>, ApiError> {
-    check_permission(&auth, SOURCE_CONFIGS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: source_configs:view".to_string()))?;
+    ensure_permission(&auth, SOURCE_CONFIGS_VIEW)?;
 
     let want_telemetry = query.includes_telemetry();
     let params = nanosiem_core::source_configs::ListParams {
@@ -354,8 +353,7 @@ pub async fn get_source_config(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<SourceConfiguration>, ApiError> {
-    check_permission(&auth, SOURCE_CONFIGS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: source_configs:view".to_string()))?;
+    ensure_permission(&auth, SOURCE_CONFIGS_VIEW)?;
 
     let config = state.source_config_service.get(*id).await?;
     Ok(Json(config))
@@ -381,8 +379,7 @@ pub async fn get_source_config_with_rules(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<SourceConfigurationWithRules>, ApiError> {
-    check_permission(&auth, SOURCE_CONFIGS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: source_configs:view".to_string()))?;
+    ensure_permission(&auth, SOURCE_CONFIGS_VIEW)?;
 
     let mut config = state.source_config_service.get_with_rules(*id).await?;
 
@@ -420,9 +417,7 @@ pub async fn create_source_config(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<NewSourceConfiguration>,
 ) -> Result<Json<SourceConfiguration>, ApiError> {
-    check_permission(&auth, SOURCE_CONFIGS_CREATE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: source_configs:create".to_string())
-    })?;
+    ensure_permission(&auth, SOURCE_CONFIGS_CREATE)?;
 
     let config = state.source_config_service.create(request).await?;
 
@@ -462,8 +457,7 @@ pub async fn update_source_config(
     Path(id): Path<TypeIdParam>,
     Json(request): Json<UpdateSourceConfiguration>,
 ) -> Result<Json<SourceConfiguration>, ApiError> {
-    check_permission(&auth, SOURCE_CONFIGS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: source_configs:edit".to_string()))?;
+    ensure_permission(&auth, SOURCE_CONFIGS_EDIT)?;
 
     let config = state.source_config_service.update(*id, request).await?;
 
@@ -500,9 +494,7 @@ pub async fn delete_source_config(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, SOURCE_CONFIGS_DELETE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: source_configs:delete".to_string())
-    })?;
+    ensure_permission(&auth, SOURCE_CONFIGS_DELETE)?;
 
     state.source_config_service.delete(*id).await?;
 
@@ -547,8 +539,7 @@ pub async fn toggle_source_config(
     Path(id): Path<TypeIdParam>,
     Json(request): Json<ToggleRequest>,
 ) -> Result<Json<SourceConfiguration>, ApiError> {
-    check_permission(&auth, SOURCE_CONFIGS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: source_configs:edit".to_string()))?;
+    ensure_permission(&auth, SOURCE_CONFIGS_EDIT)?;
 
     let config = state
         .source_config_service
@@ -589,9 +580,7 @@ pub async fn deploy_source_config(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<DeploymentResult>, ApiError> {
-    check_permission(&auth, SOURCE_CONFIGS_DEPLOY).map_err(|_| {
-        ApiError::Forbidden("Missing permission: source_configs:deploy".to_string())
-    })?;
+    ensure_permission(&auth, SOURCE_CONFIGS_DEPLOY)?;
 
     let result = state.source_config_service.deploy(*id).await?;
 
@@ -629,9 +618,7 @@ pub async fn undeploy_source_config(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<DeploymentResult>, ApiError> {
-    check_permission(&auth, SOURCE_CONFIGS_DEPLOY).map_err(|_| {
-        ApiError::Forbidden("Missing permission: source_configs:deploy".to_string())
-    })?;
+    ensure_permission(&auth, SOURCE_CONFIGS_DEPLOY)?;
 
     let result = state.source_config_service.undeploy(*id).await?;
 
@@ -664,9 +651,7 @@ pub async fn deploy_all_source_configs(
     Extension(auth): Extension<AuthContext>,
     Extension(client): Extension<ClientContext>,
 ) -> Result<Json<Vec<DeploymentResult>>, ApiError> {
-    check_permission(&auth, SOURCE_CONFIGS_DEPLOY).map_err(|_| {
-        ApiError::Forbidden("Missing permission: source_configs:deploy".to_string())
-    })?;
+    ensure_permission(&auth, SOURCE_CONFIGS_DEPLOY)?;
 
     let results = state.source_config_service.deploy_all().await?;
 
@@ -709,8 +694,7 @@ pub async fn get_source_config_deployments(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<Vec<SourceConfigDeployment>>, ApiError> {
-    check_permission(&auth, SOURCE_CONFIGS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: source_configs:view".to_string()))?;
+    ensure_permission(&auth, SOURCE_CONFIGS_VIEW)?;
 
     let history = state
         .source_config_service
@@ -743,8 +727,7 @@ pub async fn list_routing_rules(
     Extension(auth): Extension<AuthContext>,
     Path(source_config_id): Path<TypeIdParam>,
 ) -> Result<Json<Vec<RoutingRule>>, ApiError> {
-    check_permission(&auth, SOURCE_CONFIGS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: source_configs:view".to_string()))?;
+    ensure_permission(&auth, SOURCE_CONFIGS_VIEW)?;
 
     let rules = state
         .source_config_service
@@ -777,8 +760,7 @@ pub async fn create_routing_rule(
     Path(source_config_id): Path<TypeIdParam>,
     Json(request): Json<NewRoutingRule>,
 ) -> Result<Json<RoutingRule>, ApiError> {
-    check_permission(&auth, SOURCE_CONFIGS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: source_configs:edit".to_string()))?;
+    ensure_permission(&auth, SOURCE_CONFIGS_EDIT)?;
 
     let rule = state
         .source_config_service
@@ -836,8 +818,7 @@ pub async fn update_routing_rule(
     Path(path): Path<RulePath>,
     Json(request): Json<UpdateRoutingRule>,
 ) -> Result<Json<RoutingRule>, ApiError> {
-    check_permission(&auth, SOURCE_CONFIGS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: source_configs:edit".to_string()))?;
+    ensure_permission(&auth, SOURCE_CONFIGS_EDIT)?;
 
     let rule = state
         .source_config_service
@@ -878,8 +859,7 @@ pub async fn delete_routing_rule(
     Extension(client): Extension<ClientContext>,
     Path(path): Path<RulePath>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, SOURCE_CONFIGS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: source_configs:edit".to_string()))?;
+    ensure_permission(&auth, SOURCE_CONFIGS_EDIT)?;
 
     state
         .source_config_service
@@ -930,8 +910,7 @@ pub async fn reorder_routing_rules(
     Path(source_config_id): Path<TypeIdParam>,
     Json(request): Json<ReorderRulesRequest>,
 ) -> Result<Json<Vec<RoutingRule>>, ApiError> {
-    check_permission(&auth, SOURCE_CONFIGS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: source_configs:edit".to_string()))?;
+    ensure_permission(&auth, SOURCE_CONFIGS_EDIT)?;
 
     let rule_order = request.rule_order.clone();
     let rules = state
@@ -1283,8 +1262,7 @@ pub async fn check_routing_rule_reachability(
     Path(id): Path<TypeIdParam>,
     Json(request): Json<CheckReachabilityRequest>,
 ) -> Result<Json<ReachabilityResult>, ApiError> {
-    check_permission(&auth, SOURCE_CONFIGS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: source_configs:view".to_string()))?;
+    ensure_permission(&auth, SOURCE_CONFIGS_VIEW)?;
 
     // Load the source config (404 if missing)
     let config = state.source_config_service.get(*id).await?;
@@ -1392,8 +1370,7 @@ pub async fn check_routing_rule_reachability(
 pub async fn list_source_config_types(
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<SourceConfigTypeInfo>>, ApiError> {
-    check_permission(&auth, SOURCE_CONFIGS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: source_configs:view".to_string()))?;
+    ensure_permission(&auth, SOURCE_CONFIGS_VIEW)?;
 
     let infos: Vec<SourceConfigTypeInfo> = SourceConfigType::all_types()
         .iter()

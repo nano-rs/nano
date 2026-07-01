@@ -19,10 +19,10 @@ use nanosiem_core::upload::{LookupMode, ParserConfig, UploadDestination};
 use nanosiem_core::{
     calculate_next_runs, describe_cron, merge_auth_headers, redact_auth_headers, validate_cron,
     JobExecution, NewScheduledJob, ScheduledJob, SchedulerError,
-    SchedulerService, SsrfConfig, SsrfError, SsrfValidator, UpdateScheduledJob,
+    SchedulerService, SsrfError, SsrfValidator, UpdateScheduledJob,
 };
 
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 /// Request body for upserting lookup table ingestion config
@@ -93,8 +93,7 @@ pub async fn get_lookup_ingestion(
     Extension(auth): Extension<AuthContext>,
     Path(name): Path<String>,
 ) -> Result<Json<Option<ScheduledJob>>, ApiError> {
-    check_permission(&auth, permissions::LOOKUP_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: lookup:view".to_string()))?;
+    ensure_permission(&auth, permissions::LOOKUP_VIEW)?;
 
     let scheduler_service = SchedulerService::new(state.pool.clone());
 
@@ -136,8 +135,7 @@ pub async fn upsert_lookup_ingestion(
     Path(name): Path<String>,
     Json(request): Json<UpsertLookupIngestionRequest>,
 ) -> Result<Json<ScheduledJob>, ApiError> {
-    check_permission(&auth, permissions::LOOKUP_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: lookup:edit".to_string()))?;
+    ensure_permission(&auth, permissions::LOOKUP_EDIT)?;
 
     validate_ingestion_url(&request.url).await?;
 
@@ -234,8 +232,7 @@ pub async fn delete_lookup_ingestion(
     Extension(auth): Extension<AuthContext>,
     Path(name): Path<String>,
 ) -> Result<Json<IngestionDeleteResponse>, ApiError> {
-    check_permission(&auth, permissions::LOOKUP_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: lookup:edit".to_string()))?;
+    ensure_permission(&auth, permissions::LOOKUP_EDIT)?;
 
     let scheduler_service = SchedulerService::new(state.pool.clone());
 
@@ -270,8 +267,7 @@ pub async fn trigger_lookup_ingestion(
     Extension(auth): Extension<AuthContext>,
     Path(name): Path<String>,
 ) -> Result<Json<JobExecution>, ApiError> {
-    check_permission(&auth, permissions::LOOKUP_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: lookup:edit".to_string()))?;
+    ensure_permission(&auth, permissions::LOOKUP_EDIT)?;
 
     let scheduler_service = SchedulerService::new(state.pool.clone());
 
@@ -311,8 +307,7 @@ pub async fn enable_lookup_ingestion(
     Extension(auth): Extension<AuthContext>,
     Path(name): Path<String>,
 ) -> Result<Json<ScheduledJob>, ApiError> {
-    check_permission(&auth, permissions::LOOKUP_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: lookup:edit".to_string()))?;
+    ensure_permission(&auth, permissions::LOOKUP_EDIT)?;
 
     let scheduler_service = SchedulerService::new(state.pool.clone());
 
@@ -356,8 +351,7 @@ pub async fn disable_lookup_ingestion(
     Extension(auth): Extension<AuthContext>,
     Path(name): Path<String>,
 ) -> Result<Json<ScheduledJob>, ApiError> {
-    check_permission(&auth, permissions::LOOKUP_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: lookup:edit".to_string()))?;
+    ensure_permission(&auth, permissions::LOOKUP_EDIT)?;
 
     let scheduler_service = SchedulerService::new(state.pool.clone());
 
@@ -429,13 +423,7 @@ pub async fn validate_cron_expression(
 /// Errors are mapped to a generic message for IP-class rejections to avoid
 /// using validation responses as a DNS/internal-host oracle (matches NAN-679).
 async fn validate_ingestion_url(url: &str) -> Result<(), ApiError> {
-    let validator = SsrfValidator::new(SsrfConfig {
-        allow_http: true,
-        blocked_domains: Vec::new(),
-        max_redirects: 5,
-        ..Default::default()
-    });
-    validator
+    SsrfValidator::http_allowed_validator()
         .validate_with_dns(url)
         .await
         .map(|_| ())

@@ -41,7 +41,6 @@ tracing-subscriber.workspace = true
 axum.workspace = true
 tower.workspace = true
 tower-http.workspace = true
-sqlparser.workspace = true
 regex = "1.12"
 async-stream = "0.3"
 async-trait = "0.1"

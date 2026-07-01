@@ -10,7 +10,7 @@
 //! - Cloud metadata endpoints (169.254.169.254, etc.)
 //! - Non-HTTP(S) schemes
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 use thiserror::Error;
 use url::Url;
@@ -111,6 +111,105 @@ impl SsrfValidator {
     /// Create a validator with default settings (blocks HTTP, private IPs, metadata endpoints)
     pub fn default_secure() -> Self {
         Self::new(SsrfConfig::default())
+    }
+
+    /// Validator for outbound fetches that may legitimately target a plain
+    /// `http://` endpoint (internal/legacy threat feeds, on-prem S3-compatible
+    /// object stores, IPinfo Lite mirrors, synthetic probes, scheduler feeds)
+    /// while keeping every IP-class guard intact.
+    ///
+    /// Equivalent to `SsrfValidator::new(SsrfConfig { allow_http: true,
+    /// ..Default::default() })`: loopback, RFC1918, link-local, CGNAT, IPv6
+    /// loopback/ULA, and cloud-metadata targets stay blocked (no private-network
+    /// opt-in here — see [`ai_base_url_validator`] for that). Use this instead
+    /// of re-spelling the `allow_http: true` literal at every call site.
+    pub fn http_allowed_validator() -> Self {
+        Self::new(SsrfConfig {
+            allow_http: true,
+            ..Default::default()
+        })
+    }
+
+    /// SSRF-validate `url_str` and resolve it to the exact socket addresses that
+    /// are safe to pin into an outbound `reqwest` client.
+    ///
+    /// This is the shared form of the validate-then-pin sequence every
+    /// SSRF-sensitive *fetcher* (not merely a pre-flight validator) needs, so
+    /// the DNS-rebinding (TOCTOU) guard lives in exactly one place:
+    ///
+    /// 1. [`validate_with_dns`](Self::validate_with_dns) — parse, scheme /
+    ///    blocked-domain / metadata-hostname checks, and a first DNS resolution
+    ///    whose every answer must pass the IP-class checks. Rejects bad URLs
+    ///    early.
+    /// 2. If the host is an IP literal, it was already validated in step 1 and
+    ///    `reqwest` dials it directly, so an **empty** addr vec is returned (no
+    ///    `resolve_to_addrs` override is needed). `url::Url::host_str` returns
+    ///    IPv6 literals without brackets (`::1`, not `[::1]`), so both forms are
+    ///    caught here.
+    /// 3. Otherwise re-resolve the host — bounded by the same DNS timeout as
+    ///    `validate_with_dns` so a slow / poisoned resolver can't pin a worker —
+    ///    and validate **every** address from this second lookup with
+    ///    [`validate_ip_address`](Self::validate_ip_address). This catches a
+    ///    resolver that flipped a public answer to an internal one between the
+    ///    two lookups (the rebinding window).
+    /// 4. Return the parsed [`Url`] plus the validated [`SocketAddr`]s. The
+    ///    caller pins them into its client via
+    ///    `ClientBuilder::resolve_to_addrs`, so the connection dials *these*
+    ///    addresses and never a later, unvalidated DNS answer.
+    ///
+    /// The caller owns client construction and maps [`SsrfError`] to its own
+    /// error type.
+    pub async fn validate_and_resolve(
+        &self,
+        url_str: &str,
+    ) -> Result<(Url, Vec<SocketAddr>), SsrfError> {
+        // Step 1: full pre-flight validation incl. a first DNS resolution.
+        let url = self.validate_with_dns(url_str).await?;
+
+        let host = url.host_str().ok_or(SsrfError::MissingHostname)?;
+
+        // Step 2: IP-literal hosts were already validated; reqwest dials them
+        // directly, so no pinning override is required.
+        if host.parse::<IpAddr>().is_ok() {
+            return Ok((url, Vec::new()));
+        }
+
+        // Step 3: re-resolve and re-validate every address (rebinding guard).
+        let port = url.port_or_known_default().unwrap_or(443);
+        let host_owned = host.to_string();
+        let resolve_target = format!("{}:{}", host_owned, port);
+        let timeout = self
+            .config
+            .dns_timeout
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_DNS_TIMEOUT_SECS));
+
+        let addrs: Vec<SocketAddr> =
+            match tokio::time::timeout(timeout, tokio::net::lookup_host(resolve_target)).await {
+                Ok(Ok(iter)) => iter.collect(),
+                Ok(Err(e)) => {
+                    return Err(SsrfError::DnsResolutionFailed(host_owned, e.to_string()));
+                }
+                Err(_elapsed) => {
+                    return Err(SsrfError::DnsResolutionFailed(
+                        host_owned,
+                        format!("DNS resolution timed out after {:?}", timeout),
+                    ));
+                }
+            };
+
+        if addrs.is_empty() {
+            return Err(SsrfError::DnsResolutionFailed(
+                host_owned,
+                "No addresses resolved".to_string(),
+            ));
+        }
+
+        for addr in &addrs {
+            self.validate_ip_address(addr.ip())?;
+        }
+
+        // Step 4: hand back the parsed URL + validated, pinnable addresses.
+        Ok((url, addrs))
     }
 
     /// Validate a URL string before fetching
@@ -877,5 +976,85 @@ mod tests {
             "validate_with_dns hung past timeout: took {:?}",
             elapsed
         );
+    }
+
+    // NAN-1617: the shared `validate_and_resolve` helper is the single
+    // TOCTOU/SSRF guard behind every outbound fetcher (enrichment, synthetic
+    // probes, tiering S3). These assert no IP-class check was lost when the
+    // three hand-rolled copies were collapsed into it.
+    #[tokio::test]
+    async fn validate_and_resolve_rejects_blocked_ip_literals() {
+        let v = SsrfValidator::http_allowed_validator();
+
+        // Cloud metadata — the highest-value SSRF objective.
+        assert!(
+            matches!(
+                v.validate_and_resolve("http://169.254.169.254/latest/meta-data/")
+                    .await,
+                Err(SsrfError::MetadataEndpointBlocked(_))
+            ),
+            "metadata endpoint must be rejected"
+        );
+
+        // Loopback.
+        assert!(
+            matches!(
+                v.validate_and_resolve("http://127.0.0.1:8080/").await,
+                Err(SsrfError::LocalhostBlocked)
+            ),
+            "loopback must be rejected"
+        );
+
+        // RFC1918 private.
+        assert!(
+            matches!(
+                v.validate_and_resolve("http://10.0.0.5/internal").await,
+                Err(SsrfError::PrivateIpBlocked(_))
+            ),
+            "RFC1918 private address must be rejected"
+        );
+
+        // Link-local (non-metadata).
+        assert!(
+            matches!(
+                v.validate_and_resolve("http://169.254.1.1/").await,
+                Err(SsrfError::LinkLocalBlocked(_))
+            ),
+            "link-local address must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_and_resolve_allows_public_ip_literal_with_empty_pin() {
+        // A public IP literal is allowed and needs no resolve_to_addrs override
+        // (reqwest dials the literal): the documented empty-Vec contract.
+        let v = SsrfValidator::http_allowed_validator();
+        let (url, addrs) = v
+            .validate_and_resolve("http://8.8.8.8/")
+            .await
+            .expect("public IP literal must be allowed");
+        assert_eq!(url.host_str(), Some("8.8.8.8"));
+        assert!(
+            addrs.is_empty(),
+            "IP-literal host must return no pinned addrs (reqwest dials the literal)"
+        );
+    }
+
+    // Network-dependent: confirms an allowed *hostname* returns non-empty,
+    // pre-validated pinned addrs (the rebinding guard's positive path). Ignored
+    // by default because it needs a working resolver + egress.
+    #[tokio::test]
+    #[ignore = "requires DNS + egress; run manually"]
+    async fn validate_and_resolve_pins_resolved_addrs_for_public_host() {
+        let v = SsrfValidator::http_allowed_validator();
+        let (_url, addrs) = v
+            .validate_and_resolve("https://one.one.one.one/")
+            .await
+            .expect("public host must resolve and validate");
+        assert!(!addrs.is_empty(), "expected pinned addrs for a hostname");
+        for addr in &addrs {
+            v.validate_ip_address(addr.ip())
+                .expect("every pinned addr must pass the IP-class checks");
+        }
     }
 }

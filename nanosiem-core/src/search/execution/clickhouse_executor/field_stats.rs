@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 use super::sql_helpers::escape_question_marks_in_strings;
 use super::types::ClickHouseExecutor;
 use crate::search::{parse_clickhouse_error, FieldInfo, SearchError};
+use crate::sql_hygiene::escape_sql_string;
 
 /// Build the SQL that enumerates top-level ext (JSON) field names from recent data.
 ///
@@ -146,7 +147,7 @@ impl ClickHouseExecutor {
         // Escape single quotes in the table name to avoid injection in the
         // string literal (table names are internal/registry-derived, but keep
         // it safe regardless).
-        let table_lit = table.replace('\'', "''");
+        let table_lit = escape_sql_string(table);
         let sql = format!(
             r#"
             SELECT name, default_kind

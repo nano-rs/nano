@@ -1972,7 +1972,7 @@ fn doc_q_() {
 }
 
 #[test]
-fn doc_q__2() {
+fn doc_q_2() {
     npl("| inputlookup url=\"https://feeds.example.com/iocs.csv\" format=csv | table ip, category, threat_level");
 }
 

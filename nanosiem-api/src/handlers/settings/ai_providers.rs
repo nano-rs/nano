@@ -21,7 +21,7 @@ use utoipa::ToSchema;
 use super::check_not_managed;
 use crate::error::{ApiError, ErrorResponse};
 use crate::handlers::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::state::AppState;
 
 // ============================================================================
@@ -174,8 +174,7 @@ pub async fn list_ai_providers(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<ProviderCredentialsResponse>>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_AI)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_AI)?;
 
     let rows: Vec<sqlx::postgres::PgRow> = sqlx::query(
         r#"
@@ -235,8 +234,7 @@ pub async fn get_ai_provider(
     Extension(auth): Extension<AuthContext>,
     Path(provider): Path<String>,
 ) -> Result<Json<ProviderCredentialsResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_AI)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_AI)?;
 
     let row = sqlx::query(
         r#"
@@ -294,8 +292,7 @@ pub async fn update_ai_provider(
     Json(request): Json<UpdateProviderCredentialsRequest>,
 ) -> Result<Json<ProviderCredentialsResponse>, ApiError> {
     check_not_managed(&state)?;
-    check_permission(&auth, permissions::SETTINGS_AI)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_AI)?;
 
     // SSRF guard (NAN-1368): reject a loopback / private / link-local /
     // cloud-metadata base_url before it is ever persisted, so neither the
@@ -606,8 +603,7 @@ pub async fn validate_ai_provider(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use nanosiem_core::crypto::EncryptedData;
 
-    check_permission(&auth, permissions::SETTINGS_AI)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_AI)?;
 
     // Get credentials for this provider
     use sqlx::Row;
@@ -1008,8 +1004,7 @@ pub async fn list_agent_model_configs(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<AgentModelConfigResponse>>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_AI)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_AI)?;
 
     let rows: Vec<sqlx::postgres::PgRow> = sqlx::query(
         r#"
@@ -1064,8 +1059,7 @@ pub async fn get_agent_model_config(
     Extension(auth): Extension<AuthContext>,
     Path(agent_id): Path<String>,
 ) -> Result<Json<AgentModelConfigResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_AI)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_AI)?;
 
     let row = sqlx::query(
         r#"
@@ -1123,8 +1117,7 @@ pub async fn update_agent_model_config(
 ) -> Result<Json<AgentModelConfigResponse>, ApiError> {
     use nanosiem_enterprise::melod::AgentId;
 
-    check_permission(&auth, permissions::SETTINGS_AI)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_AI)?;
 
     // Try to use the registry to update (this invalidates cache)
     let registry_guard = state.agent_config_registry.read().await;
@@ -1252,8 +1245,7 @@ pub async fn list_available_models(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<AvailableModelResponse>>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_AI)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_AI)?;
 
     let rows: Vec<sqlx::postgres::PgRow> = sqlx::query(
         r#"
@@ -1309,8 +1301,7 @@ pub async fn list_all_available_models(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<AvailableModelResponse>>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_AI)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_AI)?;
 
     let rows: Vec<sqlx::postgres::PgRow> = sqlx::query(
         r#"
@@ -1366,8 +1357,7 @@ pub async fn create_available_model(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<CreateAvailableModelRequest>,
 ) -> Result<Json<AvailableModelResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_AI)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_AI)?;
 
     // --- Input validation & sanitization ---
     let model_id = request.model_id.trim().to_string();
@@ -1549,8 +1539,7 @@ pub async fn update_available_model(
     Path(model_id): Path<String>,
     Json(request): Json<UpdateAvailableModelRequest>,
 ) -> Result<Json<AvailableModelResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_AI)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_AI)?;
 
     // --- Input validation ---
     if let Some(ref dn) = request.display_name {
@@ -1727,8 +1716,7 @@ pub async fn delete_available_model(
     Extension(client): Extension<ClientContext>,
     Path(model_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_AI)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_AI)?;
 
     // Fetch provider before deleting (needed for client cache invalidation)
     let provider: Option<String> =
@@ -1807,8 +1795,7 @@ pub async fn sync_model_catalog(
     Extension(auth): Extension<AuthContext>,
     Extension(client): Extension<ClientContext>,
 ) -> Result<Json<ModelCatalogSyncResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_AI)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_AI)?;
 
     let service = nanosiem_enterprise::melod::ModelCatalogSyncService::new(state.pool.clone());
 
@@ -1858,8 +1845,7 @@ pub async fn get_model_catalog_status(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<ModelCatalogStatusResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_AI)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:ai".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_AI)?;
 
     let row = sqlx::query(
         r#"

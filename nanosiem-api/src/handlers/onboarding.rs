@@ -18,7 +18,7 @@ use nanosiem_core::onboarding::{
 use tracing::warn;
 
 use crate::error::ApiError;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::state::AppState;
 use nanosiem_core::auth::permissions;
 
@@ -157,8 +157,7 @@ pub async fn dismiss_onboarding(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<OnboardingProgress>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:view".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_VIEW)?;
 
     let progress = state
         .onboarding_repo
@@ -183,8 +182,7 @@ pub async fn reset_onboarding(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<OnboardingProgress>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:view".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_VIEW)?;
 
     let progress = state
         .onboarding_repo
@@ -209,8 +207,7 @@ pub async fn get_onboarding_status(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<OnboardingStatus>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:view".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_VIEW)?;
 
     // Check if any AI provider is configured. AI providers live in the
     // enterprise meloD stack — open-core builds always report `false`.

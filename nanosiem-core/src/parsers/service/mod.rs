@@ -3,18 +3,14 @@
 //! Parser service for business logic
 //!
 //! Submodules organized by concern:
-//! - `config_gen`: Vector TOML configuration generation
 //! - `credentials`: Cloud credential injection for parsers
 //! - `crud`: Parser CRUD operations (create, read, update, delete, enable, disable)
 //! - `deployment`: Parser deployment lifecycle (deploy, undeploy, rollback)
-//! - `library`: Parser library management
 //! - `validation`: VRL and UDM field validation
 
-mod config_gen;
 mod credentials;
 mod crud;
 mod deployment;
-mod library;
 mod validation;
 
 #[cfg(test)]
@@ -26,7 +22,7 @@ use thiserror::Error;
 
 use super::credential_repository::{CredentialRepository, CredentialRepositoryError};
 use super::repository::ParserRepositoryError;
-use super::repository::{ParserLibraryRepository, ParserRepository};
+use super::repository::ParserRepository;
 use super::validator::VrlValidator;
 use super::vector_config::{VectorConfigError, VectorConfigManager};
 
@@ -96,9 +92,5 @@ impl ParserService {
 
     fn credential_repository(&self) -> CredentialRepository {
         CredentialRepository::new(self.pool.clone())
-    }
-
-    fn library_repository(&self) -> ParserLibraryRepository {
-        ParserLibraryRepository::new(self.pool.clone())
     }
 }

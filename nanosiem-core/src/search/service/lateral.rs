@@ -97,8 +97,8 @@ impl SearchService {
             .table_names
             .read(Self::logs_table_key(self.active_profile.as_ref()));
         let lateral_columns = self.lateral_columns();
-        let start_str = time_range.start.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
-        let end_str = time_range.end.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+        let start_str = crate::sql_hygiene::format_ch_bound_micros(&time_range.start).to_string();
+        let end_str = crate::sql_hygiene::format_ch_bound_micros(&time_range.end).to_string();
 
         // Resolve the physical columns the hop predicates reference through the
         // active schema profile (NAN-1241). Under UDM each resolves to its own name

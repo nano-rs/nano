@@ -1622,55 +1622,6 @@ export interface TlsSourceConfig {
   key_content?: string;
 }
 
-/** Kafka source configuration */
-export interface KafkaSourceConfig {
-  bootstrap_servers: string;
-  topics: string[];
-  group_id: string;
-  auto_offset_reset?: 'earliest' | 'latest';
-}
-
-/** AWS S3 source configuration */
-export interface S3SourceConfig {
-  sqs_queue_url: string;
-  region: string;
-  compression?: 'auto' | 'gzip' | 'zstd' | 'none';
-  endpoint?: string;  // For S3-compatible storage
-}
-
-/** GCP Pub/Sub source configuration */
-export interface GcpPubSubSourceConfig {
-  project: string;
-  subscription: string;
-  ack_deadline_secs?: number;
-  endpoint?: string;  // For emulators/custom endpoints
-}
-
-/** Splunk HEC source configuration */
-export interface SplunkHecSourceConfig {
-  address: string;
-  valid_tokens: string[];
-  permit_origin?: string[];
-  tls?: TlsSourceConfig;
-}
-
-/** Vector-to-Vector source configuration */
-export interface VectorSourceConfig {
-  address: string;
-  version?: '1' | '2';
-  permit_origin?: string[];
-  tls?: TlsSourceConfig;
-}
-
-/** Union type for all source configurations */
-export type SourceConfig =
-  | KafkaSourceConfig
-  | S3SourceConfig
-  | GcpPubSubSourceConfig
-  | SplunkHecSourceConfig
-  | VectorSourceConfig
-  | Record<string, unknown>;
-
 export interface CredentialListResponse {
   credentials: CloudCredential[];
   total: number;
@@ -1731,24 +1682,6 @@ export interface DeployParsersResponse {
   success: boolean;
   message: string;
   enabled_parsers: number;
-}
-
-// Parser Library types
-export interface ParserLibraryEntry {
-  id: string;
-  name: string;
-  display_name: string;
-  description?: string;
-  category: string;
-  vendor?: string;
-  source_type: string;
-  parser_vrl: string;
-  sample_logs: string[];
-  field_mappings: Record<string, string>;
-  version: string;
-  is_system: boolean;
-  created_at: string;
-  updated_at: string;
 }
 
 export interface ParserDeployment {
@@ -5272,48 +5205,6 @@ export interface SourceConfigDeploymentResult {
   action: string;
   message: string;
   deployment_id?: string;
-}
-
-// Connection config types
-export interface KafkaConnectionConfig {
-  bootstrap_servers: string;
-  topics: string[];
-  group_id: string;
-  auto_offset_reset?: string;
-}
-
-export interface AwsS3ConnectionConfig {
-  sqs_queue_url: string;
-  region: string;
-  compression?: string;
-  endpoint?: string;
-}
-
-export interface GcpPubSubConnectionConfig {
-  project: string;
-  subscription: string;
-  ack_deadline_secs?: number;
-}
-
-export interface SplunkHecConnectionConfig {
-  address: string;
-  valid_tokens: string[];
-  permit_origin?: string[];
-  tls?: TlsConfig;
-}
-
-export interface VectorConnectionConfig {
-  address: string;
-  version?: string;
-  permit_origin?: string[];
-  tls?: TlsConfig;
-}
-
-export interface TlsConfig {
-  enabled: boolean;
-  ca_content?: string;
-  crt_content?: string;
-  key_content?: string;
 }
 
 // ============================================================================

@@ -332,7 +332,7 @@ impl SignalProcessor {
 
     /// Format a DateTime for ClickHouse query interpolation
     fn format_datetime_for_ch(dt: &DateTime<Utc>) -> String {
-        dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+        crate::sql_hygiene::format_ch_bound_micros(dt)
     }
 
     /// Poll ClickHouse for new signals and process them.

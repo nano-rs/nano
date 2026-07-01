@@ -23,7 +23,7 @@ use nanosiem_core::typeid::TypeIdParam;
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{
     error::{ApiError, ErrorResponse},
     state::AppState,
@@ -110,8 +110,7 @@ pub async fn get_rule_predicates(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<RulePredicatesResponse>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     let rule = state.detection_service.get_rule(*id).await?;
 

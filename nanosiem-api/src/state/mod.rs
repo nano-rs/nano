@@ -15,7 +15,7 @@ mod schedulers;
 
 use nanosiem_core::audit::{AuditEmitter, AuditQueryService};
 use nanosiem_core::auth::{
-    ApiKeyRepository, ApiKeyService, AuditRepository, AuthConfig, AuthService, GroupRepository,
+    ApiKeyRepository, ApiKeyService, AuthConfig, AuthService, GroupRepository,
     OidcRepository, OidcService, PermissionService, RoleRepository, SessionConfig,
     SessionRepository, SessionService, TokenConfig, TokenService, UserRepository,
 };
@@ -126,8 +126,6 @@ pub struct AppState {
     pub group_repo: GroupRepository,
     /// Role repository
     pub role_repo: RoleRepository,
-    /// Audit repository
-    pub audit_repo: Arc<AuditRepository>,
     /// OIDC repository
     pub oidc_repo: OidcRepository,
     /// OIDC service
@@ -226,7 +224,6 @@ impl AppState {
         UserRepository,
         GroupRepository,
         RoleRepository,
-        Arc<AuditRepository>,
         bool,
     ) {
         // Check if auth is enabled (default: true in production, can be disabled for dev)
@@ -266,7 +263,6 @@ impl AppState {
         let group_repo = GroupRepository::new(pool.clone());
         let role_repo = RoleRepository::new(pool.clone());
         let session_repo = SessionRepository::new(pool.clone());
-        let audit_repo = Arc::new(AuditRepository::new(pool.clone()));
         let api_key_repo = ApiKeyRepository::new(pool.clone());
 
         // Create token service with a shared JTI denylist across both instances
@@ -306,7 +302,6 @@ impl AppState {
             user_repo.clone(),
             session_repo.clone(),
             group_repo.clone(),
-            (*audit_repo).clone(),
             token_service_for_auth,
             auth_config,
         ));
@@ -314,7 +309,6 @@ impl AppState {
         // Create API key service
         let api_key_service = Arc::new(ApiKeyService::new(
             api_key_repo,
-            (*audit_repo).clone(),
             RateLimitRepository::new(pool.clone()),
         ));
 
@@ -323,7 +317,6 @@ impl AppState {
         let session_service = Arc::new(SessionService::new(
             session_repo,
             user_repo.clone(),
-            (*audit_repo).clone(),
             session_config,
         ));
 
@@ -339,7 +332,6 @@ impl AppState {
             user_repo,
             group_repo,
             role_repo,
-            audit_repo,
             auth_enabled,
         )
     }

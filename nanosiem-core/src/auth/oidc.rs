@@ -23,8 +23,7 @@ use uuid::Uuid;
 use tracing::warn;
 
 use crate::auth::repository::{
-    audit_actions, AuditRepository, GroupRepository, OidcRepository, OidcRepositoryError,
-    UserRepository, UserRepositoryError,
+    GroupRepository, OidcRepository, OidcRepositoryError, UserRepository, UserRepositoryError,
 };
 use crate::auth::types::{OidcProvider, User};
 
@@ -231,7 +230,6 @@ pub struct OidcService {
     oidc_repo: OidcRepository,
     user_repo: UserRepository,
     group_repo: GroupRepository,
-    audit_repo: AuditRepository,
     http_client: Client,
     /// Cache for discovery documents
     discovery_cache: std::sync::Arc<tokio::sync::RwLock<HashMap<String, OidcDiscovery>>>,
@@ -244,13 +242,11 @@ impl OidcService {
         oidc_repo: OidcRepository,
         user_repo: UserRepository,
         group_repo: GroupRepository,
-        audit_repo: AuditRepository,
     ) -> Self {
         Self {
             oidc_repo,
             user_repo,
             group_repo,
-            audit_repo,
             // SSRF (NAN-1369): discovery/JWKS URLs are validated with
             // validate_with_dns, but the fetch must not follow a 302 to a
             // private/metadata IP. Use the shared restricted redirect policy
@@ -349,12 +345,6 @@ impl OidcService {
         }
 
         Ok(jwks)
-    }
-
-    /// Clear JWKS cache (useful when token validation fails)
-    pub async fn clear_jwks_cache(&self) {
-        let mut cache = self.jwks_cache.write().await;
-        cache.clear();
     }
 
     /// Get authorization URL for OIDC login
@@ -457,7 +447,7 @@ impl OidcService {
         redirect_uri: &str,
         ip_address: Option<&str>,
         user_agent: Option<&str>,
-    ) -> Result<(User, OidcUser), OidcError> {
+    ) -> Result<(User, OidcUser, bool), OidcError> {
         // Get provider
         let provider = self
             .oidc_repo
@@ -526,7 +516,7 @@ impl OidcService {
         let oidc_user = self.extract_user_info(&claims, &provider)?;
 
         // Provision or update user
-        let user = self
+        let (user, newly_created) = self
             .provision_user(&oidc_user, ip_address, user_agent)
             .await?;
 
@@ -534,7 +524,7 @@ impl OidcService {
         self.sync_groups(user.id, &oidc_user.groups, provider.id)
             .await?;
 
-        Ok((user, oidc_user))
+        Ok((user, oidc_user, newly_created))
     }
 
     /// Exchange authorization code for tokens
@@ -721,12 +711,18 @@ impl OidcService {
 
     /// Provision or update user from OIDC claims
     /// Requirements: 3.3, 3.8
+    /// Provisions (or links/updates) the local user for an OIDC identity.
+    ///
+    /// Returns the resolved `User` and a `bool` that is `true` only when a brand
+    /// new user was just-in-time created (so the caller can audit
+    /// `oidc_user_provisioned`); it is `false` for updates to an existing OIDC
+    /// user or links onto a pre-existing local account.
     pub async fn provision_user(
         &self,
         oidc_user: &OidcUser,
-        ip_address: Option<&str>,
-        user_agent: Option<&str>,
-    ) -> Result<User, OidcError> {
+        _ip_address: Option<&str>,
+        _user_agent: Option<&str>,
+    ) -> Result<(User, bool), OidcError> {
         // Try to find existing user by OIDC subject
         let existing_user = sqlx::query_as::<_, User>(
             "SELECT * FROM users WHERE oidc_provider_id = $1 AND oidc_subject = $2",
@@ -737,7 +733,7 @@ impl OidcService {
         .await
         .map_err(|e| OidcError::ProvisioningError(e.to_string()))?;
 
-        let user = if let Some(existing) = existing_user {
+        let (user, newly_created) = if let Some(existing) = existing_user {
             // Update existing user
             let updated_user = sqlx::query_as::<_, User>(
                 r#"
@@ -759,26 +755,7 @@ impl OidcService {
             .await
             .map_err(|e| OidcError::ProvisioningError(e.to_string()))?;
 
-            // Log the login
-            self.audit_repo
-                .log_event(
-                    Some(updated_user.id),
-                    None,
-                    audit_actions::LOGIN_SUCCESS,
-                    Some("user"),
-                    Some(updated_user.id),
-                    Some(serde_json::json!({
-                        "method": "oidc",
-                        "provider_id": oidc_user.provider_id,
-                    })),
-                    ip_address,
-                    user_agent,
-                    true,
-                )
-                .await
-                .ok();
-
-            updated_user
+            (updated_user, false)
         } else {
             // Check if user exists by email (might be a local user)
             let existing_by_email = self
@@ -823,27 +800,7 @@ impl OidcService {
                 .await
                 .map_err(|e| OidcError::ProvisioningError(e.to_string()))?;
 
-                // Log the login
-                self.audit_repo
-                    .log_event(
-                        Some(linked_user.id),
-                        None,
-                        audit_actions::LOGIN_SUCCESS,
-                        Some("user"),
-                        Some(linked_user.id),
-                        Some(serde_json::json!({
-                            "method": "oidc",
-                            "provider_id": oidc_user.provider_id,
-                            "linked_existing_account": true,
-                        })),
-                        ip_address,
-                        user_agent,
-                        true,
-                    )
-                    .await
-                    .ok();
-
-                linked_user
+                (linked_user, false)
             } else {
                 // Create new user (JIT provisioning)
                 let new_user = sqlx::query_as::<_, User>(
@@ -862,50 +819,11 @@ impl OidcService {
                 .await
                 .map_err(|e| OidcError::ProvisioningError(e.to_string()))?;
 
-                // Log the user creation and login
-                self.audit_repo
-                    .log_event(
-                        Some(new_user.id),
-                        None,
-                        audit_actions::USER_CREATE,
-                        Some("user"),
-                        Some(new_user.id),
-                        Some(serde_json::json!({
-                            "method": "oidc_jit_provisioning",
-                            "provider_id": oidc_user.provider_id,
-                            "email": oidc_user.email,
-                        })),
-                        ip_address,
-                        user_agent,
-                        true,
-                    )
-                    .await
-                    .ok();
-
-                self.audit_repo
-                    .log_event(
-                        Some(new_user.id),
-                        None,
-                        audit_actions::LOGIN_SUCCESS,
-                        Some("user"),
-                        Some(new_user.id),
-                        Some(serde_json::json!({
-                            "method": "oidc",
-                            "provider_id": oidc_user.provider_id,
-                            "first_login": true,
-                        })),
-                        ip_address,
-                        user_agent,
-                        true,
-                    )
-                    .await
-                    .ok();
-
-                new_user
+                (new_user, true)
             }
         };
 
-        Ok(user)
+        Ok((user, newly_created))
     }
 
     /// Sync user groups from OIDC claims

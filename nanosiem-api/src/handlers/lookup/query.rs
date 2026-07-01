@@ -9,7 +9,7 @@ use nanosiem_core::{BatchLookupQuery, LookupQuery};
 
 use super::lookup_error_to_api;
 use super::types::{LookupQueryRequest, LookupQueryResponse};
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 /// Execute a lookup query
@@ -33,8 +33,7 @@ pub async fn lookup_query(
     Extension(auth): Extension<AuthContext>,
     Json(query): Json<LookupQueryRequest>,
 ) -> Result<Json<LookupQueryResponse>, ApiError> {
-    check_permission(&auth, permissions::LOOKUP_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: lookup:view".to_string()))?;
+    ensure_permission(&auth, permissions::LOOKUP_VIEW)?;
 
     let lookup_service = state.lookup_service.clone();
 

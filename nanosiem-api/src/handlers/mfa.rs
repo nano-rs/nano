@@ -20,10 +20,9 @@ use crate::handlers::AuditExt;
 use crate::middleware::AuthContext;
 use crate::state::AppState;
 use crate::utils::{extract_client_ip, extract_user_agent};
-use nanosiem_core::audit::{AuditEvent, AuditSource, ClientContext};
-use nanosiem_core::auth::repository::audit_actions;
+use nanosiem_core::audit::{actions as audit_actions, AuditEvent, AuditSource, ClientContext};
 use nanosiem_core::auth::{
-    mfa, MfaChallengeRequest, MfaDisableRequest, MfaRegenerateBackupCodesRequest,
+    mfa, AuthError, MfaChallengeRequest, MfaDisableRequest, MfaRegenerateBackupCodesRequest,
     MfaSetupCompleteResponse, MfaSetupRequest, MfaSetupResponse, MfaStatusResponse,
     MfaVerifySetupRequest,
 };
@@ -467,8 +466,9 @@ pub async fn verify_mfa_challenge(
 ) -> Result<Response, (StatusCode, Json<MfaApiError>)> {
     let ip_address = extract_client_ip(&headers, Some(&addr));
     let user_agent = extract_user_agent(&headers);
+    let client_ctx = ClientContext::new(ip_address.clone(), user_agent.clone());
 
-    let response = state
+    let outcome = match state
         .auth_service
         .complete_mfa_login(
             &request.challenge_token,
@@ -478,15 +478,81 @@ pub async fn verify_mfa_challenge(
             user_agent.as_deref(),
         )
         .await
-        .map_err(|_| {
-            (
+    {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            // Only an actually-wrong MFA code is a failed *challenge*.
+            // `complete_mfa_login` returns `InvalidCredentials` for exactly that
+            // case (bad TOTP and no/invalid backup code). Every other error here
+            // — an invalid/expired challenge token, or a DB/role/session error
+            // that occurs AFTER a correct code during login completion — is NOT
+            // an MFA verification failure and must not be mis-audited as one, so
+            // it is left unaudited on this path.
+            if matches!(e, AuthError::InvalidCredentials) {
+                // The challenge token validated (we got past its check), so the
+                // actor resolves from it.
+                let actor_id = state
+                    .token_service
+                    .validate_mfa_challenge_token(&request.challenge_token)
+                    .ok()
+                    .map(|c| c.sub);
+                state.emit_audit(
+                    AuditEvent::builder(AuditSource::Auth, audit_actions::MFA_CHALLENGE_FAILED)
+                        .actor(actor_id, None)
+                        .resource("user", actor_id, None)
+                        .client_context(&client_ctx)
+                        .success(false)
+                        .details(serde_json::json!({ "reason": "invalid_mfa_code" }))
+                        .build(),
+                );
+            }
+            return Err((
                 StatusCode::UNAUTHORIZED,
                 Json(MfaApiError {
                     error: "invalid_credentials".into(),
                     message: "Invalid MFA code or expired challenge".into(),
                 }),
-            )
-        })?;
+            ));
+        }
+    };
+
+    let response = outcome.response;
+    let actor_id = response.user.id;
+    let actor_email = response.user.email.clone();
+
+    // A single-use backup code was consumed — defenders track these (a burst can
+    // indicate the user lost their authenticator or an attacker is draining
+    // codes).
+    if outcome.used_backup_code {
+        state.emit_audit(
+            AuditEvent::builder(AuditSource::Auth, audit_actions::MFA_BACKUP_CODE_USED)
+                .actor(Some(actor_id), Some(actor_email.clone()))
+                .resource("user", Some(actor_id), Some(actor_email.clone()))
+                .client_context(&client_ctx)
+                .build(),
+        );
+    }
+    // The MFA challenge was satisfied, and login completed. The non-MFA path
+    // emits login_success from the login handler; the MFA-completion path must
+    // emit its own (with mfa_verified) so MFA users' logins are audited too.
+    state.emit_audit(
+        AuditEvent::builder(AuditSource::Auth, audit_actions::MFA_CHALLENGE_SUCCESS)
+            .actor(Some(actor_id), Some(actor_email.clone()))
+            .resource("user", Some(actor_id), Some(actor_email.clone()))
+            .client_context(&client_ctx)
+            .details(serde_json::json!({
+                "method": if outcome.used_backup_code { "backup_code" } else { "totp" }
+            }))
+            .build(),
+    );
+    state.emit_audit(
+        AuditEvent::builder(AuditSource::Auth, audit_actions::LOGIN_SUCCESS)
+            .actor(Some(actor_id), Some(actor_email.clone()))
+            .resource("user", Some(actor_id), Some(actor_email))
+            .client_context(&client_ctx)
+            .details(serde_json::json!({ "mfa_verified": true }))
+            .build(),
+    );
 
     // Set cookies (same as normal login success)
     let access_cookie =

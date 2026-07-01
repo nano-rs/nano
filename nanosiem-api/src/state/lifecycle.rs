@@ -377,7 +377,6 @@ impl AppState {
             handles.push(self.start_enrichment_cache_cleanup());
         }
         handles.push(self.start_rate_limit_cleanup());
-        handles.push(self.start_audit_log_cleanup());
         handles.push(self.start_query_tracker_cleanup());
         handles.push(self.start_search_job_cleanup());
         handles.push(self.start_finding_emission_cleanup());

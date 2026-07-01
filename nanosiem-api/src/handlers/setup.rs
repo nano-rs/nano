@@ -259,25 +259,7 @@ pub async fn initialize_system(
         )
     })?;
 
-    // Log the setup completion (dual-write: PostgreSQL + ClickHouse)
-    let _ = state
-        .audit_repo
-        .log_event(
-            Some(user.id),
-            None,
-            "system_initialized",
-            Some("system"),
-            None,
-            Some(serde_json::json!({
-                "admin_email": request.email,
-                "admin_name": request.name,
-            })),
-            None,
-            None,
-            true,
-        )
-        .await;
-
+    // Log the setup completion to the ClickHouse audit store (system-of-record).
     state.emit_audit(
         AuditEvent::builder(AuditSource::Auth, SYSTEM_INITIALIZED)
             .actor(Some(user.id), Some(request.name.clone()))

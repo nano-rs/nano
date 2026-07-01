@@ -15,7 +15,7 @@ use nanosiem_core::auth::permissions;
 use nanosiem_core::{LookupUsage, RuleReferenceRow};
 
 use super::lookup_error_to_api;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 /// Maximum sample-join length, in characters, before we truncate.
@@ -56,8 +56,7 @@ pub async fn get_lookup_table_usage(
     Extension(auth): Extension<AuthContext>,
     Path(name): Path<String>,
 ) -> Result<Json<Vec<LookupUsage>>, ApiError> {
-    check_permission(&auth, permissions::LOOKUP_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: lookup:view".to_string()))?;
+    ensure_permission(&auth, permissions::LOOKUP_VIEW)?;
 
     let lookup_service = state.lookup_service.clone();
 

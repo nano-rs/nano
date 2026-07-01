@@ -24,8 +24,8 @@ pub mod tier_guard;
 pub use audit_authz::audit_authz_failures;
 pub use auth::{
     auth_middleware, check_all_permissions, check_any_permission, check_permission,
-    optional_auth_middleware, require_session_auth, require_session_or_self, AuthContext,
-    AuthErrorResponse, AuthState, PermissionGuard,
+    ensure_permission, optional_auth_middleware, require_session_auth, require_session_or_self,
+    AuthContext, AuthErrorResponse, AuthState,
 };
 pub use demo_guard::demo_guard;
 pub use ip_allowlist::{ip_allowlist_middleware, IpAllowlistState};

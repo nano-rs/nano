@@ -16,7 +16,6 @@ pub mod metrics;
 pub mod middleware;
 pub mod openapi;
 pub mod routes;
-pub mod sql_validator;
 pub mod state;
 pub mod utils;
 
@@ -24,5 +23,4 @@ pub use config::ApiConfig;
 pub use error::ApiError;
 pub use metrics::AppMetrics;
 pub use routes::create_router;
-pub use sql_validator::SqlValidator;
 pub use state::AppState;

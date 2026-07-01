@@ -21,7 +21,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ErrorResponse};
-use crate::middleware::{AuthContext, check_permission};
+use crate::middleware::{AuthContext, ensure_permission};
 use crate::state::AppState;
 use nanosiem_core::auth::permissions;
 use nanosiem_core::observability::{SloDefinition, SloRepository, SloRepositoryError, SloSliKind};
@@ -198,8 +198,7 @@ pub async fn list_slos(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<ListSlosResponse>, ApiError> {
-    check_permission(&auth, permissions::SEARCH_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:view".to_string()))?;
+    ensure_permission(&auth, permissions::SEARCH_VIEW)?;
 
     let repo = SloRepository::new(state.pool.clone());
     let defs = repo.list().await.map_err(map_repo_err)?;
@@ -230,8 +229,7 @@ pub async fn create_slo(
     Extension(auth): Extension<AuthContext>,
     Json(req): Json<SloRequest>,
 ) -> Result<(StatusCode, Json<Slo>), ApiError> {
-    check_permission(&auth, permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let (name, service, threshold) = req.validate()?;
 
@@ -289,8 +287,7 @@ pub async fn update_slo(
     Path(id): Path<TypeIdParam>,
     Json(req): Json<SloRequest>,
 ) -> Result<Json<Slo>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let (name, service, threshold) = req.validate()?;
 
@@ -330,8 +327,7 @@ pub async fn delete_slo(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<StatusCode, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let repo = SloRepository::new(state.pool.clone());
     let deleted = repo.delete(*id).await.map_err(map_repo_err)?;

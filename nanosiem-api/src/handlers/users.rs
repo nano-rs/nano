@@ -134,8 +134,8 @@ pub async fn list_users(
     check_permission(&auth, permissions::USERS_VIEW)
         .map_err(|(s, j)| (s, Json(UserApiError::new(&j.error, &j.message))))?;
 
-    let limit = query.limit.unwrap_or(50).min(100);
-    let offset = query.offset.unwrap_or(0);
+    let (limit, offset) =
+        nanosiem_api_lib::Pagination::new(query.limit, query.offset).resolved_capped(50, 100);
 
     let users = state
         .user_repo

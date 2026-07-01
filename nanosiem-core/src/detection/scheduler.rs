@@ -119,65 +119,6 @@ pub fn validate_cron_expression(cron: &str) -> Result<(), DetectionError> {
     Ok(())
 }
 
-/// Get a human-readable description of a cron expression
-pub fn describe_cron_expression(cron: &str) -> Result<String, DetectionError> {
-    // Validate first
-    validate_cron_expression(cron)?;
-
-    let fields: Vec<&str> = cron.split_whitespace().collect();
-
-    // Handle common patterns for 5-field format
-    if fields.len() == 5 {
-        let (min, hour, day, month, weekday) =
-            (fields[0], fields[1], fields[2], fields[3], fields[4]);
-
-        return Ok(match (min, hour, day, month, weekday) {
-            ("0", "0", "*", "*", "*") => "Daily at midnight".to_string(),
-            ("0", h, "*", "*", "*") if h != "*" => format!("Daily at {}:00", h),
-            (m, "*", "*", "*", "*") if m.starts_with("*/") => {
-                let interval = m.trim_start_matches("*/");
-                format!("Every {} minutes", interval)
-            }
-            ("0", "0", "1", "*", "*") => "Monthly on the 1st at midnight".to_string(),
-            ("0", "0", "*", "*", "0") | ("0", "0", "*", "*", "SUN") => {
-                "Weekly on Sunday at midnight".to_string()
-            }
-            ("0", "0", "*", "*", "1") | ("0", "0", "*", "*", "MON") => {
-                "Weekly on Monday at midnight".to_string()
-            }
-            _ => format!("Custom schedule: {}", cron),
-        });
-    }
-
-    // 6-field format
-    if fields.len() == 6 {
-        let (sec, min, hour, day, month, weekday) = (
-            fields[0], fields[1], fields[2], fields[3], fields[4], fields[5],
-        );
-
-        return Ok(match (sec, min, hour, day, month, weekday) {
-            ("0", "0", "0", "*", "*", "*") => "Daily at midnight".to_string(),
-            ("0", "0", h, "*", "*", "*") if h != "*" => format!("Daily at {}:00", h),
-            ("0", m, "*", "*", "*", "*") if m.starts_with("*/") => {
-                let interval = m.trim_start_matches("*/");
-                format!("Every {} minutes", interval)
-            }
-            _ => format!("Custom schedule: {}", cron),
-        });
-    }
-
-    Ok(format!("Custom schedule: {}", cron))
-}
-
-/// Calculate the next N run times for a cron expression
-pub fn calculate_next_runs(cron: &str, count: usize) -> Result<Vec<DateTime<Utc>>, DetectionError> {
-    let normalized = normalize_cron_expression(cron);
-    let schedule = Schedule::from_str(&normalized)
-        .map_err(|e| DetectionError::InvalidCronExpression(format!("{}: {}", cron, e)))?;
-
-    Ok(schedule.upcoming(Utc).take(count).collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,37 +168,6 @@ mod tests {
         // Daily at midnight
         let next = calculate_next_run("0 0 * * *", now);
         assert!(next > now);
-    }
-
-    #[test]
-    fn test_calculate_next_runs() {
-        let runs = calculate_next_runs("*/5 * * * *", 5).unwrap();
-        assert_eq!(runs.len(), 5);
-
-        // Verify they are in order
-        for i in 1..runs.len() {
-            assert!(runs[i] > runs[i - 1]);
-        }
-    }
-
-    #[test]
-    fn test_describe_cron_expression() {
-        assert_eq!(
-            describe_cron_expression("0 0 * * *").unwrap(),
-            "Daily at midnight"
-        );
-        assert_eq!(
-            describe_cron_expression("0 12 * * *").unwrap(),
-            "Daily at 12:00"
-        );
-        assert_eq!(
-            describe_cron_expression("*/5 * * * *").unwrap(),
-            "Every 5 minutes"
-        );
-        assert_eq!(
-            describe_cron_expression("*/2 * * * *").unwrap(),
-            "Every 2 minutes"
-        );
     }
 
     #[test]

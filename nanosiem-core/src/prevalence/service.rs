@@ -200,25 +200,6 @@ impl PrevalenceService {
         self.config.read().await.rarity_threshold
     }
 
-    /// Reload configuration from the database
-    ///
-    /// This method reloads the configuration from PostgreSQL, enabling
-    /// hot-reload of settings without service restart.
-    ///
-    /// Requirement: 8.5
-    pub async fn reload_config(&self, pg_pool: &sqlx::PgPool) -> Result<(), PrevalenceError> {
-        use super::settings::PrevalenceSettings;
-
-        let settings = PrevalenceSettings::new(pg_pool.clone());
-        let new_config = settings.get_config().await.map_err(|e| {
-            PrevalenceError::InvalidArtifact(format!("Failed to load config: {}", e))
-        })?;
-
-        self.update_config(new_config).await;
-        debug!("Prevalence config reloaded from database");
-        Ok(())
-    }
-
     /// Query prevalence for a single hash
     #[instrument(skip(self))]
     pub async fn get_hash_prevalence(
@@ -1193,90 +1174,6 @@ impl PrevalenceService {
         }
     }
 
-    /// Extract parent domain from a subdomain
-    ///
-    /// Examples:
-    /// - "evil.example.com" → Some("example.com")
-    /// - "sub.evil.example.com" → Some("example.com")
-    /// - "example.com" → None (already a root domain)
-    /// - "192.168.1.1" → None (IP address)
-    /// - "localhost" → None (single label)
-    pub fn extract_parent_domain(domain: &str) -> Option<String> {
-        // Check if it's an IP address
-        if domain.parse::<std::net::IpAddr>().is_ok() {
-            return None;
-        }
-
-        let parts: Vec<&str> = domain.split('.').collect();
-
-        // Need at least 3 parts for a subdomain (sub.example.com)
-        if parts.len() < 3 {
-            return None;
-        }
-
-        // Handle common TLDs (simplified - a full implementation would use a TLD list)
-        let tld_count = if parts.len() >= 2 {
-            let last_two = format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1]);
-            // Common two-part TLDs
-            if matches!(
-                last_two.as_str(),
-                "co.uk"
-                    | "co.jp"
-                    | "co.nz"
-                    | "co.za"
-                    | "com.au"
-                    | "com.br"
-                    | "org.uk"
-                    | "net.au"
-                    | "gov.uk"
-                    | "ac.uk"
-                    | "edu.au"
-            ) {
-                2
-            } else {
-                1
-            }
-        } else {
-            1
-        };
-
-        // Calculate how many parts make up the parent domain
-        let parent_parts = tld_count + 1;
-
-        if parts.len() <= parent_parts {
-            return None;
-        }
-
-        // Extract parent domain
-        let parent = parts[parts.len() - parent_parts..].join(".");
-        Some(parent)
-    }
-
-    /// Get prevalence for both a domain and its parent domain
-    #[instrument(skip(self))]
-    pub async fn get_domain_with_parent_prevalence(
-        &self,
-        domain: &str,
-        time_window: TimeWindow,
-    ) -> Result<(PrevalenceData, Option<PrevalenceData>), PrevalenceError> {
-        let domain_data = self.get_domain_prevalence(domain, time_window).await?;
-
-        let parent_data = if let Some(parent) = Self::extract_parent_domain(domain) {
-            Some(self.get_domain_prevalence(&parent, time_window).await?)
-        } else {
-            None
-        };
-
-        Ok((domain_data, parent_data))
-    }
-
-    /// Invalidate all cached prevalence data
-    pub async fn invalidate_cache(&self) {
-        let mut cache = self.cache.write().await;
-        cache.invalidate_all();
-        debug!("Prevalence cache invalidated");
-    }
-
     /// Get scatter plot data for a set of artifacts
     #[instrument(skip(self, hashes, domains, ips))]
     pub async fn get_scatter_data(
@@ -1355,51 +1252,6 @@ pub enum PrevalenceError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_extract_parent_domain_subdomain() {
-        assert_eq!(
-            PrevalenceService::extract_parent_domain("evil.example.com"),
-            Some("example.com".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_parent_domain_deep_subdomain() {
-        assert_eq!(
-            PrevalenceService::extract_parent_domain("sub.evil.example.com"),
-            Some("example.com".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_parent_domain_root() {
-        assert_eq!(
-            PrevalenceService::extract_parent_domain("example.com"),
-            None
-        );
-    }
-
-    #[test]
-    fn test_extract_parent_domain_ip() {
-        assert_eq!(
-            PrevalenceService::extract_parent_domain("192.168.1.1"),
-            None
-        );
-    }
-
-    #[test]
-    fn test_extract_parent_domain_single_label() {
-        assert_eq!(PrevalenceService::extract_parent_domain("localhost"), None);
-    }
-
-    #[test]
-    fn test_extract_parent_domain_two_part_tld() {
-        assert_eq!(
-            PrevalenceService::extract_parent_domain("evil.example.co.uk"),
-            Some("example.co.uk".to_string())
-        );
-    }
 
     #[test]
     fn test_cache_entry_expiration() {

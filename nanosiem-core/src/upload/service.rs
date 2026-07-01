@@ -511,12 +511,6 @@ impl UploadService {
     pub async fn delete_upload(&self, upload_id: Uuid) -> Result<bool, UploadError> {
         Ok(self.repository.delete_upload(upload_id).await?)
     }
-
-    /// Get upload statistics
-    #[instrument(skip(self))]
-    pub async fn get_stats(&self) -> Result<super::repository::UploadStats, UploadError> {
-        Ok(self.repository.get_stats().await?)
-    }
 }
 
 /// Internal struct for collecting column statistics

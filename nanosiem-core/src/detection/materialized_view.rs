@@ -444,7 +444,7 @@ WHERE {}
   AND timestamp >= now() - INTERVAL 1 HOUR"#,
             view_name,
             rule.id,
-            rule.name.replace('\'', "''"), // Escape single quotes
+            crate::sql_hygiene::escape_sql_string(&rule.name), // Escape backslashes + single quotes
             format!("{:?}", rule.severity).to_lowercase(),
             risk_score,
             risk_entity_sql,

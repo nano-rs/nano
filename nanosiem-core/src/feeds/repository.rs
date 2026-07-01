@@ -50,7 +50,7 @@ impl FeedRepository {
             if !values.is_empty() {
                 let escaped: Vec<String> = values
                     .iter()
-                    .map(|v| format!("'{}'", v.replace('\'', "''")))
+                    .map(|v| format!("'{}'", crate::sql_hygiene::escape_sql_string(v)))
                     .collect();
                 return format!("source_type IN ({})", escaped.join(", "));
             }
@@ -66,7 +66,10 @@ impl FeedRepository {
         }
 
         // Fall back to exact match on feed name
-        format!("source_type = '{}'", feed.name.replace('\'', "''"))
+        format!(
+            "source_type = '{}'",
+            crate::sql_hygiene::escape_sql_string(&feed.name)
+        )
     }
 }
 

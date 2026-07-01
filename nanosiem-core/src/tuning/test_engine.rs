@@ -94,8 +94,8 @@ impl TestEngine {
 
         tracing::info!(
             "Test time range: {} to {}",
-            start_time.format("%Y-%m-%d %H:%M:%S"),
-            end_time.format("%Y-%m-%d %H:%M:%S")
+            crate::sql_hygiene::format_ch_bound(&start_time),
+            crate::sql_hygiene::format_ch_bound(&end_time)
         );
 
         // Execute original query

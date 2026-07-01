@@ -6,7 +6,6 @@
 //!
 //! Requirements: 5.1, 5.2
 
-use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use thiserror::Error;
 use tracing::instrument;
@@ -226,42 +225,6 @@ impl UploadRepository {
 
         Ok(result.rows_affected() > 0)
     }
-
-    /// Get upload statistics
-    #[instrument(skip(self))]
-    pub async fn get_stats(&self) -> Result<UploadStats, UploadRepositoryError> {
-        let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
-            r#"
-            SELECT 
-                COUNT(*) as total_uploads,
-                COALESCE(SUM(records_success), 0) as total_records,
-                COALESCE(SUM(file_size), 0) as total_bytes,
-                COUNT(*) FILTER (WHERE status = 'completed') as successful_uploads,
-                COUNT(*) FILTER (WHERE status = 'failed') as failed_uploads
-            FROM upload_history
-            "#,
-        )
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(UploadStats {
-            total_uploads: row.0,
-            total_records: row.1,
-            total_bytes: row.2,
-            successful_uploads: row.3,
-            failed_uploads: row.4,
-        })
-    }
-}
-
-/// Upload statistics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UploadStats {
-    pub total_uploads: i64,
-    pub total_records: i64,
-    pub total_bytes: i64,
-    pub successful_uploads: i64,
-    pub failed_uploads: i64,
 }
 
 #[cfg(test)]

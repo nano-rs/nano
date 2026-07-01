@@ -21,7 +21,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ErrorResponse};
-use crate::middleware::{AuthContext, check_permission};
+use crate::middleware::{AuthContext, ensure_permission};
 use crate::state::AppState;
 use nanosiem_core::auth::permissions;
 use nanosiem_core::observability::{
@@ -193,8 +193,7 @@ pub async fn list_metric_monitors(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<ListMetricMonitorsResponse>, ApiError> {
-    check_permission(&auth, permissions::SEARCH_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:view".to_string()))?;
+    ensure_permission(&auth, permissions::SEARCH_VIEW)?;
 
     let repo = MetricMonitorRepository::new(state.pool.clone());
     let monitors = repo.list().await.map_err(map_repo_err)?;
@@ -219,8 +218,7 @@ pub async fn create_metric_monitor(
     Extension(auth): Extension<AuthContext>,
     Json(req): Json<MetricMonitorRequest>,
 ) -> Result<(StatusCode, Json<MetricMonitor>), ApiError> {
-    check_permission(&auth, permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let v = req.validate()?;
 
@@ -281,8 +279,7 @@ pub async fn update_metric_monitor(
     Path(id): Path<TypeIdParam>,
     Json(req): Json<MetricMonitorRequest>,
 ) -> Result<Json<MetricMonitor>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let v = req.validate()?;
 
@@ -325,8 +322,7 @@ pub async fn delete_metric_monitor(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<StatusCode, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_SYSTEM)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:system".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let repo = MetricMonitorRepository::new(state.pool.clone());
     let deleted = repo.delete(*id).await.map_err(map_repo_err)?;

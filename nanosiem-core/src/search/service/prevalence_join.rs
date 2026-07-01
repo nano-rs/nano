@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use super::*;
+use crate::sql_hygiene::escape_sql_string;
 
 impl SearchService {
     /// Execute a search with JOIN-based prevalence filtering
@@ -844,7 +845,7 @@ ORDER BY l.timestamp DESC"#,
                                         "0".to_string()
                                     }
                                 } else {
-                                    format!("'{}'", s.replace('\'', "''"))
+                                    format!("'{}'", escape_sql_string(s))
                                 }
                             }
                             Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
@@ -860,7 +861,7 @@ ORDER BY l.timestamp DESC"#,
                         let negate = matches!(op, Comparator::NotContains);
                         match value {
                             Value::String(s) => {
-                                let escaped = s.replace('\'', "''").to_lowercase();
+                                let escaped = escape_sql_string(s).to_lowercase();
                                 let like_op = if negate { "NOT iLike" } else { "iLike" };
                                 format!(
                                     "lower(toString({})) {} '%{}%'",
@@ -878,7 +879,7 @@ ORDER BY l.timestamp DESC"#,
                         let negate = matches!(op, Comparator::NotStartsWith);
                         match value {
                             Value::String(s) => {
-                                let escaped = s.replace('\'', "''").to_lowercase();
+                                let escaped = escape_sql_string(s).to_lowercase();
                                 let like_op = if negate { "NOT iLike" } else { "iLike" };
                                 format!("lower(toString({})) {} '{}%'", sql_field, like_op, escaped)
                             }
@@ -893,7 +894,7 @@ ORDER BY l.timestamp DESC"#,
                         let negate = matches!(op, Comparator::NotEndsWith);
                         match value {
                             Value::String(s) => {
-                                let escaped = s.replace('\'', "''").to_lowercase();
+                                let escaped = escape_sql_string(s).to_lowercase();
                                 let like_op = if negate { "NOT iLike" } else { "iLike" };
                                 format!("lower(toString({})) {} '%{}'", sql_field, like_op, escaped)
                             }
@@ -915,7 +916,7 @@ ORDER BY l.timestamp DESC"#,
                                 "toString({}) {} '{}'",
                                 sql_field,
                                 like_op,
-                                s.replace('\'', "''")
+                                escape_sql_string(s)
                             ),
                             _ => {
                                 return Err(SearchError::SqlGenError(
@@ -927,7 +928,7 @@ ORDER BY l.timestamp DESC"#,
                     Comparator::Regex | Comparator::NotRegex => {
                         let negate = matches!(op, Comparator::NotRegex);
                         let pattern = match value {
-                            Value::Regex(p) | Value::String(p) => p.replace('\'', "''"),
+                            Value::Regex(p) | Value::String(p) => escape_sql_string(p),
                             _ => {
                                 return Err(SearchError::SqlGenError(
                                     "Regex requires string/regex value".to_string(),
@@ -1064,14 +1065,14 @@ ORDER BY l.timestamp DESC"#,
                     .map(|v| match v {
                         Value::String(s) => {
                             if all_strings {
-                                format!("'{}'", s.replace('\'', "''").to_lowercase())
+                                format!("'{}'", escape_sql_string(s).to_lowercase())
                             } else {
-                                format!("'{}'", s.replace('\'', "''"))
+                                format!("'{}'", escape_sql_string(s))
                             }
                         }
                         Value::Number(n) => n.to_string(),
                         Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
-                        _ => format!("'{}'", format!("{:?}", v).replace('\'', "''")),
+                        _ => format!("'{}'", escape_sql_string(format!("{:?}", v))),
                     })
                     .collect();
                 let values_list = values_sql.join(", ");
@@ -1086,7 +1087,7 @@ ORDER BY l.timestamp DESC"#,
             }
             SearchExpr::Keyword(kw) => {
                 // Keyword search in prevalence context - search message field
-                let escaped = kw.replace('\'', "''").to_lowercase();
+                let escaped = escape_sql_string(kw).to_lowercase();
                 Ok(format!("lower(toString(l.message)) iLike '%{}%'", escaped))
             }
             _ => Err(SearchError::SqlGenError(format!(
@@ -1152,7 +1153,7 @@ ORDER BY l.timestamp DESC"#,
             }
             EvalExpression::Literal(value) => {
                 match value {
-                    crate::query::Value::String(s) => Ok(format!("'{}'", s.replace('\'', "''"))),
+                    crate::query::Value::String(s) => Ok(format!("'{}'", escape_sql_string(s))),
                     crate::query::Value::Number(n) => Ok(n.to_string()),
                     crate::query::Value::Bool(b) => Ok(if *b { "1" } else { "0" }.to_string()),
                     crate::query::Value::Interval(duration, unit) => {

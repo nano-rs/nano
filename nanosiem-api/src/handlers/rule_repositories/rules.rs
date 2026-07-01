@@ -18,7 +18,7 @@ use super::{
     },
     AuditExt,
 };
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 /// List top-level folders in a repository (for folder selection before sync)
@@ -41,9 +41,7 @@ pub async fn list_folders(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<ListFoldersResponse>, ApiError> {
-    check_permission(&auth, permissions::RULE_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: rule_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::RULE_REPOSITORIES_VIEW)?;
 
     let service = get_rule_repo_service(&state)?;
     let folders = service.list_folders(*id).await?;
@@ -73,9 +71,7 @@ pub async fn list_repository_rules(
     Path(id): Path<TypeIdParam>,
     Query(query): Query<ListRulesQuery>,
 ) -> Result<Json<Vec<RepositoryRuleResponse>>, ApiError> {
-    check_permission(&auth, permissions::RULE_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: rule_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::RULE_REPOSITORIES_VIEW)?;
 
     let service = get_rule_repo_service(&state)?;
 
@@ -136,9 +132,7 @@ pub async fn get_repository_rule(
     Extension(auth): Extension<AuthContext>,
     Path((id, path)): Path<(TypeIdParam, String)>,
 ) -> Result<Json<RepositoryRule>, ApiError> {
-    check_permission(&auth, permissions::RULE_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: rule_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::RULE_REPOSITORIES_VIEW)?;
 
     let service = get_rule_repo_service(&state)?;
     let rule = service.get_rule(*id, &path).await?;
@@ -167,9 +161,7 @@ pub async fn preview_import(
     Extension(auth): Extension<AuthContext>,
     Path((id, path)): Path<(TypeIdParam, String)>,
 ) -> Result<Json<ImportPreview>, ApiError> {
-    check_permission(&auth, permissions::RULE_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: rule_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::RULE_REPOSITORIES_VIEW)?;
 
     let service = get_rule_repo_service(&state)?;
     let preview = service.preview_import(*id, &path).await?;
@@ -202,9 +194,7 @@ pub async fn import_rule(
     Path((id, path)): Path<(TypeIdParam, String)>,
     Json(req): Json<ImportRuleRequest>,
 ) -> Result<Json<ImportRuleResponse>, ApiError> {
-    check_permission(&auth, permissions::RULE_REPOSITORIES_IMPORT).map_err(|_| {
-        ApiError::Forbidden("Missing permission: rule_repositories:import".to_string())
-    })?;
+    ensure_permission(&auth, permissions::RULE_REPOSITORIES_IMPORT)?;
 
     let service = get_rule_repo_service(&state)?;
 

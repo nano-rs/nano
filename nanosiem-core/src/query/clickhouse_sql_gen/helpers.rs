@@ -544,19 +544,22 @@ pub(crate) fn enum_values_literal_sql(
     )))
 }
 
-/// Escape a string for SQL (single quotes)
-/// Note: Backslash must be escaped BEFORE quotes, otherwise `\'` becomes `''''` instead of `\\''`
+/// Escape a string for SQL (single quotes).
+/// Thin alias over the canonical [`crate::sql_hygiene::escape_sql_string`]
+/// (backslash escaped before quotes); kept as a local name for the many
+/// SQL-gen call sites (NAN-1616).
 pub(crate) fn escape_string(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "''")
+    crate::sql_hygiene::escape_sql_string(s)
 }
 
-/// Escape a regex pattern for SQL
-/// Escapes backslashes and single quotes for embedding in SQL string literals.
+/// Escape a regex pattern for SQL.
+/// Byte-identical to [`escape_string`] — backslashes and single quotes are
+/// escaped for embedding in a SQL string literal.
 /// Note: `?` is NOT escaped here — the executor's `escape_question_marks_in_strings`
 /// handles escaping `?` inside string literals for the clickhouse-rs crate.
 /// Escaping `?` here would double-escape and break regex inline flags like `(?i)`.
 pub(crate) fn escape_regex_pattern(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "''")
+    crate::sql_hygiene::escape_sql_string(s)
 }
 
 /// NAN-1426: native JSON **subcolumn** access expression for an OCSF tail path

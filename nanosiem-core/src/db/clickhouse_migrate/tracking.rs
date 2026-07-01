@@ -143,8 +143,8 @@ impl ClickHouseMigrator {
         let sql = format!(
             "INSERT INTO {}._migrations (version, name, checksum) VALUES ('{}', '{}', '{}')",
             self.database,
-            migration.version.replace('\'', "''"),
-            migration.name.replace('\'', "''"),
+            crate::sql_hygiene::escape_sql_string(&migration.version),
+            crate::sql_hygiene::escape_sql_string(&migration.name),
             checksum
         );
 
@@ -232,8 +232,8 @@ impl ClickHouseMigrator {
             let sql = format!(
                 "INSERT INTO {}._migrations (version, name) VALUES ('{}', '{}')",
                 self.database,
-                version.replace('\'', "''"),
-                name.replace('\'', "''")
+                crate::sql_hygiene::escape_sql_string(version),
+                crate::sql_hygiene::escape_sql_string(name)
             );
             self.client
                 .query(&sql)

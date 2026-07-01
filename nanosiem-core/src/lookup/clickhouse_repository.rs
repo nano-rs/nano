@@ -212,7 +212,7 @@ impl ClickHouseLookupRepository {
                     if case_insensitive {
                         s = s.to_lowercase();
                     }
-                    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+                    format!("'{}'", crate::sql_hygiene::escape_sql_string(&s))
                 })
                 .collect::<Vec<_>>()
                 .join(", ");

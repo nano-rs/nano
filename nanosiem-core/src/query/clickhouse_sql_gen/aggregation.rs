@@ -709,8 +709,8 @@ impl ClickHouseSqlGenerator {
                         " ASC WITH FILL FROM toStartOfInterval(toDateTime('{start}', 'UTC'), \
                          toIntervalSecond({span_secs})) TO toDateTime('{end}', 'UTC') \
                          STEP toIntervalSecond({span_secs})",
-                        start = tr.start.format("%Y-%m-%d %H:%M:%S"),
-                        end = tr.end.format("%Y-%m-%d %H:%M:%S"),
+                        start = crate::sql_hygiene::format_ch_bound(&tr.start),
+                        end = crate::sql_hygiene::format_ch_bound(&tr.end),
                     )
                     .unwrap();
                 }

@@ -15,7 +15,7 @@ use nanosiem_core::auth::permissions;
 use super::sanitize_config;
 use super::types::*;
 use super::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 /// List all enrichment sources
@@ -36,8 +36,7 @@ pub async fn list_enrichment_sources(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<EnrichmentSourcesResponse>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:view".to_string()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_VIEW)?;
 
     let enrichment = state.enrichment.read().await;
     let sources = enrichment
@@ -89,9 +88,7 @@ pub async fn enable_enrichment_source(
     Extension(client): Extension<ClientContext>,
     Path(source_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_CONFIGURE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: enrichments:configure".to_string())
-    })?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
     let enrichment = state.enrichment.read().await;
     enrichment
@@ -139,9 +136,7 @@ pub async fn disable_enrichment_source(
     Extension(client): Extension<ClientContext>,
     Path(source_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_CONFIGURE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: enrichments:configure".to_string())
-    })?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
     let enrichment = state.enrichment.read().await;
     enrichment
@@ -201,8 +196,7 @@ pub async fn get_enrichment_stats(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<EnrichmentStatsResponse>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:view".to_string()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_VIEW)?;
 
     let enrichment = state.enrichment.read().await;
     let stats = enrichment
@@ -239,8 +233,7 @@ pub async fn get_auto_sync_config(
     Extension(auth): Extension<AuthContext>,
     Path(source_id): Path<String>,
 ) -> Result<Json<AutoSyncConfigResponse>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: enrichments:view".to_string()))?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_VIEW)?;
 
     let enrichment = state.enrichment.read().await;
     let sources = enrichment
@@ -302,9 +295,7 @@ pub async fn configure_auto_sync(
     Path(source_id): Path<String>,
     Json(request): Json<AutoSyncConfigRequest>,
 ) -> Result<Json<AutoSyncConfigResponse>, ApiError> {
-    check_permission(&auth, permissions::ENRICHMENTS_CONFIGURE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: enrichments:configure".to_string())
-    })?;
+    ensure_permission(&auth, permissions::ENRICHMENTS_CONFIGURE)?;
 
     let enrichment = state.enrichment.read().await;
 

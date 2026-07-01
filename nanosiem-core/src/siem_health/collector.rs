@@ -215,7 +215,7 @@ async fn collect_insert_integrity(ch: &ClickHouseClient) -> InsertIntegrityMetri
     if !referenced.is_empty() {
         let in_list = referenced
             .iter()
-            .map(|n| format!("'{}'", n.replace('\'', "\\'")))
+            .map(|n| format!("'{}'", crate::sql_hygiene::escape_sql_string(n)))
             .collect::<Vec<_>>()
             .join(", ");
         // Fetch ALL referenced dicts (not just FAILED) and filter in Rust:
@@ -225,7 +225,12 @@ async fn collect_insert_integrity(ch: &ClickHouseClient) -> InsertIntegrityMetri
         // told us these dicts exist; seeing none of them means the grant is
         // missing and this probe must not claim it ran.
         let sql = format!(
-            "SELECT concat(database, '.', name), status, substring(last_exception, 1, 300) \
+            // toString(status): CH 26.4 made system.dictionaries.status an
+            // Enum8('NOT_LOADED'=0,'LOADED'=1,'FAILED'=2,…) — deserializing it
+            // directly into a String fails (NAN-1629). Cast so the client gets
+            // a String and `.starts_with("FAILED")` still matches (incl.
+            // FAILED_AND_RELOADING).
+            "SELECT concat(database, '.', name), toString(status), substring(last_exception, 1, 300) \
              FROM system.dictionaries \
              WHERE concat(database, '.', name) IN ({in_list})"
         );

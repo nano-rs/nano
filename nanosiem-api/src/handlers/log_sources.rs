@@ -38,7 +38,7 @@ use nanosiem_core::typeid::TypeIdParam;
 use serde::Deserialize;
 use utoipa::{IntoParams, ToSchema};
 
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 // Permission constants for log sources
@@ -63,8 +63,7 @@ pub async fn list_log_sources(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<LogSource>>, ApiError> {
-    check_permission(&auth, LOG_SOURCES_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: log_sources:view".to_string()))?;
+    ensure_permission(&auth, LOG_SOURCES_VIEW)?;
 
     let log_sources = state.log_source_service.list(None).await?;
     Ok(Json(log_sources))
@@ -90,8 +89,7 @@ pub async fn get_log_source(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<LogSource>, ApiError> {
-    check_permission(&auth, LOG_SOURCES_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: log_sources:view".to_string()))?;
+    ensure_permission(&auth, LOG_SOURCES_VIEW)?;
 
     let log_source = state.log_source_service.get(*id).await?;
     Ok(Json(log_source))
@@ -116,8 +114,7 @@ pub async fn create_log_source(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<NewLogSource>,
 ) -> Result<Json<LogSource>, ApiError> {
-    check_permission(&auth, LOG_SOURCES_CREATE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: log_sources:create".to_string()))?;
+    ensure_permission(&auth, LOG_SOURCES_CREATE)?;
 
     // Tier enforcement: check data source limit
     let tier_settings = nanosiem_core::TierSettings::new(state.pool.clone());
@@ -195,8 +192,7 @@ pub async fn update_log_source(
     Path(id): Path<TypeIdParam>,
     Json(request): Json<UpdateLogSource>,
 ) -> Result<Json<LogSource>, ApiError> {
-    check_permission(&auth, LOG_SOURCES_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: log_sources:edit".to_string()))?;
+    ensure_permission(&auth, LOG_SOURCES_EDIT)?;
 
     // Validate timezone if provided
     if let Some(ref tz) = request.timezone {
@@ -244,8 +240,7 @@ pub async fn delete_log_source(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, LOG_SOURCES_DELETE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: log_sources:delete".to_string()))?;
+    ensure_permission(&auth, LOG_SOURCES_DELETE)?;
 
     state.log_source_service.delete(*id).await?;
 
@@ -290,8 +285,7 @@ pub async fn toggle_log_source(
     Path(id): Path<TypeIdParam>,
     Json(request): Json<ToggleRequest>,
 ) -> Result<Json<LogSource>, ApiError> {
-    check_permission(&auth, LOG_SOURCES_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: log_sources:edit".to_string()))?;
+    ensure_permission(&auth, LOG_SOURCES_EDIT)?;
 
     let log_source = state
         .log_source_service
@@ -337,8 +331,7 @@ pub async fn validate_log_source(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<VrlValidationResult>, ApiError> {
-    check_permission(&auth, LOG_SOURCES_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: log_sources:edit".to_string()))?;
+    ensure_permission(&auth, LOG_SOURCES_EDIT)?;
 
     let result = state.log_source_service.validate_log_source(*id).await?;
     Ok(Json(result))
@@ -365,8 +358,7 @@ pub async fn deploy_log_source(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<DeploymentResult>, ApiError> {
-    check_permission(&auth, LOG_SOURCES_DEPLOY)
-        .map_err(|_| ApiError::Forbidden("Missing permission: log_sources:deploy".to_string()))?;
+    ensure_permission(&auth, LOG_SOURCES_DEPLOY)?;
 
     let result = state.log_source_service.deploy(*id).await?;
 
@@ -406,8 +398,7 @@ pub async fn undeploy_log_source(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<DeploymentResult>, ApiError> {
-    check_permission(&auth, LOG_SOURCES_DEPLOY)
-        .map_err(|_| ApiError::Forbidden("Missing permission: log_sources:deploy".to_string()))?;
+    ensure_permission(&auth, LOG_SOURCES_DEPLOY)?;
 
     let result = state.log_source_service.undeploy(*id).await?;
 
@@ -446,8 +437,7 @@ pub async fn get_log_source_deployments(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<Vec<LogSourceDeployment>>, ApiError> {
-    check_permission(&auth, LOG_SOURCES_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: log_sources:view".to_string()))?;
+    ensure_permission(&auth, LOG_SOURCES_VIEW)?;
 
     let history = state
         .log_source_service
@@ -476,8 +466,7 @@ pub async fn get_log_source_health(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<LogSourceHealth>, ApiError> {
-    check_permission(&auth, LOG_SOURCES_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: log_sources:view".to_string()))?;
+    ensure_permission(&auth, LOG_SOURCES_VIEW)?;
 
     let health = state.log_source_service.get_health(*id).await?;
     Ok(Json(health))
@@ -508,8 +497,7 @@ pub async fn get_all_ingestion_history(
     Extension(auth): Extension<AuthContext>,
     Query(params): Query<IngestionHistoryQuery>,
 ) -> Result<Json<Vec<IngestionHistoryPoint>>, ApiError> {
-    check_permission(&auth, LOG_SOURCES_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: log_sources:view".to_string()))?;
+    ensure_permission(&auth, LOG_SOURCES_VIEW)?;
 
     let history = state
         .log_source_service
@@ -552,8 +540,7 @@ pub async fn validate_namespace(
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<ValidateNamespaceRequest>,
 ) -> Result<Json<ValidateNamespaceResponse>, ApiError> {
-    check_permission(&auth, LOG_SOURCES_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: log_sources:view".to_string()))?;
+    ensure_permission(&auth, LOG_SOURCES_VIEW)?;
 
     let valid = nanosiem_core::namespace::is_valid_namespace(&request.namespace);
     let error = if valid {
@@ -591,8 +578,7 @@ pub async fn validate_vrl(
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<ValidateVrlRequest>,
 ) -> Result<Json<VrlValidationResult>, ApiError> {
-    check_permission(&auth, LOG_SOURCES_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: log_sources:view".to_string()))?;
+    ensure_permission(&auth, LOG_SOURCES_VIEW)?;
 
     let result = state
         .log_source_service
@@ -629,8 +615,7 @@ pub async fn test_vrl(
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<TestVrlRequest>,
 ) -> Result<Json<ParserTestResult>, ApiError> {
-    check_permission(&auth, LOG_SOURCES_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: log_sources:view".to_string()))?;
+    ensure_permission(&auth, LOG_SOURCES_VIEW)?;
 
     let result = state
         .log_source_service
@@ -672,8 +657,7 @@ pub async fn test_vrl_live(
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<TestVrlLiveRequest>,
 ) -> Result<Json<Vec<LiveTestResult>>, ApiError> {
-    check_permission(&auth, LOG_SOURCES_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: log_sources:view".to_string()))?;
+    ensure_permission(&auth, LOG_SOURCES_VIEW)?;
 
     let limit = request.limit.unwrap_or(10);
     let results = state
@@ -705,8 +689,7 @@ pub async fn deploy_all_log_sources(
     Extension(auth): Extension<AuthContext>,
     Extension(client): Extension<ClientContext>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, LOG_SOURCES_DEPLOY)
-        .map_err(|_| ApiError::Forbidden("Missing permission: log_sources:deploy".to_string()))?;
+    ensure_permission(&auth, LOG_SOURCES_DEPLOY)?;
 
     state.log_source_service.deploy_all().await?;
 
@@ -745,8 +728,7 @@ pub async fn get_log_source_versions(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<Vec<LogSourceVersion>>, ApiError> {
-    check_permission(&auth, LOG_SOURCES_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: log_sources:view".to_string()))?;
+    ensure_permission(&auth, LOG_SOURCES_VIEW)?;
 
     let versions = state.log_source_service.get_versions(*id, Some(50)).await?;
     Ok(Json(versions))
@@ -773,8 +755,7 @@ pub async fn publish_log_source(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<DeploymentResult>, ApiError> {
-    check_permission(&auth, LOG_SOURCES_DEPLOY)
-        .map_err(|_| ApiError::Forbidden("Missing permission: log_sources:deploy".to_string()))?;
+    ensure_permission(&auth, LOG_SOURCES_DEPLOY)?;
 
     let result = state
         .log_source_service
@@ -818,8 +799,7 @@ pub async fn revert_log_source_version(
     Extension(client): Extension<ClientContext>,
     Path((id, version_id)): Path<(TypeIdParam, i32)>,
 ) -> Result<Json<LogSourceVersion>, ApiError> {
-    check_permission(&auth, LOG_SOURCES_DEPLOY)
-        .map_err(|_| ApiError::Forbidden("Missing permission: log_sources:deploy".to_string()))?;
+    ensure_permission(&auth, LOG_SOURCES_DEPLOY)?;
 
     let version = state
         .log_source_service
@@ -862,8 +842,7 @@ pub async fn discard_log_source_draft(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<LogSource>, ApiError> {
-    check_permission(&auth, LOG_SOURCES_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: log_sources:edit".to_string()))?;
+    ensure_permission(&auth, LOG_SOURCES_EDIT)?;
 
     let log_source = state.log_source_service.discard_draft(*id).await?;
     Ok(Json(log_source))
@@ -889,8 +868,7 @@ pub async fn get_log_source_draft_status(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<LogSourceWithDraftStatus>, ApiError> {
-    check_permission(&auth, LOG_SOURCES_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: log_sources:view".to_string()))?;
+    ensure_permission(&auth, LOG_SOURCES_VIEW)?;
 
     let status = state.log_source_service.get_draft_status(*id).await?;
     Ok(Json(status))

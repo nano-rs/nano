@@ -20,7 +20,7 @@ use utoipa::ToSchema;
 
 use crate::error::{ApiError, ErrorResponse};
 use crate::handlers::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::state::AppState;
 
 // ============================================================================
@@ -85,8 +85,7 @@ pub async fn get_risk_config(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<RiskConfigResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_RISK)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:risk".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_RISK)?;
 
     let risk_weight = get_risk_weight_from_db(&state.pool).await?;
     Ok(Json(RiskConfigResponse { risk_weight }))
@@ -119,8 +118,7 @@ pub async fn update_risk_config(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<UpdateRiskConfigRequest>,
 ) -> Result<Json<RiskConfigResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_RISK)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:risk".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_RISK)?;
 
     use nanosiem_core::detection::risk::ScoreCalculator;
 
@@ -201,8 +199,7 @@ pub async fn get_risk_decay_config(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<RiskDecayConfigResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_RISK)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:risk".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_RISK)?;
 
     let config = state
         .risk_service
@@ -244,8 +241,7 @@ pub async fn update_risk_decay_config(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<UpdateRiskDecayConfigRequest>,
 ) -> Result<Json<RiskDecayConfigResponse>, ApiError> {
-    check_permission(&auth, permissions::SETTINGS_RISK)
-        .map_err(|_| ApiError::Forbidden("Missing permission: settings:risk".to_string()))?;
+    ensure_permission(&auth, permissions::SETTINGS_RISK)?;
 
     use nanosiem_core::risk::types::RiskDecayConfig;
 

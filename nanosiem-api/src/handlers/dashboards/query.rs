@@ -15,7 +15,7 @@ use nanosiem_core::{
 use std::collections::HashMap;
 
 use super::types::{PanelQueryRequest, PanelQueryResponse};
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 /// Execute a panel query
@@ -39,8 +39,7 @@ pub async fn panel_query(
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<PanelQueryRequest>,
 ) -> Result<Json<PanelQueryResponse>, ApiError> {
-    check_permission(&auth, permissions::DASHBOARDS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: dashboards:view".to_string()))?;
+    ensure_permission(&auth, permissions::DASHBOARDS_VIEW)?;
 
     // Substitute variables in the query
     let query = substitute_variables(&request.query, &request.variables);

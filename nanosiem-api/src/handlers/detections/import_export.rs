@@ -11,7 +11,7 @@ use nanosiem_core::DetectionRule;
 
 use super::types::*;
 use super::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{
     error::{ApiError, ErrorResponse},
     state::AppState,
@@ -35,8 +35,7 @@ pub async fn import_detections(
     Extension(client): Extension<ClientContext>,
     Json(request): Json<ImportRulesRequest>,
 ) -> Result<Json<ImportResponse>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_CREATE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:create".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_CREATE)?;
 
     let mut imported = 0;
     let mut failed = 0;
@@ -104,8 +103,7 @@ pub async fn export_detections(
     Extension(client): Extension<ClientContext>,
 ) -> Result<Json<Vec<DetectionRule>>, ApiError> {
     // M8: Require separate export permission (not just view)
-    check_permission(&auth, permissions::DETECTIONS_EXPORT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:export".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_EXPORT)?;
 
     let rules = state.detection_service.list_rules().await?;
 

@@ -22,7 +22,7 @@
 //! - `source_type=audit source=ingest status=failure` - Ingestion failures (uses status, not auth_result)
 //! - `source_type=audit | stats count by source, action` - Activity breakdown
 
-mod actions;
+pub mod actions;
 mod context;
 mod emitter;
 pub mod query;

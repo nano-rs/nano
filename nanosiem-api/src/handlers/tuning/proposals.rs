@@ -18,7 +18,7 @@ use super::types::{
 };
 use crate::error::ApiError;
 use crate::handlers::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::state::AppState;
 
 /// GET /api/tuning/proposals
@@ -43,8 +43,7 @@ pub async fn list_proposals(
     Extension(auth): Extension<AuthContext>,
     Query(query): Query<ListProposalsQuery>,
 ) -> Result<Json<Vec<TuningProposal>>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     // List proposals with filters (including proposal_type)
     let proposals = state
@@ -87,8 +86,7 @@ pub async fn get_proposal(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<TuningProposal>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     // Get proposal by ID
     let proposal = state
@@ -130,8 +128,7 @@ pub async fn approve_proposal(
     Path(id): Path<TypeIdParam>,
     Json(request): Json<ApproveProposalRequest>,
 ) -> Result<Json<ApprovalResponse>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:edit".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_EDIT)?;
 
     // 1. Retrieve proposal
     let proposal = state
@@ -521,8 +518,7 @@ pub async fn reject_proposal(
     Path(id): Path<TypeIdParam>,
     Json(request): Json<RejectProposalRequest>,
 ) -> Result<Json<RejectionResponse>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:edit".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_EDIT)?;
 
     // 1. Retrieve proposal
     let proposal = state

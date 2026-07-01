@@ -87,8 +87,7 @@ pub use detection_rule::{
     UpdateRuleCasePermissionsRequest,
 };
 pub use incident::{
-    CreateIncidentRequest, Incident, IncidentSource, IncidentStatus, IncidentSummary,
-    IncidentWithCases, NewIncident,
+    CreateIncidentRequest, Incident, IncidentSummary, IncidentWithCases, NewIncident,
 };
 pub use log::{Log, NewLog};
 pub use notebook::{

@@ -22,15 +22,17 @@ pub mod audit_ext;
 pub mod auth_context;
 pub mod cookies;
 pub mod headers;
+pub mod pagination;
 
 pub use api_error::{ApiError, ErrorDetail, ErrorResponse};
 pub use audit_ext::AuditExt;
 pub use auth_context::{
-    check_all_permissions, check_any_permission, check_permission, require_session_auth,
-    require_session_or_self, AuthContext, AuthErrorResponse,
+    check_all_permissions, check_any_permission, check_permission, ensure_permission,
+    require_session_auth, require_session_or_self, AuthContext, AuthErrorResponse,
 };
 pub use cookies::{
     build_access_token_cookie, build_refresh_token_cookie, clear_access_token_cookie,
     clear_refresh_token_cookie, extract_refresh_token_cookie,
 };
 pub use headers::{extract_client_ip, extract_user_agent};
+pub use pagination::Pagination;

@@ -278,8 +278,8 @@ impl SearchService {
             "#,
             time_bucket_func,
             logs_table,
-            time_range.start.format("%Y-%m-%d %H:%M:%S%.6f"),
-            time_range.end.format("%Y-%m-%d %H:%M:%S%.6f")
+            crate::sql_hygiene::format_ch_bound_micros(&time_range.start),
+            crate::sql_hygiene::format_ch_bound_micros(&time_range.end)
         );
 
         // Execute query and fill gaps

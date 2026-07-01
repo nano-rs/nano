@@ -96,6 +96,16 @@ struct StringRow {
     value: String,
 }
 
+/// Row for the per-API-key daily usage aggregation. `day` is a UTC calendar
+/// date rendered as `YYYY-MM-DD` (via `toString(toDate(...))`) so it round-trips
+/// cleanly into `chrono::NaiveDate` without depending on the ClickHouse client's
+/// `Date` codec.
+#[derive(Debug, clickhouse::Row, Deserialize)]
+struct DailyUsageRow {
+    day: String,
+    count: u64,
+}
+
 /// Resolved time range and filter flags for building WHERE clauses
 struct ResolvedFilters {
     start_time: String,
@@ -147,8 +157,8 @@ fn resolve_filters(query: &ClickHouseAuditQuery) -> ResolvedFilters {
     };
 
     ResolvedFilters {
-        start_time: start_time.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
-        end_time: end_time.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
+        start_time: crate::sql_hygiene::format_ch_bound_micros(&start_time).to_string(),
+        end_time: crate::sql_hygiene::format_ch_bound_micros(&end_time).to_string(),
         where_clause,
         has_action,
         has_source,
@@ -356,7 +366,7 @@ impl AuditQueryService {
                  ORDER BY value",
                 self.dual_pool.logs_table()
             ))
-            .bind(since.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+            .bind(crate::sql_hygiene::format_ch_bound_micros(&since).to_string())
             .fetch_all()
             .await
             .map_err(|e| AuditQueryError::QueryError(e.to_string()))?;
@@ -377,12 +387,70 @@ impl AuditQueryService {
                  ORDER BY value",
                 self.dual_pool.logs_table()
             ))
-            .bind(since.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+            .bind(crate::sql_hygiene::format_ch_bound_micros(&since).to_string())
             .fetch_all()
             .await
             .map_err(|e| AuditQueryError::QueryError(e.to_string()))?;
 
         Ok(rows.into_iter().map(|r| r.value).collect())
+    }
+
+    /// Count audited actions attributed to an API key, bucketed by UTC calendar
+    /// day, for the window starting at `start` (inclusive).
+    ///
+    /// Reads the ClickHouse audit store (`source_type='audit'`) where the
+    /// event's `metadata.api_key_id` matches the key — i.e. every action
+    /// performed *via* that delegated credential (the key as the calling
+    /// actor). Both handler mutations and authorization denials populate
+    /// `metadata.api_key_id` (the `AuditEvent::api_key` builder), so this is the
+    /// system-of-record source for per-key call volume.
+    ///
+    /// NAN-1622 migrated this off the retired PostgreSQL `audit_logs` table.
+    /// This matches the documented "actor's api_key_id" intent: the PG column
+    /// overloaded actor-credential and target-key meanings (lifecycle writers
+    /// stored the *managed* key there), whereas the ClickHouse view is
+    /// actor-only and additionally captures every mutation the key performed
+    /// (those only ever emitted to ClickHouse). Admin lifecycle actions taken on
+    /// a key carry the key in `metadata.resource_id`, not here.
+    ///
+    /// Returns only days with activity (sparse) ordered oldest-first; callers
+    /// densify into a continuous zero-filled series.
+    pub async fn api_key_daily_usage(
+        &self,
+        api_key_id: Uuid,
+        start: DateTime<Utc>,
+    ) -> Result<Vec<(chrono::NaiveDate, i64)>, AuditQueryError> {
+        let client = self.dual_pool.clickhouse();
+
+        // Bucket on the UTC calendar day explicitly so day boundaries match the
+        // handler's UTC densification regardless of the column's timezone.
+        let sql = format!(
+            "SELECT toString(toDate(timestamp, 'UTC')) AS day, count() AS count \
+             FROM {} \
+             PREWHERE timestamp >= ? AND source_type = 'audit' \
+             WHERE JSONExtractString(metadata, 'api_key_id') = ? \
+             GROUP BY day \
+             ORDER BY day",
+            self.dual_pool.logs_table()
+        );
+
+        let rows: Vec<DailyUsageRow> = client
+            .query(&sql)
+            .bind(crate::sql_hygiene::format_ch_bound_micros(&start).to_string())
+            .bind(api_key_id.to_string())
+            .fetch_all()
+            .await
+            .map_err(|e| AuditQueryError::QueryError(e.to_string()))?;
+
+        rows.into_iter()
+            .map(|r| {
+                chrono::NaiveDate::parse_from_str(&r.day, "%Y-%m-%d")
+                    .map(|day| (day, r.count as i64))
+                    .map_err(|e| {
+                        AuditQueryError::QueryError(format!("invalid day bucket '{}': {e}", r.day))
+                    })
+            })
+            .collect()
     }
 }
 

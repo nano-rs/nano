@@ -21,7 +21,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ErrorResponse};
-use crate::middleware::{AuthContext, check_permission};
+use crate::middleware::{AuthContext, ensure_permission};
 use crate::state::AppState;
 use nanosiem_core::auth::permissions;
 use nanosiem_core::query::TimeRange;
@@ -100,8 +100,7 @@ pub async fn get_service_security_signals(
     Path(service): Path<String>,
     Query(params): Query<ServiceSecuritySignalsParams>,
 ) -> Result<Json<ServiceSecuritySignalsResponse>, ApiError> {
-    check_permission(&auth, permissions::SEARCH_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:view".to_string()))?;
+    ensure_permission(&auth, permissions::SEARCH_VIEW)?;
 
     if service.trim().is_empty() {
         return Err(ApiError::BadRequest("service must not be empty".to_string()));

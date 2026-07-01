@@ -373,6 +373,33 @@ fn class_split_udm_field(udm_field: &str) -> Option<(&'static str, &'static str,
     Some(m)
 }
 
+/// NAN-1623 (D4): the enumerable key set of the class-split sites — the single
+/// source of truth the drift guard derives from. Four hand-maintained sites must
+/// agree per concept: [`class_split_udm_field`] (the value-pick definition),
+/// [`class_split_column`] (the indexed unified column), and the
+/// [`OCSF_UNIFIED_COLUMNS`] / [`OCSF_BOOKKEEPING_COLUMNS`] re-add lists. The unified
+/// column is always `<field>_unified`. If a concept is added to only some sites the
+/// query layer and the physical table silently disagree (a multi-stage CTE stage
+/// references a `*_unified` column that the re-add list omitted → CH Code 47
+/// "Unknown identifier"). `class_split_sites_stay_in_lockstep` asserts all four
+/// agree, so a partial edit fails the build instead of failing at query time.
+///
+/// Only the lockstep test consumes this — it's the assertion's key set, not a
+/// production-consumed list — so it's `#[cfg(test)]` to stay out of prod builds.
+#[cfg(test)]
+const CLASS_SPLIT_UDM_FIELDS: &[&str] = &[
+    "process_name",
+    "process_path",
+    "command_line",
+    "process_id",
+    "process_guid",
+    "process_hash",
+    "user",
+    "url_domain",
+    "url",
+    "src_host",
+];
+
 /// NAN-1337: the 10 NAN-1333 `<udm_field>_unified` columns. They are MATERIALIZED
 /// real columns (so absent from `SELECT *`) but are NOT manifest entries, so the
 /// manifest-built re-add list (`OcsfRegistry.materialized`) omits them. They MUST be
@@ -1319,10 +1346,8 @@ mod tests {
             assert!(p.is_known_field(c));
         }
         // Lockstep: every class-split concept's unified column is in the const list.
-        for udm in [
-            "process_name", "process_path", "command_line", "process_id",
-            "process_guid", "process_hash", "user", "url_domain", "url", "src_host",
-        ] {
+        // Derived from the single CLASS_SPLIT_UDM_FIELDS source (NAN-1623, D4).
+        for udm in CLASS_SPLIT_UDM_FIELDS.iter().copied() {
             let col = class_split_column(udm).expect("class-split concept");
             assert!(
                 OCSF_UNIFIED_COLUMNS.contains(&col),
@@ -1473,22 +1498,14 @@ mod tests {
     fn class_split_column_maps_split_concepts_to_unified_column() {
         use crate::schema::{SchemaProfile, UdmProfile};
         let ocsf = OcsfProfile::new();
-        // All 10 split concepts → `<udm_field>_unified`.
-        for (udm, col) in [
-            ("process_name", "process_name_unified"),
-            ("process_path", "process_path_unified"),
-            ("command_line", "command_line_unified"),
-            ("process_id", "process_id_unified"),
-            ("process_guid", "process_guid_unified"),
-            ("process_hash", "process_hash_unified"),
-            ("user", "user_unified"),
-            ("url_domain", "url_domain_unified"),
-            ("url", "url_unified"),
-            ("src_host", "src_host_unified"),
-        ] {
+        // All 10 split concepts → `<udm_field>_unified`, derived from the single
+        // CLASS_SPLIT_UDM_FIELDS source (NAN-1623, D4) — the column is always
+        // `<udm_field>_unified`.
+        for udm in CLASS_SPLIT_UDM_FIELDS.iter().copied() {
+            let col = format!("{udm}_unified");
             assert_eq!(
                 ocsf.class_split_column(udm).as_deref(),
-                Some(col),
+                Some(col.as_str()),
                 "OCSF class_split_column({udm})"
             );
             // The unified-column set must be 1:1 with the value-pick set.
@@ -1520,6 +1537,84 @@ mod tests {
         );
         // No inline `if(` in the emitted raw-SQL reference for a split concept.
         assert!(!ocsf.udm_column_sql("src_host").unwrap().contains("if("));
+    }
+
+    /// NAN-1623 (D4): the four class-split sites stay in lockstep. The unified
+    /// columns are hand-maintained in four places (the value-pick definition, the
+    /// indexed-column map, and the OCSF_UNIFIED / OCSF_BOOKKEEPING re-add lists);
+    /// drift between them is a silent CH Code 47 at query time (a CTE stage selects
+    /// a `*_unified` column the re-add list omitted). This derives everything from
+    /// the single `CLASS_SPLIT_UDM_FIELDS` key set and asserts all four agree.
+    #[test]
+    fn class_split_sites_stay_in_lockstep() {
+        let unified: std::collections::HashSet<&str> =
+            OCSF_UNIFIED_COLUMNS.iter().copied().collect();
+        let bookkeeping: std::collections::HashSet<&str> =
+            OCSF_BOOKKEEPING_COLUMNS.iter().copied().collect();
+
+        for k in CLASS_SPLIT_UDM_FIELDS.iter().copied() {
+            // The key set must match the value-pick definition's key set.
+            assert!(
+                class_split_udm_field(k).is_some(),
+                "{k} is in CLASS_SPLIT_UDM_FIELDS but class_split_udm_field({k}) is None",
+            );
+            // The indexed column is exactly `<field>_unified`.
+            let expected = format!("{k}_unified");
+            assert_eq!(
+                class_split_column(k),
+                Some(expected.as_str()),
+                "class_split_column({k}) must be Some(\"{expected}\")",
+            );
+            // …and that column must be registered in BOTH re-add lists.
+            assert!(
+                unified.contains(expected.as_str()),
+                "{expected} missing from OCSF_UNIFIED_COLUMNS",
+            );
+            assert!(
+                bookkeeping.contains(expected.as_str()),
+                "{expected} missing from OCSF_BOOKKEEPING_COLUMNS",
+            );
+        }
+
+        // Exact size: 10 split concepts, 10 unified columns (no extras on either side).
+        assert_eq!(CLASS_SPLIT_UDM_FIELDS.len(), 10);
+        assert_eq!(OCSF_UNIFIED_COLUMNS.len(), 10);
+        assert_eq!(
+            unified.len(),
+            CLASS_SPLIT_UDM_FIELDS.len(),
+            "OCSF_UNIFIED_COLUMNS has a column with no class-split key",
+        );
+        // The unified set is a subset of the bookkeeping set (each unified column is
+        // bookkeeping, but bookkeeping also carries event/unmapped/timestamp/etc).
+        assert!(
+            unified.is_subset(&bookkeeping),
+            "OCSF_UNIFIED_COLUMNS must be a subset of OCSF_BOOKKEEPING_COLUMNS",
+        );
+
+        // Reverse direction: a class-split arm added to `class_split_udm_field` /
+        // `class_split_column` but forgotten in `CLASS_SPLIT_UDM_FIELDS` (or the
+        // re-add lists) would otherwise slip through the forward checks above. Probe
+        // the whole UDM field universe (`EXPLICIT_COLUMNS` — every class-split
+        // concept is a promoted UDM field, so a real new split concept appears here)
+        // and assert the two split functions return Some for EXACTLY the registered
+        // keys and agree with each other per field.
+        let keys: std::collections::HashSet<&str> =
+            CLASS_SPLIT_UDM_FIELDS.iter().copied().collect();
+        for field in crate::query::EXPLICIT_COLUMNS.iter().copied() {
+            let by_column = class_split_column(field).is_some();
+            let by_value = class_split_udm_field(field).is_some();
+            assert_eq!(
+                by_column, by_value,
+                "{field}: class_split_column / class_split_udm_field disagree on split-ness",
+            );
+            assert_eq!(
+                by_column,
+                keys.contains(field),
+                "{field}: class-split functions return Some={by_column} but \
+                 CLASS_SPLIT_UDM_FIELDS membership={} — a split arm and the SoT const drifted",
+                keys.contains(field),
+            );
+        }
     }
 
     /// NAN-1382 (G6): manifest-driven enum label→int metadata. Fixed-table enum

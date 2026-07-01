@@ -16,17 +16,9 @@ use super::models::{
 // Playbook Repository (the repositories table)
 // =============================================================================
 
-#[derive(Debug, Error)]
-pub enum PlaybookRepoRepositoryError {
-    #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
-
-    #[error("Repository not found: {0}")]
-    NotFound(Uuid),
-
-    #[error("Repository already exists: {0}")]
-    AlreadyExists(String),
-}
+// NAN-1618: consolidated into `crate::db::RepoError` (alias preserves the
+// public name and the variants matched in service/crud.rs).
+pub use crate::db::repo_error::RepoError as PlaybookRepoRepositoryError;
 
 #[derive(Clone)]
 pub struct PlaybookRepoRepository {
@@ -43,15 +35,7 @@ impl PlaybookRepoRepository {
         repo: &NewPlaybookRepository,
         created_by: Option<Uuid>,
     ) -> Result<PlaybookRepository, PlaybookRepoRepositoryError> {
-        let slug = repo.slug.clone().unwrap_or_else(|| {
-            repo.url
-                .trim_end_matches('/')
-                .trim_end_matches(".git")
-                .split("github.com/")
-                .last()
-                .unwrap_or(&repo.name)
-                .to_lowercase()
-        });
+        let slug = crate::db::repo_store::slug_from_url(&repo.url, &repo.name, repo.slug.as_deref());
 
         let result = sqlx::query_as::<_, PlaybookRepository>(
             r#"
@@ -75,14 +59,7 @@ impl PlaybookRepoRepository {
         .fetch_one(&self.pool)
         .await
         .map_err(|e| {
-            if let sqlx::Error::Database(ref db_err) = e {
-                if db_err.constraint() == Some("playbook_repositories_name_key")
-                    || db_err.constraint() == Some("playbook_repositories_slug_key")
-                {
-                    return PlaybookRepoRepositoryError::AlreadyExists(repo.name.clone());
-                }
-            }
-            PlaybookRepoRepositoryError::Database(e)
+            crate::db::repo_store::map_unique_violation(e, "playbook_repositories", &repo.name)
         })?;
 
         Ok(result)
@@ -92,47 +69,18 @@ impl PlaybookRepoRepository {
         &self,
         id: Uuid,
     ) -> Result<PlaybookRepository, PlaybookRepoRepositoryError> {
-        sqlx::query_as::<_, PlaybookRepository>("SELECT * FROM playbook_repositories WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or(PlaybookRepoRepositoryError::NotFound(id))
+        crate::db::repo_store::find_by_id(&self.pool, "playbook_repositories", id).await
     }
 
     pub async fn find_by_slug(
         &self,
         slug: &str,
     ) -> Result<PlaybookRepository, PlaybookRepoRepositoryError> {
-        sqlx::query_as::<_, PlaybookRepository>(
-            "SELECT * FROM playbook_repositories WHERE slug = $1",
-        )
-        .bind(slug)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| PlaybookRepoRepositoryError::NotFound(Uuid::nil()))
+        crate::db::repo_store::find_by_slug(&self.pool, "playbook_repositories", slug).await
     }
 
     pub async fn list(&self) -> Result<Vec<PlaybookRepository>, PlaybookRepoRepositoryError> {
-        // Clean up stuck syncing statuses first
-        let _ = sqlx::query(
-            r#"
-            UPDATE playbook_repositories
-            SET last_sync_status = 'failed',
-                last_sync_error = 'Sync timed out or was interrupted',
-                updated_at = NOW()
-            WHERE last_sync_status = 'syncing'
-              AND updated_at < NOW() - INTERVAL '10 minutes'
-            "#,
-        )
-        .execute(&self.pool)
-        .await;
-
-        let rows = sqlx::query_as::<_, PlaybookRepository>(
-            "SELECT * FROM playbook_repositories ORDER BY name ASC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
+        crate::db::repo_store::list(&self.pool, "playbook_repositories").await
     }
 
     pub async fn update(
@@ -179,37 +127,21 @@ impl PlaybookRepoRepository {
         playbook_count: Option<i32>,
         error: Option<&str>,
     ) -> Result<(), PlaybookRepoRepositoryError> {
-        sqlx::query(
-            r#"
-            UPDATE playbook_repositories SET
-                last_sync_status = $2,
-                last_sync_commit = COALESCE($3, last_sync_commit),
-                last_synced_at = CASE WHEN $2 = 'success' THEN NOW() ELSE last_synced_at END,
-                playbook_count = COALESCE($4, playbook_count),
-                last_sync_error = $5,
-                updated_at = NOW()
-            WHERE id = $1
-            "#,
+        crate::db::repo_store::update_sync_status(
+            &self.pool,
+            "playbook_repositories",
+            "playbook_count",
+            id,
+            status,
+            commit,
+            playbook_count,
+            error,
         )
-        .bind(id)
-        .bind(status)
-        .bind(commit)
-        .bind(playbook_count)
-        .bind(error)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await
     }
 
     pub async fn delete(&self, id: Uuid) -> Result<(), PlaybookRepoRepositoryError> {
-        let result = sqlx::query("DELETE FROM playbook_repositories WHERE id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        if result.rows_affected() == 0 {
-            return Err(PlaybookRepoRepositoryError::NotFound(id));
-        }
-        Ok(())
+        crate::db::repo_store::delete(&self.pool, "playbook_repositories", id).await
     }
 }
 
@@ -368,11 +300,12 @@ impl RepositoryPlaybooksRepository {
         &self,
         repository_id: Uuid,
     ) -> Result<i64, RepositoryPlaybooksRepositoryError> {
-        let result = sqlx::query("DELETE FROM repository_playbooks WHERE repository_id = $1")
-            .bind(repository_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(result.rows_affected() as i64)
+        Ok(crate::db::repo_store::delete_by_repository(
+            &self.pool,
+            "repository_playbooks",
+            repository_id,
+        )
+        .await?)
     }
 
     pub async fn delete_not_in_paths(
@@ -383,14 +316,13 @@ impl RepositoryPlaybooksRepository {
         if paths.is_empty() {
             return self.delete_by_repository(repository_id).await;
         }
-        let result = sqlx::query(
-            "DELETE FROM repository_playbooks WHERE repository_id = $1 AND file_path != ALL($2)",
+        Ok(crate::db::repo_store::prune_not_in_paths(
+            &self.pool,
+            "repository_playbooks",
+            repository_id,
+            paths,
         )
-        .bind(repository_id)
-        .bind(paths)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() as i64)
+        .await?)
     }
 }
 

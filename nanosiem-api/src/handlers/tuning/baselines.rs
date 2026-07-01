@@ -10,7 +10,7 @@ use nanosiem_core::typeid::TypeIdParam;
 
 use super::types::{ListBreachesQuery, ListMetricsQuery};
 use crate::error::ApiError;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::state::AppState;
 
 /// GET /api/tuning/baselines/:rule_id
@@ -37,8 +37,7 @@ pub async fn get_baseline(
     Extension(auth): Extension<AuthContext>,
     Path(rule_id): Path<TypeIdParam>,
 ) -> Result<Json<Option<Baseline>>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     use nanosiem_core::tuning::BaselineMonitor;
 
@@ -77,8 +76,7 @@ pub async fn get_metrics(
     Path(rule_id): Path<TypeIdParam>,
     Query(query): Query<ListMetricsQuery>,
 ) -> Result<Json<Vec<RuleMetrics>>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     let limit = query.limit.unwrap_or(100).min(1000); // Cap at 1000
 
@@ -136,8 +134,7 @@ pub async fn get_breaches(
     Path(rule_id): Path<TypeIdParam>,
     Query(query): Query<ListBreachesQuery>,
 ) -> Result<Json<Vec<ThresholdBreach>>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     let limit = query.limit.unwrap_or(20).min(100); // Cap at 100
 

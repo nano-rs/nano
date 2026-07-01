@@ -208,49 +208,59 @@ pub(crate) async fn validate_s3_endpoint_ssrf(endpoint: &str) -> Result<(), Tier
 pub(crate) async fn validate_and_resolve_s3_endpoint(
     endpoint: &str,
 ) -> Result<(Url, Vec<SocketAddr>), TieringError> {
-    validate_s3_endpoint_ssrf(endpoint).await?;
+    // Syntactic gate first (cheap, no DNS): scheme, Docker-internal hostnames.
+    validate_s3_endpoint(endpoint)?;
 
-    let url = Url::parse(endpoint)
-        .map_err(|e| TieringError::Config(format!("S3 endpoint is not a valid URL: {}", e)))?;
-    let host = url
-        .host_str()
-        .ok_or_else(|| TieringError::Config("S3 endpoint has no host".to_string()))?;
+    // Dev override: skip the network-level SSRF checks entirely so a local
+    // MinIO / LocalStack endpoint (127.0.0.1 / RFC1918) is reachable in dev.
+    // Resolve and return addrs WITHOUT IP-class validation — same behavior as
+    // before; the override is opt-in via ALLOW_LOCAL_ENV.
+    if allow_local() {
+        tracing::warn!(
+            endpoint = %endpoint,
+            env = ALLOW_LOCAL_ENV,
+            "tiering SSRF validation skipped (dev override)"
+        );
 
-    // IP-literal hosts: reqwest dials the literal directly. No override needed.
-    // (`url::Url::host_str` returns IPv6 literals without brackets — `::1`,
-    // not `[::1]` — so this catches both forms.)
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return Ok((url, Vec::new()));
-    }
+        let url = Url::parse(endpoint)
+            .map_err(|e| TieringError::Config(format!("S3 endpoint is not a valid URL: {}", e)))?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| TieringError::Config("S3 endpoint has no host".to_string()))?;
 
-    let port = url.port_or_known_default().unwrap_or(443);
-    let addrs: Vec<SocketAddr> = format!("{}:{}", host, port)
-        .to_socket_addrs()
-        .map_err(|_| {
-            TieringError::Config(format!(
+        // IP-literal hosts: reqwest dials the literal directly. No override.
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            return Ok((url, Vec::new()));
+        }
+
+        let port = url.port_or_known_default().unwrap_or(443);
+        let addrs: Vec<SocketAddr> = format!("{}:{}", host, port)
+            .to_socket_addrs()
+            .map_err(|_| {
+                TieringError::Config(format!(
+                    "S3 endpoint hostname '{}' could not be resolved",
+                    host
+                ))
+            })?
+            .collect();
+
+        if addrs.is_empty() {
+            return Err(TieringError::Config(format!(
                 "S3 endpoint hostname '{}' could not be resolved",
                 host
-            ))
-        })?
-        .collect();
-
-    if addrs.is_empty() {
-        return Err(TieringError::Config(format!(
-            "S3 endpoint hostname '{}' could not be resolved",
-            host
-        )));
-    }
-
-    if !allow_local() {
-        let validator = ssrf_validator();
-        for addr in &addrs {
-            validator
-                .validate_ip_address(addr.ip())
-                .map_err(|e| map_ssrf_error(endpoint, e))?;
+            )));
         }
+
+        return Ok((url, addrs));
     }
 
-    Ok((url, addrs))
+    // Production: the shared validate-then-pin guard (NAN-1617). `ssrf_validator()`
+    // keeps tiering's specialized config (max_redirects: 0). Error class is
+    // obscured by `map_ssrf_error` to avoid a DNS/internal-host oracle.
+    ssrf_validator()
+        .validate_and_resolve(endpoint)
+        .await
+        .map_err(|e| map_ssrf_error(endpoint, e))
 }
 
 /// Format bytes into human-readable string

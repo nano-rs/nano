@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::auth::{
     password::hash_password,
-    repository::{audit_actions, ApiKeyRepository, ApiKeyRepositoryError, AuditRepository},
+    repository::{ApiKeyRepository, ApiKeyRepositoryError},
     types::{ApiKey, ApiKeyCreated, CreateApiKeyRequest},
 };
 use crate::db::repository::{RateLimitRepository, RateLimitRepositoryError};
@@ -90,19 +90,13 @@ impl From<&ApiKey> for ApiKeyInfo {
 #[derive(Clone)]
 pub struct ApiKeyService {
     repo: ApiKeyRepository,
-    audit_repo: AuditRepository,
     rate_limit_repo: RateLimitRepository,
 }
 
 impl ApiKeyService {
-    pub fn new(
-        repo: ApiKeyRepository,
-        audit_repo: AuditRepository,
-        rate_limit_repo: RateLimitRepository,
-    ) -> Self {
+    pub fn new(repo: ApiKeyRepository, rate_limit_repo: RateLimitRepository) -> Self {
         Self {
             repo,
-            audit_repo,
             rate_limit_repo,
         }
     }
@@ -129,8 +123,8 @@ impl ApiKeyService {
         &self,
         request: CreateApiKeyRequest,
         created_by: Option<Uuid>,
-        ip_address: Option<&str>,
-        user_agent: Option<&str>,
+        _ip_address: Option<&str>,
+        _user_agent: Option<&str>,
     ) -> Result<ApiKeyCreated, ApiKeyServiceError> {
         // Generate a secure random key
         let plaintext_key = Self::generate_key();
@@ -159,26 +153,6 @@ impl ApiKeyService {
             )
             .await?;
 
-        // Log the creation event
-        let _ = self
-            .audit_repo
-            .log_event(
-                created_by,
-                Some(api_key.id),
-                audit_actions::APIKEY_CREATE,
-                Some("api_key"),
-                Some(api_key.id),
-                Some(serde_json::json!({
-                    "name": &request.name,
-                    "permissions": &request.permissions,
-                    "expires_at": request.expires_at,
-                })),
-                ip_address,
-                user_agent,
-                true,
-            )
-            .await;
-
         Ok(ApiKeyCreated {
             id: api_key.id,
             key: plaintext_key,
@@ -194,12 +168,12 @@ impl ApiKeyService {
     pub async fn reset_key(
         &self,
         id: Uuid,
-        user_id: Option<Uuid>,
-        ip_address: Option<&str>,
-        user_agent: Option<&str>,
+        _user_id: Option<Uuid>,
+        _ip_address: Option<&str>,
+        _user_agent: Option<&str>,
     ) -> Result<ApiKeyCreated, ApiKeyServiceError> {
         // Verify the key exists
-        let existing = self.repo.get_key_by_id(id).await?;
+        self.repo.get_key_by_id(id).await?;
 
         // Generate a new secure key
         let plaintext_key = Self::generate_key();
@@ -214,22 +188,6 @@ impl ApiKeyService {
 
         // Update the key in the database
         let api_key = self.repo.reset_key(id, &key_hash, &key_prefix).await?;
-
-        // Log the event
-        let _ = self
-            .audit_repo
-            .log_event(
-                user_id,
-                Some(id),
-                audit_actions::APIKEY_RESET,
-                Some("api_key"),
-                Some(id),
-                Some(serde_json::json!({ "name": &existing.name })),
-                ip_address,
-                user_agent,
-                true,
-            )
-            .await;
 
         Ok(ApiKeyCreated {
             id: api_key.id,
@@ -342,27 +300,11 @@ impl ApiKeyService {
     pub async fn enable_key(
         &self,
         id: Uuid,
-        user_id: Option<Uuid>,
-        ip_address: Option<&str>,
-        user_agent: Option<&str>,
+        _user_id: Option<Uuid>,
+        _ip_address: Option<&str>,
+        _user_agent: Option<&str>,
     ) -> Result<ApiKey, ApiKeyServiceError> {
         let api_key = self.repo.set_enabled(id, true).await?;
-
-        // Log the event
-        let _ = self
-            .audit_repo
-            .log_event(
-                user_id,
-                Some(id),
-                audit_actions::APIKEY_ENABLE,
-                Some("api_key"),
-                Some(id),
-                Some(serde_json::json!({ "name": &api_key.name })),
-                ip_address,
-                user_agent,
-                true,
-            )
-            .await;
 
         Ok(api_key)
     }
@@ -371,27 +313,11 @@ impl ApiKeyService {
     pub async fn disable_key(
         &self,
         id: Uuid,
-        user_id: Option<Uuid>,
-        ip_address: Option<&str>,
-        user_agent: Option<&str>,
+        _user_id: Option<Uuid>,
+        _ip_address: Option<&str>,
+        _user_agent: Option<&str>,
     ) -> Result<ApiKey, ApiKeyServiceError> {
         let api_key = self.repo.set_enabled(id, false).await?;
-
-        // Log the event
-        let _ = self
-            .audit_repo
-            .log_event(
-                user_id,
-                Some(id),
-                audit_actions::APIKEY_DISABLE,
-                Some("api_key"),
-                Some(id),
-                Some(serde_json::json!({ "name": &api_key.name })),
-                ip_address,
-                user_agent,
-                true,
-            )
-            .await;
 
         Ok(api_key)
     }
@@ -401,31 +327,13 @@ impl ApiKeyService {
     pub async fn delete_key(
         &self,
         id: Uuid,
-        user_id: Option<Uuid>,
-        ip_address: Option<&str>,
-        user_agent: Option<&str>,
+        _user_id: Option<Uuid>,
+        _ip_address: Option<&str>,
+        _user_agent: Option<&str>,
     ) -> Result<(), ApiKeyServiceError> {
-        // Get the key name for audit logging before deletion
-        let api_key = self.repo.get_key_by_id(id).await?;
-        let key_name = api_key.name.clone();
+        self.repo.get_key_by_id(id).await?;
 
         self.repo.delete_key(id).await?;
-
-        // Log the event
-        let _ = self
-            .audit_repo
-            .log_event(
-                user_id,
-                None, // Key is deleted, can't reference it
-                audit_actions::APIKEY_DELETE,
-                Some("api_key"),
-                Some(id),
-                Some(serde_json::json!({ "name": key_name })),
-                ip_address,
-                user_agent,
-                true,
-            )
-            .await;
 
         Ok(())
     }

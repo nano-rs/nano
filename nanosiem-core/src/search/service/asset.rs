@@ -619,8 +619,8 @@ impl SearchService {
             None => return Ok((Vec::new(), 0, AssetFacets::default())),
         };
 
-        let start_str = time_range.start.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
-        let end_str = time_range.end.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+        let start_str = crate::sql_hygiene::format_ch_bound_micros(&time_range.start).to_string();
+        let end_str = crate::sql_hygiene::format_ch_bound_micros(&time_range.end).to_string();
 
         // Physical column carrying the `user` UDM concept under the active schema.
         // UDM resolves to `"user"` (byte-identical to the prior hardcode modulo the
@@ -1052,8 +1052,8 @@ impl SearchService {
         };
 
         let max_age_secs = max_age.as_secs();
-        let start_str = time_range.start.format("%Y-%m-%d %H:%M:%S").to_string();
-        let end_str = time_range.end.format("%Y-%m-%d %H:%M:%S").to_string();
+        let start_str = crate::sql_hygiene::format_ch_bound(&time_range.start).to_string();
+        let end_str = crate::sql_hygiene::format_ch_bound(&time_range.end).to_string();
 
         let lower_identifier = identifier_value.to_lowercase();
 
@@ -1239,8 +1239,8 @@ impl SearchService {
                 None => return Ok(json!({ "hashes": [], "domains": [] })),
             };
 
-        let start_str = time_range.start.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
-        let end_str = time_range.end.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+        let start_str = crate::sql_hygiene::format_ch_bound_micros(&time_range.start).to_string();
+        let end_str = crate::sql_hygiene::format_ch_bound_micros(&time_range.end).to_string();
 
         // Resolve every artifact source column + its prevalence companion through the
         // active schema profile (NAN-1241). Under UDM each resolves to its own name so
@@ -1422,8 +1422,8 @@ impl SearchService {
                 None => return Ok(json!({ "hashes": [], "domains": [] })),
             };
 
-        let start_str = time_range.start.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
-        let end_str = time_range.end.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+        let start_str = crate::sql_hygiene::format_ch_bound_micros(&time_range.start).to_string();
+        let end_str = crate::sql_hygiene::format_ch_bound_micros(&time_range.end).to_string();
         let logs_table = self
             .table_names
             .read(Self::logs_table_key(profile));

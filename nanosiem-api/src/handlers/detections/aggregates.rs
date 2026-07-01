@@ -14,7 +14,7 @@ use nanosiem_core::auth::permissions;
 use uuid::Uuid;
 
 use super::types::*;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 // Thresholds — tuned once we have real usage; kept as consts so a future knob/setting
@@ -65,8 +65,7 @@ pub async fn get_detection_health_summary(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<DetectionHealthSummary>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     let needs_tuning: i64 = sqlx::query_scalar(
         r#"SELECT COUNT(*)::bigint FROM tuning_notifications WHERE read_at IS NULL"#,
@@ -131,8 +130,7 @@ pub async fn get_noisy_rules(
     Extension(auth): Extension<AuthContext>,
     Query(params): Query<NoisyRulesQuery>,
 ) -> Result<Json<NoisyRulesResponse>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     let limit = params
         .limit
@@ -245,8 +243,7 @@ pub async fn get_fleet_health(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<FleetHealthSummary>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     // Single round-trip. The CTE pulls the latest in-window metrics row per
     // rule (DISTINCT ON), then a CASE expression buckets each rule. Rules

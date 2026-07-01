@@ -13,7 +13,7 @@ use uuid::Uuid;
 use super::types::{ApprovalResponse, RuleVersionResponse};
 use crate::error::ApiError;
 use crate::handlers::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::state::AppState;
 
 /// GET /api/tuning/versions/:rule_id
@@ -40,8 +40,7 @@ pub async fn list_versions(
     Extension(auth): Extension<AuthContext>,
     Path(_rule_id): Path<TypeIdParam>,
 ) -> Result<Json<Vec<RuleVersion>>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     // TODO: Implement version history retrieval
     // For now, return empty list as version manager is not yet integrated into AppState
@@ -74,8 +73,7 @@ pub async fn get_version(
     Extension(auth): Extension<AuthContext>,
     Path((_rule_id, _version_id)): Path<(TypeIdParam, i32)>,
 ) -> Result<Json<RuleVersion>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     // TODO: Implement version retrieval
     Err(ApiError::NotFound("Version not found".to_string()))
@@ -106,8 +104,7 @@ pub async fn activate_version(
     Extension(auth): Extension<AuthContext>,
     Path((_rule_id, _version_id)): Path<(TypeIdParam, i32)>,
 ) -> Result<Json<ApprovalResponse>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:edit".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_EDIT)?;
 
     // TODO: Implement version activation workflow
     // 1. Retrieve version
@@ -147,8 +144,7 @@ pub async fn get_rule_versions(
     Extension(auth): Extension<AuthContext>,
     Path(rule_id): Path<TypeIdParam>,
 ) -> Result<Json<Vec<RuleVersionResponse>>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     use nanosiem_core::tuning::versions::RuleVersionManager;
 
@@ -243,8 +239,7 @@ pub async fn revert_to_version(
     client: Extension<ClientContext>,
     Path((rule_id, version_id)): Path<(TypeIdParam, i32)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:edit".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_EDIT)?;
 
     use nanosiem_core::tuning::versions::RuleVersionManager;
 

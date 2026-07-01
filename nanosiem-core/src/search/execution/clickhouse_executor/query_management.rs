@@ -9,6 +9,7 @@ use tracing::{debug, info};
 use super::sql_helpers::escape_question_marks_in_strings;
 use super::types::ClickHouseExecutor;
 use crate::search::{parse_clickhouse_error, SearchError};
+use crate::sql_hygiene::escape_sql_string;
 
 impl ClickHouseExecutor {
     /// Cancel a running query by its query_id
@@ -37,7 +38,7 @@ impl ClickHouseExecutor {
         // Escape single quotes in each id to prevent SQL injection
         let id_list = query_ids
             .iter()
-            .map(|id| format!("'{}'", id.replace('\'', "''")))
+            .map(|id| format!("'{}'", escape_sql_string(id)))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -107,7 +108,7 @@ impl ClickHouseExecutor {
         query_id: &str,
     ) -> Result<Option<crate::search::jobs::SearchJobProgress>, SearchError> {
         // Escape single quotes in the query_id to prevent SQL injection
-        let escaped_id = query_id.replace('\'', "''");
+        let escaped_id = escape_sql_string(query_id);
 
         let sql = format!(
             "SELECT read_rows, total_rows_approx, elapsed FROM system.processes WHERE query_id = '{}'",

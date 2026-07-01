@@ -13,7 +13,7 @@ pub mod service;
 pub mod types;
 
 pub use parser::{FileFormat, FileParser, ParseError, ParseResult, ParsedRecord, ParserConfig};
-pub use repository::{UploadRepository, UploadRepositoryError, UploadStats};
+pub use repository::{UploadRepository, UploadRepositoryError};
 pub use service::{UploadError, UploadService, DEFAULT_PREVIEW_ROWS, MAX_FILE_SIZE};
 pub use types::{
     ColumnInfo, ColumnType, LookupMode, PreviewResult, UploadDestination, UploadFilter,

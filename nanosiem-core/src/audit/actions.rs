@@ -402,6 +402,8 @@ pub const OIDC_PROVIDER_ENABLED: &str = "oidc_provider_enabled";
 pub const OIDC_PROVIDER_DISABLED: &str = "oidc_provider_disabled";
 /// OIDC group mappings were updated
 pub const OIDC_GROUP_MAPPINGS_UPDATED: &str = "oidc_group_mappings_updated";
+/// A new user was just-in-time provisioned on first OIDC login
+pub const OIDC_USER_PROVISIONED: &str = "oidc_user_provisioned";
 
 // =============================================================================
 // Parser Repository Actions
@@ -608,9 +610,46 @@ pub const LOOKUP_ROW_UPDATED: &str = "lookup_row_updated";
 pub const LOOKUP_ROWS_DELETED: &str = "lookup_rows_deleted";
 
 // =============================================================================
+// MFA Actions
+// =============================================================================
+
+/// MFA challenge was issued during login (user prompted for a TOTP/backup code)
+pub const MFA_CHALLENGE_ISSUED: &str = "mfa_challenge_issued";
+/// MFA challenge was satisfied (valid TOTP or backup code) — login proceeds
+pub const MFA_CHALLENGE_SUCCESS: &str = "mfa_challenge_success";
+/// MFA challenge failed (invalid/expired code or challenge token)
+pub const MFA_CHALLENGE_FAILED: &str = "mfa_challenge_failed";
+/// A single-use MFA backup code was consumed to satisfy a challenge
+pub const MFA_BACKUP_CODE_USED: &str = "mfa_backup_code_used";
+/// MFA setup was initiated (TOTP secret issued, not yet verified)
+pub const MFA_SETUP_INITIATED: &str = "mfa_setup_initiated";
+/// MFA setup was completed (first valid code verified, MFA now active)
+pub const MFA_SETUP_COMPLETE: &str = "mfa_setup_complete";
+/// MFA was disabled for an account
+pub const MFA_DISABLED: &str = "mfa_disabled";
+/// MFA backup codes were regenerated
+pub const MFA_BACKUP_CODES_REGENERATED: &str = "mfa_backup_codes_regenerated";
+/// An admin reset another user's MFA enrollment
+pub const MFA_ADMIN_RESET: &str = "mfa_admin_reset";
+/// MFA enforcement was toggled globally
+pub const MFA_ENFORCED_GLOBALLY: &str = "mfa_enforced_globally";
+
+// =============================================================================
 // Identity Actions (additional)
 // =============================================================================
 
+/// Identity provider was created
+pub const IDENTITY_PROVIDER_CREATED: &str = "identity_provider_created";
+/// Identity provider was updated
+pub const IDENTITY_PROVIDER_UPDATED: &str = "identity_provider_updated";
+/// Identity provider was deleted
+pub const IDENTITY_PROVIDER_DELETED: &str = "identity_provider_deleted";
+/// Identity provider credentials were updated
+pub const IDENTITY_PROVIDER_CREDENTIALS_UPDATED: &str = "identity_provider_credentials_updated";
+/// Identity directory sync was triggered
+pub const IDENTITY_SYNC_TRIGGERED: &str = "identity_sync_triggered";
+/// Identity directory sync completed
+pub const IDENTITY_SYNC_COMPLETED: &str = "identity_sync_completed";
 /// Identity users were pushed/synced
 pub const IDENTITY_USERS_PUSHED: &str = "identity_users_pushed";
 
@@ -655,3 +694,169 @@ pub const IP_ALLOWLIST_DELETED: &str = "ip_allowlist_deleted";
 pub const FOLDER_ICON_SET: &str = "folder_icon_set";
 /// Custom folder icon was cleared (folder reverts to default icon)
 pub const FOLDER_ICON_CLEARED: &str = "folder_icon_cleared";
+
+// =============================================================================
+// Durable-audit classifier (NAN-1625)
+// =============================================================================
+
+/// Audit actions that must be emitted **durably** — i.e. via a synchronous
+/// ClickHouse insert (`AuditEmitter::emit_durable`, which forces
+/// `async_insert=0` + `wait_end_of_query=1`) rather than the default
+/// fire-and-forget async-insert path. After NAN-1622 made ClickHouse the sole
+/// audit store, silent loss of these events is a real reliability/compliance
+/// gap, so the emit path awaits the write and surfaces failures loudly.
+///
+/// ## What is (and is NOT) in this set — and WHY
+///
+/// This is intentionally an **explicit, greppable list, not a prefix match**,
+/// so the durability contract is auditable. The list is a *deliberate subset*
+/// of all security-relevant actions, chosen to be **non-floodable**:
+///
+/// - **INCLUDED**: low-volume, successful/completed security **state changes**
+///   that require a *valid, authenticated* action to trigger — a login that
+///   actually succeeded, an MFA challenge that was satisfied, an API-key
+///   lifecycle change, an account lockout transition, JIT user provisioning,
+///   session termination, a completed password reset / change. An
+///   unauthenticated attacker cannot flood these.
+///
+/// - **DELIBERATELY EXCLUDED** (kept fire-and-forget) even though they are
+///   security-relevant, because they are **high-volume or attacker-floodable**
+///   and awaiting a synchronous insert on them would amplify a flood into a
+///   self-inflicted DoS on the ClickHouse connection pool:
+///     * `auth_denied` — fires on every 403 (very high volume)
+///     * `login_failed` — brute-force floodable by an unauthenticated attacker
+///     * `mfa_challenge_issued` / `mfa_challenge_failed` — floodable by anyone
+///       repeatedly submitting wrong/again
+///     * `password_reset_request` — unauthenticated, floodable
+///     * `mfa_setup_initiated` — a *non-committed* step (TOTP secret issued,
+///       not yet verified) that an authenticated user can re-trigger; only the
+///       committed `mfa_setup_complete` transition is durable
+///   These are still audited (fire-and-forget, exactly as before) — just not
+///   blocking. The dispatch path additionally caps durable-insert concurrency
+///   and falls back to fire-and-forget under load, but keeping floodable
+///   events out of the durable set is the primary guard.
+///
+/// The rule of thumb: durable == an **authenticated, committed, low-volume
+/// security state change**. All authenticated MFA and API-key state changes
+/// qualify; only the floodable challenge/request events and the non-committed
+/// `mfa_setup_initiated` step are excluded.
+///
+/// The unit test below pins this set in lockstep (C2 pattern): adding or
+/// removing a member forces a matching test edit in the same commit, keeping
+/// the contract reviewable.
+pub const SECURITY_CRITICAL_ACTIONS: &[&str] = &[
+    // Authentication — a login that actually *succeeded* (not floodable).
+    LOGIN_SUCCESS,
+    // Password changes that require an authenticated/validated action.
+    PASSWORD_RESET_COMPLETE,
+    PASSWORD_CHANGED,
+    // MFA — all authenticated / committed account-security state changes.
+    // (The floodable `mfa_challenge_issued`/`mfa_challenge_failed` and the
+    // non-committed `mfa_setup_initiated` are deliberately excluded above.)
+    MFA_CHALLENGE_SUCCESS,
+    MFA_BACKUP_CODE_USED,
+    MFA_SETUP_COMPLETE,
+    MFA_DISABLED,
+    MFA_ADMIN_RESET,
+    MFA_BACKUP_CODES_REGENERATED,
+    MFA_ENFORCED_GLOBALLY,
+    // Account lockout — once per lock transition, inherently low-volume.
+    USER_LOCKED,
+    // API-key lifecycle — all authenticated, low-volume state changes
+    // (create/delete/reset/enable/disable + permission/expiry/rate-limit
+    // updates).
+    APIKEY_CREATED,
+    APIKEY_DELETED,
+    APIKEY_RESET,
+    APIKEY_ENABLED,
+    APIKEY_DISABLED,
+    APIKEY_UPDATED,
+    // Federated identity — JIT provisioning of a new user on first OIDC login.
+    OIDC_USER_PROVISIONED,
+    // Session termination — administrative, low-volume.
+    SESSION_TERMINATED,
+    USER_SESSIONS_TERMINATED,
+];
+
+/// Returns `true` when `action` must be emitted durably (synchronous insert,
+/// awaited) rather than fire-and-forget. See [`SECURITY_CRITICAL_ACTIONS`] for
+/// the exact set and the DoS-amplification rationale behind the exclusions.
+#[inline]
+pub fn is_security_critical(action: &str) -> bool {
+    SECURITY_CRITICAL_ACTIONS.contains(&action)
+}
+
+#[cfg(test)]
+mod durable_classifier_tests {
+    use super::*;
+
+    /// Pins the exact durable set (C2 lockstep). If you change
+    /// `SECURITY_CRITICAL_ACTIONS`, update this list in the SAME commit — the
+    /// diff makes the durability/DoS contract reviewable.
+    #[test]
+    fn durable_action_set_is_pinned() {
+        let mut expected = vec![
+            "login_success",
+            "password_reset_complete",
+            "password_changed",
+            "mfa_challenge_success",
+            "mfa_backup_code_used",
+            "mfa_setup_complete",
+            "mfa_disabled",
+            "mfa_admin_reset",
+            "mfa_backup_codes_regenerated",
+            "mfa_enforced_globally",
+            "user_locked",
+            "apikey_created",
+            "apikey_deleted",
+            "apikey_reset",
+            "apikey_enabled",
+            "apikey_disabled",
+            "apikey_updated",
+            "oidc_user_provisioned",
+            "session_terminated",
+            "user_sessions_terminated",
+        ];
+        let mut actual: Vec<&str> = SECURITY_CRITICAL_ACTIONS.to_vec();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(
+            actual, expected,
+            "durable audit action set changed — review DoS-floodability before editing"
+        );
+    }
+
+    #[test]
+    fn classifier_matches_the_durable_set() {
+        // Included: low-volume, authenticated, non-floodable security events.
+        assert!(is_security_critical(LOGIN_SUCCESS));
+        assert!(is_security_critical(MFA_CHALLENGE_SUCCESS));
+        assert!(is_security_critical(MFA_BACKUP_CODE_USED));
+        assert!(is_security_critical(MFA_SETUP_COMPLETE));
+        assert!(is_security_critical(MFA_DISABLED));
+        assert!(is_security_critical(MFA_ADMIN_RESET));
+        assert!(is_security_critical(APIKEY_CREATED));
+        assert!(is_security_critical(APIKEY_RESET));
+        assert!(is_security_critical(APIKEY_UPDATED));
+        assert!(is_security_critical(USER_LOCKED));
+        assert!(is_security_critical(OIDC_USER_PROVISIONED));
+        assert!(is_security_critical(USER_SESSIONS_TERMINATED));
+        assert!(is_security_critical(PASSWORD_RESET_COMPLETE));
+
+        // Deliberately EXCLUDED: floodable / high-volume security events stay
+        // fire-and-forget so awaiting them can't amplify a flood into a DoS,
+        // plus the non-committed `mfa_setup_initiated` step.
+        assert!(!is_security_critical(AUTH_DENIED));
+        assert!(!is_security_critical(LOGIN_FAILED));
+        assert!(!is_security_critical(MFA_CHALLENGE_ISSUED));
+        assert!(!is_security_critical(MFA_CHALLENGE_FAILED));
+        assert!(!is_security_critical(MFA_SETUP_INITIATED));
+        assert!(!is_security_critical(PASSWORD_RESET_REQUEST));
+
+        // Routine, high-volume mutations are never durable.
+        assert!(!is_security_critical(RULE_CREATED));
+        assert!(!is_security_critical(SEARCH_HISTORY_CLEARED));
+        assert!(!is_security_critical(TOKEN_REFRESH));
+        assert!(!is_security_critical("nonexistent_action"));
+    }
+}

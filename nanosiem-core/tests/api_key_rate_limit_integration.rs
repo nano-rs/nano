@@ -13,7 +13,7 @@
 
 mod common;
 
-use nanosiem_core::auth::repository::{ApiKeyRepository, AuditRepository};
+use nanosiem_core::auth::repository::ApiKeyRepository;
 use nanosiem_core::auth::{ApiKeyService, ApiKeyServiceError, CreateApiKeyRequest};
 use nanosiem_core::db::repository::RateLimitRepository;
 use sqlx::PgPool;
@@ -26,7 +26,6 @@ async fn pool() -> PgPool {
 fn service(pool: PgPool) -> ApiKeyService {
     ApiKeyService::new(
         ApiKeyRepository::new(pool.clone()),
-        AuditRepository::new(pool.clone()),
         RateLimitRepository::new(pool),
     )
 }
@@ -111,44 +110,10 @@ async fn rate_limit_none_means_unlimited() {
     }
 }
 
-#[tokio::test]
-#[ignore = "db-backed; runs in pg-integration CI (cargo test -- --ignored)"]
-async fn enforcement_is_independent_of_audit_emission() {
-    // The pre-fix implementation counted rows in audit_logs filtered by
-    // api_key_id. validate_key does not emit any audit row itself, so
-    // hammering it would never trip the old check. The new implementation
-    // increments a dedicated bucket on every validate, so it must trip.
-    let pool = pool().await;
-    let svc = service(pool.clone());
-    let plaintext = mint(&svc, &pool, "rl-no-audit", Some(1)).await;
-
-    let info = svc.validate_key(&plaintext, None).await.expect("call 1");
-
-    // create_key emits an APIKEY_CREATE audit row, so the baseline for this key
-    // isn't necessarily zero. What NAN-675 requires is that validate_key itself
-    // adds none — the limiter is bucket-driven, not audit-row-counting.
-    let baseline: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM audit_logs WHERE api_key_id = $1 AND timestamp > NOW() - INTERVAL '1 minute'",
-    )
-    .bind(info.id)
-    .fetch_one(&pool)
-    .await
-    .expect("baseline audit count");
-
-    let err = svc.validate_key(&plaintext, None).await.unwrap_err();
-    assert!(matches!(err, ApiKeyServiceError::RateLimitExceeded));
-
-    let after: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM audit_logs WHERE api_key_id = $1 AND timestamp > NOW() - INTERVAL '1 minute'",
-    )
-    .bind(info.id)
-    .fetch_one(&pool)
-    .await
-    .expect("post audit count");
-    assert_eq!(
-        after.0, baseline.0,
-        "validate_key must not emit audit rows; the rate limit is bucket-driven",
-    );
-
-    clear_bucket(&pool, &info.id.to_string()).await;
-}
+// NOTE (NAN-1627): the `enforcement_is_independent_of_audit_emission` test was
+// removed here. Its mechanism counted rows in the PG `audit_logs` table, which
+// was retired in NAN-1622 (ClickHouse is now the sole audit store), so the query
+// failed with `relation "audit_logs" does not exist`. The property it guarded —
+// the api-key rate limiter is bucket-driven, not audit-row-counting (NAN-675) —
+// is now structurally guaranteed (there is no audit_logs to count) and its
+// enforcement behavior is covered by `rate_limit_trips_on_next_call_after_limit`.

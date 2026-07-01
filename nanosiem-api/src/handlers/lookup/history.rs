@@ -28,7 +28,7 @@ use nanosiem_core::{
 };
 
 use super::lookup_error_to_api;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 /// Default and ceiling for the `limit` query parameter.
@@ -87,8 +87,7 @@ pub async fn get_lookup_table_ingestion_history(
     Path(name): Path<String>,
     Query(params): Query<LookupHistoryQuery>,
 ) -> Result<Json<Vec<LookupHistoryEntry>>, ApiError> {
-    check_permission(&auth, permissions::LOOKUP_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: lookup:view".to_string()))?;
+    ensure_permission(&auth, permissions::LOOKUP_VIEW)?;
 
     let limit = params
         .limit

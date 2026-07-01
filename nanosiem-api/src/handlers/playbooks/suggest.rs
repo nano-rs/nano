@@ -22,7 +22,7 @@ use nanosiem_core::playbooks::{
 };
 use nanosiem_core::typeid::TypeIdParam;
 
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 fn get_service(state: &AppState) -> PlaybookService {
@@ -47,8 +47,7 @@ pub async fn suggest_for_rule(
     Extension(auth): Extension<AuthContext>,
     Path(rule_id): Path<TypeIdParam>,
 ) -> Result<Json<Vec<PlaybookSuggestion>>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOKS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: playbooks:view".to_string()))?;
+    ensure_permission(&auth, permissions::PLAYBOOKS_VIEW)?;
 
     let service = get_service(&state);
     let suggestions = service.suggest_for_rule(rule_id.into_uuid()).await?;
@@ -76,8 +75,7 @@ pub async fn attach_to_case(
     Path(id): Path<TypeIdParam>,
     Json(req): Json<AttachToCaseRequest>,
 ) -> Result<Json<PlaybookRun>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOKS_RUN)
-        .map_err(|_| ApiError::Forbidden("Missing permission: playbooks:run".to_string()))?;
+    ensure_permission(&auth, permissions::PLAYBOOKS_RUN)?;
 
     // TokenClaims carries only `sub` (user uuid); the display label is
     // resolved client-side or backfilled by the Analytics tab. Leaving
@@ -111,8 +109,7 @@ pub async fn finish_run(
     Path(id): Path<TypeIdParam>,
     Json(req): Json<FinishRunRequest>,
 ) -> Result<Json<PlaybookRun>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOKS_RUN)
-        .map_err(|_| ApiError::Forbidden("Missing permission: playbooks:run".to_string()))?;
+    ensure_permission(&auth, permissions::PLAYBOOKS_RUN)?;
 
     let service = get_service(&state);
     let run = service.finish_run(id.into_uuid(), req).await?;
@@ -136,8 +133,7 @@ pub async fn list_runs_for_case(
     Extension(auth): Extension<AuthContext>,
     Path(case_id): Path<TypeIdParam>,
 ) -> Result<Json<Vec<PlaybookRun>>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOKS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: playbooks:view".to_string()))?;
+    ensure_permission(&auth, permissions::PLAYBOOKS_VIEW)?;
 
     let service = get_service(&state);
     let runs = service.list_runs_for_case(case_id.into_uuid()).await?;
@@ -173,8 +169,7 @@ pub async fn update_step_completion(
     Path((run_id, step_id)): Path<(TypeIdParam, String)>,
     Json(req): Json<UpdateStepCompletionRequest>,
 ) -> Result<Json<PlaybookRun>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOKS_RUN)
-        .map_err(|_| ApiError::Forbidden("Missing permission: playbooks:run".to_string()))?;
+    ensure_permission(&auth, permissions::PLAYBOOKS_RUN)?;
 
     let service = get_service(&state);
     let run = service
@@ -204,8 +199,7 @@ pub async fn resolve_run(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<ResolvedRunResponse>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOKS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: playbooks:view".to_string()))?;
+    ensure_permission(&auth, permissions::PLAYBOOKS_VIEW)?;
 
     let service = get_service(&state);
     let resolved = service.resolve_run(id.into_uuid()).await?;
@@ -238,8 +232,7 @@ pub async fn get_analytics(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<PlaybookAnalytics>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOKS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: playbooks:view".to_string()))?;
+    ensure_permission(&auth, permissions::PLAYBOOKS_VIEW)?;
 
     let service = get_service(&state);
     let analytics = service.compute_analytics(id.into_uuid()).await?;
@@ -276,8 +269,7 @@ pub async fn submit_for_review(
     Path(id): Path<TypeIdParam>,
     Json(req): Json<SubmitForReviewRequest>,
 ) -> Result<Json<PlaybookApproval>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOKS_MANAGE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: playbooks:manage".to_string()))?;
+    ensure_permission(&auth, permissions::PLAYBOOKS_MANAGE)?;
 
     let requester_id = Some(auth.user_id());
     let service = get_service(&state);
@@ -307,8 +299,7 @@ pub async fn approve_playbook(
     Path(id): Path<TypeIdParam>,
     Json(req): Json<ApprovalResponseRequest>,
 ) -> Result<Json<PlaybookApproval>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOKS_PUBLISH)
-        .map_err(|_| ApiError::Forbidden("Missing permission: playbooks:publish".to_string()))?;
+    ensure_permission(&auth, permissions::PLAYBOOKS_PUBLISH)?;
 
     let approver_id = Some(auth.user_id());
     let service = get_service(&state);
@@ -339,8 +330,7 @@ pub async fn reject_playbook(
     Path(id): Path<TypeIdParam>,
     Json(req): Json<ApprovalResponseRequest>,
 ) -> Result<Json<PlaybookApproval>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOKS_PUBLISH)
-        .map_err(|_| ApiError::Forbidden("Missing permission: playbooks:publish".to_string()))?;
+    ensure_permission(&auth, permissions::PLAYBOOKS_PUBLISH)?;
 
     let approver_id = Some(auth.user_id());
     let service = get_service(&state);
@@ -373,8 +363,7 @@ pub async fn set_permission(
     Path((id, role)): Path<(TypeIdParam, String)>,
     Json(req): Json<SetPermissionRequest>,
 ) -> Result<Json<PlaybookPermission>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOKS_MANAGE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: playbooks:manage".to_string()))?;
+    ensure_permission(&auth, permissions::PLAYBOOKS_MANAGE)?;
 
     let service = get_service(&state);
     let perm = service
@@ -403,8 +392,7 @@ pub async fn delete_permission(
     Extension(auth): Extension<AuthContext>,
     Path((id, role)): Path<(TypeIdParam, String)>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOKS_MANAGE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: playbooks:manage".to_string()))?;
+    ensure_permission(&auth, permissions::PLAYBOOKS_MANAGE)?;
 
     let service = get_service(&state);
     service.delete_permission(id.into_uuid(), &role).await?;
@@ -438,8 +426,7 @@ pub async fn compose_adaptive_from_case(
     Extension(auth): Extension<AuthContext>,
     Path(case_id): Path<TypeIdParam>,
 ) -> Result<Json<nanosiem_core::playbooks::Playbook>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOKS_MANAGE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: playbooks:manage".to_string()))?;
+    ensure_permission(&auth, permissions::PLAYBOOKS_MANAGE)?;
 
     let user_id = Some(auth.user_id());
     let service = get_service(&state);
@@ -474,9 +461,7 @@ pub async fn promote_playbook(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<nanosiem_core::playbooks::Playbook>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOKS_PUBLISH).map_err(|_| {
-        ApiError::Forbidden("Missing permission: playbooks:publish".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PLAYBOOKS_PUBLISH)?;
 
     let user_id = Some(auth.user_id());
     let service = get_service(&state);

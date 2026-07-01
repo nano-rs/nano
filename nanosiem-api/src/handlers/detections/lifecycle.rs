@@ -14,7 +14,7 @@ use nanosiem_core::typeid::TypeIdParam;
 use nanosiem_core::DetectionRule;
 
 use super::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{
     error::{ApiError, ErrorResponse},
     state::AppState,
@@ -42,8 +42,7 @@ pub async fn pause_detection(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<DetectionRule>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_PROMOTE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:promote".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_PROMOTE)?;
 
     let rule = state.detection_service.pause_rule(*id).await?;
 
@@ -90,8 +89,7 @@ pub async fn resume_detection(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<DetectionRule>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_PROMOTE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:promote".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_PROMOTE)?;
 
     let rule = state.detection_service.resume_rule(*id).await?;
 
@@ -137,8 +135,7 @@ pub async fn promote_detection(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<DetectionRule>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_PROMOTE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:promote".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_PROMOTE)?;
 
     let rule = state.detection_service.promote_to_alerting(*id).await?;
 
@@ -184,8 +181,7 @@ pub async fn demote_detection(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<DetectionRule>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_PROMOTE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:promote".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_PROMOTE)?;
 
     let rule = state.detection_service.demote_to_live(*id).await?;
 

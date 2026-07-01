@@ -4,7 +4,7 @@
  * UDM (Unified Data Model) field definitions
  *
  * AUTO-GENERATED — do not edit manually.
- * Source: nanosiem-core/docs/udmfields.csv (521 fields)
+ * Source: nanosiem-core/docs/udmfields.csv (511 fields)
  * Regenerate: npm run generate:udm
  */
 
@@ -41,25 +41,22 @@ export const UDM_COLUMNS = new Set([
   'enriched_dest_continent_code', 'enriched_dest_country', 'enriched_dest_country_code',
   'enriched_src_as_domain', 'enriched_src_as_name', 'enriched_src_asn',
   'enriched_src_continent', 'enriched_src_continent_code', 'enriched_src_country',
-  'enriched_src_country_code', 'enrichment_label_1', 'enrichment_label_2',
-  'enrichment_label_3', 'enrichment_label_4', 'enrichment_label_5', 'enrichment_value_1',
-  'enrichment_value_2', 'enrichment_value_3', 'enrichment_value_4', 'enrichment_value_5',
-  'error_code', 'event_type', 'ext', 'family', 'fan_speed', 'fd_max', 'fd_used',
-  'file_access_time', 'file_acl', 'file_action', 'file_create_time', 'file_hash',
-  'file_modify_time', 'file_name', 'file_path', 'file_size', 'filter_action', 'filter_score',
-  'flow_id', 'free_bytes', 'http_content_type', 'http_method', 'http_referrer',
-  'http_referrer_domain', 'http_status_code', 'http_user_agent', 'http_user_agent_length',
-  'hypervisor', 'hypervisor_id', 'icmp_code', 'icmp_type', 'id', 'ids_type', 'image_id',
-  'indexes_hit', 'ingest_time', 'inline_nat', 'instance_name', 'instance_reads',
-  'instance_type', 'instance_version', 'instance_writes', 'interactive', 'interface',
-  'internal_message_id', 'ioc_confidence', 'ioc_dest_ip_confidence', 'ioc_dest_ip_malware',
-  'ioc_dest_ip_threat_type', 'ioc_domain_confidence', 'ioc_domain_malware',
-  'ioc_domain_threat_type', 'ioc_hash_confidence', 'ioc_hash_malware', 'ioc_hash_threat_type',
-  'ioc_matched', 'ioc_source', 'ioc_src_ip_confidence', 'ioc_src_ip_malware',
-  'ioc_src_ip_threat_type', 'ioc_tags', 'ip', 'last_call_minute', 'latency', 'lb_method',
-  'lease_duration', 'lease_scope', 'lock_mode', 'lock_session_id', 'logical_reads',
-  'logon_time', 'mac', 'machine', 'mem', 'mem_committed', 'mem_free', 'mem_used',
-  'memory_sorts', 'message', 'message_id', 'message_info', 'metadata', 'mfa_used',
+  'enriched_src_country_code', 'error_code', 'event_type', 'ext', 'family', 'fan_speed',
+  'fd_max', 'fd_used', 'file_access_time', 'file_acl', 'file_action', 'file_create_time',
+  'file_hash', 'file_modify_time', 'file_name', 'file_path', 'file_size', 'filter_action',
+  'filter_score', 'flow_id', 'free_bytes', 'http_content_type', 'http_method',
+  'http_referrer', 'http_referrer_domain', 'http_status_code', 'http_user_agent',
+  'http_user_agent_length', 'hypervisor', 'hypervisor_id', 'icmp_code', 'icmp_type', 'id',
+  'ids_type', 'image_id', 'indexes_hit', 'ingest_time', 'inline_nat', 'instance_name',
+  'instance_reads', 'instance_type', 'instance_version', 'instance_writes', 'interactive',
+  'interface', 'internal_message_id', 'ioc_confidence', 'ioc_dest_ip_confidence',
+  'ioc_dest_ip_malware', 'ioc_dest_ip_threat_type', 'ioc_domain_confidence',
+  'ioc_domain_malware', 'ioc_domain_threat_type', 'ioc_hash_confidence', 'ioc_hash_malware',
+  'ioc_hash_threat_type', 'ioc_matched', 'ioc_source', 'ioc_src_ip_confidence',
+  'ioc_src_ip_malware', 'ioc_src_ip_threat_type', 'ioc_tags', 'ip', 'last_call_minute',
+  'latency', 'lb_method', 'lease_duration', 'lease_scope', 'lock_mode', 'lock_session_id',
+  'logical_reads', 'logon_time', 'mac', 'machine', 'mem', 'mem_committed', 'mem_free',
+  'mem_used', 'memory_sorts', 'message', 'message_id', 'message_info', 'metadata', 'mfa_used',
   'mitre_technique_id', 'mount', 'msft', 'mskb', 'name', 'namespace', 'node', 'node_port',
   'number_of_users', 'obj_name', 'object', 'object_attrs', 'object_category', 'object_id',
   'object_path', 'object_size', 'operation', 'orig_dest', 'orig_recipient', 'orig_src',

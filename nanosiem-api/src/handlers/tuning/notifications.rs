@@ -10,7 +10,7 @@ use nanosiem_core::typeid::TypeIdParam;
 
 use super::types::MarkReadRequest;
 use crate::error::ApiError;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::state::AppState;
 
 /// GET /api/tuning/notifications
@@ -33,8 +33,7 @@ pub async fn list_tuning_notifications(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<Vec<Notification>>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     // Get user ID from auth context
     let user_id = auth.user_id();
@@ -76,8 +75,7 @@ pub async fn mark_tuning_notification_read(
     Path(id): Path<TypeIdParam>,
     Json(_request): Json<MarkReadRequest>,
 ) -> Result<Json<Notification>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     // Mark the notification as read
     state
@@ -126,8 +124,7 @@ pub async fn mark_all_tuning_notifications_read(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     // Get user ID from auth context
     let user_id = auth.user_id();

@@ -13,6 +13,7 @@ use serde::Deserialize;
 use tracing::{debug, instrument};
 
 use super::types::*;
+use crate::sql_hygiene::escape_sql_string;
 use crate::db::TableNames;
 
 /// Chunk size for dict-based bulk lookups. Bounds the inlined
@@ -160,10 +161,10 @@ impl PrevalenceRepository {
         time_window: TimeWindow,
     ) -> Result<Option<HashPrevalenceRow>, clickhouse::error::Error> {
         let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
+        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
 
         // MV already stores file_hash as lower() — no need to lower() in query
-        let hash_lower = hash.to_lowercase().replace('\'', "''");
+        let hash_lower = escape_sql_string(hash.to_lowercase());
 
         let query = format!(
             r#"
@@ -208,7 +209,7 @@ impl PrevalenceRepository {
         time_window: TimeWindow,
     ) -> Result<Option<DomainPrevalenceRow>, clickhouse::error::Error> {
         let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
+        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
 
         let query = format!(
             r#"
@@ -234,7 +235,7 @@ impl PrevalenceRepository {
             )
             "#,
             domain_prevalence_table = self.domain_prevalence_table,
-            domain = domain.replace('\'', "''"),
+            domain = escape_sql_string(domain),
             cutoff_str = cutoff_str
         );
 
@@ -257,12 +258,12 @@ impl PrevalenceRepository {
         }
 
         let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
+        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
 
         // Build the IN clause with escaped values (lowercase for case-insensitive matching)
         let hash_list: String = hashes
             .iter()
-            .map(|h| format!("'{}'", h.to_lowercase().replace('\'', "''")))
+            .map(|h| format!("'{}'", escape_sql_string(h.to_lowercase())))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -314,12 +315,12 @@ impl PrevalenceRepository {
         }
 
         let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
+        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
 
         // Build the IN clause with escaped values
         let domain_list: String = domains
             .iter()
-            .map(|d| format!("'{}'", d.replace('\'', "''")))
+            .map(|d| format!("'{}'", escape_sql_string(d)))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -367,7 +368,7 @@ impl PrevalenceRepository {
         time_window: TimeWindow,
     ) -> Result<Option<IpPrevalenceRow>, clickhouse::error::Error> {
         let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
+        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
 
         let query = format!(
             r#"
@@ -395,7 +396,7 @@ impl PrevalenceRepository {
             )
             "#,
             ip_prevalence_table = self.ip_prevalence_table,
-            ip = ip.replace('\'', "''"),
+            ip = escape_sql_string(ip),
             cutoff_str = cutoff_str
         );
 
@@ -418,12 +419,12 @@ impl PrevalenceRepository {
         }
 
         let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
+        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
 
         // Build the IN clause with escaped values
         let ip_list: String = ips
             .iter()
-            .map(|ip| format!("'{}'", ip.replace('\'', "''")))
+            .map(|ip| format!("'{}'", escape_sql_string(ip)))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -528,7 +529,7 @@ impl PrevalenceRepository {
 
         let artifact_list: String = artifacts
             .iter()
-            .map(|a| format!("'{}'", a.replace('\'', "''")))
+            .map(|a| format!("'{}'", escape_sql_string(a)))
             .collect::<Vec<_>>()
             .join(",");
 
@@ -579,7 +580,7 @@ impl PrevalenceRepository {
         limit: i64,
     ) -> Result<Vec<HashPrevalenceRow>, clickhouse::error::Error> {
         let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
+        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
 
         let query = format!(
             r#"
@@ -626,7 +627,7 @@ impl PrevalenceRepository {
         limit: i64,
     ) -> Result<Vec<DomainPrevalenceRow>, clickhouse::error::Error> {
         let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
+        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
 
         let query = format!(
             r#"
@@ -673,7 +674,7 @@ impl PrevalenceRepository {
     ) -> Result<Vec<HashPrevalenceRow>, clickhouse::error::Error> {
         // Convert since to microseconds for comparison with reinterpretAsInt64
         let since_micros = since.timestamp_micros();
-        let since_str = since.format("%Y-%m-%d %H:%M:%S").to_string();
+        let since_str = crate::sql_hygiene::format_ch_bound(&since).to_string();
 
         let query = format!(
             r#"
@@ -720,7 +721,7 @@ impl PrevalenceRepository {
     ) -> Result<Vec<DomainPrevalenceRow>, clickhouse::error::Error> {
         // Convert since to microseconds for comparison with reinterpretAsInt64
         let since_micros = since.timestamp_micros();
-        let since_str = since.format("%Y-%m-%d %H:%M:%S").to_string();
+        let since_str = crate::sql_hygiene::format_ch_bound(&since).to_string();
 
         let query = format!(
             r#"
@@ -768,7 +769,7 @@ impl PrevalenceRepository {
         limit: i64,
     ) -> Result<Vec<IpPrevalenceRow>, clickhouse::error::Error> {
         let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
+        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
 
         let query = format!(
             r#"
@@ -819,7 +820,7 @@ impl PrevalenceRepository {
     ) -> Result<Vec<IpPrevalenceRow>, clickhouse::error::Error> {
         // Convert since to microseconds for comparison with reinterpretAsInt64
         let since_micros = since.timestamp_micros();
-        let since_str = since.format("%Y-%m-%d %H:%M:%S").to_string();
+        let since_str = crate::sql_hygiene::format_ch_bound(&since).to_string();
 
         let query = format!(
             r#"
@@ -952,11 +953,11 @@ impl PrevalenceRepository {
         }
 
         let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
+        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
 
         let hash_list: String = hashes
             .iter()
-            .map(|h| format!("'{}'", h.to_lowercase().replace('\'', "''")))
+            .map(|h| format!("'{}'", escape_sql_string(h.to_lowercase())))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -996,11 +997,11 @@ impl PrevalenceRepository {
         }
 
         let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
+        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
 
         let domain_list: String = domains
             .iter()
-            .map(|d| format!("'{}'", d.replace('\'', "''")))
+            .map(|d| format!("'{}'", escape_sql_string(d)))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -1040,11 +1041,11 @@ impl PrevalenceRepository {
         }
 
         let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
+        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
 
         let ip_list: String = ips
             .iter()
-            .map(|ip| format!("'{}'", ip.replace('\'', "''")))
+            .map(|ip| format!("'{}'", escape_sql_string(ip)))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -1102,8 +1103,8 @@ impl PrevalenceRepository {
         time_window: TimeWindow,
     ) -> Result<ArtifactDetailResponse, clickhouse::error::Error> {
         let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
-        let escaped = artifact.replace('\'', "''");
+        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
+        let escaped = escape_sql_string(artifact);
 
         // Resolve UDM-semantic column names to the active schema's physical
         // columns (NAN-1241). Under UDM these return the same name (byte-identical
@@ -1459,7 +1460,7 @@ impl PrevalenceRepository {
         let domain_artifacts = cap(domain_artifacts, "domain");
 
         let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = cutoff.format("%Y-%m-%d %H:%M:%S").to_string();
+        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
         let prewhere_filter = format!("timestamp >= toDateTime('{}')", cutoff_str);
 
         // --- Hashes: top file_name, top process_name+command_line, user_count, top source_type ---
@@ -1475,7 +1476,7 @@ impl PrevalenceRepository {
             let user = col_user.as_deref().expect("checked is_some");
             let escaped: Vec<String> = hash_artifacts
                 .iter()
-                .map(|h| format!("'{}'", h.replace('\'', "''").to_lowercase()))
+                .map(|h| format!("'{}'", escape_sql_string(h).to_lowercase()))
                 .collect();
             let hash_list = escaped.join(",");
 
@@ -1575,7 +1576,7 @@ impl PrevalenceRepository {
             let user = col_user.as_deref().expect("checked is_some");
             let escaped: Vec<String> = ip_artifacts
                 .iter()
-                .map(|v| format!("'{}'", v.replace('\'', "''")))
+                .map(|v| format!("'{}'", escape_sql_string(v)))
                 .collect();
             let ip_list = escaped.join(",");
 
@@ -1621,7 +1622,7 @@ impl PrevalenceRepository {
             let user = col_user.as_deref().expect("checked is_some");
             let escaped: Vec<String> = domain_artifacts
                 .iter()
-                .map(|v| format!("'{}'", v.replace('\'', "''")))
+                .map(|v| format!("'{}'", escape_sql_string(v)))
                 .collect();
             let dom_list = escaped.join(",");
 

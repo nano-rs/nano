@@ -236,11 +236,6 @@ impl ArtifactType {
             ArtifactType::IpAddress | ArtifactType::IpAddressPrivate
         )
     }
-
-    /// Check if a value is a valid IP address
-    pub fn is_valid_ip_value(value: &str) -> bool {
-        value.parse::<std::net::IpAddr>().is_ok()
-    }
 }
 
 impl std::fmt::Display for ArtifactType {
@@ -339,21 +334,6 @@ impl Default for PrevalenceConfig {
             cache_ttl_seconds: 60,
         }
     }
-}
-
-/// Filter options for prevalence queries
-#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct PrevalenceFilter {
-    /// Filter by artifact type
-    pub artifact_type: Option<ArtifactType>,
-    /// Maximum prevalence (host count) to include
-    pub max_prevalence: Option<u64>,
-    /// Minimum prevalence (host count) to include
-    pub min_prevalence: Option<u64>,
-    /// Maximum number of results
-    pub limit: Option<i64>,
-    /// Offset for pagination
-    pub offset: Option<i64>,
 }
 
 /// Request for bulk prevalence lookup

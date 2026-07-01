@@ -57,7 +57,10 @@
              refresh MVs (*_dict_refresh). A failing refresh keeps ingestion
              alive on the last good staging snapshot; this read is how the
              staleness surfaces. Column-scoped. -->
-        <query>GRANT SELECT(database, view, exception, retry, last_success_time) ON system.view_refreshes</query>
+        <!-- NAN-1629: status + next_refresh_time are used in the probe's WHERE
+             (status='Disabled', next_refresh_time < now()-1h); without them the
+             column-scoped grant rejects the whole read (ACCESS_DENIED). -->
+        <query>GRANT SELECT(database, view, exception, retry, last_success_time, status, next_refresh_time) ON system.view_refreshes</query>
         <!-- NAN-1435: search cancel (KILL QUERY WHERE query_id IN …) and the
              query-progress endpoint read system.processes. Table-level on
              purpose: ClickHouse's KILL rejects column-scoped SELECT on

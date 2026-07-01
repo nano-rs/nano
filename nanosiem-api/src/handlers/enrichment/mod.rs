@@ -34,7 +34,7 @@ pub use types::*;
 
 use chrono::{DateTime, Utc};
 use nanosiem_core::enrichment::EnrichmentService;
-use nanosiem_core::inputlookup::{SsrfConfig, SsrfValidator};
+use nanosiem_core::inputlookup::SsrfValidator;
 
 use crate::error::ApiError;
 use crate::handlers::AuditExt;
@@ -55,12 +55,7 @@ use crate::handlers::AuditExt;
 /// Plain `http://` is allowed so existing IPinfo Lite configs keep working;
 /// the IP-range checks apply equally to http and https.
 pub(crate) async fn validate_external_url(url_str: &str) -> Result<(), ApiError> {
-    let validator = SsrfValidator::new(SsrfConfig {
-        allow_http: true,
-        ..Default::default()
-    });
-
-    validator
+    SsrfValidator::http_allowed_validator()
         .validate_with_dns(url_str)
         .await
         .map(|_| ())

@@ -24,11 +24,10 @@ use sqlx::PgPool;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use std::net::SocketAddr;
 
 use super::synthetic_check_repository::{SyntheticCheck, SyntheticCheckRepository};
 use crate::db::repository::{AlertInsert, AlertRepository};
-use crate::inputlookup::{SsrfConfig, SsrfValidator};
+use crate::inputlookup::SsrfValidator;
 use crate::models::Severity;
 
 /// How often the runner wakes to look for due checks. The minimum check
@@ -151,12 +150,10 @@ impl SyntheticRunner {
     /// block (the caller records it as the probe failure). Secure by default:
     /// private/link-local/loopback/metadata ranges are blocked.
     async fn ssrf_checked_client(target_url: &str) -> Result<reqwest::Client, String> {
-        let validator = SsrfValidator::new(SsrfConfig {
-            allow_http: true,
-            ..Default::default()
-        });
-        let url = validator
-            .validate_with_dns(target_url)
+        // Shared validate-then-pin guard (NAN-1617): pre-flight validation +
+        // re-resolve + per-address re-validation, returning the addrs to pin.
+        let (url, addrs) = SsrfValidator::http_allowed_validator()
+            .validate_and_resolve(target_url)
             .await
             .map_err(|e| format!("blocked by SSRF guard: {e}"))?;
 
@@ -164,28 +161,11 @@ impl SyntheticRunner {
             .redirect(reqwest::redirect::Policy::none())
             .user_agent("nano-synthetic-monitor");
 
-        // IP-literal hosts were already validated by validate_with_dns; reqwest
-        // dials them directly. DNS-name hosts: resolve, re-validate every
-        // address, and pin reqwest to them (defeats rebind TOCTOU).
-        let host = url.host_str().ok_or_else(|| "URL missing host".to_string())?;
-        if host.parse::<std::net::IpAddr>().is_err() {
-            let port = url.port_or_known_default().unwrap_or(80);
-            let addrs: Vec<SocketAddr> = tokio::time::timeout(
-                StdDuration::from_secs(5),
-                tokio::net::lookup_host(format!("{host}:{port}")),
-            )
-            .await
-            .map_err(|_| format!("DNS resolution timed out for {host}"))?
-            .map_err(|e| format!("DNS resolution failed for {host}: {e}"))?
-            .collect();
-            if addrs.is_empty() {
-                return Err(format!("DNS resolution returned no addresses for {host}"));
-            }
-            for addr in &addrs {
-                validator
-                    .validate_ip_address(addr.ip())
-                    .map_err(|e| format!("blocked by SSRF guard: resolved IP blocked: {e}"))?;
-            }
+        // IP-literal hosts return an empty Vec (reqwest dials the literal,
+        // already validated). DNS-name hosts: pin reqwest to the pre-validated
+        // addrs so DNS can't be rebound to an internal IP after validation.
+        if !addrs.is_empty() {
+            let host = url.host_str().ok_or_else(|| "URL missing host".to_string())?;
             builder = builder.resolve_to_addrs(host, &addrs);
         }
 

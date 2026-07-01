@@ -57,29 +57,11 @@ test = false
 doc = false
 bench = false
 
-# Log Parser Fuzzer - tests syslog/CEF/LEEF/JSON log parsing
-# Catches: format detection bugs, field extraction panics
-[[bin]]
-name = "fuzz_log_parser"
-path = "fuzz_targets/fuzz_log_parser.rs"
-test = false
-doc = false
-bench = false
-
 # Auth Fuzzer - tests password validation and JWT token parsing
 # Catches: panics in password complexity checks, JWT parsing crashes
 [[bin]]
 name = "fuzz_auth"
 path = "fuzz_targets/fuzz_auth.rs"
-test = false
-doc = false
-bench = false
-
-# Auto-Detect Fuzzer - tests log source type detection with regex patterns
-# Catches: ReDoS vulnerabilities, regex compilation panics, detection crashes
-[[bin]]
-name = "fuzz_auto_detect"
-path = "fuzz_targets/fuzz_auto_detect.rs"
 test = false
 doc = false
 bench = false

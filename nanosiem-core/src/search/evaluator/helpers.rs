@@ -64,20 +64,10 @@ pub fn compare_json_values(
     }
 }
 
-/// Escape a string for SQL to prevent SQL injection
-/// Note: Backslash must be escaped BEFORE quotes to avoid `\'` becoming `''''`
-pub fn escape_sql_string(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "''")
-}
-
-/// Escape a string for use in LIKE/ILIKE patterns.
-/// Escapes the SQL wildcards (% and _) and backslashes, then escapes quotes.
-pub fn escape_like_pattern(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-        .replace('\'', "''")
-}
+// Canonical SQL-literal escapers live in `crate::sql_hygiene` (NAN-1616).
+// Re-exported here so existing `evaluator::helpers::{escape_sql_string,
+// escape_like_pattern}` import paths keep working.
+pub(crate) use crate::sql_hygiene::{escape_like_pattern, escape_sql_string};
 
 /// Strip empty/default values from a result JSON object to reduce response size.
 /// Removes empty strings, zero numbers, empty arrays, and null values.

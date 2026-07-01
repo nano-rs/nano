@@ -24,8 +24,9 @@ use uuid::Uuid;
 
 use crate::utils::{extract_client_ip, extract_user_agent};
 use nanosiem_core::audit::{
-    AuditEvent, AuditSource, ClientContext, LOGIN_FAILED, LOGIN_SUCCESS, LOGOUT, PASSWORD_CHANGED,
-    PASSWORD_RESET_COMPLETE, PASSWORD_RESET_REQUEST,
+    AuditEvent, AuditSource, ClientContext, LOGIN_FAILED, LOGIN_SUCCESS, LOGOUT,
+    MFA_CHALLENGE_ISSUED, PASSWORD_CHANGED, PASSWORD_RESET_COMPLETE, PASSWORD_RESET_REQUEST,
+    USER_LOCKED,
 };
 use nanosiem_core::auth::{
     AuthError, AuthResponse, LoginRequest, LoginResult, PasswordResetCompletion,
@@ -197,6 +198,21 @@ pub async fn login(
             Ok(res)
         }
         Ok(LoginResult::MfaRequired { challenge_token }) => {
+            // Password verified; MFA code now required. Audit the challenge
+            // issuance (the actor is recovered from the freshly minted challenge
+            // token). Completion/failure is audited by verify_mfa_challenge.
+            let actor_id = state
+                .token_service
+                .validate_mfa_challenge_token(&challenge_token)
+                .ok()
+                .map(|c| c.sub);
+            state.emit_audit(
+                AuditEvent::builder(AuditSource::Auth, MFA_CHALLENGE_ISSUED)
+                    .actor(actor_id, Some(request.email.clone()))
+                    .resource("user", actor_id, Some(request.email.clone()))
+                    .client_context(&client_ctx)
+                    .build(),
+            );
             // MFA enabled — return challenge token, no cookies/tokens
             Ok(Json(serde_json::json!({
                 "status": "mfa_required",
@@ -227,6 +243,30 @@ pub async fn login(
                     }))
                     .build(),
             );
+            // The auth service signals a fresh lockout via AccountLocked, returned
+            // ONLY on the attempt that crosses the failed-attempt threshold (not on
+            // every subsequent attempt against an already-throttled account), so
+            // user_locked is audited exactly once per lock episode. Within the login
+            // flow authenticate() returns AccountLocked only at that crossing — its
+            // disabled and hard-locked checks return generic InvalidCredentials for
+            // enumeration safety — so this match is precise (refresh_token's own
+            // AccountLocked never reaches this handler). AccountLocked is normalized
+            // to a generic 401 by from_auth_error, so the client still can't
+            // enumerate. The account is identified by email; no user_id is exposed
+            // here (enumeration-safety), matching login_failed.
+            if matches!(e, AuthError::AccountLocked) {
+                state.emit_audit(
+                    AuditEvent::builder(AuditSource::Auth, USER_LOCKED)
+                        .actor(None, Some(request.email.clone()))
+                        .resource("user", None, Some(request.email.clone()))
+                        .client_context(&client_ctx)
+                        .success(false)
+                        .details(serde_json::json!({
+                            "reason": "failed_login_threshold_exceeded"
+                        }))
+                        .build(),
+                );
+            }
             let (status, err) = AuthApiError::from_auth_error(&e);
             Err((status, Json(err)))
         }

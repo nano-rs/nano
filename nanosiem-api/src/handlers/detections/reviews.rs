@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{
     error::{ApiError, ErrorResponse},
     state::AppState,
@@ -72,8 +72,7 @@ pub async fn mark_match_reviewed(
     Path(id): Path<TypeIdParam>,
     Json(body): Json<MarkReviewRequest>,
 ) -> Result<Json<MatchReviewResponse>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:edit".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_EDIT)?;
 
     // Verify the match exists so we can return a clean 404 (the FK would also
     // reject, but its error message is opaque).
@@ -149,8 +148,7 @@ pub async fn unmark_match_reviewed(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<MatchReviewResponse>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:edit".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_EDIT)?;
 
     sqlx::query("DELETE FROM match_reviews WHERE match_id = $1")
         .bind(*id)

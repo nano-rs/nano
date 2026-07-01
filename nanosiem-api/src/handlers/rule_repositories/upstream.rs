@@ -9,7 +9,7 @@ use nanosiem_core::auth::permissions;
 use nanosiem_core::typeid::TypeIdParam;
 
 use super::{get_rule_repo_service, types::UpstreamUpdatesResponse};
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 /// Get list of imported rules with upstream changes
@@ -32,9 +32,7 @@ pub async fn get_upstream_updates(
     Extension(auth): Extension<AuthContext>,
     Path(repo_id): Path<TypeIdParam>,
 ) -> Result<Json<UpstreamUpdatesResponse>, ApiError> {
-    check_permission(&auth, permissions::RULE_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: rule_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::RULE_REPOSITORIES_VIEW)?;
 
     let service = get_rule_repo_service(&state)?;
     let updates = service.check_for_updates(*repo_id).await?;
@@ -66,9 +64,7 @@ pub async fn get_upstream_diff(
     Extension(auth): Extension<AuthContext>,
     Path(detection_rule_id): Path<TypeIdParam>,
 ) -> Result<Json<nanosiem_core::rule_repository::UpstreamDiff>, ApiError> {
-    check_permission(&auth, permissions::RULE_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: rule_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::RULE_REPOSITORIES_VIEW)?;
 
     let service = get_rule_repo_service(&state)?;
     let diff = service.get_upstream_diff(*detection_rule_id).await?;
@@ -96,8 +92,7 @@ pub async fn dismiss_upstream_changes(
     Extension(auth): Extension<AuthContext>,
     Path(detection_rule_id): Path<TypeIdParam>,
 ) -> Result<StatusCode, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:edit".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_EDIT)?;
 
     let service = get_rule_repo_service(&state)?;
     service.dismiss_upstream_changes(*detection_rule_id).await?;

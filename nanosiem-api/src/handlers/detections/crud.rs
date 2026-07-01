@@ -17,7 +17,7 @@ use nanosiem_core::{DetectionRule, NewDetectionRule, UpdateDetectionRule};
 use super::strip_comments;
 use super::types::*;
 use super::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{
     error::{ApiError, ErrorResponse},
     state::AppState,
@@ -47,8 +47,7 @@ pub async fn list_detections(
     Extension(auth): Extension<AuthContext>,
     Query(query): Query<ListDetectionsQuery>,
 ) -> Result<Json<Vec<DetectionRule>>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     let mut rules = if let Some(severity) = query.severity {
         state
@@ -136,8 +135,7 @@ pub async fn get_detection(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<DetectionRule>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     let rule = state.detection_service.get_rule(*id).await?;
 
@@ -181,8 +179,7 @@ pub async fn create_detection(
     Extension(client): Extension<ClientContext>,
     Json(mut request): Json<NewDetectionRule>,
 ) -> Result<Json<DetectionResponse>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_CREATE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:create".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_CREATE)?;
 
     // Production-activation fields require detections:promote, matching the gate
     // on update/lifecycle/bulk-update. Without it, a create-only key could mint
@@ -351,8 +348,7 @@ pub async fn update_detection(
     Path(id): Path<TypeIdParam>,
     Json(mut request): Json<UpdateDetectionRule>,
 ) -> Result<Json<DetectionResponse>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:edit".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_EDIT)?;
 
     // Fetch current rule state for audit diff
     let old_rule = state.detection_service.get_rule(*id).await?;
@@ -560,8 +556,7 @@ pub async fn delete_detection(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_DELETE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:delete".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_DELETE)?;
 
     // Get the rule name before deleting for audit
     let rule_name = state

@@ -2,7 +2,6 @@
 
 //! Tests for the tuning repository.
 
-use super::*;
 use crate::tuning::types::{
     AlertPattern, ComparisonMetrics, ProposalType, SafetyCheck, SafetyValidation, TestResults,
     TuningLogEntry, TuningProposal, TuningStatus,

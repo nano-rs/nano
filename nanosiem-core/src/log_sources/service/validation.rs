@@ -196,7 +196,7 @@ impl LogSourceService {
         })?;
 
         let limit = limit.min(20);
-        let safe_source_type = source_type.replace('\'', "''");
+        let safe_source_type = crate::sql_hygiene::escape_sql_string(source_type);
         let sql = format!(
             "SELECT message FROM {} WHERE source_type = '{}' AND message != '' ORDER BY timestamp DESC LIMIT {}",
             self.logs_table, safe_source_type, limit

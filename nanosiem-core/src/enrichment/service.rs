@@ -18,7 +18,7 @@ use tracing::{info, instrument, warn};
 
 use super::repository::{EnrichmentRepository, EnrichmentRepositoryError};
 use super::types::*;
-use crate::inputlookup::{SsrfConfig, SsrfValidator};
+use crate::inputlookup::SsrfValidator;
 
 #[derive(Error, Debug)]
 pub enum EnrichmentError {
@@ -170,84 +170,22 @@ impl Default for IpEnrichmentCache {
 /// SSRF-validate an IPinfo download URL and resolve it to socket addresses
 /// safe to pin into a reqwest client.
 ///
-/// Two-step resolution: `SsrfValidator::validate_with_dns` runs first to
-/// catch syntax / scheme / blocked-domain / metadata-hostname violations
-/// and reject the URL early if its hostname currently resolves to a
-/// forbidden IP. We then re-resolve so we have addresses to feed
-/// `ClientBuilder::resolve_to_addrs`, validating every address from the
-/// second lookup the same way (catches the case where DNS flipped between
-/// the two calls). Pinning closes the rebinding window between our final
-/// resolution and reqwest's connect-time resolution — the connector dials
-/// these exact addresses, not whatever the resolver returns later.
-///
-/// IP-literal hosts return an empty `Vec`; reqwest dials the literal
-/// directly and no override is needed.
-///
-/// Mirrors the pattern in `nanosiem-core/src/settings/tiering/validation.rs`
-/// (`validate_and_resolve_s3_endpoint`) so the two SSRF-sensitive download
-/// paths in the codebase share the same shape.
+/// Delegates to the shared `SsrfValidator::validate_and_resolve` helper
+/// (NAN-1617), which performs the validate-then-pin sequence in one place:
+/// pre-flight validation, IP-literal short-circuit (returns an empty `Vec`,
+/// reqwest dials the literal directly), then a re-resolve whose every address
+/// is re-validated and returned for `ClientBuilder::resolve_to_addrs`. Pinning
+/// closes the DNS-rebinding window between resolution and reqwest's
+/// connect-time lookup.
 async fn validate_and_resolve_ipinfo_url(
     url_str: &str,
 ) -> Result<(url::Url, Vec<std::net::SocketAddr>), EnrichmentError> {
-    let validator = SsrfValidator::new(SsrfConfig {
-        allow_http: true,
-        ..Default::default()
-    });
-
-    let parsed_url = validator.validate_with_dns(url_str).await.map_err(|e| {
-        EnrichmentError::DownloadError(format!(
-            "URL rejected by SSRF check before fetch: {}",
-            e
-        ))
-    })?;
-
-    let host = parsed_url
-        .host_str()
-        .ok_or_else(|| EnrichmentError::DownloadError("URL missing host".to_string()))?;
-
-    // IP-literal hosts: validate_with_dns already validated the IP; reqwest
-    // dials it directly, no override needed. (`url::Url::host_str` returns
-    // IPv6 literals without brackets — `::1`, not `[::1]` — so this catches
-    // both forms.)
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return Ok((parsed_url, Vec::new()));
-    }
-
-    let port = parsed_url.port_or_known_default().unwrap_or(443);
-    let resolve_target = format!("{}:{}", host, port);
-
-    // Bound DNS resolution so a slow / poisoned resolver can't pin a runtime
-    // worker indefinitely. Five seconds matches the default in SsrfValidator.
-    let addrs: Vec<std::net::SocketAddr> = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::net::lookup_host(resolve_target),
-    )
-    .await
-    .map_err(|_| {
-        EnrichmentError::DownloadError(format!("DNS resolution timed out for {}", host))
-    })?
-    .map_err(|e| {
-        EnrichmentError::DownloadError(format!("DNS resolution failed for {}: {}", host, e))
-    })?
-    .collect();
-
-    if addrs.is_empty() {
-        return Err(EnrichmentError::DownloadError(format!(
-            "DNS resolution returned no addresses for {}",
-            host
-        )));
-    }
-
-    for addr in &addrs {
-        validator.validate_ip_address(addr.ip()).map_err(|e| {
-            EnrichmentError::DownloadError(format!(
-                "URL rejected by SSRF check: resolved IP blocked: {}",
-                e
-            ))
-        })?;
-    }
-
-    Ok((parsed_url, addrs))
+    SsrfValidator::http_allowed_validator()
+        .validate_and_resolve(url_str)
+        .await
+        .map_err(|e| {
+            EnrichmentError::DownloadError(format!("URL rejected by SSRF check before fetch: {}", e))
+        })
 }
 
 impl EnrichmentService {
@@ -869,50 +807,6 @@ impl EnrichmentService {
         }
 
         Ok(results)
-    }
-
-    /// Enrich a log record with IP geolocation data
-    /// Returns enrichment data for src_ip and dest_ip
-    pub async fn enrich_log_ips(
-        &self,
-        src_ip: Option<&str>,
-        dest_ip: Option<&str>,
-    ) -> Result<LogEnrichment, EnrichmentError> {
-        let mut enrichment = LogEnrichment::default();
-
-        // Collect IPs to lookup
-        let mut ips_to_lookup = Vec::new();
-        if let Some(ip) = src_ip {
-            if !ip.is_empty() {
-                ips_to_lookup.push(ip);
-            }
-        }
-        if let Some(ip) = dest_ip {
-            if !ip.is_empty() && Some(ip) != src_ip {
-                ips_to_lookup.push(ip);
-            }
-        }
-
-        if ips_to_lookup.is_empty() {
-            return Ok(enrichment);
-        }
-
-        // Bulk lookup (CH dictGet path — NAN-1117)
-        let results = self.lookup_ips_bulk(&ips_to_lookup).await?;
-
-        // Apply results
-        if let Some(ip) = src_ip {
-            if let Some(result) = results.get(ip) {
-                enrichment.src = Some(result.clone());
-            }
-        }
-        if let Some(ip) = dest_ip {
-            if let Some(result) = results.get(ip) {
-                enrichment.dest = Some(result.clone());
-            }
-        }
-
-        Ok(enrichment)
     }
 
     // ========================================================================

@@ -17,7 +17,7 @@ use super::{
     types::{CreateRepositoryRequest, ListRepositoriesResponse, UpdateRepositoryRequest},
     AuditExt,
 };
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 /// List all rule repositories
@@ -35,9 +35,7 @@ pub async fn list_repositories(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<ListRepositoriesResponse>, ApiError> {
-    check_permission(&auth, permissions::RULE_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: rule_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::RULE_REPOSITORIES_VIEW)?;
 
     let service = get_rule_repo_service(&state)?;
     let repositories = service.list_repositories().await?;
@@ -65,9 +63,7 @@ pub async fn get_repository(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<RuleRepository>, ApiError> {
-    check_permission(&auth, permissions::RULE_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: rule_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::RULE_REPOSITORIES_VIEW)?;
 
     let service = get_rule_repo_service(&state)?;
     let repository = service.get_repository(*id).await?;
@@ -93,9 +89,7 @@ pub async fn create_repository(
     Extension(client): Extension<ClientContext>,
     Json(req): Json<CreateRepositoryRequest>,
 ) -> Result<Json<RuleRepository>, ApiError> {
-    check_permission(&auth, permissions::RULE_REPOSITORIES_MANAGE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: rule_repositories:manage".to_string())
-    })?;
+    ensure_permission(&auth, permissions::RULE_REPOSITORIES_MANAGE)?;
 
     let service = get_rule_repo_service(&state)?;
 
@@ -154,9 +148,7 @@ pub async fn update_repository(
     Path(id): Path<TypeIdParam>,
     Json(req): Json<UpdateRepositoryRequest>,
 ) -> Result<Json<RuleRepository>, ApiError> {
-    check_permission(&auth, permissions::RULE_REPOSITORIES_MANAGE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: rule_repositories:manage".to_string())
-    })?;
+    ensure_permission(&auth, permissions::RULE_REPOSITORIES_MANAGE)?;
 
     let service = get_rule_repo_service(&state)?;
 
@@ -210,9 +202,7 @@ pub async fn delete_repository(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<StatusCode, ApiError> {
-    check_permission(&auth, permissions::RULE_REPOSITORIES_MANAGE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: rule_repositories:manage".to_string())
-    })?;
+    ensure_permission(&auth, permissions::RULE_REPOSITORIES_MANAGE)?;
 
     let service = get_rule_repo_service(&state)?;
     service.delete_repository(*id).await?;

@@ -63,7 +63,6 @@ pub fn create_router(state: AppState) -> Router {
     let auth_state = AuthState::from_arcs(
         state.token_service.clone(),
         Some(state.api_key_service.clone()),
-        state.audit_repo.clone(),
         state.auth_enabled,
     )
     .with_permission_resolver(permission_resolver);
@@ -370,18 +369,9 @@ pub fn create_router(state: AppState) -> Router {
             "/api/audit/export",
             post(handlers::audit::export_audit_logs),
         )
-        // NOTE: Core search endpoints moved to nanosiem-search service (port 3002)
-        // Requests to /api/search, /api/search/sql, /api/search/explain, /api/search/saved/*
-        // should be routed via nginx to the Search Service
-        // .route("/api/search", post(handlers::search))
-        // .route("/api/search/sql", post(handlers::search_sql))
-        // .route("/api/search/explain", post(handlers::explain))
-        // Saved searches - moved to Search Service
-        // .route("/api/search/saved", get(handlers::list_saved_searches))
-        // .route("/api/search/saved", post(handlers::create_saved_search))
-        // .route("/api/search/saved/{id}", get(handlers::get_saved_search))
-        // .route("/api/search/saved/{id}", put(handlers::update_saved_search))
-        // .route("/api/search/saved/{id}", delete(handlers::delete_saved_search))
+        // NOTE: Core search endpoints (/api/search, /api/search/sql, /api/search/explain,
+        // /api/search/saved/*) moved to nanosiem-search service (port 3002) and are routed
+        // there via nginx.
         // Search history (per-user) - remains in Main API
         .route(
             "/api/search/history",

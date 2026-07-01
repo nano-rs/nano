@@ -263,14 +263,8 @@ impl SearchService {
             None => return Ok(CloudOverview::default()),
         };
 
-        let start_str = time_range
-            .start
-            .format("%Y-%m-%d %H:%M:%S%.6f")
-            .to_string();
-        let end_str = time_range
-            .end
-            .format("%Y-%m-%d %H:%M:%S%.6f")
-            .to_string();
+        let start_str = crate::sql_hygiene::format_ch_bound_micros(&time_range.start);
+        let end_str = crate::sql_hygiene::format_ch_bound_micros(&time_range.end);
 
         let span_secs = (time_range.end - time_range.start).num_seconds().max(60);
         let timeline_bucket_secs = (span_secs as u64 / TIMELINE_BUCKETS as u64).max(1);

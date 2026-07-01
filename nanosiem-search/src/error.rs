@@ -43,9 +43,6 @@ pub enum SearchError {
     #[error("Internal server error: {0}")]
     InternalError(String),
 
-    #[error("Service unavailable: {0}")]
-    ServiceUnavailable(String),
-
     #[error("Admission denied: {0}")]
     AdmissionDenied(String),
 
@@ -110,7 +107,6 @@ impl SearchError {
             SearchError::StructuredParseError { .. } => "PARSE_ERROR",
             SearchError::QueryError(_) => "QUERY_ERROR",
             SearchError::InternalError(_) => "INTERNAL_ERROR",
-            SearchError::ServiceUnavailable(_) => "SERVICE_UNAVAILABLE",
             SearchError::AdmissionDenied(_) => "ADMISSION_DENIED",
             SearchError::Cancelled => "QUERY_CANCELLED",
         }
@@ -126,7 +122,6 @@ impl SearchError {
             SearchError::StructuredParseError { .. } => StatusCode::BAD_REQUEST,
             SearchError::QueryError(_) => StatusCode::BAD_REQUEST,
             SearchError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            SearchError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             SearchError::AdmissionDenied(_) => StatusCode::TOO_MANY_REQUESTS,
             // 409: the request didn't fail — its lifecycle conflicted with a
             // deliberate cancel issued against it. Not 4xx-client-mistake, not

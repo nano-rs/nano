@@ -310,10 +310,6 @@ impl ProcessTree {
         self.processes.values().find(|p| p.name == name)
     }
 
-    pub fn find_by_pid(&self, pid: u32) -> Option<&Process> {
-        self.processes.get(&pid)
-    }
-
     pub fn random_active_parent(&self) -> Option<&Process> {
         let mut rng = rand::rng();
         self.active_user_pids
@@ -435,10 +431,6 @@ impl ProcessTree {
 
         let child = self.spawn(name, path, cmdline, user, parent.pid);
         (child, parent)
-    }
-
-    pub fn terminate(&mut self, pid: u32) {
-        self.active_user_pids.retain(|&p| p != pid);
     }
 
     fn cleanup_old_processes(&mut self) {
@@ -692,49 +684,8 @@ impl Entity {
             .spawn_with_random_parent(name, path, cmdline, user)
     }
 
-    pub fn spawn_process_with_parent(
-        &self,
-        name: &str,
-        path: &str,
-        cmdline: &str,
-        user: Option<&str>,
-        parent_pid: u32,
-    ) -> Process {
-        let user = user.unwrap_or(&self.user);
-        self.process_tree
-            .lock()
-            .spawn(name, path, cmdline, user, parent_pid)
-    }
-
-    pub fn get_process(&self, pid: u32) -> Option<Process> {
-        self.process_tree.lock().find_by_pid(pid).cloned()
-    }
-
-    pub fn get_explorer(&self) -> Option<Process> {
-        self.process_tree.lock().get_explorer().cloned()
-    }
-
-    pub fn random_parent(&self) -> Option<Process> {
-        self.process_tree.lock().random_active_parent().cloned()
-    }
-
-    pub fn terminate_process(&self, pid: u32) {
-        self.process_tree.lock().terminate(pid);
-    }
-
     pub fn next_browse_request(&self) -> (String, String, String) {
         self.browsing_session.lock().next_request()
-    }
-
-    pub fn needs_dhcp_event(&self, current_time: DateTime<Utc>) -> bool {
-        match *self.last_dhcp_event.lock() {
-            None => true,
-            Some(last) => current_time >= last + self.dhcp_event_interval,
-        }
-    }
-
-    pub fn record_dhcp_event(&self, current_time: DateTime<Utc>) {
-        *self.last_dhcp_event.lock() = Some(current_time);
     }
 }
 

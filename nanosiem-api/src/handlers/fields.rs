@@ -18,7 +18,7 @@ use nanosiem_core::TimeRangeInput;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 /// Query parameters for field values endpoint
@@ -112,8 +112,7 @@ pub async fn get_source_types(
     Extension(auth): Extension<AuthContext>,
     Query(query): Query<FieldValuesQuery>,
 ) -> Result<Json<Vec<(String, i64)>>, ApiError> {
-    check_permission(&auth, permissions::SEARCH_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:view".to_string()))?;
+    ensure_permission(&auth, permissions::SEARCH_VIEW)?;
 
     let time_range = query.time_range();
 

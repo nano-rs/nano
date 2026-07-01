@@ -94,8 +94,8 @@ pub async fn list_all_sessions(
     check_permission(&auth, permissions::SESSIONS_ADMIN)
         .map_err(|(s, j)| (s, Json(SessionApiError::new(&j.error, &j.message))))?;
 
-    let limit = query.limit.unwrap_or(50).min(100);
-    let offset = query.offset.unwrap_or(0);
+    let (limit, offset) =
+        nanosiem_api_lib::Pagination::new(query.limit, query.offset).resolved_capped(50, 100);
 
     let sessions = state
         .session_service

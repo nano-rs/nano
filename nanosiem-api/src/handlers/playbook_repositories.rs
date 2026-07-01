@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 // NAN-845: hardcoded URL allowlist for the only repo we sync from. The
@@ -168,9 +168,7 @@ pub async fn list_playbook_repositories(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<ListPlaybookRepositoriesResponse>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: playbook_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_VIEW)?;
     let service = get_service(&state);
     let repositories = service.list_repositories().await?;
     Ok(Json(ListPlaybookRepositoriesResponse { repositories }))
@@ -194,9 +192,7 @@ pub async fn get_playbook_repository(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<PlaybookRepository>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: playbook_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_VIEW)?;
     let service = get_service(&state);
     let repo = service.get_repository(*id).await?;
     Ok(Json(repo))
@@ -220,9 +216,7 @@ pub async fn create_playbook_repository(
     Extension(auth): Extension<AuthContext>,
     Json(req): Json<CreatePlaybookRepositoryRequest>,
 ) -> Result<Json<PlaybookRepository>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_MANAGE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: playbook_repositories:manage".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_MANAGE)?;
     validate_repo_url(&req.url)?;
     let service = get_service(&state);
     let new_repo = NewPlaybookRepository {
@@ -261,9 +255,7 @@ pub async fn update_playbook_repository(
     Path(id): Path<TypeIdParam>,
     Json(req): Json<UpdatePlaybookRepositoryRequest>,
 ) -> Result<Json<PlaybookRepository>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_MANAGE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: playbook_repositories:manage".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_MANAGE)?;
     let service = get_service(&state);
     let update = UpdatePlaybookRepository {
         name: req.name,
@@ -296,9 +288,7 @@ pub async fn delete_playbook_repository(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<StatusCode, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_MANAGE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: playbook_repositories:manage".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_MANAGE)?;
     let service = get_service(&state);
     service.delete_repository(*id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -326,9 +316,7 @@ pub async fn sync_playbook_repository(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<PlaybookSyncStartResponse>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_SYNC).map_err(|_| {
-        ApiError::Forbidden("Missing permission: playbook_repositories:sync".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_SYNC)?;
     let service = get_service(&state);
     let repo = service.get_repository(*id).await?;
     service.start_sync(*id).await?;
@@ -357,9 +345,7 @@ pub async fn get_playbook_sync_status(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<PlaybookSyncStatusResponse>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: playbook_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_VIEW)?;
     let service = get_service(&state);
     let repo = service.get_repository(*id).await?;
     Ok(Json(PlaybookSyncStatusResponse {
@@ -397,9 +383,7 @@ pub async fn list_repository_playbooks(
     Path(id): Path<TypeIdParam>,
     Query(q): Query<ListRepositoryPlaybooksQuery>,
 ) -> Result<Json<ListRepositoryPlaybooksResponse>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: playbook_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_VIEW)?;
     let service = get_service(&state);
     let filter = RepositoryPlaybookFilter {
         category: q.category,
@@ -440,9 +424,7 @@ pub async fn import_repository_playbook(
     Path((id, path)): Path<(TypeIdParam, String)>,
     Json(req): Json<PlaybookImportRequest>,
 ) -> Result<Json<PlaybookImportResponse>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_IMPORT).map_err(|_| {
-        ApiError::Forbidden("Missing permission: playbook_repositories:import".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_IMPORT)?;
     let service = get_service(&state);
     let response = service
         .import_playbook(*id, &path, req, Some(auth.user_id()))
@@ -476,9 +458,7 @@ pub async fn import_all_repository_playbooks(
     Path(id): Path<TypeIdParam>,
     Json(req): Json<ImportAllPlaybooksRequest>,
 ) -> Result<Json<ImportAllPlaybooksResponse>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_IMPORT).map_err(|_| {
-        ApiError::Forbidden("Missing permission: playbook_repositories:import".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_IMPORT)?;
     let service = get_service(&state);
     // Confirm the repo exists (404 if not) before doing any work.
     service.get_repository(*id).await?;
@@ -593,12 +573,8 @@ pub async fn sync_and_import_repository(
     Path(id): Path<TypeIdParam>,
     Json(req): Json<ImportAllPlaybooksRequest>,
 ) -> Result<Json<SyncAndImportResponse>, ApiError> {
-    check_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_SYNC).map_err(|_| {
-        ApiError::Forbidden("Missing permission: playbook_repositories:sync".to_string())
-    })?;
-    check_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_IMPORT).map_err(|_| {
-        ApiError::Forbidden("Missing permission: playbook_repositories:import".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_SYNC)?;
+    ensure_permission(&auth, permissions::PLAYBOOK_REPOSITORIES_IMPORT)?;
     let service = get_service(&state);
     service.get_repository(*id).await?;
 

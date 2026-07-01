@@ -26,176 +26,8 @@ use nanosiem_core::auth::permissions;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
-
-// =============================================================================
-// DEPRECATED: Core search handlers moved to nanosiem-search service
-// =============================================================================
-
-/*
-use nanosiem_core::{
-    SearchRequest, SearchResponse, RawSqlRequest, TimeRangeInput,
-    SavedSearch, NewSavedSearch, UpdateSavedSearch,
-};
-use uuid::Uuid;
-
-// Re-export types for API
-pub use nanosiem_core::{SearchRequest as SearchRequestBody, RawSqlRequest as RawSqlRequestBody};
-
-/// Request for explaining a query
-#[derive(Debug, Deserialize)]
-pub struct ExplainRequest {
-    pub query: String,
-    pub time_range: TimeRangeInput,
-}
-
-/// Response for explain endpoint
-#[derive(Debug, Serialize)]
-pub struct ExplainResponse {
-    pub sql: String,
-}
-
-/// Execute a piped query
-pub async fn search(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Json(request): Json<SearchRequest>,
-) -> Result<Json<SearchResponse>, ApiError> {
-    check_permission(&auth, permissions::SEARCH_EXECUTE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:execute".to_string()))?;
-
-    let response = state.search_service.search(request).await?;
-    Ok(Json(response))
-}
-
-/// Execute a raw SQL query (SELECT only)
-pub async fn search_sql(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Json(request): Json<RawSqlRequest>,
-) -> Result<Json<SearchResponse>, ApiError> {
-    check_permission(&auth, permissions::SEARCH_EXECUTE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:execute".to_string()))?;
-
-    let response = state.search_service.search_sql(request).await?;
-    Ok(Json(response))
-}
-
-/// Explain a piped query (show generated SQL without executing)
-pub async fn explain(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Json(request): Json<ExplainRequest>,
-) -> Result<Json<ExplainResponse>, ApiError> {
-    check_permission(&auth, permissions::SEARCH_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:view".to_string()))?;
-
-    let sql = state.search_service.explain(&request.query, &request.time_range)?;
-    Ok(Json(ExplainResponse { sql }))
-}
-
-/// List all saved searches
-pub async fn list_saved_searches(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-) -> Result<Json<Vec<SavedSearch>>, ApiError> {
-    check_permission(&auth, permissions::SEARCH_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:view".to_string()))?;
-
-    use nanosiem_core::db::repository::SavedSearchRepository;
-
-    let repo = SavedSearchRepository::new(state.pool.clone());
-    let searches = repo.list().await.map_err(|e| ApiError::DatabaseError(e.to_string()))?;
-    Ok(Json(searches))
-}
-
-/// Get a saved search by ID
-pub async fn get_saved_search(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<SavedSearch>, ApiError> {
-    check_permission(&auth, permissions::SEARCH_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:view".to_string()))?;
-
-    use nanosiem_core::db::repository::SavedSearchRepository;
-
-    let repo = SavedSearchRepository::new(state.pool.clone());
-    let search = repo.find_by_id(id).await.map_err(|e| {
-        match e {
-            nanosiem_core::db::repository::SavedSearchRepositoryError::NotFound(_) => {
-                ApiError::NotFound(format!("Saved search not found: {}", id))
-            }
-            _ => ApiError::DatabaseError(e.to_string()),
-        }
-    })?;
-    Ok(Json(search))
-}
-
-/// Create a new saved search
-pub async fn create_saved_search(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Json(request): Json<NewSavedSearch>,
-) -> Result<Json<SavedSearch>, ApiError> {
-    check_permission(&auth, permissions::SEARCH_SAVE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:save".to_string()))?;
-
-    use nanosiem_core::db::repository::SavedSearchRepository;
-
-    let repo = SavedSearchRepository::new(state.pool.clone());
-    let search = repo.create(&request).await.map_err(|e| ApiError::DatabaseError(e.to_string()))?;
-    Ok(Json(search))
-}
-
-/// Update a saved search
-pub async fn update_saved_search(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Path(id): Path<Uuid>,
-    Json(request): Json<UpdateSavedSearch>,
-) -> Result<Json<SavedSearch>, ApiError> {
-    check_permission(&auth, permissions::SEARCH_SAVE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:save".to_string()))?;
-
-    use nanosiem_core::db::repository::SavedSearchRepository;
-
-    let repo = SavedSearchRepository::new(state.pool.clone());
-    let search = repo.update(id, &request).await.map_err(|e| {
-        match e {
-            nanosiem_core::db::repository::SavedSearchRepositoryError::NotFound(_) => {
-                ApiError::NotFound(format!("Saved search not found: {}", id))
-            }
-            _ => ApiError::DatabaseError(e.to_string()),
-        }
-    })?;
-    Ok(Json(search))
-}
-
-/// Delete a saved search
-pub async fn delete_saved_search(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Path(id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    check_permission(&auth, permissions::SEARCH_SAVE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:save".to_string()))?;
-
-    use nanosiem_core::db::repository::SavedSearchRepository;
-
-    let repo = SavedSearchRepository::new(state.pool.clone());
-    repo.delete(id).await.map_err(|e| {
-        match e {
-            nanosiem_core::db::repository::SavedSearchRepositoryError::NotFound(_) => {
-                ApiError::NotFound(format!("Saved search not found: {}", id))
-            }
-            _ => ApiError::DatabaseError(e.to_string()),
-        }
-    })?;
-    Ok(Json(serde_json::json!({"deleted": true})))
-}
-*/
 
 // =============================================================================
 // ACTIVE: Shared search handlers (remain in Main API)
@@ -237,8 +69,7 @@ pub async fn create_shared_search(
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<CreateSharedSearchRequest>,
 ) -> Result<Json<CreateSharedSearchResponse>, ApiError> {
-    check_permission(&auth, permissions::SEARCH_SHARE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:share".to_string()))?;
+    ensure_permission(&auth, permissions::SEARCH_SHARE)?;
     use nanosiem_core::db::repository::SharedSearchRepository;
 
     // Parse timestamps if provided
@@ -294,8 +125,7 @@ pub async fn get_shared_search(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<String>,
 ) -> Result<Json<SharedSearchResponse>, ApiError> {
-    check_permission(&auth, permissions::SEARCH_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:view".to_string()))?;
+    ensure_permission(&auth, permissions::SEARCH_VIEW)?;
     use nanosiem_core::db::repository::SharedSearchRepository;
 
     let repo = SharedSearchRepository::new(state.pool.clone());
@@ -393,8 +223,7 @@ pub async fn store_query_explanation(
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<StoreQueryExplanationRequest>,
 ) -> Result<Json<QueryExplanationResponse>, ApiError> {
-    check_permission(&auth, permissions::SEARCH_EXECUTE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:execute".to_string()))?;
+    ensure_permission(&auth, permissions::SEARCH_EXECUTE)?;
     use nanosiem_core::db::repository::{
         NewQueryExplanation, QueryExplanationRepository, ReasoningStepRow,
     };
@@ -450,8 +279,7 @@ pub async fn get_query_explanation(
     Extension(auth): Extension<AuthContext>,
     axum::extract::Query(params): axum::extract::Query<GetExplanationParams>,
 ) -> Result<Json<QueryExplanationResponse>, ApiError> {
-    check_permission(&auth, permissions::SEARCH_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: search:view".to_string()))?;
+    ensure_permission(&auth, permissions::SEARCH_VIEW)?;
     use nanosiem_core::db::repository::QueryExplanationRepository;
 
     let repo = QueryExplanationRepository::new(state.pool.clone());

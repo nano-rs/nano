@@ -28,7 +28,7 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use super::AuditExt;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 // =============================================================================
@@ -218,9 +218,7 @@ pub async fn list_parser_repositories(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<ListParserRepositoriesResponse>, ApiError> {
-    check_permission(&auth, permissions::PARSER_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: parser_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PARSER_REPOSITORIES_VIEW)?;
 
     let service = get_parser_repo_service(&state);
     let repositories = service.list_repositories().await?;
@@ -248,9 +246,7 @@ pub async fn get_parser_repository(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<ParserRepository>, ApiError> {
-    check_permission(&auth, permissions::PARSER_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: parser_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PARSER_REPOSITORIES_VIEW)?;
 
     let service = get_parser_repo_service(&state);
     let repository = service.get_repository(*id).await?;
@@ -276,9 +272,7 @@ pub async fn create_parser_repository(
     Extension(client): Extension<ClientContext>,
     Json(req): Json<CreateParserRepositoryRequest>,
 ) -> Result<Json<ParserRepository>, ApiError> {
-    check_permission(&auth, permissions::PARSER_REPOSITORIES_MANAGE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: parser_repositories:manage".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PARSER_REPOSITORIES_MANAGE)?;
 
     let service = get_parser_repo_service(&state);
 
@@ -337,9 +331,7 @@ pub async fn update_parser_repository(
     Path(id): Path<TypeIdParam>,
     Json(req): Json<UpdateParserRepositoryRequest>,
 ) -> Result<Json<ParserRepository>, ApiError> {
-    check_permission(&auth, permissions::PARSER_REPOSITORIES_MANAGE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: parser_repositories:manage".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PARSER_REPOSITORIES_MANAGE)?;
 
     let service = get_parser_repo_service(&state);
 
@@ -393,9 +385,7 @@ pub async fn delete_parser_repository(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<StatusCode, ApiError> {
-    check_permission(&auth, permissions::PARSER_REPOSITORIES_MANAGE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: parser_repositories:manage".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PARSER_REPOSITORIES_MANAGE)?;
 
     let service = get_parser_repo_service(&state);
     service.delete_repository(*id).await?;
@@ -438,9 +428,7 @@ pub async fn sync_parser_repository(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<ParserSyncStartResponse>, ApiError> {
-    check_permission(&auth, permissions::PARSER_REPOSITORIES_SYNC).map_err(|_| {
-        ApiError::Forbidden("Missing permission: parser_repositories:sync".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PARSER_REPOSITORIES_SYNC)?;
 
     let service = get_parser_repo_service(&state);
     let repo = service.get_repository(*id).await?;
@@ -484,9 +472,7 @@ pub async fn get_parser_sync_status(
     Extension(auth): Extension<AuthContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<ParserSyncStatusResponse>, ApiError> {
-    check_permission(&auth, permissions::PARSER_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: parser_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PARSER_REPOSITORIES_VIEW)?;
 
     let service = get_parser_repo_service(&state);
     let repository = service.get_repository(*id).await?;
@@ -526,9 +512,7 @@ pub async fn list_repository_parsers(
     Path(id): Path<TypeIdParam>,
     Query(query): Query<ListParsersQuery>,
 ) -> Result<Json<Vec<RepositoryParserResponse>>, ApiError> {
-    check_permission(&auth, permissions::PARSER_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: parser_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PARSER_REPOSITORIES_VIEW)?;
 
     let service = get_parser_repo_service(&state);
 
@@ -584,9 +568,7 @@ pub async fn get_repository_parser(
     Extension(auth): Extension<AuthContext>,
     Path((id, path)): Path<(TypeIdParam, String)>,
 ) -> Result<Json<RepositoryParser>, ApiError> {
-    check_permission(&auth, permissions::PARSER_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: parser_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PARSER_REPOSITORIES_VIEW)?;
 
     let service = get_parser_repo_service(&state);
     let parser = service.get_parser(*id, &path).await?;
@@ -619,9 +601,7 @@ pub async fn preview_parser_import(
     Extension(auth): Extension<AuthContext>,
     Path((id, path)): Path<(TypeIdParam, String)>,
 ) -> Result<Json<ParserImportPreview>, ApiError> {
-    check_permission(&auth, permissions::PARSER_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: parser_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PARSER_REPOSITORIES_VIEW)?;
 
     let service = get_parser_repo_service(&state);
     let preview = service.preview_import(*id, &path).await?;
@@ -654,9 +634,7 @@ pub async fn import_parser(
     Path((id, path)): Path<(TypeIdParam, String)>,
     Json(req): Json<ImportParserRequest>,
 ) -> Result<Json<ImportParserResponse>, ApiError> {
-    check_permission(&auth, permissions::PARSER_REPOSITORIES_IMPORT).map_err(|_| {
-        ApiError::Forbidden("Missing permission: parser_repositories:import".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PARSER_REPOSITORIES_IMPORT)?;
 
     let service = get_parser_repo_service(&state);
 
@@ -715,9 +693,7 @@ pub async fn batch_import_parsers(
     Path(id): Path<TypeIdParam>,
     Json(req): Json<BatchImportParsersRequest>,
 ) -> Result<Json<BatchImportParsersResponse>, ApiError> {
-    check_permission(&auth, permissions::PARSER_REPOSITORIES_IMPORT).map_err(|_| {
-        ApiError::Forbidden("Missing permission: parser_repositories:import".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PARSER_REPOSITORIES_IMPORT)?;
 
     // Build per-item list: use `items` if provided, otherwise fall back to legacy `paths`
     let items: Vec<BatchImportParserItem> = if !req.items.is_empty() {
@@ -821,9 +797,7 @@ pub async fn remove_all_imported_parsers(
     Extension(client): Extension<ClientContext>,
     Path(id): Path<TypeIdParam>,
 ) -> Result<Json<BatchRemoveParsersResponse>, ApiError> {
-    check_permission(&auth, permissions::PARSER_REPOSITORIES_MANAGE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: parser_repositories:manage".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PARSER_REPOSITORIES_MANAGE)?;
 
     let service = get_parser_repo_service(&state);
     let (removed, failed) = service.remove_all_imported(*id).await?;
@@ -865,9 +839,7 @@ pub async fn get_parser_upstream_updates(
     Extension(auth): Extension<AuthContext>,
     Path(repo_id): Path<TypeIdParam>,
 ) -> Result<Json<ParserUpstreamUpdatesResponse>, ApiError> {
-    check_permission(&auth, permissions::PARSER_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: parser_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PARSER_REPOSITORIES_VIEW)?;
 
     let service = get_parser_repo_service(&state);
     let updates = service.get_upstream_updates(*repo_id).await?;
@@ -895,9 +867,7 @@ pub async fn get_log_source_upstream_diff(
     Extension(auth): Extension<AuthContext>,
     Path(log_source_id): Path<TypeIdParam>,
 ) -> Result<Json<UpstreamParserDiff>, ApiError> {
-    check_permission(&auth, permissions::PARSER_REPOSITORIES_VIEW).map_err(|_| {
-        ApiError::Forbidden("Missing permission: parser_repositories:view".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PARSER_REPOSITORIES_VIEW)?;
 
     let service = get_parser_repo_service(&state);
     let diff = service.get_upstream_diff(*log_source_id).await?;
@@ -925,8 +895,7 @@ pub async fn dismiss_parser_upstream_changes(
     Extension(auth): Extension<AuthContext>,
     Path(log_source_id): Path<TypeIdParam>,
 ) -> Result<StatusCode, ApiError> {
-    check_permission(&auth, permissions::PARSERS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: parsers:edit".to_string()))?;
+    ensure_permission(&auth, permissions::PARSERS_EDIT)?;
 
     let service = get_parser_repo_service(&state);
     service.dismiss_upstream_changes(*log_source_id).await?;
@@ -955,8 +924,7 @@ pub async fn apply_upstream_update(
     Extension(client): Extension<ClientContext>,
     Path(log_source_id): Path<TypeIdParam>,
 ) -> Result<Json<ApplyUpstreamUpdateResult>, ApiError> {
-    check_permission(&auth, permissions::PARSERS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: parsers:edit".to_string()))?;
+    ensure_permission(&auth, permissions::PARSERS_EDIT)?;
 
     let service = get_parser_repo_service(&state);
     let result = service.apply_upstream_update(*log_source_id).await?;
@@ -994,8 +962,7 @@ pub async fn apply_all_upstream_updates(
     Extension(client): Extension<ClientContext>,
     Path(repo_id): Path<TypeIdParam>,
 ) -> Result<Json<BulkApplyUpstreamResult>, ApiError> {
-    check_permission(&auth, permissions::PARSERS_EDIT)
-        .map_err(|_| ApiError::Forbidden("Missing permission: parsers:edit".to_string()))?;
+    ensure_permission(&auth, permissions::PARSERS_EDIT)?;
 
     let service = get_parser_repo_service(&state);
     let result = service.apply_all_upstream_updates(*repo_id).await?;
@@ -1042,9 +1009,7 @@ pub async fn fixup_match_values(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthContext>,
 ) -> Result<Json<FixupMatchValuesResponse>, ApiError> {
-    check_permission(&auth, permissions::PARSER_REPOSITORIES_MANAGE).map_err(|_| {
-        ApiError::Forbidden("Missing permission: parser_repositories:manage".to_string())
-    })?;
+    ensure_permission(&auth, permissions::PARSER_REPOSITORIES_MANAGE)?;
 
     let service = get_parser_repo_service(&state);
 

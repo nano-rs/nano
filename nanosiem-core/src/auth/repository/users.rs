@@ -4,14 +4,14 @@
 //!
 //! Requirements: 1.1, 1.6, 1.7
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::auth::password::hash_password;
 use crate::auth::types::{
-    builtin_groups, config_defaults, CreateUserRequest, GroupSummary, LandingPage, QueryMode,
+    builtin_groups, CreateUserRequest, GroupSummary, LandingPage, QueryMode,
     SearchHubStyle, TimeRangePreset, UpdateUserRequest, User, UserPreferences,
 };
 
@@ -283,37 +283,6 @@ impl UserRepository {
         Ok(())
     }
 
-    /// Lock a user account
-    /// Requirements: 1.6
-    pub async fn lock_user(
-        &self,
-        id: Uuid,
-        duration_seconds: Option<i64>,
-    ) -> Result<(), UserRepositoryError> {
-        let duration = duration_seconds.unwrap_or(config_defaults::LOCKOUT_DURATION);
-        let locked_until = Utc::now() + Duration::seconds(duration);
-
-        let result = sqlx::query(
-            r#"
-            UPDATE users SET
-                status = 'locked',
-                locked_until = $2,
-                updated_at = NOW()
-            WHERE id = $1
-            "#,
-        )
-        .bind(id)
-        .bind(locked_until)
-        .execute(&self.pool)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(UserRepositoryError::NotFound(id));
-        }
-
-        Ok(())
-    }
-
     /// Unlock a user account
     pub async fn unlock_user(&self, id: Uuid) -> Result<(), UserRepositoryError> {
         let result = sqlx::query(
@@ -385,28 +354,6 @@ impl UserRepository {
         Ok(())
     }
 
-    /// Clear password reset token
-    pub async fn clear_password_reset_token(&self, id: Uuid) -> Result<(), UserRepositoryError> {
-        let result = sqlx::query(
-            r#"
-            UPDATE users SET
-                password_reset_token = NULL,
-                password_reset_expires = NULL,
-                updated_at = NOW()
-            WHERE id = $1
-            "#,
-        )
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(UserRepositoryError::NotFound(id));
-        }
-
-        Ok(())
-    }
-
     /// Get user by password reset token
     pub async fn get_user_by_reset_token(&self, token: &str) -> Result<User, UserRepositoryError> {
         let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE password_reset_token = $1")
@@ -454,21 +401,6 @@ impl UserRepository {
         .bind(password_hash)
         .execute(&self.pool)
         .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(UserRepositoryError::NotFound(id));
-        }
-
-        Ok(())
-    }
-
-    /// Update user's last login timestamp
-    pub async fn update_last_login(&self, id: Uuid) -> Result<(), UserRepositoryError> {
-        let result =
-            sqlx::query("UPDATE users SET last_login_at = NOW(), updated_at = NOW() WHERE id = $1")
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
 
         if result.rows_affected() == 0 {
             return Err(UserRepositoryError::NotFound(id));

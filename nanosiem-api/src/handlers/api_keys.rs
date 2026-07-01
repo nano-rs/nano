@@ -230,9 +230,13 @@ pub struct ApiKeyUsageResponse {
 /// Get per-key call volume (audited actions per day)
 ///
 /// Returns a continuous, zero-filled daily series over the trailing window.
-/// Source is `audit_logs` filtered on the key's `api_key_id`, so this reflects
-/// audited actions (mutations + authorization denials) rather than raw request
-/// volume — read-only GET traffic is not audited.
+/// Source is the ClickHouse audit store (`source_type='audit'`) filtered on the
+/// key as the acting credential (`metadata.api_key_id`), so this reflects
+/// audited actions performed *via* the key (mutations + authorization denials)
+/// rather than raw request volume — read-only GET traffic is not audited, and
+/// admin lifecycle actions taken *on* the key (create/enable/disable) are not
+/// counted here since the key is the target, not the actor. NAN-1622 moved this
+/// off the retired PostgreSQL `audit_logs` table.
 ///
 /// GET /api/api-keys/{id}/usage
 #[utoipa::path(
@@ -273,18 +277,17 @@ pub async fn get_key_usage(
         .and_utc();
 
     let rows = state
-        .audit_repo
-        .get_api_key_daily_usage(*id, start_ts)
+        .audit_query_service
+        .api_key_daily_usage(*id, start_ts)
         .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiKeyApiError::new("database_error", &e.to_string())),
+                Json(ApiKeyApiError::new("query_error", &e.to_string())),
             )
         })?;
 
-    let counts: std::collections::HashMap<chrono::NaiveDate, i64> =
-        rows.into_iter().map(|r| (r.day, r.count)).collect();
+    let counts: std::collections::HashMap<chrono::NaiveDate, i64> = rows.into_iter().collect();
 
     let mut series = Vec::with_capacity(days as usize);
     let mut total = 0i64;

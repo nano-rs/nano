@@ -21,7 +21,7 @@ use nanosiem_core::{
     UploadService,
 };
 
-use crate::middleware::{check_any_permission, check_permission, AuthContext};
+use crate::middleware::{check_any_permission, ensure_permission, AuthContext};
 use crate::{error::ApiError, state::AppState};
 
 /// Request body for upload configuration (sent as form field)
@@ -215,8 +215,7 @@ pub async fn get_upload_history(
     Extension(auth): Extension<AuthContext>,
     Query(query): Query<UploadHistoryQuery>,
 ) -> Result<Json<Vec<UploadRecord>>, ApiError> {
-    check_permission(&auth, permissions::UPLOAD_HISTORY)
-        .map_err(|_| ApiError::Forbidden("Missing permission: upload:history".to_string()))?;
+    ensure_permission(&auth, permissions::UPLOAD_HISTORY)?;
 
     let filter = UploadFilter {
         destination_type: query.destination_type,

@@ -316,7 +316,6 @@ impl FindingEvent {
 pub struct FindingLogger {
     pg_pool: PgPool,
     dual_pool: DualPool,
-    enabled: bool,
 }
 
 impl FindingLogger {
@@ -327,28 +326,12 @@ impl FindingLogger {
         Self {
             pg_pool: dual_pool.postgres().clone(),
             dual_pool: dual_pool.clone(),
-            enabled: true,
         }
-    }
-
-    /// Enable or disable finding logging
-    pub fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
-    }
-
-    /// Check if finding logging is enabled
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
     }
 
     /// Log a finding event
     #[instrument(skip(self, finding), fields(finding_type = %finding.finding_type, rule_id = %finding.rule_id))]
     pub async fn log_finding(&self, finding: &FindingEvent) -> Result<(), FindingLogError> {
-        if !self.enabled {
-            debug!("Finding logging disabled, skipping");
-            return Ok(());
-        }
-
         let metadata = finding.to_log_json();
         let message = finding.message();
         let timestamp = finding.detected_at;

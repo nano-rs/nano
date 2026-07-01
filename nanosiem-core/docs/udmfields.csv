@@ -131,16 +131,6 @@ enriched_src_continent,Enrichment
 enriched_src_continent_code,Enrichment
 enriched_src_country,Enrichment
 enriched_src_country_code,Enrichment
-enrichment_label_1,Enrichment
-enrichment_label_2,Enrichment
-enrichment_label_3,Enrichment
-enrichment_label_4,Enrichment
-enrichment_label_5,Enrichment
-enrichment_value_1,Enrichment
-enrichment_value_2,Enrichment
-enrichment_value_3,Enrichment
-enrichment_value_4,Enrichment
-enrichment_value_5,Enrichment
 error_code,Web
 event_type,Endpoint
 ext,System

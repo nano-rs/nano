@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use super::strip_comments;
 use super::types::*;
-use crate::middleware::{check_permission, AuthContext};
+use crate::middleware::{ensure_permission, AuthContext};
 use crate::{
     error::{ApiError, ErrorResponse},
     state::AppState,
@@ -109,8 +109,7 @@ pub async fn test_detection(
     Path(id): Path<TypeIdParam>,
     Json(request): Json<TestRuleRequest>,
 ) -> Result<Json<HistoricalAnalysisResult>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     let _guard = try_claim_test_slot(&state.rule_test_in_flight, auth.user_id())
         .ok_or_else(|| {
@@ -174,8 +173,7 @@ pub async fn test_query(
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<TestRuleRequest>,
 ) -> Result<Json<HistoricalAnalysisResult>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_CREATE)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:create".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_CREATE)?;
 
     let _guard = try_claim_test_slot(&state.rule_test_in_flight, auth.user_id())
         .ok_or_else(|| {
@@ -235,8 +233,7 @@ pub async fn format_query(
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<FormatQueryRequest>,
 ) -> Result<Json<FormatQueryResponse>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     use nanosiem_core::{parse_query, PrettyPrint};
 
@@ -280,8 +277,7 @@ pub async fn validate_detection(
     Extension(auth): Extension<AuthContext>,
     Json(request): Json<ValidateDetectionRequest>,
 ) -> Result<Json<ValidateDetectionResponse>, ApiError> {
-    check_permission(&auth, permissions::DETECTIONS_VIEW)
-        .map_err(|_| ApiError::Forbidden("Missing permission: detections:view".to_string()))?;
+    ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
     use nanosiem_core::detection::materialized_view::MaterializedViewGenerator;
     use nanosiem_core::parse_query;

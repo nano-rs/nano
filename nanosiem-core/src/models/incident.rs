@@ -19,65 +19,6 @@ use uuid::Uuid;
 use crate::typeid;
 
 // =============================================================================
-// ENUMS
-// =============================================================================
-
-/// Incident lifecycle state.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema,
-)]
-#[sqlx(type_name = "text", rename_all = "snake_case")]
-#[serde(rename_all = "snake_case")]
-pub enum IncidentStatus {
-    Active,
-    Resolved,
-    Closed,
-}
-
-impl Default for IncidentStatus {
-    fn default() -> Self {
-        Self::Active
-    }
-}
-
-impl std::fmt::Display for IncidentStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Active => write!(f, "active"),
-            Self::Resolved => write!(f, "resolved"),
-            Self::Closed => write!(f, "closed"),
-        }
-    }
-}
-
-/// Provenance of an incident — whether it was created manually by an analyst
-/// or auto-grouped by an agent-detection rule.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema,
-)]
-#[sqlx(type_name = "text", rename_all = "snake_case")]
-#[serde(rename_all = "snake_case")]
-pub enum IncidentSource {
-    Manual,
-    AgentDetected,
-}
-
-impl Default for IncidentSource {
-    fn default() -> Self {
-        Self::Manual
-    }
-}
-
-impl std::fmt::Display for IncidentSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Manual => write!(f, "manual"),
-            Self::AgentDetected => write!(f, "agent_detected"),
-        }
-    }
-}
-
-// =============================================================================
 // INCIDENT MODEL
 // =============================================================================
 

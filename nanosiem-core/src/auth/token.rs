@@ -558,12 +558,6 @@ impl TokenService {
         Arc::clone(&self.revoked_jtis)
     }
 
-    /// Get a clone of the optional Redis denylist handle so peer
-    /// `TokenService` instances can be wired to the same Dragonfly.
-    pub fn redis_denylist_handle(&self) -> Option<RedisDenylist> {
-        self.redis.get().cloned()
-    }
-
     /// Create a TokenService that shares the revocation denylist with another instance.
     pub fn new_with_shared_denylist(
         config: TokenConfig,
