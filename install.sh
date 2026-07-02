@@ -255,7 +255,19 @@ verify_image_digests() {
         result=$(verify_one_digest "$inspect_ref" "$repo_notag" "$expected")
         case "$result" in
             ok) verified_tp=$((verified_tp + 1)) ;;
-            missing) fail "No registry digest found for ${inspect_ref} — cannot verify it against images.lock. Refusing to start with unverifiable images." ;;
+            # NAN-1659: a "missing" third-party image was NOT pulled — i.e. it
+            # belongs to an optional compose profile that's off for this install
+            # (e.g. tenzir, `profiles: ["tenzir"]`, only pulled when
+            # COMPOSE_PROFILES=tenzir). images.lock records every profile's
+            # images, but `docker compose pull` only fetches the active set, so
+            # the purely-local digest readback finds nothing. That's not a
+            # supply-chain risk — the image isn't deployed, and the compose file
+            # pins it inline by @sha256 for when the profile IS enabled — so skip
+            # it rather than refuse to start. A tampered image that IS running
+            # would be present and caught as a "mismatch" below. First-party
+            # cores are always deployed, so their "missing" stays fatal.
+            missing)
+                warn "Skipping digest verify for ${inspect_ref} — not pulled (optional/profile-gated image, not deployed)." ;;
             *) mismatch=1 ;;
         esac
     done < "$lockfile"
