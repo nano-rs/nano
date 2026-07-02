@@ -49,14 +49,27 @@ fn build_ext_field_names_sql(table: &str, json_col: &str, nested: bool, where_pr
     // scan. NAN-1510: the service passes the SAME query+time predicate the
     // per-field value fetch uses, so the enumerated keys match what expanding a
     // field can actually return (a time-only or `now()-3h` predicate is used for
-    // the historical-window / highlighter fallbacks). `max_execution_time` stays
-    // as the best-effort backstop for very wide windows on busy tenants.
+    // the historical-window / highlighter fallbacks).
+    //
+    // NAN-1653: bound the scan to the most-recent `EXT_FIELD_NAMES_ROW_CAP` rows.
+    // `distinctJSONPaths` reads every matched row, and `LIMIT 512` only caps the
+    // OUTPUT names — so on a busy tenant a wide window (e.g. 3.7M rows/3h on
+    // Saturn) blows past `max_execution_time` and 500s the row-expand. The table
+    // is sorted by `timestamp`, so `ORDER BY timestamp DESC LIMIT N` reads only
+    // the tail — key discovery over the most recent N rows is representative for
+    // highlighting/picker, and the query can't run away regardless of window
+    // width. `max_execution_time` remains as the last-resort backstop.
     format!(
         "SELECT DISTINCT {name_expr} AS name \
          FROM ( \
              SELECT arrayJoin(distinctJSONPaths({json_col})) AS path \
-             FROM {table} \
-             WHERE {where_predicate} \
+             FROM ( \
+                 SELECT {json_col} \
+                 FROM {table} \
+                 WHERE {where_predicate} \
+                 ORDER BY timestamp DESC \
+                 LIMIT {EXT_FIELD_NAMES_ROW_CAP} \
+             ) \
          ) \
          WHERE name != '' \
          ORDER BY name \
@@ -64,6 +77,11 @@ fn build_ext_field_names_sql(table: &str, json_col: &str, nested: bool, where_pr
          SETTINGS max_execution_time = 10"
     )
 }
+
+/// Most-recent-row cap for the ext-field-names discovery scan (NAN-1653). Mirrors
+/// the field-stats picker's 100k bound so the "what keys exist?" query stays
+/// cheap and can't time out on high-volume tenants.
+const EXT_FIELD_NAMES_ROW_CAP: usize = 100_000;
 
 /// Quote a column name for use as a *reference* inside `toString(...)` / `uniq(...)`.
 ///
@@ -804,9 +822,15 @@ mod tests {
         assert!(!ocsf_sql.contains("splitByChar"), "sql: {ocsf_sql}");
         assert!(ocsf_sql.contains("SELECT DISTINCT path AS name"), "sql: {ocsf_sql}");
 
-        // Bounded three ways: short recent window, result cap, and a hard server-side
-        // execution cap so a slow ClickHouse can never hang the request.
+        // Bounded four ways: short recent window, a most-recent-row scan cap
+        // (NAN-1653 — the load-bearing one; distinctJSONPaths reads every row),
+        // the result cap, and a hard server-side execution cap so a slow
+        // ClickHouse can never hang the request.
         assert!(sql.contains("INTERVAL 3 HOUR"), "sql: {sql}");
+        assert!(
+            sql.contains("ORDER BY timestamp DESC LIMIT 100000"),
+            "inner scan must be row-bounded (NAN-1653): {sql}"
+        );
         assert!(sql.contains("LIMIT 512"), "sql: {sql}");
         assert!(sql.contains("max_execution_time"), "sql: {sql}");
     }

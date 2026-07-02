@@ -215,6 +215,22 @@ async fn run() -> Result<()> {
         );
     }
 
+    // NAN-1652 / NAN-1655: converge each Distributed wrapper's columns to its
+    // source local table — ADD columns the wrapper lacks and DROP ones the
+    // source no longer has. Without this, a migration that ALTERs the local
+    // table leaves the wrapper drifted, and wrapper reads (fetch-by-id /
+    // `SELECT <col>`) fail with UNKNOWN_IDENTIFIER on clusters.
+    let reconciled_count = migrator
+        .reconcile_distributed_columns()
+        .await
+        .context("reconciling columns on distributed wrappers")?;
+    if reconciled_count > 0 {
+        tracing::info!(
+            "Reconciled {} column(s) on distributed wrappers",
+            reconciled_count
+        );
+    }
+
     // NAN-1116: surface any FAILED dictionaries in the deploy log. A FAILED
     // dict referenced by a dictGet()-backed MATERIALIZED column silently drops
     // 100% of ingestion at runtime; this makes it loud at every migrate instead

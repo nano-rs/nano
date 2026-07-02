@@ -250,11 +250,12 @@
         );
     }
 
-    /// NAN-1635 (findings 2.3/3.4): `unordered` on count-companion
-    /// regenerations drops the implicit trailing ORDER BY but keeps user
-    /// LIMITs (`| head N` bounds the count) and user `| sort` stages (their
-    /// ORDER BY lives inside their own CTE and is elidable under a count
-    /// wrap — it is semantics, not the implicit newest-first tail).
+    /// NAN-1635 (findings 2.3/3.4) + NAN-1657: `unordered` on count-companion
+    /// regenerations drops the implicit trailing ORDER BY and keeps user
+    /// LIMITs (`| head N` bounds the count). NAN-1657 extended this to
+    /// explicit `| sort` stages: a sort never changes the row count, so when
+    /// nothing downstream is value-dependent it is dropped too (NAN-1635 had
+    /// kept it, leaving a full-sort barrier inside the count wrap).
     #[test]
     fn unordered_keeps_user_head_and_sort_semantics() {
         let gen = ClickHouseSqlGenerator::new();
@@ -280,6 +281,7 @@
              count's inner LIMIT), got:\n{head_sql}"
         );
 
+        // NAN-1657: a terminal `| sort` cannot change the count — dropped.
         let sort_sql = gen
             .generate_with_options(
                 &parse_query("error | sort -bytes_out").unwrap(),
@@ -288,8 +290,126 @@
             )
             .unwrap();
         assert!(
-            sort_sql.contains("ORDER BY"),
-            "user `| sort` stage keeps its ORDER BY, got:\n{sort_sql}"
+            !sort_sql.contains("ORDER BY"),
+            "count-invariant terminal `| sort` must be dropped under unordered \
+             (NAN-1657), got:\n{sort_sql}"
+        );
+    }
+
+    /// NAN-1657: the matches-page incident shape. The count companion for
+    /// `<filter> | sort -timestamp | head 10` regenerates with `unordered`;
+    /// the sort is count-invariant (only a head follows), so it must be
+    /// dropped — which collapses the pipeline onto the `search | head N`
+    /// flat fast path where the LIMIT can genuinely early-terminate. With
+    /// the sort kept (NAN-1635 behavior), the stage_1 ORDER BY was a full
+    /// sort barrier and the count scanned the entire match set (Saturn:
+    /// 151M rows to compute a count that is ≤ 10).
+    #[test]
+    fn unordered_drops_count_invariant_sort_before_head() {
+        let gen = ClickHouseSqlGenerator::new();
+        let options = QueryOptions {
+            limit: None,
+            unordered: true,
+            ..Default::default()
+        };
+        let sql = gen
+            .generate_with_options(
+                &parse_query("src_ip=\"10.0.0.1\" | sort -timestamp | head 10").unwrap(),
+                &time_range(),
+                &options,
+            )
+            .unwrap();
+        assert!(
+            !sql.contains("ORDER BY"),
+            "sort before a terminal head is count-invariant — must be dropped, got:\n{sql}"
+        );
+        assert!(
+            sql.contains("LIMIT 10 "),
+            "the head cap bounds the count and must survive, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("WITH stage_0"),
+            "with the sort gone this must collapse to the flat search|head fast \
+             path (no CTE chain), got:\n{sql}"
+        );
+
+        // Ordered generation (the data fetch) is untouched — sort stays.
+        let ordered = gen
+            .generate_with_options(
+                &parse_query("src_ip=\"10.0.0.1\" | sort -timestamp | head 10").unwrap(),
+                &time_range(),
+                &QueryOptions {
+                    limit: None,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            ordered.contains("ORDER BY"),
+            "ordered fetch keeps the user sort, got:\n{ordered}"
+        );
+    }
+
+    /// NAN-1657: a value-dependent stage AFTER a head makes the preceding sort
+    /// count-RELEVANT (which 10 rows survive the cut changes what the filter
+    /// sees), so the sort must be kept under unordered. Projections after the
+    /// head stay benign.
+    #[test]
+    fn unordered_keeps_sort_when_filter_follows_head() {
+        let gen = ClickHouseSqlGenerator::new();
+        let options = QueryOptions {
+            limit: None,
+            unordered: true,
+            ..Default::default()
+        };
+        let sql = gen
+            .generate_with_options(
+                &parse_query("error | sort -timestamp | head 10 | where status=500").unwrap(),
+                &time_range(),
+                &options,
+            )
+            .unwrap();
+        assert!(
+            sql.contains("ORDER BY"),
+            "sort feeding head|where is count-relevant — must be kept, got:\n{sql}"
+        );
+
+        // Projection after the head is count-safe — sort still droppable.
+        let proj_sql = gen
+            .generate_with_options(
+                &parse_query("error | sort -timestamp | head 10 | table src_ip, dest_ip")
+                    .unwrap(),
+                &time_range(),
+                &options,
+            )
+            .unwrap();
+        assert!(
+            !proj_sql.contains("ORDER BY"),
+            "sort before head|table is count-invariant — must be dropped, got:\n{proj_sql}"
+        );
+    }
+
+    /// NAN-1657: a LIMITED sort (`sort N -field`) is a top-N — it CAPS the row
+    /// count, so it must never be dropped by the unordered regeneration (only
+    /// `limit: None` sorts are pure reorders).
+    #[test]
+    fn unordered_keeps_limited_sort_top_n() {
+        let gen = ClickHouseSqlGenerator::new();
+        let options = QueryOptions {
+            limit: None,
+            unordered: true,
+            ..Default::default()
+        };
+        let sql = gen
+            .generate_with_options(
+                &parse_query("error | sort 5 -bytes_out").unwrap(),
+                &time_range(),
+                &options,
+            )
+            .unwrap();
+        assert!(
+            sql.contains("LIMIT 5"),
+            "limited sort caps the count — its LIMIT must survive, got:\n{sql}"
         );
     }
 
@@ -2135,6 +2255,38 @@
         assert!(
             sql.contains("lower(dest_user) = 'corp-admin'"),
             "dest_user has mixed-case history and must keep the lower() compare, got:\n{sql}"
+        );
+    }
+
+    /// NAN-1647 (NAN-1632 finding 3.9): dvc_ip is downcased at ingest (NAN-1646)
+    /// and full-retention history is all-lowercase (Saturn: 0/1.75B rows
+    /// mixed-case), so equality compares RAW and the whole-value dvc_ip bloom
+    /// engages — `lower(dvc_ip)` matched no index. Negation keeps the
+    /// `lower(dvc_ip)` form: NAN-1643 made the raw compare Eq-only (an uppercase
+    /// row flips excluded→included under a raw `!=`, and no bloom prunes a
+    /// negation anyway).
+    #[test]
+    fn dvc_ip_eq_and_ne_compare_raw() {
+        let query = parse_query("dvc_ip=\"FE80::1ABC:2DEF\"").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("dvc_ip = 'fe80::1abc:2def'"),
+            "dvc_ip is ingest-lowercased; equality must compare raw for bloom pruning, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("lower(dvc_ip)"),
+            "dvc_ip must not be lower-wrapped on equality, got:\n{sql}"
+        );
+
+        let query = parse_query("dvc_ip!=\"FE80::1ABC:2DEF\"").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("lower(dvc_ip) != 'fe80::1abc:2def'"),
+            "dvc_ip negation keeps the lower() form (NAN-1643 raw compare is Eq-only), got:\n{sql}"
         );
     }
 

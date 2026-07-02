@@ -602,6 +602,16 @@ pub(crate) const LOWERCASE_NORMALIZED_FIELDS: &[&str] = &[
     // mixed-case, so queries keep the `lower(col)` form, served by the
     // migration-132 `idx_*_lower` expression blooms.
     "src_user",
+    // NAN-1647 (NAN-1632 finding 3.9): dvc_ip carries a raw whole-value bloom
+    // and full-retention history is empirically all-lowercase (Saturn probe:
+    // 0/1.75B rows mixed-case), so the raw compare engages the index that the
+    // previous `lower(dvc_ip)` form orphaned. The IOC sweep
+    // (IOC_OBSERVABLE_RAW_COLUMNS, NAN-1580) already compared this column RAW.
+    // DEPENDENCY: membership is sound only because the Vector clickhouse_mapping
+    // lane downcases dvc_ip at ingest (NAN-1646) — that change must be deployed
+    // to ingest before this one goes live, or uppercase IPv6 rows written in
+    // between become unfindable by raw equality.
+    "dvc_ip",
     // NAN-1528: OTLP trace/span ids are emitted lowercase-hex (the spans MV uses
     // `lower(hex(...))` and the logs-lane parsers downcase them), so a raw
     // `trace_id = '<lowered>'` engages the migration-141 `idx_trace_id` bloom.
@@ -1462,10 +1472,25 @@ impl ClickHouseSqlGenerator {
         ctx: &mut GeneratorContext,
     ) -> Result<String, SqlGenError> {
         // Collect all stages (search + commands)
-        let stages = self.collect_stages(query);
+        let mut stages = self.collect_stages(query);
 
         if stages.is_empty() {
             return Err(SqlGenError::EmptyQuery);
+        }
+
+        // NAN-1657: count-companion regenerations (`ctx.unordered`) drop
+        // pure-reorder stages (sort/reverse) that cannot change the row count.
+        // An explicit `| sort` becomes its own CTE — a full sort barrier that
+        // must consume the ENTIRE match set before a downstream `head N` emits
+        // anything, so the count companion for `… | sort -ts | head 10` scanned
+        // the full window (Saturn: 151M rows to compute a count that is ≤ 10).
+        // With the sort gone, `search | head N` collapses to the flat fast path
+        // below and the count's inner LIMIT genuinely early-terminates. Applied
+        // only at this top-level entry (single call site) — subsearch/append
+        // legs use their own generators and keep their sorts (WHICH rows they
+        // emit feeds the outer query there).
+        if ctx.unordered {
+            drop_count_invariant_reorders(&mut stages);
         }
 
         // Single stage - no CTEs needed
@@ -3060,6 +3085,59 @@ impl ClickHouseSqlGenerator {
 pub(super) enum QueryStage<'a> {
     Search(&'a SearchExpr),
     Command(&'a Command),
+}
+
+/// NAN-1657: remove pure-reorder stages (`sort` / `reverse`) that cannot change
+/// the pipeline's row count, for count-companion regenerations (`unordered`).
+///
+/// A reorder never changes HOW MANY rows flow — only WHICH rows survive a later
+/// `head`/`tail` cut. That only matters to the count when a value-dependent
+/// stage (where/stats/dedup/…) sits after such a cut: different surviving rows
+/// then produce a different count. So a reorder at index `i` is droppable iff
+/// every stage after `i` is itself count-safe under reordering:
+/// - `sort` / `reverse` — reorders, no count effect;
+/// - `sort N …` / `head` / `tail` — cap the count identically regardless of order;
+/// - `table` / `fields` / `rename` — pure projections.
+/// Any other downstream command keeps the reorder (conservative).
+///
+/// A limited sort (`sort N -field`, `limit: Some`) is a top-N — it CAPS the
+/// count, so it is never dropped itself (only `limit: None` sorts are pure
+/// reorders), but as a suffix member it is benign like `head`.
+fn drop_count_invariant_reorders(stages: &mut Vec<QueryStage<'_>>) {
+    fn reorder_benign(stage: &QueryStage<'_>) -> bool {
+        matches!(
+            stage,
+            QueryStage::Command(
+                Command::Sort { .. }
+                    | Command::Reverse
+                    | Command::Head { .. }
+                    | Command::Tail { .. }
+                    | Command::Table { .. }
+                    | Command::Fields { .. }
+                    | Command::Rename { .. }
+            )
+        )
+    }
+
+    let n = stages.len();
+    let mut keep = vec![true; n];
+    // Walk back to front: `suffix_benign` holds for stages strictly after `i`.
+    let mut suffix_benign = true;
+    for i in (0..n).rev() {
+        if suffix_benign
+            && matches!(
+                stages[i],
+                QueryStage::Command(Command::Sort { limit: None, .. } | Command::Reverse)
+            )
+        {
+            keep[i] = false;
+        }
+        if !reorder_benign(&stages[i]) {
+            suffix_benign = false;
+        }
+    }
+    let mut keep_iter = keep.into_iter();
+    stages.retain(|_| keep_iter.next().unwrap_or(true));
 }
 
 /// Statically known output projection of a pipeline prefix — used by `append`

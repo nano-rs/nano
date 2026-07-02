@@ -292,8 +292,8 @@ pub use query_library::{
 };
 pub use risk::{
     EntityActivityResponse, EntityDailyCount, EntityRiskScore, EntityRiskSummary,
-    EntitySignalSummary, RiskAnalyticsOverview, RiskDecayConfig, RiskFilter, RiskLevel,
-    RiskTimeWindow, TimeWindowedRiskScore,
+    EntityRuleContribution, EntitySignalSummary, RiskAnalyticsOverview, RiskDecayConfig,
+    RiskFilter, RiskLevel, RiskTimeWindow, TimeWindowedRiskScore,
 };
 pub use rule_repository::{
     ConversionTriageHints, CoverageAnalysis, CoverageAnalyzer, CoverageFilter, CoverageResult,

@@ -13,6 +13,7 @@ import { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from '@/comp
 import { LatencyPill } from './LatencyPill';
 import { EventViewer } from './EventViewer';
 import { useIdentityUserLookup, useRulePredicates } from '@/hooks/use-api';
+import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
 import { api } from '@/lib/api';
 import type { MatchEntity } from './helpers';
 
@@ -20,30 +21,37 @@ import type { MatchEntity } from './helpers';
 // field by entity type so we hit the indexed columns (case-insensitive
 // `_search` columns are already wired into the query path) rather than
 // scanning the full message body.
-function entitySearchQuery(entity: MatchEntity): string | null {
+function entitySearchQuery(entity: MatchEntity, schema: string | undefined): string | null {
   const raw = (entity.raw || entity.label || '').trim();
   if (!raw) return null;
   // Escape backslashes first, then double quotes — order matters.
   const escaped = raw.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  // OR the UDM column names together with their OCSF promoted (dotted)
-  // equivalents so the entity dossier + recent-activity searches resolve under
-  // either schema profile (NAN-1287). UDM names hit UDM columns / OCSF aliases;
-  // OCSF dotted names hit the promoted OCSF columns. On the inactive schema the
-  // extra clauses resolve to empty `ext`/JSON lookups (harmless, no error).
-  // OCSF Sysmon events in particular live under `device.hostname` and
-  // `actor.user.name`, which the UDM names never reach.
+  // NAN-1656: emit ONLY the ACTIVE schema profile's real columns. Previously we
+  // OR'd the UDM names with their OCSF-dotted equivalents to work under either
+  // profile (NAN-1287), but on the inactive profile those extra clauses resolve
+  // to `lower(toString(ext.<name>))` JSON lookups with no index — they can never
+  // match AND OR-ing them in defeats the bloom index on the real columns, so an
+  // entity search full-scans 7 days (151M rows on Saturn). Branch on the profile
+  // so the WHERE only carries indexed columns that actually exist.
+  const isOcsf = schema === 'ocsf';
   switch (entity.type) {
     case 'user':
     case 'role':
     case 'service':
-      // ARN-style identifiers (CloudTrail) round-trip through user_identity.arn
-      // when present. Otherwise match the username across UDM + OCSF columns.
+      // ARN-style identifiers (CloudTrail) round-trip through user_identity.arn.
       if (raw.startsWith('arn:')) return `user_identity.arn="${escaped}"`;
-      return `user="${escaped}" OR user.name="${escaped}" OR actor.user.name="${escaped}"`;
+      // OCSF Sysmon users live under actor.user.name / user.name; UDM uses `user`.
+      return isOcsf
+        ? `user.name="${escaped}" OR actor.user.name="${escaped}"`
+        : `user="${escaped}"`;
     case 'host':
-      return `src_host="${escaped}" OR dest_host="${escaped}" OR hostname="${escaped}" OR device.hostname="${escaped}" OR src_endpoint.hostname="${escaped}" OR dst_endpoint.hostname="${escaped}"`;
+      return isOcsf
+        ? `device.hostname="${escaped}" OR src_endpoint.hostname="${escaped}" OR dst_endpoint.hostname="${escaped}"`
+        : `src_host="${escaped}" OR dest_host="${escaped}"`;
     case 'ip':
-      return `src_ip="${escaped}" OR dest_ip="${escaped}" OR src_endpoint.ip="${escaped}" OR dst_endpoint.ip="${escaped}"`;
+      return isOcsf
+        ? `src_endpoint.ip="${escaped}" OR dst_endpoint.ip="${escaped}"`
+        : `src_ip="${escaped}" OR dest_ip="${escaped}"`;
     default:
       // Fall back to a free-text search on the raw value.
       return `"${escaped}"`;
@@ -59,7 +67,8 @@ function useEntityActivity7d(entity: MatchEntity | null): {
 } {
   const [count, setCount] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
-  const queryStr = useMemo(() => (entity ? entitySearchQuery(entity) : null), [entity]);
+  const { schema } = useSchemaEntityMap();
+  const queryStr = useMemo(() => (entity ? entitySearchQuery(entity, schema) : null), [entity, schema]);
   useEffect(() => {
     if (!queryStr) {
       setCount(null);
@@ -76,6 +85,9 @@ function useEntityActivity7d(entity: MatchEntity | null): {
         time_range: { start: start.toISOString(), end: end.toISOString() },
         limit: 1,
         skip_field_stats: true,
+        // This card shows only a total count — no time-bucketed histogram — so
+        // skip the histogram companion (its GROUP BY forces a full 7-day scan).
+        skip_histogram: true,
         table_view: true,
       })
       .then((res) => {
@@ -103,7 +115,8 @@ function useEntityRecentActivity(entity: MatchEntity | null): {
 } {
   const [events, setEvents] = useState<Array<Record<string, unknown>>>([]);
   const [loading, setLoading] = useState(false);
-  const queryStr = useMemo(() => (entity ? entitySearchQuery(entity) : null), [entity]);
+  const { schema } = useSchemaEntityMap();
+  const queryStr = useMemo(() => (entity ? entitySearchQuery(entity, schema) : null), [entity, schema]);
   useEffect(() => {
     if (!queryStr) {
       setEvents([]);
@@ -120,6 +133,9 @@ function useEntityRecentActivity(entity: MatchEntity | null): {
         time_range: { start: start.toISOString(), end: end.toISOString() },
         limit: 10,
         skip_field_stats: true,
+        // Top-10 list only — no histogram rendered, so skip the histogram
+        // companion (its GROUP BY forces a full 7-day scan).
+        skip_histogram: true,
         table_view: true,
       })
       .then((res) => {

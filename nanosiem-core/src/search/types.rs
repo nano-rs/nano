@@ -197,7 +197,9 @@ pub fn parse_clickhouse_error(error_msg: &str) -> SearchError {
     if error_msg.contains("TIMEOUT_EXCEEDED")
         || error_msg.contains("timeout") && error_msg.contains("exceeded")
     {
-        return SearchError::Timeout(0); // Will show as timeout error
+        // NAN-1653: surface the real elapsed instead of a misleading "0ms".
+        // ClickHouse phrases it as "elapsed 10030.034392 ms, maximum: 10000 ms".
+        return SearchError::Timeout(parse_elapsed_ms(error_msg).unwrap_or(0));
     }
 
     // Pattern: Division by zero
@@ -246,6 +248,16 @@ pub fn parse_clickhouse_error(error_msg: &str) -> SearchError {
     // Default: return as DatabaseError but with cleaned up message
     let cleaned_msg = clean_clickhouse_error(error_msg);
     SearchError::DatabaseError(sqlx::Error::Protocol(cleaned_msg))
+}
+
+/// Extract the elapsed milliseconds from a ClickHouse timeout message so the
+/// surfaced error reports the real duration rather than a misleading `0ms`
+/// (NAN-1653). ClickHouse phrases it as `elapsed 10030.034392 ms, maximum: …`.
+/// Returns `None` when the message doesn't carry an `elapsed <n> ms` clause.
+fn parse_elapsed_ms(error_msg: &str) -> Option<u64> {
+    let after = error_msg.split("elapsed ").nth(1)?;
+    let num = after.split(" ms").next()?.trim();
+    num.parse::<f64>().ok().map(|ms| ms as u64)
 }
 
 /// Clean up a ClickHouse error message to be more user-friendly
@@ -706,6 +718,21 @@ mod tests {
             parse_clickhouse_error(disconnect),
             SearchError::Cancelled
         ));
+    }
+
+    /// NAN-1653: a CH timeout must surface the real elapsed, not `0ms`.
+    #[test]
+    fn test_timeout_reports_real_elapsed() {
+        let msg = "Code: 159. DB::Exception: Timeout exceeded: elapsed 10030.034392 ms, maximum: 10000 ms: While executing MergeTreeSelect. (TIMEOUT_EXCEEDED)";
+        match parse_clickhouse_error(msg) {
+            SearchError::Timeout(ms) => assert_eq!(ms, 10030),
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+        // No parseable elapsed → falls back to 0 rather than misreporting.
+        match parse_clickhouse_error("Code: 159. TIMEOUT_EXCEEDED: query timed out") {
+            SearchError::Timeout(ms) => assert_eq!(ms, 0),
+            other => panic!("expected Timeout, got {other:?}"),
+        }
     }
 
     /// NAN-1436: the 394 mapping must not change how other ClickHouse errors

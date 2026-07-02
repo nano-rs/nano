@@ -43,6 +43,85 @@ mod tests {
         assert!(!is_safe_identifier("foo`bar"));
     }
 
+    /// NAN-1652: `stale_wrapper_columns` returns exactly the columns present on
+    /// the Distributed wrapper but gone from the source table — the set the
+    /// reconcile step must drop. This is the flexible-enrichment repro:
+    /// migration 149 dropped `enrichment_label_*` / `enrichment_value_*` from
+    /// `logs` but the wrapper kept them.
+    #[test]
+    fn stale_wrapper_columns_returns_wrapper_only_columns() {
+        use crate::db::clickhouse_migrate::distributed::stale_wrapper_columns;
+        let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        let wrapper = s(&[
+            "id",
+            "timestamp",
+            "message",
+            "enrichment_label_1",
+            "enrichment_value_1",
+            "event_type", // alias present on both — must NOT be dropped
+        ]);
+        let source = s(&["id", "timestamp", "message", "event_type"]);
+
+        let mut stale = stale_wrapper_columns(&wrapper, &source);
+        stale.sort();
+        assert_eq!(stale, s(&["enrichment_label_1", "enrichment_value_1"]));
+    }
+
+    /// A wrapper already in sync with its source yields nothing to drop — the
+    /// reconcile is idempotent and a converged cluster does no work.
+    #[test]
+    fn stale_wrapper_columns_empty_when_in_sync() {
+        use crate::db::clickhouse_migrate::distributed::stale_wrapper_columns;
+        let s = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let cols = s(&["id", "timestamp", "message"]);
+        assert!(stale_wrapper_columns(&cols, &cols).is_empty());
+        // The wrapper never dictates additions here — columns the source has
+        // but the wrapper lacks are NOT returned (that's the alias-sync path).
+        assert!(stale_wrapper_columns(&s(&["id"]), &s(&["id", "new_col"])).is_empty());
+    }
+
+    /// NAN-1655: `columns_to_add` returns source columns the wrapper lacks, with
+    /// ALIAS columns ordered LAST so their referenced base columns are added
+    /// first. Repro of the Saturn add-drift (`process` ALIAS, `tags` DEFAULT).
+    #[test]
+    fn columns_to_add_returns_missing_source_columns_alias_last() {
+        use crate::db::clickhouse_migrate::distributed::columns_to_add;
+        let spec = |n: &str, t: &str, k: &str, e: &str| {
+            (n.to_string(), t.to_string(), k.to_string(), e.to_string())
+        };
+        let wrapper = vec!["id".to_string(), "command_line".to_string()];
+        let source = vec![
+            spec("id", "UUID", "", ""),
+            spec("command_line", "String", "", ""),
+            spec("process", "String", "ALIAS", "command_line"), // missing, ALIAS
+            spec("tags", "Array(String)", "DEFAULT", "[]"),      // missing, DEFAULT
+        ];
+        let add = columns_to_add(&wrapper, &source);
+        let names: Vec<&str> = add.iter().map(|(n, ..)| n.as_str()).collect();
+        // Only the two missing; ALIAS (`process`) sorted after the DEFAULT.
+        assert_eq!(names, vec!["tags", "process"]);
+    }
+
+    /// NAN-1655: the ADD clause reconstructs each `system.columns` default_kind.
+    #[test]
+    fn build_add_column_clause_covers_every_kind() {
+        use crate::db::clickhouse_migrate::distributed::build_add_column_clause;
+        assert_eq!(build_add_column_clause("span_id", "String", "", ""), "span_id String");
+        assert_eq!(
+            build_add_column_clause("tags", "Array(String)", "DEFAULT", "[]"),
+            "tags Array(String) DEFAULT []"
+        );
+        assert_eq!(
+            build_add_column_clause("process", "String", "ALIAS", "command_line"),
+            "process String ALIAS command_line"
+        );
+        assert_eq!(
+            build_add_column_clause("enr", "String", "MATERIALIZED", "dictGet('d','k',x)"),
+            "enr String MATERIALIZED dictGet('d','k',x)"
+        );
+    }
+
     #[test]
     fn test_load_migrations_from_dir() {
         let temp_dir = TempDir::new().unwrap();

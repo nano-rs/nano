@@ -217,3 +217,33 @@ pub struct EntitySignalSummary {
     /// finding row's `action` column.
     pub signal_type: String,
 }
+
+/// Exact per-rule contribution to an entity's decayed risk score (NAN-1658).
+///
+/// Computed with the SAME source, window, and decay curve as the entity's
+/// `decayed_score_24h/7d`, grouped by rule — so summing these per window
+/// reproduces the headline score. This exists because the recent-matches feed
+/// is capped (`ENTITY_MATCHES_LIMIT`), and a breakdown derived from that
+/// sample understated hot entities (25 fires / +1875 shown against a 21600
+/// headline).
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct EntityRuleContribution {
+    /// Detection rule UUID as a string. May be empty for ad-hoc findings.
+    pub rule_id: String,
+    pub rule_name: String,
+    /// Severity of the most recent fire.
+    pub severity: String,
+    /// Fires inside the trailing 24h window.
+    pub fires_24h: i64,
+    /// Fires inside the trailing 7d window.
+    pub fires_7d: i64,
+    /// Decay-weighted score contribution inside 24h — sums to the entity's
+    /// `decayed_score_24h` across rules.
+    pub decayed_contribution_24h: i64,
+    /// Decay-weighted score contribution inside 7d — sums to the entity's
+    /// `decayed_score_7d` across rules.
+    pub decayed_contribution_7d: i64,
+    pub last_fire_at: DateTime<Utc>,
+    /// The per-fire score of the most recent fire (undecayed).
+    pub last_fire_score: i32,
+}

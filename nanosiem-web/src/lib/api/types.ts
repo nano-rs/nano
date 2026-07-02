@@ -2070,6 +2070,22 @@ export interface EntitySignalSummary {
   signal_type: string;
 }
 
+/** Exact per-rule contribution to an entity's decayed risk score (NAN-1658).
+ * Same source/window/decay as the headline score — summing
+ * `decayed_contribution_24h/7d` across rules reproduces `decayed_score_24h/7d`.
+ * Use this for score breakdowns, NOT `matches` (a capped recency sample). */
+export interface EntityRuleContribution {
+  rule_id: string;
+  rule_name: string;
+  severity: string;
+  fires_24h: number;
+  fires_7d: number;
+  decayed_contribution_24h: number;
+  decayed_contribution_7d: number;
+  last_fire_at: string;
+  last_fire_score: number;
+}
+
 export interface EntityContextResponse {
   entity: string;
   entity_type: string;
@@ -2078,6 +2094,7 @@ export interface EntityContextResponse {
   alert_count: number;
   matches: EntitySignalSummary[];
   match_count: number;
+  rule_contributions: EntityRuleContribution[];
   cases: EntityCaseSummary[];
   case_count: number;
 }

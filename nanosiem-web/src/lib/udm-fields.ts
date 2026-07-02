@@ -4,14 +4,14 @@
  * UDM (Unified Data Model) field definitions
  *
  * AUTO-GENERATED — do not edit manually.
- * Source: nanosiem-core/docs/udmfields.csv (511 fields)
+ * Source: nanosiem-core/docs/udmfields.csv (512 fields)
  * Regenerate: npm run generate:udm
  */
 
 export const UDM_COLUMNS = new Set([
   // === UDM Fields (from udmfields.csv) ===
-  'additional_answer_count', 'ai_confidence', 'ai_reasoning', 'ai_verdict', 'answer',
-  'answer_count', 'app', 'app_id', 'array', 'auth_result', 'auth_type',
+  'action', 'additional_answer_count', 'ai_confidence', 'ai_reasoning', 'ai_verdict',
+  'answer', 'answer_count', 'app', 'app_id', 'array', 'auth_result', 'auth_type',
   'authentication_method', 'authentication_service', 'authority_answer_count', 'availability',
   'avg_executions', 'blocksize', 'buffer_cache_hit_ratio', 'bugtraq', 'bytes', 'bytes_in',
   'bytes_out', 'cached', 'category', 'cert', 'change_type', 'channel', 'cloud_account_id',

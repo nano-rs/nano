@@ -644,7 +644,7 @@ mod tests {
                 // write them, so the contract holds vacuously for audit rows
                 // (ClickHouse defaults them to '').
                 "user_domain" | "src_mac" | "dest_mac" | "src_user" | "trace_id"
-                | "span_id" => continue,
+                | "span_id" | "dvc_ip" => continue,
                 other => panic!(
                     "`{other}` joined LOWERCASE_NORMALIZED_FIELDS — teach this \
                      contract test where the audit writer surfaces it (or record \
