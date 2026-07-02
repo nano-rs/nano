@@ -96,7 +96,14 @@ pub fn fallback_report(metrics: &CollectedMetrics) -> AnalysisResult {
         // NAN-1405: fired insert-integrity signals become explicit critical/high
         // recommendations even without AI — silent ingestion loss must never
         // depend on an LLM being reachable to surface.
-        recommendations: insert_integrity_recommendations(&metrics.ingestion.insert_integrity),
+        // NAN-1643: same posture for ingest-lowercase invariant drift — silent
+        // query divergence must not depend on an LLM either.
+        recommendations: {
+            let mut recs =
+                insert_integrity_recommendations(&metrics.ingestion.insert_integrity);
+            recs.extend(lowercase_invariant_recommendations(&metrics.parsing));
+            recs
+        },
         dimension_details: DimensionDetails {
             ingestion: "AI analysis unavailable".to_string(),
             parsing: "AI analysis unavailable".to_string(),
@@ -410,9 +417,56 @@ fn insert_integrity_recommendations(ii: &InsertIntegrityMetrics) -> Vec<Recommen
     recs
 }
 
+/// NAN-1643: recommendation for fired ingest-lowercase invariant violations.
+/// High, not critical, per the house line: critical is reserved for proven
+/// data LOSS (NAN-1405); this is data landing but silently invisible to
+/// raw-compare queries — a correctness degradation with the rows still
+/// recoverable once the lane is fixed.
+fn lowercase_invariant_recommendations(p: &ParsingMetrics) -> Vec<Recommendation> {
+    if p.lowercase_invariant_violations.is_empty() {
+        return vec![];
+    }
+    let columns = p
+        .lowercase_invariant_violations
+        .iter()
+        .map(|v| format!("{} ({} rows)", v.column, v.violation_count))
+        .collect::<Vec<_>>()
+        .join(", ");
+    vec![Recommendation {
+        title: format!(
+            "Ingest-lowercase invariant broken: mixed-case values landing in {}",
+            p.lowercase_invariant_violations
+                .iter()
+                .map(|v| v.column.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        description: format!(
+            "In the last hour, rows landed with mixed-case values in ingest-lowercased \
+             column(s): {columns}. The query engine compares these columns RAW (no lower() \
+             wrapper) so their bloom/primary-key indexes prune — equality searches and \
+             detection rules on these fields will silently MISS the mixed-case rows \
+             (case-sensitive divergence, no error). Find the ingest lane writing them \
+             (a new source, a backfill, or a parser regression that skips the Vector \
+             downcase stage) and restore lowercase normalization; existing mixed-case \
+             rows should be rewritten or re-ingested."
+        ),
+        priority: "high".to_string(),
+    }]
+}
+
 fn score_parsing(m: &ParsingMetrics) -> i32 {
+    // NAN-1643: active ingest-lowercase invariant drift means raw-compare
+    // queries are silently missing rows RIGHT NOW — a hard drag on the score
+    // regardless of how good field coverage looks, and applied even on the
+    // low-volume early return (a single mixed-case lane can predate coverage).
+    let invariant_penalty = if m.lowercase_invariant_violations.is_empty() {
+        0
+    } else {
+        30
+    };
     if m.field_coverage.is_empty() {
-        return 50;
+        return (50 - invariant_penalty).clamp(0, 100);
     }
     let avg_coverage: f64 = m
         .field_coverage
@@ -427,7 +481,7 @@ fn score_parsing(m: &ParsingMetrics) -> i32 {
         .sum::<f64>()
         / m.field_coverage.len() as f64;
     let ext_penalty = (m.high_ext_sources.len() as i32) * 10;
-    (avg_coverage as i32 - ext_penalty).clamp(0, 100)
+    (avg_coverage as i32 - ext_penalty - invariant_penalty).clamp(0, 100)
 }
 
 fn score_enrichment(m: &EnrichmentMetrics) -> i32 {
@@ -628,6 +682,7 @@ mod tests {
             parsing: ParsingMetrics {
                 field_coverage: vec![],
                 high_ext_sources: vec![],
+                lowercase_invariant_violations: vec![],
             },
             enrichment: EnrichmentMetrics {
                 total_events_24h: 0,
@@ -919,6 +974,75 @@ mod tests {
             rec.description.contains("Ingestion is NOT affected"),
             "the rec must say rows keep landing: {}",
             rec.description
+        );
+    }
+
+    /// NAN-1643: ingest-lowercase invariant drift must drag the parsing score
+    /// and raise a high-priority recommendation naming the offending columns
+    /// and counts — the consequence (raw-compare queries silently missing
+    /// rows) must never depend on an LLM being reachable to surface.
+    #[test]
+    fn lowercase_invariant_violations_drag_parsing_and_recommend() {
+        let clean = ParsingMetrics {
+            field_coverage: vec![],
+            high_ext_sources: vec![],
+            lowercase_invariant_violations: vec![],
+        };
+        assert!(lowercase_invariant_recommendations(&clean).is_empty());
+        let clean_score = score_parsing(&clean);
+
+        let mut drifting = clean.clone();
+        drifting.lowercase_invariant_violations = vec![
+            LowercaseInvariantViolation {
+                column: "src_ip".to_string(),
+                violation_count: 1_842,
+            },
+            LowercaseInvariantViolation {
+                column: "user".to_string(),
+                violation_count: 12,
+            },
+        ];
+        assert!(
+            score_parsing(&drifting) < clean_score,
+            "active invariant drift must drag the parsing score"
+        );
+
+        let recs = lowercase_invariant_recommendations(&drifting);
+        assert_eq!(recs.len(), 1, "one finding covering all columns");
+        let rec = &recs[0];
+        assert_eq!(
+            rec.priority, "high",
+            "divergence is degradation, not proven loss — high, not critical"
+        );
+        assert!(
+            rec.title.contains("src_ip") && rec.title.contains("user"),
+            "finding must name the offending columns: {}",
+            rec.title
+        );
+        assert!(
+            rec.description.contains("1842 rows") && rec.description.contains("12 rows"),
+            "finding must carry per-column counts: {}",
+            rec.description
+        );
+        assert!(
+            rec.description.to_lowercase().contains("miss"),
+            "finding must explain the consequence (raw-compare queries miss rows): {}",
+            rec.description
+        );
+
+        // ...and it survives into the fallback report on a live deployment.
+        let mut metrics = base_zero_metrics_fixture();
+        metrics.ingestion.total_events_24h = 100_000;
+        metrics.enrichment.total_events_24h = 100_000;
+        metrics.parsing = drifting;
+        let report = fallback_report(&metrics);
+        assert!(
+            report
+                .recommendations
+                .iter()
+                .any(|r| r.priority == "high" && r.title.contains("Ingest-lowercase")),
+            "invariant finding must survive into the fallback report; got {:?}",
+            report.recommendations
         );
     }
 

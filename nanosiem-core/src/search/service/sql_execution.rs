@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::search::execution::clickhouse_executor::{
-    wrap_query_for_count, wrap_query_with_pagination,
+    wrap_query_for_count, wrap_query_with_pagination, BoundedCountInput,
 };
 
 impl SearchService {
@@ -214,11 +214,14 @@ impl SearchService {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
-        self.execute_clickhouse_sql_with_query_id(sql, limit, offset, None, None)
+        self.execute_clickhouse_sql_with_query_id(sql, limit, offset, None, None, None)
             .await
     }
 
-    /// Execute SQL against ClickHouse with optional query_id and per-query settings
+    /// Execute SQL against ClickHouse with optional query_id and per-query settings.
+    ///
+    /// `bounded_count` (NAN-1635, finding 2.3): caller-supplied bounded input
+    /// for the raw-search count companion; `None` keeps the unbounded wrap.
     pub(crate) async fn execute_clickhouse_sql_with_query_id(
         &self,
         sql: &str,
@@ -226,6 +229,7 @@ impl SearchService {
         offset: usize,
         query_id: Option<&str>,
         ch_settings: Option<&super::admission::ClickHouseQuerySettings>,
+        bounded_count: Option<BoundedCountInput<'_>>,
     ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
@@ -239,11 +243,11 @@ impl SearchService {
         // If both query_id and settings are provided, use the settings-aware method
         if let (Some(id), Some(settings)) = (query_id, effective_settings) {
             ch_executor
-                .execute_sql_with_settings(sql, limit, offset, id, settings)
+                .execute_sql_with_settings(sql, limit, offset, id, settings, bounded_count)
                 .await
         } else if let Some(id) = query_id {
             ch_executor
-                .execute_sql_with_query_id(sql, limit, offset, id)
+                .execute_sql_with_query_id(sql, limit, offset, id, bounded_count)
                 .await
         } else {
             ch_executor.execute_sql(sql, limit, offset).await

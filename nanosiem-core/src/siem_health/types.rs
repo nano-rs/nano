@@ -210,6 +210,15 @@ pub struct ParsingMetrics {
     pub field_coverage: Vec<FieldCoverageMetric>,
     /// Source types with high ext column usage (> 50% of events)
     pub high_ext_sources: Vec<ExtUsageMetric>,
+    /// NAN-1643: ingest-lowercase invariant violations over the last hour.
+    /// The query generator compares `LOWERCASE_NORMALIZED_FIELDS` columns RAW
+    /// (no lower() wrapper) so their bloom/PK indexes prune; that is only
+    /// correct while ingest keeps those columns all-lowercase. Any entry here
+    /// means a lane (new source, backfill, parser regression) is writing
+    /// mixed-case and raw-compare queries are silently missing those rows.
+    /// `serde(default)` so reports stored before NAN-1643 still deserialize.
+    #[serde(default)]
+    pub lowercase_invariant_violations: Vec<LowercaseInvariantViolation>,
 }
 
 /// Field coverage for a source type
@@ -229,6 +238,16 @@ pub struct ExtUsageMetric {
     pub source_type: String,
     pub total_events: u64,
     pub ext_usage_pct: f64,
+}
+
+/// A logs column that broke the ingest-lowercase invariant in the probe
+/// window (NAN-1643).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LowercaseInvariantViolation {
+    /// Physical `logs` column name (`src_ip`, `user`, …).
+    pub column: String,
+    /// Rows in the window where `col != lower(col)`.
+    pub violation_count: u64,
 }
 
 /// Enrichment health metrics — fleet-wide fill rates over the last 24h.

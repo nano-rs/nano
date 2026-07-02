@@ -71,6 +71,22 @@
         );
     }
 
+    /// NAN-1646 (NAN-1632 finding 3.9): `dvc_ip` was the only lowercase-candidate
+    /// column in the clickhouse_mapping stage WITHOUT an ingest downcase. It joins
+    /// `LOWERCASE_NORMALIZED_FIELDS` in the follow-up codegen half (NAN-1647), so
+    /// equality hunts compare the column RAW — sound only while every new row is
+    /// stored lowercase (uppercase IPv6 hex would otherwise be silently
+    /// unfindable). Pin the wrapper: dropping it reintroduces mixed-case ingest
+    /// under a raw-compare query path.
+    #[test]
+    fn pipeline_config_canonicalizes_dvc_ip_lowercase() {
+        let content = VectorConfigManager::pipeline_config_content();
+        assert!(
+            content.contains(r#".dvc_ip = downcase(to_string(.dvc_ip) ?? "")"#),
+            "clickhouse_mapping must downcase dvc_ip at ingest (NAN-1646)"
+        );
+    }
+
     /// NAN-1378: `ocsf_prepare` reads `%source_type` (with an `?? "unknown"`
     /// fallback) to restore provenance after the OCSF parsers' `. = {...}`
     /// root-replacement wipes `.source_type`. The writer lives in 00-base.toml's

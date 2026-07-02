@@ -358,8 +358,9 @@ impl ClickHouseSqlGenerator {
         let time_bucket_expr = self.generate_time_bucket(span);
 
         // (aggregate expression, output column name) per aggregation. The name is
-        // None only for field-less non-count aggregations (no alias to derive) —
-        // those columns keep ClickHouse's expression-derived name.
+        // None only for field-less aggregations other than count/sparkline (no
+        // alias to derive) — those columns keep ClickHouse's expression-derived
+        // name.
         let agg_cols: Vec<(String, Option<String>)> = aggregations.iter()
             .map(|agg| {
                 let field_expr = agg.field.as_ref()
@@ -437,6 +438,15 @@ impl ClickHouseSqlGenerator {
                     .or_else(|| {
                         (agg.field.is_none() && agg.func == AggFunc::Count)
                             .then(|| "count".to_string())
+                    })
+                    .or_else(|| {
+                        // Field-less sparkline aggregates the time column, so it
+                        // has a canonical name (mirrors the eventstats default in
+                        // commands_advanced.rs). Leaving it unnamed forced every
+                        // count-ranked `... , sparkline by X limit=N` timechart
+                        // onto the two-pass top-N path (NAN-1632 3.7).
+                        (agg.field.is_none() && agg.func == AggFunc::Sparkline)
+                            .then(|| "sparkline".to_string())
                     });
                 (agg_expr, name)
             })
@@ -503,17 +513,18 @@ impl ClickHouseSqlGenerator {
                     let (e, _) = field_to_sql_expr(f, self);
                     e
                 });
-                // Two-pass form is kept when:
-                //  - the rank aggregation is dc()/estdc(): distinct counts are NOT
-                //    per-bucket decomposable (the union of per-bucket distinct sets
-                //    isn't the sum of their sizes), or
-                //  - any aggregation column has no derivable output name (field-less
-                //    non-count aggregations keep ClickHouse's expression-derived
-                //    name, which the single-scan outer projection can't reference).
-                // Everything else uses the single-scan windowed form (NAN-1430 / D1).
+                // Two-pass form is kept only when an aggregation column has no
+                // derivable output name (empty-parens non-count/non-sparkline
+                // aggregations keep ClickHouse's expression-derived name, which the
+                // single-scan outer projection can't reference), or when a dc/estdc
+                // rank has no field to carry a state for. Everything else — including
+                // dc()/estdc() ranks, which merge per-bucket aggregate STATES rather
+                // than summing scalars (NAN-1632 3.2) — uses the single-scan windowed
+                // form (NAN-1430 / D1).
                 let any_unnamed = agg_cols.iter().any(|(_, name)| name.is_none());
-                if matches!(first_func, Some(AggFunc::Dc) | Some(AggFunc::EstDc)) || any_unnamed
-                {
+                let dc_rank_without_field = rank_field_expr.is_none()
+                    && matches!(first_func, Some(AggFunc::Dc) | Some(AggFunc::EstDc));
+                if any_unnamed || dc_rank_without_field {
                     let (field_expr, needs_cast) = field_to_sql_expr(field, self);
                     let field_in_subq = if needs_cast {
                         format!("toString({})", field_expr)
@@ -563,8 +574,24 @@ impl ClickHouseSqlGenerator {
                     // and divides at the end):
                     //   count → sum(per-bucket count)  sum → sum(per-bucket sum)
                     //   avg   → sum(per-bucket sum) / sum(per-bucket count)
+                    //   dc/estdc → merge of per-bucket uniq STATES (distinct counts
+                    //     are not decomposable as scalar sums; the carried
+                    //     AggregateFunction state merges exactly — NAN-1632 3.2)
                     //   other → row count (matches the old form's count() fallback)
                     let (helper_cols, total_expr) = match (first_func, &rank_field_expr) {
+                        // dc() must stay uniqExact end-to-end: ranking by a merged
+                        // APPROXIMATE state is not result-identical to the exact
+                        // two-pass form it replaces.
+                        (Some(AggFunc::Dc), Some(f)) => (
+                            format!("uniqExactState({}) AS __rank_state", f),
+                            "uniqExactMerge(__rank_state) OVER (PARTITION BY __rank_key)"
+                                .to_string(),
+                        ),
+                        (Some(AggFunc::EstDc), Some(f)) => (
+                            format!("uniqCombined64State({}) AS __rank_state", f),
+                            "uniqCombined64Merge(__rank_state) OVER (PARTITION BY __rank_key)"
+                                .to_string(),
+                        ),
                         (Some(AggFunc::Count), Some(f)) => (
                             format!("count({}) AS __rank_val", f),
                             "sum(__rank_val) OVER (PARTITION BY __rank_key)".to_string(),
@@ -614,6 +641,7 @@ impl ClickHouseSqlGenerator {
                         Some("__rank_val"),
                         Some("__rank_sum"),
                         Some("__rank_cnt"),
+                        Some("__rank_state"),
                         Some("__rank_total"),
                         Some("__rank"),
                     ]

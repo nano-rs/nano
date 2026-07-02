@@ -24,5 +24,7 @@ pub use sql_helpers::{
     escape_question_marks_in_strings, inject_limit_offset, wrap_query_for_count,
     wrap_query_with_pagination,
 };
+pub(crate) use paginated::is_first_page;
+pub(crate) use sql_helpers::BoundedCountInput;
 pub use types::{ClickHouseExecutor, ClickHouseLogReadRow};
 pub(crate) use types::with_query_options;

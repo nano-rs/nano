@@ -146,6 +146,188 @@
         );
     }
 
+    /// NAN-1635 (finding 3.6): multi-stage SQL must apply `QueryOptions.limit`
+    /// to the final SELECT — previously it was dropped entirely, so the
+    /// documented safety bound vanished for every piped query (a streamed
+    /// high-cardinality `| stats count by col` ran unbounded, and deployments
+    /// with query_limits.xml turned the graceful cap into a hard
+    /// max_result_rows error).
+    #[test]
+    fn cte_final_select_applies_options_limit() {
+        let gen = ClickHouseSqlGenerator::new();
+        for q in [
+            "error | where src_ip!=\"\"",          // row-preserving tail (implicit ORDER BY)
+            "* | stats count by src_ip",           // aggregation tail
+            "* | stats count by src_ip | sort -count", // ordering tail
+        ] {
+            let sql = gen
+                .generate(&parse_query(q).unwrap(), &time_range())
+                .unwrap();
+            let final_select = sql
+                .rfind("\nSELECT ")
+                .map(|p| &sql[p..])
+                .unwrap_or_else(|| panic!("no final SELECT in:\n{sql}"));
+            assert!(
+                final_select.contains(&format!(
+                    "LIMIT {} ",
+                    ClickHouseSqlGenerator::DEFAULT_RESULT_LIMIT
+                )),
+                "`{q}` final select must carry the safety LIMIT, got:\n{sql}"
+            );
+        }
+    }
+
+    /// NAN-1635 (finding 3.6): the limit stays offset-aware — `limit: None`
+    /// keeps the CTE tail LIMIT-free for callers that own the bound themselves:
+    /// the executor's injected LIMIT/OFFSET (pagination) and the prevalence
+    /// JOIN wrapper (whose ORDER-BY-anchored stripper would miss a bare
+    /// trailing `LIMIT` on a projected base like `| fields -`). The
+    /// row-preserving tail is pinned by
+    /// `multistage_raw_pipeline_with_limit_none_emits_no_limit` above.
+    #[test]
+    fn cte_final_select_skips_limit_for_executor_pagination() {
+        let gen = ClickHouseSqlGenerator::new();
+        let options = QueryOptions {
+            limit: None,
+            ..Default::default()
+        };
+        for q in ["* | stats count by src_ip", "error | fields - message"] {
+            let sql = gen
+                .generate_with_options(&parse_query(q).unwrap(), &time_range(), &options)
+                .unwrap();
+            assert!(
+                !sql.to_uppercase().contains(" LIMIT "),
+                "`{q}` with limit: None must keep the CTE tail LIMIT-free, got:\n{sql}"
+            );
+        }
+    }
+
+    /// NAN-1635 (finding 2.2): the histogram companion's base shape — with
+    /// `unordered` + `limit: None` the generator emits a flat scan with no
+    /// trailing ORDER BY and no LIMIT, so the wrapping GROUP BY buckets the
+    /// FULL match set (the old `ORDER BY timestamp DESC LIMIT 1000000` base
+    /// forced a top-1M sort AND silently truncated the timeline to the newest
+    /// 1M events). Subsearch caps inside the base expression survive — they
+    /// are query semantics, and dropping them would change the match set.
+    #[test]
+    fn unordered_limit_none_emits_flat_base_scan() {
+        let gen = ClickHouseSqlGenerator::new();
+        let options = QueryOptions {
+            limit: None,
+            unordered: true,
+            ..Default::default()
+        };
+        for q in ["*", "error", "src_ip=\"10.0.0.1\""] {
+            let sql = gen
+                .generate_with_options(&parse_query(q).unwrap(), &time_range(), &options)
+                .unwrap();
+            assert!(
+                !sql.contains("ORDER BY"),
+                "`{q}` unordered base must have no sort, got:\n{sql}"
+            );
+            assert!(
+                !sql.to_uppercase().contains(" LIMIT "),
+                "`{q}` unbounded base must have no LIMIT, got:\n{sql}"
+            );
+        }
+
+        // Subsearch cap is query semantics — it survives; only the trailing
+        // ORDER BY is dropped.
+        let sql = gen
+            .generate_with_options(
+                &parse_query("src_ip IN [search error | return src_ip]").unwrap(),
+                &time_range(),
+                &options,
+            )
+            .unwrap();
+        assert!(
+            sql.to_uppercase().contains(" LIMIT "),
+            "subsearch cap must survive the unbounded base, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("ORDER BY timestamp DESC"),
+            "trailing sort must still be dropped, got:\n{sql}"
+        );
+    }
+
+    /// NAN-1635 (findings 2.3/3.4): `unordered` on count-companion
+    /// regenerations drops the implicit trailing ORDER BY but keeps user
+    /// LIMITs (`| head N` bounds the count) and user `| sort` stages (their
+    /// ORDER BY lives inside their own CTE and is elidable under a count
+    /// wrap — it is semantics, not the implicit newest-first tail).
+    #[test]
+    fn unordered_keeps_user_head_and_sort_semantics() {
+        let gen = ClickHouseSqlGenerator::new();
+        let options = QueryOptions {
+            limit: None,
+            unordered: true,
+            ..Default::default()
+        };
+        let head_sql = gen
+            .generate_with_options(
+                &parse_query("error | head 10").unwrap(),
+                &time_range(),
+                &options,
+            )
+            .unwrap();
+        assert!(
+            head_sql.contains("LIMIT 10 "),
+            "user head cap must bound the count, got:\n{head_sql}"
+        );
+        assert!(
+            !head_sql.contains("ORDER BY"),
+            "implicit sort must be dropped (ORDER BY + LIMIT = top-N under the \
+             count's inner LIMIT), got:\n{head_sql}"
+        );
+
+        let sort_sql = gen
+            .generate_with_options(
+                &parse_query("error | sort -bytes_out").unwrap(),
+                &time_range(),
+                &options,
+            )
+            .unwrap();
+        assert!(
+            sort_sql.contains("ORDER BY"),
+            "user `| sort` stage keeps its ORDER BY, got:\n{sort_sql}"
+        );
+    }
+
+    /// NAN-1635 (finding p12): the read-in-order toggle applies to CTE tails
+    /// too — CH 26.4 inlines the CTEs and pushes the outer `ORDER BY timestamp
+    /// DESC` down to the base read, so a piped query with a selective indexed
+    /// equality must disable `optimize_read_in_order` exactly like its
+    /// single-stage form (Saturn: ~23% wall on a pinned-source_type hunt and
+    /// 78.91k rows read on a zero-match probe vs 0). A broad source_type-only
+    /// pipe keeps it on.
+    #[test]
+    fn read_in_order_toggle_applies_to_cte_tail() {
+        let gen = ClickHouseSqlGenerator::new();
+        let selective = gen
+            .generate(
+                &parse_query(
+                    "source_type=aws_cloudtrail src_ip=\"1.2.3.4\" | where dest_port=443",
+                )
+                .unwrap(),
+                &time_range(),
+            )
+            .unwrap();
+        assert!(
+            selective.contains("optimize_read_in_order=0"),
+            "piped selective indexed equality must disable read-in-order, got:\n{selective}"
+        );
+        let broad = gen
+            .generate(
+                &parse_query("source_type=aws_cloudtrail | where dest_port=443").unwrap(),
+                &time_range(),
+            )
+            .unwrap();
+        assert!(
+            broad.contains("optimize_read_in_order=1"),
+            "broad piped source_type filter must keep read-in-order, got:\n{broad}"
+        );
+    }
+
     /// NAN-1311: under OCSF a `sequence` step-capture column whose field is dotted
     /// (`[process.name=…]` → emitted alias `step1_process_name`) must be registered
     /// as a computed column, so a downstream `| table step1_process_name` references
@@ -889,6 +1071,35 @@
             where_clause.contains("src_ip = '89.248.167.131'"),
             "UDM WHERE must keep the direct `src_ip = '…'` fast path, got:\n{where_clause}"
         );
+    }
+
+    /// NAN-1643: the raw (no lower()) form on ingest-lowercased columns is
+    /// Eq ONLY — for Eq it is row-identical to the lower() form while the
+    /// ingest-lowercase invariant holds; for Ne it is not (an uppercase row
+    /// flips from excluded to included), and a bloom can never prune a
+    /// negation anyway. Ne must keep the lower() wrapper.
+    #[test]
+    fn udm_ne_on_ingest_lowercased_field_keeps_lower_wrapper() {
+        let gen = ClickHouseSqlGenerator::new();
+        for (q, want, forbid) in [
+            (
+                "src_ip!=\"89.248.167.131\"",
+                "lower(src_ip) != '89.248.167.131'",
+                "src_ip != '89.248.167.131'",
+            ),
+            (
+                "user!=\"Admin\"",
+                "lower(\"user\") != 'admin'",
+                "\"user\" != 'admin'",
+            ),
+        ] {
+            let sql = gen.generate(&parse_query(q).unwrap(), &time_range()).unwrap();
+            let where_clause = where_slice(&sql);
+            assert!(
+                where_clause.contains(want) && !where_clause.contains(forbid),
+                "UDM `{q}` must negate on lower(col), never the raw column (NAN-1643), got:\n{where_clause}"
+            );
+        }
     }
 
     /// NAN-1381 (root cause of NAN-1247): non-Eq string operators on a UDM alias
@@ -2094,5 +2305,1202 @@
         assert!(
             sql.contains("src_ip IN (") && sql.contains("lower(file_hash) IN ("),
             "feed indicators must match each observable column via IN, got:\n{sql}"
+        );
+    }
+
+    // === NAN-1634: secondary filter paths route through index-form selection ===
+    //
+    // Saturn-measured (CLICKHOUSE_SQLGEN_PERF_FINDINGS.md): the `| where` pipe,
+    // IN-lists, subsearch IN, and field=function() filters bypassed the form
+    // selection the primary search path applies, wrapping physical columns in
+    // lower(toString(col)) / lower(col) / toString(col) — none of which match
+    // the raw blooms, the lower(col) text indexes, or PK analysis.
+
+    /// `| where col="v"` on an ingest-lowercased base column must compare RAW
+    /// (bloom/set/PK engage via predicate pushdown into stage_0) — measured
+    /// 31.8x read_rows vs the previous `lower(toString(src_ip))` wrap.
+    #[test]
+    fn where_pipe_eq_on_ingest_lowercased_column_compares_raw() {
+        let query = parse_query("* | where src_ip=\"10.1.6.161\"").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("src_ip = '10.1.6.161'"),
+            "where-pipe Eq on src_ip must be raw, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("lower(toString(src_ip))"),
+            "index-defeating wrap must be gone, got:\n{sql}"
+        );
+    }
+
+    /// `| where col!="v"` must KEEP the case-insensitive wrap — raw negation
+    /// flips invariant-violating rows from excluded to included, and no skip
+    /// index prunes a negation anyway (the "Eq ONLY" rule the OCSF alias path
+    /// documents).
+    #[test]
+    fn where_pipe_ne_keeps_case_insensitive_wrap() {
+        let query = parse_query("* | where user!=\"admin\"").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("lower(toString(\"user\")) != 'admin'"),
+            "where-pipe Ne must stay case-insensitive, got:\n{sql}"
+        );
+    }
+
+    /// NOT IN keeps the `lower()` wrap on both the search path and the
+    /// where-pipe path — same negation rule as Ne.
+    #[test]
+    fn not_in_keeps_lower_wrap_on_ingest_lowercased_columns() {
+        let query = parse_query("src_ip NOT IN (\"10.1.2.3\")").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            where_slice(&sql).contains("lower(src_ip) NOT IN ('10.1.2.3')"),
+            "search-path NOT IN must keep lower(), got:\n{sql}"
+        );
+
+        let query = parse_query("* | where src_ip NOT IN (\"10.1.2.3\")").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("lower(src_ip) NOT IN ('10.1.2.3')"),
+            "where-pipe NOT IN must keep lower(), got:\n{sql}"
+        );
+    }
+
+    /// A text-indexed column that is NOT lowercased at ingest takes the
+    /// `lower(col)` form (the migration-119 text indexes are built on
+    /// `lower(col)`; `lower(toString(col))` matches no index expression).
+    #[test]
+    fn where_pipe_eq_on_text_column_uses_lower_form() {
+        let query = parse_query("* | where dest_user=\"Administrator\"").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("lower(dest_user) = 'administrator'"),
+            "where-pipe Eq on dest_user must use lower(col) (mixed-case history — raw would drop matches), got:\n{sql}"
+        );
+    }
+
+    /// A pipeline-computed name shadowing a physical column (NAN-1341) must
+    /// KEEP the scope-relative normalizing wrap — its values are not the
+    /// ingest-normalized column values.
+    #[test]
+    fn where_pipe_eq_on_shadowed_column_keeps_tostring_wrap() {
+        let query = parse_query("* | eval user=upper(src_host) | where user=\"WS01\"").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("lower(toString(\"user\")) = 'ws01'"),
+            "computed `user` must keep the lower(toString()) wrap, got:\n{sql}"
+        );
+    }
+
+    /// where-pipe IN on an ingest-lowercased base column drops the `lower()`.
+    #[test]
+    fn where_pipe_in_list_on_ingest_lowercased_column_compares_raw() {
+        let query = parse_query("* | where src_ip IN (\"10.1.2.3\", \"10.4.5.6\")").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("src_ip IN ('10.1.2.3', '10.4.5.6')"),
+            "where-pipe IN on src_ip must be raw, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("lower(src_ip)"),
+            "lower() must not wrap src_ip, got:\n{sql}"
+        );
+    }
+
+    /// Search-path IN-list on an ingest-lowercased column compares RAW,
+    /// mirroring the Eq arm (measured 8.6x read_rows on a 7d two-IP hunt);
+    /// a mixed-case-history column keeps `lower(col) IN`.
+    #[test]
+    fn search_in_list_form_selection_matches_eq_arm() {
+        let query = parse_query("src_ip IN (\"10.1.2.3\", \"10.4.5.6\")").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        let where_clause = where_slice(&sql);
+        assert!(
+            where_clause.contains("src_ip IN ('10.1.2.3', '10.4.5.6')"),
+            "IN-list on src_ip must be raw so idx_src_ip + PK prune, got:\n{where_clause}"
+        );
+
+        let query = parse_query("dest_user IN (\"Alice\", \"Bob\")").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        let where_clause = where_slice(&sql);
+        assert!(
+            where_clause.contains("lower(dest_user) IN ('alice', 'bob')"),
+            "IN-list on mixed-case-history dest_user must keep lower(), got:\n{where_clause}"
+        );
+    }
+
+    /// Subsearch IN with plain physical String columns on BOTH sides drops the
+    /// `toString()` wraps (strict identity on non-Nullable String DEFAULT '')
+    /// so the outer column's expression-matched bloom engages (2.98x granules).
+    #[test]
+    fn subsearch_in_plain_string_both_sides_drops_tostring() {
+        let query = parse_query("src_ip IN [search error | return src_ip]").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("src_ip IN (SELECT DISTINCT src_ip FROM"),
+            "plain-String subsearch IN must compare bare columns, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("toString(src_ip)"),
+            "toString wrap must be gone on the String/String path, got:\n{sql}"
+        );
+    }
+
+    /// A UUID outer side (the NAN-1562 coercion class) KEEPS the normalizing
+    /// `toString()` wrap.
+    #[test]
+    fn subsearch_in_uuid_side_keeps_tostring() {
+        let query = parse_query("id IN [search error | return id]").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("toString(id) IN (SELECT DISTINCT toString(id) FROM"),
+            "UUID subsearch IN must keep the toString coercion, got:\n{sql}"
+        );
+    }
+
+    /// `field=function(...)` on an explicit column must compare the PHYSICAL
+    /// column — the previous unconditional `JSONExtractString(metadata, …)`
+    /// probe is empty for every promoted field (metadata carries no copies),
+    /// so `user=lower(dest_user)` degenerated to `'' = rhs` and matched WRONG
+    /// rows.
+    #[test]
+    fn field_function_filter_resolves_explicit_column_not_metadata() {
+        let query = parse_query("user=lower(dest_user)").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        let where_clause = where_slice(&sql);
+        assert!(
+            where_clause.contains("\"user\" = lower(lower(dest_user))")
+                || where_clause.contains("user = lower(lower(dest_user))"),
+            "LHS must be the raw ingest-lowercased column, got:\n{where_clause}"
+        );
+        assert!(
+            !where_clause.contains("JSONExtractString(metadata, 'user')"),
+            "metadata probe must be gone for explicit columns, got:\n{where_clause}"
+        );
+    }
+
+    /// Numeric explicit columns skip lower() on both sides (CH Code 43).
+    #[test]
+    fn field_function_filter_numeric_column_skips_lower() {
+        let query = parse_query("src_port=abs(dest_port)").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        let where_clause = where_slice(&sql);
+        assert!(
+            where_clause.contains("src_port = abs(dest_port)"),
+            "numeric field=function() must compare raw, got:\n{where_clause}"
+        );
+    }
+
+    /// Unknown fields keep the metadata-JSON fallback (pre-NAN-1634 behavior).
+    #[test]
+    fn field_function_filter_unknown_field_keeps_metadata_fallback() {
+        let query = parse_query("weird_custom_field=lower(user)").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        let where_clause = where_slice(&sql);
+        assert!(
+            where_clause.contains("JSONExtractString(metadata, 'weird_custom_field')"),
+            "unknown fields must keep the metadata-JSON access, got:\n{where_clause}"
+        );
+    }
+
+    /// NAN-1639 (finding 3.8): the executor-injected `| sort -count` on a
+    /// grouped stats query must not emit a bogus `ext.count` column, and the
+    /// stage_0 base read must stay on the pruned projection instead of the
+    /// wide `SELECT *` + MATERIALIZED re-adds.
+    #[test]
+    fn injected_sort_on_grouped_stats_keeps_pruned_stage_0() {
+        let gen = ClickHouseSqlGenerator::new();
+        let query = parse_query("* | stats count by src_ip | sort -count").unwrap();
+        let sql = gen.generate(&query, &time_range()).unwrap();
+        assert!(
+            !sql.contains("ext.count"),
+            "aggregation output alias must not be spilled from ext, got:\n{sql}"
+        );
+        let stage_0 = sql
+            .split("stage_1")
+            .next()
+            .expect("stage_0 present");
+        assert!(
+            !stage_0.contains("SELECT *"),
+            "grouped stats + injected sort must keep the pruned stage_0, got:\n{sql}"
+        );
+        assert!(
+            stage_0.contains("src_ip"),
+            "group-by column must be projected in stage_0, got:\n{sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY count DESC"),
+            "sort must still bind the stats output column, got:\n{sql}"
+        );
+    }
+
+    /// NAN-1639 (finding 2.4): in table_view a row-preserving pipe keeps the
+    /// slim summary stage_0 (the same projection a bare search gets) plus the
+    /// pipe's referenced fields — not `SELECT *` + 78 MATERIALIZED re-adds.
+    #[test]
+    fn table_view_where_pipe_keeps_slim_stage_0() {
+        let gen = ClickHouseSqlGenerator::new();
+        let query = parse_query("error | where dest_port=443").unwrap();
+        let options = QueryOptions {
+            table_view: true,
+            ..Default::default()
+        };
+        let sql = gen
+            .generate_with_options(&query, &time_range(), &options)
+            .unwrap();
+        let stage_0 = sql.split("stage_1").next().expect("stage_0 present");
+        assert!(
+            !stage_0.contains("SELECT *"),
+            "table_view where-pipe must keep the slim stage_0, got:\n{sql}"
+        );
+        // Slim summary columns + the pipe-referenced field are projected.
+        for col in ["dest_port", "src_ip", "enriched_src_country", "prevalence_min"] {
+            assert!(
+                stage_0.contains(col),
+                "slim stage_0 missing {col}, got:\n{sql}"
+            );
+        }
+        // The where stage still filters on the projected column.
+        assert!(sql.contains("WHERE dest_port = 443"), "got:\n{sql}");
+    }
+
+    /// NAN-1639 (finding 2.4) scope guards: a structural command (rex) keeps
+    /// the wide stage_0 even in table_view, and a NON-table_view where-pipe
+    /// keeps the historical full-row projection for API/detection consumers.
+    #[test]
+    fn wide_stage_0_retained_where_full_rows_are_required() {
+        let gen = ClickHouseSqlGenerator::new();
+        for (q, table_view) in [
+            ("error | rex \"(?P<foo>bar)\"", true),
+            ("error | where dest_port=443", false),
+        ] {
+            let options = QueryOptions {
+                table_view,
+                ..Default::default()
+            };
+            let sql = gen
+                .generate_with_options(&parse_query(q).unwrap(), &time_range(), &options)
+                .unwrap();
+            let stage_0 = sql.split("stage_1").next().expect("stage_0 present");
+            assert!(
+                stage_0.contains("SELECT *, action AS event_type"),
+                "{q} (table_view={table_view}) must keep the wide stage_0, got:\n{sql}"
+            );
+        }
+    }
+
+    /// NAN-1644 (finding 2.6): `ext.*` in a GROUP BY must be projected as the
+    /// native subcolumn in stage_0's SELECT list (`toString(ext.<key>) AS
+    /// "ext.<key>"`) with the aggregation binding the alias — NOT extracted
+    /// from `metadata` (which never carries an 'ext' key: every row collapsed
+    /// into one '' bucket), and NOT re-derived in the aggregation stage (a
+    /// stage_1 expression over the base read defeats ClickHouse 26.4
+    /// JSON-subcolumn pruning — local A/B: 1.65 GiB vs 103 MiB read_bytes).
+    #[test]
+    fn ext_dotted_group_by_binds_stage_0_native_subcolumn() {
+        let gen = ClickHouseSqlGenerator::new();
+        for q in [
+            "* | stats count by ext.threat_name",
+            "* | stats count by ext.threat_name | sort -count",
+            "* | top ext.threat_name",
+            "* | timechart span=1h count by ext.threat_name",
+        ] {
+            let sql = gen.generate(&parse_query(q).unwrap(), &time_range()).unwrap();
+            let stage_0 = sql.split("stage_1").next().expect("stage_0 present");
+            assert!(
+                stage_0.contains("toString(ext.threat_name) AS \"ext.threat_name\""),
+                "{q}: stage_0 must project the native ext subcolumn, got:\n{sql}"
+            );
+            assert!(
+                !sql.contains("JSONExtractString(metadata, 'ext'"),
+                "{q}: ext.* must never be extracted from metadata, got:\n{sql}"
+            );
+            // The aggregation stage binds the projected alias — the expression
+            // must not be re-derived outside stage_0.
+            let post_stage_0 = &sql[sql.find("stage_1").unwrap()..];
+            assert!(
+                !post_stage_0.contains("toString(ext."),
+                "{q}: ext access re-derived outside stage_0 (pruning trap), got:\n{sql}"
+            );
+        }
+    }
+
+    /// NAN-1644: the wide (`SELECT *`) base — forced here by `| fillnull` —
+    /// must ALSO carry the explicit `toString(ext.<key>)` projection: `ext.*`
+    /// materialization is needs_all-independent, or the GROUP BY alias has
+    /// nothing to bind.
+    #[test]
+    fn ext_dotted_projection_survives_wide_stage_0() {
+        let gen = ClickHouseSqlGenerator::new();
+        let query =
+            parse_query("* | stats count by ext.threat_name | fillnull value=\"-\"").unwrap();
+        let sql = gen.generate(&query, &time_range()).unwrap();
+        let stage_0 = sql.split("stage_1").next().expect("stage_0 present");
+        assert!(
+            stage_0.contains("SELECT *")
+                && stage_0.contains("toString(ext.threat_name) AS \"ext.threat_name\""),
+            "wide stage_0 must still project the ext subcolumn explicitly, got:\n{sql}"
+        );
+    }
+
+    /// NAN-1644: `metadata_`-prefixed fields keep metadata JSON extraction —
+    /// and the slim projection passes the backing `metadata` column through
+    /// (the aggregation stage re-derives `JSONExtractString(metadata, …)` per
+    /// reference), instead of the previous junk `toString(ext.metadata_foo)`
+    /// spill that shadowed nothing.
+    #[test]
+    fn metadata_prefixed_group_by_keeps_metadata_extraction() {
+        let gen = ClickHouseSqlGenerator::new();
+        let query = parse_query("* | stats count by metadata_channel").unwrap();
+        let sql = gen.generate(&query, &time_range()).unwrap();
+        assert!(
+            sql.contains("GROUP BY toString(JSONExtractString(metadata, 'channel'))"),
+            "metadata_ prefix must keep metadata JSON extraction, got:\n{sql}"
+        );
+        let stage_0 = sql.split("stage_1").next().expect("stage_0 present");
+        assert!(
+            stage_0.contains(" metadata FROM logs") || stage_0.contains(", metadata,"),
+            "slim stage_0 must pass the metadata column through, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("ext.metadata_channel"),
+            "metadata_ field must not be spilled from ext, got:\n{sql}"
+        );
+    }
+
+    /// NAN-1644: a `| where` on an `ext.*` field filters via the stage_0
+    /// projected alias (native subcolumn semantics), not metadata JSON.
+    #[test]
+    fn where_pipe_on_ext_dotted_binds_projected_alias() {
+        let gen = ClickHouseSqlGenerator::new();
+        let options = QueryOptions {
+            table_view: true,
+            ..Default::default()
+        };
+        let sql = gen
+            .generate_with_options(
+                &parse_query("error | where ext.threat_name=\"x\"").unwrap(),
+                &time_range(),
+                &options,
+            )
+            .unwrap();
+        let stage_0 = sql.split("stage_1").next().expect("stage_0 present");
+        assert!(
+            stage_0.contains("toString(ext.threat_name) AS \"ext.threat_name\""),
+            "stage_0 must materialize the ext field, got:\n{sql}"
+        );
+        assert!(
+            sql.contains("lower(toString(\"ext.threat_name\")) = 'x'"),
+            "where stage must bind the projected alias, got:\n{sql}"
+        );
+    }
+
+    /// NAN-1644 scope guard: under OCSF, `ext.*` resolves into the JSON tail
+    /// (JsonPath → the `unmapped` column) — the UDM alias-binding branch must
+    /// not hijack it, and it must never read `metadata`.
+    #[test]
+    fn ocsf_ext_dotted_group_by_keeps_json_tail_access() {
+        use crate::schema::OcsfProfile;
+        use std::sync::Arc;
+        let gen = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()));
+        let query = parse_query("* | stats count by ext.threat_name").unwrap();
+        let sql = gen.generate(&query, &time_range()).unwrap();
+        assert!(
+            sql.contains("unmapped.\"threat_name\""),
+            "OCSF ext.* must route to the unmapped JSON tail, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("JSONExtractString(metadata, 'ext'"),
+            "OCSF ext.* must not read metadata, got:\n{sql}"
+        );
+    }
+
+    /// NAN-1644: an `ext.*` referenced only INSIDE a join subsearch must be
+    /// materialized in the subsearch's own base scan (the outer analysis walks
+    /// the subsearch pipeline), and its GROUP BY binds the projected alias.
+    #[test]
+    fn join_subsearch_ext_dotted_is_materialized_in_sub_base() {
+        let gen = ClickHouseSqlGenerator::new();
+        let query = parse_query(
+            "* | join user [search error | stats count by ext.threat_name, user]",
+        )
+        .unwrap();
+        let sql = gen.generate(&query, &time_range()).unwrap();
+        assert!(
+            sql.contains("toString(ext.threat_name) AS \"ext.threat_name\""),
+            "subsearch base scan must project the ext subcolumn, got:\n{sql}"
+        );
+        assert!(
+            sql.contains("GROUP BY \"ext.threat_name\", \"user\""),
+            "subsearch GROUP BY must bind the projected alias, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("JSONExtractString(metadata, 'ext'"),
+            "ext.* must never be extracted from metadata, got:\n{sql}"
+        );
+    }
+
+
+    // ── dedup survivor-id rewrite (NAN-1636, finding 2.7) ──────────────────
+    //
+    // The legacy `ORDER BY <keys>, timestamp LIMIT 1 BY <keys>` full-sorts
+    // every wide row — Code 241 OOM at ≥~15min windows under the production
+    // 3GiB/query profile. Over the deterministic base scan the stage instead
+    // filters to per-key argMin(id, timestamp) survivors. Every guard trips
+    // back to the legacy shape.
+
+    /// `dedup` directly over the base scan (stage_0) must emit the survivor-id
+    /// shape: no sort, keep-oldest via argMin(id, timestamp).
+    #[test]
+    fn dedup_on_base_scan_emits_survivor_id_in() {
+        let query = parse_query("* | dedup src_ip").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("WHERE id IN (") && sql.contains("argMin(id, timestamp) FROM stage_0"),
+            "dedup over the base scan must select survivors via argMin(id, timestamp), got:\n{sql}"
+        );
+        assert!(
+            sql.contains("GROUP BY src_ip"),
+            "survivor subquery must group by the dedup keys, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("LIMIT 1 BY"),
+            "rewritten dedup must not carry the OOM-class full-row sort + LIMIT 1 BY, got:\n{sql}"
+        );
+    }
+
+    /// Multi-key dedup groups the survivor subquery by every key.
+    #[test]
+    fn dedup_multi_key_groups_by_all_keys() {
+        let query = parse_query("error | dedup src_ip, user").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("GROUP BY src_ip, \"user\"") && sql.contains("argMin(id, timestamp)"),
+            "multi-key dedup must group survivors by all keys, got:\n{sql}"
+        );
+    }
+
+    /// Guard 1: an upstream include-mode projection that pruned `id` would make
+    /// the IN-subquery UNKNOWN_IDENTIFIER — keep the legacy shape.
+    #[test]
+    fn dedup_after_id_pruning_projection_falls_back() {
+        for q in [
+            "* | fields src_ip, user | dedup src_ip",
+            "* | table src_ip, user | dedup src_ip",
+        ] {
+            let query = parse_query(q).unwrap();
+            let sql = ClickHouseSqlGenerator::new()
+                .generate(&query, &time_range())
+                .unwrap();
+            assert!(
+                sql.contains("LIMIT 1 BY src_ip") && !sql.contains("argMin("),
+                "dedup after id-pruning projection must keep the legacy shape for {q}, got:\n{sql}"
+            );
+        }
+    }
+
+    /// Guard 2: an upstream `eval id=…` shadows the physical row id — survivor
+    /// selection on the reassigned value would keep the wrong rows.
+    #[test]
+    fn dedup_after_eval_id_shadowing_falls_back() {
+        let query = parse_query("* | eval id=user | dedup src_ip").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("LIMIT 1 BY src_ip") && !sql.contains("argMin("),
+            "dedup after `eval id=…` must keep the legacy shape, got:\n{sql}"
+        );
+    }
+
+    /// Guard 3: the rewrite scans its source CTE twice, so any non-base source
+    /// stage — nondeterministic (`head N` with no ORDER BY) or otherwise —
+    /// keeps the legacy single-scan shape.
+    #[test]
+    fn dedup_after_upstream_command_falls_back() {
+        for q in [
+            "* | head 100 | dedup src_ip",
+            "error | where status=\"failure\" | dedup src_ip",
+            "* | sort -timestamp | dedup src_ip",
+        ] {
+            let query = parse_query(q).unwrap();
+            let sql = ClickHouseSqlGenerator::new()
+                .generate(&query, &time_range())
+                .unwrap();
+            assert!(
+                sql.contains("LIMIT 1 BY src_ip") && !sql.contains("argMin("),
+                "dedup with a non-base source must keep the legacy shape for {q}, got:\n{sql}"
+            );
+        }
+    }
+
+    /// Guard 3 (requery variant): a downstream requery command (tree/asset/
+    /// cloud) injects `ORDER BY … LIMIT` into stage_0 — a bounded top-N samples
+    /// tie rows nondeterministically per scan, so the dual-scan rewrite must
+    /// not fire even though dedup's source IS stage_0.
+    #[test]
+    fn dedup_with_requery_command_falls_back() {
+        let query = parse_query("* | dedup src_host | tree process").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("LIMIT 1 BY src_host") && !sql.contains("argMin("),
+            "dedup over a LIMITed requery base scan must keep the legacy shape, got:\n{sql}"
+        );
+    }
+
+    /// Subsearch pipelines route through `generate_command_sql` (no stage
+    /// context) — the rewrite stays off there; only the main pipeline's
+    /// base-scan dedup rewrites.
+    #[test]
+    fn dedup_inside_subsearch_falls_back() {
+        let query = parse_query("error | append [error | dedup src_ip]").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("LIMIT 1 BY src_ip") && !sql.contains("argMin("),
+            "subsearch dedup must keep the legacy shape, got:\n{sql}"
+        );
+    }
+
+    /// Spans/metrics profiles have no `id`/`timestamp` core columns — the
+    /// survivor-id shape can't apply; the legacy shape is preserved.
+    #[test]
+    fn dedup_on_spans_dataset_falls_back() {
+        let query = parse_query("* | dedup service_name").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .with_dataset(otel::Dataset::Spans)
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("LIMIT 1 BY service_name") && !sql.contains("argMin(id"),
+            "spans dedup must keep the legacy shape (no id row identity), got:\n{sql}"
+        );
+    }
+
+    /// OCSF: dedup keys resolve through the active profile (src_ip → the
+    /// promoted endpoint column); `id` is a physical ocsf_logs column, so the
+    /// survivor-id rewrite still fires.
+    #[test]
+    fn dedup_ocsf_resolves_keys_and_rewrites() {
+        use crate::schema::OcsfProfile;
+        let query = parse_query("* | dedup src_ip").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .with_profile(Arc::new(OcsfProfile::new()))
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("argMin(id, timestamp)") && sql.contains("WHERE id IN ("),
+            "OCSF dedup over the base scan must rewrite, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("GROUP BY src_ip"),
+            "OCSF dedup key must resolve through the profile, not stay a raw UDM name, got:\n{sql}"
+        );
+    }
+
+    /// Documented ordering behavior (finding 2.7 guard 4): the rewritten dedup
+    /// stage carries NO ORDER BY — the survivor SET is unchanged (per-key
+    /// oldest), but which of them a downstream bare `head N` picks follows
+    /// stream order, not the legacy shape's `<keys>, timestamp` sort order.
+    /// This artifact-order change is accepted; a terminal dedup still gets the
+    /// outer `ORDER BY timestamp DESC` like every non-ordering pipeline.
+    #[test]
+    fn dedup_then_head_keeps_rewrite_without_stage_ordering() {
+        let query = parse_query("* | dedup src_ip | head 5").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("argMin(id, timestamp)"),
+            "downstream head must not disable the rewrite (guards are about the SOURCE), got:\n{sql}"
+        );
+        // The dedup stage itself is sort-free — reintroducing the legacy
+        // `ORDER BY <keys>, timestamp` would resurrect the wide-row sort the
+        // rewrite exists to remove.
+        assert!(
+            !sql.contains("ORDER BY src_ip"),
+            "rewritten dedup stage must not sort by the dedup keys, got:\n{sql}"
+        );
+    }
+
+    // ── resolve_identity bounded ASOF build side (NAN-1638, finding 2.8) ───
+    //
+    // The bare-table ASOF join materialized ALL of identity_observations into
+    // the join build side (62.8M rows on Saturn incl. S3 cold tier) —
+    // MEMORY_LIMIT_EXCEEDED 3/3 at the production 3GiB cap; the max-age filter
+    // in the outer WHERE ran only after the join. The build side is now
+    // bounded to `observed_at BETWEEN query_start − max_age AND query_end`,
+    // which covers every observation an in-window event can accept.
+
+    /// Default max_age (24h): the build side must be bounded to
+    /// [window_start − 24h, window_end].
+    #[test]
+    fn resolve_identity_bounds_build_side_to_window_plus_max_age() {
+        let query = parse_query("src_ip=\"10.0.0.1\" | resolve_identity src_ip").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains(
+                "ASOF LEFT JOIN (\n    SELECT * FROM identity_observations\n    WHERE observed_at BETWEEN '2023-12-31 00:00:00.000000' AND '2024-01-02 00:00:00.000000'\n  ) AS i"
+            ),
+            "build side must be bounded to window_start − max_age .. window_end, got:\n{sql}"
+        );
+        // The outer max-age semantics are unchanged: the per-event staleness
+        // filter and the no-match ('none') branch both survive — the bound
+        // only shrinks the join build side.
+        assert!(
+            sql.contains("i.observed_at IS NULL")
+                && sql.contains("INTERVAL 86400 SECOND"),
+            "outer max-age WHERE + none-branch must be preserved, got:\n{sql}"
+        );
+    }
+
+    /// A user-supplied max_age drives the lower bound.
+    #[test]
+    fn resolve_identity_bound_respects_custom_max_age() {
+        let query = parse_query("* | resolve_identity src_ip max_age=1h").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("WHERE observed_at BETWEEN '2023-12-31 23:00:00.000000' AND '2024-01-02 00:00:00.000000'"),
+            "custom max_age must widen the lower bound by exactly max_age, got:\n{sql}"
+        );
+    }
+
+    /// Reverse lookups (user/hostname → IP) get the same bound.
+    #[test]
+    fn resolve_identity_reverse_lookup_is_bounded_too() {
+        let query = parse_query("* | resolve_identity user").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("SELECT * FROM identity_observations\n    WHERE observed_at BETWEEN"),
+            "reverse lookup build side must be bounded, got:\n{sql}"
+        );
+    }
+
+    /// Guard (skeptic amendment): `bin timestamp span=X` floors event
+    /// timestamps up to one span BEFORE the window start, so the
+    /// window-derived bound could cut observations those rewritten timestamps
+    /// still accept — the join must stay unbounded. Conservative choice over
+    /// widening the bound by accumulated spans (spans can chain/alias through
+    /// multiple stages, and eval rewrites are unboundable anyway).
+    #[test]
+    fn resolve_identity_after_bin_timestamp_stays_unbounded() {
+        for q in [
+            "* | bin timestamp span=1h | resolve_identity src_ip",
+            "* | bin _time span=30m | resolve_identity src_ip",
+            "* | bin span=1h field=x as timestamp | resolve_identity src_ip",
+        ] {
+            let query = parse_query(q).unwrap();
+            let sql = ClickHouseSqlGenerator::new()
+                .generate(&query, &time_range())
+                .unwrap();
+            assert!(
+                sql.contains("ASOF LEFT JOIN identity_observations AS i"),
+                "timestamp-rewriting bin must keep the unbounded join for {q}, got:\n{sql}"
+            );
+            assert!(
+                !sql.contains("WHERE observed_at BETWEEN"),
+                "no build-side bound may be emitted after a timestamp rewrite for {q}, got:\n{sql}"
+            );
+        }
+    }
+
+    /// A field-less `bin span=X` writes `time_bucket` and leaves `timestamp`
+    /// intact — the bound still applies.
+    #[test]
+    fn resolve_identity_after_fieldless_bin_stays_bounded() {
+        let query = parse_query("* | bin span=1h | resolve_identity src_ip").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("time_bucket") && sql.contains("WHERE observed_at BETWEEN"),
+            "field-less bin does not rewrite timestamp — bound must apply, got:\n{sql}"
+        );
+    }
+
+    /// Any upstream reassignment of `timestamp` — eval/rename/rex named
+    /// capture/stats alias (upstream-computed set) or a `table … as timestamp`
+    /// re-alias (dedicated flag) — moves row timestamps to values no
+    /// window-derived bound can cover; the join must stay unbounded for all.
+    #[test]
+    fn resolve_identity_after_timestamp_reassignment_stays_unbounded() {
+        for q in [
+            "* | eval timestamp=now() | resolve_identity src_ip",
+            "* | rename observed_time as timestamp | resolve_identity src_ip",
+            "* | rex field=message \"(?<timestamp>\\\\d+)\" | resolve_identity src_ip",
+            "* | stats max(observed_time) as timestamp by src_ip | resolve_identity src_ip",
+            "* | table first_seen as timestamp, src_ip, id | resolve_identity src_ip",
+        ] {
+            let query = parse_query(q).unwrap();
+            let sql = ClickHouseSqlGenerator::new()
+                .generate(&query, &time_range())
+                .unwrap();
+            assert!(
+                sql.contains("ASOF LEFT JOIN identity_observations AS i")
+                    && !sql.contains("WHERE observed_at BETWEEN"),
+                "timestamp reassignment must keep the unbounded join for {q}, got:\n{sql}"
+            );
+        }
+    }
+
+    /// Direct `generate_command_sql` callers (subsearch nesting, prevalence
+    /// re-embedding) run outside `generate_with_options` — no generation time
+    /// range exists, so the legacy unbounded shape is kept.
+    #[test]
+    fn resolve_identity_without_generation_window_stays_unbounded() {
+        let gen = ClickHouseSqlGenerator::new();
+        let cmd = Command::ResolveIdentity {
+            field: "src_ip".to_string(),
+            max_age: std::time::Duration::from_secs(24 * 3600),
+        };
+        let sql = gen.generate_command_sql("stage_0", &cmd).unwrap();
+        assert!(
+            sql.contains("ASOF LEFT JOIN identity_observations AS i")
+                && !sql.contains("WHERE observed_at BETWEEN"),
+            "no-window generation must keep the unbounded join, got:\n{sql}"
+        );
+    }
+
+
+    /// A pathological max_age (the parser accepts up to u64::MAX seconds)
+    /// must degrade to the legacy unbounded join — never panic codegen
+    /// (chrono::Duration::seconds panics past ~i64::MAX/1000 seconds).
+    #[test]
+    fn resolve_identity_pathological_max_age_degrades_to_unbounded() {
+        let gen = ClickHouseSqlGenerator::new();
+        let query = crate::query::ast::Query::Piped {
+            source: Box::new(crate::query::ast::Query::Search(SearchExpr::Keyword(
+                "*".to_string(),
+            ))),
+            command: Command::ResolveIdentity {
+                field: "src_ip".to_string(),
+                max_age: std::time::Duration::from_secs(u64::MAX),
+            },
+        };
+        let sql = gen.generate(&query, &time_range()).unwrap();
+        assert!(
+            sql.contains("ASOF LEFT JOIN identity_observations AS i")
+                && !sql.contains("WHERE observed_at BETWEEN"),
+            "overflow-class max_age must fall back to the unbounded join, got:\n{sql}"
+        );
+    }
+
+    /// NAN-1640: an anchored prefix regex on a text-indexed String column emits
+    /// an implied `iLike '%tok%'` guard in front of the startsWith — no skip
+    /// index serves startsWith (text-index analysis yields `tokens: []`, full
+    /// column read; Saturn: 19.97GiB → 25.71MiB read_bytes with the guard).
+    /// `startsWith(x, lit) ⇒ x iLike '%lit%'`, so results are identical.
+    #[test]
+    fn anchored_prefix_regex_emits_text_index_guard() {
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(
+                &parse_query("message=/^powershell.*/").unwrap(),
+                &time_range(),
+            )
+            .unwrap();
+        let where_clause = where_slice(&sql);
+        assert!(
+            where_clause.contains(
+                "lower(message) iLike '%powershell%' AND startsWith(lower(message), 'powershell')"
+            ),
+            "prefix regex must carry the index-servable iLike guard, got:\n{where_clause}"
+        );
+    }
+
+    /// NAN-1640: same guard for the anchored-suffix (endsWith) lowering.
+    #[test]
+    fn anchored_suffix_regex_emits_text_index_guard() {
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(
+                &parse_query("command_line=/.*sekurlsa$/").unwrap(),
+                &time_range(),
+            )
+            .unwrap();
+        let where_clause = where_slice(&sql);
+        assert!(
+            where_clause.contains(
+                "lower(command_line) iLike '%sekurlsa%' AND endsWith(lower(command_line), 'sekurlsa')"
+            ),
+            "suffix regex must carry the index-servable iLike guard, got:\n{where_clause}"
+        );
+    }
+
+    /// NAN-1640: literals whose tokens all fail the NAN-1416 bar (≥6 chars,
+    /// lettered) emit NO guard — short/unlettered tokens make the text-index
+    /// probe cost more than it saves; the safe failure mode is the unchanged
+    /// bare endsWith/startsWith shape.
+    #[test]
+    fn anchored_suffix_regex_below_guard_bar_stays_bare() {
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(
+                &parse_query(r"file_path=/.*\.exe$/").unwrap(),
+                &time_range(),
+            )
+            .unwrap();
+        let where_clause = where_slice(&sql);
+        assert!(
+            where_clause.contains("endsWith(lower(file_path), '.exe')"),
+            "short-literal suffix must keep the bare endsWith, got:\n{where_clause}"
+        );
+        assert!(
+            !where_clause.contains("iLike '%exe%'"),
+            "3-char token fails the NAN-1416 bar — no guard, got:\n{where_clause}"
+        );
+    }
+
+    /// NAN-1640: negation drops the guard (BloomGuard precedent) —
+    /// `guard AND NOT startsWith` ≢ `NOT startsWith`; a guard ANDed under
+    /// negation would silently drop non-matching rows.
+    #[test]
+    fn negated_anchored_prefix_regex_has_no_guard() {
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(
+                &parse_query("message!=/^powershell.*/").unwrap(),
+                &time_range(),
+            )
+            .unwrap();
+        let where_clause = where_slice(&sql);
+        assert!(
+            where_clause.contains("NOT startsWith(lower(message), 'powershell')"),
+            "negated prefix regex must stay the bare NOT startsWith, got:\n{where_clause}"
+        );
+        assert!(
+            !where_clause.contains("iLike '%powershell%'"),
+            "negation must drop the guard, got:\n{where_clause}"
+        );
+    }
+
+    /// NAN-1640: ext/JSON targets have no `lower(col)` text index to serve the
+    /// guard — the anchored lowering stays bare there (skip_tostring=false).
+    #[test]
+    fn anchored_prefix_regex_on_ext_field_has_no_guard() {
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(
+                &parse_query("integrity_level=/^powershell.*/").unwrap(),
+                &time_range(),
+            )
+            .unwrap();
+        let where_clause = where_slice(&sql);
+        assert!(
+            where_clause.contains("startsWith("),
+            "ext-field prefix regex must keep the startsWith lowering, got:\n{where_clause}"
+        );
+        assert!(
+            !where_clause.contains("iLike '%powershell%'"),
+            "non-text-indexed target must not emit the guard, got:\n{where_clause}"
+        );
+    }
+
+    /// NAN-1640: where-pipe regex targets are toString-wrapped CTE
+    /// intermediates — no index to serve a guard, deliberately bare
+    /// (where-pipe form selection is finding 2.1 / Batch 1).
+    #[test]
+    fn where_pipe_anchored_prefix_regex_has_no_guard() {
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(
+                &parse_query("error | where message=/^powershell.*/").unwrap(),
+                &time_range(),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("startsWith("),
+            "where-pipe prefix regex must keep the startsWith lowering, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("iLike '%powershell%'"),
+            "where-pipe target must not emit the guard, got:\n{sql}"
+        );
+    }
+
+    // ── NAN-1642: eventstats / anomaly map-scalar attach ──────────────────
+    // Whole-partition window functions (`agg(x) OVER (PARTITION BY k)` /
+    // `OVER ()`) buffered the entire partition and OOM'd (Code 241) at
+    // production scale; per-group constants now come from a scalar Map built
+    // with bounded GROUP BY memory and attached per row via a lookup on the
+    // null-canonicalized key. These tests pin the emitted shapes.
+
+    #[test]
+    fn eventstats_grouped_emits_map_scalar_attach_not_window() {
+        let query = parse_query("error | eventstats avg(bytes_out) as ab by user").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("mapFromArrays(groupArray(__nano_k), groupArray(__nano_v))"),
+            "grouped eventstats must build a per-group scalar map, got:\n{sql}"
+        );
+        // Null-canonicalized key on BOTH the map-build side (GROUP BY) and
+        // the per-row lookup side, so NULL BY-keys receive their group's
+        // aggregate instead of the Map default (0).
+        let canonical_key = "coalesce(toString(\"user\"), '\\0__null__')";
+        assert!(
+            sql.contains(&format!("{} AS __nano_k", canonical_key))
+                && sql.contains(&format!("__nano_es[{}]", canonical_key)),
+            "canonicalized key must appear on build and lookup sides, got:\n{sql}"
+        );
+        assert!(
+            sql.contains("toFloat64(avg(bytes_out))") && sql.contains("AS ab"),
+            "aggregate + user alias must be preserved, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("OVER ("),
+            "no whole-partition window may remain in eventstats SQL, got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn eventstats_multiple_aggs_share_one_tuple_valued_map() {
+        let query = parse_query(
+            "error | eventstats avg(bytes_out) as ab, stdev(bytes_out) as sb by user",
+        )
+        .unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        // One map, tuple values — the stage source is scanned once for the
+        // constants regardless of aggregation count.
+        assert_eq!(
+            sql.matches("mapFromArrays").count(),
+            1,
+            "multiple aggregations must share a single map, got:\n{sql}"
+        );
+        assert!(
+            sql.contains("tuple(toFloat64(avg(bytes_out)), toFloat64(stddevPop(bytes_out)))"),
+            "map value must be a tuple of all aggregates, got:\n{sql}"
+        );
+        assert!(
+            sql.contains(".1 AS ab") && sql.contains(".2 AS sb"),
+            "attach must project tuple elements under the user aliases, got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn eventstats_ungrouped_uses_plain_scalar_no_map() {
+        let query = parse_query("error | eventstats count() as c, median(bytes_out) as m").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            !sql.contains("mapFromArrays") && !sql.contains("OVER ("),
+            "no `by` clause = single global group: plain scalar, no map/window, got:\n{sql}"
+        );
+        assert!(
+            sql.contains("WITH (SELECT tuple(toFloat64(count()), toFloat64(median(bytes_out))) FROM stage_0) AS __nano_es"),
+            "global aggregates must come from one scalar tuple subquery, got:\n{sql}"
+        );
+        assert!(
+            sql.contains("__nano_es.1 AS c") && sql.contains("__nano_es.2 AS m"),
+            "scalar tuple elements must attach under the user aliases, got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn eventstats_multikey_by_canonicalizes_via_tuple_rendering() {
+        let query = parse_query("error | eventstats count() as c by user, src_ip").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        // toString(tuple(...)) quote-delimits components (unambiguous for any
+        // content, incl embedded NULs) and renders NULL elements as a bare
+        // NULL token — same expression on the build and lookup sides.
+        assert!(
+            sql.contains("toString(tuple(\"user\", src_ip)) AS __nano_k")
+                && sql.contains("__nano_es[toString(tuple(\"user\", src_ip))]"),
+            "multi-key BY must canonicalize via tuple rendering on both sides, got:\n{sql}"
+        );
+        assert!(!sql.contains("OVER ("), "no window may remain, got:\n{sql}");
+    }
+
+    #[test]
+    fn eventstats_null_key_ext_field_is_canonicalized() {
+        // `by ext.*` keys are NULL for rows without the key — the sentinel
+        // canonicalization must group them together (NAN-1642 acceptance:
+        // NULL-key rows receive their group's aggregate, not zero).
+        let query = parse_query("error | eventstats avg(bytes_out) as ab by ext.provider").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("coalesce(toString(\"ext.provider\"), '\\0__null__')"),
+            "ext.* BY-key must be null-canonicalized, got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn eventstats_dc_keeps_exact_distinct_forms() {
+        let grouped = ClickHouseSqlGenerator::new()
+            .generate(
+                &parse_query("error | eventstats dc(src_ip) as d by user").unwrap(),
+                &time_range(),
+            )
+            .unwrap();
+        assert!(
+            grouped.contains("toFloat64(uniqExact(src_ip))"),
+            "grouped dc() must stay uniqExact, got:\n{grouped}"
+        );
+        let global = ClickHouseSqlGenerator::new()
+            .generate(
+                &parse_query("error | eventstats dc(src_ip) as d").unwrap(),
+                &time_range(),
+            )
+            .unwrap();
+        assert!(
+            global.contains("toFloat64(count(DISTINCT src_ip))"),
+            "ungrouped dc() must stay count(DISTINCT), got:\n{global}"
+        );
+    }
+
+    #[test]
+    fn anomaly_zscore_grouped_attaches_stats_from_map_not_window() {
+        let query = parse_query("error | anomaly bytes_out by user").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("mapFromArrays")
+                && sql.contains("tuple(toFloat64(avg(bytes_out)), toFloat64(stddevPop(bytes_out)))"),
+            "grouped z-score constants must come from a per-group map, got:\n{sql}"
+        );
+        assert!(
+            sql.contains("__nano_stats[coalesce(toString(\"user\"), '\\0__null__')].1 as avg_val")
+                && sql.contains(".2 as stddev_val"),
+            "avg_val/stddev_val column names must be preserved, got:\n{sql}"
+        );
+        // Scoring math and output contract unchanged.
+        assert!(
+            sql.contains("abs(bytes_out - avg_val) / nullIf(stddev_val, 0) as anomaly_score")
+                && sql.contains("WHERE is_anomaly = 1")
+                && sql.contains("ORDER BY anomaly_score DESC"),
+            "z-score math / filter / ordering must be unchanged, got:\n{sql}"
+        );
+        assert!(!sql.contains("OVER ("), "no window may remain, got:\n{sql}");
+    }
+
+    #[test]
+    fn anomaly_zscore_ungrouped_uses_scalar_tuple() {
+        let query = parse_query("error | anomaly bytes_out").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains(
+                "WITH (SELECT tuple(toFloat64(avg(bytes_out)), toFloat64(stddevPop(bytes_out))) FROM stage_0) AS __nano_stats"
+            ) && sql.contains("__nano_stats.1 as avg_val"),
+            "ungrouped z-score must use a plain scalar tuple, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("mapFromArrays") && !sql.contains("OVER ("),
+            "no map and no window for the global group, got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn anomaly_mad_grouped_builds_median_then_mad_maps() {
+        let query = parse_query("error | anomaly bytes_out by user method=mad").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        // Two bounded GROUP BY passes: median map, then MAD map referencing it.
+        assert!(
+            sql.contains("toFloat64(quantile(0.5)(bytes_out)) AS __nano_v"),
+            "median map must aggregate quantile(0.5) per group, got:\n{sql}"
+        );
+        assert!(
+            sql.contains("quantile(0.5)(abs(bytes_out - __nano_med[__nano_k]))"),
+            "MAD map must reference the median map per group, got:\n{sql}"
+        );
+        assert!(
+            sql.contains("as median_val") && sql.contains("as mad_val")
+                && sql.contains("abs(bytes_out - median_val) / nullIf(mad_val * 1.4826, 0) as anomaly_score"),
+            "median_val/mad_val names and MAD math must be unchanged, got:\n{sql}"
+        );
+        assert!(!sql.contains("OVER ("), "no window may remain, got:\n{sql}");
+    }
+
+    #[test]
+    fn anomaly_categorical_keeps_pair_dedup_but_stats_from_pair_counts() {
+        let query = parse_query("error | anomaly process_name by user").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        // The fine-grained (by, field) pair windows for _anomaly_count / _rn
+        // dedup are retained — they are not the OOM-class coarse partition.
+        assert!(
+            sql.contains("count() OVER (PARTITION BY \"user\", process_name) as _anomaly_count")
+                && sql.contains("row_number() OVER (PARTITION BY \"user\", process_name"),
+            "pair-count window + dedup must be preserved, got:\n{sql}"
+        );
+        // The coarse per-BY-group stats windows are replaced by a bounded
+        // pair-count GROUP BY feeding the map.
+        assert!(
+            !sql.contains("avg(_anomaly_count) OVER") && !sql.contains("stddevPop(_anomaly_count) OVER"),
+            "whole-BY-partition stats windows must be gone, got:\n{sql}"
+        );
+        assert!(
+            sql.contains("count() AS __nano_cnt")
+                && sql.contains("tuple(toFloat64(avg(__nano_cnt)), toFloat64(stddevPop(__nano_cnt)))"),
+            "stats must aggregate the pair counts via GROUP BY, got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn anomaly_aggregation_first_uses_scalar_tuple_over_agg_source() {
+        let query = parse_query("error | anomaly count() by user").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("tuple(toFloat64(avg(_agg_value)), toFloat64(stddevPop(_agg_value)))"),
+            "aggregation-first stats must come from a scalar tuple over the grouped source, got:\n{sql}"
+        );
+        assert!(
+            !sql.contains("OVER ()"),
+            "whole-set windows must be gone from the aggregation-first path, got:\n{sql}"
+        );
+        // This path scores every group — no is_anomaly filter, ordering kept.
+        assert!(
+            !sql.contains("WHERE is_anomaly = 1") && sql.contains("ORDER BY anomaly_score DESC"),
+            "aggregation-first path must keep score-all semantics, got:\n{sql}"
         );
     }

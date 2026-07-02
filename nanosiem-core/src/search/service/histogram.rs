@@ -38,6 +38,27 @@ impl SearchService {
             .await
     }
 
+    /// Generation options for the histogram companion's base query.
+    ///
+    /// NAN-1635 (finding 2.2): the base must be an unbounded flat scan, like
+    /// the raw-SQL histogram (`generate_clickhouse_histogram_for_time_range`).
+    /// Default options baked `ORDER BY timestamp DESC LIMIT 1000000` into the
+    /// base, which (a) made the sort semantically required — a forced top-1M
+    /// sort on every broad search (Saturn: 2x wall, ~2750x memory) — and
+    /// (b) silently truncated the timeline to the newest 1M events (17 buckets
+    /// shown vs 289 real ones over a 21.77M-event day). `limit: None` still
+    /// preserves user-semantic LIMITs (`| head` never reaches here — the base
+    /// is pipe-stripped — but subsearch caps inside the base expression are
+    /// emitted regardless, per the QueryOptions contract).
+    pub(crate) fn histogram_base_options() -> crate::query::QueryOptions {
+        crate::query::QueryOptions {
+            use_cache: false,
+            table_view: false,
+            limit: None,
+            unordered: true,
+        }
+    }
+
     /// Generate histogram for ClickHouse backend
     async fn generate_clickhouse_histogram(
         &self,
@@ -64,7 +85,7 @@ impl SearchService {
             self.ch_sql_generator.clone().with_dataset(dataset)
         };
         let base_sql = base_gen
-            .generate(query, time_range)
+            .generate_with_options(query, time_range, &Self::histogram_base_options())
             .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
 
         // The histogram buckets the BASE query's output, which carries the

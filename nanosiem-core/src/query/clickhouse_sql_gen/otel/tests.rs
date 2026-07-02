@@ -175,7 +175,11 @@
     fn metric_names_sql_optional_service_filter() {
         let all = metric_names_sql(None);
         assert!(all.contains("SELECT DISTINCT metric_name"), "{all}");
-        assert!(all.contains("FROM nanosiem.otel_metrics"), "{all}");
+        // NAN-1632 3.12: the (deliberately) time-unbounded name list reads the
+        // 1-minute rollup, NOT raw otel_metrics and NOT the 400d-TTL _1h rollup
+        // (which would return a stale-name superset past raw's 90d TTL).
+        assert!(all.contains("FROM nanosiem.otel_metrics_1m"), "{all}");
+        assert!(!all.contains("otel_metrics_1h"), "{all}");
         assert!(!all.contains("WHERE"), "{all}");
         let svc = metric_names_sql(Some("api"));
         assert!(svc.contains("WHERE service_name = 'api'"), "{svc}");
@@ -393,21 +397,34 @@
 
     #[test]
     fn slo_compute_availability_and_latency() {
+        // Availability reads the RED minute rollup, not raw spans (NAN-1632
+        // 3.13): sum(request_count) / sum(request_count)-sum(error_count) are
+        // exactly the raw count() / countIf(status_code != 'ERROR').
         let avail = slo_compute_sql("checkout-api", SliKind::Availability, None, &day_range());
-        assert!(avail.contains("count() AS total"), "{avail}");
         assert!(
-            avail.contains("countIf(status_code != 'ERROR') AS good"),
+            avail.contains("FROM nanosiem.otel_service_red_1m"),
+            "{avail}"
+        );
+        assert!(avail.contains("sum(request_count) AS total"), "{avail}");
+        assert!(
+            avail.contains("sum(request_count) - sum(error_count) AS good"),
             "{avail}"
         );
         assert!(avail.contains("service_name = 'checkout-api'"), "{avail}");
         assert!(avail.contains("LIMIT 1"), "{avail}");
+        assert!(!avail.contains("otel_spans"), "{avail}");
 
-        // Latency: threshold ms → ns literal.
+        // Latency stays on raw spans (no rollup carries the per-span duration
+        // threshold): threshold ms → ns literal.
         let lat = slo_compute_sql("payments", SliKind::Latency, Some(300.0), &day_range());
+        assert!(lat.contains("FROM nanosiem.otel_spans"), "{lat}");
+        assert!(lat.contains("count() AS total"), "{lat}");
         assert!(lat.contains("countIf(duration_ns <= 300000000) AS good"), "{lat}");
 
-        // Latency with missing threshold degrades to the availability definition.
+        // Latency with missing threshold degrades to the availability GOOD
+        // definition but keeps its historical raw-spans shape.
         let lat_none = slo_compute_sql("payments", SliKind::Latency, None, &day_range());
+        assert!(lat_none.contains("FROM nanosiem.otel_spans"), "{lat_none}");
         assert!(
             lat_none.contains("countIf(status_code != 'ERROR') AS good"),
             "{lat_none}"
@@ -418,6 +435,26 @@
             lat_nan.contains("countIf(status_code != 'ERROR') AS good"),
             "{lat_nan}"
         );
+    }
+
+    #[test]
+    fn slo_availability_minute_aligns_start_bound() {
+        // The rollup read floors the window START to the minute so the first
+        // bucket is complete (rollup rows are keyed by toStartOfMinute); the
+        // end bound passes through — minute keys are already aligned, so
+        // `minute <= end` selects the same buckets as `minute <= floor(end)`.
+        let tr = TimeRange {
+            start: Utc.with_ymd_and_hms(2024, 1, 1, 10, 15, 42).unwrap(),
+            end: Utc.with_ymd_and_hms(2024, 1, 2, 10, 15, 42).unwrap(),
+        };
+        let sql = slo_compute_sql("api", SliKind::Availability, None, &tr);
+        assert!(
+            sql.contains("BETWEEN '2024-01-01 10:15:00' AND '2024-01-02 10:15:42'"),
+            "{sql}"
+        );
+        // Second-precision bounds — the rollup `minute` is a DateTime, not
+        // DateTime64 (a fractional literal fails to parse, Code 53).
+        assert!(!sql.contains(".000000"), "{sql}");
     }
 
     #[test]
@@ -668,14 +705,25 @@
     // ------------------------------------------------------------------------
 
     #[test]
-    fn service_entities_unions_ip_and_host_escapes() {
+    fn service_entities_single_scan_array_join_escapes() {
         let sql = service_entities_sql("checkout'api", &day_range());
-        assert!(sql.contains("SELECT src_ip AS entity"), "{sql}");
-        assert!(sql.contains("SELECT host AS entity"), "{sql}");
-        assert!(sql.contains("UNION ALL"), "{sql}");
-        // service escaped, applied to both legs.
+        // NAN-1632 3.14: one scan arrayJoining both entity columns — the old
+        // UNION ALL read the same granules twice under an identical predicate.
+        assert!(
+            sql.contains("SELECT arrayJoin([src_ip, host]) AS entity"),
+            "{sql}"
+        );
+        assert!(!sql.contains("UNION ALL"), "{sql}");
+        assert_eq!(
+            sql.matches("FROM nanosiem.otel_spans").count(),
+            1,
+            "must scan otel_spans exactly once: {sql}"
+        );
         assert!(sql.contains("service_name = 'checkout''api'"), "{sql}");
-        assert!(sql.contains("WHERE entity != ''"), "{sql}");
+        // The empty filter must sit on the OUTER level: a same-level WHERE on
+        // the arrayJoin alias gets the expression alias-substituted (a second
+        // independent arrayJoin), not a filter on the projected one.
+        assert!(sql.contains(")\nWHERE entity != ''"), "{sql}");
         assert!(sql.contains(&format!("LIMIT {SERVICE_ENTITY_CAP}")), "{sql}");
         assert!(!sql.contains("PREWHERE"), "{sql}");
     }

@@ -14,7 +14,7 @@ pub use command_extraction::{
     extract_post_ai_commands, extract_post_inputlookup_commands, extract_post_lateral_commands,
     extract_funnel_command, extract_post_prevalence_commands, extract_prevalence_commands,
     extract_tree_command, has_aggregation_before_prevalence,
-    has_only_simple_post_prevalence_commands, query_has_aggregation,
+    has_only_simple_post_prevalence_commands, query_has_aggregation, query_has_per_row_filters,
     validate_panel_query_commands, validate_panel_query_unscoped_prevalence, AiCommandInfo,
     AssetCommandInfo, CloudCommandInfo, FunnelCommandInfo, InputLookupCommandInfo,
     LateralCommandInfo, LookupCommandInfo, OomRisk, PanelBlockedCommand, PrevalenceCommandInfo,

@@ -406,16 +406,110 @@ async fn collect_parsing_metrics(
         }
     }
 
+    // NAN-1643: ingest-lowercase invariant tripwire. UDM-only —
+    // `LOWERCASE_NORMALIZED_FIELDS` names physical `logs` columns; the OCSF
+    // table carries its own lowercased promoted columns, so skip rather than
+    // error on columns that don't exist there (same posture as the
+    // identity-enrichment probes, NAN-1241).
+    let lowercase_invariant_violations = if ocsf {
+        vec![]
+    } else {
+        collect_lowercase_invariant_violations(ch, &logs_table).await
+    };
+
     info!(
-        "Collected parsing metrics: {} source types with coverage, {} with high ext usage",
+        "Collected parsing metrics: {} source types with coverage, {} with high ext usage, {} lowercase-invariant violations",
         field_coverage.len(),
-        high_ext_sources.len()
+        high_ext_sources.len(),
+        lowercase_invariant_violations.len()
     );
 
     ParsingMetrics {
         field_coverage,
         high_ext_sources,
+        lowercase_invariant_violations,
     }
+}
+
+/// NAN-1643: watch production data for ingest-lowercase invariant drift.
+///
+/// The query generator compares `LOWERCASE_NORMALIZED_FIELDS` columns RAW
+/// (`src_ip = '<lowered>'`, no lower() wrapper) so their raw-column bloom/PK
+/// indexes prune. That is only row-correct while ingest keeps those columns
+/// all-lowercase (Vector downcases them; probed 0/1.75B violations on
+/// Saturn). Nothing else watches the DATA for drift — a new ingest lane,
+/// backfill, or parser regression writing mixed-case would silently diverge
+/// query results. Best-effort like the other collectors: on error, warn and
+/// return empty (absence never alarms).
+async fn collect_lowercase_invariant_violations(
+    ch: &ClickHouseClient,
+    logs_table: &str,
+) -> Vec<LowercaseInvariantViolation> {
+    let sql = build_lowercase_invariant_sql(logs_table);
+    match ch.query(&sql).fetch_all::<(String, u64)>().await {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|(column, violation_count)| LowercaseInvariantViolation {
+                column,
+                violation_count,
+            })
+            .collect(),
+        Err(e) => {
+            warn!("Failed to collect lowercase-invariant violations: {}", e);
+            vec![]
+        }
+    }
+}
+
+/// The columns the invariant probe covers: every `LOWERCASE_NORMALIZED_FIELDS`
+/// entry that is a physical `logs` column, which drops (a) alias SPELLINGS the
+/// router doesn't know as columns (`sourcetype` — not in `EXPLICIT_COLUMNS`)
+/// and (b) DDL ALIAS columns (`event_type` is `ALIAS action` in the logs
+/// schema — its leg would double-count `action`'s violations under a second
+/// name; sourced from the UDM profile's `default_view_renames`, the single
+/// Rust-side record of that alias pair). Derived, not hand-copied, so a
+/// column added to the raw-compare set is probed by construction.
+fn lowercase_invariant_columns() -> Vec<&'static str> {
+    use crate::query::clickhouse_sql_gen::{EXPLICIT_COLUMNS, LOWERCASE_NORMALIZED_FIELDS};
+    use crate::schema::SchemaProfile;
+    let ddl_aliases = crate::schema::UdmProfile.default_view_renames();
+    LOWERCASE_NORMALIZED_FIELDS
+        .iter()
+        .copied()
+        .filter(|c| EXPLICIT_COLUMNS.contains(c))
+        .filter(|c| !ddl_aliases.iter().any(|(_, alias)| alias == c))
+        .collect()
+}
+
+/// Build the invariant-probe SQL: ONE bounded scan (1h window, no GROUP BY)
+/// carrying a `countIf(col != lower(col))` leg per probed column — never a
+/// query per column. The aggregate row is pivoted to `(column, violations)`
+/// rows via ARRAY JOIN so the client-side row type stays fixed while the
+/// column set evolves; `WHERE t.2 > 0` keeps the healthy case at zero rows.
+/// The window is deliberately recent: pre-invariant history (mixed-case rows
+/// ingested before the Vector downcase lanes) must not flag forever — the
+/// tripwire is for ACTIVE drift. Validated on local CH (26.4): zero rows on
+/// invariant-clean data, and the legs count real mixed-case when present.
+fn build_lowercase_invariant_sql(logs_table: &str) -> String {
+    let legs = lowercase_invariant_columns()
+        .iter()
+        .map(|c| format!("('{c}', countIf({c} != lower({c})))"))
+        .collect::<Vec<_>>()
+        .join(",\n                ");
+    format!(
+        r#"
+        SELECT t.1 AS column, t.2 AS violations
+        FROM (
+            SELECT [
+                {legs}
+            ] AS pairs
+            FROM {logs_table}
+            WHERE timestamp > now() - INTERVAL 1 HOUR
+        )
+        ARRAY JOIN pairs AS t
+        WHERE t.2 > 0
+    "#
+    )
 }
 
 /// Collect enrichment health metrics from ClickHouse.
@@ -1219,6 +1313,87 @@ mod tests {
         // Filtering/grouping is shared and must survive.
         assert!(sql.contains("source_type != 'audit'"));
         assert!(sql.contains("HAVING total_events >= 100"));
+    }
+
+    #[test]
+    fn lowercase_invariant_columns_are_physical_logs_columns() {
+        // NAN-1643: the probe set is LOWERCASE_NORMALIZED_FIELDS restricted to
+        // physical columns — alias spellings must be dropped, entries deduped
+        // to real `logs` columns.
+        let cols = lowercase_invariant_columns();
+        assert!(
+            !cols.contains(&"sourcetype"),
+            "alias spelling `sourcetype` must be dropped (source_type is the column), got {cols:?}"
+        );
+        // `event_type` is `ALIAS action` in the logs DDL (migration 113) —
+        // probing it would report action's violations twice under two names.
+        assert!(
+            !cols.contains(&"event_type"),
+            "DDL alias `event_type` must be dropped (action is the column), got {cols:?}"
+        );
+        assert!(
+            cols.contains(&"action"),
+            "the physical `action` column must cover the event_type alias, got {cols:?}"
+        );
+        for expected in ["source_type", "src_ip", "dest_ip", "user", "src_host", "trace_id"] {
+            assert!(
+                cols.contains(&expected),
+                "probe must cover raw-compared column {expected}, got {cols:?}"
+            );
+        }
+        // Every probed name must be a physical column, or the probe SQL errors.
+        for c in &cols {
+            assert!(
+                crate::query::clickhouse_sql_gen::EXPLICIT_COLUMNS.contains(c),
+                "{c} is not a physical logs column"
+            );
+        }
+    }
+
+    #[test]
+    fn lowercase_invariant_sql_is_one_bounded_scan() {
+        // NAN-1643: ONE aggregate scan with a countIf leg per column — never a
+        // query per column — bounded to a 1h window with no GROUP BY (the
+        // CH-migrations/probes resource rule: every aggregating query bounded).
+        let sql = build_lowercase_invariant_sql("logs");
+        assert_eq!(
+            sql.matches("FROM logs").count(),
+            1,
+            "probe must be a single scan, got:\n{sql}"
+        );
+        assert!(
+            sql.contains("timestamp > now() - INTERVAL 1 HOUR"),
+            "probe must be time-bounded to the recent window, got:\n{sql}"
+        );
+        assert!(
+            !sql.to_uppercase().contains("GROUP BY"),
+            "probe must not group — single aggregate row only, got:\n{sql}"
+        );
+        for leg in [
+            "('src_ip', countIf(src_ip != lower(src_ip)))",
+            "('user', countIf(user != lower(user)))",
+            "('source_type', countIf(source_type != lower(source_type)))",
+        ] {
+            assert!(sql.contains(leg), "probe must carry leg {leg}, got:\n{sql}");
+        }
+        // The pivot keeps the healthy case at zero rows.
+        assert!(
+            sql.contains("ARRAY JOIN pairs AS t") && sql.contains("WHERE t.2 > 0"),
+            "probe must pivot to (column, violations) rows and filter zeros, got:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn pre_nan1643_reports_deserialize_without_invariant_field() {
+        // Reports stored before NAN-1643 lack the violations key — the
+        // serde(default) must keep them loadable.
+        let old_json = r#"{
+            "field_coverage": [],
+            "high_ext_sources": []
+        }"#;
+        let m: ParsingMetrics =
+            serde_json::from_str(old_json).expect("pre-NAN-1643 report deserializes");
+        assert!(m.lowercase_invariant_violations.is_empty());
     }
 
     #[test]

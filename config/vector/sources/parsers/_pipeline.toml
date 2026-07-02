@@ -308,7 +308,10 @@ if pcmd_val == null || pcmd_val == "" { pcmd_val = .parent_process }
 .risk_score = to_float(.risk_score) ?? 0.0
 .risk_level = to_string(.risk_level) ?? ""
 .dvc = to_string(.dvc) ?? ""
-.dvc_ip = to_string(.dvc_ip) ?? ""
+# NAN-1646: downcase on the same lane as src_ip/dest_ip so dvc_ip can join
+# LOWERCASE_NORMALIZED_FIELDS and equality hunts engage the raw bloom index.
+# Only affects IPv6 hex case - IPv4 is case-free.
+.dvc_ip = downcase(to_string(.dvc_ip) ?? "")
 .dvc_mac = to_string(.dvc_mac) ?? ""
 
 # Build ext JSON with all non-explicit fields

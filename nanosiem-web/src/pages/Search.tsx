@@ -1786,7 +1786,10 @@ export function Search() {
         // table_view: slim columns (id, timestamp, message, source_type + key UDM fields)
         // Full row data fetched on demand via fetchLog when user expands a row
         // Field stats come from separate async /api/search/field-stats endpoint
-        response = await search({ query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset, use_cache: useCache, skip_field_stats: true, table_view: true, request_id: requestId, dataset });
+        // NAN-1645: page flips (offset > 0) skip the histogram companion — the
+        // timeline is page-invariant and frozen from page 1 (mirrors the
+        // existing skip_field_stats behavior; the backend offset-gates too).
+        response = await search({ query: cleanQuery, time_range: apiTimeRange, limit: pageSize, offset, use_cache: useCache, skip_field_stats: true, skip_histogram: offset > 0, table_view: true, request_id: requestId, dataset });
       }
 
       if (abortControllerRef.current?.signal.aborted) return;
@@ -1812,12 +1815,26 @@ export function Search() {
       // Use total_count from backend, but handle fallback for failed count queries
       // If backend returns 0 and results.length equals the limit, assume there's more data
       let effectiveTotalCount = response.total_count;
-      if (effectiveTotalCount === 0) {
-        // If we got exactly the limit, there's likely more data
-        // Use a high estimate to enable pagination
-        effectiveTotalCount = results.length >= pageSize ? results.length * 100 : results.length;
+      if (!append) {
+        if (effectiveTotalCount === 0) {
+          // If we got exactly the limit, there's likely more data
+          // Use a high estimate to enable pagination
+          effectiveTotalCount = results.length >= pageSize ? results.length * 100 : results.length;
+        }
+        setTotalCount(effectiveTotalCount);
+      } else if (response.total_count <= offset + pageSize) {
+        // NAN-1645: freeze the page-1 total across page flips. Page-N
+        // responses carry a monotonic estimate (the count companion only runs
+        // on page 1): `offset + returned + limit` on a full page (always
+        // > offset + pageSize), `offset + returned` (exact) on a partial last
+        // page. Adopting the mid-set estimate would replace the exact page-1
+        // count, so only adopt when the server proves the end of the result
+        // set — which also stops loadMore when the frozen total was itself an
+        // over-estimate. Server-side (raw) page fullness is the signal here,
+        // NOT results.length: post-processing (e.g. lookup + where) can shrink
+        // a full raw page below pageSize while more raw pages remain.
+        setTotalCount(response.total_count);
       }
-      setTotalCount(effectiveTotalCount);
       setCurrentPage(page);
       if (response.generated_sql) setGeneratedSql(response.generated_sql);
       if (response.execution_time_ms !== undefined) setExecutionTimeMs(response.execution_time_ms);
@@ -1893,14 +1910,19 @@ export function Search() {
         setQueryCostScore(null);
       }
       
-      // Store histogram data from API response (always update, even if empty)
+      // Store histogram data from API response (always update, even if empty).
+      // NAN-1645: except on page flips — offset>0 requests skip the histogram
+      // companion entirely, so keep the frozen page-1 timeline instead of
+      // blanking it with the (absent) page-N histogram.
       const histData = response.histogram && response.histogram.length > 0
         ? response.histogram.map(bucket => ({
             time: bucket.time,
             count: bucket.count
           }))
         : [];
-      setHistogramData(histData);
+      if (!append) {
+        setHistogramData(histData);
+      }
 
       // Cache results for back-navigation (use local vars, not state which is async)
       const cacheKey = !append ? buildCacheKey(currentQuery, currentTimeRange, currentMode) : null;
@@ -2081,7 +2103,7 @@ export function Search() {
 
       const response = queryMode === 'sql'
         ? await searchSql({ sql: cleanQuery, time_range: apiTimeRange, limit: effectiveSize, offset })
-        : await search({ query: cleanQuery, time_range: apiTimeRange, limit: effectiveSize, offset, skip_field_stats: true, dataset });
+        : await search({ query: cleanQuery, time_range: apiTimeRange, limit: effectiveSize, offset, skip_field_stats: true, skip_histogram: offset > 0, dataset });
 
       if (abortControllerRef.current?.signal.aborted) return;
 

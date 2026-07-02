@@ -236,22 +236,49 @@ fn build_optimized_regex_sql(
         match opt {
             RegexOptimization::Prefix(prefix) => {
                 let escaped_prefix = escape_string(&prefix);
-                return if negated {
-                    format!(
+                if negated {
+                    // NAN-1640: no guard under negation — mirrors the BloomGuard
+                    // arm below (NOT startsWith ≢ guard AND NOT startsWith; a
+                    // guard ANDed under negation changes semantics).
+                    return format!(
                         "NOT startsWith(lower({}), '{}')",
                         field_expr, escaped_prefix
-                    )
-                } else {
-                    format!("startsWith(lower({}), '{}')", field_expr, escaped_prefix)
-                };
+                    );
+                }
+                let base = format!("startsWith(lower({}), '{}')", field_expr, escaped_prefix);
+                // NAN-1640: no skip index serves startsWith — text-index analysis
+                // yields `tokens: []` and the whole column is read (Saturn:
+                // 19.97GiB read_bytes on a selective 24h hunt). AND an implied,
+                // index-servable guard in front: startsWith(x, lit) ⇒
+                // x iLike '%tok%' for any token of lit, so results are identical
+                // while the `lower(col)` text index prunes granules
+                // (19.97GiB → 25.71MiB read_bytes, 795x). Only when the target is
+                // a plain String column (`skip_tostring` — the exact `lower(col)`
+                // index expression; ext/JSON/CTE targets have no index to serve
+                // the guard) and the literal yields a token passing the NAN-1416
+                // bar (the token is pure ASCII-alnum → no LIKE escaping needed).
+                if skip_tostring {
+                    if let Some(token) = anchored_guard_token(&prefix) {
+                        return format!("lower({}) iLike '%{}%' AND {}", field_expr, token, base);
+                    }
+                }
+                return base;
             }
             RegexOptimization::Suffix(suffix) => {
                 let escaped_suffix = escape_string(&suffix);
-                return if negated {
-                    format!("NOT endsWith(lower({}), '{}')", field_expr, escaped_suffix)
-                } else {
-                    format!("endsWith(lower({}), '{}')", field_expr, escaped_suffix)
-                };
+                if negated {
+                    // NAN-1640: no guard under negation (see the Prefix arm).
+                    return format!("NOT endsWith(lower({}), '{}')", field_expr, escaped_suffix);
+                }
+                let base = format!("endsWith(lower({}), '{}')", field_expr, escaped_suffix);
+                // NAN-1640: same implied text-index guard as the Prefix arm —
+                // endsWith(x, lit) ⇒ x iLike '%tok%' for any token of lit.
+                if skip_tostring {
+                    if let Some(token) = anchored_guard_token(&suffix) {
+                        return format!("lower({}) iLike '%{}%' AND {}", field_expr, token, base);
+                    }
+                }
+                return base;
             }
             RegexOptimization::LiteralAlternation(literals) => {
                 // NAN-1026 Phase 2: each literal lowered to iLike instead of hasToken*.
@@ -378,8 +405,9 @@ impl ClickHouseSqlGenerator {
     }
 
     /// Whether `field`'s *resolved physical column* is lowercase-normalized at
-    /// ingest, so an Eq/Ne string compare can skip the `lower()` wrapper and the
-    /// raw-column bloom/set indexes engage. Judged on the resolved column, not
+    /// ingest, so an Eq string compare (Eq ONLY — see the NAN-1643 comments at
+    /// the call sites; Ne keeps the `lower()` form) can skip the `lower()`
+    /// wrapper and the raw-column bloom/set indexes engage. Judged on the resolved column, not
     /// the raw nPL token: under OCSF a UDM alias like `src_ip` resolves to the
     /// ingest-lowercased promoted column `src_endpoint.ip`, which a raw-token
     /// lookup misses. Pre-NAN-1412 the explicit-PREWHERE duplicate carried the
@@ -403,6 +431,63 @@ impl ClickHouseSqlGenerator {
             }
             _ => self.profile.is_lowercased_at_ingest(field),
         }
+    }
+
+    /// The LHS of a case-insensitive string compare against a physical column,
+    /// in the form the skip indexes match by EXPRESSION: the bare column when
+    /// it is lowercase-normalized at ingest (raw bloom/set indexes + PK
+    /// analysis engage), `lower(col)` otherwise (the migration-119 text
+    /// indexes are built on `lower(col)`). Shared by every filter arm so the
+    /// form selection can't drift per-arm again (NAN-1634).
+    fn string_filter_lhs(&self, field: &str, column_expr: &str) -> String {
+        if self.is_resolved_lowercased_at_ingest(field) {
+            column_expr.to_string()
+        } else {
+            format!("lower({})", column_expr)
+        }
+    }
+
+    /// Whether `field` names a plain physical String column under identity
+    /// resolution — the bare name IS the base-table column, with no value-pick
+    /// (class-split), Map subscript, spill/JSON access, numeric/UUID/Timestamp
+    /// typing, or upstream shadowing in the way. Only such a column may take
+    /// the index-form compare (`col`/`lower(col)`) instead of a normalizing
+    /// `toString(...)` wrap. OCSF UDM-aliases resolve to a *different* column
+    /// name → excluded → emission there is byte-identical (NAN-1634).
+    fn is_plain_string_physical_column(&self, field: &str) -> bool {
+        if self.resolves_to_map_key(field)
+            || self.profile.class_split_value_sql(field).is_some()
+            || self.is_upstream_computed_field(field)
+            || self.profile.is_uuid_field(field)
+            || self.field_is_numeric(field)
+        {
+            return false;
+        }
+        matches!(
+            self.profile.field_type(field),
+            Some(crate::schema::FieldType::String | crate::schema::FieldType::IpAddress)
+        ) && matches!(
+            self.profile.resolve(field),
+            crate::schema::FieldResolution::ExplicitColumn(col) if col == field
+        )
+    }
+
+    /// [`is_plain_string_physical_column`] narrowed to a `| where` stage scope:
+    /// additionally rejects aggregation references (`avg(bytes_out)`, NAN-1339
+    /// `{func}_{field}` aliases) and any pipeline-computed name (eval/rex/stats
+    /// output — NAN-1341/1557), whose values are NOT the ingest-normalized
+    /// column values. Those keep the scope-relative `lower(toString(...))`
+    /// wrap; a surviving base column takes the index form the predicate
+    /// pushdown carries into the stage_0 read (NAN-1634: the wrap matched
+    /// neither the raw blooms nor the `lower(col)` text indexes — measured
+    /// 31.8x read_rows on `* | where src_ip="…"` at production scale).
+    ///
+    /// [`is_plain_string_physical_column`]: Self::is_plain_string_physical_column
+    fn where_scope_physical_string_column(&self, field: &str) -> bool {
+        !field.contains('(')
+            && self.agg_reference_alias(field).is_none()
+            && !self.is_computed_field(field)
+            && self.is_plain_string_physical_column(field)
     }
 
     /// Generate SQL for a search expression (WHERE clause content)
@@ -461,9 +546,53 @@ impl ClickHouseSqlGenerator {
                 op,
                 function,
             } => {
-                let field_sql = self.generate_json_extract(field, "String");
+                // NAN-1634: the LHS previously resolved unconditionally via
+                // `generate_json_extract(field, "String")` — a metadata-JSON
+                // probe that is empty for every explicit column (`metadata`
+                // never carries copies of promoted fields), so
+                // `user=lower(dest_user)` degenerated to `'' = rhs` and
+                // matched WRONG rows. Dispatch like `FieldFilter`: known /
+                // class-split / Map-tail fields resolve to their physical
+                // access; unknown fields keep the metadata-JSON fallback.
+                let field = self.canonicalize_field(field);
                 let func_sql = eval_expression_to_sql(self, function)?;
                 let sql_op = comparator_to_sql(op);
+                let is_resolvable = self.profile.is_known_field(field)
+                    || self.profile.class_split_value_sql(field).is_some()
+                    || self.resolves_to_map_key(field);
+                if is_resolvable {
+                    let field_expr = self.filter_field_expr(field, "String");
+                    if self.field_is_numeric(field) {
+                        // Never lower() a numeric column (CH Code 43); the
+                        // function side stays as-is (numeric expression).
+                        return Ok(format!("{} {} {}", field_expr, sql_op, func_sql));
+                    }
+                    if self.profile.is_uuid_field(field) {
+                        // toString(UUID) is lowercase-canonical; keep the old
+                        // code's lower() on the function side so an
+                        // uppercase-producing RHS still matches.
+                        return Ok(format!(
+                            "toString({}) {} lower({})",
+                            field_expr, sql_op, func_sql
+                        ));
+                    }
+                    return match op {
+                        // Raw LHS for Eq ONLY (see the where-pipe arm): a raw
+                        // Ne flips invariant-violating rows from excluded to
+                        // included for zero index gain.
+                        Comparator::Eq => Ok(format!(
+                            "{} = lower({})",
+                            self.string_filter_lhs(field, &field_expr),
+                            func_sql
+                        )),
+                        Comparator::Ne => Ok(format!(
+                            "lower({}) != lower({})",
+                            field_expr, func_sql
+                        )),
+                        _ => Ok(format!("{} {} {}", field_expr, sql_op, func_sql)),
+                    };
+                }
+                let field_sql = self.generate_json_extract(field, "String");
                 // Case-insensitive comparison for Eq/Ne
                 match op {
                     Comparator::Eq | Comparator::Ne => Ok(format!(
@@ -791,7 +920,16 @@ impl ClickHouseSqlGenerator {
                 let values_list = values_sql.join(", ");
                 Ok(format!("{} {} ({})", field_expr, op, values_list))
             } else if all_strings {
-                // Case-insensitive: lower(field) IN ('val1', 'val2')
+                // Case-insensitive membership. NAN-1634: mirror the Eq arm's
+                // form selection — the literals are lowercased at emission, so
+                // an ingest-lowercased column compares RAW and its bloom/set
+                // index + PK analysis prune (unconditional `lower(field) IN`
+                // measured 8.6x read_rows on a 7d two-IP hunt). Class-split
+                // value-picks and mixed-case-history columns (dest_user,
+                // hashes) resolve false and keep the `lower(...)` form.
+                // Positive membership ONLY (same rule as the raw-Eq arms): a
+                // raw NOT IN flips invariant-violating rows from excluded to
+                // included, and no skip index prunes a negation anyway.
                 let values_sql: Vec<String> = values
                     .iter()
                     .map(|v| match v {
@@ -800,7 +938,12 @@ impl ClickHouseSqlGenerator {
                     })
                     .collect();
                 let values_list = values_sql.join(", ");
-                Ok(format!("lower({}) {} ({})", field_expr, op, values_list))
+                let lhs = if !negated {
+                    self.string_filter_lhs(field, &field_expr)
+                } else {
+                    format!("lower({})", field_expr)
+                };
+                Ok(format!("{} {} ({})", lhs, op, values_list))
             } else {
                 let values_sql: Vec<String> = values
                     .iter()
@@ -1279,12 +1422,19 @@ impl ClickHouseSqlGenerator {
                                     "(lower({}) != '{}' AND NOT startsWith(lower({}), '{}.'))",
                                     field_expr, escaped_lower, field_expr, escaped_lower
                                 ))
-                            } else if self.is_resolved_lowercased_at_ingest(field) {
+                            } else if *op == Comparator::Eq
+                                && self.is_resolved_lowercased_at_ingest(field)
+                            {
                                 // For fields normalized to lowercase at ingest, skip lower() wrapper
                                 // This allows efficient index usage (set indexes, bloom filters).
                                 // Judged on the profile-RESOLVED column so OCSF UDM-aliases
                                 // (src_ip → src_endpoint.ip) keep their bloom pruning now that
                                 // the raw-form PREWHERE duplicate is gone (NAN-1412).
+                                // Eq ONLY: for Eq the raw form is row-identical to the
+                                // lower() form while the ingest-lowercase invariant holds;
+                                // for Ne it is not (an uppercase row flips from excluded to
+                                // included), and a bloom can never prune a negation anyway —
+                                // Ne falls through to the lower() form (NAN-1643).
                                 Ok(format!("{} {} '{}'", field_expr, sql_op, escaped_lower))
                             } else {
                                 Ok(format!(
@@ -1828,7 +1978,11 @@ impl ClickHouseSqlGenerator {
                                     escape_like_pattern(&escape_string(&token.to_lowercase()))
                                 ));
                             }
-                            // Complex regex — try bloom filter pre-filtering and pattern rewrites
+                            // Complex regex — try bloom filter pre-filtering and pattern rewrites.
+                            // NAN-1640: skip_tostring=false deliberately withholds the
+                            // anchored prefix/suffix text-index guard — where-pipe targets
+                            // are toString-wrapped CTE intermediates with no `lower(col)`
+                            // index to serve it (where-pipe form selection is finding 2.1).
                             let col_str = format!("toString({})", column_ref);
                             return Ok(build_optimized_regex_sql(&col_str, pattern, false, false));
                         }
@@ -1943,6 +2097,29 @@ impl ClickHouseSqlGenerator {
                                     let bool_val = if lower == "true" { 1 } else { 0 };
                                     return Ok(format!("{} {} {}", column_ref, sql_op, bool_val));
                                 }
+                                // NAN-1634: a base-scan String column still
+                                // carrying ingest values takes the index-form
+                                // LHS — the predicate pushes down into the
+                                // stage_0 read, where `lower(toString(col))`
+                                // matched neither the raw blooms nor the
+                                // `lower(col)` text indexes (31.8x read_rows
+                                // on `* | where src_ip="…"` at Saturn scale).
+                                // Computed/agg/Map names keep the
+                                // scope-relative normalizing wrap. Eq ONLY —
+                                // same rule as the OCSF alias path below: a
+                                // raw Ne flips invariant-violating rows from
+                                // excluded to included, and no skip index
+                                // prunes a negation anyway.
+                                if *op == Comparator::Eq
+                                    && self.where_scope_physical_string_column(field)
+                                {
+                                    return Ok(format!(
+                                        "{} {} '{}'",
+                                        self.string_filter_lhs(field, &column_ref),
+                                        sql_op,
+                                        escape_string(&lower)
+                                    ));
+                                }
                                 Ok(format!(
                                     "lower(toString({})) {} '{}'",
                                     column_ref,
@@ -1989,7 +2166,18 @@ impl ClickHouseSqlGenerator {
                         })
                         .collect();
                     let values_list = values_sql.join(", ");
-                    Ok(format!("lower({}) {} ({})", column_ref, op, values_list))
+                    // NAN-1634: same index-form selection as the Eq arm —
+                    // a base-scan ingest-lowercased column compares RAW so
+                    // its bloom/set index prunes; anything computed keeps the
+                    // scope-relative `lower(...)`. Positive membership ONLY:
+                    // a raw NOT IN flips invariant-violating rows from
+                    // excluded to included, and no index prunes a negation.
+                    let lhs = if !*negated && self.where_scope_physical_string_column(field) {
+                        self.string_filter_lhs(field, &column_ref)
+                    } else {
+                        format!("lower({})", column_ref)
+                    };
+                    Ok(format!("{} {} ({})", lhs, op, values_list))
                 } else {
                     let values_sql: Vec<String> = values.iter().map(value_to_sql).collect();
                     let values_list = values_sql.join(", ");
@@ -2118,9 +2306,12 @@ impl ClickHouseSqlGenerator {
     }
 
     /// Generate SQL for `field IN [search ... | return field]` subsearch expressions.
-    /// Produces a ClickHouse subquery: `toString(field) IN (SELECT DISTINCT toString(return_field) FROM ... LIMIT 10000)`
-    /// when either side is non-numeric, or the bare numeric form when BOTH the
-    /// outer field and the return field are numeric under their profiles.
+    /// Produces a ClickHouse subquery in one of three forms: bare numeric when
+    /// BOTH sides are numeric under their profiles; bare String when BOTH sides
+    /// are plain physical String columns (NAN-1634 — the `toString()` wrap is an
+    /// identity there and only orphans the outer bloom skip index); otherwise
+    /// the normalizing `toString(field) IN (SELECT DISTINCT toString(return_field)
+    /// FROM ... LIMIT 10000)` coercion form (NAN-1562).
     ///
     /// NAN-1562: when `subsearch_dataset` selects a dataset whose storage table
     /// differs from the outer query's, the subsearch FROM table, time column,
@@ -2248,6 +2439,25 @@ impl ClickHouseSqlGenerator {
         let outer_numeric = self.profile.is_numeric_field(field);
         let return_numeric = sub_gen.profile.is_numeric_field(return_field);
         if outer_numeric && return_numeric {
+            Ok(format!(
+                "{} {} (SELECT DISTINCT {} FROM {} WHERE {} LIMIT {})",
+                outer_field_expr,
+                op,
+                return_field_expr,
+                sub_gen.table_name,
+                where_clause,
+                SUBSEARCH_RESULT_LIMIT,
+            ))
+        } else if self.is_plain_string_physical_column(field)
+            && sub_gen.is_plain_string_physical_column(return_field)
+        {
+            // NAN-1634: with BOTH sides plain physical String columns
+            // (non-Nullable, DEFAULT '') the `toString()` wrap is a strict
+            // identity that only orphans the outer column's
+            // expression-matched bloom skip index (2.98x granules restored on
+            // a 24h `src_ip IN [subsearch]`). The mixed-type sides the wrap
+            // exists for (UUID / numeric-vs-string / Map / spill — the
+            // NAN-1562 coercion cases) fail the gate and keep it.
             Ok(format!(
                 "{} {} (SELECT DISTINCT {} FROM {} WHERE {} LIMIT {})",
                 outer_field_expr,

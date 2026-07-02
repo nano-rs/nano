@@ -339,6 +339,62 @@ impl ClickHouseSqlGenerator {
             )
         };
 
+        // Bound the ASOF right/build side to the query window (NAN-1638). The
+        // bare-table join materializes ALL of identity_observations (62.8M rows
+        // on Saturn, incl. S3 cold-tier parts) into the hash build side —
+        // MEMORY_LIMIT_EXCEEDED at the production 3GiB query cap in
+        // FillingRightJoinSide; the max-age filter in the outer WHERE runs only
+        // after the join. Any observation an in-window event can accept
+        // satisfies `observed_at ∈ (event_ts − max_age, event_ts]` ⊆
+        // `[query_start − max_age, query_end]`, so this bound never removes a
+        // joinable observation. The one divergence class — an event whose
+        // NEWEST observation ≤ its timestamp is older than the bound — comes
+        // back as no-match → kept with identity_confidence 'none', where the
+        // unbounded join matched the stale row and the outer WHERE silently
+        // DROPPED the event, contradicting the 'none'/'stale' taxonomy above.
+        //
+        // Guards — keep the legacy unbounded join when:
+        //  - a prior stage rewrote `timestamp` (`bin timestamp span=X`,
+        //    `eval timestamp=…`, `rex (?<timestamp>…)`, `stats … as
+        //    timestamp`, `table x as timestamp`, …): binned values precede
+        //    the window start by up to one span, and computed ones move
+        //    arbitrarily, so the window-derived bound could cut observations
+        //    those rewritten timestamps still accept. Conservative choice
+        //    over widening the bound by accumulated spans: spans can
+        //    chain/alias through multiple stages, and computed rewrites are
+        //    unboundable anyway. Registered rewriters surface through the
+        //    upstream-computed set; bin/table escape it and are tracked by
+        //    the dedicated flag (see `command_rewrites_timestamp`);
+        //  - no generation time range is available (direct
+        //    `generate_command_sql` callers, e.g. prevalence re-embedding);
+        //  - the window-start − max_age subtraction over/underflows.
+        let bounded_window = if self.is_upstream_timestamp_rewritten()
+            || self.is_upstream_computed_field("timestamp")
+        {
+            None
+        } else {
+            match self.generation_time_range.read() {
+                Ok(guard) => guard.clone(),
+                Err(poisoned) => (**poisoned.get_ref()).clone(),
+            }
+        };
+        let build_side = bounded_window
+            .and_then(|tr| {
+                // try_seconds + checked_sub_signed: a crafted max_age (the
+                // parser accepts up to u64::MAX seconds) must degrade to the
+                // unbounded join, not panic codegen.
+                let lower = i64::try_from(max_age_secs)
+                    .ok()
+                    .and_then(chrono::Duration::try_seconds)
+                    .and_then(|d| tr.start.checked_sub_signed(d))?;
+                Some(format!(
+                    "(\n    SELECT * FROM identity_observations\n    WHERE observed_at BETWEEN '{}' AND '{}'\n  )",
+                    crate::sql_hygiene::format_ch_bound_micros(&lower),
+                    crate::sql_hygiene::format_ch_bound_micros(&tr.end)
+                ))
+            })
+            .unwrap_or_else(|| "identity_observations".to_string());
+
         Ok(format!(
             r#"  SELECT
     {select_main},
@@ -355,7 +411,7 @@ impl ClickHouseSqlGenerator {
     coalesce(i.fqdn, '') AS identity_fqdn,
     {dict_lookups}
   FROM {source} AS main
-  ASOF LEFT JOIN identity_observations AS i
+  ASOF LEFT JOIN {build_side} AS i
     ON {asof_equi}
     AND main.timestamp >= i.observed_at
   WHERE i.observed_at IS NULL
@@ -366,6 +422,7 @@ impl ClickHouseSqlGenerator {
             dict_lookups = dict_lookups,
             asof_equi = asof_equi,
             source = source,
+            build_side = build_side,
             max_age_secs = max_age_secs
         ))
     }

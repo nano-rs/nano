@@ -43,8 +43,9 @@ use super::query_processing::{
     extract_post_ai_commands, extract_post_inputlookup_commands, extract_post_lateral_commands,
     extract_funnel_command, extract_post_prevalence_commands, extract_prevalence_commands,
     extract_tree_command, has_aggregation_before_prevalence,
-    has_only_simple_post_prevalence_commands, query_has_aggregation, strip_ai_and_after,
-    strip_inputlookup_and_after, strip_lateral_and_after, strip_post_prevalence_commands,
+    has_only_simple_post_prevalence_commands, query_has_aggregation, query_has_per_row_filters,
+    strip_ai_and_after, strip_inputlookup_and_after, strip_lateral_and_after,
+    strip_post_prevalence_commands,
     strip_prevalence_and_after, AssetCommandInfo, CloudCommandInfo, FunnelCommandInfo,
     InputLookupCommandInfo, LookupCommandInfo, PrevalenceCommandInfo, TreeCommandInfo,
 };
@@ -1019,6 +1020,40 @@ mod tests {
         assert!(sql.contains("SELECT"));
         // ClickHouse generator uses lower(message) for keyword searches
         assert!(sql.contains("lower(message)") || sql.contains("error"));
+    }
+
+    /// NAN-1635 (finding 2.2): the histogram companion's base options must
+    /// produce an unbounded FLAT scan — no trailing ORDER BY, no LIMIT — like
+    /// the raw-SQL time-range histogram. The old `QueryOptions::default()`
+    /// base baked `ORDER BY timestamp DESC LIMIT 1000000`, forcing a top-1M
+    /// sort on every broad search (Saturn: 2x wall, ~2750x memory) and
+    /// silently truncating the timeline to the newest 1M events (17 buckets
+    /// shown vs 289 real ones over a 21.77M-event day).
+    #[test]
+    fn histogram_base_options_emit_unbounded_flat_scan() {
+        let sql_generator = ClickHouseSqlGenerator::new();
+        let time_range = TimeRange::new(
+            "2024-01-01T00:00:00Z".parse().unwrap(),
+            "2024-01-02T00:00:00Z".parse().unwrap(),
+        );
+        let options = SearchService::histogram_base_options();
+        assert!(options.limit.is_none(), "histogram base must be unbounded");
+        assert!(options.unordered, "histogram base must be flat (no sort)");
+
+        for q in ["*", "error", "src_ip=\"10.0.0.1\""] {
+            let base_sql = sql_generator
+                .generate_with_options(&parse_query(q).unwrap(), &time_range, &options)
+                .unwrap();
+            assert!(
+                !base_sql.contains("ORDER BY"),
+                "`{q}` histogram base must carry no sort, got:\n{base_sql}"
+            );
+            assert!(
+                !base_sql.to_uppercase().contains(" LIMIT "),
+                "`{q}` histogram base must carry no LIMIT (the old top-1M \
+                 truncated the timeline), got:\n{base_sql}"
+            );
+        }
     }
 
     #[test]

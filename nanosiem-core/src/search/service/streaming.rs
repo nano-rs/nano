@@ -295,6 +295,7 @@ impl SearchService {
             use_cache: request.use_cache,
             table_view: request.table_view,
             limit: Some(limit),
+            unordered: false,
         };
 
         let full_time_range =
@@ -325,8 +326,19 @@ impl SearchService {
         // the resolved per-priority settings, so a disconnect/cancel kills them
         // along with the chunk queries and admission limits bound them.
         let count_handle = if !is_aggregation {
+            // NAN-1635 (finding 3.4): the companion must count the FULL match
+            // set. The data `options` bake `limit: Some(page)` — counting that
+            // SQL as-is would report min(total, page). Regenerate with
+            // `limit: None` (user `| head N` caps survive: they are query
+            // semantics per the QueryOptions contract) and `unordered` (the
+            // trailing ORDER BY is dead weight under the count(*) wrap).
+            let count_options = QueryOptions {
+                limit: None,
+                unordered: true,
+                ..options.clone()
+            };
             let count_sql = stream_gen
-                .generate_with_options(query, &full_time_range, &options)
+                .generate_with_options(query, &full_time_range, &count_options)
                 .ok();
             let count_executor = ch_executor.clone();
             let count_qid = format!("{query_id}-count");

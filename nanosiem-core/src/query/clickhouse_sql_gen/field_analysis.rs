@@ -34,12 +34,53 @@ pub(crate) fn analyze_required_fields(
 ) -> Option<HashSet<String>> {
     let mut fields = HashSet::new();
     let mut needs_all_fields = false;
+    let mut wants_full_rows = false;
 
-    collect_required_fields_from_query(query, &mut fields, &mut needs_all_fields, profile);
+    collect_required_fields_from_query(
+        query,
+        &mut fields,
+        &mut needs_all_fields,
+        &mut wants_full_rows,
+        profile,
+    );
 
     // Remove fields that are added by post-processing (ai, anomaly, prevalence, risk).
     // These never exist in ClickHouse columns or ext JSON — they're computed at runtime.
     fields.retain(|f| !is_post_processing_field(f));
+
+    // NAN-1639 (finding 3.8): pipeline-CREATED output columns — aggregation
+    // aliases (`count`, `total`), top/rare's `count`/`percent`, sequence /
+    // transaction outputs — referenced by a downstream row command (most
+    // commonly the executor-injected `| sort -count` on grouped stats) are
+    // stage outputs, not base columns. Leaving them in the required set makes
+    // stage_0 emit a bogus `toString(ext.count) AS count`. Group-by
+    // passthroughs are NOT in this set — they are real columns (or ext spills)
+    // that stage_0 must still project. `{func}_{field}` references to
+    // un-aliased aggregations resolve to the real output column downstream
+    // (NAN-1339) and aggregation expressions like `count()` are never
+    // projectable base columns, so both are dropped too (mirroring
+    // `analyze_ext_fields`).
+    //
+    // A stage-output name that resolves to a REAL physical column is kept: it
+    // may be legitimately referenced by a stage BEFORE the one that creates
+    // the alias (`… | where status=… | stats sum(x) as status by …`), and
+    // projecting the base column is harmless when it is not (an aggregation
+    // stage's own output shadows it downstream).
+    let stage_outputs = collect_stage_output_names(query);
+    let computed = collect_computed_field_names(query);
+    let agg_aliases = collect_agg_reference_aliases(query, &computed);
+    fields.retain(|f| {
+        if f.contains('(') {
+            return false;
+        }
+        if !stage_outputs.contains(f) && !agg_aliases.contains_key(f) {
+            return true;
+        }
+        matches!(
+            profile.resolve(&profile.canonicalize(f)),
+            crate::schema::FieldResolution::ExplicitColumn(_)
+        )
+    });
 
     // Always include core fields needed for basic functionality. Profile-driven
     // (NAN-1555): UDM/OCSF logs default to id/timestamp/message/source_type;
@@ -180,6 +221,17 @@ pub(crate) fn analyze_required_fields(
         return None;
     }
 
+    // NAN-1639 (finding 2.4): row-preserving pipes (where/sort/dedup/head/…)
+    // keep the historical full-row projection for NON-table_view callers —
+    // API/detection consumers of raw-event output see complete rows,
+    // unchanged. Once an aggregation shapes the output, only group/agg
+    // columns survive the GROUP BY, so the wide stage_0 is pure coordinator
+    // waste (finding 3.8) and pruning applies. table_view was already handled
+    // above: the events grid renders the slim summary either way.
+    if wants_full_rows && !has_aggregation_command(query) {
+        return None;
+    }
+
     // If we have a reasonable number of fields, use field pruning
     // If we need too many fields (>50), it's not worth the optimization
     if fields.len() < 50 {
@@ -219,11 +271,19 @@ fn has_aggregation_command(query: &Query) -> bool {
     }
 }
 
-/// Recursively collect fields referenced in the query
+/// Recursively collect fields referenced in the query.
+///
+/// `needs_all` — downstream codegen structurally requires the full column set
+/// (wildcard projections, lookup/rex/eval/…). `wants_full_rows` — a
+/// row-preserving pipe (where/sort/dedup/head/…) whose full-row output is a
+/// DISPLAY expectation only: honored for the non-table_view raw-event view,
+/// ignored under table_view (the grid renders the slim summary) and after an
+/// aggregation (NAN-1639, findings 2.4/3.8).
 fn collect_required_fields_from_query(
     query: &Query,
     fields: &mut HashSet<String>,
     needs_all: &mut bool,
+    wants_full_rows: &mut bool,
     profile: &dyn crate::schema::SchemaProfile,
 ) {
     match query {
@@ -231,8 +291,8 @@ fn collect_required_fields_from_query(
             collect_fields_from_search_expr(expr, fields, profile);
         }
         Query::Piped { source, command } => {
-            collect_required_fields_from_query(source, fields, needs_all, profile);
-            collect_fields_from_command(command, fields, needs_all, profile);
+            collect_required_fields_from_query(source, fields, needs_all, wants_full_rows, profile);
+            collect_fields_from_command(command, fields, needs_all, wants_full_rows, profile);
         }
     }
 }
@@ -292,6 +352,7 @@ fn collect_fields_from_command(
     cmd: &Command,
     fields: &mut HashSet<String>,
     needs_all: &mut bool,
+    wants_full_rows: &mut bool,
     profile: &dyn crate::schema::SchemaProfile,
 ) {
     match cmd {
@@ -395,16 +456,21 @@ fn collect_fields_from_command(
             }
         }
         Command::Where { condition } => {
-            // Where clauses filter results but users expect to see all fields
-            *needs_all = true;
+            // Row-preserving filter (NAN-1639, finding 2.4): full rows are a
+            // display expectation, not a structural need — the stage emits
+            // `SELECT * FROM prev WHERE …` over whatever the base projected.
+            *wants_full_rows = true;
             collect_fields_from_search_expr(condition, fields, profile);
         }
         Command::Sort {
             fields: sort_fields,
             ..
         } => {
-            // Sort reorders results but users expect to see all fields
-            *needs_all = true;
+            // Row-preserving reorder (NAN-1639, findings 2.4/3.8): the
+            // executor-injected `| sort -count` on grouped stats lands here —
+            // it must not force the wide stage_0 (its `count` field is
+            // filtered out of the required set in `analyze_required_fields`).
+            *wants_full_rows = true;
             for sf in sort_fields {
                 fields.insert(canon_collect(&sf.field, profile));
             }
@@ -427,8 +493,10 @@ fn collect_fields_from_command(
             fields: dedup_fields,
             ..
         } => {
-            // Dedup removes duplicates but users expect to see all fields
-            *needs_all = true;
+            // Row-preserving dedup (NAN-1639, finding 2.4): the stage only
+            // needs its keys + timestamp (`ORDER BY <keys>, timestamp LIMIT 1
+            // BY <keys>` over the base projection); full rows are display-only.
+            *wants_full_rows = true;
             for field in dedup_fields {
                 fields.insert(canon_collect(field, profile));
             }
@@ -488,20 +556,61 @@ fn collect_fields_from_command(
             // Prevalence needs file_hash, url_domain, etc. - safer to get all fields
             *needs_all = true;
         }
-        // Commands that need all fields or don't affect field selection
+        // Row-preserving slicers (NAN-1639, finding 2.4): head/tail/sample/
+        // reverse reference no fields of their own — head is a bare LIMIT;
+        // tail/reverse order by `timestamp` (core) or rowNumberInAllBlocks();
+        // sample hashes `id` (core). Full rows are a display expectation only.
         Command::Head { .. }
         | Command::Tail { .. }
-        | Command::Lookup { .. }
-        | Command::Rex { .. }
-        | Command::Fillnull { .. }
-        | Command::Mvexpand { .. }
-        | Command::Spath { .. }
-        | Command::Append { .. }
-        | Command::Join { .. }
-        | Command::Format { .. }
-        | Command::Return { .. }
         | Command::Sample { .. }
-        | Command::Reverse
+        | Command::Reverse => {
+            *wants_full_rows = true;
+        }
+        // Join/append structurally need the wide base on BOTH sides, and their
+        // subsearch is a full pipeline of its own: walk it so fields it
+        // references (in particular ext/overflow fields, which must be
+        // materialized in the subsearch's base scan via `analyze_ext_fields`)
+        // are collected (NAN-1644).
+        Command::Append { subsearch, .. } | Command::Join { subsearch, .. } => {
+            *needs_all = true;
+            collect_required_fields_from_query(subsearch, fields, needs_all, wants_full_rows, profile);
+        }
+        // Wide commands that also reference specific event-side fields: the
+        // wide base still needs their ext/overflow references collected so
+        // `analyze_ext_fields` materializes them in stage_0 — the command SQL
+        // binds the projected alias (NAN-1644).
+        Command::Lookup { key_field, .. } => {
+            *needs_all = true;
+            fields.insert(canon_collect(key_field, profile));
+        }
+        Command::Fillnull {
+            fields: fill_fields,
+            ..
+        } => {
+            *needs_all = true;
+            if let Some(fs) = fill_fields {
+                for f in fs {
+                    fields.insert(canon_collect(f, profile));
+                }
+            }
+        }
+        Command::Mvexpand { field, .. } => {
+            *needs_all = true;
+            fields.insert(canon_collect(field, profile));
+        }
+        Command::Return {
+            fields: return_fields,
+            ..
+        } => {
+            *needs_all = true;
+            for f in return_fields {
+                fields.insert(canon_collect(f, profile));
+            }
+        }
+        // Commands that need all fields or don't affect field selection
+        Command::Rex { .. }
+        | Command::Spath { .. }
+        | Command::Format { .. }
         | Command::InputLookup { .. }
         | Command::Tree { .. } => {
             // These commands either need all fields or we can't easily determine requirements
@@ -717,7 +826,14 @@ pub(crate) fn analyze_ext_fields(
 ) -> HashSet<String> {
     let mut all_fields = HashSet::new();
     let mut needs_all = false;
-    collect_required_fields_from_query(query, &mut all_fields, &mut needs_all, profile);
+    let mut wants_full_rows = false;
+    collect_required_fields_from_query(
+        query,
+        &mut all_fields,
+        &mut needs_all,
+        &mut wants_full_rows,
+        profile,
+    );
 
     // Collect field names that are computed by the query pipeline (stats aliases,
     // sequence outputs, etc.) — these must NOT be materialized from ext JSON
@@ -726,6 +842,11 @@ pub(crate) fn analyze_ext_fields(
     // output column (NAN-1339) — materializing them from ext would shadow the
     // resolution with JSON junk in stage_0.
     let agg_aliases = collect_agg_reference_aliases(query, &computed);
+    // NAN-1644 (finding 2.6): group-by passthroughs ARE registered in
+    // `computed`, so dotted `ext.*` fields gate on the stage-OUTPUT set
+    // instead (names a stage creates with a NEW value — rename/spath targets —
+    // still lose; a group-by on `ext.foo` must be materialized in stage_0).
+    let stage_outputs = collect_stage_output_names(query);
 
     all_fields
         .into_iter()
@@ -741,8 +862,19 @@ pub(crate) fn analyze_ext_fields(
                 && !f.starts_with("metadata_")
                 && !f.starts_with("metadata.")
                 && !is_known_metadata_field(f)
-                && !f.contains('.')
-                && !computed.contains(f)
+                // NAN-1644 (finding 2.6): a dotted `ext.*` path the schema
+                // cannot resolve is a NATIVE ext-tail access, not metadata
+                // JSON — materialize `toString(ext.<key>) AS "ext.<key>"` in
+                // stage_0 exactly like the undotted spill fields, so every
+                // downstream GROUP BY / SORT / projection binds the stage_0
+                // alias (evaluated in the base scan, where ClickHouse 26.4
+                // JSON-subcolumn pruning applies). Other dotted names keep
+                // the legacy metadata JSON path and stay excluded here.
+                && (if f.contains('.') {
+                    f.starts_with("ext.") && !stage_outputs.contains(f)
+                } else {
+                    !computed.contains(f)
+                })
                 && !agg_aliases.contains_key(f)
                 // Skip fields added by post-processing commands (ai, anomaly, risk, etc.)
                 // These never exist in the ext JSON column
@@ -756,6 +888,47 @@ pub(crate) fn analyze_ext_fields(
                 )
         })
         .collect()
+}
+
+/// Output column names CREATED by pipeline stages — everything
+/// [`collect_computed_field_names`] registers EXCEPT stats/chart/eventstats
+/// group-by passthroughs, which are real base columns (or ext spills) that
+/// stage_0 must still project (NAN-1639). Used by `analyze_required_fields`
+/// to keep stage outputs referenced by downstream row commands (the injected
+/// `| sort -count`, `| where count > 10`) out of the stage_0 projection.
+fn collect_stage_output_names(query: &Query) -> HashSet<String> {
+    let mut out = collect_computed_field_names(query);
+    fn strip_group_bys(query: &Query, out: &mut HashSet<String>) {
+        let (source, command) = match query {
+            Query::Search(_) => return,
+            Query::Piped { source, command } => (source, command),
+        };
+        strip_group_bys(source, out);
+        match command {
+            Command::Stats {
+                group_by: Some(gb), ..
+            }
+            | Command::Chart {
+                group_by: Some(gb), ..
+            }
+            | Command::EventStats {
+                group_by: Some(gb), ..
+            } => {
+                for f in gb {
+                    out.remove(f.as_str());
+                }
+            }
+            // A join/append surfaces the SUBSEARCH's output columns —
+            // `collect_computed_from_command` registered its group-bys too,
+            // so they must be stripped as passthroughs here (NAN-1644).
+            Command::Join { subsearch, .. } | Command::Append { subsearch, .. } => {
+                strip_group_bys(subsearch, out);
+            }
+            _ => {}
+        }
+    }
+    strip_group_bys(query, &mut out);
+    out
 }
 
 /// Collect field names that are created/computed by query pipeline commands.
@@ -1123,6 +1296,135 @@ mod table_view_profile_tests {
         // OCSF-only promoted columns must never leak into the UDM projection.
         assert!(!f.contains("src_endpoint.ip"));
         assert!(!f.contains("class_uid"));
+    }
+
+    // ── NAN-1639 (findings 2.4 / 3.8): projection width under row-preserving
+    // pipes and pipeline-output references ─────────────────────────────────
+
+    fn analyze(q: &str, table_view: bool) -> Option<HashSet<String>> {
+        let query = parse_query(q).unwrap();
+        analyze_required_fields(&query, table_view, &UdmProfile::new())
+    }
+
+    /// Finding 2.4: every SAFE row-preserving pipe keeps the slim table_view
+    /// projection (plus its own referenced fields) instead of flipping to the
+    /// wide `SELECT *` + 78 MATERIALIZED re-adds (Saturn: 4.4x wall, 8-12x
+    /// memory at LIMIT 100).
+    #[test]
+    fn table_view_slim_projection_survives_safe_row_preserving_pipes() {
+        for (q, referenced) in [
+            ("error | where status=\"failure\"", Some("status")),
+            ("error | sort -bytes_out", Some("bytes_out")),
+            ("error | dedup src_ip", Some("src_ip")),
+            ("error | head 100", None),
+            ("error | tail 50", None),
+            ("error | reverse", None),
+            ("error | sample 10", None),
+        ] {
+            let fields = analyze(q, true)
+                .unwrap_or_else(|| panic!("safe pipe flipped to wide projection: {q}"));
+            // Core + the UDM summary set still present (same grid as bare searches).
+            for f in ["id", "timestamp", "message", "source_type", "src_ip", "user"] {
+                assert!(fields.contains(f), "{q}: slim projection missing {f}");
+            }
+            if let Some(f) = referenced {
+                assert!(fields.contains(f), "{q}: pipe-referenced field {f} missing");
+            }
+        }
+    }
+
+    /// Finding 2.4: commands that genuinely need the full column set keep the
+    /// wide projection, even in table_view.
+    #[test]
+    fn table_view_wide_projection_retained_for_structural_commands() {
+        for q in [
+            "error | lookup assets host AS src_host",
+            "error | rex \"(?P<foo>bar)\"",
+            "error | spath path=a.b",
+            "error | join src_ip [search error]",
+            "error | append [search error]",
+            "error | fillnull value=\"-\"",
+            "error | fields - message",
+            "error | table src_*",
+        ] {
+            assert!(
+                analyze(q, true).is_none(),
+                "structural command must keep the wide projection: {q}"
+            );
+        }
+    }
+
+    /// Finding 2.4 scope guard: NON-table_view raw-event output under a
+    /// row-preserving pipe keeps the historical full-row projection —
+    /// API/detection consumers see complete rows, unchanged.
+    #[test]
+    fn non_table_view_row_preserving_pipe_keeps_full_rows() {
+        for q in [
+            "error | where status=\"failure\"",
+            "error | sort -bytes_out",
+            "error | dedup src_ip",
+            "error | head 100",
+        ] {
+            assert!(
+                analyze(q, false).is_none(),
+                "non-table_view raw output must stay full-row: {q}"
+            );
+        }
+    }
+
+    /// Finding 3.8: the executor-injected `| sort -count` on grouped stats
+    /// must not force the wide stage_0, and the aggregation output alias must
+    /// NOT enter the required set (stage_0 would emit a bogus
+    /// `toString(ext.count) AS count`).
+    #[test]
+    fn injected_sort_on_grouped_stats_prunes_and_excludes_agg_outputs() {
+        for table_view in [false, true] {
+            let fields = analyze("* | stats count by src_ip | sort -count", table_view)
+                .expect("grouped stats + sort must keep the pruned projection");
+            assert!(fields.contains("src_ip"), "group-by passthrough must be projected");
+            assert!(
+                !fields.contains("count"),
+                "aggregation output alias leaked into stage_0 required fields"
+            );
+        }
+        // Explicit alias and `{func}_{field}` reference forms are excluded too.
+        let fields =
+            analyze("* | stats sum(bytes_out) as total by src_ip | sort -total", false).unwrap();
+        assert!(fields.contains("bytes_out"));
+        assert!(!fields.contains("total"));
+        let fields =
+            analyze("* | stats sum(bytes_out) by src_ip | sort -sum_bytes_out", false).unwrap();
+        assert!(!fields.contains("sum_bytes_out"));
+        // `| where` on an aggregation output is the same class of reference.
+        let fields = analyze("* | stats count by user | where count > 10", false).unwrap();
+        assert!(!fields.contains("count"));
+    }
+
+    /// A group-by passthrough that only exists in ext JSON must SURVIVE the
+    /// stage-output exclusion — required_fields is what materializes
+    /// `toString(ext.threat_name) AS threat_name` in stage_0.
+    #[test]
+    fn ext_group_by_passthrough_survives_stage_output_exclusion() {
+        let fields = analyze("* | stats count by threat_name | sort -count", false).unwrap();
+        assert!(fields.contains("threat_name"));
+        assert!(!fields.contains("count"));
+    }
+
+    /// A stage-output alias that COLLIDES with a real column referenced by an
+    /// EARLIER stage must not be evicted from stage_0 — the pre-stats
+    /// `where status=…` filters against the base column, which only exists
+    /// downstream if stage_0 projects it (codex second-pass finding).
+    #[test]
+    fn stage_output_alias_colliding_with_real_column_is_kept() {
+        let fields = analyze(
+            "error | where status=\"failure\" | stats sum(bytes_out) as status by src_ip",
+            false,
+        )
+        .expect("aggregated pipeline must prune");
+        assert!(
+            fields.contains("status"),
+            "base column referenced before the aliasing stage must stay projected"
+        );
     }
 
     #[test]

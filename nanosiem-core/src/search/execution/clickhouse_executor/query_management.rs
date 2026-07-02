@@ -177,25 +177,16 @@ impl ClickHouseExecutor {
         query_id: Option<&str>,
         settings: Option<&crate::search::admission::ClickHouseQuerySettings>,
     ) -> Result<u64, SearchError> {
-        // Extract FROM and WHERE clauses from base SQL
-        let base_upper = base_sql.to_uppercase();
-        let from_pos = base_upper.find(" FROM ").unwrap_or(0);
-        let where_pos = base_upper
-            .find(" WHERE ")
-            .or_else(|| base_upper.find(" PREWHERE "))
-            .unwrap_or(base_sql.len());
-        let order_pos = base_upper.find(" ORDER BY ").unwrap_or(base_sql.len());
-        let settings_pos = base_upper.find(" SETTINGS ").unwrap_or(base_sql.len());
-        let end_pos = order_pos.min(settings_pos);
-
-        let table_clause = &base_sql[from_pos..where_pos.min(end_pos)];
-        let conditions = if where_pos < end_pos {
-            &base_sql[where_pos..end_pos]
-        } else {
-            ""
-        };
-
-        let count_sql = format!("SELECT count(*) as cnt{}{}", table_clause, conditions);
+        // NAN-1635 (finding 3.4): wrap structurally instead of regex-slicing
+        // FROM/WHERE out of the SQL. The old slicing grabbed the first ` FROM `
+        // (stage_0's, inside the WITH) for every piped/CTE streamable query and
+        // emitted unbalanced-parenthesis SQL — ClickHouse Code 62 on every
+        // `error | where …` stream — and the caller swallowed the error, so
+        // total_count silently reported the delivered row count. Same fix as
+        // NAN-1159/1160 on the paginated count path. The caller regenerates the
+        // input with `limit: None` + `unordered`, so the wrap counts the full
+        // match set with no top-N sort.
+        let count_sql = super::sql_helpers::wrap_query_for_count(base_sql);
         debug!("Quick count SQL: {}", count_sql);
 
         let escaped_sql = escape_question_marks_in_strings(&count_sql);

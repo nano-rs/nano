@@ -484,25 +484,19 @@ fn eval_function_to_sql(
         "entropy" => {
             // Shannon entropy over the character array of the argument:
             //   H = -Σ p(c) * log2(p(c)) for each distinct character c.
-            // extractAll(str, '.') splits into individual characters (regex . = any char).
-            // The previous form wrapped this in a scalar subquery
-            //   (SELECT ... FROM (SELECT extractAll(arg,'.') AS chars))
-            // which failed with Code 48 (NOT_IMPLEMENTED) on a real column — the column
-            // could not be correlated into the derived table (NAN-1144). This inline form
-            // binds the char array exactly once by mapping a single-element array
-            // [extractAll(arg,'.')] through a lambda and taking element [1], so there is no
-            // subquery and extractAll is evaluated only once. Empty/single-char strings yield 0
-            // (the countEqual=0 guard avoids log2(0)/NaN).
+            // extractAll(str, '.') splits into individual characters (regex . = any char);
+            // arrayReduce applies ClickHouse's `entropy` aggregate over that array in
+            // one pass. Must stay INLINE (no subquery): an earlier scalar-subquery form
+            // failed Code 48 on real columns because the column could not be correlated
+            // into the derived table (NAN-1144). The previous inline lowering recomputed
+            // countEqual per distinct character — O(chars × distinct) array traversals
+            // per row, ~17GiB attempted at 4.1M rows (NAN-1632 3.1). Equivalence
+            // verified on real data incl. empty/single-char/unicode inputs (fp noise
+            // ≤4.44e-16); empty strings yield 0 (entropy over an empty array).
             let arg = arg_sqls
                 .first()
                 .ok_or_else(|| SqlGenError::InvalidQuery("entropy() requires 1 argument".into()))?;
-            Ok(format!(
-                "arrayMap(arr -> arrayReduce('sum', arrayMap(c -> \
-                 if(countEqual(arr, c) = 0, 0, \
-                 -(countEqual(arr, c) / length(arr)) * log2(countEqual(arr, c) / length(arr))), \
-                 arrayDistinct(arr))), [extractAll({}, '.')])[1]",
-                arg
-            ))
+            Ok(format!("arrayReduce('entropy', extractAll({}, '.'))", arg))
         }
 
         // ============================================================
@@ -1093,6 +1087,10 @@ fn eval_function_to_sql(
                     "match() requires 2 arguments (string, pattern)".into(),
                 ));
             }
+            // NAN-1640: deliberately a bare match() — eval args are arbitrary
+            // expressions (case-SENSITIVE semantics, pattern may itself be an
+            // expression), so the anchored prefix/suffix rewrite + text-index
+            // guard in build_optimized_regex_sql does not apply here.
             Ok(format!("match({}, {})", arg_sqls[0], arg_sqls[1]))
         }
         "regex_extract" | "extract_regex" => {

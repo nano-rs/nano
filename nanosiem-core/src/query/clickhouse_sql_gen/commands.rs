@@ -26,6 +26,10 @@ impl ClickHouseSqlGenerator {
         // True when the pipeline has exactly one resolve_identity — the stage
         // then also emits bare `identity_*` aliases (NAN-1346 #5).
         single_resolve_identity: bool,
+        // True when `source` is the deterministic base scan (stage_0 with no
+        // injected ORDER BY/LIMIT) — the only source the dedup survivor-id
+        // rewrite may scan twice (NAN-1636).
+        source_is_deterministic_base: bool,
     ) -> Result<String, SqlGenError> {
         // Whether the raw `timestamp` column still exists at this pipeline stage:
         // false after an aggregating command (stats/timechart/top/...) or after a
@@ -258,11 +262,46 @@ impl ClickHouseSqlGenerator {
                     .collect();
                 let partition_by = partition_fields.join(", ");
 
-                // ClickHouse uses LIMIT 1 BY for deduplication
-                Ok(format!(
-                    "  SELECT * FROM {}\n  ORDER BY {}, timestamp\n  LIMIT 1 BY {}",
-                    source, partition_by, partition_by
-                ))
+                // Survivor-id rewrite (NAN-1636). The legacy `ORDER BY <keys>,
+                // timestamp LIMIT 1 BY <keys>` full-sorts every wide (~200-column)
+                // row before the LIMIT BY — Code 241 (MergeSortingTransform OOM) at
+                // ≥~15min windows under the production 3GiB/query profile. Selecting
+                // survivor ids with argMin(id, timestamp) sorts nothing and keeps
+                // the same keep-oldest semantics (`keep_first` is ignored in both
+                // shapes; timestamp ties are nondeterministic in both; `id` is the
+                // unique per-row UUIDv7). Guards — ALL must hold, else keep the
+                // legacy shape:
+                //  - `source` must be the deterministic base scan: the rewrite
+                //    scans the source CTE twice (outer + IN-subquery), so a
+                //    nondeterministic upstream stage (`head` with no ORDER BY, a
+                //    LIMITed requery base) could sample different rows per scan;
+                //  - `id` must still exist at this stage — an upstream
+                //    include-mode `fields`/`table` that pruned it would make the
+                //    IN-subquery UNKNOWN_IDENTIFIER;
+                //  - `id`/`timestamp` must be the physical row identity — not an
+                //    upstream `eval id=…`/`eval timestamp=…` reassignment, and
+                //    only on profiles whose core columns carry them (logs, not
+                //    spans/metrics).
+                let id_available = match available_columns {
+                    None => true,
+                    Some(cols) => cols.contains("id"),
+                };
+                let id_is_row_identity = self.profile.core_fields().contains(&"id")
+                    && self.profile.core_fields().contains(&"timestamp")
+                    && !self.is_upstream_computed_field("id")
+                    && !self.is_upstream_computed_field("timestamp");
+                if source_is_deterministic_base && id_available && id_is_row_identity {
+                    Ok(format!(
+                        "  SELECT * FROM {src}\n  WHERE id IN (\n    SELECT argMin(id, timestamp) FROM {src}\n    GROUP BY {partition_by}\n  )",
+                        src = source
+                    ))
+                } else {
+                    // ClickHouse uses LIMIT 1 BY for deduplication
+                    Ok(format!(
+                        "  SELECT * FROM {}\n  ORDER BY {}, timestamp\n  LIMIT 1 BY {}",
+                        source, partition_by, partition_by
+                    ))
+                }
             }
             Command::Bin {
                 span,

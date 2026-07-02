@@ -10,7 +10,201 @@ use super::{extract_fields_from_search_expr, ClickHouseSqlGenerator};
 use crate::query::ast::*;
 use crate::query::sql_gen::SqlGenError;
 
+/// Sentinel substituted for NULL group keys in the map-scalar attach shape used
+/// by eventstats / anomaly (NAN-1642). Rows whose BY-key is NULL (reachable via
+/// `by ext.*` and any Nullable column) must land in the same group on BOTH the
+/// map-build side and the per-row lookup side, so they receive their group's
+/// aggregate instead of the Map default value (0 / ''). The leading NUL byte
+/// makes collision with a real key value practically impossible: no toString()
+/// rendering of a column value starts with '\0' unless the raw data itself
+/// contains NUL-prefixed binary, and `PARTITION BY` grouped NULLs together the
+/// same way before this rewrite.
+const NULL_KEY_SENTINEL: &str = "'\\0__null__'";
+
+/// Null-canonicalized group-key expression, used verbatim on both the
+/// map-build side (`GROUP BY __nano_k`) and the per-row lookup side
+/// (`__nano_map[<key>]`) so the two sides can never disagree on group
+/// membership.
+///
+/// Multi-key `by a, b` renders `toString(tuple(a, b))`: the tuple rendering
+/// quote-delimits and escapes each string component, so component boundaries
+/// are unambiguous for ANY content (including embedded NUL bytes), and NULL
+/// elements render as an unquoted `NULL` token — distinct from every quoted
+/// string — grouping exactly like `PARTITION BY a, b` did. Single-key uses
+/// the sentinel form; its only residual collision is a raw value literally
+/// equal to `\0__null__` (see [`NULL_KEY_SENTINEL`]).
+fn null_canonical_key_sql(key_exprs: &[String]) -> String {
+    if key_exprs.len() == 1 {
+        format!(
+            "coalesce(toString({}), {})",
+            key_exprs[0], NULL_KEY_SENTINEL
+        )
+    } else {
+        format!("toString(tuple({}))", key_exprs.join(", "))
+    }
+}
+
+/// Scalar subquery producing a per-group aggregate Map: canonicalized key →
+/// aggregate value(s). Attached per row via `map[<key>]`, this replaces the
+/// whole-partition window shape (`agg(x) OVER (PARTITION BY k)`), which
+/// buffers the entire partition and OOMs (Code 241) at production scale
+/// (NAN-1642: 24h/21.4M rows in 1.9s/155MiB where both the window and a LEFT
+/// JOIN join-back OOM — the JOIN defeats ClickHouse lazy materialization).
+/// The scalar is evaluated once per query (ClickHouse scalar-subquery cache).
+fn group_agg_map_sql(build_key_sql: &str, value_sql: &str, stats_source: &str) -> String {
+    format!(
+        "(SELECT mapFromArrays(groupArray(__nano_k), groupArray(__nano_v)) FROM \
+         (SELECT {} AS __nano_k, {} AS __nano_v FROM {} GROUP BY __nano_k))",
+        build_key_sql, value_sql, stats_source
+    )
+}
+
+/// Per-group (or global) z-score constants attach layer: annotates every row
+/// of `attach_source` with `avg_val` / `stddev_val` computed over
+/// `stats_source`. `keys` is `(build_key, lookup_key)` — the map-build side
+/// groups `stats_source` by `build_key`, each row of `attach_source` looks its
+/// group up via `lookup_key`; `None` means a single global group (plain scalar
+/// tuple, no map needed).
+fn zscore_attach_sql(
+    attach_source: &str,
+    stats_source: &str,
+    value_expr: &str,
+    keys: Option<(&str, &str)>,
+) -> String {
+    match keys {
+        None => format!(
+            "WITH (SELECT tuple(toFloat64(avg({v})), toFloat64(stddevPop({v}))) FROM {ss}) AS __nano_stats\n    \
+             SELECT *, __nano_stats.1 as avg_val, __nano_stats.2 as stddev_val\n    \
+             FROM {atk}",
+            v = value_expr,
+            ss = stats_source,
+            atk = attach_source
+        ),
+        Some((build_key, lookup_key)) => {
+            let map = group_agg_map_sql(
+                build_key,
+                &format!(
+                    "tuple(toFloat64(avg({v})), toFloat64(stddevPop({v})))",
+                    v = value_expr
+                ),
+                stats_source,
+            );
+            format!(
+                "WITH {map} AS __nano_stats\n    \
+                 SELECT *, __nano_stats[{lk}].1 as avg_val, __nano_stats[{lk}].2 as stddev_val\n    \
+                 FROM {atk}",
+                map = map,
+                lk = lookup_key,
+                atk = attach_source
+            )
+        }
+    }
+}
+
+/// Per-group (or global) MAD constants attach layer: annotates every row of
+/// `attach_source` with `median_val` / `mad_val` computed over `stats_source`.
+/// Two bounded GROUP BY passes replace the two stacked whole-partition
+/// quantile windows: the second map's build references the first
+/// (`__nano_med[__nano_k]`) to compute the median absolute deviation — the
+/// identical scalar text is computed once (scalar-subquery cache).
+fn mad_attach_sql(
+    attach_source: &str,
+    stats_source: &str,
+    value_expr: &str,
+    keys: Option<(&str, &str)>,
+) -> String {
+    match keys {
+        None => format!(
+            "WITH (SELECT toFloat64(quantile(0.5)({v})) FROM {ss}) AS __nano_med,\n      \
+             (SELECT toFloat64(quantile(0.5)(abs({v} - __nano_med))) FROM {ss}) AS __nano_mad\n    \
+             SELECT *, __nano_med as median_val, __nano_mad as mad_val\n    \
+             FROM {atk}",
+            v = value_expr,
+            ss = stats_source,
+            atk = attach_source
+        ),
+        Some((build_key, lookup_key)) => {
+            let med_map = group_agg_map_sql(
+                build_key,
+                &format!("toFloat64(quantile(0.5)({}))", value_expr),
+                stats_source,
+            );
+            let mad_map = group_agg_map_sql(
+                build_key,
+                &format!(
+                    "toFloat64(quantile(0.5)(abs({} - __nano_med[__nano_k])))",
+                    value_expr
+                ),
+                stats_source,
+            );
+            format!(
+                "WITH {med} AS __nano_med,\n      \
+                 {mad} AS __nano_mad\n    \
+                 SELECT *, __nano_med[{lk}] as median_val, __nano_mad[{lk}] as mad_val\n    \
+                 FROM {atk}",
+                med = med_map,
+                mad = mad_map,
+                lk = lookup_key,
+                atk = attach_source
+            )
+        }
+    }
+}
+
 impl ClickHouseSqlGenerator {
+    /// Shared z-score scoring wrapper: score/flag every row of the attach
+    /// layer against its group's avg/stddev. The math is unchanged from the
+    /// window-function era — only where the per-group constants come from
+    /// changed (NAN-1642).
+    fn zscore_outer_sql(
+        value_col: &str,
+        threshold: f64,
+        attach: &str,
+        filter_anomalies: bool,
+    ) -> String {
+        let filter = if filter_anomalies {
+            "\n  WHERE is_anomaly = 1"
+        } else {
+            ""
+        };
+        format!(
+            "  SELECT *, avg_val, stddev_val,\n    \
+             abs({v} - avg_val) / nullIf(stddev_val, 0) as anomaly_score,\n    \
+             if(abs({v} - avg_val) > {t} * stddev_val, 1, 0) as is_anomaly\n  \
+             FROM (\n    {attach}\n  ){filter}\n  \
+             ORDER BY anomaly_score DESC",
+            v = value_col,
+            t = threshold,
+            attach = attach,
+            filter = filter
+        )
+    }
+
+    /// Shared MAD scoring wrapper (see [`Self::zscore_outer_sql`]).
+    fn mad_outer_sql(
+        value_col: &str,
+        threshold: f64,
+        attach: &str,
+        filter_anomalies: bool,
+    ) -> String {
+        let filter = if filter_anomalies {
+            "\n  WHERE is_anomaly = 1"
+        } else {
+            ""
+        };
+        format!(
+            "  SELECT *, median_val, mad_val,\n    \
+             abs({v} - median_val) / nullIf(mad_val * 1.4826, 0) as anomaly_score,\n    \
+             if(abs({v} - median_val) > {t} * mad_val * 1.4826, 1, 0) as is_anomaly\n  \
+             FROM (\n    {attach}\n  ){filter}\n  \
+             ORDER BY anomaly_score DESC",
+            v = value_col,
+            t = threshold,
+            attach = attach,
+            filter = filter
+        )
+    }
+
     /// Generate SQL for streamstats command using window functions
     pub(super) fn generate_streamstats_sql(
         &self,
@@ -145,152 +339,197 @@ impl ClickHouseSqlGenerator {
         ))
     }
 
-    /// Generate SQL for eventstats command using window functions
+    /// Generate SQL for eventstats command using the map-scalar attach shape.
+    ///
+    /// NAN-1642: the previous whole-partition window emission
+    /// (`agg(x) OVER (PARTITION BY k)` / `OVER ()`) buffered the entire
+    /// partition in memory and OOM'd (Code 241) at ≥15min windows at
+    /// production scale. Per-group aggregates are now computed once into a
+    /// scalar Map (bounded GROUP BY memory) and attached per row via a map
+    /// lookup on the null-canonicalized key; with no `by` clause the whole
+    /// set is a single global group and a plain scalar subquery suffices.
     pub(super) fn generate_eventstats_sql(
         &self,
         source: &str,
         aggregations: &[Aggregation],
         group_by: &Option<Vec<String>>,
     ) -> Result<String, SqlGenError> {
-        let partition_clause = match group_by {
-            Some(fields) => {
-                let partition_fields: Vec<String> = fields
-                    .iter()
-                    .map(|f| by_field_sql(f, self))
-                    .collect();
-                partition_fields.join(", ")
+        let key_exprs: Vec<String> = group_by
+            .as_ref()
+            .map(|fields| fields.iter().map(|f| by_field_sql(f, self)).collect())
+            .unwrap_or_default();
+        let grouped = !key_exprs.is_empty();
+
+        let mut value_exprs: Vec<String> = Vec::with_capacity(aggregations.len());
+        let mut aliases: Vec<String> = Vec::with_capacity(aggregations.len());
+        for agg in aggregations {
+            let field_expr = agg
+                .field
+                .as_ref()
+                .map(|f| by_field_sql(f, self))
+                .unwrap_or_else(|| "*".to_string());
+
+            // Exhaustive on purpose. Previously the `_` arm silently emitted `count() OVER`
+            // for stdev/var/values/list/range/median/perc/mode/first/last/earliest/latest,
+            // returning a row count under the user's alias (NAN-1145). Every variant now maps
+            // to its real plain aggregate (mirroring streamstats/stats) or is rejected —
+            // never silently count(). A new AggFunc variant forces a decision here.
+            //
+            // Numeric-returning aggregates are toFloat64-normalized so map
+            // values have a uniform, non-surprising type; value-typed
+            // aggregates (min/max/first/last/earliest/latest/mode) keep the
+            // field's own type, and values()/list() stay String — matching
+            // the window emission's output types.
+            let value_expr = match agg.func {
+                AggFunc::Count => "toFloat64(count())".to_string(),
+                AggFunc::Dc => {
+                    // Same aggregates the window emission used: exact
+                    // count(DISTINCT) over the whole set, uniqExact per group.
+                    if grouped {
+                        format!("toFloat64(uniqExact({}))", field_expr)
+                    } else {
+                        format!("toFloat64(count(DISTINCT {}))", field_expr)
+                    }
+                }
+                AggFunc::EstDc => {
+                    // Approximate distinct count: bounded memory via
+                    // uniqCombined64 (~0.9% measured error).
+                    format!("toFloat64(uniqCombined64({}))", field_expr)
+                }
+                AggFunc::Sum => format!("toFloat64(sum({}))", field_expr),
+                AggFunc::Avg => format!("toFloat64(avg({}))", field_expr),
+                AggFunc::Min => format!("min({})", field_expr),
+                AggFunc::Max => format!("max({})", field_expr),
+                AggFunc::Stdev => format!("toFloat64(stddevPop({}))", field_expr),
+                AggFunc::Var => format!("toFloat64(varPop({}))", field_expr),
+                AggFunc::Range => format!("toFloat64(max({0}) - min({0}))", field_expr),
+                AggFunc::Median => format!("toFloat64(median({}))", field_expr),
+                AggFunc::Perc95 => format!("toFloat64(quantile(0.95)({}))", field_expr),
+                AggFunc::Percentile(p) => {
+                    format!(
+                        "toFloat64(quantile({})({}))",
+                        f64::from(p) / 100.0,
+                        field_expr
+                    )
+                }
+                AggFunc::Values => format!(
+                    "arrayStringConcat(arrayFilter(x -> x != '', \
+                     groupUniqArray({})(toString({}))), ', ')",
+                    self.max_group_array_size, field_expr
+                ),
+                AggFunc::List => format!(
+                    "arrayStringConcat(arrayFilter(x -> x != '', \
+                     groupArray({})(toString({}))), ', ')",
+                    self.max_group_array_size, field_expr
+                ),
+                AggFunc::First => format!("any({})", field_expr),
+                AggFunc::Last => format!("anyLast({})", field_expr),
+                AggFunc::Earliest => format!("argMin({}, timestamp)", field_expr),
+                AggFunc::Latest => format!("argMax({}, timestamp)", field_expr),
+                AggFunc::Mode => format!("(topK(1)({}))[1]", field_expr),
+                AggFunc::Sparkline => {
+                    return Err(SqlGenError::InvalidQuery(
+                        "eventstats does not support sparkline() — there is no whole-partition \
+                         window form; use timechart or stats sparkline() instead"
+                            .into(),
+                    ))
+                }
+                // NAN-1528: rate()/histogram_quantile() are OTLP-metric stats
+                // (need a min/max-over-window or quantileTDigest reduction);
+                // they have no whole-partition window form. Use stats/timechart
+                // on the `metrics` dataset instead.
+                AggFunc::Rate | AggFunc::HistogramQuantile(_) => {
+                    return Err(SqlGenError::InvalidQuery(
+                        "eventstats does not support rate()/histogram_quantile() — use \
+                         stats or timechart on the metrics dataset instead"
+                            .into(),
+                    ))
+                }
+            };
+
+            let alias = agg.alias.as_ref().cloned().unwrap_or_else(|| {
+                let func_name = match agg.func {
+                    AggFunc::Count => "count",
+                    AggFunc::Dc => "dc",
+                    AggFunc::EstDc => "estdc",
+                    AggFunc::Sum => "sum",
+                    AggFunc::Avg => "avg",
+                    AggFunc::Min => "min",
+                    AggFunc::Max => "max",
+                    AggFunc::Stdev => "stdev",
+                    AggFunc::Var => "var",
+                    AggFunc::Range => "range",
+                    AggFunc::Median => "median",
+                    AggFunc::Perc95 => "perc95",
+                    AggFunc::Percentile(_) => "percentile",
+                    AggFunc::Values => "values",
+                    AggFunc::List => "list",
+                    AggFunc::First => "first",
+                    AggFunc::Last => "last",
+                    AggFunc::Earliest => "earliest",
+                    AggFunc::Latest => "latest",
+                    AggFunc::Mode => "mode",
+                    AggFunc::Sparkline => "sparkline",
+                    AggFunc::Rate => "rate",
+                    AggFunc::HistogramQuantile(_) => "histogram_quantile",
+                };
+                match &agg.field {
+                    Some(f) => format!("{}_{}", func_name, normalize_field_name(f)),
+                    None => func_name.to_string(),
+                }
+            });
+
+            value_exprs.push(value_expr);
+            aliases.push(alias);
+        }
+
+        // One scalar per eventstats stage: multiple aggregations share a
+        // single tuple-valued map / scalar so the stage source is scanned
+        // once for the constants regardless of aggregation count.
+        let value_pack = if value_exprs.len() == 1 {
+            value_exprs[0].clone()
+        } else {
+            format!("tuple({})", value_exprs.join(", "))
+        };
+        let element = |i: usize, base: &str| -> String {
+            if value_exprs.len() == 1 {
+                base.to_string()
+            } else {
+                format!("{}.{}", base, i + 1)
             }
-            None => String::new(),
         };
 
-        let window_exprs: Vec<String> = aggregations
-            .iter()
-            .map(|agg| -> Result<String, SqlGenError> {
-                let field_expr = agg
-                    .field
-                    .as_ref()
-                    .map(|f| by_field_sql(f, self))
-                    .unwrap_or_else(|| "*".to_string());
-
-                // Whole-partition window (no ORDER BY): eventstats annotates every row with the
-                // group aggregate. Computed once and reused by every arm below.
-                let over = if partition_clause.is_empty() {
-                    "OVER ()".to_string()
-                } else {
-                    format!("OVER (PARTITION BY {})", partition_clause)
-                };
-
-                // Exhaustive on purpose. Previously the `_` arm silently emitted `count() OVER`
-                // for stdev/var/values/list/range/median/perc/mode/first/last/earliest/latest,
-                // returning a row count under the user's alias (NAN-1145). Every variant now maps
-                // to its real window aggregate (mirroring streamstats/stats) or is rejected —
-                // never silently count(). A new AggFunc variant forces a decision here.
-                let window_func = match agg.func {
-                    AggFunc::Count => format!("count() {}", over),
-                    AggFunc::Dc => {
-                        // ClickHouse has no distinct window function; over the whole set use a
-                        // scalar subquery, otherwise approximate with uniqExact over the partition.
-                        if partition_clause.is_empty() {
-                            format!("(SELECT count(DISTINCT {}) FROM {})", field_expr, source)
-                        } else {
-                            format!("uniqExact({}) {}", field_expr, over)
-                        }
-                    }
-                    AggFunc::EstDc => {
-                        // Approximate distinct count: same shape as dc() but bounded
-                        // memory via uniqCombined64 (~0.9% measured error).
-                        if partition_clause.is_empty() {
-                            format!("(SELECT uniqCombined64({}) FROM {})", field_expr, source)
-                        } else {
-                            format!("uniqCombined64({}) {}", field_expr, over)
-                        }
-                    }
-                    AggFunc::Sum => format!("sum({}) {}", field_expr, over),
-                    AggFunc::Avg => format!("avg({}) {}", field_expr, over),
-                    AggFunc::Min => format!("min({}) {}", field_expr, over),
-                    AggFunc::Max => format!("max({}) {}", field_expr, over),
-                    AggFunc::Stdev => format!("stddevPop({}) {}", field_expr, over),
-                    AggFunc::Var => format!("varPop({}) {}", field_expr, over),
-                    AggFunc::Range => format!("(max({0}) {1} - min({0}) {1})", field_expr, over),
-                    AggFunc::Median => format!("median({}) {}", field_expr, over),
-                    AggFunc::Perc95 => format!("quantile(0.95)({}) {}", field_expr, over),
-                    AggFunc::Percentile(p) => {
-                        format!("quantile({})({}) {}", f64::from(p) / 100.0, field_expr, over)
-                    }
-                    AggFunc::Values => format!(
-                        "arrayStringConcat(arrayFilter(x -> x != '', \
-                         groupUniqArray({})(toString({})) {}), ', ')",
-                        self.max_group_array_size, field_expr, over
-                    ),
-                    AggFunc::List => format!(
-                        "arrayStringConcat(arrayFilter(x -> x != '', \
-                         groupArray({})(toString({})) {}), ', ')",
-                        self.max_group_array_size, field_expr, over
-                    ),
-                    AggFunc::First => format!("any({}) {}", field_expr, over),
-                    AggFunc::Last => format!("anyLast({}) {}", field_expr, over),
-                    AggFunc::Earliest => format!("argMin({}, timestamp) {}", field_expr, over),
-                    AggFunc::Latest => format!("argMax({}, timestamp) {}", field_expr, over),
-                    AggFunc::Mode => format!("(topK(1)({}) {})[1]", field_expr, over),
-                    AggFunc::Sparkline => {
-                        return Err(SqlGenError::InvalidQuery(
-                            "eventstats does not support sparkline() — there is no whole-partition \
-                             window form; use timechart or stats sparkline() instead"
-                                .into(),
-                        ))
-                    }
-                    // NAN-1528: rate()/histogram_quantile() are OTLP-metric stats
-                    // (need a min/max-over-window or quantileTDigest reduction);
-                    // they have no whole-partition window form. Use stats/timechart
-                    // on the `metrics` dataset instead.
-                    AggFunc::Rate | AggFunc::HistogramQuantile(_) => {
-                        return Err(SqlGenError::InvalidQuery(
-                            "eventstats does not support rate()/histogram_quantile() — use \
-                             stats or timechart on the metrics dataset instead"
-                                .into(),
-                        ))
-                    }
-                };
-
-                let alias = agg.alias.as_ref().cloned().unwrap_or_else(|| {
-                    let func_name = match agg.func {
-                        AggFunc::Count => "count",
-                        AggFunc::Dc => "dc",
-                        AggFunc::EstDc => "estdc",
-                        AggFunc::Sum => "sum",
-                        AggFunc::Avg => "avg",
-                        AggFunc::Min => "min",
-                        AggFunc::Max => "max",
-                        AggFunc::Stdev => "stdev",
-                        AggFunc::Var => "var",
-                        AggFunc::Range => "range",
-                        AggFunc::Median => "median",
-                        AggFunc::Perc95 => "perc95",
-                        AggFunc::Percentile(_) => "percentile",
-                        AggFunc::Values => "values",
-                        AggFunc::List => "list",
-                        AggFunc::First => "first",
-                        AggFunc::Last => "last",
-                        AggFunc::Earliest => "earliest",
-                        AggFunc::Latest => "latest",
-                        AggFunc::Mode => "mode",
-                        AggFunc::Sparkline => "sparkline",
-                        AggFunc::Rate => "rate",
-                        AggFunc::HistogramQuantile(_) => "histogram_quantile",
-                    };
-                    match &agg.field {
-                        Some(f) => format!("{}_{}", func_name, normalize_field_name(f)),
-                        None => func_name.to_string(),
-                    }
-                });
-
-                Ok(format!("{} AS {}", window_func, escape_identifier(&alias)))
-            })
-            .collect::<Result<Vec<String>, SqlGenError>>()?;
+        let (with_scalar, attach_exprs) = if grouped {
+            let key_sql = null_canonical_key_sql(&key_exprs);
+            let map = group_agg_map_sql(&key_sql, &value_pack, source);
+            let attaches: Vec<String> = aliases
+                .iter()
+                .enumerate()
+                .map(|(i, alias)| {
+                    format!(
+                        "{} AS {}",
+                        element(i, &format!("__nano_es[{}]", key_sql)),
+                        escape_identifier(alias)
+                    )
+                })
+                .collect();
+            (map, attaches)
+        } else {
+            let scalar = format!("(SELECT {} FROM {})", value_pack, source);
+            let attaches: Vec<String> = aliases
+                .iter()
+                .enumerate()
+                .map(|(i, alias)| {
+                    format!("{} AS {}", element(i, "__nano_es"), escape_identifier(alias))
+                })
+                .collect();
+            (scalar, attaches)
+        };
 
         Ok(format!(
-            "  SELECT *, {} FROM {}",
-            window_exprs.join(", "),
+            "  WITH {} AS __nano_es\n  SELECT *, {} FROM {}",
+            with_scalar,
+            attach_exprs.join(", "),
             source
         ))
     }
@@ -722,11 +961,14 @@ impl ClickHouseSqlGenerator {
         }
 
         let field_expr = by_field_sql(field, self);
-        let partition_clause = if !by_exprs.is_empty() {
-            format!("PARTITION BY {}", by_exprs.join(", "))
-        } else {
-            String::new()
-        };
+        // NAN-1642: per-group z-score/MAD constants come from a map-scalar
+        // attach (or a plain scalar with no `by`) instead of whole-partition
+        // windows, which buffered every wide row of the partition and OOM'd
+        // (Code 241) at production scale. The scoring math is unchanged.
+        let lookup_key = (!by_exprs.is_empty()).then(|| null_canonical_key_sql(&by_exprs));
+        let keys = lookup_key
+            .as_deref()
+            .map(|k| (k, k));
 
         // Non-column numeric fields: aggregation/alias names that are not part of
         // any schema's column universe but are still numeric when statistical
@@ -769,40 +1011,12 @@ impl ClickHouseSqlGenerator {
             // Direct anomaly on numeric values
             match method {
                 AnomalyMethod::ZScore => {
-                    Ok(format!(
-                        "  SELECT *, avg_val, stddev_val,\n    \
-                        abs({field} - avg_val) / nullIf(stddev_val, 0) as anomaly_score,\n    \
-                        if(abs({field} - avg_val) > {threshold} * stddev_val, 1, 0) as is_anomaly\n  \
-                        FROM (\n    \
-                        SELECT *, avg({field}) OVER ({partition}) as avg_val,\n      \
-                        stddevPop({field}) OVER ({partition}) as stddev_val\n    \
-                        FROM {source}\n  )\n  \
-                        WHERE is_anomaly = 1\n  \
-                        ORDER BY anomaly_score DESC",
-                        field = field_expr,
-                        threshold = threshold,
-                        partition = partition_clause,
-                        source = source
-                    ))
+                    let attach = zscore_attach_sql(source, source, &field_expr, keys);
+                    Ok(Self::zscore_outer_sql(&field_expr, threshold, &attach, true))
                 }
                 AnomalyMethod::Mad => {
-                    Ok(format!(
-                        "  SELECT *, median_val, mad_val,\n    \
-                        abs({field} - median_val) / nullIf(mad_val * 1.4826, 0) as anomaly_score,\n    \
-                        if(abs({field} - median_val) > {threshold} * mad_val * 1.4826, 1, 0) as is_anomaly\n  \
-                        FROM (\n    \
-                        SELECT *, median_val,\n      \
-                        quantile(0.5)(abs({field} - median_val)) OVER ({partition}) as mad_val\n    \
-                        FROM (\n      \
-                        SELECT *, quantile(0.5)({field}) OVER ({partition}) as median_val\n      \
-                        FROM {source}\n    )\n  )\n  \
-                        WHERE is_anomaly = 1\n  \
-                        ORDER BY anomaly_score DESC",
-                        field = field_expr,
-                        threshold = threshold,
-                        partition = partition_clause,
-                        source = source
-                    ))
+                    let attach = mad_attach_sql(source, source, &field_expr, keys);
+                    Ok(Self::mad_outer_sql(&field_expr, threshold, &attach, true))
                 }
             }
         } else {
@@ -810,9 +1024,13 @@ impl ClickHouseSqlGenerator {
             // anomalously rare values. e.g. "anomaly field=process_name by user"
             // → count each (user, process_name) pair, find unusually low counts.
             //
-            // Uses window functions (not GROUP BY) to preserve all original columns
-            // (timestamp, etc.) for downstream commands like `| table timestamp`.
-            // Steps: window count per group → dedup to 1 row per group → anomaly stats.
+            // The window count + row_number dedup preserves all original columns
+            // (timestamp, etc.) for downstream commands like `| table timestamp`
+            // and is partitioned by (by-fields, field) — fine-grained partitions,
+            // not the OOM-class whole-set buffering. The per-BY-group stats over
+            // those pair counts, previously coarse whole-partition windows, come
+            // from a bounded pair-count GROUP BY instead (NAN-1642): one row per
+            // (by, field) pair carrying the same count `_anomaly_count` holds.
             let partition_cols = if !by_exprs.is_empty() {
                 format!("{}, {}", by_exprs.join(", "), field_expr)
             } else {
@@ -830,42 +1048,41 @@ impl ClickHouseSqlGenerator {
             );
             let count_field = "_anomaly_count";
 
+            // One row per (by, field) pair with its occurrence count — the same
+            // value distribution the stats windows previously aggregated over
+            // `count_source`, but built with plain GROUP BY memory bounds and
+            // without re-executing the windowed dedup.
+            let (pair_source, pair_keys): (String, Option<(&str, &str)>) = match &lookup_key {
+                Some(key) => (
+                    format!(
+                        "(SELECT {key} AS __nano_k, count() AS __nano_cnt FROM {source} \
+                         GROUP BY __nano_k, {field})",
+                        key = key,
+                        source = source,
+                        field = field_expr
+                    ),
+                    Some(("__nano_k", key.as_str())),
+                ),
+                None => (
+                    format!(
+                        "(SELECT count() AS __nano_cnt FROM {source} GROUP BY {field})",
+                        source = source,
+                        field = field_expr
+                    ),
+                    None,
+                ),
+            };
+
             match method {
                 AnomalyMethod::ZScore => {
-                    Ok(format!(
-                        "  SELECT *, avg_val, stddev_val,\n    \
-                        abs({cf} - avg_val) / nullIf(stddev_val, 0) as anomaly_score,\n    \
-                        if(abs({cf} - avg_val) > {threshold} * stddev_val, 1, 0) as is_anomaly\n  \
-                        FROM (\n    \
-                        SELECT *, avg({cf}) OVER ({partition}) as avg_val,\n      \
-                        stddevPop({cf}) OVER ({partition}) as stddev_val\n    \
-                        FROM {count_source}\n  )\n  \
-                        WHERE is_anomaly = 1\n  \
-                        ORDER BY anomaly_score DESC",
-                        cf = count_field,
-                        threshold = threshold,
-                        partition = partition_clause,
-                        count_source = count_source
-                    ))
+                    let attach =
+                        zscore_attach_sql(&count_source, &pair_source, "__nano_cnt", pair_keys);
+                    Ok(Self::zscore_outer_sql(count_field, threshold, &attach, true))
                 }
                 AnomalyMethod::Mad => {
-                    Ok(format!(
-                        "  SELECT *, median_val, mad_val,\n    \
-                        abs({cf} - median_val) / nullIf(mad_val * 1.4826, 0) as anomaly_score,\n    \
-                        if(abs({cf} - median_val) > {threshold} * mad_val * 1.4826, 1, 0) as is_anomaly\n  \
-                        FROM (\n    \
-                        SELECT *, median_val,\n      \
-                        quantile(0.5)(abs({cf} - median_val)) OVER ({partition}) as mad_val\n    \
-                        FROM (\n      \
-                        SELECT *, quantile(0.5)({cf}) OVER ({partition}) as median_val\n      \
-                        FROM {count_source}\n    )\n  )\n  \
-                        WHERE is_anomaly = 1\n  \
-                        ORDER BY anomaly_score DESC",
-                        cf = count_field,
-                        threshold = threshold,
-                        partition = partition_clause,
-                        count_source = count_source
-                    ))
+                    let attach =
+                        mad_attach_sql(&count_source, &pair_source, "__nano_cnt", pair_keys);
+                    Ok(Self::mad_outer_sql(count_field, threshold, &attach, true))
                 }
             }
         }
@@ -924,39 +1141,21 @@ impl ClickHouseSqlGenerator {
             source = source
         );
 
+        // NAN-1642: the global stats over the per-group aggregates were
+        // whole-set windows (`… OVER ()`) buffering every group row; the same
+        // constants now come from a scalar tuple over `agg_source` (a single
+        // global group — every group's value is scored against the whole
+        // distribution, unchanged). No is_anomaly filter on this path: all
+        // groups are returned, scored.
         let val = "_agg_value";
         match method {
             AnomalyMethod::ZScore => {
-                Ok(format!(
-                    "  SELECT *, avg_val, stddev_val,\n    \
-                    abs({val} - avg_val) / nullIf(stddev_val, 0) as anomaly_score,\n    \
-                    if(abs({val} - avg_val) > {threshold} * stddev_val, 1, 0) as is_anomaly\n  \
-                    FROM (\n    \
-                    SELECT *, avg({val}) OVER () as avg_val,\n      \
-                    stddevPop({val}) OVER () as stddev_val\n    \
-                    FROM {agg_source}\n  )\n  \
-                    ORDER BY anomaly_score DESC",
-                    val = val,
-                    threshold = threshold,
-                    agg_source = agg_source,
-                ))
+                let attach = zscore_attach_sql(&agg_source, &agg_source, val, None);
+                Ok(Self::zscore_outer_sql(val, threshold, &attach, false))
             }
             AnomalyMethod::Mad => {
-                Ok(format!(
-                    "  SELECT *, median_val, mad_val,\n    \
-                    abs({val} - median_val) / nullIf(mad_val * 1.4826, 0) as anomaly_score,\n    \
-                    if(abs({val} - median_val) > {threshold} * mad_val * 1.4826, 1, 0) as is_anomaly\n  \
-                    FROM (\n    \
-                    SELECT *, median_val,\n      \
-                    quantile(0.5)(abs({val} - median_val)) OVER () as mad_val\n    \
-                    FROM (\n      \
-                    SELECT *, quantile(0.5)({val}) OVER () as median_val\n      \
-                    FROM {agg_source}\n    )\n  )\n  \
-                    ORDER BY anomaly_score DESC",
-                    val = val,
-                    threshold = threshold,
-                    agg_source = agg_source,
-                ))
+                let attach = mad_attach_sql(&agg_source, &agg_source, val, None);
+                Ok(Self::mad_outer_sql(val, threshold, &attach, false))
             }
         }
     }

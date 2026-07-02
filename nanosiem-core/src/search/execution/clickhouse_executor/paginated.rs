@@ -11,21 +11,60 @@ use tracing::debug;
 use super::super::traits::SqlExecutor;
 use super::sql_helpers::{
     build_count_query, escape_question_marks_in_strings, inject_limit_offset, is_aggregation_query,
+    BoundedCountInput,
 };
 use super::types::ClickHouseExecutor;
 use crate::search::{parse_clickhouse_error, SearchError, StreamingChunk};
+
+/// NAN-1645 (finding 3.5): companion queries (count / histogram) only run for
+/// the FIRST page of a paginated search.
+///
+/// The count companion re-scans the full match set and the histogram
+/// re-aggregates the full window on every page flip, yet both are
+/// page-invariant — page 1 already delivered the exact total and the timeline.
+/// The result cache keys include the offset, so nothing absorbs the repeat
+/// work. Subsequent pages return [`paged_total_estimate`] instead (mirroring
+/// the long-standing `SqlExecutor::execute_sql` no-query-id path) and omit the
+/// histogram; the frontend freezes the page-1 values across flips.
+///
+/// 43155f11's rationale (never pay the count sequentially — run it in parallel
+/// with the data query) is preserved: when the companion DOES run (page 1), it
+/// still runs under `tokio::join!`.
+///
+/// Call sites: the count gate in both paginated executor variants below, and
+/// the histogram spawn gate in `service/core_search.rs`.
+pub(crate) fn is_first_page(offset: usize) -> bool {
+    offset == 0
+}
+
+/// Total estimate for offset>0 pages, where no count companion ran (NAN-1645).
+///
+/// A full page signals "there is probably more" — the estimate stays ahead of
+/// what the client has so next-page fetches remain enabled. A partial page is
+/// definitively the last one, so `offset + returned` is exact.
+pub(crate) fn paged_total_estimate(offset: usize, returned: usize, limit: usize) -> u64 {
+    if returned >= limit {
+        (offset + returned + limit) as u64
+    } else {
+        (offset + returned) as u64
+    }
+}
 
 impl ClickHouseExecutor {
     /// Execute a SQL query with a custom query_id for cancellation support
     ///
     /// The query_id is set via the ClickHouse client API (not SETTINGS clause)
     /// which allows tracking and cancellation via KILL QUERY.
+    ///
+    /// `bounded_count`: caller-supplied bounded input for the count companion
+    /// (NAN-1635, finding 2.3) — `None` keeps the unbounded wrap.
     pub async fn execute_sql_with_query_id(
         &self,
         sql: &str,
         limit: usize,
         offset: usize,
         query_id: &str,
+        bounded_count: Option<BoundedCountInput<'_>>,
     ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
         // Check if this is an aggregation query that needs all data
         if is_aggregation_query(sql) {
@@ -64,22 +103,33 @@ impl ClickHouseExecutor {
 
             let paginated_sql = inject_limit_offset(sql, limit, offset);
 
-            // Always run count in parallel with data query to avoid sequential latency.
-            // For first page with few results (< limit), the count query result is
-            // discarded in favor of the exact row count, but the parallel execution
-            // avoids the worst case where data finishes fast and count adds 200ms+.
+            // NAN-1645: page flips (offset > 0) skip the count companion — the
+            // exact total was already delivered with page 1.
+            if !is_first_page(offset) {
+                let results = self
+                    .execute_dynamic_query_with_query_id(&paginated_sql, query_id)
+                    .await?;
+                let total_count = paged_total_estimate(offset, results.len(), limit);
+                return Ok((results, total_count));
+            }
+
+            // First page: run count in parallel with the data query to avoid
+            // sequential latency (43155f11). For a first page with few results
+            // (< limit), the count query result is discarded in favor of the
+            // exact row count, but the parallel execution avoids the worst case
+            // where data finishes fast and count adds 200ms+.
             //
             // NAN-1428: the companion carries the derived `{query_id}-count` id so
             // cancellation kills it together with the data query.
-            let count_sql = build_count_query(sql);
+            let count_sql = build_count_query(sql, bounded_count);
             let count_qid = format!("{query_id}-count");
             let (results, count_result) = tokio::join!(
                 self.execute_dynamic_query_with_query_id(&paginated_sql, query_id),
                 self.execute_count_query_with_options(&count_sql, Some(&count_qid), None)
             );
             let results = results?;
-            let total_count = if results.len() < limit && offset == 0 {
-                // Got fewer results than requested on first page — exact count known
+            let total_count = if results.len() < limit {
+                // Got fewer results than requested on the first page — exact count known
                 results.len() as u64
             } else {
                 count_result.unwrap_or(results.len() as u64)
@@ -89,6 +139,9 @@ impl ClickHouseExecutor {
     }
 
     /// Execute a paginated SQL query with per-query ClickHouse settings
+    ///
+    /// `bounded_count`: caller-supplied bounded input for the count companion
+    /// (NAN-1635, finding 2.3) — `None` keeps the unbounded wrap.
     pub async fn execute_sql_with_settings(
         &self,
         sql: &str,
@@ -96,6 +149,7 @@ impl ClickHouseExecutor {
         offset: usize,
         query_id: &str,
         settings: &crate::search::admission::ClickHouseQuerySettings,
+        bounded_count: Option<BoundedCountInput<'_>>,
     ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
         if is_aggregation_query(sql) {
             debug!("Detected aggregation query with settings, using full scan");
@@ -127,16 +181,27 @@ impl ClickHouseExecutor {
 
             let paginated_sql = inject_limit_offset(sql, limit, offset);
 
+            // NAN-1645: page flips (offset > 0) skip the count companion — the
+            // exact total was already delivered with page 1.
+            if !is_first_page(offset) {
+                let results = self
+                    .execute_dynamic_query_with_settings(&paginated_sql, query_id, settings)
+                    .await?;
+                let total_count = paged_total_estimate(offset, results.len(), limit);
+                return Ok((results, total_count));
+            }
+
+            // First page: parallel count (43155f11).
             // NAN-1428: derived id + the same per-priority settings for the
             // count companion (settings change no result rows).
-            let count_sql = build_count_query(sql);
+            let count_sql = build_count_query(sql, bounded_count);
             let count_qid = format!("{query_id}-count");
             let (results, count_result) = tokio::join!(
                 self.execute_dynamic_query_with_settings(&paginated_sql, query_id, settings),
                 self.execute_count_query_with_options(&count_sql, Some(&count_qid), Some(settings))
             );
             let results = results?;
-            let total_count = if results.len() < limit && offset == 0 {
+            let total_count = if results.len() < limit {
                 results.len() as u64
             } else {
                 count_result.unwrap_or(results.len() as u64)
@@ -293,6 +358,9 @@ impl ClickHouseExecutor {
     }
 }
 
+#[cfg(test)]
+mod tests;
+
 impl SqlExecutor for ClickHouseExecutor {
     async fn execute_sql(
         &self,
@@ -337,7 +405,7 @@ impl SqlExecutor for ClickHouseExecutor {
             if offset == 0 {
                 // First page: run data query and count query in parallel
                 // This gives us exact total count while still benefiting from early LIMIT
-                let count_sql = build_count_query(sql);
+                let count_sql = build_count_query(sql, None);
                 debug!("Count SQL: {}", count_sql);
 
                 let (data_result, count_result) = tokio::join!(
@@ -359,15 +427,7 @@ impl SqlExecutor for ClickHouseExecutor {
                 // The UI already has the total count from the first page
                 // Return a high estimate to signal "there might be more"
                 let results = self.execute_sql_to_json(&paginated_sql).await?;
-
-                // Return estimate that's definitely higher than current position if we got a full page
-                let estimated_total = if results.len() >= limit {
-                    // Got a full page, there's probably more
-                    (offset + results.len() + limit) as u64
-                } else {
-                    // Partial page, this is the last page
-                    (offset + results.len()) as u64
-                };
+                let estimated_total = paged_total_estimate(offset, results.len(), limit);
 
                 debug!(
                     "Page at offset {}: {} results, estimated total {}",

@@ -679,6 +679,14 @@ pub fn recent_traces_sql(time_range: &TimeRange, filters: &TraceListFilters) -> 
 /// dropdown source. Returns `metric_name` rows, optionally restricted to a
 /// single `service_name`, name-ordered. `LIMIT 10000` is an ample cap for a
 /// dropdown (metric cardinality is bounded by instrumentation, not data volume).
+///
+/// This dropdown is deliberately UNBOUNDED in time (bounding it would drop names
+/// that stopped reporting inside the window — lossy), so it reads the minute
+/// rollup `nanosiem.otel_metrics_1m` (migration 144) rather than the raw table:
+/// the rollup is keyed (metric_name, service_name, minute) and carries the
+/// identical name universe at orders of magnitude fewer rows (NAN-1632 3.12).
+/// It must stay on `_1m` — the `_1h` rollup keeps 400d vs the shared 90d TTL of
+/// `_1m`/raw, so past day 90 it would return a stale-name superset.
 pub fn metric_names_sql(service_name: Option<&str>) -> String {
     let mut filter = String::new();
     if let Some(svc) = service_name {
@@ -688,7 +696,7 @@ pub fn metric_names_sql(service_name: Option<&str>) -> String {
     }
     format!(
         "SELECT DISTINCT metric_name\n\
-         FROM nanosiem.otel_metrics{filter}\n\
+         FROM nanosiem.otel_metrics_1m{filter}\n\
          ORDER BY metric_name ASC\n\
          LIMIT 10000"
     )
@@ -974,20 +982,32 @@ pub enum SliKind {
     Latency,
 }
 
-/// SQL that computes one SLO's attainment over its window from `otel_spans`
-/// (NAN-1536). Returns a single row `(total, good)` for `service` over
-/// `[time_range]` (the api layer passes `now - window_days .. now`):
+/// SQL that computes one SLO's attainment over its window (NAN-1536). Returns a
+/// single row `(total, good)` for `service` over `[time_range]` (the api layer
+/// passes `now - window_days .. now`):
 ///   - `total` — all spans for the service in the window;
 ///   - `good`  — for [`SliKind::Availability`], non-ERROR spans; for
 ///     [`SliKind::Latency`], spans with `duration_ns <= threshold_ms * 1e6`.
 ///
 /// The api/PG slice owns SLO CRUD + the scalar math (`current = good/total`,
-/// `budget_remaining_pct`, `burn_rate`, `status`); this is purely the spans-based
+/// `budget_remaining_pct`, `burn_rate`, `status`); this is purely the
 /// numerator/denominator. For [`SliKind::Latency`], `latency_threshold_ms` must
 /// be supplied (the api layer validates this when `sli_kind = latency`); passed
 /// as `None` it degrades to the availability `good` definition so the query never
 /// errors. `service` is escaped; the threshold is a numeric literal (no
 /// injection surface). Single time-bound WHERE, no GROUP BY (one scalar row).
+///
+/// The availability SLI reads the minute rollup `nanosiem.otel_service_red_1m`
+/// instead of counting raw spans (NAN-1632 3.13): its synchronous MV carries
+/// exact per-minute request/error sums, so `sum(request_count)` /
+/// `sum(request_count) - sum(error_count)` equal the raw `count()` /
+/// `countIf(status_code != 'ERROR')` over the same buckets (TTL-matched,
+/// non-Nullable). The window start is floored to the minute so the first bucket
+/// is complete rather than truncated (≤1-minute edge skew either way — the
+/// NAN-1539 rollup reads accepted the same shape; negligible against day-scale
+/// SLO windows). Latency SLIs need the per-span duration threshold, which no
+/// rollup carries — they stay on raw `otel_spans` (as does the degraded
+/// missing-threshold latency fallback, keeping its historical shape).
 pub fn slo_compute_sql(
     service: &str,
     sli_kind: SliKind,
@@ -995,20 +1015,40 @@ pub fn slo_compute_sql(
     time_range: &TimeRange,
 ) -> String {
     let svc = escape_string(service);
-    let good_expr = match sli_kind {
-        SliKind::Availability => "countIf(status_code != 'ERROR')".to_string(),
-        SliKind::Latency => {
-            // Threshold ms → ns; finite-guard the literal (NaN/Inf would emit an
-            // un-parseable token). A missing/invalid threshold falls back to the
-            // availability definition so the SLO still computes a number.
-            match latency_threshold_ms.filter(|v| v.is_finite() && *v >= 0.0) {
-                Some(ms) => {
-                    let threshold_ns = (ms * 1e6).round() as u64;
-                    format!("countIf(duration_ns <= {threshold_ns})")
-                }
-                None => "countIf(status_code != 'ERROR')".to_string(),
-            }
+    if sli_kind == SliKind::Availability {
+        // Floor the start bound to the minute (rollup rows are keyed by
+        // toStartOfMinute). The end bound needs no alignment: minute keys
+        // are already aligned, so `minute <= end` selects the same buckets
+        // as `minute <= floor(end)`.
+        use chrono::Timelike;
+        let start_aligned = time_range
+            .start
+            .with_second(0)
+            .and_then(|t| t.with_nanosecond(0))
+            .unwrap_or(time_range.start);
+        return format!(
+            "SELECT sum(request_count) AS total,\n       \
+                    sum(request_count) - sum(error_count) AS good\n\
+             FROM nanosiem.otel_service_red_1m\n\
+             WHERE otel_service_red_1m.minute BETWEEN '{start}' AND '{end}'\n  \
+               AND service_name = '{svc}'\n\
+             LIMIT 1",
+            // Second-precision bounds — the rollup `minute` is a DateTime,
+            // not DateTime64 (see services_overview_sql; %.6f fails Code 53).
+            start = crate::sql_hygiene::format_ch_bound(&start_aligned),
+            end = crate::sql_hygiene::format_ch_bound(&time_range.end),
+        );
+    }
+    // Latency SLI, on raw spans. Threshold ms → ns; finite-guard the literal
+    // (NaN/Inf would emit an un-parseable token). A missing/invalid threshold
+    // falls back to the availability definition so the SLO still computes a
+    // number.
+    let good_expr = match latency_threshold_ms.filter(|v| v.is_finite() && *v >= 0.0) {
+        Some(ms) => {
+            let threshold_ns = (ms * 1e6).round() as u64;
+            format!("countIf(duration_ns <= {threshold_ns})")
         }
+        None => "countIf(status_code != 'ERROR')".to_string(),
     };
     format!(
         "SELECT count() AS total,\n       \
@@ -1419,22 +1459,22 @@ pub const SERVICE_ENTITY_CAP: u32 = 100;
 
 /// SQL for the distinct non-empty entities (src_ip + host) a service touched
 /// over `[time_range]`, from `otel_spans` (NAN-1542). One column `entity`,
-/// unioned from the `src_ip` and `host` span columns, empties dropped. Bounded
-/// by `SERVICE_ENTITY_CAP` so the downstream signal `IN (...)` stays small.
-/// `service` is escaped; single time-bound WHERE on `start_time`.
+/// `arrayJoin`ed from the `src_ip` and `host` span columns in a single scan —
+/// the previous `UNION ALL` read the same granules twice under an identical
+/// predicate (NAN-1632 3.14). The empty filter MUST stay on the OUTER level:
+/// a same-level `WHERE entity != ''` gets the `arrayJoin([...])` expression
+/// alias-substituted into it, which is a second independent arrayJoin, not a
+/// filter on the projected one. Bounded by `SERVICE_ENTITY_CAP` so the
+/// downstream signal `IN (...)` stays small. `service` is escaped; single
+/// time-bound WHERE on `start_time`.
 pub fn service_entities_sql(service: &str, time_range: &TimeRange) -> String {
     let svc = escape_string(service);
     format!(
         "SELECT DISTINCT entity FROM (\n  \
-           SELECT src_ip AS entity\n  \
+           SELECT arrayJoin([src_ip, host]) AS entity\n  \
            FROM nanosiem.otel_spans\n  \
            WHERE otel_spans.start_time BETWEEN '{start}' AND '{end}'\n    \
-             AND service_name = '{svc}' AND src_ip != ''\n  \
-           UNION ALL\n  \
-           SELECT host AS entity\n  \
-           FROM nanosiem.otel_spans\n  \
-           WHERE otel_spans.start_time BETWEEN '{start}' AND '{end}'\n    \
-             AND service_name = '{svc}' AND host != ''\n\
+             AND service_name = '{svc}'\n\
          )\n\
          WHERE entity != ''\n\
          LIMIT {cap}",

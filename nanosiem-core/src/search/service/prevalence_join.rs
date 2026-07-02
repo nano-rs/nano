@@ -36,10 +36,27 @@ impl SearchService {
         // Strip prevalence and post-prevalence commands from query for base SQL generation
         let base_query = strip_prevalence_and_after(query);
 
-        // Generate base SQL for the search part
+        // Generate base SQL for the search part.
+        //
+        // NAN-1635: `limit: None` — the prevalence wrapper owns the result
+        // bound (generate_prevalence_join_sql appends its own LIMIT) and the
+        // ORDER-BY-anchored stripper below only removes a trailing
+        // `ORDER BY … [LIMIT …]`. With the CTE tail now applying the default
+        // safety limit (finding 3.6), a projected base (`… | fields - x |
+        // prevalence`) ends in a bare `LIMIT 1000000 SETTINGS …` the stripper
+        // would miss, silently truncating the prevalence base set. Emitting no
+        // generator LIMIT reproduces the pre-3.6 base byte-for-byte after the
+        // strip. The implicit trailing ORDER BY is kept (NOT `unordered`): the
+        // stripper anchors on the LAST ` order by `, and removing the final
+        // one would make it truncate mid-CTE at an internal stage's ORDER BY
+        // (e.g. dedup's `ORDER BY … LIMIT 1 BY …`).
+        let base_options = crate::query::QueryOptions {
+            limit: None,
+            ..Default::default()
+        };
         let base_sql = self
             .ch_sql_generator
-            .generate(&base_query, time_range)
+            .generate_with_options(&base_query, time_range, &base_options)
             .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
 
         // NAN-362: Prior to the dict-based rewrite, this path built CTEs that aggregated the
@@ -240,8 +257,12 @@ impl SearchService {
         };
 
         // Generate histogram using cleaned query (with time modifiers removed)
-        // Skip if requested for detection execution
-        let histogram = if request.skip_histogram {
+        // Skip if requested for detection execution.
+        // NAN-1645: also skip on page flips (offset > 0) — the histogram is
+        // page-invariant and the frontend freezes the page-1 timeline.
+        let histogram = if request.skip_histogram
+            || !crate::search::execution::clickhouse_executor::is_first_page(offset)
+        {
             None
         } else {
             let histogram_start = Instant::now();

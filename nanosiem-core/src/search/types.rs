@@ -388,7 +388,13 @@ pub struct HistogramBucket {
 pub struct SearchResponse {
     /// The search results as JSON values
     pub results: Vec<serde_json::Value>,
-    /// Total count of matching records (before limit/offset)
+    /// Total count of matching records (before limit/offset).
+    ///
+    /// Exact for first-page requests (offset 0). Page flips (offset > 0) skip
+    /// the count companion (NAN-1645) and report a monotonic estimate instead:
+    /// `offset + returned + limit` when a full page came back (signals "more"),
+    /// `offset + returned` (exact) on a partial last page. Clients should keep
+    /// the page-1 total across flips.
     pub total_count: u64,
     /// Query execution time in milliseconds
     pub execution_time_ms: u64,
@@ -396,7 +402,11 @@ pub struct SearchResponse {
     pub fields: Vec<FieldInfo>,
     /// The generated SQL (if requested)
     pub generated_sql: Option<String>,
-    /// Event histogram for timeline visualization
+    /// Event histogram for timeline visualization.
+    ///
+    /// Omitted when `skip_histogram` was set, when the display type renders no
+    /// timeline (NAN-1429), and on page flips (offset > 0, NAN-1645) — the
+    /// histogram is page-invariant, so clients keep the page-1 timeline.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub histogram: Option<Vec<HistogramBucket>>,
     /// Query performance warnings (query cost analysis)

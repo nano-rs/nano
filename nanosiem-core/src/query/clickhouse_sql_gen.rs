@@ -528,6 +528,16 @@ pub struct QueryOptions {
     /// User-level limits (`| head N`, subsearch caps) are emitted regardless —
     /// they are query semantics, not pagination.
     pub limit: Option<usize>,
+    /// Emit no trailing result ORDER BY (the generator's implicit
+    /// `ORDER BY <time> DESC` on raw-event output). Companion queries
+    /// (histogram, count) wrap the SQL in an aggregation where row order is
+    /// irrelevant — and under the count companion's bounded inner LIMIT a
+    /// trailing ORDER BY becomes a semantic top-N that ClickHouse cannot
+    /// elide, defeating early termination (NAN-1635). This is the structural
+    /// alternative to string-stripping ORDER BY from generated SQL, which
+    /// truncates mid-literal (NAN-1160). User-level ordering (`| sort`) is
+    /// query semantics and keeps its ORDER BY inside its own stage.
+    pub unordered: bool,
 }
 
 impl Default for QueryOptions {
@@ -538,6 +548,7 @@ impl Default for QueryOptions {
             // Safety bound for callers that execute the generated SQL directly
             // (explain, detection, …) without an executor-side pagination step.
             limit: Some(ClickHouseSqlGenerator::DEFAULT_RESULT_LIMIT),
+            unordered: false,
         }
     }
 }
@@ -769,6 +780,18 @@ pub struct ClickHouseSqlGenerator {
     max_mvexpand_rows: usize,
     /// Time range set during generation for subsearch IN subqueries
     generation_time_range: RwLock<Option<TimeRange>>,
+    /// True once a generated stage has rewritten the `timestamp` column
+    /// WITHOUT registering it in `upstream_computed_fields` (`bin timestamp
+    /// span=…` in-place, `table x as timestamp` — see
+    /// `command_rewrites_timestamp`) — rewritten values can precede the query
+    /// window start, so the resolve_identity ASOF build-side bound (NAN-1638)
+    /// must not be applied after one. Registered rewriters (eval/rename/rex/
+    /// spath/stats aliases) are caught via the upstream-computed set instead.
+    /// Maintained by `note_upstream_computed`; deliberately NOT swapped with
+    /// the subsearch scope: a rewrite in either scope keeps the bound off for
+    /// the rest of the generation (conservative — falls back to the legacy
+    /// unbounded join). Reset by `generate_with_options`.
+    upstream_timestamp_rewritten: RwLock<bool>,
     /// Field names produced by earlier pipeline commands (eval, stats aliases,
     /// risk, …), set at the start of generation. A name in this set is a real
     /// column in the current scope, so it must be referenced directly even when
@@ -822,6 +845,7 @@ impl Clone for ClickHouseSqlGenerator {
             max_group_array_size: self.max_group_array_size,
             max_mvexpand_rows: self.max_mvexpand_rows,
             generation_time_range: RwLock::new(None),
+            upstream_timestamp_rewritten: RwLock::new(false),
             computed_fields: RwLock::new(HashSet::new()),
             upstream_computed_fields: RwLock::new(HashSet::new()),
             agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
@@ -849,6 +873,7 @@ impl ClickHouseSqlGenerator {
             max_group_array_size: DEFAULT_MAX_GROUP_ARRAY_SIZE,
             max_mvexpand_rows: DEFAULT_MAX_MVEXPAND_ROWS,
             generation_time_range: RwLock::new(None),
+            upstream_timestamp_rewritten: RwLock::new(false),
             computed_fields: RwLock::new(HashSet::new()),
             upstream_computed_fields: RwLock::new(HashSet::new()),
             agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
@@ -868,6 +893,7 @@ impl ClickHouseSqlGenerator {
             max_group_array_size: DEFAULT_MAX_GROUP_ARRAY_SIZE,
             max_mvexpand_rows: DEFAULT_MAX_MVEXPAND_ROWS,
             generation_time_range: RwLock::new(None),
+            upstream_timestamp_rewritten: RwLock::new(false),
             computed_fields: RwLock::new(HashSet::new()),
             upstream_computed_fields: RwLock::new(HashSet::new()),
             agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
@@ -1015,6 +1041,23 @@ impl ClickHouseSqlGenerator {
     /// [`field_access_expr`]: ClickHouseSqlGenerator::field_access_expr
     pub(crate) fn resolves_to_map_key(&self, field: &str) -> bool {
         matches!(self.profile.resolve(field), FieldResolution::MapKey { .. })
+    }
+
+    /// Whether `field_to_sql_expr` JSON-extracts `field` from the `metadata`
+    /// column: `metadata_`-prefixed / `metadata.*` names, known metadata
+    /// fields, and non-`ext.*` dotted paths (NAN-1644). The slim projection
+    /// must pass the backing `metadata` column through for these — downstream
+    /// stages re-derive `JSONExtract…(metadata, …)` per reference. Gated off
+    /// for names the profile resolves natively (OCSF `event` tail JsonPath,
+    /// spans/metrics `Map` attributes), which never read `metadata`.
+    pub(crate) fn is_metadata_extracted_field(&self, field: &str) -> bool {
+        if self.resolves_to_json_path(field) || self.resolves_to_map_key(field) {
+            return false;
+        }
+        field.starts_with("metadata_")
+            || field.starts_with("metadata.")
+            || (field.contains('.') && !field.starts_with("ext."))
+            || is_known_metadata_field(field)
     }
 
     /// Canonicalize an nPL field token for the value/group/filter seams (NAN-1555).
@@ -1241,6 +1284,50 @@ impl ClickHouseSqlGenerator {
             Ok(mut guard) => guard.extend(added),
             Err(poisoned) => poisoned.into_inner().extend(added),
         }
+        if Self::command_rewrites_timestamp(cmd) {
+            match self.upstream_timestamp_rewritten.write() {
+                Ok(mut guard) => *guard = true,
+                Err(poisoned) => *poisoned.into_inner() = true,
+            }
+        }
+    }
+
+    /// Whether `cmd` rewrites the `timestamp` column WITHOUT registering it in
+    /// the upstream-computed set, so downstream row timestamps may no longer
+    /// fall inside the query window (NAN-1638). Only two commands escape that
+    /// set: `bin` in-place modification (`bin timestamp span=X` floors values
+    /// up to one span before window start; bins are not value-computed
+    /// registrations) and a `table … AS timestamp` re-alias (table aliases are
+    /// projections, not registered computations). Every OTHER timestamp
+    /// rewriter — eval/rename/rex captures/spath output/streamstats/stats
+    /// aliases — registers `timestamp` via `note_upstream_computed`, and the
+    /// resolve_identity bound checks `is_upstream_computed_field("timestamp")`
+    /// alongside this flag. The bin conditions mirror the Bin arm's alias
+    /// resolution exactly: an explicit `as timestamp` alias, or no alias with
+    /// the binned field being `timestamp`/`_time` (in-place modification); a
+    /// field-less `bin span=X` writes `time_bucket` and leaves `timestamp`
+    /// intact.
+    fn command_rewrites_timestamp(cmd: &Command) -> bool {
+        match cmd {
+            Command::Bin { field, alias, .. } => {
+                alias.as_deref() == Some("timestamp")
+                    || (alias.is_none()
+                        && matches!(field.as_deref(), Some("timestamp") | Some("_time")))
+            }
+            Command::Table { fields } => fields
+                .iter()
+                .any(|f| f.alias.as_deref() == Some("timestamp")),
+            _ => false,
+        }
+    }
+
+    /// Whether an already-generated stage rewrote `timestamp` in place — the
+    /// resolve_identity ASOF build-side bound must stay off then (NAN-1638).
+    pub(crate) fn is_upstream_timestamp_rewritten(&self) -> bool {
+        match self.upstream_timestamp_rewritten.read() {
+            Ok(guard) => *guard,
+            Err(poisoned) => **poisoned.get_ref(),
+        }
     }
 
     /// Swap the upstream-computed scope (NAN-1341). A subsearch is its own
@@ -1296,6 +1383,11 @@ impl ClickHouseSqlGenerator {
             Ok(mut guard) => *guard = Some(time_range.clone()),
             Err(poisoned) => *poisoned.into_inner() = Some(time_range.clone()),
         }
+        // Fresh timestamp-rewrite tracking for this generation (NAN-1638).
+        match self.upstream_timestamp_rewritten.write() {
+            Ok(mut guard) => *guard = false,
+            Err(poisoned) => *poisoned.into_inner() = false,
+        }
 
         // Record the fields computed by pipeline commands (risk, eval, stats
         // aliases, …) so `field_to_sql_expr` references them as real columns
@@ -1324,6 +1416,7 @@ impl ClickHouseSqlGenerator {
             .count()
             == 1;
         ctx.limit = options.limit;
+        ctx.unordered = options.unordered;
 
         // Analyze query to determine required fields for optimization
         // In table_view mode, always use minimal fields for fast initial load
@@ -1349,6 +1442,10 @@ impl ClickHouseSqlGenerator {
         match self.generation_time_range.write() {
             Ok(mut guard) => *guard = None,
             Err(poisoned) => *poisoned.into_inner() = None,
+        }
+        match self.upstream_timestamp_rewritten.write() {
+            Ok(mut guard) => *guard = false,
+            Err(poisoned) => *poisoned.into_inner() = false,
         }
         match self.computed_fields.write() {
             Ok(mut guard) => guard.clear(),
@@ -1405,14 +1502,23 @@ impl ClickHouseSqlGenerator {
         // Single WHERE with all conjuncts — `optimize_move_to_prewhere` decides
         // PREWHERE placement (NAN-1412: an explicit PREWHERE disables the auto
         // move, leaving every non-promoted filter after the full-projection read).
-        // Single query with ORDER BY and LIMIT together - much faster than CTE approach
+        // Single query with ORDER BY and LIMIT together - much faster than CTE approach.
+        // NAN-1635: unordered callers (companion count wraps) keep the user's
+        // head LIMIT — it bounds the count — but drop the implicit ORDER BY,
+        // which under that LIMIT would be a semantic top-N.
+        let order_clause = if ctx.unordered {
+            String::new()
+        } else {
+            format!("ORDER BY {} DESC ", ctx.time_column)
+        };
         Ok(format!(
-            "SELECT {} FROM {} WHERE {tc} BETWEEN '{}' AND '{}' AND ({}) ORDER BY {tc} DESC LIMIT {} {}",
+            "SELECT {} FROM {} WHERE {tc} BETWEEN '{}' AND '{}' AND ({}) {}LIMIT {} {}",
             select_clause,
             ctx.table_name,
             crate::sql_hygiene::format_ch_bound_micros(&ctx.time_range.start),
             crate::sql_hygiene::format_ch_bound_micros(&ctx.time_range.end),
             where_clause,
+            order_clause,
             limit,
             generate_settings(ctx.use_cache, selective, false),
             tc = ctx.time_column,
@@ -1465,13 +1571,22 @@ impl ClickHouseSqlGenerator {
                     Some(limit) => format!("LIMIT {} ", limit),
                     None => String::new(),
                 };
+                // NAN-1635: companion wraps (histogram GROUP BY, count) are
+                // order-insensitive — dropping the implicit ORDER BY here keeps
+                // the base flat, like the raw-SQL time-range histogram.
+                let order_clause = if ctx.unordered {
+                    String::new()
+                } else {
+                    format!("ORDER BY {} DESC ", ctx.time_column)
+                };
                 Ok(format!(
-                    "SELECT {} FROM {} WHERE {tc} BETWEEN '{}' AND '{}' AND ({}) ORDER BY {tc} DESC {}{}",
+                    "SELECT {} FROM {} WHERE {tc} BETWEEN '{}' AND '{}' AND ({}) {}{}{}",
                     select_clause,
                     ctx.table_name,
                     crate::sql_hygiene::format_ch_bound_micros(&ctx.time_range.start),
                     crate::sql_hygiene::format_ch_bound_micros(&ctx.time_range.end),
                     where_clause,
+                    order_clause,
                     limit_clause,
                     generate_settings(ctx.use_cache, selective, false),
                     tc = ctx.time_column,
@@ -1673,8 +1788,22 @@ impl ClickHouseSqlGenerator {
                         }
                         _ => {}
                     }
-                    let cte =
-                        self.generate_command_cte(&cte_name, &prev_cte, cmd, ctx, &stages[..i])?;
+                    // The dedup survivor-id rewrite (commands.rs) scans its source
+                    // CTE twice — only sound when that source is the deterministic
+                    // base scan: stage_0, and no requery command (asset/tree/cloud)
+                    // injected `ORDER BY … LIMIT` into it (a bounded top-N samples
+                    // tie rows nondeterministically per scan).
+                    let source_is_deterministic_base = i == 1
+                        && !has_requery_command
+                        && matches!(stages[0], QueryStage::Search(_));
+                    let cte = self.generate_command_cte(
+                        &cte_name,
+                        &prev_cte,
+                        cmd,
+                        ctx,
+                        &stages[..i],
+                        source_is_deterministic_base,
+                    )?;
                     // This stage's value-computed outputs (rex captures, eval
                     // assignments, …) shadow schema fields / UDM aliases for
                     // every stage after it (NAN-1341).
@@ -1689,10 +1818,22 @@ impl ClickHouseSqlGenerator {
         sql.push_str(&cte_parts.join(",\n"));
 
         // Final SELECT from the last CTE
-        // CTE final SELECT operates on already-filtered/aggregated data,
-        // so optimize_read_in_order is irrelevant here (pass false).
+        // NAN-1635 (finding p12): the read-in-order toggle is NOT irrelevant
+        // for CTE tails — CH 26.4's analyzer inlines the CTEs and pushes the
+        // outer `ORDER BY timestamp DESC` down to the base ReadFromMergeTree,
+        // so `optimize_read_in_order=1` forces sequential in-order-per-part
+        // reads whenever a source_type equality pins the sort-key prefix
+        // (Saturn: ~23% wall on a pinned-source_type + selective-eq hunt, and
+        // 78.91k rows read on a zero-match probe vs 0 with the toggle off).
+        // Mirror the single-stage paths: disable read-in-order when any Search
+        // stage carries a selective indexed equality (`any` also covers
+        // append-arm Search stages).
+        let selective = stages.iter().any(|s| {
+            matches!(s, QueryStage::Search(expr) if has_selective_indexed_eq(expr, self.profile.as_ref()))
+        });
         let last_cte = format!("stage_{}", stages.len() - 1);
-        let mut settings = generate_settings(ctx.use_cache, false, has_non_timechart_aggregation);
+        let mut settings =
+            generate_settings(ctx.use_cache, selective, has_non_timechart_aggregation);
         // An append UNION can produce Variant-typed columns when the arms carry
         // different types under the same name (e.g. a numeric group-by column
         // unioned with an eval'd string literal). ClickHouse rejects ORDER
@@ -1724,16 +1865,34 @@ impl ClickHouseSqlGenerator {
             // nonexistent UDM `action` column.
             self.outer_select_except_list()
         };
-        if last_stage_has_ordering || has_aggregate_or_projection {
-            write!(sql, "\nSELECT {} FROM {} {}", select_list, last_cte, settings).unwrap();
+        // NAN-1635 (finding 3.6): apply the caller's result limit to the final
+        // SELECT. Multi-stage SQL previously dropped `QueryOptions.limit`
+        // entirely, so the documented safety bound vanished for every piped
+        // query — a streamed high-cardinality `| stats count by col` ran
+        // unbounded, and deployments with query_limits.xml turned the intended
+        // graceful cap into a hard max_result_rows error. `ctx.limit == None`
+        // keeps the executor-pagination contract (NAN-1410): the executor
+        // injects/wraps its own LIMIT/OFFSET, so baking one here would
+        // double-limit.
+        let limit_clause = match ctx.limit {
+            Some(limit) => format!("LIMIT {} ", limit),
+            None => String::new(),
+        };
+        if last_stage_has_ordering || has_aggregate_or_projection || ctx.unordered {
+            write!(
+                sql,
+                "\nSELECT {} FROM {} {}{}",
+                select_list, last_cte, limit_clause, settings
+            )
+            .unwrap();
         } else {
             // NAN-1555: order by the active dataset's time column (`start_time` for
             // spans) — `timestamp` does not exist on `otel_spans`. Logs keep
             // `timestamp` (byte-identical).
             write!(
                 sql,
-                "\nSELECT {} FROM {} ORDER BY {} DESC {}",
-                select_list, last_cte, self.time_column, settings
+                "\nSELECT {} FROM {} ORDER BY {} DESC {}{}",
+                select_list, last_cte, self.time_column, limit_clause, settings
             )
             .unwrap();
         }
@@ -1753,6 +1912,9 @@ impl ClickHouseSqlGenerator {
         cmd: &Command,
         ctx: &mut GeneratorContext,
         prior_stages: &[QueryStage],
+        // Whether `source_cte` is the deterministic base scan — see the dedup
+        // survivor-id rewrite guards (NAN-1636).
+        source_is_deterministic_base: bool,
     ) -> Result<String, SqlGenError> {
         // Handle join specially since it needs to generate subsearch SQL
         if let Command::Join {
@@ -1788,7 +1950,8 @@ impl ClickHouseSqlGenerator {
             return Ok(format!("{} AS (\n{}\n)", cte_name, inner_sql));
         }
 
-        let inner_sql = self.generate_command_sql_with_ctx(source_cte, cmd, ctx)?;
+        let inner_sql =
+            self.generate_command_sql_with_ctx(source_cte, cmd, ctx, source_is_deterministic_base)?;
         Ok(format!("{} AS (\n{}\n)", cte_name, inner_sql))
     }
 
@@ -2714,9 +2877,10 @@ impl ClickHouseSqlGenerator {
 
                 // Build field expressions, handling JSON fields
                 // Cast JSON fields to String to avoid Dynamic type issues in GROUP BY
+                let mut needs_metadata_tail = false;
                 let mut field_exprs: Vec<String> = field_list
                     .iter()
-                    .map(|field| {
+                    .filter_map(|field| {
                         if let Some(unified) = self.class_split_column(field) {
                             // NAN-1337: a class-split concept (src_host / process_name /
                             // user / url) must project its INDEXED unified column
@@ -2726,7 +2890,7 @@ impl ClickHouseSqlGenerator {
                             // class-split *primary* (`src_endpoint.hostname`) instead left
                             // the later `GROUP BY src_host_unified` with nothing to bind →
                             // CH Code 47. UDM never class-splits → `None` → byte-identical.
-                            escape_identifier(&unified)
+                            Some(escape_identifier(&unified))
                         } else if self.resolves_to_column(field) {
                             // Resolve to the PHYSICAL column (NAN-1248): under OCSF a
                             // UDM-semantic required field (`src_ip`) must project the
@@ -2735,21 +2899,35 @@ impl ClickHouseSqlGenerator {
                             // resolved column (`stats`/`timechart`/`top` GROUP BY) finds
                             // it in this stage's output. UDM byte-identical: for a UDM
                             // explicit column `field_access_expr` == `escape_identifier`.
-                            self.field_access_expr(field, "String")
+                            Some(self.field_access_expr(field, "String"))
+                        } else if self.is_metadata_extracted_field(field) {
+                            // NAN-1644: a field `field_to_sql_expr` JSON-extracts from the
+                            // `metadata` column (metadata_-prefixed, metadata.*, known
+                            // metadata fields, non-ext dotted paths) — downstream stages
+                            // re-derive `JSONExtract…(metadata, …)`, so the backing
+                            // column must survive the slim projection (mirroring the OCSF
+                            // `event` tail passthrough below). The previous ext-spill
+                            // projection here emitted a junk `toString(ext.metadata_foo)`
+                            // alias no stage ever bound.
+                            needs_metadata_tail = true;
+                            None
                         } else {
                             // Spill field — cast to String to avoid Dynamic type in
                             // GROUP BY. Profile-aware: UDM Unknown → `ext.{field}`
                             // (byte-identical); an OCSF tail path → native `event`
                             // subcolumn access (NAN-1426; the ''-defaulting multiIf
                             // string form, no longer whole-event JSONExtractString).
-                            format!(
+                            Some(format!(
                                 "toString({}) AS {}",
                                 self.field_access_expr(field, "String"),
                                 escape_identifier(field)
-                            )
+                            ))
                         }
                     })
                     .collect();
+                if needs_metadata_tail && !fields.contains("metadata") {
+                    field_exprs.push("metadata".to_string());
+                }
 
                 // Also materialize any ext fields not already in the required fields set
                 for f in ext_fields {
@@ -2818,10 +2996,13 @@ impl ClickHouseSqlGenerator {
         }
     }
 
-    /// Generate SQL for a command (public API without context tracking)
+    /// Generate SQL for a command (public API without context tracking).
+    /// Callers here (subsearch nesting, prevalence re-embedding) never hand the
+    /// deterministic base scan as `source`, so the dedup survivor-id rewrite
+    /// stays off — they keep the legacy `LIMIT 1 BY` shape (NAN-1636).
     pub fn generate_command_sql(&self, source: &str, cmd: &Command) -> Result<String, SqlGenError> {
         let mut no_ctx: Option<HashSet<String>> = None;
-        self.generate_command_sql_inner(source, cmd, &mut no_ctx, None, false, false, false)
+        self.generate_command_sql_inner(source, cmd, &mut no_ctx, None, false, false, false, false)
     }
 
     fn generate_command_sql_with_ctx(
@@ -2829,6 +3010,7 @@ impl ClickHouseSqlGenerator {
         source: &str,
         cmd: &Command,
         ctx: &mut GeneratorContext,
+        source_is_deterministic_base: bool,
     ) -> Result<String, SqlGenError> {
         let sparkline_span = Self::compute_sparkline_span_secs(ctx.time_range);
         let has_prior_risk = ctx.has_prior_risk;
@@ -2840,6 +3022,7 @@ impl ClickHouseSqlGenerator {
             has_prior_risk,
             ctx.aggregated,
             ctx.single_resolve_identity,
+            source_is_deterministic_base,
         );
         if matches!(cmd, Command::Risk { .. }) {
             ctx.has_prior_risk = true;
@@ -2921,6 +3104,9 @@ struct GeneratorContext<'a> {
     /// Maximum results to return as a generator-baked trailing LIMIT.
     /// `None` = emit no trailing LIMIT — the executor owns pagination (NAN-1410).
     limit: Option<usize>,
+    /// Suppress the implicit trailing `ORDER BY <time> DESC` — companion
+    /// queries wrap the SQL in order-insensitive aggregation (NAN-1635).
+    unordered: bool,
     /// Fields that live in the `ext` JSON column and need materializing in stage_0
     ext_fields: HashSet<String>,
     /// Columns available after a column-pruning command (table, fields keep).
@@ -2947,6 +3133,7 @@ impl<'a> GeneratorContext<'a> {
             required_fields: None,
             use_cache: false,
             limit: Some(ClickHouseSqlGenerator::DEFAULT_RESULT_LIMIT),
+            unordered: false,
             ext_fields: HashSet::new(),
             available_columns: None,
             has_prior_risk: false,

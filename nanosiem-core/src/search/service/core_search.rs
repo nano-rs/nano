@@ -782,7 +782,7 @@ impl SearchService {
         };
 
         // Generate SQL
-        let sql = {
+        let (sql, bounded_count_sql) = {
             use crate::query::QueryOptions;
             let options = QueryOptions {
                 use_cache: request.use_cache,
@@ -794,6 +794,7 @@ impl SearchService {
                 // total_count at the page size (NAN-1410). Aggregation /
                 // tree / asset / prevalence queries keep their explicit caps.
                 limit: if is_raw_event_query { None } else { Some(limit) },
+                unordered: false,
             };
             // Apply current query safety limits to the SQL generator.
             let mut ch_gen = self
@@ -825,12 +826,49 @@ impl SearchService {
                     ch_gen = ch_gen.with_metrics_rollup(grain);
                 }
             }
-            ch_gen
+            let sql = ch_gen
                 .generate_with_options(&query_for_sql, &time_range, &options)
-                .map_err(|e| SearchError::SqlGenError(e.to_string()))?
+                .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
+
+            // NAN-1635 (finding 2.3): the count companion's total is clamped
+            // at max_limit below, so when the WHERE carries per-row filters the
+            // count scan can stop at max_limit+1 matches instead of scanning
+            // the full match set (Saturn: 9.5x read_rows / 8.5x read_bytes on
+            // a broad keyword). Filter-free counts stay unbounded — ClickHouse
+            // serves them from part metadata and the bounded form measured
+            // 12.8x MORE expensive there, so the bound is conditional. The
+            // count input is REGENERATED with `unordered` rather than
+            // string-stripped (NAN-1160): a trailing ORDER BY under the count's
+            // inner LIMIT is a semantic top-N that defeats early termination.
+            let bounded_count_sql = if is_raw_event_query
+                && query_has_per_row_filters(&query_for_sql)
+            {
+                ch_gen
+                    .generate_with_options(
+                        &query_for_sql,
+                        &time_range,
+                        &QueryOptions {
+                            unordered: true,
+                            ..options
+                        },
+                    )
+                    .ok()
+            } else {
+                None
+            };
+            (sql, bounded_count_sql)
         };
 
         debug!("Generated SQL (backend={:?}): {}", self.backend, sql);
+
+        // One past the consumer clamp (`total_count.min(max_limit)` below), so
+        // "exactly max_limit" and "more than max_limit" stay distinguishable.
+        let bounded_count = bounded_count_sql.as_deref().map(|count_sql| {
+            crate::search::execution::clickhouse_executor::BoundedCountInput {
+                sql: count_sql,
+                limit: self.config.max_limit.saturating_add(1),
+            }
+        });
 
         // Start histogram query in parallel with data execution — it only needs
         // the base search expression and time range, independent of data results.
@@ -843,7 +881,14 @@ impl SearchService {
         // NAN-1428: the companion carries the derived `{query_id}-hist` id (and
         // the resolved per-priority settings via the cloned service) so cancel
         // kills it together with the data query.
+        //
+        // NAN-1645 (finding 3.5): page flips (offset > 0) skip the spawn — the
+        // histogram is page-invariant, so re-aggregating the full window on
+        // every page was pure repeat work. The frontend freezes the page-1
+        // timeline across flips; `histogram: None` in the response leaves it
+        // untouched (same shape `skip_histogram` already produces).
         let histogram_handle = if !request.skip_histogram
+            && crate::search::execution::clickhouse_executor::is_first_page(offset)
             && !is_tree_query
             && !is_asset_query
             && display_type_renders_timeline(display_type)
@@ -953,7 +998,8 @@ impl SearchService {
                             limit,
                             offset,
                             Some(&query_id),
-                            None
+                            None,
+                            bounded_count
                         ),
                         ch_executor.execute_field_stats_query(
                             &field_stats_sql,
@@ -988,6 +1034,7 @@ impl SearchService {
                             offset,
                             Some(&query_id),
                             None,
+                            bounded_count,
                         )
                         .await?;
                 (results, total_count, None)

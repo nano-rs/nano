@@ -74,8 +74,31 @@ pub fn wrap_query_for_count(sql: &str) -> String {
     format!("SELECT count(*) AS cnt FROM ({}) AS subquery", sql)
 }
 
+/// Bounded input for the paginated count companion (NAN-1635, finding 2.3).
+///
+/// The consumer clamps the reported total at `SearchConfig.max_limit`
+/// (core_search.rs `total_count.min(max_limit)`), so when the WHERE carries
+/// per-row filters the count scan can stop at `max_limit + 1` matches instead
+/// of scanning the full match set (Saturn: 9.5x read_rows / 8.5x read_bytes on
+/// a broad keyword). The bound is CONDITIONAL: a filter-free count is served
+/// from part metadata and the bounded row-reading form measured 12.8x MORE
+/// expensive — callers only supply this for filtered queries.
+///
+/// `sql` must be REGENERATED with `QueryOptions.unordered` (and the same
+/// `limit: None` pagination contract as the data SQL) rather than
+/// string-stripped: a trailing ORDER BY under the inner LIMIT is a semantic
+/// top-N that ClickHouse cannot elide (and string surgery truncates
+/// mid-literal — NAN-1160).
+pub(crate) struct BoundedCountInput<'a> {
+    /// ORDER-BY-free data SQL regenerated from the query AST.
+    pub sql: &'a str,
+    /// `SearchConfig.max_limit + 1` — one past the clamp so the consumer can
+    /// still distinguish "exactly max_limit" from "more than max_limit".
+    pub limit: usize,
+}
+
 /// Build a COUNT query from a data query by wrapping it in a counting subquery.
-pub(crate) fn build_count_query(sql: &str) -> String {
+pub(crate) fn build_count_query(sql: &str, bounded: Option<BoundedCountInput>) -> String {
     // Always wrap the full query in a counting subquery rather than regex-slicing the
     // FROM/WHERE out of it.
     //
@@ -93,7 +116,18 @@ pub(crate) fn build_count_query(sql: &str) -> String {
     // paginated.rs). Any LIMIT still present is query semantics — a user `| head N` or a
     // subsearch cap — which legitimately bounds the total, so counting the wrapped result
     // yields the correct pre-pagination total.
-    wrap_query_for_count(sql)
+    //
+    // NAN-1635 (finding 2.3): with a bounded input, count over a `SELECT 1`
+    // wrap capped one past the consumer's clamp — ClickHouse stops reading at
+    // `limit` matched rows, and the SELECT 1 projection lets the planner prune
+    // every inner column. Both forms clamp to the same reported total.
+    match bounded {
+        Some(b) => format!(
+            "SELECT count(*) AS cnt FROM (SELECT 1 FROM ({}) AS matched LIMIT {}) AS subquery",
+            b.sql, b.limit
+        ),
+        None => wrap_query_for_count(sql),
+    }
 }
 
 /// Escape `?` characters within SQL string literals for the clickhouse-rs crate.
@@ -167,7 +201,7 @@ mod tests {
     fn count_query_wraps_cte_multistage() {
         let cte = "WITH stage_0 AS (SELECT * FROM logs WHERE source_type = 'x') \
                    SELECT * FROM stage_0 WHERE toString(process_path) iLike '%c:%' ORDER BY timestamp";
-        let count = build_count_query(cte);
+        let count = build_count_query(cte, None);
         assert!(
             count.starts_with("SELECT count(*) AS cnt FROM (WITH stage_0"),
             "CTE query must be subquery-wrapped, got: {count}"
@@ -179,7 +213,7 @@ mod tests {
     #[test]
     fn count_query_wraps_simple_single_from() {
         let simple = "SELECT * FROM logs PREWHERE timestamp >= '2026-01-01' WHERE source_type = 'x'";
-        let count = build_count_query(simple);
+        let count = build_count_query(simple, None);
         assert!(
             count.starts_with("SELECT count(*) AS cnt FROM (SELECT * FROM logs"),
             "simple query should be subquery-wrapped, got: {count}"
@@ -263,7 +297,7 @@ mod tests {
         let sql = "SELECT * FROM logs PREWHERE timestamp >= '2026-01-01' \
                    WHERE (lower(message) iLike '%error%') ORDER BY timestamp DESC \
                    SETTINGS max_threads=16";
-        let count = build_count_query(sql);
+        let count = build_count_query(sql, None);
         assert!(
             !count.to_uppercase().contains(" LIMIT "),
             "count query must not be LIMIT-capped, got: {count}"
@@ -279,7 +313,7 @@ mod tests {
     fn count_query_preserves_in_literal_keywords() {
         let sql = "SELECT * FROM logs WHERE lower(message) iLike '%alpha order by beta%' \
                    ORDER BY timestamp DESC SETTINGS max_threads=16";
-        let count = build_count_query(sql);
+        let count = build_count_query(sql, None);
         assert!(
             count.contains("alpha order by beta"),
             "in-literal `order by` must be preserved, got: {count}"
@@ -288,5 +322,91 @@ mod tests {
             count.contains("SETTINGS max_threads=16"),
             "trailing clauses must be preserved inside the wrap, got: {count}"
         );
+    }
+
+    /// NAN-1635 (finding 2.3): with a bounded input (filtered raw search), the
+    /// count wraps the REGENERATED ORDER-BY-free SQL in a `SELECT 1 … LIMIT
+    /// max_limit+1` shell — ClickHouse stops reading one past the consumer
+    /// clamp instead of scanning the full match set. The data SQL (which
+    /// carries the ORDER BY) must NOT be used: a top-N sort under the inner
+    /// LIMIT defeats early termination.
+    #[test]
+    fn count_query_bounded_uses_select_one_with_conditional_limit() {
+        let data_sql = "SELECT * FROM logs WHERE (lower(message) iLike '%error%') \
+                        ORDER BY timestamp DESC SETTINGS max_threads=16";
+        let count_input_sql = "SELECT * FROM logs WHERE (lower(message) iLike '%error%') \
+                               SETTINGS max_threads=16";
+        let count = build_count_query(
+            data_sql,
+            Some(BoundedCountInput {
+                sql: count_input_sql,
+                limit: 1_000_001,
+            }),
+        );
+        assert_eq!(
+            count,
+            format!(
+                "SELECT count(*) AS cnt FROM (SELECT 1 FROM ({}) AS matched LIMIT 1000001) AS subquery",
+                count_input_sql
+            ),
+        );
+        assert!(
+            !count.contains("ORDER BY"),
+            "bounded count must wrap the unordered regeneration (ORDER BY + LIMIT = top-N), got: {count}"
+        );
+    }
+
+    /// NAN-1635 (finding 3.4): the streaming quick_count wraps REGENERATED
+    /// (limit-free, unordered) SQL in the shared count shell. For a piped
+    /// query that regeneration is a CTE chain — the wrap must be structural
+    /// (the old FROM/WHERE regex slicing emitted unbalanced-parenthesis SQL,
+    /// ClickHouse Code 62, and the caller swallowed the error so total_count
+    /// silently reported delivered rows).
+    #[test]
+    fn quick_count_wrap_over_piped_regeneration_is_structural() {
+        use crate::query::{parse_query, ClickHouseSqlGenerator, QueryOptions, TimeRange};
+        let gen = ClickHouseSqlGenerator::new();
+        let time_range = TimeRange {
+            start: "2024-01-01T00:00:00Z".parse().unwrap(),
+            end: "2024-01-02T00:00:00Z".parse().unwrap(),
+        };
+        let options = QueryOptions {
+            limit: None,
+            unordered: true,
+            ..Default::default()
+        };
+        let regenerated = gen
+            .generate_with_options(
+                &parse_query("error | where status_code=500").unwrap(),
+                &time_range,
+                &options,
+            )
+            .unwrap();
+        let count = wrap_query_for_count(&regenerated);
+        assert!(
+            count.starts_with("SELECT count(*) AS cnt FROM (WITH "),
+            "piped count must wrap the whole CTE chain, got:\n{count}"
+        );
+        assert!(
+            !count.to_uppercase().contains(" LIMIT "),
+            "count input must be limit-free (streaming bakes the page size \
+             into the data SQL only), got:\n{count}"
+        );
+        // Balanced parens — the Code 62 failure mode was an unbalanced slice.
+        let open = count.matches('(').count();
+        let close = count.matches(')').count();
+        assert_eq!(open, close, "unbalanced parentheses in:\n{count}");
+    }
+
+    /// NAN-1635 (finding 2.3): the bound is CONDITIONAL — without a bounded
+    /// input (filter-free `*` browse) the unbounded wrap is kept, because
+    /// ClickHouse serves that count from part metadata and the bounded
+    /// SELECT-1 form measured 12.8x MORE expensive there.
+    #[test]
+    fn count_query_without_bounded_input_stays_unbounded() {
+        let sql = "SELECT * FROM logs WHERE (1) ORDER BY timestamp DESC SETTINGS max_threads=16";
+        let count = build_count_query(sql, None);
+        assert_eq!(count, wrap_query_for_count(sql));
+        assert!(!count.to_uppercase().contains(" LIMIT "));
     }
 }

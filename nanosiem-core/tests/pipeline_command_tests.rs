@@ -650,8 +650,11 @@ fn transaction_startswith_endswith_sessionizes() {
         sql.contains("_txn_session"),
         "startswith/endswith must sessionize, not collapse per group key (NAN-1346 #6):\n{sql}"
     );
+    // NAN-1515 routed bare keywords to hasAllTokens; the markers reuse that
+    // lowering (this assertion previously pinned the old iLike '%…%' form).
     assert!(
-        sql.contains("'%login%'") && sql.contains("'%logout%'"),
+        sql.contains("hasAllTokens(lower(message), 'login')")
+            && sql.contains("hasAllTokens(lower(message), 'logout')"),
         "both markers must be evaluated as row flags:\n{sql}"
     );
     // Sessions begin at a start marker; rows after the first end marker and
@@ -1034,46 +1037,82 @@ fn timechart_limit_avg_carries_sum_and_count() {
     assert!(!sql.contains("IN (SELECT"), "got: {sql}");
 }
 
-/// dc() rank values are NOT per-bucket decomposable — the two-pass rank-subquery
-/// form is intentional and must stay (NAN-1430 verifier mandate). Pin the shape.
+/// dc() ranks are not decomposable as scalar sums, but the per-bucket
+/// uniqExact STATES merge exactly — the single-scan windowed form carries
+/// `uniqExactState` through the aggregated stage and `uniqExactMerge`s it per
+/// split value (NAN-1632 3.2). Must stay uniqExact end-to-end: ranking by an
+/// approximate merged state is not result-identical to the exact two-pass
+/// form this replaces.
 #[test]
-fn timechart_limit_dc_keeps_two_pass_form() {
+fn timechart_limit_dc_single_scan_merges_uniq_exact_states() {
     let sql = npl("* | timechart span=1h dc(src_ip) by source_type limit=3");
     assert!(
-        sql.contains(
-            "WHERE source_type IN (SELECT source_type FROM stage_0 GROUP BY source_type ORDER BY uniqExact(src_ip) DESC LIMIT 3)"
-        ),
-        "dc rank must keep the exact two-pass subquery form; got: {sql}"
+        sql.contains("uniqExactState(src_ip) AS __rank_state"),
+        "dc rank must carry the per-bucket uniqExact state; got: {sql}"
     );
     assert!(
-        !sql.contains("dense_rank"),
-        "dc must not use the windowed form; got: {sql}"
+        sql.contains("uniqExactMerge(__rank_state) OVER (PARTITION BY __rank_key)"),
+        "dc rank total must merge the carried states; got: {sql}"
+    );
+    assert!(
+        sql.contains("dense_rank() OVER (ORDER BY __rank_total DESC, __rank_key ASC)"),
+        "expected the windowed single-scan rank; got: {sql}"
+    );
+    assert!(
+        !sql.contains("IN (SELECT"),
+        "single-scan form must not re-read the source via a rank subquery; got: {sql}"
     );
 }
 
-/// estdc() is likewise not decomposable; it keeps the two-pass form but ranks
-/// with uniqCombined64.
+/// estdc() likewise merges per-bucket states, with the approximate
+/// uniqCombined64 sketch it already aggregates with (state-merge is exactly
+/// how the sketch composes, so this matches the old two-pass ranking).
 #[test]
-fn timechart_limit_estdc_two_pass_uniq_combined() {
+fn timechart_limit_estdc_single_scan_merges_uniq_combined_states() {
     let sql = npl("* | timechart span=1h estdc(src_ip) by source_type limit=3");
     assert!(
-        sql.contains("ORDER BY uniqCombined64(src_ip) DESC LIMIT 3"),
-        "estdc rank must use uniqCombined64 in the two-pass form; got: {sql}"
+        sql.contains("uniqCombined64State(src_ip) AS __rank_state"),
+        "estdc rank must carry the per-bucket uniqCombined64 state; got: {sql}"
     );
-    assert!(!sql.contains("dense_rank"), "got: {sql}");
+    assert!(
+        sql.contains("uniqCombined64Merge(__rank_state) OVER (PARTITION BY __rank_key)"),
+        "estdc rank total must merge the carried states; got: {sql}"
+    );
+    assert!(!sql.contains("IN (SELECT"), "got: {sql}");
 }
 
-/// A field-less non-count aggregation (sparkline) has no derivable output name,
-/// so the single-scan outer projection can't reference it — fall back to the
+/// A field-less aggregation with no derivable output name (empty-parens
+/// non-count/non-sparkline) keeps ClickHouse's expression-derived column name,
+/// which the single-scan outer projection can't reference — fall back to the
 /// two-pass form rather than renaming user-visible columns.
 #[test]
 fn timechart_limit_unnamed_agg_falls_back_to_two_pass() {
-    let sql = npl("* | timechart span=1h sum(bytes_in), sparkline by source_type limit=3");
+    let sql = npl("* | timechart span=1h sum(bytes_in), median() by source_type limit=3");
     assert!(
         sql.contains("IN (SELECT source_type FROM stage_0"),
         "unnamed agg columns must keep the two-pass form; got: {sql}"
     );
     assert!(!sql.contains("dense_rank"), "got: {sql}");
+}
+
+/// Field-less sparkline default-names its output column `sparkline`
+/// (NAN-1632 3.7) — it no longer counts as unnamed, so a count-ranked
+/// timechart carrying it keeps the single-scan windowed form.
+#[test]
+fn timechart_limit_fieldless_sparkline_stays_single_scan() {
+    let sql = npl("* | timechart span=1h count, sparkline by source_type limit=3");
+    assert!(
+        sql.contains("AS sparkline"),
+        "field-less sparkline must be default-named; got: {sql}"
+    );
+    assert!(
+        sql.contains("dense_rank() OVER (ORDER BY __rank_total DESC, __rank_key ASC)"),
+        "expected the windowed single-scan rank; got: {sql}"
+    );
+    assert!(
+        !sql.contains("IN (SELECT"),
+        "sparkline must not force the two-pass rank subquery; got: {sql}"
+    );
 }
 
 /// timechart without limit= keeps the plain GROUP BY shape — no window stages.

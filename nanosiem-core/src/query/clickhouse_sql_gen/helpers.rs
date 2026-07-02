@@ -217,6 +217,23 @@ pub(crate) fn field_to_sql_expr(field: &str, gen: &ClickHouseSqlGenerator) -> (S
 
     // Dot notation means nested metadata access
     if field.contains('.') {
+        // NAN-1644 (finding 2.6): a UDM `ext.*` path is a NATIVE ext-tail
+        // field, not metadata JSON — the ingest pipeline never writes an
+        // 'ext' key into `metadata`, so the old
+        // `JSONExtractString(metadata, 'ext', …)` collapsed every row into
+        // one '' bucket for stats/table/chart on ext fields. stage_0
+        // materializes `toString(ext.<key>) AS "ext.<key>"`
+        // (`analyze_ext_fields`), so reference the projected alias here —
+        // re-deriving the ext expression in a later stage over a `SELECT *`
+        // stage_0 defeats ClickHouse 26.4 JSON-subcolumn pruning and reads
+        // the whole ext column (Saturn-measured 22.68 GiB / 65x regression).
+        // OCSF never takes this branch for ext.*: its profile resolves the
+        // path to the `event` tail (JsonPath), routed natively by
+        // `generate_json_extract`. `metadata_`-prefixed and `metadata.*`
+        // names were already returned above / keep the JSON path below.
+        if field.starts_with("ext.") && !gen.resolves_to_json_path(field) {
+            return (escape_identifier(field), false);
+        }
         return (gen.generate_json_extract(field, "String"), true);
     }
 
@@ -715,6 +732,19 @@ pub(crate) const GUARD_TOKEN_MIN_LEN: usize = 6;
 /// the token contains no LIKE metachars (`%`, `_`, `\`) and no quotes, so it
 /// needs no escaping.
 pub(crate) fn longest_guard_token(needle_lower: &str) -> Option<&str> {
+    let (token_count, best) = guard_token_scan(needle_lower);
+    if token_count >= 2 {
+        best
+    } else {
+        None
+    }
+}
+
+/// Shared scan behind [`longest_guard_token`] and [`anchored_guard_token`]:
+/// splits on non-ASCII-alnum, counts the tokens, and returns the longest one
+/// passing the [`GUARD_TOKEN_MIN_LEN`]+letter bar (ties → first occurrence,
+/// deterministic SQL). The two callers differ only in the token-count policy.
+fn guard_token_scan(needle_lower: &str) -> (usize, Option<&str>) {
     let mut token_count = 0usize;
     let mut best: Option<&str> = None;
     for t in needle_lower
@@ -731,11 +761,28 @@ pub(crate) fn longest_guard_token(needle_lower: &str) -> Option<&str> {
             best = Some(t);
         }
     }
-    if token_count >= 2 {
-        best
-    } else {
-        None
-    }
+    (token_count, best)
+}
+
+/// NAN-1640: index-servable guard token for an *anchored* prefix/suffix regex
+/// literal (the `startsWith`/`endsWith` lowerings of `^lit.*` / `.*lit$`).
+///
+/// Same token bar and extraction as [`longest_guard_token`], with one deliberate
+/// policy difference: **single-token literals DO return a guard**. The ≥2-token
+/// requirement over there exists because a single-token `iLike '%tok%'` primary
+/// predicate is already text-index-served, so a guard would be redundant. Here
+/// the primary predicate is `startsWith`/`endsWith`, which NO skip index serves
+/// (text-index analysis yields `tokens: []` — EXPLAIN-verified), so even a
+/// single-token literal like `powershell` needs the iLike conjunct to engage the
+/// `lower(col)` text index (Saturn: 19.97GiB → 25.71MiB read_bytes, 795x).
+///
+/// Soundness: the token is a contiguous substring of the anchored literal, so
+/// `startsWith(x, lit) ⇒ x iLike '%tok%'` (likewise `endsWith`) — ANDing the
+/// guard is a pure conjunctive implication, results identical by construction.
+/// Like the keyword guard, the returned token is pure ASCII-alnum: no LIKE
+/// metachars, no quotes, no escaping needed.
+pub(crate) fn anchored_guard_token(literal_lower: &str) -> Option<&str> {
+    guard_token_scan(literal_lower).1
 }
 
 /// NAN-1515: bare free-text keyword → text-index predicate on `col` (the active
@@ -1570,5 +1617,29 @@ mod inline_tests {
                 );
             }
         }
+    }
+
+    /// NAN-1640: guard token for anchored prefix/suffix literals. Identical bar
+    /// to `longest_guard_token`, but single-token literals DO guard — the
+    /// startsWith/endsWith primary predicate is never index-served, unlike the
+    /// single-token iLike that justifies the ≥2-token policy over there.
+    #[test]
+    fn test_anchored_guard_token() {
+        // Single-token literal ≥6 chars + lettered → guards (the 795x case).
+        assert_eq!(anchored_guard_token("powershell"), Some("powershell"));
+        assert_eq!(anchored_guard_token("sekurlsa"), Some("sekurlsa"));
+        // Multi-token literal → longest qualifying token (ties → first), same
+        // as the keyword guard.
+        assert_eq!(anchored_guard_token("svchost.exe started"), Some("svchost"));
+        assert_eq!(anchored_guard_token("run mimikatz64.log"), Some("mimikatz64"));
+        // NAN-1416 bar still applies: short tokens never guard…
+        assert_eq!(anchored_guard_token(".exe"), None);
+        assert_eq!(anchored_guard_token("admin"), None);
+        // …nor do unlettered (numeric-only) tokens, regardless of length.
+        assert_eq!(anchored_guard_token("20250612"), None);
+        assert_eq!(anchored_guard_token("192.168.1.100"), None);
+        // No alphanumeric content → no guard.
+        assert_eq!(anchored_guard_token("***"), None);
+        assert_eq!(anchored_guard_token(""), None);
     }
 }

@@ -223,6 +223,8 @@ pub enum OomRisk {
     UnboundedReverse,
     /// transaction without filters — holds all events in memory
     UnboundedTransaction,
+    /// anomaly without filters — scores every row in the window (NAN-1648)
+    UnboundedAnomaly,
     /// values()/list() aggregation without filters — collects unbounded arrays
     UnboundedCollectAggregation,
     /// GROUP BY on a high-cardinality string field without filters
@@ -249,6 +251,11 @@ impl OomRisk {
             OomRisk::UnboundedTransaction => {
                 "transaction on an unfiltered search can exhaust memory (OOM). \
                  Add a source_type filter or other search terms before | transaction."
+                    .to_string()
+            }
+            OomRisk::UnboundedAnomaly => {
+                "anomaly on an unfiltered search scores every event in the time range. \
+                 Add a source_type filter or other search terms before | anomaly."
                     .to_string()
             }
             OomRisk::UnboundedCollectAggregation => {
@@ -286,11 +293,16 @@ pub fn detect_oom_risk(query: &Query) -> Option<OomRisk> {
 
     let has_filter = search_has_meaningful_filter(query);
 
-    // Check if there's a head/tail limit preceding a given command index
+    // Check if there's a row-bounding limit preceding a given command index.
+    // `sample N` emits `ORDER BY … LIMIT N` just like head/tail, so it bounds
+    // the downstream row set identically (NAN-1648).
     let has_limit_before = |target_idx: usize| -> bool {
-        commands[..target_idx]
-            .iter()
-            .any(|cmd| matches!(cmd, Command::Head { .. } | Command::Tail { .. }))
+        commands[..target_idx].iter().any(|cmd| {
+            matches!(
+                cmd,
+                Command::Head { .. } | Command::Tail { .. } | Command::Sample { .. }
+            )
+        })
     };
 
     for (i, cmd) in commands.iter().enumerate() {
@@ -319,7 +331,26 @@ pub fn detect_oom_risk(query: &Query) -> Option<OomRisk> {
                     return Some(OomRisk::UnboundedTransaction);
                 }
             }
-            // 5. stats with values()/list() or high-cardinality GROUP BY without filters
+            // 5. anomaly without filters — scores every row in the window; the
+            //    same filters-required rule as eventstats (NAN-1648: this arm was
+            //    missing, so `* | anomaly …` ran unbounded while eventstats/dedup
+            //    were rejected; pre-NAN-1642 emissions also buffered whole
+            //    partitions and OOMed). Aggregation-first anomaly
+            //    (`… | stats count by user | anomaly count`) is a first-class
+            //    mode operating on already-collapsed groups, not raw rows —
+            //    a preceding aggregation bounds it, so it stays allowed.
+            Command::Anomaly { .. } => {
+                let has_agg_before = commands[..i].iter().any(|c| {
+                    matches!(
+                        c,
+                        Command::Stats { .. } | Command::Chart { .. } | Command::Timechart { .. }
+                    )
+                });
+                if !has_filter && !has_limit_before(i) && !has_agg_before {
+                    return Some(OomRisk::UnboundedAnomaly);
+                }
+            }
+            // 6. stats with values()/list() or high-cardinality GROUP BY without filters
             Command::Stats {
                 aggregations,
                 group_by,
@@ -351,6 +382,23 @@ pub fn detect_oom_risk(query: &Query) -> Option<OomRisk> {
                 }
             }
             _ => {}
+        }
+    }
+
+    // Executable nested pipelines get their own SCOPED pass (NAN-1649):
+    // append/join subsearches generate full command chains as CTEs, so an
+    // unfiltered dedup/eventstats/anomaly inside one runs for real — and the
+    // parent's filters/limits/aggregations bound only the parent's rows, never
+    // the subsearch's, so nothing from this scope may exempt it (the recursion
+    // re-derives has_filter from the SUBSEARCH's own search stage).
+    // `field IN [search … | return f]` subsearches are deliberately NOT
+    // scanned: `generate_in_subsearch_filter` extracts only the search
+    // expression and return field, so commands inside them never execute.
+    for cmd in &commands {
+        if let Command::Append { subsearch, .. } | Command::Join { subsearch, .. } = cmd {
+            if let Some(risk) = detect_oom_risk(subsearch) {
+                return Some(risk);
+            }
         }
     }
 
@@ -409,6 +457,51 @@ pub fn query_has_aggregation(query: &Query) -> bool {
                 | Command::Anomaly { .. }
         )
     })
+}
+
+/// NAN-1635 (finding 2.3): does the query's WHERE carry per-row filters beyond
+/// the time bounds and the injected `source_type != "<internal>"` exclusion?
+///
+/// Drives the count companion's conditional bound: a filtered count can stop
+/// scanning at `max_limit + 1` matches (Saturn: 9.5x fewer rows read on a broad
+/// keyword), but a filter-free count is served from part metadata and the
+/// bounded row-reading form measured 12.8x MORE expensive — so the bound must
+/// only apply when this returns true. Row-reducing pipe commands (`where`,
+/// `dedup`, `sample`) count as filters too.
+///
+/// Conservative by construction: anything not recognized as the match-all
+/// baseline is treated as filtered. Misclassification is a perf tradeoff, never
+/// a correctness one — both count forms clamp to the same reported total.
+pub fn query_has_per_row_filters(query: &Query) -> bool {
+    fn is_match_all_baseline(expr: &SearchExpr) -> bool {
+        match expr {
+            SearchExpr::Keyword(kw) => kw == "*",
+            SearchExpr::Group(inner) => is_match_all_baseline(inner),
+            // The audit-gate wrap injected by `enforce_source_type_exclusion`:
+            // `(<expr>) AND source_type != "audit"`. source_type leads the sort
+            // key, so the exclusion prunes at the granule level and the count
+            // stays metadata-served — it is part of the filter-free baseline.
+            SearchExpr::And(left, right) => {
+                is_match_all_baseline(left) && is_match_all_baseline(right)
+            }
+            SearchExpr::FieldFilter {
+                field,
+                op: Comparator::Ne,
+                ..
+            } => field == "source_type" || field == "sourcetype",
+            _ => false,
+        }
+    }
+    match query {
+        Query::Search(expr) => !is_match_all_baseline(expr),
+        Query::Piped { source, command } => {
+            query_has_per_row_filters(source)
+                || matches!(
+                    command,
+                    Command::Where { .. } | Command::Dedup { .. } | Command::Sample { .. }
+                )
+        }
+    }
 }
 
 /// Check if post-prevalence commands are safe for JOIN-based prevalence optimization.
@@ -1366,6 +1459,105 @@ mod tests {
     }
 
     #[test]
+    fn test_oom_anomaly_unfiltered() {
+        let query = parse_query("* | anomaly bytes_out by src_ip").unwrap();
+        assert_eq!(detect_oom_risk(&query), Some(OomRisk::UnboundedAnomaly));
+    }
+
+    #[test]
+    fn test_oom_anomaly_with_filter() {
+        let query = parse_query("source_type=firewall | anomaly bytes_out by src_ip").unwrap();
+        assert_eq!(detect_oom_risk(&query), None);
+    }
+
+    #[test]
+    fn test_oom_anomaly_with_head_before() {
+        let query = parse_query("* | head 1000 | anomaly bytes_out").unwrap();
+        assert_eq!(detect_oom_risk(&query), None);
+    }
+
+    #[test]
+    fn test_oom_append_subsearch_scanned() {
+        // NAN-1649: the appended pipeline executes for real — a parent filter
+        // must not exempt an unfiltered command inside it
+        let query =
+            parse_query("source_type=firewall | append [search * | anomaly bytes_out]").unwrap();
+        assert_eq!(detect_oom_risk(&query), Some(OomRisk::UnboundedAnomaly));
+        let query =
+            parse_query("source_type=firewall | append [search * | dedup src_ip]").unwrap();
+        assert_eq!(detect_oom_risk(&query), Some(OomRisk::UnboundedDedup));
+    }
+
+    #[test]
+    fn test_oom_append_subsearch_with_own_filter_allowed() {
+        let query = parse_query(
+            "source_type=firewall | append [search source_type=proxy | dedup src_ip]",
+        )
+        .unwrap();
+        assert_eq!(detect_oom_risk(&query), None);
+    }
+
+    #[test]
+    fn test_oom_parent_head_does_not_exempt_subsearch() {
+        // parent's head bounds the PARENT rows only
+        let query = parse_query("* | head 10 | append [search * | dedup src_ip]").unwrap();
+        assert_eq!(detect_oom_risk(&query), Some(OomRisk::UnboundedDedup));
+    }
+
+    #[test]
+    fn test_oom_subsearch_own_head_exempts() {
+        let query =
+            parse_query("source_type=firewall | append [search * | head 100 | dedup src_ip]")
+                .unwrap();
+        assert_eq!(detect_oom_risk(&query), None);
+    }
+
+    #[test]
+    fn test_oom_join_subsearch_scanned() {
+        let query = parse_query(
+            "source_type=firewall | join src_ip [search * | eventstats count by src_ip]",
+        )
+        .unwrap();
+        assert_eq!(
+            detect_oom_risk(&query),
+            Some(OomRisk::UnboundedWindowFunction)
+        );
+    }
+
+    #[test]
+    fn test_oom_nested_append_recursed() {
+        let query = parse_query(
+            "source_type=firewall | append [search source_type=proxy | append [search * | dedup src_ip]]",
+        )
+        .unwrap();
+        assert_eq!(detect_oom_risk(&query), Some(OomRisk::UnboundedDedup));
+    }
+
+    #[test]
+    fn test_oom_in_subsearch_not_scanned() {
+        // IN-subsearches only codegen search + return; other commands never
+        // execute, so they must not be guarded
+        let query = parse_query("src_ip IN [search error | return src_ip]").unwrap();
+        assert_eq!(detect_oom_risk(&query), None);
+    }
+
+    #[test]
+    fn test_oom_sample_bounds_downstream_commands() {
+        // sample emits ORDER BY … LIMIT N — bounds rows exactly like head
+        let query = parse_query("* | sample 1000 | anomaly bytes_out").unwrap();
+        assert_eq!(detect_oom_risk(&query), None);
+        let query = parse_query("* | sample 1000 | dedup src_ip").unwrap();
+        assert_eq!(detect_oom_risk(&query), None);
+    }
+
+    #[test]
+    fn test_oom_anomaly_aggregation_first_allowed() {
+        // aggregation-first anomaly operates on collapsed groups, not raw rows
+        let query = parse_query("* | stats count by \"user\" | anomaly count").unwrap();
+        assert_eq!(detect_oom_risk(&query), None);
+    }
+
+    #[test]
     fn test_oom_reverse_unfiltered() {
         let query = parse_query("* | reverse").unwrap();
         assert_eq!(detect_oom_risk(&query), Some(OomRisk::UnboundedReverse));
@@ -1679,5 +1871,51 @@ mod tests {
         )
         .unwrap();
         assert!(validate_panel_query_unscoped_prevalence(&q).is_ok());
+    }
+
+    /// NAN-1635 (finding 2.3): the per-row-filter boundary drives whether the
+    /// count companion gets a LIMIT bound. Filter-free = match-all `*` plus the
+    /// injected `source_type != "audit"` gate plus non-filtering pipes — those
+    /// counts are metadata-served and the bound made them 12.8x MORE expensive.
+    /// Everything else must classify as filtered (9.5x fewer rows read bounded).
+    #[test]
+    fn per_row_filter_boundary_for_bounded_count() {
+        use super::super::enforce_source_type_exclusion;
+
+        // Filter-free baseline: unbounded count stays.
+        for q in ["*", "* | head 100", "* | sort -timestamp", "* | table src_ip, user"] {
+            assert!(
+                !query_has_per_row_filters(&parse_query(q).unwrap()),
+                "`{q}` must classify as filter-free"
+            );
+        }
+        // The audit-gate wrap every non-audit-view search carries:
+        // `(<expr>) AND source_type != "audit"` — still filter-free.
+        let audit_gated = enforce_source_type_exclusion(&parse_query("*").unwrap(), "audit");
+        assert!(
+            !query_has_per_row_filters(&audit_gated),
+            "audit-gated match-all must stay filter-free"
+        );
+
+        // Per-row filters: bounded count engages.
+        for q in [
+            "error",
+            "src_ip=\"1.2.3.4\"",
+            "user!=\"bob\"", // non-source_type negation still reads rows
+            "* | where status_code=500",
+            "* | dedup src_ip",
+            "error | head 100",
+        ] {
+            assert!(
+                query_has_per_row_filters(&parse_query(q).unwrap()),
+                "`{q}` must classify as filtered"
+            );
+        }
+        let audit_gated_filtered =
+            enforce_source_type_exclusion(&parse_query("error").unwrap(), "audit");
+        assert!(
+            query_has_per_row_filters(&audit_gated_filtered),
+            "audit-gated keyword search must classify as filtered"
+        );
     }
 }
