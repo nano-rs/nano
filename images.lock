@@ -13,4 +13,3 @@ clickhouse/clickhouse-server:26.5 sha256:07afc18d8a9706eb9d85c5c5d2752e5270f91bb
 docker.dragonflydb.io/dragonflydb/dragonfly:v1.38.1 sha256:baf70ba7ad182a992b988497cfa31a488978c8fab7712079784c2401f447e402
 timberio/vector:0.56.0-debian sha256:93b072b416fd29152f1bfe5bd2925a0b48999aeb069f3ae000691f82a135c200
 nginx:alpine sha256:8b1e78743a03dbb2c95171cc58639fef29abc8816598e27fb910ed2e621e589a
-tenzir/tenzir:v6.4.0 sha256:a9db7f2e0bab2d212bf855a75b9f1e70f274a7f9c51cc9b5a9d25f6846f3fcf3
