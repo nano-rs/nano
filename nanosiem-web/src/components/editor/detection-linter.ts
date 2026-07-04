@@ -504,6 +504,10 @@ export interface ValidationState {
   matchCount?: number;
   detectionMode?: 'realtime' | 'scheduled';
   createsMaterializedView?: boolean;
+  /** NAN-1688: query shape qualifies for real-time mode, independent of the
+   * requested mode. Drives the "switch to real-time" nudge on scheduled rules. */
+  realtimeEligible?: boolean;
+  realtimeEligibleReason?: string;
 }
 
 /**
@@ -554,6 +558,8 @@ export function getValidationState(): ValidationState | null {
     info,
     detectionMode,
     createsMaterializedView: lastBackendResult.creates_materialized_view,
+    realtimeEligible: lastBackendResult.realtime_eligible,
+    realtimeEligibleReason: lastBackendResult.realtime_eligible_reason,
   };
 }
 

@@ -3211,7 +3211,7 @@ CREATE TABLE IF NOT EXISTS public.system_settings (
     case_max_alerts_per_case integer DEFAULT 100 NOT NULL,
     case_default_time_window_minutes integer DEFAULT 60 NOT NULL,
     case_auto_grouping_enabled boolean DEFAULT true NOT NULL,
-    ai_monitoring_enabled boolean DEFAULT true CONSTRAINT system_settings_health_monitoring_enabled_not_null NOT NULL,
+    ai_monitoring_enabled boolean DEFAULT false CONSTRAINT system_settings_health_monitoring_enabled_not_null NOT NULL,
     feed_monitoring_enabled boolean DEFAULT true NOT NULL,
     sla_critical_response_minutes integer DEFAULT 15 NOT NULL,
     sla_critical_triage_minutes integer DEFAULT 60 NOT NULL,

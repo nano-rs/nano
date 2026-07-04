@@ -978,6 +978,56 @@ async fn test_provider_connection(
                 Ok(())
             }
         }
+        // Workers AI is credential-less (NAN-1102): the per-provider key is
+        // optional — auth is the Cloudflare AI Gateway's `cf-aig-authorization`.
+        // Mirror the runtime path (nanosiem-enterprise ai_gateway.rs):
+        // `{CLOUDFLARE_AI_GATEWAY_URL}/workers-ai/v1/chat/completions`.
+        "workers-ai" => {
+            let base = std::env::var("CLOUDFLARE_AI_GATEWAY_URL").map_err(|_| {
+                "CLOUDFLARE_AI_GATEWAY_URL not set — Workers AI routes through the \
+                 Cloudflare AI Gateway"
+                    .to_string()
+            })?;
+            let base = base.trim_end_matches('/');
+            // Config may override the probe model; default to the catalog model.
+            // Strip the `workers-ai/` prefix the same way the runtime does.
+            let model = config
+                .and_then(|c| c["model"].as_str())
+                .map(|m| m.strip_prefix("workers-ai/").unwrap_or(m))
+                .unwrap_or("@cf/google/gemma-4-26b-a4b-it");
+
+            let mut req = client
+                .post(format!("{}/workers-ai/v1/chat/completions", base))
+                .header("content-type", "application/json")
+                .json(&serde_json::json!({
+                    "model": model,
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": "Hi"}]
+                }));
+            // Gateway-level auth (set when the gateway requires it).
+            if let Ok(token) = std::env::var("CF_AIG_AUTH_TOKEN") {
+                if !token.is_empty() {
+                    req = req.header("cf-aig-authorization", format!("Bearer {}", token));
+                }
+            }
+            // Provider key is optional for Workers AI; attach only if configured.
+            if !api_key.is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", api_key));
+            }
+
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| format!("Request failed: {}", e))?;
+
+            if resp.status().is_success() {
+                Ok(())
+            } else {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                Err(format!("API error ({}): {}", status, body))
+            }
+        }
         _ => Err(format!("Unknown provider: {}", provider)),
     }
 }

@@ -176,6 +176,16 @@ pub struct ValidateDetectionResponse {
     pub creates_materialized_view: bool,
     /// Human-readable explanation of mode selection
     pub mode_reason: String,
+    /// NAN-1688: whether the query *shape* qualifies for real-time
+    /// (materialized-view) mode, independent of the requested mode. Lets the
+    /// editor nudge a scheduled rule that could run real-time. Dataset
+    /// (logs-only) and risk-entity gating is applied by the UI, which knows the
+    /// rule's dataset.
+    pub realtime_eligible: bool,
+    /// Human-readable reason for `realtime_eligible` — a positive explanation
+    /// when eligible, or why the query is ineligible otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub realtime_eligible_reason: Option<String>,
     /// Any warnings about the configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,

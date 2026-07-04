@@ -369,7 +369,9 @@ pub async fn update_health_monitoring_settings(
                 r.get::<bool, _>("feed_enabled"),
             )
         }
-        None => (true, true),
+        // Missing settings row: AI monitoring reports disabled (it's opt-in and
+        // costs API tokens, NAN-1685); feed monitoring stays on by default.
+        None => (false, true),
     };
 
     state.emit_audit(

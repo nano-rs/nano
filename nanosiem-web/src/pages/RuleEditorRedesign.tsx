@@ -437,6 +437,19 @@ export function RuleEditorRedesign() {
     return null;
   }, [metadata.detection_mode]);
 
+  // NAN-1688 — flip a scheduled rule to real-time from the validation-tray
+  // nudge. Patches the YAML the same way FormLens's mode toggle does. Only
+  // offered when the backend reports the query is real-time eligible (see
+  // ValidateCard) AND the dataset supports the MV path — spans/metrics are
+  // scheduled-only, mirroring FormLens's lockout.
+  const switchToRealtime = useCallback(() => {
+    if (!canEdit) return;
+    setEditorContent(serializeDetectionMetadata({ ...metadata, detection_mode: 'realtime' }, actualQuery));
+  }, [canEdit, metadata, actualQuery]);
+
+  const realtimeNudgeAvailable =
+    canEdit && detectionModeLens === 'scheduled' && (metadata.dataset || 'logs') === 'logs';
+
   // Browser close / refresh guard — mirrors the legacy editor.
   useEffect(() => {
     const shouldBlock = hasChanges || (isNewMode && (actualQuery.trim() || metadata.title));
@@ -1072,6 +1085,7 @@ export function RuleEditorRedesign() {
           dailyStats={id ? detectionStats?.[id] : undefined}
           ruleId={!isNewMode && id && canEdit ? id : undefined}
           readOnly={!canEdit}
+          onSwitchToRealtime={realtimeNudgeAvailable ? switchToRealtime : undefined}
           onOpenTest={handleOpenTest}
           onOpenVersion={(v) => {
             setInspectorCollapsed(false);

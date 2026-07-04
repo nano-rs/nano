@@ -279,7 +279,9 @@ pub async fn validate_detection(
 ) -> Result<Json<ValidateDetectionResponse>, ApiError> {
     ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
-    use nanosiem_core::detection::materialized_view::MaterializedViewGenerator;
+    use nanosiem_core::detection::materialized_view::{
+        MaterializedViewError, MaterializedViewGenerator,
+    };
     use nanosiem_core::parse_query;
 
     let mut errors = Vec::new();
@@ -578,53 +580,72 @@ pub async fn validate_detection(
         .map(|m| m.to_lowercase())
         .unwrap_or_else(|| "scheduled".to_string());
 
-    let has_pipes = MaterializedViewGenerator::has_piped_commands(&clean_query);
+    // NAN-1688: query-shape real-time (materialized-view) eligibility, evaluated
+    // once from the parsed query and reused for BOTH the requested-mode routing
+    // below and the scheduled-rule nudge in the response. This is the single
+    // source of truth — the same `check_query_realtime_eligible` gate the MV
+    // path applies at DDL-generation time — so validation can never promise an
+    // MV (or nudge toward one) that DDL generation would then reject (e.g. a
+    // real-time request carrying `ioc`/`IN [...]`, previously reported as
+    // creating an MV before failing downstream).
+    //
+    // `Ok(())` = eligible; `Err(reason)` carries a clean, user-facing reason.
+    // Dataset (logs-only) and risk-entity gating is applied by the UI, which
+    // knows the rule's dataset.
+    let realtime_shape: Result<(), String> = match parse_result.as_ref() {
+        Ok(parsed) => MaterializedViewGenerator::check_query_realtime_eligible(parsed).map_err(
+            |e| match e {
+                // `check_query_realtime_eligible` only ever returns `InvalidRule`,
+                // whose inner string is already user-facing.
+                MaterializedViewError::InvalidRule(msg) => msg,
+                other => other.to_string(),
+            },
+        ),
+        Err(_) => Err("query has parse errors".to_string()),
+    };
 
-    // Determine effective mode and whether MV will be created
+    let (realtime_eligible, realtime_eligible_reason) = match &realtime_shape {
+        Ok(()) => (
+            true,
+            Some(
+                "Simple filter query — can stream via a materialized view (10–30s latency) \
+                 instead of running on a cron schedule"
+                    .to_string(),
+            ),
+        ),
+        Err(reason) => (false, Some(reason.clone())),
+    };
+
+    // Determine effective mode and whether an MV will be created.
     let (effective_mode, creates_mv, mode_reason) = if requested_mode == "real-time"
         || requested_mode == "realtime"
     {
-        if has_pipes {
-            warning = Some(
-                "Query contains piped commands (stats, where, etc.) which are not supported in real-time mode. \
-                 The rule will be automatically converted to scheduled mode with a 30-second interval.".to_string()
-            );
-            (
-                "scheduled".to_string(),
-                false,
-                "Auto-converted to scheduled: query contains piped commands".to_string(),
-            )
-        } else {
-            // Check if it's a keyword-only query
-            if parse_result.is_ok() {
-                if let Ok(ref parsed) = parse_result {
-                    use nanosiem_core::query::Query;
-                    match parsed {
-                        Query::Search(nanosiem_core::query::SearchExpr::Keyword(_)) => {
-                            (
-                                "scheduled".to_string(),
-                                false,
-                                "Auto-converted to scheduled: keyword searches require full-text search".to_string()
-                            )
-                        }
-                        _ => (
-                            "real-time".to_string(),
-                            true,
-                            "Real-time mode: simple filter query will create a ClickHouse materialized view".to_string()
-                        )
-                    }
-                } else {
-                    (
-                        "real-time".to_string(),
-                        true,
-                        "Real-time mode: will create a ClickHouse materialized view".to_string(),
-                    )
-                }
-            } else {
+        match &realtime_shape {
+            Ok(()) => (
+                "real-time".to_string(),
+                true,
+                "Real-time mode: simple filter query will create a ClickHouse materialized view"
+                    .to_string(),
+            ),
+            // Requested real-time but the query didn't parse — surface the errors
+            // rather than an auto-conversion warning.
+            Err(_) if parse_result.is_err() => (
+                "real-time".to_string(),
+                false, // Won't create MV if query is invalid
+                "Real-time mode requested but query has errors".to_string(),
+            ),
+            // Parsed, but the shape isn't MV-eligible (piped commands, keyword
+            // search, subsearch, or the `ioc` term). Auto-convert to scheduled,
+            // mirroring the create/update path in `crud.rs`.
+            Err(reason) => {
+                warning = Some(format!(
+                    "{reason}. The rule will be automatically converted to scheduled mode \
+                     with a 30-second interval."
+                ));
                 (
-                    "real-time".to_string(),
-                    false, // Won't create MV if query is invalid
-                    "Real-time mode requested but query has errors".to_string(),
+                    "scheduled".to_string(),
+                    false,
+                    format!("Auto-converted to scheduled: {reason}"),
                 )
             }
         }
@@ -644,6 +665,12 @@ pub async fn validate_detection(
         effective_mode,
         creates_materialized_view: creates_mv && valid,
         mode_reason,
+        realtime_eligible: realtime_eligible && valid,
+        realtime_eligible_reason: if realtime_eligible && valid {
+            realtime_eligible_reason
+        } else {
+            None
+        },
         warning,
         errors,
         referenced_fields,

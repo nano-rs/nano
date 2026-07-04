@@ -16,6 +16,7 @@ import {
   TrendingUp,
   TrendingDown,
   Minus,
+  Zap,
 } from 'lucide-react';
 import { Line, LineChart, ResponsiveContainer, Tooltip } from 'recharts';
 import { Separator } from '@/components/ui/separator';
@@ -47,6 +48,10 @@ interface BottomTrayProps {
   ruleId?: string;
   /** Read-only surface disables tune-settings save. */
   readOnly?: boolean;
+  /** NAN-1688 — present only when the rule is on scheduled mode, editable, and
+   * on a dataset that supports the MV path. When set and the backend reports
+   * the query real-time eligible, ValidateCard shows a one-click nudge. */
+  onSwitchToRealtime?: () => void;
   onOpenTest?: () => void;
   onOpenVersion?: (version: RuleVersionSummary) => void;
 }
@@ -59,6 +64,7 @@ export function BottomTray({
   dailyStats,
   ruleId,
   readOnly,
+  onSwitchToRealtime,
   onOpenTest,
   onOpenVersion,
 }: BottomTrayProps) {
@@ -71,6 +77,12 @@ export function BottomTray({
     : 'unchecked';
 
   const versionCount = versions?.length ?? 0;
+
+  // NAN-1688 — the rule is scheduled but its query shape qualifies for the
+  // lower-latency real-time (materialized-view) path. Offer a one-click switch.
+  // Self-clears the moment the query stops being eligible (e.g. add `| stats`)
+  // or the mode is already real-time — no dismiss state to manage.
+  const showRealtimeNudge = Boolean(onSwitchToRealtime && validation?.valid && validation?.realtimeEligible);
 
   return (
     <div className="border-t border-border bg-[var(--panel)] shrink-0">
@@ -125,6 +137,23 @@ export function BottomTray({
           </>
         )}
 
+        {showRealtimeNudge && (
+          <>
+            <Separator orientation="vertical" className="h-4" />
+            <span
+              onClick={(e) => {
+                e.stopPropagation();
+                onSwitchToRealtime?.();
+              }}
+              title={validation?.realtimeEligibleReason}
+              className="inline-flex items-center gap-1.5 whitespace-nowrap text-[var(--primary)] hover:underline cursor-pointer"
+            >
+              <Zap className="w-3 h-3" strokeWidth={1.75} />
+              Eligible for real-time · Switch
+            </span>
+          </>
+        )}
+
         <div className="flex-1" />
 
         {ruleId && (
@@ -153,7 +182,11 @@ export function BottomTray({
           id="rule-editor-bottom-tray-body"
           className="px-4 pb-3 pt-1 grid grid-cols-1 md:grid-cols-3 gap-3"
         >
-          <ValidateCard validation={validation} />
+          <ValidateCard
+            validation={validation}
+            showRealtimeNudge={showRealtimeNudge}
+            onSwitchToRealtime={onSwitchToRealtime}
+          />
           <ImpactCard matchCount={matchCount} lastSavedLabel={lastSavedLabel} dailyStats={dailyStats} />
           <VersionsCard versions={versions} onOpenVersion={onOpenVersion} />
         </div>
@@ -162,7 +195,15 @@ export function BottomTray({
   );
 }
 
-function ValidateCard({ validation }: { validation: ValidationState | null }) {
+function ValidateCard({
+  validation,
+  showRealtimeNudge,
+  onSwitchToRealtime,
+}: {
+  validation: ValidationState | null;
+  showRealtimeNudge?: boolean;
+  onSwitchToRealtime?: () => void;
+}) {
   const valStatus: 'valid' | 'invalid' | 'unchecked' = validation
     ? validation.valid
       ? 'valid'
@@ -228,6 +269,26 @@ function ValidateCard({ validation }: { validation: ValidationState | null }) {
             <div className="flex-1 font-mono text-muted-foreground leading-snug">
               Executes as <span className="text-foreground">{validation.detectionMode}</span>
               {validation.createsMaterializedView ? ' · creates materialized view' : ''}
+            </div>
+          </div>
+        )}
+        {showRealtimeNudge && (
+          <div className="mt-2 flex items-start gap-2 rounded-md border border-[color-mix(in_srgb,var(--primary)_35%,var(--border))] bg-[color-mix(in_srgb,var(--primary)_7%,transparent)] px-2.5 py-2">
+            <Zap className="w-3.5 h-3.5 text-[var(--primary)] mt-px shrink-0" strokeWidth={1.75} />
+            <div className="flex-1 min-w-0">
+              <div className="text-[11px] text-foreground/90 leading-snug">
+                Eligible for <span className="font-semibold text-[var(--primary)]">real-time</span> — streams via a
+                materialized view (10–30s latency) instead of running on a cron schedule.
+              </div>
+              {onSwitchToRealtime && (
+                <button
+                  type="button"
+                  onClick={onSwitchToRealtime}
+                  className="mt-1.5 inline-flex items-center gap-1 h-6 px-2 rounded text-[11px] font-mono font-semibold text-[var(--primary)] bg-[color-mix(in_srgb,var(--primary)_14%,transparent)] hover:bg-[color-mix(in_srgb,var(--primary)_22%,transparent)] transition-colors"
+                >
+                  Switch to real-time
+                </button>
+              )}
             </div>
           </div>
         )}

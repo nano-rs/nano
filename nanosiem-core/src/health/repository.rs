@@ -178,7 +178,11 @@ impl HealthRepository {
         )
         .fetch_optional(&self.pool)
         .await?
-        .unwrap_or(true);
+        // Missing settings row → disabled. AI provider monitoring polls the
+        // provider on a schedule and costs API tokens, so it must be opt-in;
+        // defaulting a missing row to enabled re-introduced the token drain
+        // this setting is meant to gate (NAN-1685).
+        .unwrap_or(false);
 
         Ok(enabled)
     }

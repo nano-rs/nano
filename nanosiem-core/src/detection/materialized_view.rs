@@ -607,6 +607,34 @@ FROM (
         query_str.contains('|')
     }
 
+    /// Real-time (materialized-view) eligibility for a *parsed* query, decoupled
+    /// from DDL generation.
+    ///
+    /// This is the query-shape half of the eligibility gate that
+    /// [`Self::extract_where_clause`] applies during DDL generation: reject piped
+    /// commands (stats/where/timechart/prevalence/…) and reject the
+    /// [`reject_unsupported_for_realtime`] leaf variants (keyword full-text,
+    /// `IN [...]` subsearch, `ioc` retro-hunt). It deliberately does NOT check the
+    /// dataset (`logs`-only) or the risk-entity column, which need the full
+    /// `DetectionRule` context — callers surfacing a hint (e.g. the `/api/rules/validate`
+    /// endpoint) gate those separately.
+    ///
+    /// Sharing this with `extract_where_clause` keeps the "eligible for real-time"
+    /// hint in lock-step with what the MV path will actually accept, so we never
+    /// nudge a user toward a mode their query would be auto-downgraded out of.
+    ///
+    /// # Returns
+    /// * `Ok(())` if the query shape is real-time eligible
+    /// * `Err(MaterializedViewError::InvalidRule)` with a human-readable reason otherwise
+    pub fn check_query_realtime_eligible(query: &Query) -> Result<(), MaterializedViewError> {
+        match query {
+            Query::Search(search_expr) => reject_unsupported_for_realtime(search_expr),
+            Query::Piped { .. } => Err(MaterializedViewError::InvalidRule(
+                "Real-time rules cannot contain piped commands (stats, where, etc.)".to_string(),
+            )),
+        }
+    }
+
     /// Extract WHERE clause from parsed query
     ///
     /// Converts the parsed query AST into a ClickHouse WHERE clause.
@@ -621,22 +649,23 @@ FROM (
     ///
     /// Requirements: 4.1
     fn extract_where_clause(&self, query: &Query) -> Result<String, MaterializedViewError> {
-        let search_expr = match query {
-            Query::Search(search_expr) => search_expr,
-            Query::Piped { .. } => {
-                return Err(MaterializedViewError::InvalidRule(
-                    "Real-time rules cannot contain piped commands (stats, where, etc.)".to_string(),
-                ))
-            }
+        // Real-time eligibility is intentionally narrower than scheduled search:
+        // piped commands, keyword (full-text) and subsearch filters are not
+        // supported in a materialized view and must fall back to scheduled mode.
+        // This is the same gate the `/api/rules/validate` hint uses, so the
+        // "eligible for real-time" nudge stays in lock-step with what the MV path
+        // actually accepts.
+        Self::check_query_realtime_eligible(query)?;
+        // Safe: `check_query_realtime_eligible` only returns `Ok` for
+        // `Query::Search`. The `else` is unreachable but returns a sane error
+        // rather than panicking.
+        let Query::Search(search_expr) = query else {
+            return Err(MaterializedViewError::InvalidRule(
+                "Real-time rules cannot contain piped commands (stats, where, etc.)".to_string(),
+            ));
         };
 
-        // Real-time eligibility is intentionally narrower than scheduled search:
-        // keyword (full-text) and subsearch filters are not supported in a
-        // materialized view and must fall back to scheduled mode. Reject them up
-        // front with the historical messages...
-        reject_unsupported_for_realtime(search_expr)?;
-
-        // ...then delegate WHERE generation to the canonical generator so the
+        // Delegate WHERE generation to the canonical generator so the
         // real-time WHERE clause stays byte-for-byte identical to the scheduled
         // path. This module previously carried its own SearchExpr->SQL codegen
         // that had drifted from canonical (no lower(), no field-name
@@ -749,6 +778,63 @@ mod tests {
             ddl.contains(&format!("WHERE {expected}")),
             "real-time WHERE drifted from canonical\n  query:     {query}\n  canonical: {expected}\n  ddl:\n{ddl}"
         );
+    }
+
+    /// NAN-1688: `check_query_realtime_eligible` is the query-shape gate the
+    /// validate endpoint reuses to nudge scheduled rules that qualify. It must
+    /// stay in lock-step with what `generate_view_ddl` actually accepts.
+    fn is_realtime_eligible(query: &str) -> bool {
+        let parsed = parse_query(query).expect("query should parse");
+        MaterializedViewGenerator::check_query_realtime_eligible(&parsed).is_ok()
+    }
+
+    #[test]
+    fn test_realtime_eligible_simple_filters() {
+        // Simple column predicates are the whole point of the MV path.
+        assert!(is_realtime_eligible("src_ip=\"10.0.0.1\""));
+        assert!(is_realtime_eligible("dest_port=445 AND process_name=\"cmd.exe\""));
+        assert!(is_realtime_eligible("NOT (user=\"admin\")"));
+    }
+
+    #[test]
+    fn test_realtime_ineligible_piped_commands() {
+        // Anything after a `|` (stats/where/timechart/prevalence/…) drops out.
+        assert!(!is_realtime_eligible("src_ip=\"10.0.0.1\" | stats count by user"));
+        assert!(!is_realtime_eligible("error | where count > 10"));
+    }
+
+    #[test]
+    fn test_realtime_ineligible_keyword_and_ioc() {
+        // Keyword full-text and the `ioc` retro-hunt term require full scans,
+        // not a simple-column MV predicate.
+        assert!(!is_realtime_eligible("malware"));
+        assert!(!is_realtime_eligible("ioc"));
+    }
+
+    #[test]
+    fn test_realtime_eligible_matches_ddl_acceptance() {
+        // Lock-step invariant: if the shape gate says eligible, DDL generation
+        // must succeed; if it says ineligible, DDL generation must fail.
+        for query in ["src_ip=\"10.0.0.1\"", "dest_port=445"] {
+            assert!(is_realtime_eligible(query));
+            let mut rule = create_test_rule();
+            rule.query = query.to_string();
+            let generator = MaterializedViewGenerator::new(clickhouse::Client::default());
+            assert!(
+                generator.generate_view_ddl(&rule).is_ok(),
+                "shape gate said eligible but DDL failed for {query:?}"
+            );
+        }
+        for query in ["malware", "src_ip=\"10.0.0.1\" | stats count by user"] {
+            assert!(!is_realtime_eligible(query));
+            let mut rule = create_test_rule();
+            rule.query = query.to_string();
+            let generator = MaterializedViewGenerator::new(clickhouse::Client::default());
+            assert!(
+                generator.generate_view_ddl(&rule).is_err(),
+                "shape gate said ineligible but DDL succeeded for {query:?}"
+            );
+        }
     }
 
     #[test]

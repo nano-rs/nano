@@ -1255,6 +1255,11 @@ export interface ValidateDetectionResult {
   effective_mode: string;
   creates_materialized_view: boolean;
   mode_reason: string;
+  /** NAN-1688: whether the query shape qualifies for real-time mode,
+   * independent of the requested mode. Drives the "switch to real-time" nudge
+   * on scheduled rules. */
+  realtime_eligible: boolean;
+  realtime_eligible_reason?: string;
   warning?: string;
   errors: string[];
   referenced_fields: string[];
