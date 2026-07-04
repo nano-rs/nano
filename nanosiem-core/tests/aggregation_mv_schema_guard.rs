@@ -37,6 +37,20 @@ const MIGRATION_129: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../clickhouse/129_prevalence_mv_split.sql"
 ));
+// NAN-1443 lean-storage rework: the promote MV in migration 135 populates
+// event_bytes on existing tenants; it must match ocsf/init.sql's ingest MV.
+const MIGRATION_135: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../clickhouse/135_ocsf_promote_udm_parity.sql"
+));
+// NAN-1661: migration 150 supersedes migration 129 for the OCSF prevalence
+// branch MVs — it retargets them from the entity-keyed *_prevalence_summary
+// tables at the hourly *_prevalence_agg tables (the OCSF agg-layer bypass fix).
+// So the OCSF prevalence MV lockstep is now init.sql-vs-150, not init.sql-vs-129.
+const MIGRATION_152: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../clickhouse/152_ocsf_prevalence_route_through_agg.sql"
+));
 
 /// The split-per-branch aggregation MV family this guard pins.
 const UDM_AGG_MVS: &[&str] = &[
@@ -217,11 +231,13 @@ fn migration_128_matches_init_definitions() {
 
 /// Migration 129 (existing deployments) and the init files (fresh bootstraps)
 /// must define byte-equivalent prevalence MVs, or the two paths diverge
-/// silently.
+/// silently. NAN-1661: migration 129's OCSF prevalence MVs are SUPERSEDED by
+/// migration 150 (which retargets them at *_prevalence_agg), so the OCSF-side
+/// lockstep moved to `migration_152_matches_init_definitions`; here we only
+/// pin the UDM prevalence MVs (129 remains authoritative for those).
 #[test]
 fn migration_129_matches_init_definitions() {
     let udm = create_mv_statements(UDM_INIT);
-    let ocsf = create_mv_statements(OCSF_INIT);
     let mig = create_mv_statements(MIGRATION_129);
 
     for name in UDM_PREVALENCE_MVS {
@@ -231,13 +247,8 @@ fn migration_129_matches_init_definitions() {
             "{name} differs between migration 129 and clickhouse/init.sql"
         );
     }
-    for name in OCSF_PREVALENCE_MVS {
-        assert_eq!(
-            mig.get(*name),
-            ocsf.get(*name),
-            "{name} differs between migration 129 and clickhouse/ocsf/init.sql"
-        );
-    }
+    // Migration 129 physically still defines the 7 UDM + 7 (now-superseded)
+    // OCSF prevalence MVs; the count documents that full set.
     assert_eq!(
         mig.len(),
         UDM_PREVALENCE_MVS.len() + OCSF_PREVALENCE_MVS.len(),
@@ -245,21 +256,70 @@ fn migration_129_matches_init_definitions() {
     );
 }
 
-/// The OCSF telemetry rollup depends on the materialized `event_bytes` column;
-/// its definition must stay identical between the fresh CREATE TABLE, the
-/// existing-tenant overlay ALTER (both in ocsf/init.sql), and migration 128 —
-/// or fresh-vs-grown tables diverge.
+/// NAN-1661: migration 150 (existing deployments) retargets the OCSF prevalence
+/// branch MVs from *_prevalence_summary at *_prevalence_agg. Its DDL must be
+/// byte-equivalent to the fresh-bootstrap definitions in clickhouse/ocsf/init.sql,
+/// or the migrated-vs-fresh OCSF prevalence chains diverge silently.
+#[test]
+fn migration_152_matches_init_definitions() {
+    let ocsf = create_mv_statements(OCSF_INIT);
+    let mig = create_mv_statements(MIGRATION_152);
+
+    for name in OCSF_PREVALENCE_MVS {
+        assert_eq!(
+            mig.get(*name),
+            ocsf.get(*name),
+            "{name} differs between migration 150 and clickhouse/ocsf/init.sql"
+        );
+    }
+    assert_eq!(
+        mig.len(),
+        OCSF_PREVALENCE_MVS.len(),
+        "migration 150 defines MVs not covered by the OCSF prevalence guard list"
+    );
+}
+
+/// The OCSF telemetry rollup depends on `event_bytes` (the serialized-event byte
+/// count). NAN-1443 ("OCSF lean storage via Null-table + MV") replaced the old
+/// MATERIALIZED-at-insert column with a PLAIN column whose value is computed by
+/// the ingest MV (`length(toString(event))` off `ocsf_logs_raw`). Two locksteps
+/// must hold or fresh-vs-migrated tables diverge:
+///   1. the plain column definition is byte-identical in the fresh CREATE TABLE
+///      and the existing-tenant overlay ALTER (both in ocsf/init.sql);
+///   2. the MV value expression is byte-identical between ocsf/init.sql's ingest
+///      MV and the migration-135 promote MV that populates existing tenants.
+///
+/// Migration 128's earlier `ADD COLUMN … MATERIALIZED` is SUPERSEDED by the
+/// NAN-1443 rework and intentionally not asserted: it survives only as an
+/// `ADD COLUMN IF NOT EXISTS` no-op once init.sql has created the plain column.
 #[test]
 fn event_bytes_definitions_in_lockstep() {
-    let def = "`event_bytes` UInt64 MATERIALIZED length(toString(event)) CODEC(T64, LZ4)";
+    // 1. Plain column — twice in ocsf/init.sql (CREATE TABLE + overlay ALTER).
+    let col_def = "`event_bytes` UInt64 CODEC(T64, LZ4)";
     assert_eq!(
-        OCSF_INIT.matches(def).count(),
+        OCSF_INIT.matches(col_def).count(),
         2,
-        "ocsf/init.sql must define event_bytes exactly twice (CREATE TABLE + overlay ALTER)"
+        "ocsf/init.sql must define the plain event_bytes column exactly twice \
+         (CREATE TABLE + overlay ALTER); NAN-1443 dropped the MATERIALIZED form"
+    );
+    // event_bytes is OCSF-only — it must not leak into the UDM schema.
+    assert_eq!(
+        UDM_INIT.matches(col_def).count(),
+        0,
+        "event_bytes is an OCSF-only column; it must not appear in clickhouse/init.sql"
+    );
+
+    // 2. The MV value expression must be byte-identical in the fresh ingest MV
+    //    (ocsf/init.sql) and the migration-135 promote MV.
+    let mv_expr = "length(toString(event)) AS `event_bytes`";
+    assert_eq!(
+        OCSF_INIT.matches(mv_expr).count(),
+        1,
+        "ocsf/init.sql's ingest MV must compute event_bytes exactly once"
     );
     assert_eq!(
-        MIGRATION_128.matches(def).count(),
+        MIGRATION_135.matches(mv_expr).count(),
         1,
-        "migration 128 must ADD COLUMN event_bytes with the same definition"
+        "migration 135's promote MV must compute event_bytes identically to ocsf/init.sql"
     );
 }

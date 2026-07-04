@@ -27,11 +27,13 @@ impl SearchService {
         auto_sort_decision: &crate::search::query_processing::AutoSortDecision,
     ) -> Result<SearchResponse, SearchError> {
         // Get the time window from prevalence command
-        let time_window = prevalence_commands
+        let time_window = match prevalence_commands
             .first()
             .and_then(|cmd| cmd.time_window.as_ref())
-            .map(|tw| ast_to_prevalence_time_window(Some(tw)))
-            .unwrap_or(PrevalenceTimeWindow::ThirtyDays);
+        {
+            Some(tw) => ast_to_prevalence_time_window(Some(tw))?,
+            None => PrevalenceTimeWindow::ThirtyDays,
+        };
 
         // Strip prevalence and post-prevalence commands from query for base SQL generation
         let base_query = strip_prevalence_and_after(query);
@@ -75,13 +77,14 @@ impl SearchService {
         // Generate the JOIN-based SQL with prevalence filtering
         // num_commands_pushed indicates how many post-prevalence commands were pushed into SQL
         // (aggregation + trailing sort/head/etc.) and should be skipped in Rust post-processing
+        // Pagination is owned by `execute_clickhouse_sql` below (the SQL matches
+        // is_aggregation_query, so the executor wraps it with LIMIT/OFFSET + the
+        // count(*) OVER () total) — the generator no longer takes limit/offset.
         let (sql, num_commands_pushed) = self.generate_prevalence_join_sql(
             &base_sql,
             post_prevalence_commands,
             time_window,
             rarity_threshold,
-            limit,
-            offset,
         )?;
 
         tracing::debug!(
@@ -354,8 +357,6 @@ impl SearchService {
         post_prevalence_commands: &[Command],
         time_window: PrevalenceTimeWindow,
         rarity_threshold: u64,
-        limit: usize,
-        offset: usize,
     ) -> Result<(String, usize), SearchError> {
         tracing::debug!(
             "generate_prevalence_join_sql: {} post-prevalence commands",
@@ -777,10 +778,18 @@ ORDER BY l.timestamp DESC"#,
             }
 
             sql = format!("{}\nSELECT * FROM {}", cte_sql, current_source);
-        } else {
-            // No aggregation push-down — apply LIMIT/OFFSET to bound the result set
-            sql = format!("{}\nLIMIT {} OFFSET {}", sql, limit, offset);
         }
+        // NAN-366 pagination fix: do NOT append `LIMIT {limit} OFFSET {offset}` here.
+        // This SQL matches `is_aggregation_query` (it projects host_count / is_rare /
+        // prevalence_score), so the executor wraps it in
+        // `SELECT *, count(*) OVER () AS _total_count FROM (<sql>) LIMIT {limit} OFFSET {offset}`
+        // and owns pagination + the pre-pagination total. Appending LIMIT/OFFSET here too
+        // double-paginated: page 1's `count(*) OVER ()` ran AFTER the inner LIMIT so the
+        // reported total was capped at the page size, and page 2+ came back EMPTY because
+        // the outer OFFSET slid past the already-offset inner window. Leaving the query
+        // unbounded (the base CTE still carries its own safety LIMIT) lets the outer wrap
+        // slice the page and report the real total. The push-down branch above already
+        // relied on this — it never appended pagination either.
 
         tracing::debug!(
             "Generated prevalence SQL (first 2000 chars): {}",
@@ -1161,8 +1170,14 @@ ORDER BY l.timestamp DESC"#,
                 // Replace them with the properly qualified CASE expression
                 if in_prevalence_context {
                     match field.as_str() {
-                        "first_seen" => Ok("(CASE WHEN _dp_host_count < 9999 THEN _dp_first_seen WHEN _ip_host_count < 9999 THEN _ip_first_seen WHEN _hp_host_count < 9999 THEN _hp_first_seen ELSE NULL END)".to_string()),
-                        "last_seen" => Ok("(CASE WHEN _dp_host_count < 9999 THEN _dp_last_seen WHEN _ip_host_count < 9999 THEN _ip_last_seen WHEN _hp_host_count < 9999 THEN _hp_last_seen ELSE NULL END)".to_string()),
+                        // NAN-366: report the timestamps of the SAME artifact the SELECT/WHERE
+                        // side chose — the RAREST entity (lowest host_count), domain→ip→hash
+                        // only as a tie-break. The prior dict-PRESENCE priority (domain first
+                        // whenever present) disagreed with the rarest-wins selection, so an
+                        // eval like `eval age = now() - first_seen` reported the domain's
+                        // first_seen even when a rarer IP/hash won the row's host_count.
+                        "first_seen" => Ok("(CASE WHEN _dp_host_count < 9999 AND _dp_host_count <= _ip_host_count AND _dp_host_count <= _hp_host_count THEN _dp_first_seen WHEN _ip_host_count < 9999 AND _ip_host_count <= _hp_host_count THEN _ip_first_seen WHEN _hp_host_count < 9999 THEN _hp_first_seen ELSE NULL END)".to_string()),
+                        "last_seen" => Ok("(CASE WHEN _dp_host_count < 9999 AND _dp_host_count <= _ip_host_count AND _dp_host_count <= _hp_host_count THEN _dp_last_seen WHEN _ip_host_count < 9999 AND _ip_host_count <= _hp_host_count THEN _ip_last_seen WHEN _hp_host_count < 9999 THEN _hp_last_seen ELSE NULL END)".to_string()),
                         // host_count and total_occurrences are also defined in the SELECT,
                         // but reference them from the already-selected alias would cause ordering issues
                         // Use the CASE expression for consistency

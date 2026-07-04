@@ -525,6 +525,14 @@ pub struct ArtifactExplorerResponse {
     pub new_count: usize,
     /// Count of high-risk assets (both rare AND active in last 24h)
     pub high_risk_asset_count: usize,
+    /// The headline counts (`total`, `rare_count`, `new_count`,
+    /// `high_risk_asset_count`) are computed over a bounded fetch buffer, not a
+    /// full table scan. When any underlying per-type fetch hit that buffer cap,
+    /// these counts are FLOORS (real values are higher) and the UI should render
+    /// them as `N+` rather than an exact total (audit P6). `false` means the
+    /// buffer was not capped and the counts are exact.
+    #[serde(default)]
+    pub counts_approximate: bool,
 }
 
 /// A host that observed an artifact, with occurrence count

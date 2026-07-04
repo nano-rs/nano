@@ -410,7 +410,18 @@ impl MaterializedViewGenerator {
 
         // Calculate risk score (use rule's risk_score or default based on severity).
         // Severity defaults are sourced from `crate::detection::risk` so the MV path
-        // and the scheduled path can never drift apart.
+        // and the scheduled path share the same base-score fallback.
+        //
+        // This bakes a STATIC base score into the `signals` row as a coarse hint
+        // only — it is NOT the authoritative finding score. As of NAN-1663 the
+        // `SignalProcessor` recomputes the score for every drained signal through
+        // the SAME engine the scheduled path uses (`risk::score_rule_match` →
+        // `ScoreCalculator::calculate`), applying the rule's `risk_modifiers` and
+        // the global `risk_weight` against the matched event. So a rule scores
+        // identically scheduled vs. real-time (audit R1), and this SQL value only
+        // needs the shared severity-default fallback (kept in lockstep via
+        // `default_score_for_severity`). `| risk score=…` piped rules remain
+        // rejected from real-time entirely.
         let risk_score = rule
             .risk_score
             .unwrap_or_else(|| default_score_for_severity(rule.severity));
@@ -425,7 +436,30 @@ impl MaterializedViewGenerator {
         // against the same table (both schemas expose an `id` column).
         let logs_table = Self::logs_table_name(self.profile.as_ref());
 
-        // Generate DDL
+        // Generate DDL.
+        //
+        // R2 (alias-shadows-column, Code 53 class): the projection assigns the
+        // *constant* rule metadata to output columns whose names — `rule_name`,
+        // `severity`, `risk_score`, `risk_entity` — are ALSO real base columns of
+        // the `logs`/`ocsf_logs` table (they are RBA-owned CIM/UDM columns a rule
+        // may legitimately filter on). ClickHouse resolves a name that is both a
+        // SELECT alias and a table column to the ALIAS EXPRESSION. If the filter
+        // predicate lived in the same SELECT scope as `'critical' AS severity`,
+        // a rule filtering `severity="high"` would compile to
+        // `lower('critical') = lower('high')` — a constant WHERE that silently
+        // matches everything or nothing with NO error. (Empirically: a flat MV
+        // over a source with a real `severity` column dropped every matching row.)
+        //
+        // The projection aliases CANNOT simply be renamed with a reserved prefix:
+        // a `... TO signals` materialized view matches the SELECT output to the
+        // target table **by column NAME**, not by position (ClickHouse raises
+        // `THERE_IS_NO_COLUMN` otherwise), so the output names are pinned to the
+        // `signals` schema.
+        //
+        // Fix: evaluate the filter predicate in an inner derived-table subquery,
+        // where none of the outer projection aliases are in scope, so the WHERE
+        // always references the TRUE base columns. The outer projection then only
+        // re-labels already-filtered rows and can safely reuse base-column names.
         let ddl = format!(
             r#"CREATE MATERIALIZED VIEW {} TO signals AS
 SELECT
@@ -436,12 +470,17 @@ SELECT
     '{}' AS severity,
     {} AS risk_score,
     {} AS risk_entity,
-    {}.id AS matched_log_id,
+    matched_log_id,
     toJSONString(map()) AS metadata,
     now64(6) AS _inserted_at
-FROM {}
-WHERE {}
-  AND timestamp >= now() - INTERVAL 1 HOUR"#,
+FROM (
+    SELECT
+        *,
+        {}.id AS matched_log_id
+    FROM {}
+    WHERE {}
+      AND timestamp >= now() - INTERVAL 1 HOUR
+) AS matched_logs"#,
             view_name,
             rule.id,
             crate::sql_hygiene::escape_sql_string(&rule.name), // Escape backslashes + single quotes
@@ -453,7 +492,59 @@ WHERE {}
             where_clause
         );
 
+        // R2 GUARD: the filter predicate must live in the inner source subquery,
+        // never in the outer projection scope where the constant column aliases
+        // (`rule_name`/`severity`/`risk_score`/`risk_entity`) are defined. If a
+        // future edit collapses the subquery, those aliases would shadow the
+        // base columns and any rule filtering one of them would compile to a
+        // constant WHERE (silent match-all / match-none). Assert the structural
+        // isolation holds: the `FROM (` subquery boundary must precede the WHERE.
+        Self::assert_filter_scope_isolated(&ddl)?;
+
         Ok(ddl)
+    }
+
+    /// Output-projection aliases the MV assigns that COLLIDE with real base
+    /// columns of the `logs`/`ocsf_logs` table. These are RBA-owned CIM/UDM
+    /// columns a detection rule may filter on, so their names in the outer
+    /// projection would shadow the base column inside a shared SELECT scope
+    /// (the R2 alias-shadows-column bug). The generated DDL keeps the filter in
+    /// an inner subquery so this can never happen; [`Self::assert_filter_scope_isolated`]
+    /// enforces that invariant on every generated DDL.
+    const SHADOW_PRONE_OUTPUT_ALIASES: &'static [&'static str] =
+        &["rule_name", "severity", "risk_score", "risk_entity"];
+
+    /// R2 codegen guard: verify the filter predicate is isolated in the inner
+    /// source subquery, so a projection alias can never shadow a filtered base
+    /// column. The generated DDL places every rule filter inside
+    /// `FROM ( SELECT ... WHERE <filter> ) AS matched_logs`; the outer SELECT —
+    /// which defines the shadow-prone aliases — is textually *before* the
+    /// `FROM (` boundary, and the WHERE is *after* it. If a future edit collapses
+    /// the subquery (moving the WHERE up alongside the constant aliases), this
+    /// guard fails fast instead of shipping a silently-constant materialized view.
+    fn assert_filter_scope_isolated(ddl: &str) -> Result<(), MaterializedViewError> {
+        // The subquery boundary that isolates the filter scope.
+        let sub_open = ddl.find("FROM (").ok_or_else(|| {
+            MaterializedViewError::DdlGenerationError(
+                "real-time MV DDL lost its source subquery — the rule filter is no \
+                 longer isolated from output-column aliases (R2 shadowing risk)"
+                    .to_string(),
+            )
+        })?;
+
+        // Every WHERE must appear after the subquery opens (i.e. inside it), so
+        // filtered base columns are resolved before the shadow-prone aliases exist.
+        if let Some(where_pos) = ddl.find(" WHERE ") {
+            if where_pos < sub_open {
+                return Err(MaterializedViewError::DdlGenerationError(format!(
+                    "real-time MV WHERE is not isolated in the source subquery; a \
+                     rule filtering any of {:?} would shadow the base column and \
+                     compile to a constant predicate",
+                    Self::SHADOW_PRONE_OUTPUT_ALIASES
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Auto-detect the best risk entity field by analyzing the query
@@ -700,6 +791,63 @@ mod tests {
         ] {
             assert_where_matches_canonical(q);
         }
+    }
+
+    /// R2 (alias-shadows-column): a rule filtering a base column whose name
+    /// collides with an output-projection alias (`severity`, `risk_score`,
+    /// `rule_name`, `risk_entity`) must have its WHERE resolved against the TRUE
+    /// base column — not the constant alias expression. The generated DDL
+    /// isolates the filter inside the source subquery so ClickHouse cannot
+    /// shadow the column (Code 53 class). Before the fix the flat SELECT placed
+    /// `'high' AS severity` in the same scope as `WHERE lower(severity) = …`,
+    /// collapsing the predicate to a constant that matched everything/nothing.
+    #[test]
+    fn test_r2_shadow_prone_filter_isolated_in_subquery() {
+        for q in ["severity=\"high\"", "risk_score>50"] {
+            let mut rule = create_test_rule();
+            rule.query = q.to_string();
+            let generator = MaterializedViewGenerator::new(clickhouse::Client::default());
+            let ddl = generator
+                .generate_view_ddl(&rule)
+                .unwrap_or_else(|e| panic!("DDL generation failed for {q:?}: {e}"));
+
+            // The canonical WHERE (referencing the real base column) is embedded
+            // verbatim — the filter did not silently become a constant.
+            let expected = canonical_where(q);
+            assert!(
+                ddl.contains(&format!("WHERE {expected}")),
+                "WHERE drifted from canonical for {q}\n  canonical: {expected}\n  ddl:\n{ddl}"
+            );
+
+            // Structural isolation: the source subquery opens (`FROM (`) BEFORE
+            // the WHERE, and the shadow-prone output alias is defined in the
+            // outer projection, before the subquery. That separation is what
+            // guarantees the WHERE binds the base column, not the alias.
+            let sub_open = ddl.find("FROM (").expect("DDL must open a source subquery");
+            let where_pos = ddl.find(" WHERE ").expect("DDL must have a WHERE");
+            let sev_alias = ddl.find("AS severity").expect("severity output alias");
+            assert!(
+                sev_alias < sub_open && sub_open < where_pos,
+                "filter not isolated from output aliases for {q}\n  ddl:\n{ddl}"
+            );
+        }
+    }
+
+    /// The R2 guard rejects a DDL whose WHERE has been hoisted into the outer
+    /// projection scope (where the shadow-prone aliases live), and accepts the
+    /// real generated shape where the WHERE sits inside the source subquery.
+    #[test]
+    fn test_r2_guard_rejects_collapsed_where_scope() {
+        let collapsed = "SELECT 'x' AS severity FROM logs WHERE lower(severity)='high' \
+                         FROM ( SELECT * FROM logs )";
+        assert!(matches!(
+            MaterializedViewGenerator::assert_filter_scope_isolated(collapsed),
+            Err(MaterializedViewError::DdlGenerationError(_))
+        ));
+
+        let isolated =
+            "SELECT 'x' AS severity FROM ( SELECT * FROM logs WHERE lower(severity)='high' )";
+        assert!(MaterializedViewGenerator::assert_filter_scope_isolated(isolated).is_ok());
     }
 
     #[test]

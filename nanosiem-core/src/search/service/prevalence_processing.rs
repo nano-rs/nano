@@ -80,7 +80,7 @@ impl SearchService {
         };
 
         for cmd in prevalence_commands {
-            let time_window = ast_to_prevalence_time_window(cmd.time_window.as_ref());
+            let time_window = ast_to_prevalence_time_window(cmd.time_window.as_ref())?;
 
             if cmd.enrich {
                 // Enrichment mode: add _prevalence field to all results
@@ -202,9 +202,17 @@ impl SearchService {
                 }
             }
             Err(e) => {
-                warn!("Failed to query prevalence: {}", e);
-                // Continue without filtering on error
-                return Ok(results);
+                // Fail CLOSED. A prevalence-gated filter must NOT pass rows when the
+                // dict/CH lookup fails. Returning the UNFILTERED set here meant a
+                // prevalence-filtered detection rule (e.g. `… | prevalence host_count < 3`)
+                // fired on EVERY row whenever the dict was momentarily unavailable —
+                // the opposite of "signal over noise". Exclude all rows instead,
+                // mirroring the JOIN path where an absent host_count is dropped.
+                warn!(
+                    "Prevalence filtering failed ({}); failing closed (excluding all rows)",
+                    e
+                );
+                return Ok(Vec::new());
             }
         }
 
@@ -239,19 +247,17 @@ impl SearchService {
                 // Dict-based map keys are lowercase for hash/domain (the only
                 // two artifact types this filter handles); lowercase the row's
                 // value to match.
-                let prevalence = prevalence_map
-                    .get(&artifact.to_lowercase())
-                    .copied()
-                    .unwrap_or(0);
-
-                match operator {
-                    PrevalenceOperator::Lt => prevalence < threshold_value,
-                    PrevalenceOperator::Lte => prevalence <= threshold_value,
-                    PrevalenceOperator::Gt => prevalence > threshold_value,
-                    PrevalenceOperator::Gte => prevalence >= threshold_value,
-                    PrevalenceOperator::Eq => prevalence == threshold_value,
-                    PrevalenceOperator::Ne => prevalence != threshold_value,
-                }
+                //
+                // A MISS is NOT host_count 0. The dict deliberately OMITS common
+                // artifacts (entities on >=1000 hosts are absent, and the rest are
+                // masked to the 9999 sentinel), so a lookup miss means "common /
+                // not tracked". Treating a miss as 0 inverted the filter: a common
+                // artifact absent from the dict PASSED `host_count < N` — the exact
+                // opposite of rare. Mirror the JOIN path's NULL semantics: a miss
+                // fails EVERY comparison (SQL `NULL <cmp> x` yields NULL → the row is
+                // dropped by the WHERE).
+                let prevalence = prevalence_map.get(&artifact.to_lowercase()).copied();
+                prevalence_passes_filter(prevalence, operator, threshold_value)
             })
             .collect();
 
@@ -948,69 +954,66 @@ impl SearchService {
             });
         }
 
-        // Domain UNION-ALL branches (alias `domain`): dest_host / src_host (non-IP) + query (dotted).
-        let mut domain_branches: Vec<String> = Vec::new();
+        // Unpivot every mapped artifact column in a SINGLE pass over `matching_logs`
+        // via ARRAY JOIN. The prior shape ran one `SELECT DISTINCT … FROM matching_logs`
+        // per artifact column (up to 7 branches). A ClickHouse `WITH … AS` CTE is INLINED,
+        // not materialized, so each branch re-scanned the whole base query — ~7.5x read
+        // amplification. arrayConcat of per-column conditional singleton arrays collapses
+        // that to one scan; the outer `SELECT DISTINCT` dedups across columns.
+        //
+        // Domain columns (dest_host / src_host) now exclude ONLY actual IPv4 literals via
+        // `isIPv4String`, not everything with >=3 dots. The old `NOT LIKE '%.%.%.%'` dropped
+        // legit deep subdomains (e.g. `a.b.c.example.com`) along with IPs. The `query`
+        // branch keeps its "must contain a dot" gate. Domain artifacts are lowercased to
+        // match the dict keyspace; hash/ip stay raw (mirroring the union wrappers this
+        // replaces: `lower(domain)`, raw `hash`, raw `ip`). Each `if(cond, [tuple], [])`
+        // emits zero-or-one `(artifact_type, artifact)` tuple; the empty `[]` inherits the
+        // `Array(Tuple(String, String))` type from the populated arm.
+        let mut artifact_entries: Vec<String> = Vec::new();
         if let Some(c) = &dest_host_a {
-            domain_branches.push(format!(
-                "SELECT DISTINCT {c} as domain FROM matching_logs\n                WHERE {c} != '' AND {c} NOT LIKE '%%.%%.%%.%%'"
+            artifact_entries.push(format!(
+                "if({c} != '' AND NOT isIPv4String({c}), [('domain', lower({c}))], [])"
             ));
         }
         if let Some(c) = &src_host_a {
-            domain_branches.push(format!(
-                "SELECT DISTINCT {c} as domain FROM matching_logs\n                WHERE {c} != '' AND {c} NOT LIKE '%%.%%.%%.%%'"
+            artifact_entries.push(format!(
+                "if({c} != '' AND NOT isIPv4String({c}), [('domain', lower({c}))], [])"
             ));
         }
         if let Some(c) = &query_a {
-            domain_branches.push(format!(
-                "SELECT DISTINCT {c} as domain FROM matching_logs\n                WHERE {c} != '' AND {c} LIKE '%%.%%'"
+            artifact_entries.push(format!(
+                "if({c} != '' AND position({c}, '.') > 0, [('domain', lower({c}))], [])"
             ));
         }
-
-        // Hash UNION-ALL branches (alias `hash`): file_hash + process_hash.
-        let mut hash_branches: Vec<String> = Vec::new();
         if let Some(c) = &file_hash_a {
-            hash_branches.push(format!(
-                "SELECT DISTINCT {c} as hash FROM matching_logs WHERE {c} != '' AND length({c}) >= 32"
+            artifact_entries.push(format!(
+                "if({c} != '' AND length({c}) >= 32, [('hash', {c})], [])"
             ));
         }
         if let Some(c) = &process_hash_a {
-            hash_branches.push(format!(
-                "SELECT DISTINCT {c} as hash FROM matching_logs WHERE {c} != '' AND length({c}) >= 32"
+            artifact_entries.push(format!(
+                "if({c} != '' AND length({c}) >= 32, [('hash', {c})], [])"
             ));
         }
-
-        // IP UNION-ALL branches (alias `ip`): dest_ip + src_ip.
-        let mut ip_branches: Vec<String> = Vec::new();
         if let Some(c) = &dest_ip_a {
-            ip_branches.push(format!(
-                "SELECT DISTINCT {c} as ip FROM matching_logs WHERE {c} != '' AND {c} LIKE '%%.%%.%%.%%'"
+            artifact_entries.push(format!(
+                "if({c} != '' AND isIPv4String({c}), [('ip', {c})], [])"
             ));
         }
         if let Some(c) = &src_ip_a {
-            ip_branches.push(format!(
-                "SELECT DISTINCT {c} as ip FROM matching_logs WHERE {c} != '' AND {c} LIKE '%%.%%.%%.%%'"
+            artifact_entries.push(format!(
+                "if({c} != '' AND isIPv4String({c}), [('ip', {c})], [])"
             ));
         }
 
-        // Assemble the per-type SELECT, skipping a whole artifact type when it has no branches.
-        let mut union_sections: Vec<String> = Vec::new();
-        if !domain_branches.is_empty() {
-            union_sections.push(format!(
-                "SELECT\n                'domain' as artifact_type,\n                lower(domain) as artifact\n            FROM (\n                {}\n            )\n            WHERE domain != ''",
-                domain_branches.join("\n                UNION ALL\n                ")
-            ));
-        }
-        if !hash_branches.is_empty() {
-            union_sections.push(format!(
-                "SELECT\n                'hash' as artifact_type,\n                hash as artifact\n            FROM (\n                {}\n            )\n            WHERE hash != ''",
-                hash_branches.join("\n                UNION ALL\n                ")
-            ));
-        }
-        if !ip_branches.is_empty() {
-            union_sections.push(format!(
-                "SELECT\n                'ip' as artifact_type,\n                ip as artifact\n            FROM (\n                {}\n            )\n            WHERE ip != ''",
-                ip_branches.join("\n                UNION ALL\n                ")
-            ));
+        // No artifact columns mapped under this schema → nothing to extract.
+        if artifact_entries.is_empty() {
+            return Ok(PrevalenceScatterData {
+                hash_points: Vec::new(),
+                domain_points: Vec::new(),
+                ip_points: Vec::new(),
+                rarity_threshold: 3,
+            });
         }
 
         let artifacts_sql = format!(
@@ -1022,12 +1025,22 @@ impl SearchService {
                 WHERE {where_clause}
                 LIMIT 100000
             )
-            {union_body}
+            SELECT DISTINCT artifact_type, artifact
+            FROM (
+                SELECT
+                    tupleElement(pair, 1) AS artifact_type,
+                    tupleElement(pair, 2) AS artifact
+                FROM matching_logs
+                ARRAY JOIN arrayConcat(
+                    {entries}
+                ) AS pair
+            )
+            WHERE artifact != ''
             "#,
             select_cols = select_cols.join(",\n                    "),
             logs_table = logs_table,
             where_clause = where_clause,
-            union_body = union_sections.join("\n\n            UNION ALL\n\n            "),
+            entries = artifact_entries.join(",\n                    "),
         );
 
         tracing::debug!("Prevalence artifacts SQL: {}", artifacts_sql);
@@ -1117,3 +1130,34 @@ impl SearchService {
         }
     }
 }
+
+/// Decide whether a row whose looked-up prevalence host_count is `prevalence`
+/// passes a `| prevalence <field> <op> <threshold>` filter condition.
+///
+/// `prevalence` is `None` when the artifact is ABSENT from the prevalence dict.
+/// A dict miss means "common / not tracked" — the dict omits artifacts seen on
+/// >=1000 hosts and masks the rest to the 9999 sentinel — it is NOT host_count
+/// 0. A miss therefore fails EVERY comparison, mirroring the JOIN path where an
+/// absent host_count (SQL NULL) is dropped by the WHERE. This keeps the
+/// dict-path filter from inverting: a common artifact must never satisfy a
+/// `host_count < N` rarity test just because it fell out of the dict.
+pub(crate) fn prevalence_passes_filter(
+    prevalence: Option<u64>,
+    operator: &PrevalenceOperator,
+    threshold: u64,
+) -> bool {
+    let Some(prevalence) = prevalence else {
+        return false;
+    };
+    match operator {
+        PrevalenceOperator::Lt => prevalence < threshold,
+        PrevalenceOperator::Lte => prevalence <= threshold,
+        PrevalenceOperator::Gt => prevalence > threshold,
+        PrevalenceOperator::Gte => prevalence >= threshold,
+        PrevalenceOperator::Eq => prevalence == threshold,
+        PrevalenceOperator::Ne => prevalence != threshold,
+    }
+}
+
+#[cfg(test)]
+mod tests;

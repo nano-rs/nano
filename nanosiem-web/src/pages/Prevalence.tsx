@@ -132,6 +132,7 @@ function KpiTile({
   icon: Icon,
   tone,
   loading,
+  approximate = false,
 }: {
   label: string;
   value: number;
@@ -139,6 +140,8 @@ function KpiTile({
   icon: typeof AlertOctagon;
   tone: KpiTone;
   loading: boolean;
+  /** Count is a floor over a capped fetch buffer — render as `N+`. */
+  approximate?: boolean;
 }) {
   const toneClasses =
     tone === 'danger'
@@ -156,8 +159,20 @@ function KpiTile({
         <div
           className={cn('mt-1.5 font-semibold tabular-nums tracking-tight', toneClasses.fg)}
           style={{ fontSize: '32px', lineHeight: '1.05' }}
+          title={
+            approximate && !loading
+              ? 'At least this many — the fleet exceeds the scan buffer, so this is a floor, not an exact total'
+              : undefined
+          }
         >
-          {loading ? <span className="text-muted-foreground/40">—</span> : value.toLocaleString()}
+          {loading ? (
+            <span className="text-muted-foreground/40">—</span>
+          ) : (
+            <>
+              {value.toLocaleString()}
+              {approximate && <span className="text-muted-foreground/70">+</span>}
+            </>
+          )}
         </div>
         <div className="mt-1 text-[11.5px] text-muted-foreground">{sub}</div>
       </div>
@@ -405,6 +420,8 @@ export function Prevalence() {
   const rareCount = data?.rare_count ?? 0;
   const newCount = data?.new_count ?? 0;
   const highRiskCount = data?.high_risk_asset_count ?? 0;
+  // P6: headline counts are floors when the fleet exceeds the fetch buffer.
+  const countsApproximate = data?.counts_approximate ?? false;
   const artifacts = data?.artifacts ?? [];
   const total = data?.total ?? 0;
   const totalPages = total > 0 ? Math.max(1, Math.ceil(total / PAGE_SIZE)) : 1;
@@ -434,8 +451,18 @@ export function Prevalence() {
         <span className="flex-1" />
         {data && (
           <div className="flex items-center gap-2 font-mono text-[10.5px] text-muted-foreground">
-            <span>
-              <span className="tabular-nums text-foreground">{total.toLocaleString()}</span> indicators
+            <span
+              title={
+                countsApproximate
+                  ? 'At least this many — the fleet exceeds the scan buffer, so this is a floor, not an exact total'
+                  : undefined
+              }
+            >
+              <span className="tabular-nums text-foreground">
+                {total.toLocaleString()}
+                {countsApproximate && '+'}
+              </span>{' '}
+              indicators
             </span>
           </div>
         )}
@@ -450,6 +477,7 @@ export function Prevalence() {
           icon={AlertOctagon}
           tone="danger"
           loading={loading && !data}
+          approximate={countsApproximate}
         />
         <KpiTile
           label="New artifacts (24h)"
@@ -458,6 +486,7 @@ export function Prevalence() {
           icon={Sparkles}
           tone="brand"
           loading={loading && !data}
+          approximate={countsApproximate}
         />
         <KpiTile
           label="High-risk assets"
@@ -466,6 +495,7 @@ export function Prevalence() {
           icon={ShieldAlert}
           tone="warn"
           loading={loading && !data}
+          approximate={countsApproximate}
         />
       </div>
 

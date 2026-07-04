@@ -78,6 +78,13 @@ pub struct QueryArtifactsResponse {
     pub hash_points: Vec<ArtifactPoint>,
     pub domain_points: Vec<ArtifactPoint>,
     pub rarity_threshold: u64,
+    /// True when the distinct-artifact extraction hit its cap and only a
+    /// subset of matching artifacts was scored. Lets the caller distinguish
+    /// "the query matched nothing" from "the query matched too much to score
+    /// in one pass" (audit P8) — previously an over-cap result was silently
+    /// swallowed into an empty 200.
+    #[serde(default)]
+    pub artifacts_truncated: bool,
 }
 
 /// Single artifact point for scatter/chart visualization
@@ -163,4 +170,35 @@ pub struct ArtifactDetailQuery {
     pub artifact: String,
     /// Time window for detail queries (1h, 24h, 7d, 30d)
     pub window: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Audit P8: an over-cap query must be distinguishable on the wire from
+    /// "matched nothing". The response carries an explicit `artifacts_truncated`
+    /// flag; empty points + `true` means "too much to score in one pass".
+    #[test]
+    fn query_artifacts_response_exposes_truncation_signal() {
+        let truncated = QueryArtifactsResponse {
+            hash_points: vec![],
+            domain_points: vec![],
+            rarity_threshold: 3,
+            artifacts_truncated: true,
+        };
+        let json = serde_json::to_value(&truncated).unwrap();
+        assert_eq!(json["artifacts_truncated"], serde_json::json!(true));
+
+        // Default (not truncated) path stays false so a genuinely-empty match
+        // reads as empty, not truncated.
+        let empty = QueryArtifactsResponse {
+            hash_points: vec![],
+            domain_points: vec![],
+            rarity_threshold: 3,
+            artifacts_truncated: false,
+        };
+        let json = serde_json::to_value(&empty).unwrap();
+        assert_eq!(json["artifacts_truncated"], serde_json::json!(false));
+    }
 }

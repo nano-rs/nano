@@ -484,8 +484,10 @@ LIFETIME(MIN 60 MAX 300);
 -- at insert (CACHE_DICTIONARY_UPDATE_FAIL) instead of degrading to stale
 -- data — but the miss query is a bounded local-table read, and the
 -- NAN-1405/1437 alarms + wait_for_async_insert=1 make any recurrence loud
--- instead of silent. The HAVING host_count < 1000 filter keeps noisy
--- artifacts out of the cache: lookups miss and return the default 9999.
+-- instead of silent. NAN-1662: common artifacts (>=1000 hosts) are stored
+-- capped at the 9999 marker (NOT dropped), so an ingest dict MISS unambiguously
+-- means "genuinely new" and stamps 1 (rare/new) via the call-site default,
+-- rather than being confused with a dropped-common artifact.
 
 CREATE OR REPLACE DICTIONARY nanosiem.hash_prevalence_dict
 (
@@ -503,13 +505,12 @@ SOURCE(CLICKHOUSE(
     PASSWORD '{clickhouse_self_password}'
     DB 'nanosiem'
     QUERY 'SELECT file_hash,
-                  toUInt16(least(9998, uniqMerge(host_count))) AS host_count,
+                  if(uniqMerge(host_count) >= 1000, toUInt16(9999), toUInt16(least(9998, uniqMerge(host_count)))) AS host_count,
                   min(first_seen) AS first_seen,
                   max(last_seen) AS last_seen,
                   toUInt64(sum(total_count)) AS total_occurrences
            FROM nanosiem.hash_prevalence_summary
            GROUP BY file_hash
-           HAVING host_count < 1000
            SETTINGS max_memory_usage = 536870912, max_bytes_before_external_group_by = 268435456, max_threads = 2'
 ))
 LIFETIME(MIN 900 MAX 1800)
@@ -531,13 +532,12 @@ SOURCE(CLICKHOUSE(
     PASSWORD '{clickhouse_self_password}'
     DB 'nanosiem'
     QUERY 'SELECT domain,
-                  toUInt16(least(9998, uniqMerge(source_host_count))) AS host_count,
+                  if(uniqMerge(source_host_count) >= 1000, toUInt16(9999), toUInt16(least(9998, uniqMerge(source_host_count)))) AS host_count,
                   min(first_seen) AS first_seen,
                   max(last_seen) AS last_seen,
                   toUInt64(sum(total_count)) AS total_occurrences
            FROM nanosiem.domain_prevalence_summary
            GROUP BY domain
-           HAVING host_count < 1000
            SETTINGS max_memory_usage = 536870912, max_bytes_before_external_group_by = 268435456, max_threads = 2'
 ))
 LIFETIME(MIN 900 MAX 1800)
@@ -564,14 +564,13 @@ SOURCE(CLICKHOUSE(
     PASSWORD '{clickhouse_self_password}'
     DB 'nanosiem'
     QUERY 'SELECT ip,
-                  toUInt16(least(9998, uniqMerge(source_host_count))) AS host_count,
+                  if(uniqMerge(source_host_count) >= 1000, toUInt16(9999), toUInt16(least(9998, uniqMerge(source_host_count)))) AS host_count,
                   min(first_seen) AS first_seen,
                   max(last_seen) AS last_seen,
                   toUInt64(sum(total_count)) AS total_occurrences
            FROM nanosiem.ip_prevalence_summary
            WHERE is_private = 0
            GROUP BY ip
-           HAVING host_count < 1000
            SETTINGS max_memory_usage = 536870912, max_bytes_before_external_group_by = 268435456, max_threads = 2'
 ))
 LIFETIME(MIN 900 MAX 1800)
@@ -899,17 +898,17 @@ CREATE TABLE IF NOT EXISTS nanosiem.logs
     `parent_process_name` LowCardinality(String) DEFAULT '' CODEC(ZSTD(1)),
     `command_line` String DEFAULT '' CODEC(ZSTD(1)),
     -- Prevalence columns (lookup from prevalence dictionaries)
-    `prevalence_file_hash` UInt16 MATERIALIZED if(file_hash != '', dictGetOrDefault('nanosiem.hash_prevalence_dict', 'host_count', lower(file_hash), toUInt16(9999)), toUInt16(65535)) CODEC(T64, LZ4),
-    `prevalence_process_hash` UInt16 MATERIALIZED if(process_hash != '', dictGetOrDefault('nanosiem.hash_prevalence_dict', 'host_count', lower(process_hash), toUInt16(9999)), toUInt16(65535)) CODEC(T64, LZ4),
-    `prevalence_dest_domain` UInt16 MATERIALIZED if(dest_host != '' AND NOT match(dest_host, '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$'), dictGetOrDefault('nanosiem.domain_prevalence_dict', 'host_count', lower(dest_host), toUInt16(9999)), toUInt16(65535)) CODEC(T64, LZ4),
-    `prevalence_dest_ip` UInt16 MATERIALIZED if(dest_ip != '' AND NOT (startsWith(dest_ip, '10.') OR startsWith(dest_ip, '172.16.') OR startsWith(dest_ip, '192.168.') OR startsWith(dest_ip, '127.')), dictGetOrDefault('nanosiem.ip_prevalence_dict', 'host_count', dest_ip, toUInt16(9999)), toUInt16(65535)) CODEC(T64, LZ4),
+    `prevalence_file_hash` UInt16 MATERIALIZED if(file_hash != '', dictGetOrDefault('nanosiem.hash_prevalence_dict', 'host_count', lower(file_hash), toUInt16(1)), toUInt16(65535)) CODEC(T64, LZ4),
+    `prevalence_process_hash` UInt16 MATERIALIZED if(process_hash != '', dictGetOrDefault('nanosiem.hash_prevalence_dict', 'host_count', lower(process_hash), toUInt16(1)), toUInt16(65535)) CODEC(T64, LZ4),
+    `prevalence_dest_domain` UInt16 MATERIALIZED if(dest_host != '' AND NOT match(dest_host, '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$'), dictGetOrDefault('nanosiem.domain_prevalence_dict', 'host_count', lower(dest_host), toUInt16(1)), toUInt16(65535)) CODEC(T64, LZ4),
+    `prevalence_dest_ip` UInt16 MATERIALIZED if(dest_ip != '' AND NOT (match(dest_ip, '^10\\.') OR match(dest_ip, '^172\\.(1[6-9]|2[0-9]|3[0-1])\\.') OR match(dest_ip, '^192\\.168\\.') OR match(dest_ip, '^127\\.') OR match(dest_ip, '^169\\.254\\.')), dictGetOrDefault('nanosiem.ip_prevalence_dict', 'host_count', dest_ip, toUInt16(1)), toUInt16(65535)) CODEC(T64, LZ4),
     -- prevalence_min: inlined dict lookups instead of cross-column DEFAULT references
     -- (ClickHouse 26.x analyzer can't resolve inter-column DEFAULT refs during INSERT)
     `prevalence_min` UInt16 DEFAULT least(
-        if(file_hash != '', dictGetOrDefault('nanosiem.hash_prevalence_dict', 'host_count', lower(file_hash), toUInt16(9999)), toUInt16(9999)),
-        if(process_hash != '', dictGetOrDefault('nanosiem.hash_prevalence_dict', 'host_count', lower(process_hash), toUInt16(9999)), toUInt16(9999)),
-        if(dest_host != '' AND NOT match(dest_host, '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$'), dictGetOrDefault('nanosiem.domain_prevalence_dict', 'host_count', lower(dest_host), toUInt16(9999)), toUInt16(9999)),
-        if(dest_ip != '' AND NOT (startsWith(dest_ip, '10.') OR startsWith(dest_ip, '172.16.') OR startsWith(dest_ip, '192.168.') OR startsWith(dest_ip, '127.')), dictGetOrDefault('nanosiem.ip_prevalence_dict', 'host_count', dest_ip, toUInt16(9999)), toUInt16(9999))
+        if(file_hash != '', dictGetOrDefault('nanosiem.hash_prevalence_dict', 'host_count', lower(file_hash), toUInt16(1)), toUInt16(9999)),
+        if(process_hash != '', dictGetOrDefault('nanosiem.hash_prevalence_dict', 'host_count', lower(process_hash), toUInt16(1)), toUInt16(9999)),
+        if(dest_host != '' AND NOT match(dest_host, '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$'), dictGetOrDefault('nanosiem.domain_prevalence_dict', 'host_count', lower(dest_host), toUInt16(1)), toUInt16(9999)),
+        if(dest_ip != '' AND NOT (match(dest_ip, '^10\\.') OR match(dest_ip, '^172\\.(1[6-9]|2[0-9]|3[0-1])\\.') OR match(dest_ip, '^192\\.168\\.') OR match(dest_ip, '^127\\.') OR match(dest_ip, '^169\\.254\\.')), dictGetOrDefault('nanosiem.ip_prevalence_dict', 'host_count', dest_ip, toUInt16(1)), toUInt16(9999))
     ) CODEC(T64, LZ4),
     INDEX idx_src_ip src_ip TYPE bloom_filter GRANULARITY 4,
     INDEX idx_dest_ip dest_ip TYPE bloom_filter GRANULARITY 4,

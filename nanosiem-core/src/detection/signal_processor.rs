@@ -37,7 +37,7 @@ use uuid::Uuid;
 use crate::db::DualPool;
 use crate::db::repository::{AlertRepository, AlertRepositoryError, DetectionRuleRepository};
 use crate::detection::findings::FindingLogger;
-use crate::detection::risk::RiskResult;
+use crate::detection::risk::{score_rule_match, RiskModifier, ScoreCalculator};
 use crate::extensions::{
     AlertCasePermissions, CaseGroupingHook, NoopCaseGroupingHook, NoopShadowInvestigationHook,
     ShadowInvestigationHook,
@@ -57,6 +57,21 @@ pub struct SignalProcessorConfig {
     pub backoff_base_secs: u64,
     /// After this many consecutive errors, advance the watermark to skip stuck signals (default: 10)
     pub max_skip_threshold: u32,
+    /// Settling lag in seconds applied to the poll watermark (default: 5).
+    ///
+    /// `_inserted_at` is a `DEFAULT now64()` stamp; a row's column value is set
+    /// at row creation but the containing part does not become queryable in
+    /// strict `_inserted_at` order. Two concurrent inserts can therefore be made
+    /// visible out of order — a row with a *smaller* `_inserted_at` may appear
+    /// only after we have already advanced the watermark past a peer with a
+    /// larger stamp, which would silently drop the earlier signal.
+    ///
+    /// The poll query only considers signals older than `now64() - lag`, so we
+    /// never advance the watermark into a band where inserts may still be
+    /// settling. As long as the lag exceeds the max insert-visibility skew,
+    /// strict `_inserted_at > watermark` advancement can never skip a concurrent
+    /// insert. It costs `watermark_lag_secs` of added processing latency.
+    pub watermark_lag_secs: u64,
 }
 
 impl Default for SignalProcessorConfig {
@@ -67,8 +82,27 @@ impl Default for SignalProcessorConfig {
             max_retries: 3,
             backoff_base_secs: 2,
             max_skip_threshold: 10,
+            watermark_lag_secs: 5,
         }
     }
+}
+
+/// Outcome of processing a single signal, so the batch loop can aggregate
+/// high-volume skip reasons into ONE summary log per poll cycle instead of
+/// one line per signal. Draining a large backlog of unenrichable signals
+/// (e.g. matched logs TTL'd out, or stale/synthetic seed rows) otherwise
+/// floods the log — a bounded `fetch_matched_log` (R5) made each skip fast
+/// enough to turn that flood into a storm (NAN-1661 follow-up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalOutcome {
+    /// Alert created (or a real finding path ran) for this signal.
+    Processed,
+    /// Alert deduplicated against an existing one.
+    Duplicate,
+    /// The matched log was not found within the bounded window.
+    MatchedLogMissing,
+    /// The signal's detection rule no longer exists.
+    RuleMissing,
 }
 
 /// Watermark for tracking processed signals
@@ -335,6 +369,82 @@ impl SignalProcessor {
         crate::sql_hygiene::format_ch_bound_micros(dt)
     }
 
+    /// Build the incremental signals-poll query for the current watermark.
+    ///
+    /// The watermark advances strictly by `_inserted_at` (with `id` as the
+    /// tie-break at an identical microsecond), but `_inserted_at` is not
+    /// commit-ordered: concurrent inserts can become queryable out of stamp
+    /// order, so a row with a smaller `_inserted_at` may appear *after* the
+    /// watermark has already advanced past a peer with a larger stamp. Left
+    /// unguarded, that earlier signal is skipped forever (R7).
+    ///
+    /// The `AND _inserted_at <= now64(6) - toIntervalSecond(lag)` settling
+    /// clause makes the poll ignore any signal newer than `lag` seconds, so the
+    /// watermark is only ever advanced into a band where all concurrent inserts
+    /// have already settled into a visible part. Provided `lag` exceeds the max
+    /// insert-visibility skew, no concurrent insert can be missed.
+    ///
+    /// The strict `_inserted_at > W OR (_inserted_at = W AND id > last_id)` lower
+    /// bound is wrapped in parentheses so the trailing settling `AND` binds to
+    /// the whole disjunction rather than only its final term.
+    fn build_poll_signals_query(
+        signals_table: &str,
+        watermark_str: &str,
+        last_signal_id: Option<Uuid>,
+        batch_size: usize,
+        watermark_lag_secs: u64,
+    ) -> String {
+        // Only consider signals that have had at least `watermark_lag_secs` to
+        // settle into a queryable part before the watermark can cross them.
+        let settle_clause =
+            format!("AND _inserted_at <= now64(6) - toIntervalSecond({watermark_lag_secs})");
+
+        if let Some(last_id) = last_signal_id {
+            format!(
+                r#"
+                SELECT
+                    toString(id) as signal_id,
+                    reinterpretAsInt64(timestamp) as ts,
+                    toString(rule_id) as detection_rule_id,
+                    rule_name,
+                    severity,
+                    risk_score,
+                    risk_entity,
+                    toString(matched_log_id) as log_id,
+                    metadata,
+                    reinterpretAsInt64(_inserted_at) as inserted_ts
+                FROM {signals_table}
+                WHERE (_inserted_at > toDateTime64('{watermark_str}', 6)
+                       OR (_inserted_at = toDateTime64('{watermark_str}', 6) AND id > '{last_id}'))
+                  {settle_clause}
+                ORDER BY _inserted_at ASC, id ASC
+                LIMIT {batch_size}
+                "#,
+            )
+        } else {
+            format!(
+                r#"
+                SELECT
+                    toString(id) as signal_id,
+                    reinterpretAsInt64(timestamp) as ts,
+                    toString(rule_id) as detection_rule_id,
+                    rule_name,
+                    severity,
+                    risk_score,
+                    risk_entity,
+                    toString(matched_log_id) as log_id,
+                    metadata,
+                    reinterpretAsInt64(_inserted_at) as inserted_ts
+                FROM {signals_table}
+                WHERE _inserted_at > toDateTime64('{watermark_str}', 6)
+                  {settle_clause}
+                ORDER BY _inserted_at ASC, id ASC
+                LIMIT {batch_size}
+                "#,
+            )
+        }
+    }
+
     /// Poll ClickHouse for new signals and process them.
     ///
     /// Uses `SELECT ... FOR UPDATE` on the watermark row to prevent duplicate
@@ -389,50 +499,13 @@ impl SignalProcessor {
         // Use reinterpretAsInt64 to convert DateTime64 to microseconds
         // Use toString() for UUIDs because clickhouse-rs UUID support has compatibility issues
         let signals_table = dual_pool.table_names().read("signals");
-        let query = if let Some(last_id) = last_signal_id {
-            format!(
-                r#"
-                SELECT
-                    toString(id) as signal_id,
-                    reinterpretAsInt64(timestamp) as ts,
-                    toString(rule_id) as detection_rule_id,
-                    rule_name,
-                    severity,
-                    risk_score,
-                    risk_entity,
-                    toString(matched_log_id) as log_id,
-                    metadata,
-                    reinterpretAsInt64(_inserted_at) as inserted_ts
-                FROM {signals_table}
-                WHERE _inserted_at > toDateTime64('{}', 6)
-                   OR (_inserted_at = toDateTime64('{}', 6) AND id > '{}')
-                ORDER BY _inserted_at ASC, id ASC
-                LIMIT {}
-                "#,
-                watermark_str, watermark_str, last_id, config.batch_size
-            )
-        } else {
-            format!(
-                r#"
-                SELECT
-                    toString(id) as signal_id,
-                    reinterpretAsInt64(timestamp) as ts,
-                    toString(rule_id) as detection_rule_id,
-                    rule_name,
-                    severity,
-                    risk_score,
-                    risk_entity,
-                    toString(matched_log_id) as log_id,
-                    metadata,
-                    reinterpretAsInt64(_inserted_at) as inserted_ts
-                FROM {signals_table}
-                WHERE _inserted_at > toDateTime64('{}', 6)
-                ORDER BY _inserted_at ASC, id ASC
-                LIMIT {}
-                "#,
-                watermark_str, config.batch_size
-            )
-        };
+        let query = Self::build_poll_signals_query(
+            &signals_table,
+            &watermark_str,
+            last_signal_id,
+            config.batch_size,
+            config.watermark_lag_secs,
+        );
 
         let ch_client = dual_pool.clickhouse();
 
@@ -457,8 +530,25 @@ impl SignalProcessor {
         let signal_count = signals.len();
         debug!("Found {} new signals to process", signal_count);
 
+        // Build the scoring inputs ONCE per batch (not per signal): the global
+        // risk weight and a ScoreCalculator bound to the active schema profile —
+        // the same inputs the scheduled path feeds ScoreCalculator, so real-time
+        // findings score identically (NAN-1663).
+        let global_weight = Self::load_risk_weight(dual_pool).await;
+        let score_calculator = match crate::schema::active_profile_from_env() {
+            Ok(profile) => ScoreCalculator::new().with_profile(profile),
+            Err(e) => {
+                warn!("SignalProcessor: invalid schema profile ({e}); using UDM default");
+                ScoreCalculator::new()
+            }
+        };
+
         let mut processed = 0;
         let mut last_processed_signal: Option<ClickHouseSignal> = None;
+        // Per-cycle skip aggregation (see the summary logs after the loop).
+        let mut missing_log_count: u64 = 0;
+        let mut missing_rule_count: u64 = 0;
+        let mut missing_log_sample: Option<(Uuid, Uuid, DateTime<Utc>)> = None;
 
         for signal in signals {
             match Self::process_signal(
@@ -469,11 +559,24 @@ impl SignalProcessor {
                 finding_logger,
                 &signal,
                 shadow_investigation,
+                &score_calculator,
+                global_weight,
             )
             .await
             {
-                Ok(_) => {
+                Ok(outcome) => {
                     processed += 1;
+                    match outcome {
+                        SignalOutcome::MatchedLogMissing => {
+                            missing_log_count += 1;
+                            if missing_log_sample.is_none() {
+                                missing_log_sample =
+                                    Some((signal.id, signal.matched_log_id, signal.timestamp));
+                            }
+                        }
+                        SignalOutcome::RuleMissing => missing_rule_count += 1,
+                        SignalOutcome::Processed | SignalOutcome::Duplicate => {}
+                    }
                     last_processed_signal = Some(signal);
                 }
                 Err(e) => {
@@ -488,6 +591,28 @@ impl SignalProcessor {
                     last_processed_signal = Some(signal);
                 }
             }
+        }
+
+        // Aggregate skip reasons into ONE summary line per poll cycle rather than
+        // one per signal, so draining a large backlog of unenrichable signals
+        // can't flood the log (NAN-1661).
+        if missing_log_count > 0 {
+            if let Some((sid, lid, ts)) = missing_log_sample {
+                warn!(
+                    skipped = missing_log_count,
+                    sample_signal_id = %sid,
+                    sample_matched_log_id = %lid,
+                    sample_event_ts = %ts,
+                    "Skipped signals whose matched log was not found within the bounded \
+                     window (event TTL'd, or stale/synthetic signal)"
+                );
+            }
+        }
+        if missing_rule_count > 0 {
+            warn!(
+                skipped = missing_rule_count,
+                "Skipped signals whose detection rule no longer exists"
+            );
         }
 
         // Update watermark after processing and commit the transaction
@@ -528,6 +653,7 @@ impl SignalProcessor {
 
     /// Process a single signal: create alert, group into case, log finding
     #[instrument(skip_all, fields(signal_id = %signal.id, rule_id = %signal.rule_id))]
+    #[allow(clippy::too_many_arguments)]
     async fn process_signal(
         dual_pool: &DualPool,
         rule_repo: &DetectionRuleRepository,
@@ -536,33 +662,43 @@ impl SignalProcessor {
         finding_logger: &FindingLogger,
         signal: &ClickHouseSignal,
         shadow_investigation: &dyn ShadowInvestigationHook,
-    ) -> anyhow::Result<()> {
-        // Fetch the matched log from ClickHouse
-        let matched_log = Self::fetch_matched_log(dual_pool, signal.matched_log_id).await?;
-
-        let matched_log = match matched_log {
-            Some(log) => log,
-            None => {
-                warn!(
-                    signal_id = %signal.id,
-                    matched_log_id = %signal.matched_log_id,
-                    "Matched log not found, skipping signal"
-                );
-                return Ok(());
+        score_calculator: &ScoreCalculator,
+        global_weight: f64,
+    ) -> anyhow::Result<SignalOutcome> {
+        // Fetch the rule FIRST — its `risk_modifiers` decide which extra columns
+        // the matched-log fetch must project so the real-time score sees the same
+        // fields the scheduled path does (NAN-1663).
+        let rule = match rule_repo.find_by_id(signal.rule_id).await {
+            Ok(rule) => rule,
+            Err(_) => {
+                // Aggregated by the batch loop (see MatchedLogMissing) so a large
+                // backlog of signals for a deleted rule cannot flood the log.
+                return Ok(SignalOutcome::RuleMissing);
             }
         };
 
-        // Fetch the rule to get full details
-        let rule = match rule_repo.find_by_id(signal.rule_id).await {
-            Ok(rule) => rule,
-            Err(e) => {
-                warn!(
-                    signal_id = %signal.id,
-                    rule_id = %signal.rule_id,
-                    "Rule not found: {}, skipping signal",
-                    e
-                );
-                return Ok(());
+        // Fetch the matched log from ClickHouse, bounded to a tight window around
+        // the signal's event time so `id =` prunes to a single partition instead
+        // of full-scanning `logs` (R5). The projection carries the entity fields,
+        // message, metadata AND every column the rule's `risk_modifiers` reference
+        // (NAN-1663), so the score below sees the same fields the scheduled path
+        // does.
+        let matched_log = match Self::fetch_matched_log(
+            dual_pool,
+            signal.matched_log_id,
+            signal.timestamp,
+            &rule.risk_modifiers,
+        )
+        .await?
+        {
+            Some(log) => log,
+            None => {
+                // A genuine miss (the bounded window is guaranteed to contain the
+                // row, so this means the matched event is gone/TTL'd, or the signal
+                // is stale/synthetic). Do NOT log per-signal here — the batch loop
+                // aggregates these into one summary line so a backlog drain can't
+                // flood the log (NAN-1661).
+                return Ok(SignalOutcome::MatchedLogMissing);
             }
         };
 
@@ -572,6 +708,29 @@ impl SignalProcessor {
             &mut events_vec,
             chrono::Utc::now(),
         );
+
+        // Score the match through the SAME engine the scheduled path uses (audit
+        // R1 / NAN-1663): apply the rule's base score, its `risk_modifiers`, and
+        // the global `risk_weight` to the matched event — instead of the STATIC
+        // score the MV baked into `signal.risk_score`. The fetch above projects
+        // every modifier-referenced column, so modifiers evaluate identically to
+        // the scheduled path. Computed here, before `events_vec` is consumed into
+        // the JSON array below.
+        let mut risk_result = score_rule_match(score_calculator, &rule, &events_vec, global_weight);
+
+        // Entity ATTRIBUTION: prefer what the scorer resolved from the event, but
+        // when it couldn't (`entity_field` None — e.g. `risk_entity_field` is a
+        // column outside the fetch projection like `process_name`), fall back to
+        // the MV-computed `signal.risk_entity` (the MV already resolved
+        // `risk_entity_field` per matching row). This avoids regressing to the
+        // "unknown" default while keeping the scorer's own auto-detected field for
+        // rules without an explicit `risk_entity_field` (NAN-1663). Only the SCORE
+        // is recomputed; entity stays authoritative.
+        if risk_result.entity_field.is_none() && !signal.risk_entity.is_empty() {
+            risk_result.entity = signal.risk_entity.clone();
+            risk_result.entity_field = rule.risk_entity_field.clone();
+        }
+
         let matched_events = serde_json::Value::Array(events_vec);
 
         // Create alert with deduplication
@@ -598,7 +757,7 @@ impl SignalProcessor {
                     event_hash = %hash,
                     "Duplicate alert, skipping"
                 );
-                return Ok(());
+                return Ok(SignalOutcome::Duplicate);
             }
             Err(e) => {
                 return Err(anyhow::anyhow!("Failed to create alert: {}", e));
@@ -668,17 +827,7 @@ impl SignalProcessor {
             }
         }
 
-        // Log finding for analytics
-        // Extract risk entity field from metadata if available
-        let risk_entity_field = Self::extract_risk_entity_field(&signal.metadata);
-        let risk_result = RiskResult::new(
-            signal.risk_score,
-            signal.risk_score,
-            signal.risk_entity.clone(),
-            risk_entity_field,
-            vec![format!("from_signal:{}", signal.id)],
-        );
-
+        // Log finding for analytics with the unified risk result (computed above).
         if let Err(e) = finding_logger
             .log_alert(&rule, &alert, true, risk_result)
             .await
@@ -691,7 +840,7 @@ impl SignalProcessor {
             // Don't fail the whole signal processing
         }
 
-        Ok(())
+        Ok(SignalOutcome::Processed)
     }
 
     /// Build the matched-log fetch SQL for the active schema profile (NAN-1377).
@@ -712,10 +861,45 @@ impl SignalProcessor {
     ///   old `reinterpretAsInt64`) and OCSF's DateTime64(3), where the raw
     ///   reinterpret returned ms ticks that `from_timestamp_micros` silently
     ///   decoded to 1970 dates (G10).
+    /// Resolve the `(field_name, column_sql)` pairs a rule's `risk_modifiers`
+    /// need at fetch time (NAN-1663). Each field is gated on `is_known_field`, so
+    /// only a REAL column of the active schema is selected — injection-safe (known
+    /// field names) and never 500s the fetch on an unknown column. Fields already
+    /// in the base projection, nested (`metadata.*`, resolved from the metadata
+    /// blob), or absent from the schema are skipped. Keyed by the UDM-semantic
+    /// name the modifier tests; OCSF resolves the value from its promoted column.
+    fn resolve_modifier_columns(
+        profile: &dyn crate::schema::SchemaProfile,
+        modifiers: &[RiskModifier],
+    ) -> Vec<(String, String)> {
+        const BASE_PROJECTION: &[&str] = &[
+            "src_ip", "dest_ip", "src_host", "dest_host", "src_user", "dest_user",
+            "message", "source_type", "risk_entity", "id", "timestamp",
+        ];
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut cols: Vec<(String, String)> = Vec::new();
+        for m in modifiers {
+            let Some(field) = m.field_name() else { continue };
+            if field.contains('.') || BASE_PROJECTION.contains(&field) {
+                continue;
+            }
+            if !seen.insert(field.to_string()) || !profile.is_known_field(field) {
+                continue;
+            }
+            if let Some(col_sql) = profile.udm_column_sql(field) {
+                cols.push((field.to_string(), col_sql));
+            }
+        }
+        cols
+    }
+
     fn build_fetch_matched_log_query(
         profile: &dyn crate::schema::SchemaProfile,
         logs_table: &str,
         log_id: Uuid,
+        ts_lower: &str,
+        ts_upper: &str,
+        modifier_cols: &[(String, String)],
     ) -> String {
         // Resolve a UDM-semantic entity field to a SELECT clause aliased back to
         // the canonical name. When the active schema has no column for that
@@ -739,6 +923,30 @@ impl SignalProcessor {
             }
         };
 
+        // The rule's modifier-referenced columns as a JSON object under one
+        // `modifier_fields` alias (NAN-1663). `toString` each so the Map is
+        // homogeneous and the values decode as strings — RiskModifier parses
+        // strings to numbers for `>`/`<` and compares strings for `=`/`contains`,
+        // so string values evaluate correctly for every operator. The field name
+        // (the Map key) is a `is_known_field`-gated schema field, so it is a safe
+        // identifier; escape it defensively anyway.
+        let modifier_expr = if modifier_cols.is_empty() {
+            "'{}' AS modifier_fields".to_string()
+        } else {
+            let pairs = modifier_cols
+                .iter()
+                .map(|(name, col_sql)| {
+                    format!(
+                        "'{}', toString({})",
+                        crate::sql_hygiene::escape_sql_string(name),
+                        col_sql
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("toJSONString(map({pairs})) AS modifier_fields")
+        };
+
         // Only fetch key fields for alert context - metadata contains the full original log
         format!(
             r#"
@@ -754,9 +962,10 @@ impl SignalProcessor {
                 {dest_host},
                 {src_user},
                 {dest_user},
-                {risk_entity}
+                {risk_entity},
+                {modifier_expr}
             FROM {logs_table}
-            WHERE id = '{}'
+            WHERE timestamp BETWEEN '{ts_lower}' AND '{ts_upper}' AND id = '{}'
             LIMIT 1
             "#,
             log_id,
@@ -768,14 +977,36 @@ impl SignalProcessor {
             src_user = entity_col("src_user"),
             dest_user = entity_col("dest_user"),
             risk_entity = entity_col("risk_entity"),
+            modifier_expr = modifier_expr,
         )
     }
 
-    /// Fetch a matched log from ClickHouse by ID
-    /// Returns key identifying fields plus the metadata JSON blob for full context
+    /// Half-width of the timestamp window used to bound the matched-log fetch.
+    ///
+    /// The matched event's `timestamp` is copied verbatim from the log into the
+    /// signal by the detection MV, so the event lives at (essentially) the same
+    /// instant as `signal.timestamp`. A ±1h window is far wider than any
+    /// precision/clock skew yet still prunes the read to a single daily
+    /// partition and a handful of primary-index granules (R5: 2262/2271 →
+    /// 1/2271 granules measured on local CH).
+    const MATCHED_LOG_WINDOW: chrono::Duration = chrono::Duration::hours(1);
+
+    /// Fetch a matched log from ClickHouse by ID, bounded to a tight timestamp
+    /// window around the signal's event time.
+    ///
+    /// Returns key identifying fields plus the metadata JSON blob for full
+    /// context. `event_ts` is the matched event's timestamp (from the signal);
+    /// it bounds the scan so `id =` never triggers a full-table scan (R5). The
+    /// `logs` sort key is `(source_type, timestamp, …, cityHash64(id))` — `id`
+    /// only appears hashed last with no skip index, so an unbounded `WHERE id =`
+    /// scanned every granule and, at Saturn scale, hit the 300s
+    /// `max_execution_time` (18.2 GiB / 1.22B rows), whose error propagated up
+    /// and silently dropped the alert.
     async fn fetch_matched_log(
         dual_pool: &DualPool,
         log_id: Uuid,
+        event_ts: DateTime<Utc>,
+        modifiers: &[RiskModifier],
     ) -> anyhow::Result<Option<serde_json::Value>> {
         // Resolve the active schema profile so column resolution + the FROM table
         // follow UDM vs OCSF. UDM keeps the literal column names (byte-identical);
@@ -784,6 +1015,10 @@ impl SignalProcessor {
         // (`risk_entity`), so the strongly-typed row below still deserializes.
         let profile = crate::schema::active_profile_from_env()
             .map_err(|e| anyhow::anyhow!("invalid schema profile: {e}"))?;
+
+        // Resolve the extra columns the rule's risk_modifiers need so the scored
+        // event carries them (NAN-1663).
+        let modifier_cols = Self::resolve_modifier_columns(profile.as_ref(), modifiers);
         // Same table-key derivation the search service uses: OCSF reads
         // `ocsf_logs`, UDM reads `logs`, both through the tenant-aware registry.
         let logs_table_key = match profile.id() {
@@ -794,7 +1029,23 @@ impl SignalProcessor {
         };
         let logs_table = dual_pool.table_names().read(logs_table_key);
 
-        let query = Self::build_fetch_matched_log_query(profile.as_ref(), &logs_table, log_id);
+        // Bound the scan to a tight window around the event time. The window is
+        // guaranteed to contain the row (the MV copies the log's `timestamp`
+        // into the signal), so this never causes a spurious miss.
+        let ts_lower = crate::sql_hygiene::format_ch_bound_micros(
+            &(event_ts - Self::MATCHED_LOG_WINDOW),
+        );
+        let ts_upper = crate::sql_hygiene::format_ch_bound_micros(
+            &(event_ts + Self::MATCHED_LOG_WINDOW),
+        );
+        let query = Self::build_fetch_matched_log_query(
+            profile.as_ref(),
+            &logs_table,
+            log_id,
+            &ts_lower,
+            &ts_upper,
+            &modifier_cols,
+        );
 
         let ch_client = dual_pool.clickhouse();
 
@@ -812,6 +1063,10 @@ impl SignalProcessor {
             src_user: String,
             dest_user: String,
             risk_entity: String,
+            /// JSON object of the rule's modifier-referenced columns (NAN-1663),
+            /// `{}` when the rule has none. Merged flat into the event below so
+            /// modifiers resolve them by their bare UDM-semantic name.
+            modifier_fields: String,
         }
 
         let rows: Vec<LogRow> = ch_client.query(&query).fetch_all().await?;
@@ -825,7 +1080,7 @@ impl SignalProcessor {
             let metadata: serde_json::Value =
                 serde_json::from_str(&row.metadata).unwrap_or_else(|_| serde_json::json!({}));
 
-            let json = serde_json::json!({
+            let mut json = serde_json::json!({
                 "id": row.log_id,
                 "timestamp": timestamp,
                 "message": row.message,
@@ -839,20 +1094,42 @@ impl SignalProcessor {
                 "dest_user": row.dest_user,
                 "risk_entity": row.risk_entity,
             });
+
+            // Merge the modifier columns as flat keys (never overwriting a base
+            // field), so a risk_modifier on e.g. `auth_result` resolves exactly as
+            // it does on the scheduled path (NAN-1663).
+            if let (serde_json::Value::Object(obj), Ok(serde_json::Value::Object(extra))) = (
+                &mut json,
+                serde_json::from_str::<serde_json::Value>(&row.modifier_fields),
+            ) {
+                for (k, v) in extra {
+                    obj.entry(k).or_insert(v);
+                }
+            }
+
             Ok(Some(json))
         } else {
             Ok(None)
         }
     }
 
-    /// Extract risk_entity_field from signal metadata JSON
-    fn extract_risk_entity_field(metadata: &str) -> Option<String> {
-        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(metadata) {
-            meta.get("risk_entity_field")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        } else {
-            None
+    /// Load the global risk-weight multiplier from `system_settings` (mirrors
+    /// `DetectionService::load_risk_weight`; called once per poll batch so the
+    /// real-time path applies the same weight the scheduled path does). Defaults
+    /// to 1.0 (no attenuation) when the setting is absent or unreadable.
+    async fn load_risk_weight(dual_pool: &DualPool) -> f64 {
+        match sqlx::query_scalar::<_, f64>(
+            "SELECT COALESCE(risk_weight, 1.0)::float8 FROM system_settings WHERE id = 'default'",
+        )
+        .fetch_optional(dual_pool.postgres())
+        .await
+        {
+            Ok(Some(w)) => w.clamp(0.0, 1.0),
+            Ok(None) => 1.0,
+            Err(e) => {
+                warn!("SignalProcessor: failed to load risk_weight ({e}); using 1.0");
+                1.0
+            }
         }
     }
 }
@@ -868,6 +1145,7 @@ mod tests {
         assert_eq!(config.batch_size, 100);
         assert_eq!(config.max_retries, 3);
         assert_eq!(config.backoff_base_secs, 2);
+        assert_eq!(config.watermark_lag_secs, 5);
     }
 
     #[test]
@@ -875,28 +1153,6 @@ mod tests {
         let wm = ProcessorWatermark::default();
         assert!(wm.last_signal_id.is_none());
         assert_eq!(wm.processed_count, 0);
-    }
-
-    #[test]
-    fn test_extract_risk_entity_field() {
-        // Valid metadata with risk_entity_field
-        let metadata = r#"{"risk_entity_field": "src_ip", "other": "value"}"#;
-        assert_eq!(
-            SignalProcessor::extract_risk_entity_field(metadata),
-            Some("src_ip".to_string())
-        );
-
-        // Metadata without risk_entity_field
-        let metadata = r#"{"other": "value"}"#;
-        assert_eq!(SignalProcessor::extract_risk_entity_field(metadata), None);
-
-        // Invalid JSON
-        let metadata = "not json";
-        assert_eq!(SignalProcessor::extract_risk_entity_field(metadata), None);
-
-        // Empty metadata
-        let metadata = "{}";
-        assert_eq!(SignalProcessor::extract_risk_entity_field(metadata), None);
     }
 
     #[test]
@@ -917,13 +1173,21 @@ mod tests {
     fn test_fetch_matched_log_query_udm() {
         let profile = crate::schema::UdmProfile::new();
         let log_id = Uuid::parse_str("019e3bf3-ff47-7273-936a-8d426d333343").unwrap();
-        let query =
-            SignalProcessor::build_fetch_matched_log_query(&profile, "nanosiem.logs", log_id);
+        let query = SignalProcessor::build_fetch_matched_log_query(
+            &profile,
+            "nanosiem.logs",
+            log_id,
+            "2026-07-02 20:25:55.774000",
+            "2026-07-02 22:25:55.774000",
+            &[],
+        );
 
         // UDM keeps the literal `metadata` column and identity entity aliases.
         // `toUnixTimestamp64Micro(timestamp)` on DateTime64(6) yields the same
         // µs ticks as the old `reinterpretAsInt64` (verified against CH), so
-        // UDM decode behavior is unchanged.
+        // UDM decode behavior is unchanged. R5: the WHERE now carries a single
+        // `timestamp BETWEEN … AND id = …` bound (no PREWHERE) so the primary
+        // index prunes to one partition instead of a full-table `id` scan.
         let expected = r#"
             SELECT
                 toString(id) as log_id,
@@ -937,20 +1201,141 @@ mod tests {
                 dest_host AS dest_host,
                 src_user AS src_user,
                 dest_user AS dest_user,
-                risk_entity AS risk_entity
+                risk_entity AS risk_entity,
+                '{}' AS modifier_fields
             FROM nanosiem.logs
-            WHERE id = '019e3bf3-ff47-7273-936a-8d426d333343'
+            WHERE timestamp BETWEEN '2026-07-02 20:25:55.774000' AND '2026-07-02 22:25:55.774000' AND id = '019e3bf3-ff47-7273-936a-8d426d333343'
             LIMIT 1
             "#;
         assert_eq!(query, expected);
     }
 
     #[test]
+    fn resolve_modifier_columns_gates_to_known_non_base_fields() {
+        use crate::detection::risk::RiskModifier;
+        let profile = crate::schema::UdmProfile::new();
+        let m = |c: &str| RiskModifier { condition: c.to_string(), score: 50 };
+        let mods = vec![
+            m("auth_result = failure"),  // known UDM column, not in base → included
+            m("bytes_out > 1000000"),    // known UDM column → included
+            m("src_ip = 10.0.0.1"),      // in base projection → skipped
+            m("metadata.count > 5"),     // nested → skipped (metadata blob resolves it)
+            m("not_a_real_field = x"),   // unknown → skipped (no unknown-column 500)
+            m("auth_result = success"),  // duplicate field → deduped
+        ];
+        let cols = SignalProcessor::resolve_modifier_columns(&profile, &mods);
+        let fields: Vec<&str> = cols.iter().map(|(f, _)| f.as_str()).collect();
+        assert_eq!(fields, vec!["auth_result", "bytes_out"]);
+        // UDM resolves the column SQL to the field itself.
+        assert!(cols.iter().any(|(f, sql)| f == "auth_result" && sql.contains("auth_result")));
+    }
+
+    #[test]
+    fn build_query_emits_modifier_map_when_columns_present() {
+        let profile = crate::schema::UdmProfile::new();
+        let log_id = Uuid::parse_str("019e3bf3-ff47-7273-936a-8d426d333343").unwrap();
+        let cols = vec![("auth_result".to_string(), "auth_result".to_string())];
+        let query = SignalProcessor::build_fetch_matched_log_query(
+            &profile,
+            "nanosiem.logs",
+            log_id,
+            "2026-07-02 20:25:55.774000",
+            "2026-07-02 22:25:55.774000",
+            &cols,
+        );
+        assert!(
+            query.contains("toJSONString(map('auth_result', toString(auth_result))) AS modifier_fields"),
+            "modifier map must select the resolved column: {query}"
+        );
+    }
+
+    // R5: the matched-log fetch must never emit a bare `WHERE id = …`. `logs` is
+    // sorted `(source_type, timestamp, …, cityHash64(id))` — `id` appears only
+    // hashed last with no skip index, so an unbounded fetch full-scanned every
+    // granule and, at Saturn scale, hit the 300s max_execution_time whose error
+    // propagated up and silently dropped the alert.
+    #[test]
+    fn test_fetch_matched_log_query_is_timestamp_bounded() {
+        for profile in [
+            Box::new(crate::schema::UdmProfile::new()) as Box<dyn crate::schema::SchemaProfile>,
+            Box::new(crate::schema::OcsfProfile::new()) as Box<dyn crate::schema::SchemaProfile>,
+        ] {
+            let log_id = Uuid::parse_str("019ea2f0-9453-7db5-aec0-12fb99f7b373").unwrap();
+            let query = SignalProcessor::build_fetch_matched_log_query(
+                profile.as_ref(),
+                "nanosiem.logs",
+                log_id,
+                "2026-07-02 20:25:55.774000",
+                "2026-07-02 22:25:55.774000",
+                &[],
+            );
+            assert!(
+                query.contains(
+                    "WHERE timestamp BETWEEN '2026-07-02 20:25:55.774000' AND '2026-07-02 22:25:55.774000' AND id ="
+                ),
+                "fetch must be timestamp-bounded ahead of the id equality: {query}"
+            );
+            // No explicit PREWHERE — let optimize_move_to_prewhere place the bound.
+            assert!(
+                !query.contains("PREWHERE"),
+                "fetch must not emit an explicit PREWHERE: {query}"
+            );
+        }
+    }
+
+    // R7: the poll query must apply a settling lag so the watermark never
+    // advances into a band where concurrent inserts may still be becoming
+    // visible out of `_inserted_at` order, and the strict lower bound must be
+    // parenthesized so the settling `AND` binds to the whole disjunction.
+    #[test]
+    fn test_poll_signals_query_has_settling_lag() {
+        let last_id = Uuid::parse_str("019ea2f0-9453-7db5-aec0-12fb99f7b373").unwrap();
+
+        // First poll (no tie-break id yet).
+        let q0 = SignalProcessor::build_poll_signals_query(
+            "nanosiem.signals",
+            "2026-07-02 21:00:00.000000",
+            None,
+            100,
+            5,
+        );
+        assert!(
+            q0.contains("AND _inserted_at <= now64(6) - toIntervalSecond(5)"),
+            "settling lag missing on first poll: {q0}"
+        );
+
+        // Subsequent poll (with tie-break) — the disjunction must be wrapped so
+        // the settling AND does not bind only to the id tie-break term.
+        let q1 = SignalProcessor::build_poll_signals_query(
+            "nanosiem.signals",
+            "2026-07-02 21:00:00.000000",
+            Some(last_id),
+            100,
+            5,
+        );
+        assert!(
+            q1.contains("AND _inserted_at <= now64(6) - toIntervalSecond(5)"),
+            "settling lag missing on tie-break poll: {q1}"
+        );
+        assert!(
+            q1.contains("WHERE (_inserted_at >")
+                && q1.contains("AND id > '019ea2f0-9453-7db5-aec0-12fb99f7b373'))"),
+            "strict lower bound must be parenthesized as a unit: {q1}"
+        );
+    }
+
+    #[test]
     fn test_fetch_matched_log_query_ocsf() {
         let profile = crate::schema::OcsfProfile::new();
         let log_id = Uuid::parse_str("019ea2f0-9453-7db5-aec0-12fb99f7b373").unwrap();
-        let query =
-            SignalProcessor::build_fetch_matched_log_query(&profile, "nanosiem.ocsf_logs", log_id);
+        let query = SignalProcessor::build_fetch_matched_log_query(
+            &profile,
+            "nanosiem.ocsf_logs",
+            log_id,
+            "2026-07-02 20:25:55.774000",
+            "2026-07-02 22:25:55.774000",
+            &[],
+        );
 
         // The full-context blob comes from the OCSF JSON tail column — the
         // `unmapped` spill (NAN-1443; was `event`, now EPHEMERAL) — never the

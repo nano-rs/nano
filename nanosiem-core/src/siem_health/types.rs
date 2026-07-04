@@ -147,9 +147,14 @@ pub struct InsertIntegrityMetrics {
     /// system.errors counter for CACHE_DICTIONARY_UPDATE_FAIL (code 510),
     /// 24h-recency-gated — the hash_prevalence_dict collateral signature.
     pub cache_dictionary_update_fails: u64,
-    /// Dictionaries referenced by the logs table's MATERIALIZED columns that
-    /// are currently FAILED. Any entry here is a guaranteed ingestion halt
-    /// today (dictGetOrDefault THROWS at flush when the dict is FAILED).
+    /// Dictionaries referenced by the logs table's MATERIALIZED columns that are
+    /// currently unhealthy: either `FAILED*` status, OR a non-empty
+    /// `last_exception` at any status. The second case catches a degraded
+    /// CACHE dict (the prevalence dicts) — a broken source flips it to `LOADED`
+    /// while every `dictGetOrDefault` throws at flush, so a status-only filter
+    /// missed the halt (NAN-1667, gap G2). Either way any entry is a guaranteed
+    /// ingestion halt today. `last_exception` clears on recovery, so a recovered
+    /// dict drops out on the next probe (no false positives).
     pub failed_logs_dictionaries: Vec<FailedDictionary>,
     /// Flush failures from system.asynchronous_insert_log over the last hour.
     /// None when the log is not enabled (pre-NAN-1405 server config).
@@ -165,7 +170,9 @@ pub struct InsertIntegrityMetrics {
     pub stale_dict_refreshes: Vec<StaleDictRefresh>,
 }
 
-/// A FAILED ClickHouse dictionary referenced by the logs table DDL.
+/// An unhealthy ClickHouse dictionary referenced by the logs table DDL — either
+/// `FAILED*` status or a degraded CACHE dict carrying a live `last_exception`
+/// (NAN-1667). Both halt inserts at flush.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FailedDictionary {
     /// Fully qualified name (`nanosiem.ip_enrichment_dict`).

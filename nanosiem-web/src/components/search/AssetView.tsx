@@ -6,6 +6,7 @@ import { api } from '@/lib/api';
 import type { AssetEventsRequest, AssetEventFilters, AssetPagination, TimeRange, EntityContextResponse, AssetTrueTimeRangeResponse, IdentityUser } from '@/lib/api/types';
 import { UDM_COLUMNS } from '@/lib/udm-fields';
 import { fieldVal } from '@/lib/ocsf-field-fallbacks';
+import { isPrevalenceSentinelField, isPrevalenceSentinelValue } from '@/lib/prevalence-sentinels';
 import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
 import {
   DropdownMenu,
@@ -675,8 +676,8 @@ function TimelineEvent({ event, onDrilldown, onAddToQuery, onFetchLog, isHighlig
         !exclude.has(key) &&
         !key.startsWith('_') &&
         isMeaningful(value) &&
-        // Filter prevalence sentinel values (65535=N/A, 9999=common/not tracked, 255=UInt8 N/A)
-        !(key.startsWith('prevalence_') && (value === 65535 || value === 9999 || value === 255))
+        // Filter prevalence sentinel values (65535=N/A, 9999=common). See lib/prevalence-sentinels.
+        !isPrevalenceSentinelField(key, value)
       );
 
     // Category sort matching SearchResults: UDM first, then enrichment types
@@ -751,7 +752,7 @@ function TimelineEvent({ event, onDrilldown, onAddToQuery, onFetchLog, isHighlig
 
   // Prevalence indicator: show on collapsed row when prevalence_min has a real (non-sentinel) value
   const prevMin = fields.prevalence_min as number | undefined;
-  const hasRealPrevalence = prevMin !== undefined && prevMin !== 65535 && prevMin !== 9999 && prevMin !== 255;
+  const hasRealPrevalence = prevMin !== undefined && !isPrevalenceSentinelValue(prevMin);
   const prevColor = hasRealPrevalence
     ? prevMin <= 3 ? 'bg-red-500/20 text-red-400 border-red-500/30'
     : prevMin <= 10 ? 'bg-orange-500/20 text-orange-400 border-orange-500/30'

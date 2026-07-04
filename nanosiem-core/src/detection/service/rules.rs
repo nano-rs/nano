@@ -406,8 +406,16 @@ impl DetectionService {
         match (old_mode, new_mode) {
             // No mode change - Real-Time
             (DetectionMode::RealTime, DetectionMode::RealTime) => {
-                // If staying in real-time mode and query changed, recreate materialized view
-                if update.query.is_some() {
+                // The MV DDL bakes the query filter, risk_score, risk_entity (from
+                // risk_entity_field) and severity — so a change to ANY of them must
+                // recreate the view, not just the query. Previously only `query`
+                // triggered recreation, so editing e.g. risk_entity_field on a live
+                // real-time rule silently left the MV emitting the stale entity (NAN-1665).
+                let mv_affecting_change = update.query.is_some()
+                    || update.severity.is_some()
+                    || update.risk_score.is_some()
+                    || update.risk_entity_field.is_some();
+                if mv_affecting_change {
                     // Update the rule first
                     let updated_rule = self.rule_repo.update(id, &update).await?;
 

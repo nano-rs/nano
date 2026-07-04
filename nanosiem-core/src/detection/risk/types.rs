@@ -119,6 +119,23 @@ impl RiskModifier {
         false
     }
 
+    /// The field name this condition tests — the token before the operator.
+    ///
+    /// Used to resolve which columns a modifier needs at fetch time so the
+    /// real-time path can select them and score identically to the scheduled
+    /// path (NAN-1663). Operator precedence mirrors [`evaluate`](Self::evaluate)
+    /// so the field is parsed the same way. Returns `None` for a condition with
+    /// no recognized operator.
+    pub fn field_name(&self) -> Option<&str> {
+        let condition = self.condition.trim();
+        for op in [">=", "<=", "!=", ">", "<", "=", " contains "] {
+            if let Some((field, _)) = Self::parse_operator(condition, op) {
+                return Some(field);
+            }
+        }
+        None
+    }
+
     /// Parse an operator from a condition string
     fn parse_operator<'a>(condition: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
         let parts: Vec<&str> = condition.splitn(2, op).collect();
@@ -224,5 +241,24 @@ impl RiskModifier {
             Value::Null => str_value == "null",
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn field_name_extracts_the_token_before_each_operator() {
+        let f = |c: &str| RiskModifier { condition: c.to_string(), score: 10 }.field_name().map(str::to_string);
+        assert_eq!(f("auth_result = failure").as_deref(), Some("auth_result"));
+        assert_eq!(f("bytes_out > 1000000").as_deref(), Some("bytes_out"));
+        assert_eq!(f("count >= 5").as_deref(), Some("count"));
+        assert_eq!(f("status != success").as_deref(), Some("status"));
+        assert_eq!(f("message contains error").as_deref(), Some("message"));
+        // Nested path preserved verbatim (caller decides how to resolve it).
+        assert_eq!(f("metadata.count > 5").as_deref(), Some("metadata.count"));
+        // No operator → None.
+        assert_eq!(f("just_a_field"), None);
     }
 }

@@ -130,6 +130,15 @@ pub struct PrevalenceRepository {
     hash_prevalence_table: String,
     domain_prevalence_table: String,
     ip_prevalence_table: String,
+    // Per-entity summary tables (migration 110). Keyed on entity only (no
+    // time_bucket), so a `GROUP BY entity` read is bounded by N_entities rather
+    // than N_entities × N_hours — the unbounded aggregation that OOM'd the
+    // rare/new/explorer reads at scale (NAN-365 / prevalence-risk-audit P10).
+    // They also carry the true GLOBAL first_seen (SimpleAggregateFunction(min)),
+    // which is what makes the "new artifacts" query honest (audit P6).
+    hash_prevalence_summary: String,
+    domain_prevalence_summary: String,
+    ip_prevalence_summary: String,
 }
 
 impl PrevalenceRepository {
@@ -140,6 +149,15 @@ impl PrevalenceRepository {
             hash_prevalence_table: table_names.read("hash_prevalence_agg"),
             domain_prevalence_table: table_names.read("domain_prevalence_agg"),
             ip_prevalence_table: table_names.read("ip_prevalence_agg"),
+            // NOTE(P11): `*_prevalence_summary` are NOT in `DISTRIBUTED_TABLE_SET`,
+            // so in cluster mode `table_names.read()` returns the node-local name
+            // — the same node-local read the CH dict sources already do. Routing
+            // through `read()` here means these queries pick up the distributed
+            // wrapper automatically once Lane L4 adds
+            // `*_prevalence_summary_distributed` + registers them in the set.
+            hash_prevalence_summary: table_names.read("hash_prevalence_summary"),
+            domain_prevalence_summary: table_names.read("domain_prevalence_summary"),
+            ip_prevalence_summary: table_names.read("ip_prevalence_summary"),
         }
     }
 
@@ -235,7 +253,9 @@ impl PrevalenceRepository {
             )
             "#,
             domain_prevalence_table = self.domain_prevalence_table,
-            domain = escape_sql_string(domain),
+            // Storage is MV-lowercased (`lower(dest_host) AS domain`); compare the
+            // input lowercased so `Accounts.Google.com` matches (audit P9).
+            domain = escape_sql_string(domain.to_lowercase()),
             cutoff_str = cutoff_str
         );
 
@@ -317,10 +337,12 @@ impl PrevalenceRepository {
         let cutoff = Self::get_cutoff_time(time_window);
         let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
 
-        // Build the IN clause with escaped values
+        // Build the IN clause with escaped values. Storage is MV-lowercased
+        // (`lower(dest_host) AS domain`); lowercase the input so mixed-case
+        // domains like `Accounts.Google.com` match (audit P9).
         let domain_list: String = domains
             .iter()
-            .map(|d| format!("'{}'", escape_sql_string(d)))
+            .map(|d| format!("'{}'", escape_sql_string(d.to_lowercase())))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -518,9 +540,13 @@ impl PrevalenceRepository {
         // match), raw for IP (no case ambiguity).
         let output_artifact_expr = key_expr;
 
-        // Window cutoff masking — see prevalence_join.rs:323-333. 1h is
-        // rejected upstream there; we accept it here and treat it as 24h
-        // (post-processing fallback is rare; not worth a separate error).
+        // Window cutoff masking — see prevalence_join.rs:323-333. The SEARCH
+        // prevalence command now rejects `window=1h` up front for every command
+        // (core_search.rs, audit P2), so this fallback never receives 1h from
+        // search. The `OneHour` arm remains only as defense-in-depth for any
+        // non-search caller that constructs `TimeWindow::OneHour`: treat it as
+        // 24h rather than erroring (this returns `clickhouse::error::Error`, the
+        // wrong type for a validation failure).
         let cutoff_sql = match time_window {
             TimeWindow::OneHour | TimeWindow::TwentyFourHours => "now() - INTERVAL 1 DAY",
             TimeWindow::SevenDays => "now() - INTERVAL 7 DAY",
@@ -571,8 +597,46 @@ impl PrevalenceRepository {
         self.client.query(&query).fetch_all().await
     }
 
-    /// Get rare artifacts (below threshold) for a given time window
+    /// Get rare artifacts (below threshold) that were active within the window.
+    ///
+    /// Reads the per-entity `hash_prevalence_summary` table (audit P10): the
+    /// `GROUP BY file_hash` is bounded by N_entities, not N_entities × N_hours,
+    /// so it no longer OOMs on busy tenants the way the hourly-bucketed
+    /// `*_prevalence_agg` scan did. `host_count` is the GLOBAL (retention-bounded,
+    /// 30d TTL) prevalence — the correct notion of "how rare is this overall" —
+    /// and the `time_window` now scopes *recency* via `last_seen >= cutoff`
+    /// rather than windowing the host count itself. Rarity boundary is `<`
+    /// (strictly below threshold): threshold N means "seen on fewer than N
+    /// hosts" (audit P10 — Lane L2 search-side must match this `<`, not `<=`).
     #[instrument(skip(self))]
+    // Recency filter pushdown (audit NAN-1664): the recency/newness predicate is
+    // applied in a nested `SELECT * … WHERE …` BEFORE the GROUP BY, so ClickHouse
+    // only aggregates in-window entities. Filtering after the GROUP BY forced a
+    // full per-entity aggregation of every retained artifact first — Saturn-measured
+    // non-viable for IPs (106M entities: >30s / 3 GiB ceiling); with the pushdown a
+    // 24h window is ~4.5M entities (4.7s / 1.3 GiB). The `*_prevalence_summary`
+    // tables are ~1 row per entity (Saturn: 1.01), so `max(last_seen)`/`min(first_seen)`
+    // over that single row equals the raw column and the pushdown is exact — verified
+    // byte-identical result sets vs the outer-filter form on local CH. The filter must
+    // live in the nested subquery, not the aggregating SELECT's WHERE, because that
+    // SELECT aliases `max(last_seen) AS last_seen` etc. which would shadow the raw
+    // column (ILLEGAL_AGGREGATION — the R2 alias-shadow class).
+    //
+    // CORRECTNESS CAVEAT (post-audit cross-review, NAN-1678): the "~1 row/entity ⇒
+    // exact" claim is the *merged* steady state. `*_prevalence_summary` is an
+    // AggregatingMergeTree; between background merges a freshly-active entity can
+    // transiently hold >1 part. The nested filter tests each part's RAW `last_seen`
+    // (a per-part `max`), so an older part whose unmerged `last_seen` predates the
+    // cutoff is dropped BEFORE its `uniqMerge(host_count)` state contributes — a
+    // transient host_count UNDERCOUNT that can momentarily mis-flag a
+    // common-but-recently-active entity as rare (symmetrically `get_new_*` can flag a
+    // returning-old entity as new). Self-heals on merge; bounded by
+    // unmerged-parts-per-entity (~1% transient at Saturn scale). So this is NOT exact
+    // on unmerged parts — the accuracy-for-viability trade is deliberate (aggregating
+    // all 106M entities to filter on `HAVING max(last_seen)` is the non-viable form
+    // the pushdown exists to avoid). Re-measure rare/new counts after a busy-ingest
+    // burst before treating them as precise; a real fix (staged query / bounded
+    // FINAL) is tracked, not attempted here.
     pub async fn get_rare_hashes(
         &self,
         threshold: u64,
@@ -580,7 +644,7 @@ impl PrevalenceRepository {
         limit: i64,
     ) -> Result<Vec<HashPrevalenceRow>, clickhouse::error::Error> {
         let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
+        let cutoff_micros = cutoff.timestamp_micros();
 
         let query = format!(
             r#"
@@ -599,17 +663,19 @@ impl PrevalenceRepository {
                     min(first_seen) AS first_seen,
                     max(last_seen) AS last_seen,
                     sum(total_count) AS total_count
-                FROM {hash_prevalence_table}
-                PREWHERE time_bucket >= toDateTime('{cutoff_str}')
+                FROM (
+                    SELECT * FROM {hash_prevalence_summary}
+                    WHERE reinterpretAsInt64(last_seen) >= {cutoff_micros}
+                )
                 GROUP BY file_hash, hash_type
             )
             WHERE host_count < {threshold}
             ORDER BY last_seen DESC
             LIMIT {limit}
             "#,
-            hash_prevalence_table = self.hash_prevalence_table,
-            cutoff_str = cutoff_str,
+            hash_prevalence_summary = self.hash_prevalence_summary,
             threshold = threshold,
+            cutoff_micros = cutoff_micros,
             limit = limit
         );
 
@@ -618,7 +684,11 @@ impl PrevalenceRepository {
         self.client.query(&query).fetch_all().await
     }
 
-    /// Get rare domains (below threshold) for a given time window
+    /// Get rare domains (below threshold) active within the window.
+    ///
+    /// Reads `domain_prevalence_summary` (per-entity, bounded) — see
+    /// `get_rare_hashes` for the rationale and the recency/rarity semantics
+    /// (audit P10).
     #[instrument(skip(self))]
     pub async fn get_rare_domains(
         &self,
@@ -627,7 +697,7 @@ impl PrevalenceRepository {
         limit: i64,
     ) -> Result<Vec<DomainPrevalenceRow>, clickhouse::error::Error> {
         let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
+        let cutoff_micros = cutoff.timestamp_micros();
 
         let query = format!(
             r#"
@@ -646,16 +716,18 @@ impl PrevalenceRepository {
                     min(first_seen) AS first_seen,
                     max(last_seen) AS last_seen,
                     sum(total_count) AS total_count
-                FROM {domain_prevalence_table}
-                PREWHERE time_bucket >= toDateTime('{cutoff_str}')
+                FROM (
+                    SELECT * FROM {domain_prevalence_summary}
+                    WHERE reinterpretAsInt64(last_seen) >= {cutoff_micros}
+                )
                 GROUP BY domain
             )
             WHERE source_host_count < {threshold}
             ORDER BY last_seen DESC
             LIMIT {limit}
             "#,
-            domain_prevalence_table = self.domain_prevalence_table,
-            cutoff_str = cutoff_str,
+            domain_prevalence_summary = self.domain_prevalence_summary,
+            cutoff_micros = cutoff_micros,
             threshold = threshold,
             limit = limit
         );
@@ -665,7 +737,21 @@ impl PrevalenceRepository {
         self.client.query(&query).fetch_all().await
     }
 
-    /// Get newly seen hashes (first_seen after specified time)
+    /// Get genuinely new hashes — those whose GLOBAL first_seen falls inside
+    /// the requested window (audit P6).
+    ///
+    /// The previous implementation restricted the aggregation to buckets with
+    /// `time_bucket >= since` and then filtered `min(first_seen) >= since`. But
+    /// `first_seen` is a per-bucket min, and every surviving bucket already
+    /// starts at/after `since`, so the predicate was VACUOUSLY TRUE — the query
+    /// returned every artifact active in the window, not the newly-seen ones.
+    ///
+    /// The fix reads `hash_prevalence_summary`, whose `first_seen`
+    /// (SimpleAggregateFunction(min)) collapses to the true earliest-ever sighting
+    /// across all retained buckets. Filtering that global minimum against `since`
+    /// is now meaningful: an artifact first observed months ago but seen again
+    /// today has a global first_seen far below `since` and is correctly excluded.
+    /// The per-entity table also bounds the read by N_entities (audit P10).
     #[instrument(skip(self))]
     pub async fn get_new_hashes(
         &self,
@@ -674,7 +760,6 @@ impl PrevalenceRepository {
     ) -> Result<Vec<HashPrevalenceRow>, clickhouse::error::Error> {
         // Convert since to microseconds for comparison with reinterpretAsInt64
         let since_micros = since.timestamp_micros();
-        let since_str = crate::sql_hygiene::format_ch_bound(&since).to_string();
 
         let query = format!(
             r#"
@@ -693,16 +778,16 @@ impl PrevalenceRepository {
                     min(first_seen) AS first_seen,
                     max(last_seen) AS last_seen,
                     sum(total_count) AS total_count
-                FROM {hash_prevalence_table}
-                PREWHERE time_bucket >= toDateTime('{since_str}')
+                FROM (
+                    SELECT * FROM {hash_prevalence_summary}
+                    WHERE reinterpretAsInt64(first_seen) >= {since_micros}
+                )
                 GROUP BY file_hash, hash_type
             )
-            WHERE reinterpretAsInt64(first_seen) >= {since_micros}
             ORDER BY first_seen DESC
             LIMIT {limit}
             "#,
-            hash_prevalence_table = self.hash_prevalence_table,
-            since_str = since_str,
+            hash_prevalence_summary = self.hash_prevalence_summary,
             since_micros = since_micros,
             limit = limit
         );
@@ -712,7 +797,10 @@ impl PrevalenceRepository {
         self.client.query(&query).fetch_all().await
     }
 
-    /// Get newly seen domains (first_seen after specified time)
+    /// Get genuinely new domains — global first_seen inside the window.
+    /// Reads `domain_prevalence_summary` for the true earliest-ever sighting;
+    /// see `get_new_hashes` for why the old agg-table predicate was vacuous
+    /// (audit P6/P10).
     #[instrument(skip(self))]
     pub async fn get_new_domains(
         &self,
@@ -721,7 +809,6 @@ impl PrevalenceRepository {
     ) -> Result<Vec<DomainPrevalenceRow>, clickhouse::error::Error> {
         // Convert since to microseconds for comparison with reinterpretAsInt64
         let since_micros = since.timestamp_micros();
-        let since_str = crate::sql_hygiene::format_ch_bound(&since).to_string();
 
         let query = format!(
             r#"
@@ -740,16 +827,16 @@ impl PrevalenceRepository {
                     min(first_seen) AS first_seen,
                     max(last_seen) AS last_seen,
                     sum(total_count) AS total_count
-                FROM {domain_prevalence_table}
-                PREWHERE time_bucket >= toDateTime('{since_str}')
+                FROM (
+                    SELECT * FROM {domain_prevalence_summary}
+                    WHERE reinterpretAsInt64(first_seen) >= {since_micros}
+                )
                 GROUP BY domain
             )
-            WHERE reinterpretAsInt64(first_seen) >= {since_micros}
             ORDER BY first_seen DESC
             LIMIT {limit}
             "#,
-            domain_prevalence_table = self.domain_prevalence_table,
-            since_str = since_str,
+            domain_prevalence_summary = self.domain_prevalence_summary,
             since_micros = since_micros,
             limit = limit
         );
@@ -759,8 +846,10 @@ impl PrevalenceRepository {
         self.client.query(&query).fetch_all().await
     }
 
-    /// Get rare IPs (below threshold) for a given time window
-    /// Note: Excludes private/RFC1918 IPs by default to reduce noise
+    /// Get rare IPs (below threshold) active within the window.
+    /// Reads `ip_prevalence_summary` (per-entity, bounded) — see
+    /// `get_rare_hashes` for the rationale (audit P10).
+    /// Note: Excludes private/RFC1918 IPs by default to reduce noise.
     #[instrument(skip(self))]
     pub async fn get_rare_ips(
         &self,
@@ -769,7 +858,7 @@ impl PrevalenceRepository {
         limit: i64,
     ) -> Result<Vec<IpPrevalenceRow>, clickhouse::error::Error> {
         let cutoff = Self::get_cutoff_time(time_window);
-        let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
+        let cutoff_micros = cutoff.timestamp_micros();
 
         let query = format!(
             r#"
@@ -790,17 +879,19 @@ impl PrevalenceRepository {
                     min(first_seen) AS first_seen,
                     max(last_seen) AS last_seen,
                     sum(total_count) AS total_count
-                FROM {ip_prevalence_table}
-                PREWHERE time_bucket >= toDateTime('{cutoff_str}')
+                FROM (
+                    SELECT * FROM {ip_prevalence_summary}
+                    WHERE is_private = 0
+                      AND reinterpretAsInt64(last_seen) >= {cutoff_micros}
+                )
                 GROUP BY ip
             )
             WHERE source_host_count < {threshold}
-              AND is_private = 0
             ORDER BY last_seen DESC
             LIMIT {limit}
             "#,
-            ip_prevalence_table = self.ip_prevalence_table,
-            cutoff_str = cutoff_str,
+            ip_prevalence_summary = self.ip_prevalence_summary,
+            cutoff_micros = cutoff_micros,
             threshold = threshold,
             limit = limit
         );
@@ -810,8 +901,9 @@ impl PrevalenceRepository {
         self.client.query(&query).fetch_all().await
     }
 
-    /// Get newly seen IPs (first_seen after specified time)
-    /// Note: Excludes private/RFC1918 IPs by default to reduce noise
+    /// Get genuinely new IPs — global first_seen inside the window.
+    /// Reads `ip_prevalence_summary`; see `get_new_hashes` (audit P6/P10).
+    /// Note: Excludes private/RFC1918 IPs by default to reduce noise.
     #[instrument(skip(self))]
     pub async fn get_new_ips(
         &self,
@@ -820,7 +912,6 @@ impl PrevalenceRepository {
     ) -> Result<Vec<IpPrevalenceRow>, clickhouse::error::Error> {
         // Convert since to microseconds for comparison with reinterpretAsInt64
         let since_micros = since.timestamp_micros();
-        let since_str = crate::sql_hygiene::format_ch_bound(&since).to_string();
 
         let query = format!(
             r#"
@@ -841,17 +932,17 @@ impl PrevalenceRepository {
                     min(first_seen) AS first_seen,
                     max(last_seen) AS last_seen,
                     sum(total_count) AS total_count
-                FROM {ip_prevalence_table}
-                PREWHERE time_bucket >= toDateTime('{since_str}')
+                FROM (
+                    SELECT * FROM {ip_prevalence_summary}
+                    WHERE is_private = 0
+                      AND reinterpretAsInt64(first_seen) >= {since_micros}
+                )
                 GROUP BY ip
             )
-            WHERE reinterpretAsInt64(first_seen) >= {since_micros}
-              AND is_private = 0
             ORDER BY first_seen DESC
             LIMIT {limit}
             "#,
-            ip_prevalence_table = self.ip_prevalence_table,
-            since_str = since_str,
+            ip_prevalence_summary = self.ip_prevalence_summary,
             since_micros = since_micros,
             limit = limit
         );
@@ -999,9 +1090,11 @@ impl PrevalenceRepository {
         let cutoff = Self::get_cutoff_time(time_window);
         let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
 
+        // Storage is MV-lowercased; lowercase the input so mixed-case domains
+        // still match their daily buckets (audit P9).
         let domain_list: String = domains
             .iter()
-            .map(|d| format!("'{}'", escape_sql_string(d)))
+            .map(|d| format!("'{}'", escape_sql_string(d.to_lowercase())))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -1150,7 +1243,7 @@ impl PrevalenceRepository {
             }
         };
 
-        let prewhere_filter = format!("timestamp >= toDateTime('{}')", cutoff_str);
+        let time_filter = format!("timestamp >= toDateTime('{}')", cutoff_str);
 
         // Run all detail queries concurrently
         let (hosts_r, users_r, sources_r, processes_r, file_names_r, network_r, geo_r) = tokio::join!(
@@ -1167,9 +1260,9 @@ impl PrevalenceRepository {
                 }
                 let q = format!(
                     "SELECT {sh} AS host, count() AS cnt, reinterpretAsInt64(max(timestamp)) AS last_ts \
-                     FROM {} PREWHERE {} WHERE {} AND {sh} != '' \
+                     FROM {} WHERE {} AND {} AND {sh} != '' \
                      GROUP BY {sh} ORDER BY cnt DESC LIMIT 10",
-                    logs_table, prewhere_filter, where_clause, sh = src_host
+                    logs_table, time_filter, where_clause, sh = src_host
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -1193,9 +1286,9 @@ impl PrevalenceRepository {
                 }
                 let q = format!(
                     "SELECT {u} AS user, count() AS cnt \
-                     FROM {} PREWHERE {} WHERE {} AND {u} != '' \
+                     FROM {} WHERE {} AND {} AND {u} != '' \
                      GROUP BY {u} ORDER BY cnt DESC LIMIT 10",
-                    logs_table, prewhere_filter, where_clause, u = user
+                    logs_table, time_filter, where_clause, u = user
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -1215,9 +1308,9 @@ impl PrevalenceRepository {
                 }
                 let q = format!(
                     "SELECT source_type, count() AS cnt \
-                     FROM {} PREWHERE {} WHERE {} AND source_type != '' \
+                     FROM {} WHERE {} AND {} AND source_type != '' \
                      GROUP BY source_type ORDER BY cnt DESC LIMIT 10",
-                    logs_table, prewhere_filter, where_clause
+                    logs_table, time_filter, where_clause
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -1249,9 +1342,9 @@ impl PrevalenceRepository {
                 }
                 let q = format!(
                     "SELECT {pn} AS process_name, {cl} AS command_line, count() AS cnt \
-                     FROM {} PREWHERE {} WHERE {} AND {pn} != '' \
+                     FROM {} WHERE {} AND {} AND {pn} != '' \
                      GROUP BY {pn}, {cl} ORDER BY cnt DESC LIMIT 5",
-                    logs_table, prewhere_filter, where_clause, pn = process_name, cl = command_line
+                    logs_table, time_filter, where_clause, pn = process_name, cl = command_line
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -1286,9 +1379,9 @@ impl PrevalenceRepository {
                 }
                 let q = format!(
                     "SELECT {fn_} AS file_name, count() AS cnt \
-                     FROM {} PREWHERE {} WHERE {} AND {fn_} != '' \
+                     FROM {} WHERE {} AND {} AND {fn_} != '' \
                      GROUP BY {fn_} ORDER BY cnt DESC LIMIT 5",
-                    logs_table, prewhere_filter, where_clause, fn_ = file_name
+                    logs_table, time_filter, where_clause, fn_ = file_name
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -1321,9 +1414,9 @@ impl PrevalenceRepository {
                 // degradation; a String protocol name has no promoted OCSF column.
                 let q = format!(
                     "SELECT {dp} AS dest_port, {proto} AS protocol, count() AS cnt \
-                     FROM {} PREWHERE {} WHERE {} AND {dp} > 0 \
+                     FROM {} WHERE {} AND {} AND {dp} > 0 \
                      GROUP BY {dp}, {proto} ORDER BY cnt DESC LIMIT 10",
-                    logs_table, prewhere_filter, where_clause, dp = dest_port, proto = protocol
+                    logs_table, time_filter, where_clause, dp = dest_port, proto = protocol
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -1360,9 +1453,9 @@ impl PrevalenceRepository {
                 }
                 let q = format!(
                     "SELECT {cc} AS country, {asn} AS asn, count() AS cnt \
-                     FROM {} PREWHERE {} WHERE {} AND {cc} != '' \
+                     FROM {} WHERE {} AND {} AND {cc} != '' \
                      GROUP BY country, asn ORDER BY cnt DESC LIMIT 5",
-                    logs_table, prewhere_filter, where_clause, cc = country_col, asn = asn_col
+                    logs_table, time_filter, where_clause, cc = country_col, asn = asn_col
                 );
                 self.client.query(&q).fetch_all::<R>().await.map(|rows| {
                     rows.into_iter()
@@ -1402,7 +1495,7 @@ impl PrevalenceRepository {
     ///
     /// Each call issues two CH queries that group by (artifact, …) so the
     /// scan cost is one pass per call regardless of artifact count, bounded
-    /// by `prewhere_filter` (which is the same time window as the list).
+    /// by `time_filter` (which is the same time window as the list).
     ///
     /// Per-bucket size is capped at `MAX_BULK_INLINE_CONTEXT` to keep the
     /// inlined `IN (...)` list well under ClickHouse's 262 KB `max_query_size`
@@ -1461,7 +1554,7 @@ impl PrevalenceRepository {
 
         let cutoff = Self::get_cutoff_time(time_window);
         let cutoff_str = crate::sql_hygiene::format_ch_bound(&cutoff).to_string();
-        let prewhere_filter = format!("timestamp >= toDateTime('{}')", cutoff_str);
+        let time_filter = format!("timestamp >= toDateTime('{}')", cutoff_str);
 
         // --- Hashes: top file_name, top process_name+command_line, user_count, top source_type ---
         // Requires file_hash + file_name + user columns; skip the whole bucket if
@@ -1489,21 +1582,24 @@ impl PrevalenceRepository {
                 top_source_type: String,
             }
             let q_files = format!(
+                // user_count is a TRUE distinct across the whole hash, not `any()`
+                // of one (file_name, source_type) group's count (audit P10): the
+                // inner emits a per-group `uniqExactState`, the outer merges those
+                // states so partial per-group counts don't undercount the hash.
                 "SELECT lower({fh}) AS hash, \
                         argMax({fn_}, file_name_cnt) AS top_file_name, \
-                        any(distinct_users) AS user_count, \
+                        uniqExactMerge(distinct_users) AS user_count, \
                         argMax(source_type, src_cnt) AS top_source_type \
                  FROM ( \
                     SELECT lower({fh}) AS hash_lc, {fn_} AS file_name, count() AS file_name_cnt, \
-                           uniqExact({u}) AS distinct_users, source_type, count() AS src_cnt \
+                           uniqExactState({u}) AS distinct_users, source_type, count() AS src_cnt \
                     FROM {logs} \
-                    PREWHERE {pre} \
-                    WHERE lower({fh}) IN ({hashes}) \
+                    WHERE {pre} AND lower({fh}) IN ({hashes}) \
                     GROUP BY hash_lc, file_name, source_type \
                  ) \
                  GROUP BY lower({fh})",
                 logs = logs_table,
-                pre = prewhere_filter,
+                pre = time_filter,
                 hashes = hash_list,
                 fh = file_hash,
                 fn_ = file_name,
@@ -1541,13 +1637,12 @@ impl PrevalenceRepository {
                      FROM ( \
                         SELECT lower({fh}) AS hash_lc, {pn} AS process_name, {cl} AS command_line, count() AS cnt \
                         FROM {logs} \
-                        PREWHERE {pre} \
-                        WHERE lower({fh}) IN ({hashes}) AND {pn} != '' \
+                        WHERE {pre} AND lower({fh}) IN ({hashes}) AND {pn} != '' \
                         GROUP BY hash_lc, process_name, command_line \
                      ) \
                      GROUP BY lower({fh})",
                     logs = logs_table,
-                    pre = prewhere_filter,
+                    pre = time_filter,
                     hashes = hash_list,
                     fh = file_hash,
                     pn = process_name,
@@ -1593,13 +1688,12 @@ impl PrevalenceRepository {
                  FROM ( \
                     SELECT {di} AS dest_ip, {u} AS user, source_type, count() AS src_cnt \
                     FROM {logs} \
-                    PREWHERE {pre} \
-                    WHERE {di} IN ({ips}) \
+                    WHERE {pre} AND {di} IN ({ips}) \
                     GROUP BY dest_ip, user, source_type \
                  ) \
                  GROUP BY {di}",
                 logs = logs_table,
-                pre = prewhere_filter,
+                pre = time_filter,
                 ips = ip_list,
                 di = dest_ip,
                 u = user,
@@ -1639,13 +1733,12 @@ impl PrevalenceRepository {
                  FROM ( \
                     SELECT {dh} AS dest_host, {u} AS user, source_type, count() AS src_cnt \
                     FROM {logs} \
-                    PREWHERE {pre} \
-                    WHERE {dh} IN ({doms}) \
+                    WHERE {pre} AND {dh} IN ({doms}) \
                     GROUP BY dest_host, user, source_type \
                  ) \
                  GROUP BY {dh}",
                 logs = logs_table,
-                pre = prewhere_filter,
+                pre = time_filter,
                 doms = dom_list,
                 dh = dest_host,
                 u = user,

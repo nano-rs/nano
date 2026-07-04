@@ -58,7 +58,10 @@ pub async fn export_prevalence(
 
     let time_window = parse_time_window(params.window.as_deref());
     let artifact_type = parse_artifact_type(params.artifact_type.as_deref());
-    let max_prevalence = params.max_prevalence.unwrap_or(3); // Default to rarity threshold
+    // Default to the CONFIGURED rarity threshold (P1 audit — was hardcoded 3, so
+    // a tenant that raised the threshold got an export cut at the wrong bound).
+    let default_max_prevalence = prevalence_service.get_config().await.rarity_threshold;
+    let max_prevalence = params.max_prevalence.unwrap_or(default_max_prevalence);
     let format = params.format.as_deref().unwrap_or("csv");
 
     // Get rare artifacts (limited to MAX_EXPORT_ARTIFACTS)

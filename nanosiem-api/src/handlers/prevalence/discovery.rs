@@ -684,10 +684,19 @@ pub async fn get_query_artifacts(
         .table_names()
         .read(profile.table_name().trim_start_matches("nanosiem."));
 
-    // Query for unique file hashes (no limit - let prevalence filtering handle it)
+    // Bound the DISTINCT extraction. `get_bulk_prevalence` refuses more than
+    // MAX_BULK_ARTIFACTS in one pass, and the old unbounded DISTINCT let a
+    // >MAX result flow straight into that refusal — whose error was then caught
+    // by `if let Ok(..)` and swallowed into an empty 200 (audit P8). We instead
+    // fetch one row past the cap so we can (a) score up to the cap and (b) tell
+    // the caller, via `artifacts_truncated`, that more matched.
+    let distinct_cap = MAX_BULK_ARTIFACTS + 1;
+
+    // Query for unique file hashes (capped; over-cap is signalled, not silently dropped)
+    let mut artifacts_truncated = false;
     let hash_results: Vec<String> = if let Some(hash_col) = profile.udm_column_sql("file_hash") {
         let hash_query = format!(
-            "SELECT DISTINCT {hash_col} AS value FROM {logs_table} WHERE {combined_filter} AND {hash_col} != ''"
+            "SELECT DISTINCT {hash_col} AS value FROM {logs_table} WHERE {combined_filter} AND {hash_col} != '' LIMIT {distinct_cap}"
         );
         ch.query(&hash_query)
             .fetch_all::<SingleStringRow>()
@@ -701,7 +710,7 @@ pub async fn get_query_artifacts(
     // Query for unique domains (from dest_host)
     let domain_results: Vec<String> = if let Some(host_col) = profile.udm_column_sql("dest_host") {
         let domain_query = format!(
-            "SELECT DISTINCT {host_col} AS value FROM {logs_table} WHERE {combined_filter} AND {host_col} != '' AND {host_col} NOT LIKE '%%.internal' AND {host_col} NOT LIKE '%%.local'"
+            "SELECT DISTINCT {host_col} AS value FROM {logs_table} WHERE {combined_filter} AND {host_col} != '' AND {host_col} NOT LIKE '%%.internal' AND {host_col} NOT LIKE '%%.local' LIMIT {distinct_cap}"
         );
         ch.query(&domain_query)
             .fetch_all::<SingleStringRow>()
@@ -712,10 +721,24 @@ pub async fn get_query_artifacts(
         Vec::new()
     };
 
+    // Truncate each class down to the bulk cap before scoring; flag if either
+    // class overflowed so the client knows the result is partial.
+    let mut hash_results = hash_results;
+    if hash_results.len() > MAX_BULK_ARTIFACTS {
+        hash_results.truncate(MAX_BULK_ARTIFACTS);
+        artifacts_truncated = true;
+    }
+    let mut domain_results = domain_results;
+    if domain_results.len() > MAX_BULK_ARTIFACTS {
+        domain_results.truncate(MAX_BULK_ARTIFACTS);
+        artifacts_truncated = true;
+    }
+
     tracing::info!(
-        "Query artifacts: found {} hashes, {} domains for query '{}' in time range",
+        "Query artifacts: found {} hashes, {} domains (truncated={}) for query '{}' in time range",
         hash_results.len(),
         domain_results.len(),
+        artifacts_truncated,
         request.query
     );
 
@@ -765,6 +788,7 @@ pub async fn get_query_artifacts(
         hash_points,
         domain_points,
         rarity_threshold,
+        artifacts_truncated,
     }))
 }
 

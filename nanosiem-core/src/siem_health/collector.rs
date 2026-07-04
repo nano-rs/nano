@@ -96,7 +96,7 @@ async fn collect_ingestion_metrics(
     let insert_integrity = collect_insert_integrity(ch).await;
 
     info!(
-        "Collected ingestion metrics: {} source types, {} events (24h), {} silent sources, {} FAILED logs dicts",
+        "Collected ingestion metrics: {} source types, {} events (24h), {} silent sources, {} unhealthy logs dicts",
         source_volumes.len(),
         total_24h,
         silent_sources.len(),
@@ -228,8 +228,7 @@ async fn collect_insert_integrity(ch: &ClickHouseClient) -> InsertIntegrityMetri
             // toString(status): CH 26.4 made system.dictionaries.status an
             // Enum8('NOT_LOADED'=0,'LOADED'=1,'FAILED'=2,…) — deserializing it
             // directly into a String fails (NAN-1629). Cast so the client gets
-            // a String and `.starts_with("FAILED")` still matches (incl.
-            // FAILED_AND_RELOADING).
+            // a String and dict_is_unhealthy's status prefix check still matches.
             "SELECT concat(database, '.', name), toString(status), substring(last_exception, 1, 300) \
              FROM system.dictionaries \
              WHERE concat(database, '.', name) IN ({in_list})"
@@ -238,15 +237,20 @@ async fn collect_insert_integrity(ch: &ClickHouseClient) -> InsertIntegrityMetri
             Ok(rows) if rows.is_empty() => warn!(
                 "Insert-integrity probe: logs DDL references {} dictionaries but \
                  system.dictionaries shows none — GRANT SHOW DICTIONARIES ON *.* \
-                 missing? (NAN-1437); FAILED-dict detection is blind",
+                 missing? (NAN-1437); unhealthy-dict detection is blind",
                 referenced.len()
             ),
             Ok(rows) => {
                 m.probes_available = true;
+                // Flag FAILED status AND LOADED/NOT_LOADED-with-exception: a
+                // degraded CACHE dict (the prevalence dicts) reports LOADED while
+                // throwing at flush, so a status-only filter misses the halt
+                // (NAN-1667, gap G2).
                 m.failed_logs_dictionaries = rows
                     .into_iter()
-                    // starts_with: also catches FAILED_AND_RELOADING.
-                    .filter(|(_, status, _)| status.starts_with("FAILED"))
+                    .filter(|(_, status, last_exception)| {
+                        dict_is_unhealthy(status, last_exception)
+                    })
                     .map(|(name, _, last_exception)| FailedDictionary {
                         name,
                         last_exception,
@@ -345,6 +349,34 @@ fn extract_dict_references(ddl: &str) -> Vec<String> {
     names.sort();
     names.dedup();
     names
+}
+
+/// Whether a referenced dictionary is currently halting inserts.
+///
+/// `dictGetOrDefault` on a logs MATERIALIZED column THROWS at flush both when the
+/// dictionary status is `FAILED*` (FLAT/HASHED load failure) AND when a
+/// CACHE-layout dictionary's source is erroring — but a broken CACHE dict does
+/// NOT report `FAILED`. Reproduced on CH 26.4 (COMPLEX_KEY_CACHE, missing source
+/// table): the first failing lookup flips status to **`LOADED`** while populating
+/// `last_exception` (Code 510 CACHE_DICTIONARY_UPDATE_FAIL), and every lookup
+/// throws — the same total ingestion halt as a FAILED dict, invisible to a
+/// status-only filter. `last_exception` is a CURRENT signal: it CLEARS on the
+/// next successful update (verified), so keying off it never false-flags a
+/// recovered dict. A benign never-referenced lazy dict sits at `NOT_LOADED` with
+/// an EMPTY exception and is correctly not flagged.
+///
+/// Why the plain `last_exception != ''` clause is false-positive-safe across ALL
+/// layouts, not just cache (verified on CH 26.4): a HASHED/Trie/FLAT dict (the
+/// enrichment dicts) that fails a BACKGROUND reload keeps serving its last good
+/// snapshot, stays `LOADED`, and leaves `last_exception` EMPTY — `dictGet` never
+/// throws, so it never halts inserts and is correctly not flagged. Those dicts
+/// only carry a non-empty `last_exception` when their INITIAL load fails, which
+/// also flips status to `FAILED` (throwing → a real halt). So a non-empty
+/// exception always means "throwing right now", regardless of layout.
+/// (NAN-1667, audit gap G2.)
+fn dict_is_unhealthy(status: &str, last_exception: &str) -> bool {
+    // starts_with also catches FAILED_AND_RELOADING.
+    status.starts_with("FAILED") || !last_exception.is_empty()
 }
 
 /// Collect parsing health metrics from ClickHouse
@@ -1421,5 +1453,26 @@ mod tests {
         );
         // A dict-free DDL (no enrichment MATERIALIZED columns) yields nothing.
         assert!(extract_dict_references("CREATE TABLE t (x String) ENGINE = Memory").is_empty());
+    }
+
+    #[test]
+    fn dict_is_unhealthy_flags_failed_and_degraded_but_not_benign() {
+        // FAILED family — status-only, no exception needed.
+        assert!(dict_is_unhealthy("FAILED", ""));
+        assert!(dict_is_unhealthy("FAILED_AND_RELOADING", ""));
+        // Degraded CACHE dict: reports LOADED while its source errors — the G2
+        // blind spot. Empirically reproduced on CH 26.4 (Code 510).
+        assert!(dict_is_unhealthy(
+            "LOADED",
+            "Code: 510. DB::Exception: Update failed for dictionary ..."
+        ));
+        // NOT_LOADED with a load exception is unhealthy too.
+        assert!(dict_is_unhealthy("NOT_LOADED", "Code: 60. Unknown table ..."));
+        // Benign: healthy LOADED dict, and a never-referenced lazy dict sitting
+        // at NOT_LOADED with an EMPTY exception — must NOT be flagged (the
+        // false-positive trap). last_exception clears on recovery, so a
+        // recovered dict lands here on the next probe.
+        assert!(!dict_is_unhealthy("LOADED", ""));
+        assert!(!dict_is_unhealthy("NOT_LOADED", ""));
     }
 }

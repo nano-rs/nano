@@ -44,7 +44,7 @@ impl AppState {
     /// - PostgreSQL is used for metadata, configuration, and AI-related data
     ///
     /// Requirements: 1.1, 1.2
-    pub fn new_with_dual_pool(dual_pool: DualPool, config: ApiConfig) -> Self {
+    pub async fn new_with_dual_pool(dual_pool: DualPool, config: ApiConfig) -> Self {
         let pg_pool = dual_pool.postgres().clone();
 
         let enrichment_repo = EnrichmentRepository::new(pg_pool.clone());
@@ -86,9 +86,22 @@ impl AppState {
         // moved into `search_service` below.
         let lookup_service_for_state = lookup_service.clone();
 
-        // Create prevalence service for search enrichment (uses ClickHouse)
-        let prevalence_service =
-            PrevalenceService::new(dual_pool.clickhouse().clone(), dual_pool.table_names());
+        // Create prevalence service for search enrichment (uses ClickHouse).
+        // P1 audit: build via `with_database_config` so this long-lived instance
+        // (shared into SearchService + DetectionService below) honors the
+        // persisted admin config at boot instead of the hardcoded defaults
+        // (rarity_threshold=3, all tracking on). Otherwise detection `is_rare`
+        // and search `prevalence_score` ignore the admin config until restart.
+        let prevalence_service = PrevalenceService::with_database_config(
+            dual_pool.clickhouse().clone(),
+            dual_pool.table_names(),
+            &pg_pool,
+        )
+        .await;
+        // Keep a Clone-shared handle for AppState so the settings PUT handler can
+        // hot-reload config in-process. Clone shares the Arc<RwLock<config>>, so
+        // updating this handle updates the search + detection copies too.
+        let prevalence_service_for_state = prevalence_service.clone();
 
         // Initialize auth services
         let (
@@ -413,6 +426,9 @@ impl AppState {
             search_result_cache: None,
             rule_test_in_flight: Arc::new(dashmap::DashMap::new()),
             shadow_investigation_hook,
+            // P1 audit: shared prevalence handle for in-process config hot-reload
+            // (settings PUT handler → live search/detection consumers).
+            prevalence_service: prevalence_service_for_state,
         }
     }
 
@@ -609,7 +625,7 @@ impl AppState {
             .await;
 
         tracing::info!("DualPool initialized - using ClickHouse for log storage");
-        let mut state = Self::new_with_dual_pool(dual_pool, config);
+        let mut state = Self::new_with_dual_pool(dual_pool, config).await;
 
         // Swap the in-process presence tracker + marketplace coverage cache
         // for Redis-backed versions so cross-replica state is consistent.

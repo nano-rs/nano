@@ -76,6 +76,10 @@ pub struct AppState {
     pub lookup_service: nanosiem_core::lookup::LookupService,
     /// Detection service
     pub detection_service: DetectionService,
+    /// Prevalence service (Clone-shared with the search + detection services).
+    /// Held on AppState so the settings PUT handler can hot-reload prevalence
+    /// config in-process without a restart (P1 audit).
+    pub prevalence_service: nanosiem_core::prevalence::PrevalenceService,
     /// Detection scheduler (legacy, kept for trigger_rule API)
     /// Distributed detection scheduler (SKIP LOCKED, runs on all nodes)
     pub distributed_scheduler: Arc<RwLock<Option<Arc<DistributedDetectionScheduler>>>>,

@@ -74,6 +74,88 @@ impl DetectionService {
         }
     }
 
+    /// Partition a result set into per-entity finding groups, honoring the nPL
+    /// `| risk` command's per-event score/entity when present (R1).
+    ///
+    /// Returns `(has_query_scores, groups)` where each group is
+    /// `(entity, field, events)`. When the query produced per-event risk scores
+    /// (`| risk score=… entity=…`), **each event is its own group** keyed on the
+    /// query-derived entity; otherwise events are grouped by the rule's
+    /// risk-entity field and scored at rule level. This is the single source of
+    /// truth for grouping shared by the Live (`log_live_findings`) and Alerting
+    /// (`handle_grouped_alert` / `log_alert_signals`) paths, so promoting a rule
+    /// Live→Alerting can no longer silently revert per-event scoring/entity back
+    /// to the rule-level value.
+    pub(super) fn partition_entity_groups(
+        &self,
+        rule: &DetectionRule,
+        results: &[serde_json::Value],
+        global_weight: f64,
+    ) -> (bool, Vec<(String, String, Vec<serde_json::Value>)>) {
+        let has_query_scores = results
+            .first()
+            .map(super::super::risk::ScoreCalculator::has_query_risk_score)
+            .unwrap_or(false);
+
+        let groups = if has_query_scores {
+            results
+                .iter()
+                .filter_map(|event| {
+                    let rr = self
+                        .score_calculator
+                        .calculate_from_query_result(event, global_weight)?;
+                    let field = rr.entity_field.clone().unwrap_or_default();
+                    Some((rr.entity, field, vec![event.clone()]))
+                })
+                .collect()
+        } else {
+            self.group_events_by_entity(rule.risk_entity_field.as_deref(), results)
+                .into_iter()
+                .map(|((entity, field), events)| (entity, field, events))
+                .collect()
+        };
+        (has_query_scores, groups)
+    }
+
+    /// Compute the risk result for one entity group, honoring query-derived
+    /// per-event scores when the rule's `| risk` command produced them (R1),
+    /// else the rule-level score for the group (`rule.risk_score` + severity
+    /// default, `rule.risk_modifiers`, and the global `risk_weight`).
+    ///
+    /// Shared by every finding-emission path (Live + Alerting) so a rule scores
+    /// identically regardless of mode. Returns `None` only when a query-scored
+    /// event can no longer be scored (caller skips it).
+    pub(super) fn risk_result_for_group(
+        &self,
+        rule: &DetectionRule,
+        has_query_scores: bool,
+        entity: &str,
+        field: &str,
+        events: &[serde_json::Value],
+        global_weight: f64,
+    ) -> Option<super::super::risk::RiskResult> {
+        if has_query_scores {
+            self.score_calculator
+                .calculate_from_query_result(&events[0], global_weight)
+        } else {
+            let r = self.score_calculator.calculate(
+                rule.risk_score,
+                rule.severity,
+                Some(field),
+                &rule.risk_modifiers,
+                events,
+                global_weight,
+            );
+            Some(super::super::risk::RiskResult::new(
+                r.raw_score,
+                r.weighted_score,
+                entity.to_string(),
+                Some(field.to_string()),
+                r.factors,
+            ))
+        }
+    }
+
     /// Log risk signals for an alert's matched events, grouped by entity.
     ///
     /// Used by the per-event alert path. Grouped / aggregate rules do NOT use
@@ -89,36 +171,33 @@ impl DetectionService {
         events: &[serde_json::Value],
         global_weight: f64,
     ) {
-        let events_by_entity =
-            self.group_events_by_entity(rule.risk_entity_field.as_deref(), events);
+        let Some(ref logger) = self.finding_logger else {
+            return;
+        };
 
-        if let Some(ref logger) = self.finding_logger {
-            for ((entity, field_name), entity_events) in events_by_entity {
-                let risk_result = self.score_calculator.calculate(
-                    rule.risk_score,
-                    rule.severity,
-                    Some(&field_name),
-                    &rule.risk_modifiers,
-                    &entity_events,
-                    global_weight,
-                );
+        // R1: honor the `| risk` command's per-event score/entity here too — the
+        // per-event alert path must score identically to Live/grouped, not revert
+        // to the rule-level score/entity.
+        let (has_query_scores, groups) = self.partition_entity_groups(rule, events, global_weight);
+        for (entity, field_name, entity_events) in groups {
+            let Some(risk_result) = self.risk_result_for_group(
+                rule,
+                has_query_scores,
+                &entity,
+                &field_name,
+                &entity_events,
+                global_weight,
+            ) else {
+                continue;
+            };
 
-                let risk_result = super::super::risk::RiskResult::new(
-                    risk_result.raw_score,
-                    risk_result.weighted_score,
-                    entity.clone(),
-                    Some(field_name.clone()),
-                    risk_result.factors,
-                );
+            debug!(
+                "Risk score for entity {} (field: {}): raw={}, weighted={}",
+                entity, field_name, risk_result.raw_score, risk_result.weighted_score
+            );
 
-                debug!(
-                    "Risk score for entity {} (field: {}): raw={}, weighted={}",
-                    entity, field_name, risk_result.raw_score, risk_result.weighted_score
-                );
-
-                if let Err(e) = logger.log_alert(rule, alert, false, risk_result).await {
-                    error!("Failed to log alert signal for entity {}: {}", entity, e);
-                }
+            if let Err(e) = logger.log_alert(rule, alert, false, risk_result).await {
+                error!("Failed to log alert signal for entity {}: {}", entity, e);
             }
         }
     }
@@ -234,13 +313,11 @@ impl DetectionService {
         // (No writes yet — we only record emissions after the alert is created,
         // so a failed alert insert can't orphan a dedup row and silently
         // suppress a future alert.)
-        let candidates = Self::build_finding_candidates(
-            "alert",
-            rule.id,
-            self.group_events_by_entity(rule.risk_entity_field.as_deref(), results)
-                .into_iter()
-                .map(|((entity, field), events)| (entity, field, events)),
-        );
+        // R1: build candidates from the same query-score-aware grouping the Live
+        // path uses, so a `| risk` rule keeps its per-event score/entity after a
+        // Live→Alerting promotion instead of reverting to rule-level grouping.
+        let (has_query_scores, groups) = self.partition_entity_groups(rule, results, global_weight);
+        let candidates = Self::build_finding_candidates("alert", rule.id, groups.into_iter());
         let new_findings = self.retain_unemitted(rule.id, candidates).await;
 
         if new_findings.is_empty() {
@@ -285,7 +362,7 @@ impl DetectionService {
             alert.id
         );
 
-        self.emit_grouped_findings(rule, &alert, &new_findings, global_weight)
+        self.emit_grouped_findings(rule, &alert, &new_findings, has_query_scores, global_weight)
             .await;
 
         let case_permissions = self.get_case_permissions(rule).await;
@@ -302,28 +379,26 @@ impl DetectionService {
         rule: &DetectionRule,
         alert: &Alert,
         new_findings: &[ClaimedFinding],
+        has_query_scores: bool,
         global_weight: f64,
     ) {
         let Some(ref logger) = self.finding_logger else {
             return;
         };
         for nf in new_findings {
-            let risk_result = self.score_calculator.calculate(
-                rule.risk_score,
-                rule.severity,
-                Some(&nf.field),
-                &rule.risk_modifiers,
+            // R1: score with the query-derived per-event value when the rule's
+            // `| risk` command produced one, else the rule-level score — the same
+            // rule scores identically in Live and Alerting.
+            let Some(risk_result) = self.risk_result_for_group(
+                rule,
+                has_query_scores,
+                &nf.entity,
+                &nf.field,
                 &nf.events,
                 global_weight,
-            );
-
-            let risk_result = super::super::risk::RiskResult::new(
-                risk_result.raw_score,
-                risk_result.weighted_score,
-                nf.entity.clone(),
-                Some(nf.field.clone()),
-                risk_result.factors,
-            );
+            ) else {
+                continue;
+            };
 
             debug!(
                 "Risk score for entity {} (field: {}): raw={}, weighted={}",
@@ -354,29 +429,9 @@ impl DetectionService {
         };
 
         // Query-derived scores (`| risk` command) score each event individually;
-        // otherwise group by entity and score per group.
-        let has_query_scores = results
-            .first()
-            .map(super::super::risk::ScoreCalculator::has_query_risk_score)
-            .unwrap_or(false);
-
-        let groups: Vec<(String, String, Vec<serde_json::Value>)> = if has_query_scores {
-            results
-                .iter()
-                .filter_map(|event| {
-                    let rr = self
-                        .score_calculator
-                        .calculate_from_query_result(event, global_weight)?;
-                    let field = rr.entity_field.clone().unwrap_or_default();
-                    Some((rr.entity, field, vec![event.clone()]))
-                })
-                .collect()
-        } else {
-            self.group_events_by_entity(rule.risk_entity_field.as_deref(), results)
-                .into_iter()
-                .map(|((entity, field), events)| (entity, field, events))
-                .collect()
-        };
+        // otherwise group by entity and score per group. Shared with the Alerting
+        // path so Live and Alerting group + score identically (R1).
+        let (has_query_scores, groups) = self.partition_entity_groups(rule, results, global_weight);
 
         let candidates = Self::build_finding_candidates("live", rule.id, groups);
         let new_findings = self.retain_unemitted(rule.id, candidates).await;
@@ -388,31 +443,17 @@ impl DetectionService {
         let mut emitted = 0;
         for nf in &new_findings {
             // Re-derive the risk result for this entity/event (query-derived
-            // score per event, else rule-derived score per group).
-            let risk_result = if has_query_scores {
-                match self
-                    .score_calculator
-                    .calculate_from_query_result(&nf.events[0], global_weight)
-                {
-                    Some(r) => r,
-                    None => continue,
-                }
-            } else {
-                let r = self.score_calculator.calculate(
-                    rule.risk_score,
-                    rule.severity,
-                    Some(&nf.field),
-                    &rule.risk_modifiers,
-                    &nf.events,
-                    global_weight,
-                );
-                super::super::risk::RiskResult::new(
-                    r.raw_score,
-                    r.weighted_score,
-                    nf.entity.clone(),
-                    Some(nf.field.clone()),
-                    r.factors,
-                )
+            // score per event, else rule-derived score per group) — shared with
+            // the Alerting path (R1).
+            let Some(risk_result) = self.risk_result_for_group(
+                rule,
+                has_query_scores,
+                &nf.entity,
+                &nf.field,
+                &nf.events,
+                global_weight,
+            ) else {
+                continue;
             };
 
             debug!(

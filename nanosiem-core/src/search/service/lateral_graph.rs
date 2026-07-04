@@ -787,9 +787,13 @@ where
     // misses the majority of real risk rows. Match on both the raw lowered
     // form and the FQDN-stripped short form so either style of stored
     // entity still lights up the node's band.
+    // Read the DECAYED score (maintained by the enterprise RiskDecayScheduler,
+    // NAN-1675), not the cumulative accumulator — so node bands match the Risk
+    // page's decayed view. It's a plain PG column, so core reads it without
+    // reaching into the enterprise decay computation.
     let rows: Result<Vec<(String, i32)>, sqlx::Error> = sqlx::query_as(
         r#"
-        SELECT entity, MAX(risk_score)::int4
+        SELECT entity, MAX(decayed_score)::int4
         FROM entity_risk_scores
         WHERE lower(entity) = ANY($1)
            OR lower(split_part(entity, '.', 1)) = ANY($1)

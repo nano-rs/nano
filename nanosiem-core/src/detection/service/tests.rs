@@ -47,6 +47,41 @@ fn test_validate_query_invalid() {
     assert!(parse_query("error |").is_err());
 }
 
+/// R1 (Live→Alerting parity): the mechanism the Alerting path now shares with
+/// Live via `partition_entity_groups` / `risk_result_for_group`. When a rule's
+/// `| risk` command produced per-event scores, `has_query_risk_score` is true
+/// and `calculate_from_query_result` yields the PER-EVENT entity + weighted
+/// score (not the rule-level entity/score). Previously the grouped Alerting path
+/// ignored this and reverted to `rule.risk_score` + the rule's risk-entity field
+/// after a Live→Alerting promotion; both paths now key off exactly this signal.
+#[test]
+fn test_r1_query_derived_score_and_entity_are_per_event() {
+    let calc = crate::detection::risk::ScoreCalculator::new();
+
+    // Query-scored event (`| risk score=90 entity=src_ip`): honored per-event.
+    let scored = serde_json::json!({
+        "src_ip": "10.0.0.9",
+        "raw_risk_score": 90,
+        "risk_entity": "10.0.0.9",
+        "risk_entity_field": "src_ip",
+    });
+    assert!(
+        crate::detection::risk::ScoreCalculator::has_query_risk_score(&scored),
+        "query-scored event must be detected so per-event scoring is used"
+    );
+    let rr = calc
+        .calculate_from_query_result(&scored, 1.0)
+        .expect("query-scored event must produce a RiskResult");
+    assert_eq!(rr.entity, "10.0.0.9", "entity must come from the event, not the rule");
+    assert_eq!(rr.weighted_score, 90, "score must come from the event, not the rule");
+    assert_eq!(rr.entity_field.as_deref(), Some("src_ip"));
+
+    // Plain event (no `| risk`): NOT query-scored → both paths fall back to
+    // rule-level grouping/scoring identically.
+    let plain = serde_json::json!({ "src_ip": "1.2.3.4" });
+    assert!(!crate::detection::risk::ScoreCalculator::has_query_risk_score(&plain));
+}
+
 #[test]
 fn test_rule_mode_display() {
     assert_eq!(RuleMode::Live.to_string(), "live");

@@ -1278,12 +1278,19 @@ impl SearchService {
         // silently returning 0 rows. The `= 0` form prevents the bad optimization.
         let domain_branch = |udm_col: &str| -> Option<String> {
             let col = profile.udm_column_sql(udm_col)?;
-            let prev = profile
-                .udm_column_sql("prevalence_dest_domain")
-                .unwrap_or_else(|| "0".to_string());
+            // Look the artifact's prevalence up in the shared domain dict keyed by
+            // THIS branch's own column, not the `prevalence_dest_domain` materialized
+            // stamp. That stamp only holds `dest_host`'s host_count, so attributing it
+            // to the `query` / `url_domain` branches reported the wrong entity's
+            // prevalence (a dest_host stamp on a DNS-query artifact). `dest_host`'s
+            // own result is unchanged: `prevalence_dest_domain` is itself
+            // `dictGetOrDefault(domain_prevalence_dict, host_count, lower(dest_host), 9999)`
+            // and the IP-exclusion WHERE below drops the 65535 (IP) case the stamp
+            // used. `max(...)` is a no-op collapse — the value is functionally
+            // determined by the `lower({col})` group key.
             Some(format!(
                 "SELECT lower({col}) as artifact, min(timestamp) as first_ts, max(timestamp) as last_ts, count() as cnt, \
-                    max({prev}) as host_count \
+                    max(dictGetOrDefault('nanosiem.domain_prevalence_dict', 'host_count', lower({col}), toUInt16(9999))) as host_count \
                 FROM {logs_table} \
                 PREWHERE timestamp BETWEEN '{start_str}' AND '{end_str}' AND ({identity_clause}) \
                 WHERE {col} != '' AND position({col}, '.') > 0 AND match({col}, '{ip_exclude}') = 0 \

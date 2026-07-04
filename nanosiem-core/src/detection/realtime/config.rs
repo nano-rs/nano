@@ -2,7 +2,6 @@
 
 //! Configuration types for real-time rule evaluation.
 
-use super::super::risk::CumulativeRiskConfig;
 use crate::models::DetectionRule;
 use crate::query::Query;
 
@@ -15,8 +14,6 @@ pub struct RealtimeConfig {
     pub enabled: bool,
     /// Whether to log findings for detection matches and alerts
     pub signal_logging_enabled: bool,
-    /// Whether to enable cumulative risk detection
-    pub cumulative_risk_enabled: bool,
 }
 
 impl Default for RealtimeConfig {
@@ -25,7 +22,6 @@ impl Default for RealtimeConfig {
             max_rules_per_event: 100,
             enabled: true,
             signal_logging_enabled: true,
-            cumulative_risk_enabled: true,
         }
     }
 }
@@ -35,11 +31,4 @@ impl Default for RealtimeConfig {
 pub(crate) struct CompiledRule {
     pub(crate) rule: DetectionRule,
     pub(crate) query: Query,
-}
-
-/// Compiled cumulative risk rule with extracted configuration
-#[derive(Debug, Clone)]
-pub(crate) struct CompiledCumulativeRiskRule {
-    pub(crate) rule: DetectionRule,
-    pub(crate) config: CumulativeRiskConfig,
 }

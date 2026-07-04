@@ -802,7 +802,7 @@ impl SearchService {
             Some(col) => format!("lower(l.{col}) AS service"),
             None => "'' AS service".to_string(),
         };
-        let anomaly_cloud_filter = {
+        let anomaly_cloud_predicate = {
             let terms: Vec<String> =
                 [&cloud_service_col, &cloud_provider_col, &cloud_account_id_col]
                     .into_iter()
@@ -811,11 +811,20 @@ impl SearchService {
             if terms.is_empty() {
                 // No cloud context to gate on — keep the feed empty rather than
                 // surfacing every (non-cloud) signal.
-                "WHERE 0".to_string()
+                "0".to_string()
             } else {
-                format!("WHERE {}", terms.join(" OR "))
+                format!("({})", terms.join(" OR "))
             }
         };
+        // R6-join: `logs` is the PROBE (left/streaming) side and `signals` the
+        // BUILD (right) side, so the hash table is built over the tiny signals
+        // set instead of the ~20 GiB whole-`logs` table. Both sides carry a
+        // `timestamp BETWEEN` bound (single WHERE, no PREWHERE — let
+        // optimize_move_to_prewhere place it) so `logs` prunes to the window's
+        // partitions rather than full-scanning as the build side did before.
+        // The matched event's timestamp is copied from the log into the signal,
+        // so bounding both to the same window keeps the result identical while
+        // cutting parts read from 349/349 to just the window's partitions.
         let anomalies_sql = format!(
             r#"SELECT
                 toString(s.id) AS id,
@@ -826,10 +835,11 @@ impl SearchService {
                 {anomaly_account_outer},
                 {anomaly_service_outer},
                 s.metadata AS metadata
-            FROM {signals_table} AS s
-            INNER JOIN {logs_table} AS l ON l.id = s.matched_log_id
-            PREWHERE s.timestamp BETWEEN ? AND ?
-            {anomaly_cloud_filter}
+            FROM {logs_table} AS l
+            INNER JOIN {signals_table} AS s ON s.matched_log_id = l.id
+            WHERE l.timestamp BETWEEN ? AND ?
+              AND s.timestamp BETWEEN ? AND ?
+              AND {anomaly_cloud_predicate}
             ORDER BY s.timestamp DESC
             LIMIT {ANOMALIES_LIMIT}"#,
         );
@@ -915,6 +925,10 @@ impl SearchService {
         let anomalies_fut = fetch_rows(
             clickhouse
                 .query(&anomalies_sql)
+                // Two ranges: the `l` (logs, probe) bound then the `s` (signals,
+                // build) bound — order matches the `?` placeholders above.
+                .bind(start_str.clone())
+                .bind(end_str.clone())
                 .bind(start_str.clone())
                 .bind(end_str.clone()),
             "cloud_overview.anomalies",

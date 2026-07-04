@@ -3551,6 +3551,9 @@ export interface ArtifactExplorerResponse {
   rare_count: number;
   new_count: number;
   high_risk_asset_count: number;
+  /** When true, the headline counts are floors over a capped fetch buffer
+   * (real values are higher) and should render as `N+`, not exact totals. */
+  counts_approximate?: boolean;
 }
 
 export interface ArtifactHostEntry {

@@ -323,11 +323,13 @@ fn insert_integrity_recommendations(ii: &InsertIntegrityMetrics) -> Vec<Recommen
             .collect::<Vec<_>>()
             .join(", ");
         recs.push(Recommendation {
-            title: format!("FAILED enrichment dictionary is halting ingestion: {dicts}"),
+            title: format!("Unhealthy enrichment dictionary is halting ingestion: {dicts}"),
             description: format!(
-                "The logs table's MATERIALIZED columns call dictGetOrDefault on {dicts}, and a \
-                 FAILED dictionary makes that call THROW on every insert flush — all incoming \
+                "The logs table's MATERIALIZED columns call dictGetOrDefault on {dicts}, and an \
+                 unhealthy dictionary makes that call THROW on every insert flush — all incoming \
                  batches are being discarded while every upstream ACK stays green (NAN-1404). \
+                 This is either FAILED status OR a degraded CACHE dict (e.g. a prevalence dict) \
+                 that reports LOADED while its source errors and every lookup throws (NAN-1667). \
                  Inspect system.dictionaries.last_exception, fix the dictionary source, then \
                  SYSTEM RELOAD DICTIONARY to restore ingestion."
             ),

@@ -35,10 +35,7 @@ pub use error::DetectionError;
 pub use findings::{FindingEvent, FindingLogError, FindingLogger, FindingType};
 pub use materialized_view::{MaterializedViewError, MaterializedViewGenerator};
 pub use realtime::{RealtimeConfig, RealtimeEvaluator};
-pub use risk::{
-    extract_cumulative_risk_config, is_cumulative_risk_rule, CumulativeRiskConfig,
-    CumulativeRiskResult, RiskError, RiskModifier, RiskResult, ScoreCalculator,
-};
+pub use risk::{RiskError, RiskModifier, RiskResult, ScoreCalculator};
 pub use scheduler::{calculate_next_run_with_jitter, validate_cron_expression};
 pub use service::{
     DailyMatchCount, DetectionService, DetectionServiceConfig, HistoricalAnalysisResult, TimeBucket,

@@ -1,0 +1,34 @@
+-- =============================================================================
+-- 151: fix the ingest prevalence_dest_ip private-IP exclusion set
+--      (NAN-1661 — P5 safe part)
+-- =============================================================================
+--
+-- The `prevalence_dest_ip` MATERIALIZED column on nanosiem.logs stamps each row
+-- with the IP prevalence dict's host_count at INSERT time, but skips the lookup
+-- for private/link-local addresses (stamping the 65535 "N/A — private" sentinel
+-- instead). The exclusion set was:
+--     startsWith(dest_ip,'10.') OR startsWith(dest_ip,'172.16.')
+--     OR startsWith(dest_ip,'192.168.') OR startsWith(dest_ip,'127.')
+-- which MISSES:
+--   * 172.17.0.0 – 172.31.255.255  (only the '172.16.' /16 was caught, not the
+--     full 172.16.0.0/12 — this is where Docker's default bridge networks live)
+--   * 169.254.0.0/16  (link-local)
+-- Those addresses fell through to the dict lookup; the ip_prevalence_dict source
+-- only holds public IPs (WHERE is_private = 0), so the lookup missed and returned
+-- the 9999 not-found default — permanently stamping brand-new private artifacts
+-- as "common". This replaces the startsWith set with the SAME match() regex the
+-- ip_prevalence agg/summary MVs use for is_private classification, so an address
+-- the prevalence pipeline treats as private is also excluded from the stamp.
+--
+-- ALTER … MODIFY COLUMN on a MATERIALIZED expression is METADATA-ONLY: it changes
+-- the expression for FUTURE inserts and does NOT rewrite existing parts (verified
+-- against local ClickHouse). Historical rows keep their (possibly wrong) stamp —
+-- deliberately no MATERIALIZE/backfill, which would be a multi-TB part rewrite
+-- inside the boot-gating migrator (forbidden, NAN-1398/1404). Go-forward inserts
+-- are stamped correctly.
+--
+-- This targets nanosiem.logs (always present), so NO skip-if-unknown-table
+-- marker. Keep in lockstep with clickhouse/init.sql (fresh bootstraps).
+
+ALTER TABLE nanosiem.logs
+    MODIFY COLUMN `prevalence_dest_ip` UInt16 MATERIALIZED if(dest_ip != '' AND NOT (match(dest_ip, '^10\\.') OR match(dest_ip, '^172\\.(1[6-9]|2[0-9]|3[0-1])\\.') OR match(dest_ip, '^192\\.168\\.') OR match(dest_ip, '^127\\.') OR match(dest_ip, '^169\\.254\\.')), dictGetOrDefault('nanosiem.ip_prevalence_dict', 'host_count', dest_ip, toUInt16(9999)), toUInt16(65535)) CODEC(T64, LZ4);

@@ -4,7 +4,9 @@
 
 use uuid::Uuid;
 
-use crate::models::{AlertMode, DetectionRule, NewDetectionRule, RuleMode, UpdateDetectionRule};
+use crate::models::{
+    AlertMode, DetectionMode, DetectionRule, NewDetectionRule, RuleMode, UpdateDetectionRule,
+};
 
 use super::types::{DetectionRuleRepository, DetectionRuleRepositoryError};
 
@@ -38,7 +40,10 @@ impl DetectionRuleRepository {
         .bind(&rule.risk_score)
         .bind(&rule.risk_entity_field)
         .bind(sqlx::types::Json(rule.risk_modifiers.as_ref().unwrap_or(&vec![])))
-        .bind(&rule.detection_mode)
+        // detection_mode is NOT NULL with a DB default of 'scheduled'; binding the
+        // raw Option would send an explicit NULL (overriding the default) and 500 on
+        // a create that omits it. Default it here like alert_mode/realtime_enabled (NAN-1665).
+        .bind(rule.detection_mode.unwrap_or(DetectionMode::Scheduled))
         .bind(&rule.lookback_minutes)
         .bind(rule.auto_tuning_enabled.unwrap_or(true))
         .bind(rule.auto_tuning_min_confidence.unwrap_or(0.8))
@@ -128,7 +133,7 @@ impl DetectionRuleRepository {
                 detection_mode = COALESCE($16, detection_mode),
                 materialized_view_name = COALESCE($17, materialized_view_name),
                 risk_score = COALESCE($18, risk_score),
-                risk_entity_field = $19,
+                risk_entity_field = COALESCE($19, risk_entity_field),
                 risk_modifiers = COALESCE($20, risk_modifiers),
                 archived = COALESCE($21, archived),
                 lookback_minutes = COALESCE($22, lookback_minutes),

@@ -468,14 +468,26 @@ fn extract_time_modifiers(query: &str) -> (String, Option<i64>, Option<i64>) {
     (cleaned, earliest_offset, latest_offset)
 }
 
-/// Convert AST time window to prevalence service time window
-fn ast_to_prevalence_time_window(ast_tw: Option<&AstTimeWindow>) -> PrevalenceTimeWindow {
+/// Convert an AST time window to the prevalence-service time window.
+///
+/// Rejects `window=1h` on EVERY prevalence path (audit P2). The JOIN builder
+/// already errored on `OneHour`, but the dict-fallback path silently coerced it
+/// to 24h — so the same `| prevalence window=1h` returned different truth
+/// depending on which path the query shape selected. 1h prevalence isn't
+/// meaningful (the dictionaries refresh every 5–10min), so both paths now
+/// reject it identically. Threading this through the single converter both
+/// search paths call keeps the contract path-independent.
+fn ast_to_prevalence_time_window(
+    ast_tw: Option<&AstTimeWindow>,
+) -> Result<PrevalenceTimeWindow, SearchError> {
     match ast_tw {
-        Some(AstTimeWindow::OneHour) => PrevalenceTimeWindow::OneHour,
-        Some(AstTimeWindow::TwentyFourHours) => PrevalenceTimeWindow::TwentyFourHours,
-        Some(AstTimeWindow::SevenDays) => PrevalenceTimeWindow::SevenDays,
-        Some(AstTimeWindow::ThirtyDays) => PrevalenceTimeWindow::ThirtyDays,
-        None => PrevalenceTimeWindow::ThirtyDays, // Default: match dictionary 30-day window
+        Some(AstTimeWindow::OneHour) => Err(SearchError::PrevalenceError(
+            "prevalence window=1h is not supported; use 24h, 7d, or 30d".to_string(),
+        )),
+        Some(AstTimeWindow::TwentyFourHours) => Ok(PrevalenceTimeWindow::TwentyFourHours),
+        Some(AstTimeWindow::SevenDays) => Ok(PrevalenceTimeWindow::SevenDays),
+        Some(AstTimeWindow::ThirtyDays) => Ok(PrevalenceTimeWindow::ThirtyDays),
+        None => Ok(PrevalenceTimeWindow::ThirtyDays), // Default: match dictionary 30-day window
     }
 }
 
@@ -1066,19 +1078,24 @@ mod tests {
     #[test]
     fn test_ast_to_prevalence_time_window() {
         assert_eq!(
-            ast_to_prevalence_time_window(None),
+            ast_to_prevalence_time_window(None).unwrap(),
             PrevalenceTimeWindow::ThirtyDays
         );
-        assert_eq!(
+        // P2: 1h is rejected on every prevalence path (no silent 24h coercion).
+        assert!(matches!(
             ast_to_prevalence_time_window(Some(&AstTimeWindow::OneHour)),
-            PrevalenceTimeWindow::OneHour
+            Err(SearchError::PrevalenceError(_))
+        ));
+        assert_eq!(
+            ast_to_prevalence_time_window(Some(&AstTimeWindow::TwentyFourHours)).unwrap(),
+            PrevalenceTimeWindow::TwentyFourHours
         );
         assert_eq!(
-            ast_to_prevalence_time_window(Some(&AstTimeWindow::SevenDays)),
+            ast_to_prevalence_time_window(Some(&AstTimeWindow::SevenDays)).unwrap(),
             PrevalenceTimeWindow::SevenDays
         );
         assert_eq!(
-            ast_to_prevalence_time_window(Some(&AstTimeWindow::ThirtyDays)),
+            ast_to_prevalence_time_window(Some(&AstTimeWindow::ThirtyDays)).unwrap(),
             PrevalenceTimeWindow::ThirtyDays
         );
     }

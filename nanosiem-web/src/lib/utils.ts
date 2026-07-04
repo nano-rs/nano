@@ -2,6 +2,7 @@
 
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { isPrevalenceSentinelField } from './prevalence-sentinels';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -31,10 +32,8 @@ const FIELDS_WHERE_ZERO_IS_MEANINGFUL = new Set([
  * - Strings → '' (empty string)
  * - Dates → 1970-01-01
  *
- * Prevalence sentinel values (used to indicate "no data"):
- * - 65535: N/A (UInt16 max, field is empty/not applicable)
- * - 9999: Common/not tracked (> 1000 hosts, not rare)
- * - 255: Legacy N/A (UInt8 max)
+ * Prevalence sentinel values (used to indicate "no data") — see
+ * lib/prevalence-sentinels: 65535 = N/A, 9999 = common (>= 1000 hosts).
  *
  * @param value The value to check
  * @param fieldName Optional field name for context-aware checking
@@ -47,17 +46,9 @@ export function isClickHouseDefault(value: unknown, fieldName?: string): boolean
   // Empty string
   if (value === '' || value === 'null') return true;
 
-  // Prevalence sentinel values - these indicate "no data" or "not tracked"
-  // Only apply to prevalence_* fields to avoid hiding legitimate values in other fields
-  if (fieldName) {
-    const lowerField = fieldName.toLowerCase();
-    if (lowerField.startsWith('prevalence_')) {
-      // 65535 = UInt16 max, means "no data" / "not applicable"
-      // 9999 = "common/not tracked" (artifact seen on > 1000 hosts)
-      // 255 = UInt8 max, legacy "no data" value
-      if (value === 65535 || value === 9999 || value === 255) return true;
-    }
-  }
+  // Prevalence sentinel values (N/A / common) indicate "no data" / "not tracked".
+  // Scoped to prevalence_* fields so a legitimate 9999/65535 elsewhere isn't hidden.
+  if (fieldName && isPrevalenceSentinelField(fieldName, value)) return true;
 
   // For numeric 0, check if the field is one where 0 is meaningful
   if (value === 0) {

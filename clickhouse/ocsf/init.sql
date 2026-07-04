@@ -707,10 +707,10 @@ CREATE TABLE IF NOT EXISTS nanosiem.ocsf_logs
     -- UInt16, NUMERIC (never lower()'d). Hash columns are already lowercased at
     -- ingest (see lower() in the hash materializers) so the dict key matches the
     -- UDM hash dict-key convention without re-lowering here.
-    `prevalence_file_hash` UInt16 MATERIALIZED if(`file.hashes.sha256` != '', dictGetOrDefault('nanosiem.hash_prevalence_dict', 'host_count', `file.hashes.sha256`, toUInt16(9999)), toUInt16(65535)) CODEC(T64, LZ4),
-    `prevalence_process_hash` UInt16 MATERIALIZED if(`process.file.hashes.sha256` != '', dictGetOrDefault('nanosiem.hash_prevalence_dict', 'host_count', `process.file.hashes.sha256`, toUInt16(9999)), toUInt16(65535)) CODEC(T64, LZ4),
-    `prevalence_dest_domain` UInt16 MATERIALIZED if(`dst_endpoint.hostname` != '' AND NOT match(`dst_endpoint.hostname`, '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$'), dictGetOrDefault('nanosiem.domain_prevalence_dict', 'host_count', lower(`dst_endpoint.hostname`), toUInt16(9999)), toUInt16(65535)) CODEC(T64, LZ4),
-    `prevalence_dest_ip` UInt16 MATERIALIZED if(`dst_endpoint.ip` != '' AND NOT (startsWith(`dst_endpoint.ip`, '10.') OR startsWith(`dst_endpoint.ip`, '172.16.') OR startsWith(`dst_endpoint.ip`, '192.168.') OR startsWith(`dst_endpoint.ip`, '127.')), dictGetOrDefault('nanosiem.ip_prevalence_dict', 'host_count', `dst_endpoint.ip`, toUInt16(9999)), toUInt16(65535)) CODEC(T64, LZ4),
+    `prevalence_file_hash` UInt16 MATERIALIZED if(`file.hashes.sha256` != '', dictGetOrDefault('nanosiem.hash_prevalence_dict', 'host_count', `file.hashes.sha256`, toUInt16(1)), toUInt16(65535)) CODEC(T64, LZ4),
+    `prevalence_process_hash` UInt16 MATERIALIZED if(`process.file.hashes.sha256` != '', dictGetOrDefault('nanosiem.hash_prevalence_dict', 'host_count', `process.file.hashes.sha256`, toUInt16(1)), toUInt16(65535)) CODEC(T64, LZ4),
+    `prevalence_dest_domain` UInt16 MATERIALIZED if(`dst_endpoint.hostname` != '' AND NOT match(`dst_endpoint.hostname`, '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$'), dictGetOrDefault('nanosiem.domain_prevalence_dict', 'host_count', lower(`dst_endpoint.hostname`), toUInt16(1)), toUInt16(65535)) CODEC(T64, LZ4),
+    `prevalence_dest_ip` UInt16 MATERIALIZED if(`dst_endpoint.ip` != '' AND NOT (match(`dst_endpoint.ip`, '^10\\.') OR match(`dst_endpoint.ip`, '^172\\.(1[6-9]|2[0-9]|3[0-1])\\.') OR match(`dst_endpoint.ip`, '^192\\.168\\.') OR match(`dst_endpoint.ip`, '^127\\.') OR match(`dst_endpoint.ip`, '^169\\.254\\.')), dictGetOrDefault('nanosiem.ip_prevalence_dict', 'host_count', `dst_endpoint.ip`, toUInt16(1)), toUInt16(65535)) CODEC(T64, LZ4),
     -- prevalence_min: least() of the four prevalence columns above, mirroring UDM
     -- logs.prevalence_min EXACTLY (NAN-1383). UDM's inline definition contributes
     -- 9999 (not 65535) for an ABSENT entity, so the per-column 65535 "no entity"
@@ -1374,13 +1374,12 @@ SOURCE(CLICKHOUSE(
     PASSWORD '{clickhouse_self_password}'
     DB 'nanosiem'
     QUERY 'SELECT file_hash,
-                  toUInt16(least(9998, uniqMerge(host_count))) AS host_count,
+                  if(uniqMerge(host_count) >= 1000, toUInt16(9999), toUInt16(least(9998, uniqMerge(host_count)))) AS host_count,
                   min(first_seen) AS first_seen,
                   max(last_seen) AS last_seen,
                   toUInt64(sum(total_count)) AS total_occurrences
            FROM nanosiem.hash_prevalence_summary
            GROUP BY file_hash
-           HAVING host_count < 1000
            SETTINGS max_memory_usage = 536870912, max_bytes_before_external_group_by = 268435456, max_threads = 2'
 ))
 LIFETIME(MIN 900 MAX 1800)
@@ -1402,13 +1401,12 @@ SOURCE(CLICKHOUSE(
     PASSWORD '{clickhouse_self_password}'
     DB 'nanosiem'
     QUERY 'SELECT domain,
-                  toUInt16(least(9998, uniqMerge(source_host_count))) AS host_count,
+                  if(uniqMerge(source_host_count) >= 1000, toUInt16(9999), toUInt16(least(9998, uniqMerge(source_host_count)))) AS host_count,
                   min(first_seen) AS first_seen,
                   max(last_seen) AS last_seen,
                   toUInt64(sum(total_count)) AS total_occurrences
            FROM nanosiem.domain_prevalence_summary
            GROUP BY domain
-           HAVING host_count < 1000
            SETTINGS max_memory_usage = 536870912, max_bytes_before_external_group_by = 268435456, max_threads = 2'
 ))
 LIFETIME(MIN 900 MAX 1800)
@@ -1430,28 +1428,140 @@ SOURCE(CLICKHOUSE(
     PASSWORD '{clickhouse_self_password}'
     DB 'nanosiem'
     QUERY 'SELECT ip,
-                  toUInt16(least(9998, uniqMerge(source_host_count))) AS host_count,
+                  if(uniqMerge(source_host_count) >= 1000, toUInt16(9999), toUInt16(least(9998, uniqMerge(source_host_count)))) AS host_count,
                   min(first_seen) AS first_seen,
                   max(last_seen) AS last_seen,
                   toUInt64(sum(total_count)) AS total_occurrences
            FROM nanosiem.ip_prevalence_summary
            WHERE is_private = 0
            GROUP BY ip
-           HAVING host_count < 1000
            SETTINGS max_memory_usage = 536870912, max_bytes_before_external_group_by = 268435456, max_threads = 2'
 ))
 LIFETIME(MIN 900 MAX 1800)
 LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 5000000));
 
 -- -----------------------------------------------------------------------------
--- OCSF prevalence summary MVs. Unlike the UDM chain (logs -> *_prevalence_mv ->
--- *_prevalence_agg -> *_prevalence_summary_mv -> *_prevalence_summary), these
--- read FROM nanosiem.ocsf_logs and write DIRECTLY into the entity-keyed
--- *_prevalence_summary tables (the AggregatingMergeTree merges the uniq states
--- across UDM + OCSF producers). The host-identity expression mirrors UDM
+-- Prevalence aggregation tables + chained summary MVs (agg -> summary).
+-- Re-declared verbatim from clickhouse/init.sql (NAN-365 layout) so this OCSF
+-- bootstrap is SELF-SUFFICIENT for the agg-routed prevalence chain regardless of
+-- whether clickhouse/init.sql has run first: the OCSF branch MVs below write
+-- into these *_prevalence_agg tables, and the chained *_prevalence_summary_mv
+-- views fan the agg states into the entity-keyed *_prevalence_summary tables
+-- (the dict source). All IF NOT EXISTS with identical names/columns/layout, so
+-- a no-op when clickhouse/init.sql already created them.
+-- -----------------------------------------------------------------------------
+
+-- Table: domain_prevalence_agg
+CREATE TABLE IF NOT EXISTS nanosiem.domain_prevalence_agg
+(
+    `domain` String,
+    `is_subdomain` UInt8,
+    `parent_domain` String,
+    `time_bucket` DateTime,
+    `source_host_count` AggregateFunction(uniq, String),
+    `first_seen` SimpleAggregateFunction(min, DateTime64(6)),
+    `last_seen` SimpleAggregateFunction(max, DateTime64(6)),
+    `total_count` SimpleAggregateFunction(sum, UInt64),
+    INDEX idx_domain domain TYPE bloom_filter GRANULARITY 4,
+    INDEX idx_parent_domain parent_domain TYPE bloom_filter GRANULARITY 4
+)
+ENGINE = AggregatingMergeTree
+PARTITION BY toYYYYMM(time_bucket)
+ORDER BY (domain, time_bucket)
+TTL time_bucket + toIntervalDay(90)
+SETTINGS index_granularity = 8192
+;
+
+-- Table: hash_prevalence_agg
+CREATE TABLE IF NOT EXISTS nanosiem.hash_prevalence_agg
+(
+    `file_hash` String,
+    `hash_type` LowCardinality(String),
+    `time_bucket` DateTime,
+    `host_count` AggregateFunction(uniq, String),
+    `first_seen` SimpleAggregateFunction(min, DateTime64(6)),
+    `last_seen` SimpleAggregateFunction(max, DateTime64(6)),
+    `total_count` SimpleAggregateFunction(sum, UInt64),
+    INDEX idx_file_hash file_hash TYPE bloom_filter GRANULARITY 4
+)
+ENGINE = AggregatingMergeTree
+PARTITION BY toYYYYMM(time_bucket)
+ORDER BY (file_hash, time_bucket)
+TTL time_bucket + toIntervalDay(90)
+SETTINGS index_granularity = 8192
+;
+
+-- Table: ip_prevalence_agg
+CREATE TABLE IF NOT EXISTS nanosiem.ip_prevalence_agg
+(
+    `ip` String,
+    `direction` LowCardinality(String),
+    `is_private` UInt8,
+    `time_bucket` DateTime('UTC'),
+    `source_host_count` AggregateFunction(uniq, String),
+    `first_seen` SimpleAggregateFunction(min, DateTime64(6, 'UTC')),
+    `last_seen` SimpleAggregateFunction(max, DateTime64(6, 'UTC')),
+    `total_count` SimpleAggregateFunction(sum, UInt64),
+    INDEX idx_ip ip TYPE bloom_filter GRANULARITY 4
+)
+ENGINE = AggregatingMergeTree()
+PARTITION BY toYYYYMM(time_bucket)
+ORDER BY (ip, direction, time_bucket)
+TTL time_bucket + toIntervalDay(90)
+SETTINGS index_granularity = 8192;
+
+-- Chained summary MVs (agg -> summary, pass-through — AggregatingMergeTree
+-- background-merges the uniq states). Verbatim from clickhouse/init.sql.
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.hash_prevalence_summary_mv
+TO nanosiem.hash_prevalence_summary AS
+SELECT
+    file_hash,
+    hash_type,
+    host_count,
+    first_seen,
+    last_seen,
+    total_count
+FROM nanosiem.hash_prevalence_agg;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.domain_prevalence_summary_mv
+TO nanosiem.domain_prevalence_summary AS
+SELECT
+    domain,
+    is_subdomain,
+    source_host_count,
+    first_seen,
+    last_seen,
+    total_count
+FROM nanosiem.domain_prevalence_agg;
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ip_prevalence_summary_mv
+TO nanosiem.ip_prevalence_summary AS
+SELECT
+    ip,
+    is_private,
+    source_host_count,
+    first_seen,
+    last_seen,
+    total_count
+FROM nanosiem.ip_prevalence_agg;
+
+-- -----------------------------------------------------------------------------
+-- OCSF prevalence branch MVs (NAN-1661 — agg-layer bypass fix). Earlier
+-- revisions wrote these DIRECTLY into the entity-keyed *_prevalence_summary
+-- tables, BYPASSING *_prevalence_agg. Every explorer / rare / new / export /
+-- single / bulk / daily-heatmap / scatter surface reads *_prevalence_agg, so on
+-- OCSF-profile tenants all of them returned "never seen" even though the
+-- summary-sourced dicts worked (which masked the bug). These now write into the
+-- *_prevalence_agg tables EXACTLY like the UDM per-branch MVs (init.sql /
+-- 129_prevalence_mv_split.sql), and the chained *_prevalence_summary_mv views
+-- above fan them into the summary tables via MV chaining — so ONE write path
+-- feeds BOTH the agg-reading surfaces AND the summary-sourced dicts.
+-- Bodies mirror the UDM per-branch prevalence MVs; only the source columns
+-- differ (OCSF nested names). The host-identity expression mirrors UDM
 -- (src_host else src_ip else 'unknown'); OCSF's equivalents are
--- src_endpoint.hostname / src_endpoint.ip. Domain/ip/hash validity filters and
--- normalization mirror the UDM *_prevalence_mv definitions in init.sql.
+-- src_endpoint.hostname / src_endpoint.ip. MV NAMES ARE UNCHANGED (they retain
+-- the historical *_prevalence_summary_* names) so
+-- nanosiem-core/tests/aggregation_mv_schema_guard.rs keeps pinning them.
 --
 -- ⚠ INGEST-CREDENTIAL COUPLING (NAN-1384): ClickHouse checks the INSERTING
 -- user's column-level SELECT on nanosiem.ocsf_logs for every column these MVs
@@ -1472,62 +1582,70 @@ LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 5000000));
 
 -- Hash prevalence (file + process hashes), OCSF columns -> hash_prevalence_summary.
 CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_hash_prevalence_summary_file_hash_mv
-TO nanosiem.hash_prevalence_summary
+TO nanosiem.hash_prevalence_agg
 (
     `file_hash` String,
     `hash_type` String,
+    `time_bucket` DateTime('UTC'),
     `host_count` AggregateFunction(uniq, String),
-    `first_seen` DateTime64(6),
-    `last_seen` DateTime64(6),
+    `first_seen` DateTime64(6, 'UTC'),
+    `last_seen` DateTime64(6, 'UTC'),
     `total_count` UInt64
 )
 AS SELECT
-    `file.hashes.sha256` AS file_hash,
+    lower(`file.hashes.sha256`) AS file_hash,
     multiIf(length(`file.hashes.sha256`) = 32, 'md5', length(`file.hashes.sha256`) = 40, 'sha1', length(`file.hashes.sha256`) = 64, 'sha256', 'unknown') AS hash_type,
+    toStartOfHour(timestamp) AS time_bucket,
     uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown'))) AS host_count,
     min(timestamp) AS first_seen,
     max(timestamp) AS last_seen,
     count() AS total_count
 FROM nanosiem.ocsf_logs
 WHERE (`file.hashes.sha256` != '') AND ((length(`file.hashes.sha256`) = 32) OR (length(`file.hashes.sha256`) = 40) OR (length(`file.hashes.sha256`) = 64)) AND match(`file.hashes.sha256`, '^[a-fA-F0-9]+$')
-GROUP BY file_hash, hash_type;
+GROUP BY file_hash, hash_type, time_bucket;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_hash_prevalence_summary_process_hash_mv
-TO nanosiem.hash_prevalence_summary
+TO nanosiem.hash_prevalence_agg
 (
     `file_hash` String,
     `hash_type` String,
+    `time_bucket` DateTime('UTC'),
     `host_count` AggregateFunction(uniq, String),
-    `first_seen` DateTime64(6),
-    `last_seen` DateTime64(6),
+    `first_seen` DateTime64(6, 'UTC'),
+    `last_seen` DateTime64(6, 'UTC'),
     `total_count` UInt64
 )
 AS SELECT
-    `process.file.hashes.sha256` AS file_hash,
+    lower(`process.file.hashes.sha256`) AS file_hash,
     multiIf(length(`process.file.hashes.sha256`) = 32, 'md5', length(`process.file.hashes.sha256`) = 40, 'sha1', length(`process.file.hashes.sha256`) = 64, 'sha256', 'unknown') AS hash_type,
+    toStartOfHour(timestamp) AS time_bucket,
     uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown'))) AS host_count,
     min(timestamp) AS first_seen,
     max(timestamp) AS last_seen,
     count() AS total_count
 FROM nanosiem.ocsf_logs
-WHERE (`process.file.hashes.sha256` != '') AND ((length(`process.file.hashes.sha256`) = 32) OR (length(`process.file.hashes.sha256`) = 40) OR (length(`process.file.hashes.sha256`) = 64)) AND match(`process.file.hashes.sha256`, '^[a-fA-F0-9]+$') AND ((`file.hashes.sha256` = '') OR (`file.hashes.sha256` != `process.file.hashes.sha256`))
-GROUP BY file_hash, hash_type;
+WHERE (`process.file.hashes.sha256` != '') AND ((length(`process.file.hashes.sha256`) = 32) OR (length(`process.file.hashes.sha256`) = 40) OR (length(`process.file.hashes.sha256`) = 64)) AND match(`process.file.hashes.sha256`, '^[a-fA-F0-9]+$') AND ((`file.hashes.sha256` = '') OR (lower(`file.hashes.sha256`) != lower(`process.file.hashes.sha256`)))
+GROUP BY file_hash, hash_type, time_bucket;
 
 -- Domain prevalence (dst_endpoint.hostname / query.hostname / url.hostname),
 -- OCSF columns -> domain_prevalence_summary. Validity/TLD filters mirror UDM.
 CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_domain_prevalence_summary_dest_host_mv
-TO nanosiem.domain_prevalence_summary
+TO nanosiem.domain_prevalence_agg
 (
     `domain` String,
     `is_subdomain` UInt8,
+    `parent_domain` String,
+    `time_bucket` DateTime('UTC'),
     `source_host_count` AggregateFunction(uniq, String),
-    `first_seen` DateTime64(6),
-    `last_seen` DateTime64(6),
+    `first_seen` DateTime64(6, 'UTC'),
+    `last_seen` DateTime64(6, 'UTC'),
     `total_count` UInt64
 )
 AS SELECT
     lower(`dst_endpoint.hostname`) AS domain,
     if(length(splitByChar('.', `dst_endpoint.hostname`)) > 2, 1, 0) AS is_subdomain,
+    '' AS parent_domain,
+    toStartOfHour(timestamp) AS time_bucket,
     uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown'))) AS source_host_count,
     min(timestamp) AS first_seen,
     max(timestamp) AS last_seen,
@@ -1535,21 +1653,25 @@ AS SELECT
 FROM nanosiem.ocsf_logs
 WHERE (`dst_endpoint.hostname` != '') AND (position(`dst_endpoint.hostname`, '.') > 0) AND (NOT match(`dst_endpoint.hostname`, '^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$')) AND (NOT (position(`dst_endpoint.hostname`, ':') > 0)) AND match(`dst_endpoint.hostname`, '^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$') AND (length(splitByChar('.', `dst_endpoint.hostname`)[-1]) >= 2) AND (NOT match(splitByChar('.', `dst_endpoint.hostname`)[-1], '^[0-9]+$')) AND (length(`dst_endpoint.hostname`) <= 253)
     AND (lower(splitByChar('.', `dst_endpoint.hostname`)[-1]) NOT IN ('local', 'corp', 'internal', 'lan', 'home', 'localdomain', 'intranet', 'private', 'arpa'))
-GROUP BY domain, is_subdomain;
+GROUP BY domain, is_subdomain, time_bucket;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_domain_prevalence_summary_query_mv
-TO nanosiem.domain_prevalence_summary
+TO nanosiem.domain_prevalence_agg
 (
     `domain` String,
     `is_subdomain` UInt8,
+    `parent_domain` String,
+    `time_bucket` DateTime('UTC'),
     `source_host_count` AggregateFunction(uniq, String),
-    `first_seen` DateTime64(6),
-    `last_seen` DateTime64(6),
+    `first_seen` DateTime64(6, 'UTC'),
+    `last_seen` DateTime64(6, 'UTC'),
     `total_count` UInt64
 )
 AS SELECT
     lower(`query.hostname`) AS domain,
     if(length(splitByChar('.', `query.hostname`)) > 2, 1, 0) AS is_subdomain,
+    '' AS parent_domain,
+    toStartOfHour(timestamp) AS time_bucket,
     uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown'))) AS source_host_count,
     min(timestamp) AS first_seen,
     max(timestamp) AS last_seen,
@@ -1557,21 +1679,25 @@ AS SELECT
 FROM nanosiem.ocsf_logs
 WHERE (`query.hostname` != '') AND (position(`query.hostname`, '.') > 0) AND (NOT match(`query.hostname`, '^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$')) AND (NOT (position(`query.hostname`, ':') > 0)) AND match(`query.hostname`, '^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$') AND (length(splitByChar('.', `query.hostname`)[-1]) >= 2) AND (NOT match(splitByChar('.', `query.hostname`)[-1], '^[0-9]+$')) AND (length(`query.hostname`) <= 253) AND ((`dst_endpoint.hostname` = '') OR (lower(`dst_endpoint.hostname`) != lower(`query.hostname`)))
     AND (lower(splitByChar('.', `query.hostname`)[-1]) NOT IN ('local', 'corp', 'internal', 'lan', 'home', 'localdomain', 'intranet', 'private', 'arpa'))
-GROUP BY domain, is_subdomain;
+GROUP BY domain, is_subdomain, time_bucket;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_domain_prevalence_summary_url_mv
-TO nanosiem.domain_prevalence_summary
+TO nanosiem.domain_prevalence_agg
 (
     `domain` String,
     `is_subdomain` UInt8,
+    `parent_domain` String,
+    `time_bucket` DateTime('UTC'),
     `source_host_count` AggregateFunction(uniq, String),
-    `first_seen` DateTime64(6),
-    `last_seen` DateTime64(6),
+    `first_seen` DateTime64(6, 'UTC'),
+    `last_seen` DateTime64(6, 'UTC'),
     `total_count` UInt64
 )
 AS SELECT
     lower(`url.hostname`) AS domain,
     if(length(splitByChar('.', `url.hostname`)) > 2, 1, 0) AS is_subdomain,
+    '' AS parent_domain,
+    toStartOfHour(timestamp) AS time_bucket,
     uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown'))) AS source_host_count,
     min(timestamp) AS first_seen,
     max(timestamp) AS last_seen,
@@ -1579,15 +1705,17 @@ AS SELECT
 FROM nanosiem.ocsf_logs
 WHERE (`url.hostname` != '') AND (position(`url.hostname`, '.') > 0) AND (NOT match(`url.hostname`, '^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$')) AND match(`url.hostname`, '^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$') AND (length(splitByChar('.', `url.hostname`)[-1]) >= 2) AND (NOT match(splitByChar('.', `url.hostname`)[-1], '^[0-9]+$')) AND (length(`url.hostname`) <= 253) AND ((`dst_endpoint.hostname` = '') OR (lower(`dst_endpoint.hostname`) != lower(`url.hostname`))) AND ((`query.hostname` = '') OR (lower(`query.hostname`) != lower(`url.hostname`)))
     AND (lower(splitByChar('.', `url.hostname`)[-1]) NOT IN ('local', 'corp', 'internal', 'lan', 'home', 'localdomain', 'intranet', 'private', 'arpa'))
-GROUP BY domain, is_subdomain;
+GROUP BY domain, is_subdomain, time_bucket;
 
 -- IP prevalence (dst_endpoint.ip / src_endpoint.ip), OCSF columns ->
 -- ip_prevalence_summary. is_private classification mirrors UDM.
 CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_ip_prevalence_summary_dest_ip_mv
-TO nanosiem.ip_prevalence_summary
+TO nanosiem.ip_prevalence_agg
 (
     `ip` String,
+    `direction` String,
     `is_private` UInt8,
+    `time_bucket` DateTime('UTC'),
     `source_host_count` AggregateFunction(uniq, String),
     `first_seen` DateTime64(6, 'UTC'),
     `last_seen` DateTime64(6, 'UTC'),
@@ -1595,6 +1723,7 @@ TO nanosiem.ip_prevalence_summary
 )
 AS SELECT
     `dst_endpoint.ip` AS ip,
+    'dest' AS direction,
     if(
         match(`dst_endpoint.ip`, '^10\\.') OR
         match(`dst_endpoint.ip`, '^172\\.(1[6-9]|2[0-9]|3[0-1])\\.') OR
@@ -1603,6 +1732,7 @@ AS SELECT
         match(`dst_endpoint.ip`, '^169\\.254\\.'),
         1, 0
     ) AS is_private,
+    toStartOfHour(timestamp) AS time_bucket,
     uniqState(if(`src_endpoint.hostname` != '', `src_endpoint.hostname`, if(`src_endpoint.ip` != '', `src_endpoint.ip`, 'unknown'))) AS source_host_count,
     min(timestamp) AS first_seen,
     max(timestamp) AS last_seen,
@@ -1612,13 +1742,15 @@ WHERE `dst_endpoint.ip` != ''
   AND match(`dst_endpoint.ip`, '^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$')
   AND NOT match(`dst_endpoint.ip`, '^127\\.')
   AND NOT match(`dst_endpoint.ip`, '^169\\.254\\.')
-GROUP BY ip, is_private;
+GROUP BY ip, direction, is_private, time_bucket;
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ocsf_ip_prevalence_summary_src_ip_mv
-TO nanosiem.ip_prevalence_summary
+TO nanosiem.ip_prevalence_agg
 (
     `ip` String,
+    `direction` String,
     `is_private` UInt8,
+    `time_bucket` DateTime('UTC'),
     `source_host_count` AggregateFunction(uniq, String),
     `first_seen` DateTime64(6, 'UTC'),
     `last_seen` DateTime64(6, 'UTC'),
@@ -1626,6 +1758,7 @@ TO nanosiem.ip_prevalence_summary
 )
 AS SELECT
     `src_endpoint.ip` AS ip,
+    'src' AS direction,
     if(
         match(`src_endpoint.ip`, '^10\\.') OR
         match(`src_endpoint.ip`, '^172\\.(1[6-9]|2[0-9]|3[0-1])\\.') OR
@@ -1634,6 +1767,7 @@ AS SELECT
         match(`src_endpoint.ip`, '^169\\.254\\.'),
         1, 0
     ) AS is_private,
+    toStartOfHour(timestamp) AS time_bucket,
     uniqState(if(`dst_endpoint.hostname` != '', `dst_endpoint.hostname`, if(`dst_endpoint.ip` != '', `dst_endpoint.ip`, 'unknown'))) AS source_host_count,
     min(timestamp) AS first_seen,
     max(timestamp) AS last_seen,
@@ -1644,7 +1778,7 @@ WHERE `src_endpoint.ip` != ''
   AND NOT match(`src_endpoint.ip`, '^127\\.')
   AND NOT match(`src_endpoint.ip`, '^169\\.254\\.')
   AND `src_endpoint.ip` != `dst_endpoint.ip`
-GROUP BY ip, is_private;
+GROUP BY ip, direction, is_private, time_bucket;
 
 -- -----------------------------------------------------------------------------
 -- OCSF aggregation MVs (NAN-1385, G13). Same write-directly-into-the-shared-

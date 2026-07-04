@@ -2,6 +2,7 @@
 
 import { UDM_COLUMNS } from '@/lib/udm-fields';
 import { isClickHouseDefault } from '@/lib/utils';
+import { isPrevalenceSentinelField } from '@/lib/prevalence-sentinels';
 
 // OCSF `event` JSON expansion (NAN-1241 follow-up).
 //
@@ -195,7 +196,7 @@ export function flattenEventFields(
       }
     }
 
-    if (key.startsWith('prevalence_') && (value === 255 || value === 65535 || value === 9999)) continue;
+    if (isPrevalenceSentinelField(key, value)) continue;
     if (key === 'risk_score' && (value === 0 || value === '0')) continue;
 
     // NAN-1446: `*_unified` entity columns are an internal query accelerator and

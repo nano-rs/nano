@@ -438,12 +438,17 @@ impl PrevalenceService {
                 .await
                 .map_err(PrevalenceError::ClickHouse)?;
 
+            // Domain storage is MV-lowercased, so `row.domain` is already
+            // lowercase; key everything lowercase so mixed-case inputs like
+            // `Accounts.Google.com` both MATCH a found row and get a correctly
+            // keyed empty fallback (audit P9). The final result lookup lowercases
+            // the input, so an empty keyed on the verbatim case would be lost.
             let found_domains: std::collections::HashSet<String> =
-                domain_rows.iter().map(|r| r.domain.clone()).collect();
+                domain_rows.iter().map(|r| r.domain.to_lowercase()).collect();
 
             // Add found domains to results
             for row in domain_rows {
-                let domain = row.domain.clone();
+                let domain = row.domain.to_lowercase();
                 let data =
                     PrevalenceRepository::domain_row_to_prevalence_data(row, rarity_threshold);
                 results.insert(domain, data);
@@ -451,10 +456,11 @@ impl PrevalenceService {
 
             // Add empty data for missing domains
             for domain in &domains {
-                if !found_domains.contains(domain) {
+                let domain_lower = domain.to_lowercase();
+                if !found_domains.contains(&domain_lower) {
                     let artifact_type = ArtifactType::detect(domain);
                     results.insert(
-                        domain.clone(),
+                        domain_lower,
                         PrevalenceData::empty(domain.clone(), artifact_type),
                     );
                 }
@@ -817,7 +823,14 @@ impl PrevalenceService {
                         }
                         _ => self
                             .repository
-                            .get_rare_hashes(rarity_threshold * 1000, time_window, fetch_limit) // High threshold = get all
+                            // Default lane = "all artifacts active in the window",
+                            // NOT "rare-ish". `rarity_threshold * 1000` silently
+                            // dropped any artifact seen on ≥ threshold×1000 hosts
+                            // (the most common ones) and made the headline totals
+                            // undercount them (audit P10). `u64::MAX` keeps the
+                            // get_rare code path (host_count < threshold + recency)
+                            // while admitting every host_count.
+                            .get_rare_hashes(u64::MAX, time_window, fetch_limit)
                             .await
                             .map(|rows| {
                                 rows.into_iter()
@@ -869,7 +882,8 @@ impl PrevalenceService {
                         }
                         _ => self
                             .repository
-                            .get_rare_domains(rarity_threshold * 1000, time_window, fetch_limit)
+                            // See hash lane above — admit every host_count (P10).
+                            .get_rare_domains(u64::MAX, time_window, fetch_limit)
                             .await
                             .map(|rows| {
                                 rows.into_iter()
@@ -921,7 +935,8 @@ impl PrevalenceService {
                         }
                         _ => self
                             .repository
-                            .get_rare_ips(rarity_threshold * 1000, time_window, fetch_limit)
+                            // See hash lane above — admit every host_count (P10).
+                            .get_rare_ips(u64::MAX, time_window, fetch_limit)
                             .await
                             .map(|rows| {
                                 rows.into_iter()
@@ -940,10 +955,24 @@ impl PrevalenceService {
             }
         );
 
+        let hash_vec = hash_results.map_err(PrevalenceError::ClickHouse)?;
+        let domain_vec = domain_results.map_err(PrevalenceError::ClickHouse)?;
+        let ip_vec = ip_results.map_err(PrevalenceError::ClickHouse)?;
+
+        // P6: each per-type fetch is bounded by `fetch_limit`. If any of them
+        // came back full, that type was truncated, so the headline counts below
+        // (total/rare/new/high_risk) are FLOORS, not true totals — flag them so
+        // the UI renders `N+` instead of a confident under-count. A true
+        // count(distinct) would re-pay the expensive uniqMerge aggregation
+        // (NAN-1664), and analysts don't need exactness here — only honesty.
+        let counts_approximate = (hash_vec.len() as i64) >= fetch_limit
+            || (domain_vec.len() as i64) >= fetch_limit
+            || (ip_vec.len() as i64) >= fetch_limit;
+
         let mut all_artifacts: Vec<PrevalenceData> = Vec::new();
-        all_artifacts.extend(hash_results.map_err(PrevalenceError::ClickHouse)?);
-        all_artifacts.extend(domain_results.map_err(PrevalenceError::ClickHouse)?);
-        all_artifacts.extend(ip_results.map_err(PrevalenceError::ClickHouse)?);
+        all_artifacts.extend(hash_vec);
+        all_artifacts.extend(domain_vec);
+        all_artifacts.extend(ip_vec);
 
         // Apply search filter
         if let Some(search_term) = search {
@@ -1083,6 +1112,7 @@ impl PrevalenceService {
             rare_count,
             new_count,
             high_risk_asset_count,
+            counts_approximate,
         })
     }
 

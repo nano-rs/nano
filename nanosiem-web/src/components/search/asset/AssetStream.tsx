@@ -11,6 +11,7 @@ import type {
   TimeRange,
 } from '@/lib/api/types';
 import { parseAsUTC } from './helpers';
+import { isPrevalenceSentinelField } from '@/lib/prevalence-sentinels';
 
 const TYPE_COLORS: Record<string, { fg: string; bg: string }> = {
   NETWORK: { fg: 'oklch(72% 0.16 160)', bg: 'oklch(72% 0.16 160 / 0.12)' },
@@ -456,9 +457,9 @@ function EventDetail({
   const source = fullLog ?? details;
   const entries = Object.entries(source).filter(([k, v]) => {
     if (v === '' || v === null || v === undefined || v === 0) return false;
-    // Hide prevalence sentinel values — 9999 = "common / not in rare dict",
-    // 65535 = "no data at all". Neither is meaningful in the stream.
-    if (k.startsWith('prevalence_') && (v === 9999 || v === 65535)) return false;
+    // Hide prevalence sentinel values (9999 = common, 65535 = N/A). Neither is
+    // meaningful in the stream. See lib/prevalence-sentinels.
+    if (isPrevalenceSentinelField(k, v)) return false;
     // Hide internal/marker fields the slim payload sometimes carries.
     if (k === 'event_type' || k === 'summary') return false;
     // NAN-1324: the OCSF full log (SELECT *) carries the entire raw source as a

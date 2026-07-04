@@ -88,11 +88,19 @@ impl SearchState {
             dual_pool.clickhouse().clone(),
         ));
 
-        // Create prevalence service (uses ClickHouse client directly)
-        let prevalence = Arc::new(PrevalenceService::new(
-            dual_pool.clickhouse().clone(),
-            dual_pool.table_names(),
-        ));
+        // Create prevalence service (uses ClickHouse client directly).
+        // P1 audit: build via `with_database_config` so this process honors the
+        // persisted admin config (rarity_threshold, tracking toggles) at boot
+        // instead of the hardcoded defaults. A background poll below keeps it
+        // fresh when the config is changed on nanosiem-api at runtime.
+        let prevalence = Arc::new(
+            PrevalenceService::with_database_config(
+                dual_pool.clickhouse().clone(),
+                dual_pool.table_names(),
+                dual_pool.postgres(),
+            )
+            .await,
+        );
 
         // Try loading admission config from PostgreSQL first, fall back to env vars
         let admission_config = Self::load_admission_config(&dual_pool).await;
@@ -128,8 +136,15 @@ impl SearchState {
         // Load query safety limits from database on boot
         Self::load_query_limits_on_boot(&dual_pool, &search_svc).await;
 
-        // Start background config polling (checks PostgreSQL every 60s for admin changes)
-        Self::start_config_polling(dual_pool.clone(), admission_controller.clone());
+        // Start background config polling (checks PostgreSQL every 60s for admin
+        // changes). P1 audit: also refresh prevalence config so this process
+        // honors runtime rarity_threshold / tracking-toggle changes made on
+        // nanosiem-api (cross-process hot-reload, bounded by the poll interval).
+        Self::start_config_polling(
+            dual_pool.clone(),
+            admission_controller.clone(),
+            prevalence.clone(),
+        );
 
         // Add inputlookup service for URL-based enrichment. Wire the internal
         // lookup layer so `| inputlookup <internal_table>` reads the CH/PG-backed
@@ -249,7 +264,11 @@ impl SearchState {
     /// Emit an audit event (fire-and-forget, non-blocking)
     /// Start background polling for admission config changes from PostgreSQL.
     /// Checks every 60 seconds and hot-reloads the admission controller if settings changed.
-    fn start_config_polling(dual_pool: DualPool, controller: Arc<AdmissionController>) {
+    fn start_config_polling(
+        dual_pool: DualPool,
+        controller: Arc<AdmissionController>,
+        prevalence: Arc<PrevalenceService>,
+    ) {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             interval.tick().await; // Skip immediate first tick (already loaded at startup)
@@ -273,6 +292,18 @@ impl SearchState {
                             "Config poll: could not read search admission settings: {}",
                             e
                         );
+                    }
+                }
+
+                // P1 audit: refresh prevalence config so runtime admin changes
+                // (rarity_threshold, tracking toggles) take effect here without a
+                // restart. update_config also invalidates the prevalence cache.
+                let prevalence_settings =
+                    nanosiem_core::prevalence::PrevalenceSettings::new(dual_pool.postgres().clone());
+                match prevalence_settings.get_config().await {
+                    Ok(cfg) => prevalence.update_config(cfg).await,
+                    Err(e) => {
+                        tracing::debug!("Config poll: could not read prevalence settings: {}", e);
                     }
                 }
             }

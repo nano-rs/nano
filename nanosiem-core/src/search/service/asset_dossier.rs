@@ -196,16 +196,22 @@ const RECENT_LIMIT: usize = 8;
 const TOP_LIMIT: usize = 8;
 /// Prevalence threshold (in % of fleet) for "rare" process classification.
 const RARE_PROCESS_THRESHOLD_PCT: f32 = 10.0;
-/// Denominator for "fleet %" prevalence math. The prevalence dictionaries
-/// store `host_count` as a UInt16, so this is the sample-fleet size we
-/// project those counts against to derive a percentage.
-///
-/// TODO(NAN-393 follow-up): read the real fleet size from the prevalence
-/// service (it's computed at enrichment time, just not exposed here yet)
-/// instead of this placeholder derived from the demo dataset. Callers that
-/// care about the exact figure should treat percentages as approximate until
-/// that plumbing lands.
+/// FALLBACK denominator for "fleet %" prevalence math, used only when the live
+/// fleet size cannot be measured (schema exposes no host column, or the count
+/// query fails / returns 0). The real denominator is now measured per request by
+/// [`query_fleet_size`]; this placeholder (derived from an old demo dataset)
+/// exists solely to keep percentage math from dividing by zero on that fallback
+/// path.
 const ASSUMED_FLEET_SIZE: f32 = 1742.0;
+
+/// Prevalence-dict sentinel host_count. The dicts only load entities seen on
+/// `< 1000` hosts, so `dictGetOrDefault(..., 9999)` returns this when an entity
+/// is common / not tracked, and the materialized prevalence columns stamp
+/// `65535` when the source field is empty. Any host_count at or above the
+/// sentinel must NOT be treated as a literal count in fleet-% math — doing so
+/// leaked a `9999 / fleet * 100` ≈ 574% spike into per-process prevalence
+/// averages.
+const PREVALENCE_SENTINEL_HOST_COUNT: u32 = 9999;
 
 // ============================================================================
 // Public entry
@@ -280,6 +286,10 @@ impl SearchService {
             bucket_seconds,
             unix_start,
         );
+        // Real fleet denominator for the processes card's "% of fleet" math.
+        // Measured once here (fleet-wide, not per-asset) and threaded in, so the
+        // percentages aren't projected against a hardcoded demo constant.
+        let fleet_size = query_fleet_size(clickhouse, profile, &logs_table).await;
         let processes_fut = query_processes(
             clickhouse,
             profile,
@@ -288,6 +298,7 @@ impl SearchService {
             &bind_values,
             &start_str,
             &end_str,
+            fleet_size,
         );
         let network_fut = query_network(
             clickhouse,
@@ -619,6 +630,40 @@ async fn query_timeline(
     })
 }
 
+/// Measure the real fleet denominator for "% of fleet" prevalence math.
+///
+/// The prevalence dicts count distinct *hosts* per artifact using the key
+/// `if(src_host != '', src_host, if(src_ip != '', src_ip, 'unknown'))` over the
+/// last ~30 days (see the `*_prevalence_*_mv` definitions). The correct
+/// denominator is the count of DISTINCT such host identities over that same
+/// window — not a hardcoded demo constant. Uses `uniq` (HLL, like the MVs) and
+/// caps execution time so the dossier never blocks on it. Falls back to
+/// [`ASSUMED_FLEET_SIZE`] (and never returns 0) if the schema exposes no host
+/// column or the query fails, so downstream division never hits zero.
+async fn query_fleet_size(ch: &clickhouse::Client, profile: &dyn SchemaProfile, logs: &str) -> f32 {
+    let src_host = profile.udm_column_sql("src_host");
+    let src_ip = profile.udm_column_sql("src_ip");
+    let host_expr = match (&src_host, &src_ip) {
+        (Some(h), Some(i)) => format!("if({h} != '', {h}, if({i} != '', {i}, 'unknown'))"),
+        (Some(h), None) => format!("if({h} != '', {h}, 'unknown')"),
+        (None, Some(i)) => format!("if({i} != '', {i}, 'unknown')"),
+        (None, None) => return ASSUMED_FLEET_SIZE,
+    };
+    let sql = format!(
+        "SELECT uniq({host_expr}) AS fleet FROM {logs} \
+         WHERE timestamp >= now() - INTERVAL 30 DAY \
+         SETTINGS max_execution_time = 15"
+    );
+    match ch.query(&sql).fetch_one::<u64>().await {
+        Ok(n) if n > 0 => n as f32,
+        Ok(_) => ASSUMED_FLEET_SIZE,
+        Err(e) => {
+            tracing::warn!("Fleet-size query failed ({}); using fallback denominator", e);
+            ASSUMED_FLEET_SIZE
+        }
+    }
+}
+
 async fn query_processes(
     ch: &clickhouse::Client,
     profile: &dyn SchemaProfile,
@@ -627,6 +672,7 @@ async fn query_processes(
     binds: &[String],
     start: &str,
     end: &str,
+    fleet_size: f32,
 ) -> Result<AssetProcessesSummary, SearchError> {
     // The processes card is built around `process_name`; if the schema does not
     // expose a process-name column there is nothing to summarize.
@@ -643,7 +689,7 @@ async fn query_processes(
     // it those become 0 / NULL rather than referencing a missing column.
     let rare_expr = match &prev_hash {
         Some(p) => format!(
-            "countIf({process_name} != '' AND {p} < 10000 AND toFloat32({p}) / {ASSUMED_FLEET_SIZE} * 100 < {rare_pct})",
+            "countIf({process_name} != '' AND {p} < {PREVALENCE_SENTINEL_HOST_COUNT} AND toFloat32({p}) / {fleet_size} * 100 < {rare_pct})",
             rare_pct = RARE_PROCESS_THRESHOLD_PCT
         ),
         None => "toUInt64(0)".to_string(),
@@ -665,7 +711,11 @@ async fn query_processes(
     );
     let top_prev_expr = match &prev_hash {
         Some(p) => format!(
-            "avg(toFloat32(if({p} >= 10000, 100, {p})) / {ASSUMED_FLEET_SIZE} * 100)"
+            // Map BOTH sentinels (9999 common / 65535 empty) to the full fleet so
+            // "common" reads as 100%, and clamp real counts to the fleet size — the
+            // old `>= 10000` test let the 9999 sentinel slip through as a literal
+            // host_count (~574%). `least(x, fleet)` keeps the percentage in [0, 100].
+            "avg(least(toFloat32(if({p} >= {PREVALENCE_SENTINEL_HOST_COUNT}, {fleet_size}, {p})), toFloat32({fleet_size})) / {fleet_size} * 100)"
         ),
         None => "toFloat32(0)".to_string(),
     };
@@ -695,12 +745,12 @@ async fn query_processes(
             r#"SELECT
             {process_name} AS name,
             {hash_select} AS hash,
-            avg(toFloat32({p}) / {ASSUMED_FLEET_SIZE} * 100) AS prev,
+            avg(least(toFloat32({p}), toFloat32({fleet_size})) / {fleet_size} * 100) AS prev,
             {cmd_select} AS cmd
         FROM {logs}
         PREWHERE timestamp BETWEEN '{start}' AND '{end}' AND ({ident})
-            AND {process_name} != '' AND {p} < 10000
-            AND toFloat32({p}) / {ASSUMED_FLEET_SIZE} * 100 < {RARE_PROCESS_THRESHOLD_PCT}
+            AND {process_name} != '' AND {p} < {PREVALENCE_SENTINEL_HOST_COUNT}
+            AND toFloat32({p}) / {fleet_size} * 100 < {RARE_PROCESS_THRESHOLD_PCT}
         GROUP BY {process_name}
         ORDER BY prev ASC
         LIMIT 5"#

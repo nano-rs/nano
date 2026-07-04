@@ -117,6 +117,38 @@ impl FindingEvent {
         }
     }
 
+    /// Derive the finding timestamp from the source events (R7 — consistent
+    /// timestamp basis across alert modes).
+    ///
+    /// Grouped/aggregate rules already stamp findings with the source-event
+    /// window end (`_last_seen`, passed explicitly to `log_*_at`). Per-event
+    /// rules previously fell back to `Utc::now()` (detection execution time),
+    /// giving the same activity two different time bases depending on rule mode.
+    /// This makes BOTH modes source-event based: the newest `timestamp` present
+    /// on any matched event (mirroring the aggregate window end), falling back
+    /// to `now()` only when no event carries a parseable timestamp.
+    fn source_event_time(events: &[serde_json::Value]) -> Option<DateTime<Utc>> {
+        events
+            .iter()
+            .filter_map(|e| {
+                let s = e.get("timestamp")?.as_str()?;
+                // Match the ClickHouse/serialized formats detection events use
+                // (see detection::service::helpers::event_field_time).
+                if let Ok(naive) =
+                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+                {
+                    return Some(DateTime::from_naive_utc_and_offset(naive, Utc));
+                }
+                if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+                    return Some(DateTime::from_naive_utc_and_offset(naive, Utc));
+                }
+                DateTime::parse_from_rfc3339(s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            })
+            .max()
+    }
+
     /// Create a finding event for a live mode detection match
     pub fn detection_match(
         rule: &DetectionRule,
@@ -144,7 +176,10 @@ impl FindingEvent {
             matched_event_count: matched_events.len(),
             matched_events_sample: stripped_sample,
             realtime,
-            detected_at: Utc::now(),
+            // R7: source-event time (newest matched-event timestamp), consistent
+            // with the aggregate window end used by grouped rules. Falls back to
+            // now() only when no event carries a parseable timestamp.
+            detected_at: Self::source_event_time(matched_events).unwrap_or_else(Utc::now),
             raw_risk_score: risk_result.raw_score,
             risk_score: risk_result.weighted_score,
             risk_entity: risk_result.entity,
@@ -185,7 +220,8 @@ impl FindingEvent {
             matched_event_count: matched_events.len(),
             matched_events_sample: stripped_sample,
             realtime,
-            detected_at: Utc::now(),
+            // R7: source-event time (see detection_match).
+            detected_at: Self::source_event_time(&matched_events).unwrap_or_else(Utc::now),
             raw_risk_score: risk_result.raw_score,
             risk_score: risk_result.weighted_score,
             risk_entity: risk_result.entity,
@@ -316,9 +352,23 @@ impl FindingEvent {
 pub struct FindingLogger {
     pg_pool: PgPool,
     dual_pool: DualPool,
+    /// Latch for the enterprise-only `entity_risk_scores` rollup table. On
+    /// open-core that table is stripped, so the per-finding accumulator write
+    /// would fail (42P01) and log an error every finding — gate it on a cached
+    /// existence check instead (NAN-1676). Mirrors `RiskRepository::table_exists`:
+    /// fast-path once present; re-check while absent so a later open→enterprise
+    /// upgrade is picked up.
+    entity_risk_table_verified: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FindingLogger {
+    /// Defensive upper bound on the accumulated `entity_risk_scores.risk_score`
+    /// (R3). Well above the reader's 0–100 banding range so it never silently
+    /// re-bands a normal entity, but far below `i32::MAX` so the monotonic
+    /// `+= weighted` accumulator can never overflow/wrap. See the FIXME in
+    /// `update_entity_risk_score`: the durable fix is a decay job (deferred).
+    const ENTITY_RISK_SCORE_CAP: i32 = 1_000_000;
+
     /// Create a new finding logger backed by a DualPool. ClickHouse is the
     /// findings log store; PostgreSQL is used for the entity-risk-score
     /// rollup table.
@@ -326,7 +376,30 @@ impl FindingLogger {
         Self {
             pg_pool: dual_pool.postgres().clone(),
             dual_pool: dual_pool.clone(),
+            entity_risk_table_verified: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
         }
+    }
+
+    /// Whether the enterprise `entity_risk_scores` rollup table exists (NAN-1676).
+    /// Fast-paths once verified present; while absent (open-core) re-queries the
+    /// catalog — cheap, and far better than a failing INSERT + error per finding.
+    async fn entity_risk_table_exists(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.entity_risk_table_verified.load(Ordering::Relaxed) {
+            return true;
+        }
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'entity_risk_scores')",
+        )
+        .fetch_one(&self.pg_pool)
+        .await
+        .unwrap_or(false);
+        if exists {
+            self.entity_risk_table_verified.store(true, Ordering::Relaxed);
+        }
+        exists
     }
 
     /// Log a finding event
@@ -369,6 +442,14 @@ impl FindingLogger {
         &self,
         finding: &FindingEvent,
     ) -> Result<(), FindingLogError> {
+        // Skip on open-core, where `entity_risk_scores` is stripped (enterprise
+        // feature). Otherwise the INSERT below fails 42P01 and the caller logs an
+        // error on every finding (NAN-1676). No-op = no entity risk rollup, which
+        // is exactly the open-core contract.
+        if !self.entity_risk_table_exists().await {
+            return Ok(());
+        }
+
         let now = Utc::now();
         let severity = format!("{:?}", finding.severity).to_lowercase();
 
@@ -376,15 +457,30 @@ impl FindingLogger {
         let entity_type =
             Self::infer_entity_type(&finding.risk_entity, finding.risk_entity_field.as_deref());
 
+        // R3 (prevalence/risk audit): `risk_score` is a monotonically increasing
+        // accumulator — every finding does `risk_score += weighted` and there is
+        // NO decay job that ever brings it back down. Left unbounded it (a) grows
+        // without limit so any long-lived entity is pinned "critical" forever once
+        // the reader bands it, and (b) will eventually overflow the i32 column and
+        // wrap negative, corrupting the banding entirely.
+        //
+        // FIXME(prevalence/risk-audit R3): the real fix is a time-decay job +
+        // making the read-side banding not assume a fixed 0–100 ceiling on this
+        // unbounded accumulator (tracked in the Lane L7b design note — decay job
+        // is a deliberate deferral, NOT to be added as an overnight background
+        // task). Until then, defensively clamp the stored accumulator to
+        // `ENTITY_RISK_SCORE_CAP` so it can neither overflow nor wrap. This is a
+        // safety bound only — it does not by itself un-pin a chronically-critical
+        // entity; that requires the decay work.
         sqlx::query(
             r#"
             INSERT INTO entity_risk_scores (
                 entity, entity_type, risk_score, signal_count,
                 last_signal_at, first_signal_at, last_rule_name, last_severity,
                 created_at, updated_at
-            ) VALUES ($1, $2, $3, 1, $4, $4, $5, $6, $4, $4)
+            ) VALUES ($1, $2, LEAST($3, $7), 1, $4, $4, $5, $6, $4, $4)
             ON CONFLICT (entity, entity_type) DO UPDATE SET
-                risk_score = entity_risk_scores.risk_score + $3,
+                risk_score = LEAST(entity_risk_scores.risk_score + $3, $7),
                 signal_count = entity_risk_scores.signal_count + 1,
                 last_signal_at = $4,
                 last_rule_name = $5,
@@ -398,6 +494,7 @@ impl FindingLogger {
         .bind(now)
         .bind(&finding.rule_name)
         .bind(&severity)
+        .bind(Self::ENTITY_RISK_SCORE_CAP)
         .execute(&self.pg_pool)
         .await
         .map_err(FindingLogError::DatabaseError)?;
@@ -438,28 +535,48 @@ impl FindingLogger {
         "user"
     }
 
-    /// Infer entity type from field name, falling back to value-based inference
+    /// True if `field` carries `token` as a delimited word — split on any
+    /// non-alphanumeric char — rather than as a raw substring. UDM/OCSF field
+    /// names are delimited (`src_ip`, `dest_host`, `file_hash`,
+    /// `src_endpoint.ip`), so token matching classifies them correctly while
+    /// single-word names that merely *contain* the substring — `principal` and
+    /// `description` both contain "ip" — no longer misclassify as IP entities
+    /// (audit R4d). Matches are case-insensitive.
+    fn field_has_token(field: &str, token: &str) -> bool {
+        field
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|word| word.eq_ignore_ascii_case(token))
+    }
+
+    /// Infer entity type from field name, falling back to value-based inference.
+    ///
+    /// Field-name matching is token-based, not substring-based (audit R4d): a
+    /// raw `field.contains("ip")` misclassified `principal`/`description` (which
+    /// contain the substring "ip") as IP entities, corrupting the stored
+    /// `entity_type` and the `WHERE entity_type = …` filter.
     fn infer_entity_type(entity: &str, field_name: Option<&str>) -> &'static str {
-        // If we have the field name, use it for accurate classification
+        // If we have the field name, use it for accurate classification.
         if let Some(field) = field_name {
-            // IP address fields
-            if field.contains("ip") || field == "dvc" {
+            // IP address fields. `dvc` (device) is intentionally NOT forced to
+            // "ip" — a device identifier may be an IP or a hostname, so it falls
+            // through to value-based inference which types it by its actual value.
+            if Self::field_has_token(field, "ip") {
                 return "ip";
             }
-            // Hostname fields
-            if field.contains("host") || field == "hostname" || field == "dvc" {
+            // Hostname fields (`host`, `src_host`, `hostname`, `dest_hostname`)
+            if Self::field_has_token(field, "host") || Self::field_has_token(field, "hostname") {
                 return "hostname";
             }
             // User fields
-            if field.contains("user") {
+            if Self::field_has_token(field, "user") {
                 return "user";
             }
-            // Hash fields
-            if field.contains("hash") {
+            // Hash fields (`file_hash`, and OCSF plural `file.hashes.sha256`)
+            if Self::field_has_token(field, "hash") || Self::field_has_token(field, "hashes") {
                 return "hash";
             }
             // Domain fields
-            if field.contains("domain") {
+            if Self::field_has_token(field, "domain") {
                 return "domain";
             }
         }
@@ -485,7 +602,8 @@ impl FindingLogger {
     /// Grouped / aggregate live-mode rules pass the aggregated event window end
     /// (`_last_seen`) so the live finding is stamped with the source-event time,
     /// keeping `(rule, entity, time)` stable across re-evaluations (NAN-1305).
-    /// `None` preserves the legacy `now()` stamp.
+    /// `None` uses the finding's own source-event basis (newest matched-event
+    /// timestamp, falling back to `now()`); both modes are source-event based (R7).
     pub async fn log_detection_match_at(
         &self,
         rule: &DetectionRule,
@@ -526,8 +644,9 @@ impl FindingLogger {
     /// (`_last_seen`) as `detected_at` so the finding is stamped with the
     /// source-event time rather than the detection execution time (NAN-1305).
     /// This keeps `(rule, entity, time)` stable across re-evaluations and sorts
-    /// the finding by when the activity happened. `None` preserves the legacy
-    /// `now()` stamp.
+    /// the finding by when the activity happened. `None` uses the finding's own
+    /// source-event basis (newest matched-event timestamp, falling back to
+    /// `now()`); both modes are source-event based (R7).
     pub async fn log_alert_at(
         &self,
         rule: &DetectionRule,
@@ -555,7 +674,20 @@ impl FindingLogger {
         metadata: &serde_json::Value,
         timestamp: DateTime<Utc>,
     ) -> Result<(), FindingLogError> {
-        let client = dual_pool.clickhouse();
+        // R6 (prevalence/risk audit): findings are best-effort analytics rows,
+        // not durable ingest. The ambient ClickHouse client used for logs/audit
+        // runs with `wait_for_async_insert=1`, so a per-finding single-row
+        // INSERT blocks until the server's adaptive async-insert buffer flushes
+        // (2–10s each) — serializing the whole emission loop at one finding per
+        // flush. Emit findings fire-and-forget: keep server-side async batching
+        // ON but do NOT wait for the flush. A dropped finding row on crash is
+        // acceptable (the entity-risk rollup below is written synchronously to
+        // Postgres, and findings are searchable analytics, not the audit trail).
+        let client = dual_pool
+            .clickhouse()
+            .clone()
+            .with_option("async_insert", "1")
+            .with_option("wait_for_async_insert", "0");
         let now = Utc::now();
 
         // Extract fields from metadata for direct column storage
@@ -600,12 +732,17 @@ impl FindingLogger {
             // materializes from `event`. NAN-1443: insert into the `ocsf_logs_raw`
             // ENGINE=Null landing table — the `ocsf_logs_raw_mv` MV derives the
             // stored row into `ocsf_logs` (which no longer stores `event`).
-            let ocsf_query = r#"
-                INSERT INTO ocsf_logs_raw (event, timestamp, source_type)
-                VALUES (?, ?, 'findings')
-            "#;
+            // R7: `ocsf_logs_raw` is an ENGINE=Null landing table with no
+            // distributed wrapper, so it resolves to the local name (same as the
+            // audit emitter) — but route it through the resolver rather than a
+            // bare literal so the `nanosiem.` qualification is consistent.
+            let ocsf_raw_table = dual_pool.table_names().local("ocsf_logs_raw");
+            let ocsf_query = format!(
+                "INSERT INTO {} (event, timestamp, source_type) VALUES (?, ?, 'findings')",
+                ocsf_raw_table
+            );
             client
-                .query(ocsf_query)
+                .query(&ocsf_query)
                 .bind(event.to_string())
                 .bind(timestamp.timestamp_millis())
                 .execute()
@@ -619,17 +756,26 @@ impl FindingLogger {
             return Ok(());
         }
 
-        // Insert into ClickHouse logs table with UDM fields as direct columns
-        let query = r#"
-            INSERT INTO logs (
+        // Insert into ClickHouse logs table with UDM fields as direct columns.
+        // R7: route the write through the DualPool distributed-wrapper resolver
+        // instead of a bare `logs` literal. On a clustered deployment a bare
+        // `INSERT INTO logs` hits the node-local MergeTree only; the resolver
+        // returns `logs_distributed` so the row fans out across the cluster
+        // (matching SignalProcessor's read routing and the audit emitter).
+        let logs_table = dual_pool.table_names().read("logs");
+        let query = format!(
+            r#"
+            INSERT INTO {} (
                 timestamp, message, metadata, source_type,
                 action, status, rule_id, rule_name, severity,
                 risk_score, risk_entity, ingest_time
             ) VALUES (?, ?, ?, 'findings', ?, ?, ?, ?, ?, ?, ?, ?)
-        "#;
+        "#,
+            logs_table
+        );
 
         client
-            .query(query)
+            .query(&query)
             .bind(timestamp.timestamp_micros())
             .bind(message)
             .bind(metadata.to_string())
@@ -833,6 +979,77 @@ mod ocsf_finding_tests {
             assert_eq!(ev["severity_id"], expect_id, "severity_id for {nano}");
             assert_eq!(ev["severity"], expect_title, "severity title for {nano}");
         }
+    }
+}
+
+/// R7: the per-event finding timestamp basis must match the grouped/aggregate
+/// basis (source-event time), not the detection execution wall-clock. These
+/// tests pin `FindingEvent::source_event_time` — the seam that makes both alert
+/// modes consistent.
+#[cfg(test)]
+mod timestamp_basis_tests {
+    use super::*;
+
+    #[test]
+    fn source_event_time_picks_newest_event_timestamp() {
+        // ClickHouse `DateTime64` serialization ("YYYY-MM-DD HH:MM:SS.fff").
+        let events = vec![
+            json!({ "timestamp": "2026-06-01 10:00:00.000", "user": "a" }),
+            json!({ "timestamp": "2026-06-01 12:30:15.500", "user": "b" }),
+            json!({ "timestamp": "2026-06-01 11:00:00.000", "user": "c" }),
+        ];
+        let got = FindingEvent::source_event_time(&events).expect("some timestamp");
+        let want = DateTime::parse_from_rfc3339("2026-06-01T12:30:15.5Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(got, want, "should stamp the newest matched-event time");
+    }
+
+    #[test]
+    fn source_event_time_parses_rfc3339() {
+        let events = vec![json!({ "timestamp": "2026-06-01T09:15:00Z" })];
+        let got = FindingEvent::source_event_time(&events).expect("some timestamp");
+        assert_eq!(got.to_rfc3339(), "2026-06-01T09:15:00+00:00");
+    }
+
+    #[test]
+    fn source_event_time_none_when_no_parseable_timestamp() {
+        // No `timestamp` field, or an unparseable one -> None (caller falls back
+        // to now()). This must NOT panic or silently pick a wrong basis.
+        assert!(FindingEvent::source_event_time(&[json!({ "user": "a" })]).is_none());
+        assert!(
+            FindingEvent::source_event_time(&[json!({ "timestamp": "not-a-time" })]).is_none()
+        );
+        assert!(FindingEvent::source_event_time(&[]).is_none());
+    }
+
+    #[test]
+    fn infer_entity_type_matches_delimited_tokens_not_substrings() {
+        use FindingLogger as F;
+        // Real UDM/OCSF field names still classify correctly.
+        assert_eq!(F::infer_entity_type("1.2.3.4", Some("src_ip")), "ip");
+        assert_eq!(F::infer_entity_type("1.2.3.4", Some("dest_ip")), "ip");
+        assert_eq!(F::infer_entity_type("1.2.3.4", Some("dvc_ip")), "ip");
+        assert_eq!(F::infer_entity_type("1.2.3.4", Some("src_endpoint.ip")), "ip");
+        // `dvc` (device) is typed by its value, not hardcoded to "ip": an IP
+        // value → "ip", a dotted hostname value → "hostname".
+        assert_eq!(F::infer_entity_type("1.2.3.4", Some("dvc")), "ip");
+        assert_eq!(F::infer_entity_type("host1.corp.example", Some("dvc")), "hostname");
+        assert_eq!(F::infer_entity_type("host1", Some("src_host")), "hostname");
+        assert_eq!(F::infer_entity_type("host1", Some("hostname")), "hostname");
+        assert_eq!(F::infer_entity_type("host1", Some("dest_hostname")), "hostname");
+        assert_eq!(F::infer_entity_type("bob", Some("src_user")), "user");
+        assert_eq!(F::infer_entity_type("abc", Some("file_hash")), "hash");
+        // OCSF plural hash path (tokenizes to `hashes`, not `hash`).
+        assert_eq!(F::infer_entity_type("abc", Some("file.hashes.sha256")), "hash");
+        assert_eq!(F::infer_entity_type("x.com", Some("dest_domain")), "domain");
+
+        // R4d: field names that merely CONTAIN the substring "ip" must NOT be
+        // classified as IP — they fall through to value-based inference.
+        assert_ne!(F::infer_entity_type("bob", Some("principal")), "ip");
+        assert_ne!(F::infer_entity_type("bob", Some("description")), "ip");
+        // A principal/description value that is plainly a username infers "user".
+        assert_eq!(F::infer_entity_type("bob", Some("principal")), "user");
     }
 }
 

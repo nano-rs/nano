@@ -338,6 +338,16 @@ impl AppState {
             tracing::info!("Synthetic-check runner started (leader-only, 15s tick)");
         }
 
+        // Risk-decay sweep (NAN-1675): persist always-current decayed scores so
+        // they age down between reads. Internal (PG + CH only) — runs regardless
+        // of egress/air-gap mode. Leader-only by virtue of being in
+        // start_leader_schedulers (only the elected node runs this).
+        #[cfg(feature = "enterprise")]
+        {
+            handles.push(self.start_risk_decay_scheduler());
+            tracing::info!("Risk-decay sweep scheduler started (leader-only, 15m default)");
+        }
+
         // Tuning scheduler (low-frequency singleton)
         handles.extend(self.start_tuning_scheduler());
         tracing::info!("Tuning scheduler started (leader-only)");

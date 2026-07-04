@@ -16,17 +16,42 @@
 //! - 71-100: Critical risk
 
 mod calculator;
-mod cumulative;
 mod defaults;
 mod types;
 
 pub use calculator::{RiskResult, ScoreCalculator};
-pub use cumulative::{
-    extract_cumulative_risk_config, is_cumulative_risk_rule, CumulativeRiskConfig,
-    CumulativeRiskResult,
-};
 pub use defaults::default_score_for_severity;
 pub use types::{RiskError, RiskModifier};
+
+/// Score one rule match through the single scoring engine
+/// ([`ScoreCalculator::calculate`]) — applying the rule's base score, its
+/// `risk_modifiers`, and the global `risk_weight` to the matched event(s).
+///
+/// This is the rule-level scoring adapter shared by BOTH execution paths so a
+/// rule scores identically regardless of mode (audit R1 / NAN-1663):
+/// - the scheduled path calls `ScoreCalculator::calculate` with these same
+///   rule-level inputs (`detection::service::alerts::risk_result_for_group`);
+/// - the real-time `SignalProcessor` calls this function.
+///
+/// Before NAN-1663 the real-time path used the STATIC score baked into the
+/// materialized-view DDL and ignored `risk_modifiers` / `risk_weight`, so
+/// promoting a rule to real-time silently changed its score. Routing the
+/// real-time path through the same engine here removes that divergence.
+pub fn score_rule_match(
+    calculator: &ScoreCalculator,
+    rule: &crate::models::DetectionRule,
+    events: &[serde_json::Value],
+    global_weight: f64,
+) -> RiskResult {
+    calculator.calculate(
+        rule.risk_score,
+        rule.severity,
+        rule.risk_entity_field.as_deref(),
+        &rule.risk_modifiers,
+        events,
+        global_weight,
+    )
+}
 
 #[cfg(any())]
 mod tests {
@@ -327,167 +352,4 @@ mod tests {
         assert!(ScoreCalculator::validate_weight(1.1).is_err());
     }
 
-    // ========================================================================
-    // Cumulative Risk Helper Tests
-    // ========================================================================
-
-    fn create_test_rule(query: &str) -> crate::models::DetectionRule {
-        use crate::models::RuleMode;
-        use chrono::Utc;
-        crate::models::DetectionRule {
-            id: uuid::Uuid::now_v7(),
-            name: "Test Rule".to_string(),
-            description: None,
-            query: query.to_string(),
-            severity: Severity::High,
-            mitre_tactics: vec![],
-            mitre_techniques: vec![],
-            schedule_cron: None,
-            enabled: true,
-            mode: RuleMode::Alerting,
-            narrative: None,
-            reference_url: None,
-            author: None,
-            tags: vec![],
-            ai_generated: false,
-            realtime_enabled: false,
-            risk_score: None,
-            risk_entity_field: None,
-            risk_modifiers: sqlx::types::Json(vec![]),
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            last_run_at: None,
-            last_match_at: None,
-            match_count: 0,
-            live_match_count: 0,
-            detection_mode: crate::models::detection_rule::DetectionMode::Scheduled,
-            materialized_view_name: None,
-            archived: false,
-            lookback_minutes: None,
-            dataset: None,
-            auto_tuning_enabled: true,
-            auto_tuning_min_confidence: 0.8,
-            auto_tuning_critical: false,
-            auto_tuning_disabled_until: None,
-        }
-    }
-
-    #[test]
-    fn test_is_cumulative_risk_rule_valid() {
-        let rule = create_test_rule(
-            "source_type=findings | bin span=1h | stats sum(risk_score) as total by risk_entity | where total > 100"
-        );
-        assert!(is_cumulative_risk_rule(&rule));
-    }
-
-    #[test]
-    fn test_is_cumulative_risk_rule_with_src_ip() {
-        let rule = create_test_rule(
-            "source_type=findings | stats sum(risk_score) as total by src_ip | where total >= 50",
-        );
-        assert!(is_cumulative_risk_rule(&rule));
-    }
-
-    #[test]
-    fn test_is_cumulative_risk_rule_not_findings() {
-        let rule = create_test_rule(
-            "source_type=apache | stats sum(risk_score) as total by risk_entity | where total > 100"
-        );
-        assert!(!is_cumulative_risk_rule(&rule));
-    }
-
-    #[test]
-    fn test_is_cumulative_risk_rule_no_sum() {
-        let rule = create_test_rule(
-            "source_type=findings | stats count() as total by risk_entity | where total > 100",
-        );
-        assert!(!is_cumulative_risk_rule(&rule));
-    }
-
-    #[test]
-    fn test_is_cumulative_risk_rule_no_where() {
-        let rule = create_test_rule(
-            "source_type=findings | stats sum(risk_score) as total by risk_entity",
-        );
-        assert!(!is_cumulative_risk_rule(&rule));
-    }
-
-    #[test]
-    fn test_is_cumulative_risk_rule_no_group_by() {
-        let rule = create_test_rule(
-            "source_type=findings | stats sum(risk_score) as total | where total > 100",
-        );
-        assert!(!is_cumulative_risk_rule(&rule));
-    }
-
-    #[test]
-    fn test_extract_cumulative_risk_config_full() {
-        let rule = create_test_rule(
-            "source_type=findings | bin span=2h | stats sum(risk_score) as total by risk_entity | where total > 150"
-        );
-        let config = extract_cumulative_risk_config(&rule).unwrap();
-
-        assert_eq!(config.window_seconds, 7200); // 2 hours
-        assert_eq!(config.threshold, 150);
-        assert_eq!(config.entity_field, "risk_entity");
-    }
-
-    #[test]
-    fn test_extract_cumulative_risk_config_minutes() {
-        let rule = create_test_rule(
-            "source_type=findings | bin span=30m | stats sum(risk_score) as total by user | where total >= 75"
-        );
-        let config = extract_cumulative_risk_config(&rule).unwrap();
-
-        assert_eq!(config.window_seconds, 1800); // 30 minutes
-        assert_eq!(config.threshold, 75);
-        assert_eq!(config.entity_field, "user");
-    }
-
-    #[test]
-    fn test_extract_cumulative_risk_config_defaults() {
-        let rule = create_test_rule(
-            "source_type=findings | stats sum(risk_score) as total by risk_entity | where total > 100"
-        );
-        let config = extract_cumulative_risk_config(&rule).unwrap();
-
-        // No bin span specified, should default to 1 hour
-        assert_eq!(config.window_seconds, 3600);
-        assert_eq!(config.threshold, 100);
-    }
-
-    #[test]
-    fn test_extract_cumulative_risk_config_not_cumulative_rule() {
-        let rule = create_test_rule("error | stats count() by src_ip");
-        let config = extract_cumulative_risk_config(&rule);
-
-        assert!(config.is_none());
-    }
-
-    #[test]
-    fn test_cumulative_risk_result() {
-        let result = CumulativeRiskResult::new("192.168.1.1".to_string(), 150, 5, 100, 3600);
-
-        assert_eq!(result.entity, "192.168.1.1");
-        assert_eq!(result.total_risk, 150);
-        assert_eq!(result.signal_count, 5);
-        assert!(result.threshold_exceeded);
-        assert_eq!(result.threshold, 100);
-        assert_eq!(result.window_seconds, 3600);
-    }
-
-    #[test]
-    fn test_cumulative_risk_result_below_threshold() {
-        let result = CumulativeRiskResult::new("admin".to_string(), 50, 2, 100, 3600);
-
-        assert!(!result.threshold_exceeded);
-    }
-
-    #[test]
-    fn test_cumulative_risk_config_window_duration() {
-        let config = CumulativeRiskConfig::new(7200, 100);
-        let duration = config.window_duration();
-
-        assert_eq!(duration.num_seconds(), 7200);
-    }
 }

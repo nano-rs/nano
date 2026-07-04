@@ -555,6 +555,18 @@ impl SearchService {
         // Extract prevalence commands for post-processing
         let prevalence_commands = extract_prevalence_commands(&query);
 
+        // P2 (audit): validate EVERY prevalence command's window up front —
+        // before the JOIN-vs-fallback dispatch and the prevalence-service check
+        // below. The JOIN path only reads the first command's window and the
+        // fallback early-returns when no service is wired, so a later command's
+        // `window=1h` (e.g. `… | prevalence enrich=true | prevalence host_count < 5
+        // window=1h`) would otherwise slip past one of those paths. Rejecting
+        // here makes the `window=1h` contract path-independent (1h isn't
+        // meaningful — the prevalence dicts refresh every 5–10min).
+        for cmd in &prevalence_commands {
+            ast_to_prevalence_time_window(cmd.time_window.as_ref())?;
+        }
+
         // Extract commands that come after prevalence enrichment
         let post_prevalence = extract_post_prevalence_commands(&query);
 

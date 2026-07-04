@@ -11,7 +11,6 @@
 //! - Storing generated alerts
 //! - Updating rule statistics
 //! - Logging findings (detection matches and alerts)
-//! - Cumulative risk queries for meta-detections
 //! - Auto-grouping alerts into cases
 
 mod config;

@@ -43,6 +43,29 @@ mod tests {
         assert!(!is_safe_identifier("foo`bar"));
     }
 
+    /// NAN-1668 (audit gap G4): `reconcile_distributed_columns` fixes wrapper
+    /// column drift by iterating `DISTRIBUTED_TABLES`, so a table is only
+    /// protected from `_distributed` ALTER-drift if it's in that list. The
+    /// prevalence/risk audit flagged `signals` and the three `*_prevalence_agg`
+    /// tables as the drift-prone ones (they take ALTERs and are queried across
+    /// shards). Pin them here so a future refactor can't silently drop them from
+    /// reconciliation and reopen the gap.
+    #[test]
+    fn drift_prone_tables_are_reconciled_by_distributed_columns() {
+        for table in [
+            "signals",
+            "domain_prevalence_agg",
+            "hash_prevalence_agg",
+            "ip_prevalence_agg",
+        ] {
+            assert!(
+                ClickHouseMigrator::DISTRIBUTED_TABLES.contains(&table),
+                "{table} must stay in DISTRIBUTED_TABLES so reconcile_distributed_columns \
+                 keeps its cluster wrapper free of ALTER-drift (NAN-1668 / audit gap G4)"
+            );
+        }
+    }
+
     /// NAN-1652: `stale_wrapper_columns` returns exactly the columns present on
     /// the Distributed wrapper but gone from the source table — the set the
     /// reconcile step must drop. This is the flexible-enrichment repro:

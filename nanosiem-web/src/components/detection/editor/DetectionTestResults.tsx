@@ -10,6 +10,7 @@ import { formatUTCShort, parseUTCTimestamp } from '@/lib/date-utils';
 import { isClickHouseDefault, cn } from '@/lib/utils';
 import { toast } from 'sonner';
 import type { SearchResponse, DisplayType } from '@/lib/api/types';
+import { isPrevalenceSentinelField } from '@/lib/prevalence-sentinels';
 
 interface SearchResult {
   id: string;
@@ -40,7 +41,7 @@ function flattenFields(fields: Record<string, unknown>, prefix = ''): [string, u
   const result: [string, unknown][] = [];
   for (const [key, value] of Object.entries(fields)) {
     const fullKey = prefix ? `${prefix}_${key}` : key;
-    if (key.startsWith('prevalence_') && (value === 255 || value === 65535 || value === 9999)) continue;
+    if (isPrevalenceSentinelField(key, value)) continue;
     if (key === 'risk_score' && (value === 0 || value === '0')) continue;
     if (isClickHouseDefault(value, fullKey)) continue;
     if (key === 'metadata' && typeof value === 'object' && value !== null && !Array.isArray(value)) {

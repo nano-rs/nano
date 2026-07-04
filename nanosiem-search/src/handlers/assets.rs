@@ -800,7 +800,11 @@ pub async fn get_asset_artifacts(
                 ArtifactPrevalence {
                     artifact: s.artifact.clone(),
                     host_count: s.host_count,
-                    is_rare: s.host_count <= rarity_threshold,
+                    // Match core's strict `<` rarity boundary (prevalence
+                    // repository is_rare uses `host_count < rarity_threshold`).
+                    // `<=` here over-counted: at rarity_threshold=3 it flagged an
+                    // artifact seen on exactly 3 hosts as rare while core did not.
+                    is_rare: s.host_count < rarity_threshold,
                     prevalence_score: score,
                     total_occurrences: 0, // per-asset occurrences filled in Step 4
                     first_seen: s.first_seen.clone(),

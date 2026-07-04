@@ -21,7 +21,13 @@ pub struct PrevalenceSettingsResponse {
     pub enable_hash_tracking: bool,
     /// Whether domain tracking is enabled
     pub enable_domain_tracking: bool,
-    /// Number of days to retain prevalence data
+    /// Whether IP-address tracking is enabled (gates the IP prevalence lanes)
+    pub enable_ip_tracking: bool,
+    /// Number of days prevalence data is retained.
+    ///
+    /// NOTE: informational only. ClickHouse TTLs are fixed in the schema DDL and
+    /// are NOT driven by this value, so it is read-only and cannot be changed via
+    /// the PUT endpoint (P1 audit — previously accepted but wired to nothing).
     pub retention_days: u32,
     /// Cache TTL in seconds
     pub cache_ttl_seconds: u64,
@@ -33,6 +39,7 @@ impl From<PrevalenceConfig> for PrevalenceSettingsResponse {
             rarity_threshold: config.rarity_threshold,
             enable_hash_tracking: config.enable_hash_tracking,
             enable_domain_tracking: config.enable_domain_tracking,
+            enable_ip_tracking: config.enable_ip_tracking,
             retention_days: config.retention_days,
             cache_ttl_seconds: config.cache_ttl_seconds,
         }
@@ -40,6 +47,10 @@ impl From<PrevalenceConfig> for PrevalenceSettingsResponse {
 }
 
 /// Request to update prevalence settings
+///
+/// Only provided fields are updated. `retention_days` is intentionally NOT
+/// accepted: ClickHouse TTLs are fixed in DDL, so a retention value here would
+/// silently do nothing (P1 audit).
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdatePrevalenceSettingsRequest {
     /// Number of hosts below which an artifact is considered "rare" (1-1000)
@@ -48,8 +59,8 @@ pub struct UpdatePrevalenceSettingsRequest {
     pub enable_hash_tracking: Option<bool>,
     /// Whether to enable domain tracking
     pub enable_domain_tracking: Option<bool>,
-    /// Number of days to retain prevalence data (1-365)
-    pub retention_days: Option<u32>,
+    /// Whether to enable IP-address tracking (gates the IP prevalence lanes)
+    pub enable_ip_tracking: Option<bool>,
     /// Cache TTL in seconds (0-3600)
     pub cache_ttl_seconds: Option<u64>,
 }
@@ -146,7 +157,8 @@ pub async fn update_prevalence_settings(
         .await
         .map_err(prevalence_settings_error_to_response)?;
 
-    // Apply updates
+    // Apply updates. `retention_days` is deliberately not settable — CH TTLs are
+    // fixed in DDL, so the previously-persisted value stays untouched here.
     if let Some(rarity_threshold) = request.rarity_threshold {
         config.rarity_threshold = rarity_threshold;
     }
@@ -156,8 +168,8 @@ pub async fn update_prevalence_settings(
     if let Some(enable_domain_tracking) = request.enable_domain_tracking {
         config.enable_domain_tracking = enable_domain_tracking;
     }
-    if let Some(retention_days) = request.retention_days {
-        config.retention_days = retention_days;
+    if let Some(enable_ip_tracking) = request.enable_ip_tracking {
+        config.enable_ip_tracking = enable_ip_tracking;
     }
     if let Some(cache_ttl_seconds) = request.cache_ttl_seconds {
         config.cache_ttl_seconds = cache_ttl_seconds;
@@ -169,10 +181,20 @@ pub async fn update_prevalence_settings(
         .await
         .map_err(prevalence_settings_error_to_response)?;
 
-    // Hot-reload: Update the prevalence service config if it exists
-    // The PrevalenceService will pick up the new config on next request
-    // since it reads from the database through PrevalenceSettings
-    // Requirement: 8.5
+    // Hot-reload (P1): push the new config onto the LIVE, in-process prevalence
+    // service so search prevalence_score and detection is_rare honor it
+    // immediately without a restart. The service is Clone-shared (Arc<RwLock>
+    // config) across the search + detection services, so this one call updates
+    // all in-process consumers. Cross-process (nanosiem-search) staleness is
+    // bounded by that process's own ~60s config poll. Requirement: 8.5
+    state
+        .prevalence_service
+        .update_config(updated.clone())
+        .await;
 
     Ok(Json(PrevalenceSettingsResponse::from(updated)))
 }
+
+#[cfg(test)]
+#[path = "settings_tests.rs"]
+mod settings_tests;

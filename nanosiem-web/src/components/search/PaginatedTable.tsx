@@ -7,6 +7,7 @@ import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, BookOpen, Arrow
 import { IpIdentityPopover } from './IpIdentityPopover';
 import { useSchemaEntityMap } from '@/hooks/useSchemaEntityMap';
 import { cn, isClickHouseDefault } from '@/lib/utils';
+import { isPrevalenceSentinelField } from '@/lib/prevalence-sentinels';
 
 /** Try to coerce a value into a numeric array for sparkline rendering.
  *  Handles: native arrays, JSON-encoded strings like "[1,2,3]", and
@@ -480,12 +481,9 @@ export function PaginatedTable({
   // Format cell value for display
   const formatCellValue = (value: unknown, fieldName?: string): string => {
     if (value === null || value === undefined) return '';
-    // Hide prevalence sentinel values
-    if (fieldName) {
-      const lowerField = fieldName.toLowerCase();
-      if (lowerField.startsWith('prevalence_') && (value === 65535 || value === 9999 || value === 255)) {
-        return '-';
-      }
+    // Hide prevalence sentinel values (N/A / common) — see lib/prevalence-sentinels.
+    if (fieldName && isPrevalenceSentinelField(fieldName, value)) {
+      return '-';
     }
     if (typeof value === 'object') {
       return JSON.stringify(value);

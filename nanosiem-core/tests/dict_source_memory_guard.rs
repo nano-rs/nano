@@ -85,6 +85,15 @@ const MIGRATION_148: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../clickhouse/148_lowercase_ioc_dict_keys.sql"
 ));
+/// NAN-1662 recreated the three prevalence CACHE dicts so a dict MISS means
+/// "genuinely new" (default 1 at ingest), not "common": the source drops the
+/// `HAVING host_count < 1000` filter and stores common as a 9999 cap. It is the
+/// canonical definition for the `PUSHDOWN_DICTS`. Source stays key-pushdown over
+/// `*_prevalence_summary` and memory-bounded (NAN-1440 / the per-key load).
+const MIGRATION_153: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../clickhouse/153_prevalence_new_artifact_default.sql"
+));
 
 /// The first numbered migration written under the NAN-1404 rule. Migrations
 /// before this predate it and are immutable (editing them trips
@@ -390,6 +399,7 @@ fn migration_133_matches_init_definitions() {
     let mig_dicts = create_dictionary_statements(MIGRATION_133);
     let mig136_dicts = create_dictionary_statements(MIGRATION_136);
     let mig148_dicts = create_dictionary_statements(MIGRATION_148);
+    let mig153_dicts = create_dictionary_statements(MIGRATION_153);
 
     // Migration 136 must redefine exactly the dicts it claims to (catches an
     // accidental extra/missing CREATE OR REPLACE).
@@ -422,21 +432,33 @@ fn migration_133_matches_init_definitions() {
             "{name} differs between {source} and clickhouse/init.sql"
         );
     }
+    // NAN-1662: the pushdown dicts' canonical body moved off 133 to migration
+    // 153 (drop `HAVING host_count < 1000`; store common as a 9999 cap so an
+    // ingest dict MISS unambiguously means "genuinely new"). init.sql/ocsf must
+    // match 153. Migration 153 must redefine exactly the pushdown dict set.
+    let mut expected_pushdown = PUSHDOWN_DICTS.to_vec();
+    expected_pushdown.sort_unstable(); // BTreeMap keys iterate sorted
+    assert_eq!(
+        mig153_dicts.keys().map(String::as_str).collect::<Vec<_>>(),
+        expected_pushdown,
+        "migration 153 redefines a different dict set than PUSHDOWN_DICTS"
+    );
     for name in PUSHDOWN_DICTS {
+        let canonical = mig153_dicts.get(*name);
         assert_eq!(
-            mig_dicts.get(*name),
+            canonical,
             udm_dicts.get(*name),
-            "{name} differs between migration 133 and clickhouse/init.sql"
+            "{name} differs between migration 153 and clickhouse/init.sql"
         );
         assert_eq!(
-            mig_dicts.get(*name),
+            canonical,
             ocsf_dicts.get(*name),
-            "{name} differs between migration 133 and clickhouse/ocsf/init.sql"
+            "{name} differs between migration 153 and clickhouse/ocsf/init.sql"
         );
         // NAN-1440: pushdown sources read the *_prevalence_summary tables
         // directly — never a staging table (the full-keyspace staging rewrite
         // OOMed Saturn's boot-gating migrator).
-        let query = source_query(mig_dicts.get(*name).expect("pushdown dict in 133"))
+        let query = source_query(canonical.expect("pushdown dict in 153"))
             .expect("pushdown dict has a QUERY source");
         assert!(
             query.contains("_prevalence_summary"),

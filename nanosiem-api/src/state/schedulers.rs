@@ -267,6 +267,18 @@ impl AppState {
         ModelCatalogScheduler::new(pool, interval_secs).start()
     }
 
+    /// Start the risk-decay sweep scheduler (NAN-1675).
+    ///
+    /// Periodically recomputes every entity's decayed score and persists it onto
+    /// `entity_risk_scores.decayed_score`, so scores age down between reads and
+    /// core/lateral surfaces can read a decayed band. Interval via
+    /// RISK_DECAY_SWEEP_INTERVAL_SECS (default 15 min). Leader-only (started from
+    /// start_leader_schedulers).
+    #[cfg(feature = "enterprise")]
+    pub fn start_risk_decay_scheduler(&self) -> tokio::task::JoinHandle<()> {
+        nanosiem_enterprise::risk::RiskDecayScheduler::from_env(self.risk_service.clone()).start()
+    }
+
     /// Start the tuning scheduler
     ///
     /// This spawns background tasks for:
