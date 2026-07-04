@@ -6,6 +6,14 @@
 //! LIMIT/OFFSET injection, COUNT query building, and question mark escaping.
 
 /// Check if a SQL query is an aggregation query that needs all data
+///
+/// NAN-1691: prevalence *decoration* (`host_count`/`is_rare`/`prevalence_score`
+/// columns from `| prevalence enrich=true`) is 1:1 row output, NOT an
+/// aggregation — matching those tokens here forced the blocking `count(*)
+/// OVER()` full-window wrap in the executor and OOMed the shared pod. When the
+/// enrich pipeline actually aggregates (`… | stats …`) the pushed-down GROUP
+/// BY / agg keyword below still trips this, so enrich-then-aggregate keeps the
+/// full-scan path; enrich-only now paginates as a raw-event query.
 pub(crate) fn is_aggregation_query(sql: &str) -> bool {
     let sql_upper = sql.to_uppercase();
     sql_upper.contains("GROUP BY")
@@ -20,12 +28,6 @@ pub(crate) fn is_aggregation_query(sql: &str) -> bool {
         || sql_upper.contains("ARGMAX(")
         || sql_upper.contains("ARGMIN(")
         || sql_upper.contains("MEDIAN(")
-        // Prevalence queries need all data
-        || sql_upper.contains("DOMAIN_PREV")
-        || sql_upper.contains("HASH_PREV")
-        || sql_upper.contains("HOST_COUNT")
-        || sql_upper.contains("IS_RARE")
-        || sql_upper.contains("PREVALENCE_SCORE")
 }
 
 /// Inject LIMIT and OFFSET into a SQL query before the SETTINGS clause
@@ -168,6 +170,36 @@ pub fn escape_question_marks_in_strings(sql: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NAN-1691 (P1-B): enrich-only prevalence decoration (host_count / is_rare /
+    /// prevalence_score columns, no real aggregation keyword) must NOT be treated as an
+    /// aggregation, or the executor wraps it in a blocking `count(*) OVER()` full-window
+    /// scan that OOMs the shared pod.
+    #[test]
+    fn enrich_only_prevalence_decoration_is_not_aggregation() {
+        let enrich_sql = "SELECT l.*, \
+            least(_dp_host_count, _ip_host_count, _hp_host_count) AS host_count, \
+            true AS is_rare, 42 AS prevalence_score \
+            FROM base_logs l ORDER BY l.timestamp DESC";
+        assert!(
+            !is_aggregation_query(enrich_sql),
+            "enrich-only decoration must paginate as a raw-event query, got aggregation=true"
+        );
+    }
+
+    /// Enrich-then-aggregate (`… | prevalence enrich=true | stats …`) pushes a real
+    /// GROUP BY / count() into SQL, which MUST still route through the full-scan
+    /// aggregation path (the `count(*) OVER()` then runs over the small grouped output).
+    #[test]
+    fn enrich_then_aggregate_is_still_aggregation() {
+        let agg_sql = "WITH prevalence_results AS (SELECT l.*, \
+            least(_dp_host_count) AS host_count FROM base_logs l) \
+            SELECT prevalence_type, count(*) AS cnt FROM prevalence_results GROUP BY prevalence_type";
+        assert!(
+            is_aggregation_query(agg_sql),
+            "a real GROUP BY / count() must keep the aggregation path"
+        );
+    }
 
     #[test]
     fn pagination_wrapper_enforces_outer_limit_offset() {

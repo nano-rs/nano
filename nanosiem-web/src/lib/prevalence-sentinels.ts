@@ -41,3 +41,18 @@ export function isPrevalenceSentinelValue(value: unknown): boolean {
 export function isPrevalenceSentinelField(field: string, value: unknown): boolean {
   return field.toLowerCase().startsWith('prevalence_') && isPrevalenceSentinelValue(value);
 }
+
+/**
+ * Human label for a prevalence sentinel that should still be shown, or `null`
+ * when the value carries no signal and should be hidden.
+ *
+ * NAN-1689: `9999` ("common") is real information — the artifact is on >= 1000
+ * hosts — but blanking it out (as N/A) makes it indistinguishable from "no
+ * artifact on this row" (65535). Render `9999` as `common` and keep `65535`
+ * hidden. Returns `null` for N/A and for non-prevalence / non-sentinel values
+ * (callers render those as the raw count / their existing empty).
+ */
+export function prevalenceSentinelLabel(field: string, value: unknown): string | null {
+  if (!field.toLowerCase().startsWith('prevalence_')) return null;
+  return value === PREVALENCE_COMMON ? 'common' : null;
+}

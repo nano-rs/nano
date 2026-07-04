@@ -292,7 +292,10 @@ CREATE TABLE IF NOT EXISTS nanosiem.hash_prevalence_summary
     `first_seen` SimpleAggregateFunction(min, DateTime64(6)),
     `last_seen` SimpleAggregateFunction(max, DateTime64(6)),
     `total_count` SimpleAggregateFunction(sum, UInt64),
-    INDEX idx_file_hash file_hash TYPE bloom_filter GRANULARITY 4
+    INDEX idx_file_hash file_hash TYPE bloom_filter GRANULARITY 4,
+    -- Recency minmax (NAN-1691): explorer rare/new 7d/30d filters on first_seen/last_seen.
+    INDEX idx_first_seen first_seen TYPE minmax GRANULARITY 1,
+    INDEX idx_last_seen last_seen TYPE minmax GRANULARITY 1
 )
 ENGINE = AggregatingMergeTree
 ORDER BY (file_hash, hash_type)
@@ -307,7 +310,10 @@ CREATE TABLE IF NOT EXISTS nanosiem.domain_prevalence_summary
     `first_seen` SimpleAggregateFunction(min, DateTime64(6)),
     `last_seen` SimpleAggregateFunction(max, DateTime64(6)),
     `total_count` SimpleAggregateFunction(sum, UInt64),
-    INDEX idx_domain domain TYPE bloom_filter GRANULARITY 4
+    INDEX idx_domain domain TYPE bloom_filter GRANULARITY 4,
+    -- Recency minmax (NAN-1691): explorer rare/new 7d/30d filters on first_seen/last_seen.
+    INDEX idx_first_seen first_seen TYPE minmax GRANULARITY 1,
+    INDEX idx_last_seen last_seen TYPE minmax GRANULARITY 1
 )
 ENGINE = AggregatingMergeTree
 ORDER BY (domain, is_subdomain)
@@ -322,7 +328,10 @@ CREATE TABLE IF NOT EXISTS nanosiem.ip_prevalence_summary
     `first_seen` SimpleAggregateFunction(min, DateTime64(6, 'UTC')),
     `last_seen` SimpleAggregateFunction(max, DateTime64(6, 'UTC')),
     `total_count` SimpleAggregateFunction(sum, UInt64),
-    INDEX idx_ip ip TYPE bloom_filter GRANULARITY 4
+    INDEX idx_ip ip TYPE bloom_filter GRANULARITY 4,
+    -- Recency minmax (NAN-1691): explorer rare/new 7d/30d filters on first_seen/last_seen.
+    INDEX idx_first_seen first_seen TYPE minmax GRANULARITY 1,
+    INDEX idx_last_seen last_seen TYPE minmax GRANULARITY 1
 )
 ENGINE = AggregatingMergeTree
 ORDER BY (ip, is_private)
@@ -997,7 +1006,15 @@ CREATE TABLE IF NOT EXISTS nanosiem.logs
     INDEX idx_src_host src_host TYPE bloom_filter GRANULARITY 4,
     INDEX idx_src_host_words lower(src_host) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
     INDEX idx_dest_host dest_host TYPE bloom_filter GRANULARITY 4,
-    INDEX idx_dest_host_words lower(dest_host) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1
+    INDEX idx_dest_host_words lower(dest_host) TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1,
+    -- Prevalence range-hunt minmax (NAN-1691): `| where prevalence_* < N` (rare
+    -- hunts, detection prevalence_min filter). Prunes uniformly-65535 (N/A) and
+    -- uniformly-common granule blocks. GRANULARITY 1 for max block isolation.
+    INDEX idx_prevalence_file_hash prevalence_file_hash TYPE minmax GRANULARITY 1,
+    INDEX idx_prevalence_process_hash prevalence_process_hash TYPE minmax GRANULARITY 1,
+    INDEX idx_prevalence_dest_domain prevalence_dest_domain TYPE minmax GRANULARITY 1,
+    INDEX idx_prevalence_dest_ip prevalence_dest_ip TYPE minmax GRANULARITY 1,
+    INDEX idx_prevalence_min prevalence_min TYPE minmax GRANULARITY 1
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(timestamp)

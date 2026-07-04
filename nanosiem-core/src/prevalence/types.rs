@@ -302,7 +302,7 @@ impl std::fmt::Display for TimeWindow {
 }
 
 /// Configuration for prevalence tracking
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PrevalenceConfig {
     /// Number of hosts below which an artifact is considered "rare"
     pub rarity_threshold: u64,

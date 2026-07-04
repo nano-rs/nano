@@ -272,6 +272,23 @@ pub async fn create_detection(
         );
     }
 
+    // NAN-1691 P1-C: an Alerting rule whose prevalence FILTER can't push into
+    // ClickHouse would run the bounded-but-approximate in-memory fallback inside
+    // the 1Gi jobs pod on every scheduled tick. Block it at author time; Staging/
+    // Live are allowed through so authors can iterate (validation soft-warns via
+    // /validate) — only Alerting runs on the jobs hot path and pages people.
+    if request.mode == Some(RuleMode::Alerting) {
+        let parsed = nanosiem_core::parse_query(&request.query)
+            .map_err(|e| ApiError::ValidationError(format!("Invalid query: {e}")))?;
+        if let Err(reason) =
+            nanosiem_core::search::query_processing::check_prevalence_pushdown_eligible(&parsed)
+        {
+            return Err(ApiError::ValidationError(format!(
+                "This rule can't be saved in Alerting mode: {reason}"
+            )));
+        }
+    }
+
     // Create rule with mode-based routing
     let rule = state
         .detection_service
@@ -412,6 +429,24 @@ pub async fn update_detection(
                 "Auto-corrected detection mode from real-time to scheduled for rule {} due to piped commands",
                 id
             );
+        }
+    }
+
+    // NAN-1691 P1-C: block an update that would leave the rule in Alerting mode
+    // with a non-pushable prevalence FILTER (see create handler). Uses the
+    // EFFECTIVE mode/query after this update — so changing only the query of an
+    // already-Alerting rule to an ineligible shape is also caught.
+    let effective_mode = request.mode.unwrap_or(old_rule.mode);
+    if effective_mode == RuleMode::Alerting {
+        let effective_query = request.query.as_deref().unwrap_or(&old_rule.query);
+        let parsed = nanosiem_core::parse_query(effective_query)
+            .map_err(|e| ApiError::ValidationError(format!("Invalid query: {e}")))?;
+        if let Err(reason) =
+            nanosiem_core::search::query_processing::check_prevalence_pushdown_eligible(&parsed)
+        {
+            return Err(ApiError::ValidationError(format!(
+                "This rule can't be saved in Alerting mode: {reason}"
+            )));
         }
     }
 

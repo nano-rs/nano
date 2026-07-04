@@ -186,6 +186,14 @@ pub struct ValidateDetectionResponse {
     /// when eligible, or why the query is ineligible otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub realtime_eligible_reason: Option<String>,
+    /// NAN-1691: whether a `| prevalence` FILTER in the query will push into
+    /// ClickHouse (memory-safe) vs fall back to an in-memory scan that returns
+    /// approximate results and wastes memory on the search/jobs pods. `true`
+    /// when there is no prevalence filter or it pushes down.
+    pub prevalence_pushdown_safe: bool,
+    /// Human-readable reason when `prevalence_pushdown_safe` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prevalence_pushdown_reason: Option<String>,
     /// Any warnings about the configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,

@@ -322,4 +322,31 @@ mod tests {
         assert_eq!(db.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(db.code(), "INTERNAL_ERROR");
     }
+
+    /// NAN-1689: the `window=1h is not supported` rejection is user-actionable
+    /// guidance. Both prevalence paths raise it as `SqlValidationError`, which
+    /// must surface as a clean 400 carrying the real message. Operational
+    /// `PrevalenceError`s (wrapped ClickHouse failures) stay masked as 500 — so
+    /// the window rejection deliberately does NOT ride the PrevalenceError path.
+    #[test]
+    fn unsupported_prevalence_window_maps_to_400_with_message() {
+        let mapped = SearchError::from(nanosiem_core::SearchError::SqlValidationError(
+            "prevalence window=1h is not supported; use 24h, 7d, or 30d".to_string(),
+        ));
+        assert_eq!(mapped.status_code(), StatusCode::BAD_REQUEST);
+        match mapped {
+            SearchError::QueryError(msg) => assert!(
+                msg.contains("use 24h, 7d, or 30d"),
+                "the actionable guidance must reach the client; got: {msg}"
+            ),
+            other => panic!("expected QueryError, got {other:?}"),
+        }
+
+        // An operational prevalence failure (wrapped ClickHouse error) must NOT
+        // become a 400 — it stays masked as a 500 via the catch-all.
+        let operational = SearchError::from(nanosiem_core::SearchError::PrevalenceError(
+            "ClickHouse error: connection refused".to_string(),
+        ));
+        assert_eq!(operational.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }

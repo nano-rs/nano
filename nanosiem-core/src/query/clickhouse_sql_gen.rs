@@ -1570,7 +1570,7 @@ impl ClickHouseSqlGenerator {
     }
 
     /// Default limit for queries without an explicit `| head N`.
-    const DEFAULT_RESULT_LIMIT: usize = 1_000_000;
+    pub(crate) const DEFAULT_RESULT_LIMIT: usize = 1_000_000;
 
     /// Generate SQL for a single-stage query (no CTEs)
     /// Emits a single WHERE (time bounds + filters); `optimize_move_to_prewhere`

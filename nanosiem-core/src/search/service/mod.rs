@@ -481,7 +481,12 @@ fn ast_to_prevalence_time_window(
     ast_tw: Option<&AstTimeWindow>,
 ) -> Result<PrevalenceTimeWindow, SearchError> {
     match ast_tw {
-        Some(AstTimeWindow::OneHour) => Err(SearchError::PrevalenceError(
+        // NAN-1689: SqlValidationError (not PrevalenceError) so this
+        // user-actionable guidance surfaces as a clean 400 carrying the real
+        // message. PrevalenceError also wraps operational ClickHouse failures
+        // (prevalence_processing.rs) that must stay masked as 500 — so it can't
+        // be blanket-mapped to 400.
+        Some(AstTimeWindow::OneHour) => Err(SearchError::SqlValidationError(
             "prevalence window=1h is not supported; use 24h, 7d, or 30d".to_string(),
         )),
         Some(AstTimeWindow::TwentyFourHours) => Ok(PrevalenceTimeWindow::TwentyFourHours),
@@ -1082,9 +1087,12 @@ mod tests {
             PrevalenceTimeWindow::ThirtyDays
         );
         // P2: 1h is rejected on every prevalence path (no silent 24h coercion).
+        // NAN-1689: rejection is now a SqlValidationError (clean 400 with the real
+        // message), not a PrevalenceError (which stays masked as a 500 for operational
+        // ClickHouse failures).
         assert!(matches!(
             ast_to_prevalence_time_window(Some(&AstTimeWindow::OneHour)),
-            Err(SearchError::PrevalenceError(_))
+            Err(SearchError::SqlValidationError(_))
         ));
         assert_eq!(
             ast_to_prevalence_time_window(Some(&AstTimeWindow::TwentyFourHours)).unwrap(),

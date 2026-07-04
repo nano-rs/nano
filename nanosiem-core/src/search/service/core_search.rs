@@ -15,6 +15,14 @@ fn asset_view_total_count(results: &[serde_json::Value]) -> Option<u64> {
         .and_then(|v| v.as_u64())
 }
 
+/// NAN-1691 interim safety: any prevalence FILTER that still falls to the in-memory
+/// fetch-then-filter path (aggregation-before-prevalence, first_seen conditions, or a
+/// non-ClickHouse backend) is hard-capped to this many pre-filter rows. Far below what
+/// fits in the 2Gi search pod, so a missed pushdown degrades to approximate results
+/// instead of OOM-killing the shared pod. The primary path (use_prevalence_join) pushes
+/// the filter into SQL and never hits this.
+const IN_MEMORY_PREVALENCE_FETCH_CAP: usize = 50_000;
+
 impl SearchService {
     /// Cancel a running query by its request ID
     ///
@@ -585,6 +593,17 @@ impl SearchService {
         let has_prevalence_cmds = !prevalence_commands.is_empty();
         let has_enrich = prevalence_commands.iter().any(|cmd| cmd.enrich);
 
+        // NAN-1691: the filter form (`| prevalence hash_prevalence <= N`) parses
+        // enrich=false, so it previously could never reach the dictGet WHERE pushdown and
+        // fell to the 1M in-memory fetch. It IS pushable whenever every condition is a
+        // count field — the dict-masked `_hp/_dp_host_count` aliases the JOIN already
+        // computes carry the exact windowed semantics. Timestamp-field conditions
+        // (first_seen) have no command-form SQL filter and no-op in memory today, so they
+        // stay off the JOIN path.
+        let has_pushable_prevalence_filter = prevalence_commands.iter().any(|cmd| {
+            !cmd.conditions.is_empty() && cmd.conditions.iter().all(|c| c.field.is_count_field())
+        });
+
         // Check if there's aggregation (stats, timechart, etc.) before prevalence
         // If so, we can't use JOIN-based prevalence because the result structure is different
         let has_aggregation_before = has_aggregation_before_prevalence(&query);
@@ -610,7 +629,7 @@ impl SearchService {
         let use_prevalence_join = is_clickhouse
             && has_prevalence_svc
             && has_prevalence_cmds
-            && has_enrich
+            && (has_enrich || has_pushable_prevalence_filter) // NAN-1691: also push the filter form
             && !has_aggregation_before   // Can't use JOIN approach with aggregation before prevalence
             && safe_post_commands; // Only use JOIN if post-prevalence commands are simple filters/sorts
 
@@ -670,8 +689,24 @@ impl SearchService {
             // Asset/cloud/lateral initial fetch is only used for identifier detection (first 10 rows).
             // build_*_view re-queries ClickHouse for the actual data.
             10
-        } else if is_aggregation_query || has_prevalence_filtering {
-            1_000_000 // Stats/prevalence filtering need all events for correct results
+        } else if is_aggregation_query {
+            1_000_000 // Stats need all events for correct results
+        } else if has_prevalence_filtering && !use_prevalence_join {
+            // NAN-1691: residual in-memory prevalence filter (aggregation-before,
+            // first_seen conditions, or non-ClickHouse backend). Filtering happens in
+            // Rust AFTER the fetch, so a small limit truncates the candidate set — but
+            // 1M full-width rows OOM the 2Gi pod. Fetch a bounded superset and flag the
+            // result approximate downstream.
+            IN_MEMORY_PREVALENCE_FETCH_CAP
+        } else if has_prevalence_filtering {
+            // NAN-1691: filter pushed into SQL (use_prevalence_join) — the JOIN wrapper
+            // returns only the already-rare set and the executor paginates it. Use the
+            // normal page limit, honoring the user's `| head N` / request.limit, instead
+            // of materializing 1M rows.
+            request
+                .limit
+                .unwrap_or(self.config.default_limit)
+                .min(self.config.max_limit)
         } else {
             request
                 .limit
@@ -1116,6 +1151,18 @@ impl SearchService {
             results = pp.results;
             runtime_warnings.extend(pp.warnings);
             tracing::debug!("After post-inputlookup commands: {} results", results.len());
+        }
+
+        // NAN-1691: warn when the residual in-memory prevalence filter truncated its input.
+        if has_prevalence_filtering
+            && !use_prevalence_join
+            && results.len() >= IN_MEMORY_PREVALENCE_FETCH_CAP
+        {
+            runtime_warnings.push(format!(
+                "Prevalence filter applied to the first {} events only; results are approximate. \
+                 Narrow the search or time range for exact rarity filtering.",
+                IN_MEMORY_PREVALENCE_FETCH_CAP
+            ));
         }
 
         // Apply prevalence filtering and enrichment if there are prevalence commands

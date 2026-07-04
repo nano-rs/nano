@@ -212,6 +212,64 @@ pub fn has_aggregation_before_prevalence(query: &Query) -> bool {
     false
 }
 
+/// Author-time prevalence-pushdown eligibility (NAN-1691 / P1-C).
+///
+/// A `| prevalence <field> <op> N` FILTER is only memory-safe when the search
+/// router can push the dictGet threshold into the ClickHouse WHERE
+/// (`search_with_prevalence_join`). When the shape blocks that push — an
+/// aggregation *before* the prevalence command, or a transforming command
+/// *after* it — the filter falls back to loading a bounded candidate set into
+/// the pod and filtering in Rust, which is capped but returns approximate
+/// results and, on the 1Gi jobs pod, wastes memory on every scheduled tick.
+/// Enrich-only prevalence (no conditions) just decorates an already-bounded
+/// result set and is always safe.
+///
+/// This predicate MUST stay in lock-step with the `use_prevalence_join` gate in
+/// `core_search.rs` (minus the deploy-invariant `is_clickhouse` /
+/// `has_prevalence_svc` terms, assumed true at author time) — the same
+/// lock-step contract NAN-1688 holds between `check_query_realtime_eligible`
+/// and the MV DDL path.
+///
+/// Returns `Ok(())` when the query has no prevalence FILTER, or has one that
+/// will push down. Returns `Err(reason)` (user-facing) otherwise.
+///
+/// NAN-1691: only a COUNT-field filter (`hash_prevalence`/`domain_prevalence`)
+/// pushes down, so the eligibility term mirrors the router's
+/// `has_pushable_prevalence_filter` exactly — `!conditions.is_empty()` AND every
+/// condition is a count field. A timestamp-field filter (`hash_first_seen`, …)
+/// has no command-form SQL predicate and no-ops on the bounded in-memory path
+/// today, so it never pushes AND never OOMs — it is classified like "no filter"
+/// (Ok) by both this gate and the router, not rejected.
+pub fn check_prevalence_pushdown_eligible(query: &Query) -> Result<(), String> {
+    let has_filter = extract_prevalence_commands(query).iter().any(|c| {
+        !c.conditions.is_empty() && c.conditions.iter().all(|cond| cond.field.is_count_field())
+    });
+    if !has_filter {
+        return Ok(());
+    }
+    if has_aggregation_before_prevalence(query) {
+        return Err(
+            "A prevalence filter placed after an aggregation (stats/timechart/top/rare) can't be \
+             pushed into ClickHouse and would load the full result set into memory. Put the \
+             prevalence filter before the aggregation, or filter an enriched prevalence field \
+             with `| where`."
+                .to_string(),
+        );
+    }
+    let post = extract_post_prevalence_commands(query);
+    if !has_only_simple_post_prevalence_commands(&post.commands) {
+        return Err(
+            "A prevalence filter followed by a command that re-queries or reshapes the result \
+             (lookup, join, transaction, append, streamstats, …) can't be pushed into ClickHouse \
+             and would load the full result set into memory. Keep only in-pipeline commands \
+             (where, sort, head, table, fields, dedup, rename, stats, eval, rex) after \
+             `| prevalence`, or move that command before it."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Describes why a query poses an OOM risk, enabling specific error messages.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OomRisk {
@@ -1375,6 +1433,106 @@ mod tests {
         let query =
             parse_query("error | timechart span=1h count | prevalence enrich=true").unwrap();
         assert!(has_aggregation_before_prevalence(&query));
+    }
+
+    #[test]
+    fn test_prevalence_pushdown_eligible_ok_cases() {
+        // No prevalence at all → eligible.
+        assert!(check_prevalence_pushdown_eligible(&parse_query("error | head 10").unwrap()).is_ok());
+        // Enrich-only (no conditions) → decorates an already-bounded set → eligible.
+        assert!(check_prevalence_pushdown_eligible(
+            &parse_query("error | prevalence enrich=true").unwrap()
+        )
+        .is_ok());
+        // Filter that pushes down → eligible.
+        assert!(check_prevalence_pushdown_eligible(
+            &parse_query("error | prevalence hash_prevalence <= 5 window=7d").unwrap()
+        )
+        .is_ok());
+        // Filter + only simple post-commands → still pushes down.
+        assert!(check_prevalence_pushdown_eligible(
+            &parse_query(
+                "error | prevalence domain_prevalence < 3 | where x>1 | sort -count | head 20 | table a,b"
+            )
+            .unwrap()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_prevalence_pushdown_ineligible_aggregation_before() {
+        let query =
+            parse_query("error | stats count by user | prevalence hash_prevalence <= 5").unwrap();
+        assert!(check_prevalence_pushdown_eligible(&query).is_err());
+    }
+
+    #[test]
+    fn test_prevalence_pushdown_eligible_inpipeline_post() {
+        // stats/eval after the filter push down over the already-rare set, so
+        // the router routes them through the JOIN — they must stay eligible,
+        // matching `has_only_simple_post_prevalence_commands`.
+        let query =
+            parse_query("error | prevalence hash_prevalence <= 5 | stats count by src_ip").unwrap();
+        assert!(check_prevalence_pushdown_eligible(&query).is_ok());
+        let query2 = parse_query("error | prevalence hash_prevalence <= 5 | eval y=1").unwrap();
+        assert!(check_prevalence_pushdown_eligible(&query2).is_ok());
+    }
+
+    #[test]
+    fn test_prevalence_pushdown_ineligible_requerying_post() {
+        // streamstats is NOT in the JOIN-safe post-command set, so the router
+        // falls to the in-memory path — the gate must reject it.
+        let query =
+            parse_query("error | prevalence hash_prevalence <= 5 | streamstats count").unwrap();
+        assert!(check_prevalence_pushdown_eligible(&query).is_err());
+    }
+
+    /// Lock-step guard: the author-time gate must agree with the boolean the
+    /// search router (`use_prevalence_join`) computes for the same query shape,
+    /// minus the deploy-invariant `is_clickhouse`/`has_prevalence_svc` terms.
+    /// Mirrors NAN-1688's `test_realtime_eligible_matches_ddl_acceptance`.
+    #[test]
+    fn test_prevalence_pushdown_matches_router_gate() {
+        let corpus = [
+            "error | head 10",
+            "error | prevalence enrich=true",
+            "error | prevalence hash_prevalence <= 5 window=7d",
+            "error | prevalence domain_prevalence < 3 | where x>1 | sort -count",
+            "error | stats count by user | prevalence hash_prevalence <= 5",
+            "error | prevalence hash_prevalence <= 5 | stats count by src_ip",
+            "error | prevalence hash_prevalence <= 5 | eval y=1",
+            "error | prevalence hash_prevalence <= 5 | streamstats count",
+            // NAN-1691: a timestamp-field (first_seen) filter is NOT a count-field
+            // filter — it never pushes down and no-ops in memory, so both the gate
+            // and the router-model below must treat it like "no filter" (Ok), even
+            // when it sits after an aggregation. This is the blind spot the earlier
+            // `router_ok` model (missing the is_count_field term) papered over.
+            "error | prevalence hash_first_seen > now() - 24h",
+            "error | stats count by user | prevalence hash_first_seen > now() - 24h",
+        ];
+        for q in corpus {
+            let query = parse_query(q).unwrap();
+            let gate_ok = check_prevalence_pushdown_eligible(&query).is_ok();
+            // Mirror the router's `has_pushable_prevalence_filter`: a filter is
+            // pushable only when every condition is a count field. A timestamp-field
+            // (first_seen) filter is not pushable and no-ops in memory, so it counts
+            // as "no filter" here.
+            let has_filter = extract_prevalence_commands(&query).iter().any(|c| {
+                !c.conditions.is_empty()
+                    && c.conditions.iter().all(|cond| cond.field.is_count_field())
+            });
+            // The router pushdown predicate for the FILTER form (excluding the
+            // deploy-invariant terms). No pushable filter → always safe (gate returns Ok).
+            let router_ok = if has_filter {
+                !has_aggregation_before_prevalence(&query)
+                    && has_only_simple_post_prevalence_commands(
+                        &extract_post_prevalence_commands(&query).commands,
+                    )
+            } else {
+                true
+            };
+            assert_eq!(gate_ok, router_ok, "gate/router divergence on: {q}");
+        }
     }
 
     #[test]

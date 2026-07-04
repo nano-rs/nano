@@ -391,8 +391,84 @@ export function TimelineVisualization({
   const fetchScatterDataRef = useRef(fetchScatterData);
   fetchScatterDataRef.current = fetchScatterData;
 
-  // Extract artifacts WITH timestamps from search results
-  const extractedData = useMemo(() => extractArtifactsWithTimestamps(results), [results]);
+  // Extract artifacts WITH timestamps from search results.
+  //
+  // NAN-1689: the default results view is fetched with `table_view=true` (a slim
+  // ~11-column projection for fast load) which PRUNES process_hash/file_hash/
+  // domain columns — so the slim `results` almost never yield artifacts and the
+  // Rarity view would be permanently empty. We keep the table view slim (perf)
+  // and instead fetch a full-field page on demand when Rarity is opened and the
+  // slim rows carry no artifacts, then extract from that.
+  const slimExtracted = useMemo(() => extractArtifactsWithTimestamps(results), [results]);
+  const slimHasArtifacts = slimExtracted.hashes.length > 0 || slimExtracted.domains.length > 0;
+
+  // Stable identity for the current query + window. The on-demand fetch below is
+  // keyed on this so a previous query's rows are NEVER reused for a newer one
+  // (fetches are async — the query can change before one resolves).
+  const artifactFetchKey = useMemo(
+    () =>
+      _query && timeRange?.start && timeRange?.end
+        ? `${_query}|${timeRange.start}|${timeRange.end}`
+        : null,
+    [_query, timeRange],
+  );
+
+  const [fetchedArtifacts, setFetchedArtifacts] = useState<{ key: string; rows: SearchResult[] } | null>(null);
+  const [artifactFetchLoading, setArtifactFetchLoading] = useState(false);
+  const artifactFetchKeyRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    // Only needed when Rarity is open, the slim rows lack artifacts, and this is
+    // a normal (non-asset) query we can re-run. Asset mode fetches its own
+    // artifact summaries via `assetContext`.
+    if (mode !== 'prevalence' || isAssetMode || slimHasArtifacts || !artifactFetchKey) return;
+    if (artifactFetchKeyRef.current === artifactFetchKey) return; // already fetched/attempted
+    artifactFetchKeyRef.current = artifactFetchKey;
+    setArtifactFetchLoading(true);
+    let cancelled = false;
+    api
+      .search({
+        query: _query!,
+        time_range: timeRange!,
+        limit: 500,
+        table_view: false, // full projection so process_hash/file_hash/domains are present
+        skip_field_stats: true,
+        skip_histogram: true,
+      })
+      .then((resp) => {
+        if (cancelled) return;
+        const rows: SearchResult[] = (resp.results || [])
+          .filter((r): r is Record<string, unknown> => r != null && typeof r === 'object')
+          .map((r, i) => ({
+            id: `rarity-${i}`,
+            timestamp: parseTimestampAsUTC(r.timestamp as string | undefined),
+            source: String(r.src_host ?? r.src_ip ?? 'unknown'),
+            fields: r,
+          }));
+        setFetchedArtifacts({ key: artifactFetchKey, rows });
+      })
+      .catch(() => {
+        if (cancelled) return;
+        // Reset the key so a transient failure can be retried (e.g. by toggling
+        // back to Rarity) rather than wedging the tab until the query changes.
+        if (artifactFetchKeyRef.current === artifactFetchKey) artifactFetchKeyRef.current = null;
+      })
+      .finally(() => {
+        if (!cancelled) setArtifactFetchLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, isAssetMode, slimHasArtifacts, artifactFetchKey, _query, timeRange]);
+
+  // Only trust fetched rows that belong to the CURRENT query + window; a stale
+  // set from a prior query is ignored (→ empty until the new fetch resolves).
+  const extractedData = useMemo(() => {
+    if (slimHasArtifacts) return slimExtracted;
+    const fresh =
+      fetchedArtifacts && fetchedArtifacts.key === artifactFetchKey ? fetchedArtifacts.rows : [];
+    return extractArtifactsWithTimestamps(fresh);
+  }, [slimHasArtifacts, slimExtracted, fetchedArtifacts, artifactFetchKey]);
   const hasArtifacts = extractedData.hashes.length > 0 || extractedData.domains.length > 0;
 
   // The picker window, as a numeric [start, end] (ms), or null if unusable.
@@ -912,7 +988,10 @@ export function TimelineVisualization({
             {!staticMode && (
               <Tabs
                 value={mode === 'timeline' ? 'stream' : 'rarity'}
-                onValueChange={(v) => { if (v === 'stream' || (v === 'rarity' && (hasArtifacts || !hasSearched))) setMode(v === 'stream' ? 'timeline' : 'prevalence'); }}
+                // NAN-1689: Rarity is available whenever a search has run — opening
+                // it fetches full-field artifacts on demand (the slim table_view
+                // rows can't be relied on to carry hashes/domains).
+                onValueChange={(v) => setMode(v === 'stream' ? 'timeline' : 'prevalence')}
                 onClick={(e) => e.stopPropagation()}
               >
                 <TabsList className="h-auto rounded-md p-0.5 bg-foreground/[0.03] border border-border gap-0">
@@ -925,8 +1004,14 @@ export function TimelineVisualization({
                   </TabsTrigger>
                   <TabsTrigger
                     value="rarity"
-                    disabled={!hasArtifacts && hasSearched}
-                    title={hasArtifacts ? 'Artifact Rarity' : 'No artifacts found in current results'}
+                    disabled={!hasSearched && !isAssetMode}
+                    title={
+                      artifactFetchLoading
+                        ? 'Finding artifacts…'
+                        : !hasSearched && !isAssetMode
+                          ? 'Run a search to see artifact rarity'
+                          : 'Artifact Rarity'
+                    }
                     className="h-auto rounded-sm py-0.5 px-2.5 text-[10.5px] tracking-[0.06em] gap-1.5 font-medium normal-case data-[state=active]:bg-primary/10 data-[state=active]:text-primary data-[state=inactive]:text-muted-foreground hover:text-foreground data-[state=active]:hover:text-primary"
                   >
                     <Fingerprint className="w-[11px] h-[11px]" />
@@ -1044,7 +1129,7 @@ export function TimelineVisualization({
                     <AlertTriangle className="w-4 h-4 mr-2" />{error}
                     <Button variant="ghost" size="sm" onClick={() => loadScatterData()} className="ml-4 text-muted-foreground hover:text-primary"><RefreshCw className="w-3 h-3 mr-1" />Retry query</Button>
                   </div>
-                ) : isLoading && !scatterData ? (
+                ) : (isLoading || artifactFetchLoading) && !scatterData ? (
                   <div className="flex items-center justify-center py-8 text-muted-foreground text-sm"><Loader2 className="w-4 h-4 mr-2 animate-spin" />Loading rarity index...</div>
                 ) : scatterData ? (
                   <PrevalenceScatterPlot data={scatterData} onArtifactClick={handleArtifactClick} onSelectionChange={handleSelectionChange} height={180} loading={isLoading} timeRange={timeRange} onMaxHostCountChange={isAssetMode ? handleMaxHostCountChange : undefined} />

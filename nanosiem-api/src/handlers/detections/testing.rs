@@ -616,6 +616,27 @@ pub async fn validate_detection(
         Err(reason) => (false, Some(reason.clone())),
     };
 
+    // NAN-1691 (P1-C): prevalence-pushdown safety — the same single-source gate
+    // the search router applies, so validation can't green-light a `| prevalence`
+    // FILTER shape the router then sends down the in-memory fallback path.
+    let prevalence_shape: Result<(), String> = match parse_result.as_ref() {
+        Ok(parsed) => {
+            nanosiem_core::search::query_processing::check_prevalence_pushdown_eligible(parsed)
+        }
+        Err(_) => Ok(()), // parse errors already surfaced via `valid`
+    };
+    let (prevalence_pushdown_safe, prevalence_pushdown_reason) = match &prevalence_shape {
+        Ok(()) => (true, None),
+        Err(reason) => {
+            // Fold into the existing `warning` so current UIs that only read
+            // `warning` still surface the eligibility feedback.
+            if warning.is_none() {
+                warning = Some(reason.clone());
+            }
+            (false, Some(reason.clone()))
+        }
+    };
+
     // Determine effective mode and whether an MV will be created.
     let (effective_mode, creates_mv, mode_reason) = if requested_mode == "real-time"
         || requested_mode == "realtime"
@@ -671,6 +692,8 @@ pub async fn validate_detection(
         } else {
             None
         },
+        prevalence_pushdown_safe,
+        prevalence_pushdown_reason,
         warning,
         errors,
         referenced_fields,

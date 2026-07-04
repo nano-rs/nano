@@ -1213,49 +1213,66 @@ impl PrevalenceService {
         ips: &[String],
         time_window: TimeWindow,
     ) -> Result<PrevalenceScatterData, PrevalenceError> {
-        let config = self.config.read().await;
-
-        // Get hash prevalence data
-        let hash_points: Vec<PrevalenceScatterPoint> =
-            if !hashes.is_empty() && config.enable_hash_tracking {
-                self.get_bulk_prevalence(hashes, time_window)
-                    .await?
-                    .into_iter()
-                    .map(PrevalenceScatterPoint::from)
-                    .collect()
-            } else {
-                Vec::new()
-            };
-
-        // Get domain prevalence data
-        let domain_points: Vec<PrevalenceScatterPoint> =
-            if !domains.is_empty() && config.enable_domain_tracking {
-                self.get_bulk_prevalence(domains, time_window)
-                    .await?
-                    .into_iter()
-                    .map(PrevalenceScatterPoint::from)
-                    .collect()
-            } else {
-                Vec::new()
-            };
-
-        // Get IP prevalence data
-        let ip_points: Vec<PrevalenceScatterPoint> = if !ips.is_empty() && config.enable_ip_tracking
-        {
-            self.get_bulk_prevalence(ips, time_window)
-                .await?
-                .into_iter()
-                .map(PrevalenceScatterPoint::from)
-                .collect()
-        } else {
-            Vec::new()
+        // Snapshot the config values we need and release the guard *before*
+        // the concurrent fetches — get_bulk_prevalence_via_dict re-acquires
+        // config.read() internally, and holding an outer read guard across a
+        // queued writer would deadlock tokio's write-preferring RwLock.
+        let (enable_hash, enable_domain, enable_ip, rarity_threshold) = {
+            let config = self.config.read().await;
+            (
+                config.enable_hash_tracking,
+                config.enable_domain_tracking,
+                config.enable_ip_tracking,
+                config.rarity_threshold,
+            )
         };
+
+        // NAN-1691 (P2-C): dict lookups (in-RAM) instead of the *_prevalence_agg
+        // uniqMerge scan, and fetch all three kinds concurrently so tab-open
+        // latency is max(kind) rather than sum(kind).
+        let (hash_res, domain_res, ip_res) = tokio::join!(
+            async {
+                if !hashes.is_empty() && enable_hash {
+                    self.get_bulk_prevalence_via_dict(hashes, time_window).await
+                } else {
+                    Ok(Vec::new())
+                }
+            },
+            async {
+                if !domains.is_empty() && enable_domain {
+                    self.get_bulk_prevalence_via_dict(domains, time_window)
+                        .await
+                } else {
+                    Ok(Vec::new())
+                }
+            },
+            async {
+                if !ips.is_empty() && enable_ip {
+                    self.get_bulk_prevalence_via_dict(ips, time_window).await
+                } else {
+                    Ok(Vec::new())
+                }
+            },
+        );
+
+        let hash_points: Vec<PrevalenceScatterPoint> = hash_res?
+            .into_iter()
+            .map(PrevalenceScatterPoint::from)
+            .collect();
+        let domain_points: Vec<PrevalenceScatterPoint> = domain_res?
+            .into_iter()
+            .map(PrevalenceScatterPoint::from)
+            .collect();
+        let ip_points: Vec<PrevalenceScatterPoint> = ip_res?
+            .into_iter()
+            .map(PrevalenceScatterPoint::from)
+            .collect();
 
         Ok(PrevalenceScatterData {
             hash_points,
             domain_points,
             ip_points,
-            rarity_threshold: config.rarity_threshold,
+            rarity_threshold,
         })
     }
 }

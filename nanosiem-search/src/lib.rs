@@ -301,7 +301,15 @@ impl SearchState {
                 let prevalence_settings =
                     nanosiem_core::prevalence::PrevalenceSettings::new(dual_pool.postgres().clone());
                 match prevalence_settings.get_config().await {
-                    Ok(cfg) => prevalence.update_config(cfg).await,
+                    Ok(cfg) => {
+                        // NAN-1691 (P3): only hot-reload when the DB config
+                        // actually differs. update_config() wipes the prevalence
+                        // LRU; calling it every 60s tick discarded a warm cache
+                        // even when nothing had changed.
+                        if cfg != prevalence.get_config().await {
+                            prevalence.update_config(cfg).await;
+                        }
+                    }
                     Err(e) => {
                         tracing::debug!("Config poll: could not read prevalence settings: {}", e);
                     }

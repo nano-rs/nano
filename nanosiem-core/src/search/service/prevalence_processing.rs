@@ -125,35 +125,44 @@ impl SearchService {
             return Ok(results);
         }
 
-        // Determine which result-row key to extract artifacts from based on PrevalenceField.
+        // Determine which result-row key(s) to extract artifacts from based on PrevalenceField.
         //
         // NAN-1241: these are the RESULT-ROW output field names (the keys serde produced from
         // the SELECT aliases), not raw SQL columns — so they follow the active schema's output
-        // naming. Resolve the UDM-semantic concept through the profile: UDM yields the same
-        // `file_hash`/`dest_host` literal (byte-identical), OCSF yields its promoted output
-        // column name. If the active schema has no column for the concept, the filter cannot
-        // apply — short-circuit gracefully rather than scanning a field that never exists.
+        // naming. Resolve the UDM-semantic concept(s) through the profile: UDM yields the same
+        // `file_hash`/`process_hash`/`dest_host` literals (byte-identical), OCSF yields its
+        // promoted output column names. If the active schema maps NONE of the concepts, the
+        // filter cannot apply — short-circuit gracefully rather than scanning fields that never
+        // exist.
+        //
+        // NAN-1691 LOCK-STEP: this residual in-memory path MUST agree with the WHERE pushdown
+        // (`prevalence_filter_condition_to_sql`), which keys HashPrevalence on
+        // `lower(COALESCE(file_hash, process_hash))` via the JOIN's `_hp_host_count` alias — so
+        // a sysmon row carrying only a process_hash still matches. Hence hash lookups here try
+        // `file_hash` first and fall back to `process_hash` (COALESCE semantics). DomainPrevalence
+        // stays `dest_host`, matching the domain alias. Keep the two paths in lock-step or the
+        // filter form returns different row sets depending on whether it pushed down.
         let profile = self.active_profile.as_ref();
-        let udm_concept = match field {
-            PrevalenceField::HashPrevalence | PrevalenceField::HashFirstSeen => "file_hash",
-            PrevalenceField::DomainPrevalence | PrevalenceField::DomainFirstSeen => "dest_host",
-        };
-        let artifact_field: String = match profile.udm_column_sql(udm_concept) {
-            // udm_column_sql returns the SQL-escaped column; strip the OCSF double-quotes so we
-            // index the JSON result map by the bare output key. UDM is unquoted → unchanged
-            // (byte-identical). TODO(OCSF): the result-row KEY equals the promoted column's
-            // serde name; if OCSF serialization ever renames it (vs the bare dotted column),
-            // this lookup key must follow that renaming.
-            Some(col) => col.trim_matches('"').to_string(),
-            None => {
-                debug!(
-                    "Prevalence filtering: active schema has no column for '{}'; skipping filter",
-                    udm_concept
-                );
-                return Ok(results);
-            }
-        };
-        let artifact_field: &str = artifact_field.as_str();
+        let udm_concepts = prevalence_filter_udm_concepts(field);
+        // udm_column_sql returns the SQL-escaped column; strip the OCSF double-quotes so we index
+        // the JSON result map by the bare output key. UDM is unquoted → unchanged (byte-identical).
+        // TODO(OCSF): the result-row KEY equals the promoted column's serde name; if OCSF
+        // serialization ever renames it (vs the bare dotted column), these keys must follow.
+        let artifact_fields: Vec<String> = udm_concepts
+            .iter()
+            .filter_map(|concept| {
+                profile
+                    .udm_column_sql(concept)
+                    .map(|col| col.trim_matches('"').to_string())
+            })
+            .collect();
+        if artifact_fields.is_empty() {
+            debug!(
+                "Prevalence filtering: active schema has no column for {:?}; skipping filter",
+                udm_concepts
+            );
+            return Ok(results);
+        }
 
         // For timestamp-based fields, we need different handling
         if field.is_timestamp_field() {
@@ -164,20 +173,15 @@ impl SearchService {
         // Extract unique artifacts from results
         let artifacts: Vec<String> = results
             .iter()
-            .filter_map(|row| {
-                row.get(artifact_field)
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-            })
+            .filter_map(|row| extract_prevalence_artifact(row, &artifact_fields))
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
 
         if artifacts.is_empty() {
             debug!(
-                "No artifacts found in field '{}' for prevalence filtering",
-                artifact_field
+                "No artifacts found in fields {:?} for prevalence filtering",
+                artifact_fields
             );
             return Ok(results);
         }
@@ -234,15 +238,14 @@ impl SearchService {
         let filtered_results: Vec<serde_json::Value> = results
             .into_iter()
             .filter(|row| {
-                let artifact = row
-                    .get(artifact_field)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-
-                if artifact.is_empty() {
-                    // Exclude rows without the artifact (matches JOIN path where NULL host_count is excluded by WHERE)
-                    return false;
-                }
+                // COALESCE across the resolved fields (file_hash → process_hash for hashes),
+                // matching the pushdown. A row with none of them is excluded (mirrors the JOIN
+                // path where a NULL host_count is dropped by the WHERE).
+                let artifact = match extract_prevalence_artifact(row, &artifact_fields) {
+                    Some(a) => a,
+                    None => return false,
+                };
+                let artifact = artifact.as_str();
 
                 // Dict-based map keys are lowercase for hash/domain (the only
                 // two artifact types this filter handles); lowercase the row's
@@ -1157,6 +1160,76 @@ pub(crate) fn prevalence_passes_filter(
         PrevalenceOperator::Eq => prevalence == threshold,
         PrevalenceOperator::Ne => prevalence != threshold,
     }
+}
+
+/// The ordered UDM-semantic concept list a prevalence FILTER keys on, in COALESCE
+/// priority order.
+///
+/// NAN-1691 LOCK-STEP: hash filters try `file_hash` first, then `process_hash`, matching
+/// the pushdown's `lower(COALESCE(file_hash, process_hash))` (the JOIN's `_hp_host_count`
+/// alias) — so a sysmon row carrying ONLY a process_hash matches on BOTH the in-memory
+/// path and the pushed-down path. Domain filters use `dest_host`, matching the domain
+/// alias. If this diverges from `prevalence_filter_condition_to_sql`, the filter form
+/// returns different row sets depending on whether it pushed down.
+pub(crate) fn prevalence_filter_udm_concepts(
+    field: &PrevalenceField,
+) -> &'static [&'static str] {
+    match field {
+        PrevalenceField::HashPrevalence | PrevalenceField::HashFirstSeen => {
+            &["file_hash", "process_hash"]
+        }
+        PrevalenceField::DomainPrevalence | PrevalenceField::DomainFirstSeen => &["dest_host"],
+    }
+}
+
+/// COALESCE artifact extraction: the first non-empty string value across `fields`
+/// (result-row output keys), in order. Mirrors the SQL `COALESCE(...)` the pushdown
+/// emits — a hash row falls back from `file_hash` to `process_hash`.
+pub(crate) fn extract_prevalence_artifact(
+    row: &serde_json::Value,
+    fields: &[String],
+) -> Option<String> {
+    fields.iter().find_map(|f| {
+        row.get(f.as_str())
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    })
+}
+
+/// Map a single `| prevalence <field> <op> N` count condition to a SQL predicate over the
+/// windowed, dict-masked host-count aliases the prevalence JOIN CTE computes
+/// (`_hp_host_count` for hash, `_dp_host_count` for domain). Returns None for conditions
+/// that don't push down (timestamp fields, Duration thresholds) — those stay on the
+/// no-op in-memory path, preserving today's behavior.
+///
+/// NAN-1691: the `< 9999` presence guard makes a dict miss / out-of-window entry fail
+/// every operator, mirroring `prevalence_passes_filter(None, …) == false` so the pushdown
+/// yields the SAME row set as the in-memory filter.
+pub(crate) fn prevalence_filter_condition_to_sql(
+    cond: &crate::query::PrevalenceCondition,
+) -> Option<String> {
+    use crate::query::{PrevalenceField, PrevalenceOperator, PrevalenceThreshold};
+
+    let alias = match cond.field {
+        PrevalenceField::HashPrevalence => "_hp_host_count",
+        PrevalenceField::DomainPrevalence => "_dp_host_count",
+        // first_seen fields have no command-form SQL filter (in-memory no-ops them).
+        PrevalenceField::HashFirstSeen | PrevalenceField::DomainFirstSeen => return None,
+    };
+    let n = match cond.threshold {
+        PrevalenceThreshold::Count(n) => n,
+        PrevalenceThreshold::Duration(_) => return None,
+    };
+    let op = match cond.operator {
+        PrevalenceOperator::Lt => "<",
+        PrevalenceOperator::Lte => "<=",
+        PrevalenceOperator::Gt => ">",
+        PrevalenceOperator::Gte => ">=",
+        PrevalenceOperator::Eq => "=",
+        PrevalenceOperator::Ne => "!=",
+    };
+    Some(format!("({alias} < 9999 AND {alias} {op} {n})"))
 }
 
 #[cfg(test)]

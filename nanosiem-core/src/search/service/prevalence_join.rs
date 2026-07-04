@@ -26,14 +26,28 @@ impl SearchService {
         start_time: Instant,
         auto_sort_decision: &crate::search::query_processing::AutoSortDecision,
     ) -> Result<SearchResponse, SearchError> {
-        // Get the time window from prevalence command
-        let time_window = match prevalence_commands
-            .first()
-            .and_then(|cmd| cmd.time_window.as_ref())
-        {
-            Some(tw) => ast_to_prevalence_time_window(Some(tw))?,
-            None => PrevalenceTimeWindow::ThirtyDays,
-        };
+        // Get the time window from the prevalence command(s). All conditions are
+        // flattened into ONE dictGet mask (a single window_cutoff_sql), so mixed
+        // windows across multiple `| prevalence` commands can't be honored
+        // per-command. Reject that rather than silently applying the first
+        // command's window to every condition (NAN-1691 Codex review) — the old
+        // in-memory path evaluated each command's window independently.
+        let mut time_window: Option<PrevalenceTimeWindow> = None;
+        for cmd in prevalence_commands {
+            if let Some(tw) = cmd.time_window.as_ref() {
+                let tw = ast_to_prevalence_time_window(Some(tw))?;
+                if let Some(existing) = time_window {
+                    if existing != tw {
+                        return Err(SearchError::SqlValidationError(
+                            "multiple `| prevalence` commands with different windows are not \
+                             supported in one query; use a single window".to_string(),
+                        ));
+                    }
+                }
+                time_window = Some(tw);
+            }
+        }
+        let time_window = time_window.unwrap_or(PrevalenceTimeWindow::ThirtyDays);
 
         // Strip prevalence and post-prevalence commands from query for base SQL generation
         let base_query = strip_prevalence_and_after(query);
@@ -77,12 +91,27 @@ impl SearchService {
         // Generate the JOIN-based SQL with prevalence filtering
         // num_commands_pushed indicates how many post-prevalence commands were pushed into SQL
         // (aggregation + trailing sort/head/etc.) and should be skipped in Rust post-processing
-        // Pagination is owned by `execute_clickhouse_sql` below (the SQL matches
-        // is_aggregation_query, so the executor wraps it with LIMIT/OFFSET + the
-        // count(*) OVER () total) — the generator no longer takes limit/offset.
+        // Pagination is owned by `execute_clickhouse_sql` below — the generator
+        // no longer takes limit/offset. NAN-1691 (P1-B): enrich-only / filter-only
+        // prevalence SQL is 1:1 row decoration (host_count / is_rare /
+        // prevalence_score columns), NOT an aggregation, so it now takes the
+        // executor's raw-event branch (inject_limit_offset + a bounded count
+        // companion). Only when a real aggregation is pushed down (`… | stats …`)
+        // does the SQL trip `is_aggregation_query` and get the count(*) OVER ()
+        // full-window wrap.
+        // NAN-1691: the filter form carries its predicate INSIDE the prevalence command
+        // (conditions), not as a post-prevalence WHERE. Push those into the dictGet WHERE
+        // over the windowed host-count aliases so the filter runs in ClickHouse instead of
+        // the 1M-row in-memory fetch.
+        let filter_conditions: Vec<crate::query::PrevalenceCondition> = prevalence_commands
+            .iter()
+            .flat_map(|cmd| cmd.conditions.iter().cloned())
+            .collect();
+
         let (sql, num_commands_pushed) = self.generate_prevalence_join_sql(
             &base_sql,
             post_prevalence_commands,
+            &filter_conditions,
             time_window,
             rarity_threshold,
         )?;
@@ -355,6 +384,7 @@ impl SearchService {
         &self,
         base_sql: &str,
         post_prevalence_commands: &[Command],
+        filter_conditions: &[crate::query::PrevalenceCondition],
         time_window: PrevalenceTimeWindow,
         rarity_threshold: u64,
     ) -> Result<(String, usize), SearchError> {
@@ -374,7 +404,11 @@ impl SearchService {
         // still rejected — dict refresh is 5–10 min, so sub-day granularity isn't meaningful.
         let window_cutoff_sql: &str = match time_window {
             PrevalenceTimeWindow::OneHour => {
-                return Err(SearchError::SqlGenError(
+                // NAN-1689: SqlValidationError → clean 400 carrying the real
+                // message (error.rs maps it to QueryError without masking).
+                // Previously SqlGenError, which was masked to "Query processing
+                // failed". Matches the dict-fallback rejection in service/mod.rs.
+                return Err(SearchError::SqlValidationError(
                     "prevalence window=1h is not supported; use 24h, 7d, or 30d".to_string(),
                 ));
             }
@@ -580,6 +614,19 @@ impl SearchService {
             }
         }
 
+        // NAN-1691: filter-form conditions → dictGet WHERE over the windowed host-count
+        // aliases the base_logs CTE already computes. Miss / out-of-window → 9999 → the
+        // `< 9999` presence guard drops the row for EVERY operator, exactly matching the
+        // in-memory `prevalence_passes_filter` (None → false). These AND together with any
+        // post-prevalence WHEREs above, mirroring the in-memory per-condition AND loop.
+        for cond in filter_conditions {
+            if let Some(pred) =
+                super::prevalence_processing::prevalence_filter_condition_to_sql(cond)
+            {
+                where_conditions.push(pred);
+            }
+        }
+
         // Strip ORDER BY and LIMIT from base SQL since we'll add our own
         let base_sql_clean = base_sql.trim().trim_end_matches(';');
 
@@ -633,6 +680,44 @@ impl SearchService {
             t = rt,
         );
 
+        // NAN-1691 (P1-B): enrich-only prevalence is 1:1 row decoration. Cap the rows that
+        // flow into the dictGet projections at DEFAULT_RESULT_LIMIT (the standard safety cap
+        // applied to every other raw-event query) so an unbounded window scan can no longer
+        // OOM the shared pod. `ORDER BY timestamp DESC` picks the newest N — matching the
+        // final `ORDER BY l.timestamp DESC` at the outer SELECT — and the bound lands where
+        // the ORDER-BY stripper cannot delete it and where the executor sees a ` LIMIT `
+        // (forcing the structural pagination wrap instead of SETTINGS string-surgery).
+        //
+        // When the enrich pipeline feeds a downstream aggregation (stats/top/rare/timechart,
+        // pushed to a SQL GROUP BY below) the aggregation needs its full input set, so the
+        // base stays unbounded there — exactly as before.
+        let has_downstream_aggregation = post_prevalence_commands.iter().any(|cmd| {
+            matches!(
+                cmd,
+                Command::Stats { .. }
+                    | Command::Top { .. }
+                    | Command::Rare { .. }
+                    | Command::Timechart { .. }
+            )
+        });
+        // NAN-1691 (Codex review): the FILTER form pushes a dictGet host_count
+        // predicate into the query — it must run over the FULL windowed base, not
+        // a pre-limited newest-N slice, or rare rows earlier in the window are
+        // silently missed (and total_count is capped to that slice). The dictGet
+        // predicate is cheap/streaming (measured ~41 MiB over 91M rows) and the
+        // outer LIMIT bounds the — by definition small — rare output, so no
+        // pre-limit is needed. Only the enrich-ONLY form (1:1 row decoration that
+        // returns every base row) needs the safety bound.
+        let has_prevalence_filter = !filter_conditions.is_empty();
+        let raw_logs_bound = if has_downstream_aggregation || has_prevalence_filter {
+            String::new()
+        } else {
+            format!(
+                "\n    ORDER BY timestamp DESC\n    LIMIT {}",
+                crate::query::ClickHouseSqlGenerator::DEFAULT_RESULT_LIMIT
+            )
+        };
+
         // Build the final SQL using dictGet() against precomputed per-window prevalence dicts.
         // NAN-362: Replaces the old CTE + LEFT JOIN path which aggregated the entire
         // *_prevalence_agg universe before joining (O(universe) memory — OOM on any
@@ -644,7 +729,7 @@ impl SearchService {
             r#"WITH raw_logs AS (
     SELECT * FROM (
         {base_sql}
-    )
+    ){raw_logs_bound}
 ),
 logs_with_keys AS (
     SELECT *,
@@ -727,6 +812,7 @@ SELECT
 FROM base_logs l{extra_where}
 ORDER BY l.timestamp DESC"#,
             base_sql = base_sql_no_order,
+            raw_logs_bound = raw_logs_bound,
             domain_dict = domain_dict,
             ip_dict = ip_dict,
             hash_dict = hash_dict,
@@ -780,16 +866,21 @@ ORDER BY l.timestamp DESC"#,
             sql = format!("{}\nSELECT * FROM {}", cte_sql, current_source);
         }
         // NAN-366 pagination fix: do NOT append `LIMIT {limit} OFFSET {offset}` here.
-        // This SQL matches `is_aggregation_query` (it projects host_count / is_rare /
-        // prevalence_score), so the executor wraps it in
+        // The executor (`execute_sql_with_query_id`) owns pagination + the pre-pagination
+        // total in BOTH of its branches, so appending it here would double-paginate.
+        // NAN-1691 (P1-B): enrich-only / filter-only prevalence SQL is 1:1 row decoration
+        // (host_count / is_rare / prevalence_score), NOT an aggregation, so it now takes the
+        // raw-event branch — `inject_limit_offset` slices the page and a bounded count
+        // companion reports the total. Only when a real aggregation is pushed down
+        // (`… | stats …`) does the SQL match `is_aggregation_query` and get the
         // `SELECT *, count(*) OVER () AS _total_count FROM (<sql>) LIMIT {limit} OFFSET {offset}`
-        // and owns pagination + the pre-pagination total. Appending LIMIT/OFFSET here too
-        // double-paginated: page 1's `count(*) OVER ()` ran AFTER the inner LIMIT so the
-        // reported total was capped at the page size, and page 2+ came back EMPTY because
-        // the outer OFFSET slid past the already-offset inner window. Leaving the query
-        // unbounded (the base CTE still carries its own safety LIMIT) lets the outer wrap
-        // slice the page and report the real total. The push-down branch above already
-        // relied on this — it never appended pagination either.
+        // wrap. Either way, appending LIMIT/OFFSET here too double-paginated: page 1's
+        // `count(*) OVER ()` ran AFTER the inner LIMIT so the reported total was capped at
+        // the page size, and page 2+ came back EMPTY because the outer OFFSET slid past the
+        // already-offset inner window. Leaving the query unbounded (the base CTE still
+        // carries its own safety LIMIT) lets the executor slice the page and report the real
+        // total. The push-down branch above already relied on this — it never appended
+        // pagination either.
 
         tracing::debug!(
             "Generated prevalence SQL (first 2000 chars): {}",
