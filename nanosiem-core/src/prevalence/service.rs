@@ -1214,9 +1214,9 @@ impl PrevalenceService {
         time_window: TimeWindow,
     ) -> Result<PrevalenceScatterData, PrevalenceError> {
         // Snapshot the config values we need and release the guard *before*
-        // the concurrent fetches — get_bulk_prevalence_via_dict re-acquires
-        // config.read() internally, and holding an outer read guard across a
-        // queued writer would deadlock tokio's write-preferring RwLock.
+        // the concurrent fetches — get_bulk_prevalence re-acquires config.read()
+        // internally, and holding an outer read guard across a queued writer
+        // would deadlock tokio's write-preferring RwLock.
         let (enable_hash, enable_domain, enable_ip, rarity_threshold) = {
             let config = self.config.read().await;
             (
@@ -1227,28 +1227,37 @@ impl PrevalenceService {
             )
         };
 
-        // NAN-1691 (P2-C): dict lookups (in-RAM) instead of the *_prevalence_agg
-        // uniqMerge scan, and fetch all three kinds concurrently so tab-open
-        // latency is max(kind) rather than sum(kind).
+        // NAN-1699: the scatter looks up prevalence for a BOUNDED set of specific
+        // artifacts pulled from the search results, and must return ALL of them —
+        // including common ones — so the chart can render them (faded) and the
+        // host-count slider can filter on real counts. The dict path
+        // (`get_bulk_prevalence_via_dict`, NAN-1691 P2-C) ends with
+        // `WHERE host_count_masked < 9999`, which silently DROPS every
+        // masked-common artifact: a 2000-host binary came back empty, so the
+        // frontend fabricated a rare-on-0-hosts "new to env" dot. Use the
+        // agg-based bulk lookup instead — bounded `file_hash IN (…)`, so it's
+        // fast — which returns real host_count + real env-first-seen for every
+        // requested artifact. (The `| prevalence` command keeps the dict path.)
+        // Still fetch the three kinds concurrently so tab-open latency is
+        // max(kind), not sum(kind).
         let (hash_res, domain_res, ip_res) = tokio::join!(
             async {
                 if !hashes.is_empty() && enable_hash {
-                    self.get_bulk_prevalence_via_dict(hashes, time_window).await
+                    self.get_bulk_prevalence(hashes, time_window).await
                 } else {
                     Ok(Vec::new())
                 }
             },
             async {
                 if !domains.is_empty() && enable_domain {
-                    self.get_bulk_prevalence_via_dict(domains, time_window)
-                        .await
+                    self.get_bulk_prevalence(domains, time_window).await
                 } else {
                     Ok(Vec::new())
                 }
             },
             async {
                 if !ips.is_empty() && enable_ip {
-                    self.get_bulk_prevalence_via_dict(ips, time_window).await
+                    self.get_bulk_prevalence(ips, time_window).await
                 } else {
                     Ok(Vec::new())
                 }

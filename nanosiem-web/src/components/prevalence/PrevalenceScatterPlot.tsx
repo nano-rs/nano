@@ -15,6 +15,9 @@ export interface PrevalenceScatterPoint {
   isRare: boolean;
   prevalenceScore: number;
   envFirstSeen?: Date;
+  // NAN-1700: prevalence not yet loaded for this artifact — plotted at its event
+  // time on the baseline while the (slow) rarity lookup runs, then enriched.
+  pending?: boolean;
 }
 
 export interface PrevalenceScatterData {
@@ -44,6 +47,7 @@ interface RarityDot {
   events: number;
   isRare: boolean;
   envFirstSeen?: Date;
+  pending?: boolean;
 }
 
 interface TipState {
@@ -132,6 +136,7 @@ export function PrevalenceScatterPlot({
       if (existing) {
         existing.events += p.totalOccurrences || 1;
         if (p.firstSeen < existing.firstSeen) existing.firstSeen = p.firstSeen;
+        if (!p.pending) existing.pending = false;
       } else {
         map.set(key, {
           artifact: p.artifact,
@@ -141,6 +146,7 @@ export function PrevalenceScatterPlot({
           events: p.totalOccurrences || 1,
           isRare: p.isRare,
           envFirstSeen: p.envFirstSeen,
+          pending: p.pending,
         });
       }
     };
@@ -446,18 +452,31 @@ export function PrevalenceScatterPlot({
           const cx = xScale(d.firstSeen.getTime()); // NAN-1695: event time (occurrence in window)
           const cy = yScale(Math.max(d.hostCount, 0.8));
           const r = Math.max(3, Math.min(9, Math.log10(d.events + 1) * 2.2));
-          // NAN-1696: 3-tier rarity opacity — rare pops, uncommon is present,
-          // common recedes (was a flat rare/faded binary that called 4 hosts
-          // "common").
-          const fillOpacity = d.isRare ? 1 : d.hostCount >= COMMON_HOST_THRESHOLD ? 0.3 : 0.6;
-          const strokeOpacity = d.isRare ? 0.9 : d.hostCount >= COMMON_HOST_THRESHOLD ? 0.18 : 0.4;
+          // Rarity opacity: rare pops, uncommon is present, common recedes hard,
+          // and an unbaselined (host_count 0 / no prevalence) dot recedes too — we
+          // have no signal, so don't draw the eye to it (NAN-1699). Common are
+          // kept very faint so they're visible-but-quiet when the slider is widened.
+          const recede = d.hostCount >= COMMON_HOST_THRESHOLD || d.hostCount === 0;
+          const fillOpacity = d.isRare ? 1 : recede ? 0.15 : 0.6;
+          const strokeOpacity = d.isRare ? 0.9 : recede ? 0.1 : 0.4;
           // Novelty ring: first seen in the env within the window. Gated to rare +
           // uncommon only — "new to env" is the actionable cue where spread is low;
           // on common (20+ hosts) it's just noise, so we keep those dots quiet.
           const isNovel =
+            !d.pending &&
+            d.hostCount > 0 &&
             d.hostCount < COMMON_HOST_THRESHOLD &&
             d.envFirstSeen != null &&
             nowMs - d.envFirstSeen.getTime() < NOVEL_WINDOW_MS;
+          // NAN-1700 progressive render: while prevalence is loading, the dot is
+          // plotted at its event time on the baseline (host_count 0) in a muted,
+          // pulsing "scoring…" state. When the lookup lands it animates up to its
+          // real rarity Y and colorizes — the transition on cy/fill does the reveal.
+          const dotFill = d.pending
+            ? 'var(--muted-foreground)'
+            : d.isRare
+            ? 'var(--primary)'
+            : 'var(--foreground)';
           return (
             <g
               key={`${d.artifactType}-${d.artifact}`}
@@ -485,12 +504,14 @@ export function PrevalenceScatterPlot({
                 r={r}
                 strokeWidth="1"
                 style={{
-                  fill: d.isRare ? 'var(--primary)' : 'var(--foreground)',
-                  fillOpacity,
-                  stroke: d.isRare ? 'var(--primary)' : 'var(--foreground)',
-                  strokeOpacity,
+                  fill: dotFill,
+                  fillOpacity: d.pending ? 0.4 : fillOpacity,
+                  stroke: dotFill,
+                  strokeOpacity: d.pending ? 0.25 : strokeOpacity,
+                  transition:
+                    'r 0.3s ease, cy 0.6s ease, cx 0.4s ease, fill 0.5s ease, fill-opacity 0.5s ease, stroke-opacity 0.5s ease',
                 }}
-                className={cn('transition-[r]', d.isRare && 'rare-glow')}
+                className={cn(d.pending && 'animate-pulse', !d.pending && d.isRare && 'rare-glow')}
               />
             </g>
           );
@@ -508,9 +529,17 @@ export function PrevalenceScatterPlot({
           No artifacts in current results
         </div>
       )}
-      {!loading && totalArtifacts > 0 && shownArtifacts === 0 && (
+      {!loading && totalArtifacts > 0 && shownArtifacts === 0 && !dots.some((d) => d.pending) && (
         <div className="absolute inset-0 flex items-center justify-center text-xs text-muted-foreground">
           {totalArtifacts} artifacts seen on &gt;{maxHostCount} hosts — raise the slider to see them
+        </div>
+      )}
+      {/* NAN-1700: dots are already plotted at their event times; this just
+          signals the rarity Y/color is still resolving in the background. */}
+      {dots.some((d) => d.pending) && (
+        <div className="absolute top-2 right-3 flex items-center gap-1.5 text-[10px] text-muted-foreground/80 pointer-events-none">
+          <span className="w-1.5 h-1.5 rounded-full bg-muted-foreground/60 animate-pulse" />
+          scoring rarity…
         </div>
       )}
 
@@ -553,8 +582,13 @@ export function PrevalenceScatterPlot({
               ? 'common · 1000+ hosts'
               : tip.d.hostCount >= COMMON_HOST_THRESHOLD
               ? `common · on ${tip.d.hostCount.toLocaleString()} hosts`
+              : tip.d.hostCount === 0
+              ? 'not baselined yet'
               : `uncommon · on ${tip.d.hostCount.toLocaleString()} hosts`}
-            {tip.d.hostCount < COMMON_HOST_THRESHOLD &&
+            {/* Novelty only when we have a REAL env-first-seen (NAN-1699) — never
+                inferred from the event time, and not for common/unbaselined. */}
+            {tip.d.hostCount > 0 &&
+              tip.d.hostCount < COMMON_HOST_THRESHOLD &&
               tip.d.envFirstSeen != null &&
               nowMs - tip.d.envFirstSeen.getTime() < NOVEL_WINDOW_MS && (
                 <span className="ml-1.5 text-primary font-medium">· new to env</span>

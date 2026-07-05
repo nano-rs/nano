@@ -84,7 +84,9 @@ export function AssetPrevalenceCard({
               totalOccurrences: 1,
               isRare: meta?.isRare ?? false,
               prevalenceScore: meta?.score ?? 0,
-              envFirstSeen: meta?.firstSeen ?? ts,
+              // NAN-1699: no event-time fallback — novelty must key off a REAL
+              // env-first-seen, not the occurrence time.
+              envFirstSeen: meta?.firstSeen,
             };
           });
 

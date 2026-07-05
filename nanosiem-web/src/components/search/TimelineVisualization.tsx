@@ -471,6 +471,38 @@ export function TimelineVisualization({
   }, [slimHasArtifacts, slimExtracted, fetchedArtifacts, artifactFetchKey]);
   const hasArtifacts = extractedData.hashes.length > 0 || extractedData.domains.length > 0;
 
+  // NAN-1700 progressive render: pending scatter points derived purely from the
+  // extracted occurrences (event time + count), with no prevalence yet. Shown
+  // immediately at their event times on the baseline while the (slow) rarity
+  // lookup runs; the enriched `scatterData` replaces them when it lands and the
+  // dots animate up to their real rarity Y / color. Search mode only — asset
+  // mode gets its per-event points straight from the backend.
+  const pendingScatterData = useMemo<PrevalenceScatterData | null>(() => {
+    if (isAssetMode) return null;
+    if (!extractedData.hashOccurrences.length && !extractedData.domainOccurrences.length) return null;
+    const toPending = (
+      occs: typeof extractedData.hashOccurrences,
+      artifactType: 'hash' | 'domain',
+    ): PrevalenceScatterData['hashPoints'] =>
+      occs.map((occ) => ({
+        artifact: occ.artifact,
+        artifactType,
+        hostCount: 0,
+        firstSeen: occ.eventTimestamp,
+        lastSeen: occ.eventTimestamp,
+        totalOccurrences: occ.occurrenceCount,
+        isRare: false,
+        prevalenceScore: 0,
+        envFirstSeen: undefined,
+        pending: true,
+      }));
+    return {
+      hashPoints: toPending(extractedData.hashOccurrences, 'hash'),
+      domainPoints: toPending(extractedData.domainOccurrences, 'domain'),
+      rarityThreshold: 3,
+    };
+  }, [extractedData, isAssetMode]);
+
   // The picker window, as a numeric [start, end] (ms), or null if unusable.
   const pickerRange = useMemo<[number, number] | null>(() => {
     if (timeRange?.start && timeRange?.end) {
@@ -664,18 +696,20 @@ export function TimelineVisualization({
         return {
           artifact: occ.artifact,
           artifactType,
-          // NAN-1696: when the prevalence lookup returns no record, the artifact
-          // is simply not-yet-baselined (the dict cache lags the summary) — it's
-          // still on >=1 host (it's in these results). Treat it as rare-on-1-host
-          // rather than a spurious host_count-0 "never seen" tier: host_count 0
-          // and 1 are the same artifact at two pipeline stages.
-          hostCount: prevalence?.hostCount || 1,
+          // NAN-1699: a prevalence miss is NOT a rare artifact — it means we have
+          // no baseline for it (untracked, or agg lag), so don't fabricate
+          // rare-on-1-host (that mislabeled ~157 common Windows binaries as rare).
+          // host_count 0 / not-rare = "unbaselined"; the backend now returns real
+          // counts for common artifacts so genuine misses are the exception.
+          hostCount: prevalence?.hostCount ?? 0,
           firstSeen: eventTs,
           lastSeen: eventTs,
           totalOccurrences: 1,
-          isRare: prevalence?.isRare ?? true,
+          isRare: prevalence?.isRare ?? false,
           prevalenceScore: prevalence?.prevalenceScore ?? 0,
-          envFirstSeen: prevalence?.envFirstSeen ?? eventTs,
+          // No event-time fallback: novelty ("new to env") must key off a REAL
+          // env-first-seen, never the occurrence time (which is always "now").
+          envFirstSeen: prevalence?.envFirstSeen,
         };
       });
   }, []);
@@ -768,15 +802,23 @@ export function TimelineVisualization({
       return;
     }
 
-    // Dedup: skip if we already fetched for this exact artifact set
+    // Dedup: skip if we already fetched for this exact artifact set + window.
+    // (NAN-1700: window MUST be in the key — the request is windowed, so a window
+    // change with the same artifacts would otherwise be skipped and show stale
+    // rarity.)
     const currentKey = JSON.stringify({
       hashes: extractedData.hashes,
       domains: extractedData.domains,
+      window: timeWindow,
     });
     if (currentKey === lastFetchedKeyRef.current) {
       return;
     }
 
+    // NAN-1700: new artifact set/window — drop the previous (now stale) enriched
+    // data so the pending points render immediately for THIS search instead of
+    // the old dots lingering until the new fetch lands.
+    setScatterData(null);
     setIsLoading(true);
     setError(null);
 
@@ -840,7 +882,9 @@ export function TimelineVisualization({
             totalOccurrences: occ.occurrenceCount,
             isRare: prevalence?.isRare ?? false,
             prevalenceScore: prevalence?.prevalenceScore ?? 0,
-            envFirstSeen: prevalence?.envFirstSeen ?? occ.eventTimestamp,
+            // NAN-1699: no event-time fallback — "new to env" must key off a REAL
+            // env-first-seen, not the occurrence time, or every miss looks new.
+            envFirstSeen: prevalence?.envFirstSeen,
           };
         });
 
@@ -856,7 +900,9 @@ export function TimelineVisualization({
             totalOccurrences: occ.occurrenceCount,
             isRare: prevalence?.isRare ?? false,
             prevalenceScore: prevalence?.prevalenceScore ?? 0,
-            envFirstSeen: prevalence?.envFirstSeen ?? occ.eventTimestamp,
+            // NAN-1699: no event-time fallback — "new to env" must key off a REAL
+            // env-first-seen, not the occurrence time, or every miss looks new.
+            envFirstSeen: prevalence?.envFirstSeen,
           };
         });
 
@@ -868,7 +914,11 @@ export function TimelineVisualization({
       lastFetchedKeyRef.current = currentKey;
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load prevalence data');
-      lastFetchedKeyRef.current = currentKey;
+      // NAN-1700: DON'T mark the key as fetched on failure, or the Retry button
+      // (and a later re-open) hit the dedup guard and can never recover — mirror
+      // the asset path which nulls it. More visible now that prefetch can fail in
+      // the background before the analyst ever opens Rarity.
+      lastFetchedKeyRef.current = null;
       setMode('timeline');
     } finally {
       setIsLoading(false);
@@ -877,16 +927,22 @@ export function TimelineVisualization({
   // cascading identity changes from useMutation on every render
   }, [extractedData, hasArtifacts, timeWindow, isAssetMode, assetContext, timeRange, buildScatterPoints, assetMaxHostCount]);
 
-  // Load data when switching to prevalence mode
+  // NAN-1700: PREFETCH prevalence as soon as a search yields artifacts — not
+  // gated on the Rarity tab being open. The agg lookup can take a while, so
+  // firing it non-blocking (fire-and-forget; results render independently) means
+  // the scatter is already warm by the time the analyst switches to it, instead
+  // of making them wait then. `loadScatterData`'s lastFetchedKeyRef dedups, so
+  // this runs once per unique artifact-set/window. Still skip when the whole
+  // timeline card is collapsed (nothing to warm for a hidden card).
   useEffect(() => {
-    if (mode !== 'prevalence' || collapsed) return;
+    if (collapsed) return;
     // In asset mode, load when assetContext is available (artifacts come from backend)
     if (isAssetMode && assetContext) {
       loadScatterData();
     } else if (!isAssetMode && hasArtifacts) {
       loadScatterData();
     }
-  }, [mode, hasArtifacts, collapsed, loadScatterData, isAssetMode, assetContext]);
+  }, [hasArtifacts, collapsed, loadScatterData, isAssetMode, assetContext]);
 
   const handleArtifactClick = useCallback((artifact: string, artifactType: 'hash' | 'domain', timestamp?: Date) => {
     if (onArtifactFilter) onArtifactFilter(artifact, artifactType, timestamp);
@@ -1134,10 +1190,13 @@ export function TimelineVisualization({
                     <AlertTriangle className="w-4 h-4 mr-2" />{error}
                     <Button variant="ghost" size="sm" onClick={() => loadScatterData()} className="ml-4 text-muted-foreground hover:text-primary"><RefreshCw className="w-3 h-3 mr-1" />Retry query</Button>
                   </div>
-                ) : (isLoading || artifactFetchLoading) && !scatterData ? (
+                ) : (scatterData ?? pendingScatterData) ? (
+                  // NAN-1700: render immediately with pending points (event-time
+                  // positions) and let the enriched scatterData animate the rarity
+                  // in when it lands — no full-panel spinner blocking the view.
+                  <PrevalenceScatterPlot data={(scatterData ?? pendingScatterData)!} onArtifactClick={handleArtifactClick} onSelectionChange={handleSelectionChange} height={180} loading={isLoading} timeRange={timeRange} onMaxHostCountChange={isAssetMode ? handleMaxHostCountChange : undefined} />
+                ) : (isLoading || artifactFetchLoading) ? (
                   <div className="flex items-center justify-center py-8 text-muted-foreground text-sm"><Loader2 className="w-4 h-4 mr-2 animate-spin" />Loading rarity index...</div>
-                ) : scatterData ? (
-                  <PrevalenceScatterPlot data={scatterData} onArtifactClick={handleArtifactClick} onSelectionChange={handleSelectionChange} height={180} loading={isLoading} timeRange={timeRange} onMaxHostCountChange={isAssetMode ? handleMaxHostCountChange : undefined} />
                 ) : (
                   <div className="flex items-center justify-center py-8 text-muted-foreground text-sm">No rarity data available</div>
                 )}
