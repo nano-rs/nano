@@ -634,7 +634,6 @@ mod tests {
             let value: &str = match *field {
                 "source_type" | "sourcetype" => &row.source_type,
                 "event_type" | "action" => &row.action,
-                "user" => &row.user,
                 "src_ip" => &row.src_ip,
                 "dest_ip" => &row.dest_ip,
                 "src_host" => &row.src_host,

@@ -593,17 +593,6 @@ impl SearchService {
         let has_prevalence_cmds = !prevalence_commands.is_empty();
         let has_enrich = prevalence_commands.iter().any(|cmd| cmd.enrich);
 
-        // NAN-1691: the filter form (`| prevalence hash_prevalence <= N`) parses
-        // enrich=false, so it previously could never reach the dictGet WHERE pushdown and
-        // fell to the 1M in-memory fetch. It IS pushable whenever every condition is a
-        // count field — the dict-masked `_hp/_dp_host_count` aliases the JOIN already
-        // computes carry the exact windowed semantics. Timestamp-field conditions
-        // (first_seen) have no command-form SQL filter and no-op in memory today, so they
-        // stay off the JOIN path.
-        let has_pushable_prevalence_filter = prevalence_commands.iter().any(|cmd| {
-            !cmd.conditions.is_empty() && cmd.conditions.iter().all(|c| c.field.is_count_field())
-        });
-
         // Check if there's aggregation (stats, timechart, etc.) before prevalence
         // If so, we can't use JOIN-based prevalence because the result structure is different
         let has_aggregation_before = has_aggregation_before_prevalence(&query);
@@ -626,12 +615,17 @@ impl SearchService {
         tracing::debug!("Post-prevalence commands: {:?}", post_prevalence.commands);
         tracing::debug!("Prevalence commands: {:?}", prevalence_commands);
 
-        let use_prevalence_join = is_clickhouse
-            && has_prevalence_svc
-            && has_prevalence_cmds
-            && (has_enrich || has_pushable_prevalence_filter) // NAN-1691: also push the filter form
-            && !has_aggregation_before   // Can't use JOIN approach with aggregation before prevalence
-            && safe_post_commands; // Only use JOIN if post-prevalence commands are simple filters/sorts
+        // NAN-1694: ONE shared routing decision — the execute path and the explain
+        // path both call `prevalence_join_applies` so "Inspect SQL" can never render a
+        // shape that no longer executes. (Empty prevalence_commands returns false, so
+        // this subsumes the old `has_prevalence_cmds` term.)
+        let use_prevalence_join = crate::search::query_processing::command_extraction::prevalence_join_applies(
+            &query,
+            &prevalence_commands,
+            &post_prevalence.commands,
+            is_clickhouse,
+            has_prevalence_svc,
+        );
 
         // Check if this is a tree visualization query BEFORE setting limit
         // Tree queries need ALL events to properly build parent-child relationships

@@ -526,6 +526,29 @@
         );
     }
 
+    /// NAN-1698: OCSF `user.name` / `actor.user.name` are client-writable on the
+    /// direct-INSERT-into-`ocsf_logs` path (which bypasses the derivation MV's
+    /// lower()), so equality must lower() the stored column — same reasoning as
+    /// source_type. UDM `user` already lowers (NAN-1697).
+    #[test]
+    fn ocsf_user_name_eq_is_case_tolerant() {
+        use crate::schema::OcsfProfile;
+        use std::sync::Arc;
+        let ocsf = ClickHouseSqlGenerator::new().with_profile(Arc::new(OcsfProfile::new()));
+        for field in ["user.name", "actor.user.name"] {
+            let q = parse_query(&format!("{field}=MixedUser")).unwrap();
+            let sql = ocsf.generate(&q, &time_range()).unwrap();
+            assert!(
+                sql.contains(&format!("lower(\"{field}\") = 'mixeduser'")),
+                "OCSF {field} equality must lower() the stored column, got:\n{sql}"
+            );
+            assert!(
+                !sql.contains(&format!("\"{field}\" = 'mixeduser'")),
+                "OCSF {field} must not emit the bare ingest-lowercased fast-path, got:\n{sql}"
+            );
+        }
+    }
+
     /// NAN-1323: `| resolve_identity` must not reference UDM column names that do
     /// not exist under OCSF (`src_mac`, `user`, `user_identity_*`) — doing so 500s
     /// with an unknown-identifier error. Across src_host / src_ip / user lookups the
@@ -1511,15 +1534,17 @@
             "UDM ext CONTAINS must keep the toString null-guard, got:\n{sql}"
         );
 
-        // UDM equality stays the bare indexed comparison; the bare keyword now
-        // drives idx_message_words via hasAllTokens (NAN-1515).
+        // NAN-1697: `user` Eq now emits the case-insensitive `lower("user")`
+        // form (ingest doesn't downcase it — see LOWERCASE_NORMALIZED_FIELDS),
+        // served by idx_user_words. The bare keyword drives idx_message_words
+        // via hasAllTokens (NAN-1515).
         let sql = gen
             .generate(&parse_query("user=\"bob\" error").unwrap(), &time_range())
             .unwrap();
         assert!(
-            sql.contains("\"user\" = 'bob'")
+            sql.contains("lower(\"user\") = 'bob'")
                 && sql.contains("hasAllTokens(lower(message), 'error')"),
-            "UDM Eq stays bare; bare keyword uses hasAllTokens, got:\n{sql}"
+            "UDM `user` Eq is case-insensitive; bare keyword uses hasAllTokens, got:\n{sql}"
         );
     }
 
@@ -2258,6 +2283,23 @@
         );
     }
 
+    /// NAN-1697: `user` is NOT downcased at ingest (OTLP / Windows-event write
+    /// it verbatim — mixed-case domain accounts), so equality must keep the
+    /// case-insensitive `lower("user")` form, served by idx_user_words. A raw
+    /// compare silently dropped those matches. (`user` is a CH reserved word →
+    /// quoted.)
+    #[test]
+    fn user_eq_keeps_lower_for_mixed_case_accounts() {
+        let query = parse_query("user=\"CORP-Admin\"").unwrap();
+        let sql = ClickHouseSqlGenerator::new()
+            .generate(&query, &time_range())
+            .unwrap();
+        assert!(
+            sql.contains("lower(\"user\") = 'corp-admin'"),
+            "user has mixed-case history and must keep the lower() compare, got:\n{sql}"
+        );
+    }
+
     /// NAN-1647 (NAN-1632 finding 3.9): dvc_ip is downcased at ingest (NAN-1646)
     /// and full-retention history is all-lowercase (Saturn: 0/1.75B rows
     /// mixed-case), so equality compares RAW and the whole-value dvc_ip bloom
@@ -2644,10 +2686,12 @@
             .generate(&query, &time_range())
             .unwrap();
         let where_clause = where_slice(&sql);
+        // NAN-1697: `user` is no longer in LOWERCASE_NORMALIZED_FIELDS, so the
+        // LHS is `lower("user")`, not the raw column — still the PHYSICAL column
+        // (the point of this test), never the metadata JSON probe.
         assert!(
-            where_clause.contains("\"user\" = lower(lower(dest_user))")
-                || where_clause.contains("user = lower(lower(dest_user))"),
-            "LHS must be the raw ingest-lowercased column, got:\n{where_clause}"
+            where_clause.contains("lower(\"user\") = lower(lower(dest_user))"),
+            "LHS must be the physical column (lower-wrapped), got:\n{where_clause}"
         );
         assert!(
             !where_clause.contains("JSONExtractString(metadata, 'user')"),

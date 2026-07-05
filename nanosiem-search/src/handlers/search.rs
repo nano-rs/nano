@@ -317,7 +317,8 @@ pub async fn explain(
             &request.time_range,
             request.table_view,
             request.dataset.as_deref(),
-        );
+        )
+        .await;
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     record_search_query("explain", duration_ms, result.is_ok());

@@ -234,6 +234,23 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
     [onDrilldown, identities, identifierField, identifierValue, effectiveTimeRange],
   );
 
+  // Prevalence scatter drill — narrow the asset's events to a clicked artifact.
+  // Reuses handleAssetDrilldown so the asset identity + view window ride along;
+  // the hash/domain OR-expression goes through as a pre-built raw clause.
+  const handleArtifactDrilldown = useCallback(
+    (artifact: string, artifactType: 'hash' | 'domain') => {
+      // Escape like the field=value drilldown builder — a log-derived artifact
+      // with `"`/`\` must not break out of the quoted comparison.
+      const esc = artifact.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      const rawClause =
+        artifactType === 'hash'
+          ? `(file_hash="${esc}" OR process_hash="${esc}")`
+          : `(dest_host="${esc}" OR query="${esc}" OR url_domain="${esc}")`;
+      handleAssetDrilldown({ _rawClause: rawClause });
+    },
+    [handleAssetDrilldown],
+  );
+
   // Investigate pivot — the plain entity filter, scoped to the asset view's
   // window (NAN-1458). Kept separate from handleAssetDrilldown so it doesn't
   // OR-expand across related identities.
@@ -475,6 +492,7 @@ export function AssetView({ results, timeRange, fieldsCollapsedCount, onExpandFi
             identities={identities}
             timeRange={effectiveTimeRange}
             focus={focus}
+            onArtifactClick={onDrilldown ? handleArtifactDrilldown : undefined}
           />
 
           <AssetStream

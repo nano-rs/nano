@@ -1419,6 +1419,14 @@ export function SearchResults({
                       </p>
                     </div>
                   )}
+                  {/* NAN-1695: prevalence filter/enrich scans the full window via a
+                      dictGet lookup (not skip-indexable) — can take a while at scale,
+                      so reassure the user it hasn't hung. */}
+                  {query && /\|\s*prevalence\b/i.test(query) && (
+                    <p className="text-xs text-muted-foreground/80 mt-4 max-w-sm mx-auto leading-relaxed">
+                      Prevalence searches scan the full window to rank artifact rarity — this can take a while at scale. Let it run.
+                    </p>
+                  )}
                 </>
               )}
               {asyncJobId && onCancelAsyncJob && (

@@ -16,6 +16,8 @@ interface AssetPrevalenceCardProps {
   timeRange: TimeRange | undefined;
   /** When focus mode is on, show the "focus mode" stamp in the header. */
   focus: boolean;
+  /** Drill into the asset's events for a clicked artifact (hash/domain). */
+  onArtifactClick?: (artifact: string, artifactType: 'hash' | 'domain') => void;
 }
 
 const DEFAULT_MAX_HOSTS = 100;
@@ -26,6 +28,7 @@ export function AssetPrevalenceCard({
   identities,
   timeRange,
   focus,
+  onArtifactClick,
 }: AssetPrevalenceCardProps) {
   const [data, setData] = useState<PrevalenceScatterData | null>(null);
   const [loading, setLoading] = useState(false);
@@ -147,6 +150,7 @@ export function AssetPrevalenceCard({
             timeRange={timeRange}
             defaultMaxHostCount={DEFAULT_MAX_HOSTS}
             onMaxHostCountChange={setMaxHostCount}
+            onArtifactClick={onArtifactClick ? (artifact, artifactType) => onArtifactClick(artifact, artifactType) : undefined}
           />
         ) : loading ? (
           <div className="h-[180px] flex items-center justify-center text-[11.5px] text-muted-foreground/70 font-mono">

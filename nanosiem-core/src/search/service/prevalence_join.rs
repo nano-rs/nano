@@ -26,61 +26,6 @@ impl SearchService {
         start_time: Instant,
         auto_sort_decision: &crate::search::query_processing::AutoSortDecision,
     ) -> Result<SearchResponse, SearchError> {
-        // Get the time window from the prevalence command(s). All conditions are
-        // flattened into ONE dictGet mask (a single window_cutoff_sql), so mixed
-        // windows across multiple `| prevalence` commands can't be honored
-        // per-command. Reject that rather than silently applying the first
-        // command's window to every condition (NAN-1691 Codex review) — the old
-        // in-memory path evaluated each command's window independently.
-        let mut time_window: Option<PrevalenceTimeWindow> = None;
-        for cmd in prevalence_commands {
-            if let Some(tw) = cmd.time_window.as_ref() {
-                let tw = ast_to_prevalence_time_window(Some(tw))?;
-                if let Some(existing) = time_window {
-                    if existing != tw {
-                        return Err(SearchError::SqlValidationError(
-                            "multiple `| prevalence` commands with different windows are not \
-                             supported in one query; use a single window".to_string(),
-                        ));
-                    }
-                }
-                time_window = Some(tw);
-            }
-        }
-        let time_window = time_window.unwrap_or(PrevalenceTimeWindow::ThirtyDays);
-
-        // Strip prevalence and post-prevalence commands from query for base SQL generation
-        let base_query = strip_prevalence_and_after(query);
-
-        // Generate base SQL for the search part.
-        //
-        // NAN-1635: `limit: None` — the prevalence wrapper owns the result
-        // bound (generate_prevalence_join_sql appends its own LIMIT) and the
-        // ORDER-BY-anchored stripper below only removes a trailing
-        // `ORDER BY … [LIMIT …]`. With the CTE tail now applying the default
-        // safety limit (finding 3.6), a projected base (`… | fields - x |
-        // prevalence`) ends in a bare `LIMIT 1000000 SETTINGS …` the stripper
-        // would miss, silently truncating the prevalence base set. Emitting no
-        // generator LIMIT reproduces the pre-3.6 base byte-for-byte after the
-        // strip. The implicit trailing ORDER BY is kept (NOT `unordered`): the
-        // stripper anchors on the LAST ` order by `, and removing the final
-        // one would make it truncate mid-CTE at an internal stage's ORDER BY
-        // (e.g. dedup's `ORDER BY … LIMIT 1 BY …`).
-        let base_options = crate::query::QueryOptions {
-            limit: None,
-            ..Default::default()
-        };
-        let base_sql = self
-            .ch_sql_generator
-            .generate_with_options(&base_query, time_range, &base_options)
-            .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
-
-        // NAN-362: Prior to the dict-based rewrite, this path built CTEs that aggregated the
-        // full *_prevalence_agg universe and LEFT JOINed them — which OOMed ClickHouse on any
-        // non-trivial base query. A count-based short-circuit used to guard that. The new path
-        // only issues dictGet() calls scoped to rows in the base query, so the guard is no
-        // longer needed.
-
         // Get rarity threshold from prevalence service config
         let rarity_threshold = if let Some(ref prev_svc) = self.prevalence_service {
             prev_svc.rarity_threshold().await
@@ -88,31 +33,15 @@ impl SearchService {
             3 // default
         };
 
-        // Generate the JOIN-based SQL with prevalence filtering
-        // num_commands_pushed indicates how many post-prevalence commands were pushed into SQL
-        // (aggregation + trailing sort/head/etc.) and should be skipped in Rust post-processing
-        // Pagination is owned by `execute_clickhouse_sql` below — the generator
-        // no longer takes limit/offset. NAN-1691 (P1-B): enrich-only / filter-only
-        // prevalence SQL is 1:1 row decoration (host_count / is_rare /
-        // prevalence_score columns), NOT an aggregation, so it now takes the
-        // executor's raw-event branch (inject_limit_offset + a bounded count
-        // companion). Only when a real aggregation is pushed down (`… | stats …`)
-        // does the SQL trip `is_aggregation_query` and get the count(*) OVER ()
-        // full-window wrap.
-        // NAN-1691: the filter form carries its predicate INSIDE the prevalence command
-        // (conditions), not as a post-prevalence WHERE. Push those into the dictGet WHERE
-        // over the windowed host-count aliases so the filter runs in ClickHouse instead of
-        // the 1M-row in-memory fetch.
-        let filter_conditions: Vec<crate::query::PrevalenceCondition> = prevalence_commands
-            .iter()
-            .flat_map(|cmd| cmd.conditions.iter().cloned())
-            .collect();
-
-        let (sql, num_commands_pushed) = self.generate_prevalence_join_sql(
-            &base_sql,
+        // NAN-1694: the entire pushdown SQL build (window pick + base scan + dictGet
+        // JOIN) is now the shared sync `generate_prevalence_pushdown_sql`, so the
+        // explain path renders byte-identical SQL. Only the async rarity_threshold
+        // fetch above stays here.
+        let (sql, num_commands_pushed) = self.generate_prevalence_pushdown_sql(
+            query,
+            prevalence_commands,
             post_prevalence_commands,
-            &filter_conditions,
-            time_window,
+            time_range,
             rarity_threshold,
         )?;
 
@@ -373,6 +302,105 @@ impl SearchService {
             display_type: Some(display_type),
             column_order,
         })
+    }
+
+    /// Build the JOIN-based prevalence pushdown SQL (window pick + base scan +
+    /// dictGet host_count JOIN), WITHOUT executing it or fetching config.
+    ///
+    /// NAN-1694: extracted from `search_with_prevalence_join` so the explain path
+    /// (`SearchService::explain`) renders the SAME SQL that actually executes. Kept
+    /// SYNC — the only async dependency (`rarity_threshold`) is passed in by the
+    /// caller. Returns `(sql, num_commands_pushed_to_sql)`.
+    pub(crate) fn generate_prevalence_pushdown_sql(
+        &self,
+        query: &Query,
+        prevalence_commands: &[PrevalenceCommandInfo],
+        post_prevalence_commands: &[Command],
+        time_range: &TimeRange,
+        rarity_threshold: u64,
+    ) -> Result<(String, usize), SearchError> {
+        // Get the time window from the prevalence command(s). All conditions are
+        // flattened into ONE dictGet mask (a single window_cutoff_sql), so mixed
+        // windows across multiple `| prevalence` commands can't be honored
+        // per-command. Reject that rather than silently applying the first
+        // command's window to every condition (NAN-1691 Codex review) — the old
+        // in-memory path evaluated each command's window independently.
+        let mut time_window: Option<PrevalenceTimeWindow> = None;
+        for cmd in prevalence_commands {
+            if let Some(tw) = cmd.time_window.as_ref() {
+                let tw = ast_to_prevalence_time_window(Some(tw))?;
+                if let Some(existing) = time_window {
+                    if existing != tw {
+                        return Err(SearchError::SqlValidationError(
+                            "multiple `| prevalence` commands with different windows are not \
+                             supported in one query; use a single window".to_string(),
+                        ));
+                    }
+                }
+                time_window = Some(tw);
+            }
+        }
+        let time_window = time_window.unwrap_or(PrevalenceTimeWindow::ThirtyDays);
+
+        // Strip prevalence and post-prevalence commands from query for base SQL generation
+        let base_query = strip_prevalence_and_after(query);
+
+        // Generate base SQL for the search part.
+        //
+        // NAN-1635: `limit: None` — the prevalence wrapper owns the result
+        // bound (generate_prevalence_join_sql appends its own LIMIT) and the
+        // ORDER-BY-anchored stripper below only removes a trailing
+        // `ORDER BY … [LIMIT …]`. With the CTE tail now applying the default
+        // safety limit (finding 3.6), a projected base (`… | fields - x |
+        // prevalence`) ends in a bare `LIMIT 1000000 SETTINGS …` the stripper
+        // would miss, silently truncating the prevalence base set. Emitting no
+        // generator LIMIT reproduces the pre-3.6 base byte-for-byte after the
+        // strip. The implicit trailing ORDER BY is kept (NOT `unordered`): the
+        // stripper anchors on the LAST ` order by `, and removing the final
+        // one would make it truncate mid-CTE at an internal stage's ORDER BY
+        // (e.g. dedup's `ORDER BY … LIMIT 1 BY …`).
+        let base_options = crate::query::QueryOptions {
+            limit: None,
+            ..Default::default()
+        };
+        let base_sql = self
+            .ch_sql_generator
+            .generate_with_options(&base_query, time_range, &base_options)
+            .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
+
+        // NAN-362: Prior to the dict-based rewrite, this path built CTEs that aggregated the
+        // full *_prevalence_agg universe and LEFT JOINed them — which OOMed ClickHouse on any
+        // non-trivial base query. A count-based short-circuit used to guard that. The new path
+        // only issues dictGet() calls scoped to rows in the base query, so the guard is no
+        // longer needed.
+
+        // Generate the JOIN-based SQL with prevalence filtering
+        // num_commands_pushed indicates how many post-prevalence commands were pushed into SQL
+        // (aggregation + trailing sort/head/etc.) and should be skipped in Rust post-processing
+        // Pagination is owned by `execute_clickhouse_sql` below — the generator
+        // no longer takes limit/offset. NAN-1691 (P1-B): enrich-only / filter-only
+        // prevalence SQL is 1:1 row decoration (host_count / is_rare /
+        // prevalence_score columns), NOT an aggregation, so it now takes the
+        // executor's raw-event branch (inject_limit_offset + a bounded count
+        // companion). Only when a real aggregation is pushed down (`… | stats …`)
+        // does the SQL trip `is_aggregation_query` and get the count(*) OVER ()
+        // full-window wrap.
+        // NAN-1691: the filter form carries its predicate INSIDE the prevalence command
+        // (conditions), not as a post-prevalence WHERE. Push those into the dictGet WHERE
+        // over the windowed host-count aliases so the filter runs in ClickHouse instead of
+        // the 1M-row in-memory fetch.
+        let filter_conditions: Vec<crate::query::PrevalenceCondition> = prevalence_commands
+            .iter()
+            .flat_map(|cmd| cmd.conditions.iter().cloned())
+            .collect();
+
+        self.generate_prevalence_join_sql(
+            &base_sql,
+            post_prevalence_commands,
+            &filter_conditions,
+            time_window,
+            rarity_threshold,
+        )
     }
 
     /// Generate SQL with JOINs to prevalence tables

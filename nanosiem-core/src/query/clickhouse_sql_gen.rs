@@ -585,7 +585,16 @@ pub(crate) const LOWERCASE_NORMALIZED_FIELDS: &[&str] = &[
     "action",
     "src_host",
     "dest_host",
-    "user",
+    // NAN-1697: `user` is deliberately ABSENT. It was assumed lowercased at
+    // ingest, but the logs lane never downcases it — OTLP and Windows-event
+    // ingest write it verbatim (`CORP\JSmith`, mixed-case service accounts), so
+    // a raw `user = '<lowered>'` compare silently dropped those rows (0 vs 2310
+    // locally; 781 mixed-case rows / 1.82B on Saturn). Unlike the host-entity
+    // fields it gets no hostname-expansion case rescue. Queries now emit
+    // `lower(user) = '…'`, served by the migration-119 `idx_user_words` text
+    // index (Saturn EXPLAIN: prunes 13,215 vs the raw bloom's 28,307 granules on
+    // a dotted username; ~1.6x on a single-token value but still sub-2s). The
+    // audit writer still downcases `user`, so audit-row search is unaffected.
     "user_domain",
     "src_ip",
     "dest_ip",

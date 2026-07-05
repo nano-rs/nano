@@ -68,7 +68,7 @@ impl SearchService {
 
     /// Explain a piped query by returning the generated SQL without executing
     #[instrument(skip(self), fields(query = %query))]
-    pub fn explain(
+    pub async fn explain(
         &self,
         query: &str,
         time_range: &TimeRangeInput,
@@ -101,6 +101,39 @@ impl SearchService {
 
         // Extract post-prevalence commands to determine if we need to strip them
         let post_prevalence = extract_post_prevalence_commands(&parsed);
+
+        // NAN-1694: when the query would push the prevalence filter/enrich into
+        // ClickHouse at execute time (`search_with_prevalence_join`), explain the REAL
+        // pushdown SQL — the dictGet host_count WHERE that actually runs — instead of the
+        // stale stripped base scan + "applied after enrichment" note that no longer
+        // executes. Routed through the SAME gate (`prevalence_join_applies`) and the SAME
+        // builder (`generate_prevalence_pushdown_sql`) as the execute path so the two can
+        // never diverge. Prevalence is logs-only, so this deliberately uses the tenant
+        // logs generator (`ch_sql_generator`), matching the execute path — not the
+        // dataset generator.
+        let prevalence_commands = extract_prevalence_commands(&parsed);
+        if crate::search::query_processing::command_extraction::prevalence_join_applies(
+            &parsed,
+            &prevalence_commands,
+            &post_prevalence.commands,
+            /* is_clickhouse = */ true,
+            /* has_prevalence_svc = */ self.prevalence_service.is_some(),
+        ) {
+            let rarity_threshold = if let Some(ref s) = self.prevalence_service {
+                s.rarity_threshold().await
+            } else {
+                3
+            };
+            let tr = TimeRange::new(time_range.start, time_range.end);
+            let (sql, _num_pushed) = self.generate_prevalence_pushdown_sql(
+                &parsed,
+                &prevalence_commands,
+                &post_prevalence.commands,
+                &tr,
+                rarity_threshold,
+            )?;
+            return Ok(sql);
+        }
 
         // If there are post-prevalence commands, strip them from the query for SQL generation
         // These commands are applied as post-processing after prevalence enrichment

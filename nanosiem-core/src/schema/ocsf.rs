@@ -180,8 +180,16 @@ const OCSF_LOWERCASED_AT_INGEST: &[&str] = &[
     "src_endpoint.hostname",
     "device.hostname",
     "dst_endpoint.hostname",
-    "user.name",
-    "actor.user.name",
+    // NAN-1698: `user.name` / `actor.user.name` are deliberately ABSENT (parity
+    // with the `source_type` exclusion above and UDM NAN-1697). The derivation MV
+    // (`ocsf_logs_raw_mv`) lower()s them — but ONLY on the raw/parser path; the
+    // hardened DIRECT-INSERT-into-`ocsf_logs` path (migration 127) bypasses that
+    // MV and lands the client's `user.name` verbatim into a plain String column
+    // with no `lower()` DEFAULT. A raw `= '<lowered>'` compare then silently drops
+    // a mixed-case direct write — the same hole that excluded `source_type`.
+    // Queries emit `lower("user.name") = '…'`, served by the `idx_user_name_words`
+    // / `idx_actor_user_name_words` text indexes. `user.domain` stays (parity with
+    // UDM `user_domain`).
     "user.domain",
     "file.hashes.sha256",
     "process.file.hashes.sha256",
@@ -1298,7 +1306,12 @@ mod tests {
     fn lowercased_at_ingest_matches_ddl_lower_set() {
         let p = OcsfProfile::new();
         assert!(p.is_lowercased_at_ingest("src_endpoint.ip"));
-        assert!(p.is_lowercased_at_ingest("user.name"));
+        assert!(p.is_lowercased_at_ingest("src_endpoint.hostname"));
+        // NAN-1698: user-name identity fields are NOT on the fast-path — they are
+        // client-writable on direct OCSF INSERTs and can't be server-normalized
+        // (parity with source_type / UDM NAN-1697). Queries emit lower("user.name").
+        assert!(!p.is_lowercased_at_ingest("user.name"));
+        assert!(!p.is_lowercased_at_ingest("actor.user.name"));
         assert!(!p.is_lowercased_at_ingest("class_uid"));
         assert!(!p.is_lowercased_at_ingest("message"));
     }

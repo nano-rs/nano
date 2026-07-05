@@ -1367,12 +1367,19 @@ mod tests {
             cols.contains(&"action"),
             "the physical `action` column must cover the event_type alias, got {cols:?}"
         );
-        for expected in ["source_type", "src_ip", "dest_ip", "user", "src_host", "trace_id"] {
+        for expected in ["source_type", "src_ip", "dest_ip", "src_host", "trace_id"] {
             assert!(
                 cols.contains(&expected),
                 "probe must cover raw-compared column {expected}, got {cols:?}"
             );
         }
+        // NAN-1697: `user` left LOWERCASE_NORMALIZED_FIELDS (ingest doesn't
+        // downcase it; queries now use lower(user)=), so a mixed-case `user` is
+        // no longer a raw-compare violation and must not be probed.
+        assert!(
+            !cols.contains(&"user"),
+            "`user` is no longer raw-compared and must be dropped from the probe, got {cols:?}"
+        );
         // Every probed name must be a physical column, or the probe SQL errors.
         for c in &cols {
             assert!(
@@ -1403,11 +1410,17 @@ mod tests {
         );
         for leg in [
             "('src_ip', countIf(src_ip != lower(src_ip)))",
-            "('user', countIf(user != lower(user)))",
+            "('src_host', countIf(src_host != lower(src_host)))",
             "('source_type', countIf(source_type != lower(source_type)))",
         ] {
             assert!(sql.contains(leg), "probe must carry leg {leg}, got:\n{sql}");
         }
+        // NAN-1697: `user` is no longer a raw-compared column, so it must not
+        // appear as an invariant leg (mixed-case user is legal now).
+        assert!(
+            !sql.contains("('user', countIf"),
+            "`user` must be dropped from the invariant probe, got:\n{sql}"
+        );
         // The pivot keeps the healthy case at zero rows.
         assert!(
             sql.contains("ARRAY JOIN pairs AS t") && sql.contains("WHERE t.2 > 0"),

@@ -157,8 +157,18 @@ const checkIfAggregateQuery = (q: string) => {
           afterPipe.startsWith('return')) {
         return true;
       }
-      // prevalence is only aggregate when NOT using enrich=true (which adds fields to each row)
-      if (afterPipe.startsWith('prevalence') && !afterPipe.includes('enrich=true') && !afterPipe.includes('enrich = true')) {
+      // Prevalence returns event ROWS when it enriches (enrich=true) OR filters on a
+      // prevalence field (hash_prevalence/domain_prevalence <op> N) — only the bare
+      // summary form is a true aggregate. NAN-1695: the filter form now pushes down
+      // (NAN-1691) and returns the rare events, so classifying it as aggregate skipped
+      // the event field-stats path and flattened ext.* into the field picker.
+      // Inspect ONLY the prevalence command segment (up to the next `|`), and require a
+      // comparator — so a bare `| prevalence | where hash_prevalence < 5` (summary + a
+      // later where) still classifies as aggregate.
+      const prevalenceCmd = afterPipe.split('|')[0];
+      if (afterPipe.startsWith('prevalence')
+          && !prevalenceCmd.includes('enrich=true') && !prevalenceCmd.includes('enrich = true')
+          && !/\b(hash|domain)_prevalence\b\s*(?:<=|>=|!=|=|<|>)/.test(prevalenceCmd)) {
         return true;
       }
     }
@@ -2439,11 +2449,15 @@ export function Search() {
     // - _identityClause / _tableCommand / _timeRangeOverride: handled separately
     const excludeFromDrilldown = new Set([
       'timestamp', 'bytes_out', 'bytes_in', 'bytes', 'duration', 'response_time',
-      '_identityClause', '_tableCommand', '_timeRangeOverride',
+      '_identityClause', '_tableCommand', '_timeRangeOverride', '_rawClause',
     ]);
 
     // Check for identity clause (pre-built OR expression from asset view)
     const identityClause = filters._identityClause as string | undefined;
+    // Pre-built raw search clause AND-ed onto the base search (e.g. the prevalence
+    // scatter's `(file_hash="…" OR process_hash="…")` artifact drill). Kept out of
+    // the field=value builder since it's an OR expression across two fields.
+    const rawClause = filters._rawClause as string | undefined;
     // Check for table command (pre-built | table from asset view drilldown)
     const tableCommand = filters._tableCommand as string | undefined;
     // Check for time-range override (per-bucket timeline drill — NAN-1050)
@@ -2495,6 +2509,14 @@ export function Search() {
       }
     }
     
+    // AND a pre-built raw clause (artifact scatter drill) onto the search. Wrap
+    // the existing search in parens so top-level ORs (`a OR b OR c`) don't let the
+    // AND bind only to the last term — otherwise the drill returns the same set.
+    if (rawClause) {
+      const base = newQuery.trim();
+      newQuery = base ? `(${base}) AND ${rawClause}` : rawClause;
+    }
+
     // Append table command if present (from asset view "Search as table")
     if (tableCommand) {
       newQuery = `${newQuery} ${tableCommand}`;
@@ -4191,23 +4213,21 @@ export function Search() {
           results={searchResults}
           hasSearched={hasSearched}
           onArtifactFilter={(artifact, artifactType, _ts) => {
-            // Asset mode renders its own visualization above and skips this
-            // timeline (see the enclosing condition), so we always take the
-            // "modify query and re-search" path here.
-            let newQuery: string;
-            if (artifactType === 'hash') {
-              // Search both file_hash and process_hash since different source types use different fields
-              const hashQuery = `(file_hash="${artifact}" OR process_hash="${artifact}")`;
-              newQuery = query ? `${query} AND ${hashQuery}` : hashQuery;
-            } else {
-              // Search all domain-related fields since different sources use different fields
-              // dest_host (network), query (DNS), url_domain (proxy/web)
-              const domainQuery = `(dest_host="${artifact}" OR query="${artifact}" OR url_domain="${artifact}")`;
-              newQuery = query ? `${query} AND ${domainQuery}` : domainQuery;
-            }
-            setQuery(newQuery);
-            // Auto-run search after adding filter
-            handleSearch(1, false, newQuery, queryMode, timeRange);
+            // Route through handleDrilldown so the artifact filter reuses the
+            // proven stats-drill path (deferred setQuery → updateUrl → search).
+            // Calling handleSearch synchronously here raced the URL-sync effect,
+            // which restored the pre-drill query and clobbered the filter.
+            // Escape like the field=value drilldown builder — a log-derived
+            // artifact with `"`/`\` must not break out of the quoted comparison.
+            const esc = artifact.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+            const artifactQuery =
+              artifactType === 'hash'
+                ? // Search both file_hash and process_hash since different source types use different fields
+                  `(file_hash="${esc}" OR process_hash="${esc}")`
+                : // Search all domain-related fields since different sources use different fields
+                  // dest_host (network), query (DNS), url_domain (proxy/web)
+                  `(dest_host="${esc}" OR query="${esc}" OR url_domain="${esc}")`;
+            handleDrilldown({ _rawClause: artifactQuery });
           }}
           assetContext={assetContext}
           timeWindow="24h"

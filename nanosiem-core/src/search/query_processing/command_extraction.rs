@@ -595,6 +595,46 @@ pub fn has_only_simple_post_prevalence_commands(commands: &[Command]) -> bool {
     })
 }
 
+/// Single source of truth for "does this query take the JOIN-based prevalence
+/// pushdown path?" — the dictGet host_count WHERE that `search_with_prevalence_join`
+/// pushes into ClickHouse (NAN-1691).
+///
+/// Both the execute path (`core_search`) and the explain path (`sql_execution::explain`)
+/// route through this so "Inspect SQL" can never show a different shape than what runs
+/// (NAN-1694). Returns false when there are no prevalence commands at all (subsumes the
+/// old `has_prevalence_cmds` inline check).
+///
+/// A query pushes down when it is ClickHouse-backed, has a prevalence service wired, and:
+/// - some command enriches (`enrich=true`), OR carries a pushable filter — a command whose
+///   conditions are all count fields (`hash_prevalence`/`domain_prevalence`); timestamp-field
+///   conditions (`*_first_seen`) have no command-form SQL filter and stay off this path; AND
+/// - there is no aggregation BEFORE the prevalence command (JOIN can't reshape an aggregate); AND
+/// - every post-prevalence command is a simple filter/sort (no field-creating commands that
+///   wouldn't resolve inside the JOIN).
+pub(crate) fn prevalence_join_applies(
+    query: &Query,
+    prevalence_commands: &[PrevalenceCommandInfo],
+    post_prevalence_commands: &[Command],
+    is_clickhouse: bool,
+    has_prevalence_svc: bool,
+) -> bool {
+    if prevalence_commands.is_empty() {
+        return false;
+    }
+    let has_enrich = prevalence_commands.iter().any(|cmd| cmd.enrich);
+    // NAN-1691: the filter form (`| prevalence hash_prevalence <= N`) parses enrich=false.
+    // It IS pushable whenever every condition is a count field — the dict-masked
+    // `_hp/_dp_host_count` aliases the JOIN computes carry the exact windowed semantics.
+    let has_pushable_prevalence_filter = prevalence_commands.iter().any(|cmd| {
+        !cmd.conditions.is_empty() && cmd.conditions.iter().all(|c| c.field.is_count_field())
+    });
+    is_clickhouse
+        && has_prevalence_svc
+        && (has_enrich || has_pushable_prevalence_filter)
+        && !has_aggregation_before_prevalence(query)
+        && has_only_simple_post_prevalence_commands(post_prevalence_commands)
+}
+
 /// Collect commands in pipeline order (from source to end)
 fn collect_commands_in_order<'a>(query: &'a Query, commands: &mut Vec<&'a Command>) {
     match query {
@@ -1533,6 +1573,34 @@ mod tests {
             };
             assert_eq!(gate_ok, router_ok, "gate/router divergence on: {q}");
         }
+    }
+
+    /// NAN-1694: `prevalence_join_applies` is the SINGLE gate both the execute
+    /// path (`search_with_prevalence_join`) and `explain` route through to decide
+    /// whether to render/run the dictGet pushdown SQL vs the in-memory base — so
+    /// "Inspect SQL" can never drift from what actually executes.
+    #[test]
+    fn test_prevalence_join_applies_gate() {
+        let applies = |q: &str, is_ch: bool, has_svc: bool| {
+            let query = parse_query(q).unwrap();
+            let pc = extract_prevalence_commands(&query);
+            let post = extract_post_prevalence_commands(&query).commands;
+            prevalence_join_applies(&query, &pc, &post, is_ch, has_svc)
+        };
+        // Pushes down: enrich, or a count-field filter, with only simple post-commands.
+        assert!(applies("error | prevalence enrich=true", true, true));
+        assert!(applies("error | prevalence hash_prevalence <= 5 window=7d | head 50", true, true));
+        assert!(applies("error | prevalence domain_prevalence < 3 | where x>1 | sort -count", true, true));
+        // A trailing aggregation is pushed into the JOIN as a SQL GROUP BY (NAN-366).
+        assert!(applies("error | prevalence hash_prevalence <= 5 | stats count by src_ip", true, true));
+        // Does NOT push down.
+        assert!(!applies("error | head 10", true, true)); // no prevalence command
+        assert!(!applies("error | stats count by user | prevalence hash_prevalence <= 5", true, true)); // aggregation BEFORE can't reshape into a JOIN
+        assert!(!applies("error | prevalence hash_prevalence <= 5 | streamstats count", true, true)); // field-creating window command after
+        assert!(!applies("error | prevalence hash_first_seen > now() - 24h", true, true)); // first_seen isn't a count field
+        // Deploy-invariant terms gate it off regardless of shape.
+        assert!(!applies("error | prevalence hash_prevalence <= 5", false, true), "non-clickhouse must not push down");
+        assert!(!applies("error | prevalence hash_prevalence <= 5", true, false), "no prevalence service must not push down");
     }
 
     #[test]

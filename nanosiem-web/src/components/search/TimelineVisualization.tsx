@@ -664,11 +664,16 @@ export function TimelineVisualization({
         return {
           artifact: occ.artifact,
           artifactType,
-          hostCount: prevalence?.hostCount ?? 0,
+          // NAN-1696: when the prevalence lookup returns no record, the artifact
+          // is simply not-yet-baselined (the dict cache lags the summary) — it's
+          // still on >=1 host (it's in these results). Treat it as rare-on-1-host
+          // rather than a spurious host_count-0 "never seen" tier: host_count 0
+          // and 1 are the same artifact at two pipeline stages.
+          hostCount: prevalence?.hostCount || 1,
           firstSeen: eventTs,
           lastSeen: eventTs,
           totalOccurrences: 1,
-          isRare: prevalence?.isRare ?? false,
+          isRare: prevalence?.isRare ?? true,
           prevalenceScore: prevalence?.prevalenceScore ?? 0,
           envFirstSeen: prevalence?.envFirstSeen ?? eventTs,
         };

@@ -58,6 +58,16 @@ const PR = 16;
 const PT = 14;
 const PB = 32;
 
+// NAN-1696: rarity is a 3-tier scale, not binary. `rare` (< rarity threshold) is
+// the hunt signal; anything at/above the threshold used to be flatly labeled
+// "common", but a handful of hosts isn't common — it's "uncommon". Reserve
+// "common" for artifacts genuinely spread across the fleet.
+const COMMON_HOST_THRESHOLD = 20;
+// Novelty (independent of rarity): an artifact first seen in the environment
+// within this window is "new to the estate" — a real, stable signal, unlike the
+// transient host_count-0 state. Surfaced as a subtle ring.
+const NOVEL_WINDOW_MS = 48 * 60 * 60 * 1000;
+
 const fmtUtc = (d: Date) => {
   const month = d.toLocaleString('en-US', { month: 'short', timeZone: 'UTC' });
   const day = d.getUTCDate();
@@ -178,6 +188,11 @@ export function PrevalenceScatterPlot({
       if (!isNaN(s) && !isNaN(e) && e > s) return [s, e];
     }
     if (filteredDots.length > 0) {
+      // NAN-1695: X-axis is EVENT TIME — plot each rare artifact at when it occurred
+      // in the search window (the IR/SecOps asset-timeline pattern: rare activity pops
+      // at the moment it fired). The environment first-seen is context in the tooltip,
+      // NOT the axis — moving an old-but-rare artifact to its months-ago debut would
+      // push it off the investigation window and lose the "when did it fire" signal.
       const times = filteredDots.map((d) => d.firstSeen.getTime());
       const lo = Math.min(...times);
       const hi = Math.max(...times);
@@ -226,6 +241,7 @@ export function PrevalenceScatterPlot({
   const rareZoneTop = yScale(safeThreshold);
   const rareZoneBottom = PT + PLOT_H;
   const rareZoneH = Math.max(0, rareZoneBottom - rareZoneTop);
+  const nowMs = Date.now(); // for the novelty ring (first-seen recency)
 
   const rangeMs = xMax - xMin;
   const fmtXTick = (t: number) => {
@@ -283,7 +299,22 @@ export function PrevalenceScatterPlot({
             y={rareZoneTop}
             width={PLOT_W}
             height={rareZoneH}
-            style={{ fill: 'var(--primary)', opacity: 0.08 }}
+            style={{ fill: 'var(--primary)', opacity: 0.1 }}
+          />
+        )}
+        {/* NAN-1696: dashed rarity-threshold boundary — everything below this
+            line (on <safeThreshold hosts) is "rare". Makes the cutoff explicit
+            instead of implying it via the band edge. */}
+        {rareZoneH > 0 && (
+          <line
+            x1={PL}
+            x2={PL + PLOT_W}
+            y1={rareZoneTop}
+            y2={rareZoneTop}
+            stroke="var(--primary)"
+            strokeWidth="1"
+            strokeDasharray="4 3"
+            strokeOpacity="0.5"
           />
         )}
 
@@ -298,7 +329,7 @@ export function PrevalenceScatterPlot({
           opacity="0.7"
           style={{ fill: 'var(--primary)' }}
         >
-          RARE · SUSPICIOUS
+          {`RARE · < ${safeThreshold} HOST${safeThreshold === 1 ? '' : 'S'}`}
         </text>
         <text
           x={W - PR - 6}
@@ -394,7 +425,7 @@ export function PrevalenceScatterPlot({
           fontWeight="600"
           style={{ fill: 'var(--muted-foreground)' }}
         >
-          FIRST SEEN · UTC
+          EVENT TIME · UTC
         </text>
         <text
           x={10}
@@ -412,27 +443,56 @@ export function PrevalenceScatterPlot({
 
         {/* Dots */}
         {filteredDots.map((d) => {
-          const cx = xScale(d.firstSeen.getTime());
+          const cx = xScale(d.firstSeen.getTime()); // NAN-1695: event time (occurrence in window)
           const cy = yScale(Math.max(d.hostCount, 0.8));
           const r = Math.max(3, Math.min(9, Math.log10(d.events + 1) * 2.2));
+          // NAN-1696: 3-tier rarity opacity — rare pops, uncommon is present,
+          // common recedes (was a flat rare/faded binary that called 4 hosts
+          // "common").
+          const fillOpacity = d.isRare ? 1 : d.hostCount >= COMMON_HOST_THRESHOLD ? 0.3 : 0.6;
+          const strokeOpacity = d.isRare ? 0.9 : d.hostCount >= COMMON_HOST_THRESHOLD ? 0.18 : 0.4;
+          // Novelty ring: first seen in the env within the window. Gated to rare +
+          // uncommon only — "new to env" is the actionable cue where spread is low;
+          // on common (20+ hosts) it's just noise, so we keep those dots quiet.
+          const isNovel =
+            d.hostCount < COMMON_HOST_THRESHOLD &&
+            d.envFirstSeen != null &&
+            nowMs - d.envFirstSeen.getTime() < NOVEL_WINDOW_MS;
           return (
-            <circle
+            <g
               key={`${d.artifactType}-${d.artifact}`}
-              cx={cx}
-              cy={cy}
-              r={r}
-              strokeWidth="1"
-              style={{
-                fill: d.isRare ? 'var(--primary)' : 'var(--foreground)',
-                fillOpacity: d.isRare ? 1 : 0.35,
-                stroke: d.isRare ? 'var(--primary)' : 'var(--foreground)',
-                strokeOpacity: d.isRare ? 0.9 : 0.2,
-              }}
-              className={cn('cursor-pointer transition-[r]', d.isRare && 'rare-glow')}
+              className="cursor-pointer"
               onMouseEnter={() => handleEnter(d, cx, cy)}
               onMouseLeave={() => setTip(null)}
               onClick={() => onArtifactClick?.(d.artifact, d.artifactType, d.firstSeen)}
-            />
+            >
+              {/* first-seen-recently ring — "new to the environment". Softer on
+                  uncommon than rare, so the cue tracks the underlying rarity. */}
+              {isNovel && (
+                <circle
+                  cx={cx}
+                  cy={cy}
+                  r={r + 3.5}
+                  fill="none"
+                  stroke="var(--primary)"
+                  strokeWidth="1"
+                  strokeOpacity={d.isRare ? 0.55 : 0.3}
+                />
+              )}
+              <circle
+                cx={cx}
+                cy={cy}
+                r={r}
+                strokeWidth="1"
+                style={{
+                  fill: d.isRare ? 'var(--primary)' : 'var(--foreground)',
+                  fillOpacity,
+                  stroke: d.isRare ? 'var(--primary)' : 'var(--foreground)',
+                  strokeOpacity,
+                }}
+                className={cn('transition-[r]', d.isRare && 'rare-glow')}
+              />
+            </g>
           );
         })}
       </svg>
@@ -484,22 +544,29 @@ export function PrevalenceScatterPlot({
             )}
             <span className="truncate max-w-[220px]">{tip.d.artifact}</span>
           </div>
-          <div className="grid grid-cols-[auto_1fr] gap-x-2.5 gap-y-1 text-[10.5px]">
-            <span className="text-muted-foreground/70">type</span>
-            <span className="text-foreground">{tip.d.artifactType}</span>
-            <span className="text-muted-foreground/70">hosts</span>
-            <span className={tip.d.isRare ? 'text-primary' : 'text-foreground'}>
-              {tip.d.hostCount === 0
-                ? 'New (untracked)'
-                : tip.d.hostCount >= 9999
-                ? '1000+'
-                : tip.d.hostCount.toLocaleString()}
-            </span>
-            <span className="text-muted-foreground/70">events</span>
-            <span className="text-foreground">{tip.d.events.toLocaleString()}</span>
+          {/* Rarity verdict — the headline. Rarity is measured by how many
+              distinct ASSETS (hosts) the artifact is on, not by age. */}
+          <div className={cn('text-[10.5px] font-semibold', tip.d.isRare ? 'text-primary' : 'text-muted-foreground')}>
+            {tip.d.isRare
+              ? `RARE · on ${tip.d.hostCount.toLocaleString()} host${tip.d.hostCount === 1 ? '' : 's'}`
+              : tip.d.hostCount >= 9999
+              ? 'common · 1000+ hosts'
+              : tip.d.hostCount >= COMMON_HOST_THRESHOLD
+              ? `common · on ${tip.d.hostCount.toLocaleString()} hosts`
+              : `uncommon · on ${tip.d.hostCount.toLocaleString()} hosts`}
+            {tip.d.hostCount < COMMON_HOST_THRESHOLD &&
+              tip.d.envFirstSeen != null &&
+              nowMs - tip.d.envFirstSeen.getTime() < NOVEL_WINDOW_MS && (
+                <span className="ml-1.5 text-primary font-medium">· new to env</span>
+              )}
+          </div>
+          <div className="text-[10px] text-muted-foreground/90">
+            fired{' '}
+            <b className="text-foreground font-medium">{tip.d.events.toLocaleString()}</b>
+            {tip.d.events === 1 ? ' time' : ' times'} in this window
           </div>
           <div className="mt-1.5 pt-1.5 border-t border-border text-[10px] text-muted-foreground">
-            first seen{' '}
+            event time{' '}
             <b className="text-foreground font-medium">{fmtUtc(tip.d.firstSeen)}</b>
             {tip.d.envFirstSeen && tip.d.envFirstSeen.getTime() !== tip.d.firstSeen.getTime() && (
               <>
