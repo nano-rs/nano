@@ -141,6 +141,65 @@ function parseTimestampAsUTC(timestamp: string | Date | undefined): Date {
   return new Date(isoString);
 }
 
+// NAN-1701: a dotted string is only a trackable DOMAIN artifact if its last
+// label is a plausible public TLD — otherwise filenames (`BGInfo.bmp`,
+// `kernel32.dll`), internal hostnames (`ws-01.corp.local`) and the like get
+// plotted as domains the prevalence agg can never baseline, flooding the rarity
+// scatter with fake "not baselined" dots. The internal-TLD set mirrors the
+// backend domain-prevalence MV's exclusion (migration 129); the file-extension
+// set catches Windows telemetry noise.
+// NOTE: deliberately EXCLUDES anything that is also a real public TLD —
+// `.com/.zip/.mov` are gTLDs, `.so/.md/.sh/.py/.pl/.cab` are ccTLDs/gTLDs — so we
+// only list extensions that are unambiguously NOT delegated TLDs. A file with a
+// TLD-shaped extension (`evil.sh`) will slip through as a "domain"; that's the
+// safe failure (over-include rare junk) vs dropping every `.com` domain.
+const NON_DOMAIN_LAST_LABELS = new Set([
+  // internal / non-public TLDs (match backend domain_prevalence_*_mv)
+  'local', 'corp', 'internal', 'lan', 'home', 'localdomain', 'intranet', 'private', 'arpa',
+  // file extensions that are NOT real TLDs
+  'exe', 'dll', 'sys', 'bin', 'dat', 'tmp', 'temp', 'log', 'txt', 'ini', 'cfg', 'conf',
+  'xml', 'json', 'yaml', 'bmp', 'png', 'jpg', 'jpeg', 'gif', 'ico', 'msi', 'bat', 'vbs',
+  'cmd', 'scr', 'pif', 'jar', 'rar', 'tar', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt',
+  'pptx', 'csv', 'bak', 'lnk', 'mui', 'nls', 'tlb', 'ocx', 'cpl', 'drv', 'dylib', 'crt',
+  'pfx', 'class',
+]);
+
+function isTrackableDomain(value: string): boolean {
+  if (!value.includes('.') || value.includes(' ')) return false;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(value)) return false; // IPv4
+  const labels = value.split('.');
+  const tld = labels[labels.length - 1].toLowerCase();
+  // Public TLDs are alphabetic and 2+ chars; reject numeric/short and the
+  // internal-TLD / file-extension blocklist.
+  if (tld.length < 2 || !/^[a-z]{2,24}$/.test(tld)) return false;
+  return !NON_DOMAIN_LAST_LABELS.has(tld);
+}
+
+// NAN-1701: rarity is a small-window tool. Auto-populate only for searches this
+// short; larger windows (which in a busy estate can extract tens of thousands of
+// artifacts) require an explicit "Load rarity" click.
+const RARITY_AUTO_MAX_HOURS = 4;
+// Hard ceiling on artifacts scored per search — a runaway `*`-over-a-week result
+// set can't fire hundreds of requests or drop tens of thousands of SVG dots.
+const RARITY_MAX_ARTIFACTS = 1000;
+const RARITY_BATCH_SIZE = 100; // == backend MAX_BULK_ARTIFACTS
+const RARITY_MAX_CONCURRENT = 6; // cap parallel prevalence batches
+
+// Run `fn` over `items` with at most `limit` in flight; preserves input order.
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (next < items.length) {
+        const i = next++;
+        out[i] = await fn(items[i]);
+      }
+    }),
+  );
+  return out;
+}
+
 /**
  * Extract unique hashes and domains from search results WITH their event timestamps.
  * This ensures the chart shows artifacts at the time they appeared in the search results,
@@ -151,6 +210,7 @@ function extractArtifactsWithTimestamps(results: SearchResult[]): {
   domains: string[];
   hashOccurrences: ArtifactOccurrence[];
   domainOccurrences: ArtifactOccurrence[];
+  droppedCount: number;
 } {
   const hashes = new Set<string>();
   const domains = new Set<string>();
@@ -208,8 +268,7 @@ function extractArtifactsWithTimestamps(results: SearchResult[]): {
 
     // Helper to add domain with timestamp
     const addDomain = (domain: unknown) => {
-      if (domain && typeof domain === 'string' && domain.includes('.') &&
-          !domain.includes(' ') && !/^\d+\.\d+\.\d+\.\d+$/.test(domain)) {
+      if (domain && typeof domain === 'string' && isTrackableDomain(domain)) {
         const normalizedDomain = domain.toLowerCase();
         domains.add(normalizedDomain);
 
@@ -264,11 +323,27 @@ function extractArtifactsWithTimestamps(results: SearchResult[]): {
     extractDomainFromUrl(fields.file_path);  // Sometimes contains URLs
   }
 
+  // NAN-1701: no arbitrary 50-cap — an analyst must see every artifact. The only
+  // bound is the RARITY_MAX_ARTIFACTS ceiling (a runaway-result-set backstop),
+  // applied HERE so lookup, plotting, and the SVG are all consistent — dropping
+  // it from the lookup but still plotting it would just resurrect fake host-0
+  // dots. Prioritize hashes, fill remaining budget with domains; keep only the
+  // occurrences of kept artifacts. droppedCount drives the "showing N of M" badge.
+  const allHashes = Array.from(hashes);
+  const allDomains = Array.from(domains);
+  const keptHashes = allHashes.slice(0, RARITY_MAX_ARTIFACTS);
+  const keptDomains = allDomains.slice(0, Math.max(0, RARITY_MAX_ARTIFACTS - keptHashes.length));
+  const droppedCount = allHashes.length + allDomains.length - keptHashes.length - keptDomains.length;
+  if (droppedCount === 0) {
+    return { hashes: keptHashes, domains: keptDomains, hashOccurrences, domainOccurrences, droppedCount };
+  }
+  const kept = new Set<string>([...keptHashes, ...keptDomains]);
   return {
-    hashes: Array.from(hashes).slice(0, 50),
-    domains: Array.from(domains).slice(0, 50),
-    hashOccurrences,
-    domainOccurrences,
+    hashes: keptHashes,
+    domains: keptDomains,
+    hashOccurrences: hashOccurrences.filter((o) => kept.has(o.artifact)),
+    domainOccurrences: domainOccurrences.filter((o) => kept.has(o.artifact)),
+    droppedCount,
   };
 }
 
@@ -356,6 +431,9 @@ export function TimelineVisualization({
     isAssetMode || urlWantsRarity ? 'prevalence' : 'timeline'
   );
   const [scatterData, setScatterData] = useState<PrevalenceScatterData | null>(null);
+  // NAN-1701: user explicitly loaded rarity for a large (>4h) window. (The
+  // ceiling-dropped count for the badge comes from extractedData.droppedCount.)
+  const [rarityManualLoad, setRarityManualLoad] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const lastFetchedKeyRef = useRef<string | null>(null);
@@ -514,6 +592,19 @@ export function TimelineVisualization({
     }
     return null;
   }, [timeRange]);
+
+  // NAN-1701: search-window duration (hours) — rarity auto-populates only when
+  // this is small; larger windows are gated behind an explicit load.
+  const searchWindowHours = useMemo(
+    () => (pickerRange ? (pickerRange[1] - pickerRange[0]) / 3_600_000 : null),
+    [pickerRange],
+  );
+  // True while a >RARITY_AUTO_MAX_HOURS window hasn't been explicitly loaded.
+  const rarityGatedByWindow =
+    !isAssetMode &&
+    !rarityManualLoad &&
+    searchWindowHours != null &&
+    searchWindowHours > RARITY_AUTO_MAX_HOURS;
 
   // The actual extent of the histogram buckets (ms), or null if no data.
   const dataExtent = useMemo<[number, number] | null>(() => {
@@ -823,14 +914,33 @@ export function TimelineVisualization({
     setError(null);
 
     try {
-      const response = await fetchScatterDataRef.current({
-        artifacts: {
-          hashes: extractedData.hashes,
-          domains: extractedData.domains,
-          ips: [],
-        },
-        window: timeWindow,
-      });
+      // NAN-1701: batch the prevalence lookup into MAX_BULK-sized chunks so the
+      // full (already ceiling-capped, at extraction) artifact set gets complete
+      // coverage — an analyst must see every artifact, not the first 50. Combine
+      // hashes + domains, chunk to the 100/request limit, fetch with a bounded
+      // concurrency pool, and merge.
+      const tagged: Array<['hash' | 'domain', string]> = [
+        ...extractedData.hashes.map((h) => ['hash', h] as ['hash', string]),
+        ...extractedData.domains.map((d) => ['domain', d] as ['domain', string]),
+      ];
+      const chunks: Array<Array<['hash' | 'domain', string]>> = [];
+      for (let i = 0; i < tagged.length; i += RARITY_BATCH_SIZE) chunks.push(tagged.slice(i, i + RARITY_BATCH_SIZE));
+
+      const chunkResponses = await mapLimit(chunks, RARITY_MAX_CONCURRENT, (chunk) =>
+        fetchScatterDataRef.current({
+          artifacts: {
+            hashes: chunk.filter(([t]) => t === 'hash').map(([, v]) => v),
+            domains: chunk.filter(([t]) => t === 'domain').map(([, v]) => v),
+            ips: [],
+          },
+          window: timeWindow,
+        }),
+      );
+      const response = {
+        hash_points: chunkResponses.flatMap((r) => r.hash_points),
+        domain_points: chunkResponses.flatMap((r) => r.domain_points),
+        rarity_threshold: chunkResponses[0]?.rarity_threshold ?? 3,
+      };
 
       // Build lookup maps for prevalence data (host_count, is_rare, env first_seen, etc.)
       const hashPrevalenceMap = new Map<string, {
@@ -940,9 +1050,18 @@ export function TimelineVisualization({
     if (isAssetMode && assetContext) {
       loadScatterData();
     } else if (!isAssetMode && hasArtifacts) {
+      // NAN-1701: don't auto-load rarity for large search windows — wait for the
+      // explicit "Load rarity" click (rarityGatedByWindow).
+      if (rarityGatedByWindow) return;
       loadScatterData();
     }
-  }, [hasArtifacts, collapsed, loadScatterData, isAssetMode, assetContext]);
+  }, [hasArtifacts, collapsed, loadScatterData, isAssetMode, assetContext, rarityGatedByWindow]);
+
+  // NAN-1701: a new search / window resets the explicit-load opt-in, so a fresh
+  // large-window search re-prompts instead of silently reusing the prior consent.
+  useEffect(() => {
+    setRarityManualLoad(false);
+  }, [extractedData]);
 
   const handleArtifactClick = useCallback((artifact: string, artifactType: 'hash' | 'domain', timestamp?: Date) => {
     if (onArtifactFilter) onArtifactFilter(artifact, artifactType, timestamp);
@@ -1190,11 +1309,32 @@ export function TimelineVisualization({
                     <AlertTriangle className="w-4 h-4 mr-2" />{error}
                     <Button variant="ghost" size="sm" onClick={() => loadScatterData()} className="ml-4 text-muted-foreground hover:text-primary"><RefreshCw className="w-3 h-3 mr-1" />Retry query</Button>
                   </div>
+                ) : rarityGatedByWindow ? (
+                  // NAN-1701: large window — don't auto-score; require an explicit
+                  // load. Gate on rarityGatedByWindow alone (not `&& !scatterData`)
+                  // so a prior small-window search's stale dots don't linger here.
+                  <div className="flex flex-col items-center justify-center py-8 gap-2 text-center px-4">
+                    <div className="text-muted-foreground text-sm">Rarity auto-loads for windows ≤ {RARITY_AUTO_MAX_HOURS}h</div>
+                    <div className="text-muted-foreground/70 text-xs max-w-md">
+                      This search spans {searchWindowHours != null ? (searchWindowHours >= 24 ? `${Math.round(searchWindowHours / 24)}d` : `${Math.round(searchWindowHours)}h`) : ''} — prevalence is a small-window tool, and scoring every artifact over a wide window is heavier.
+                    </div>
+                    {/* Only flip the opt-in flag — the prefetch effect (which depends
+                        on rarityGatedByWindow) fires the single load, so we don't
+                        double-fetch by also calling loadScatterData() here. */}
+                    <Button variant="outline" size="sm" onClick={() => setRarityManualLoad(true)} className="mt-1"><Fingerprint className="w-3 h-3 mr-1.5" />Load rarity anyway</Button>
+                  </div>
                 ) : (scatterData ?? pendingScatterData) ? (
                   // NAN-1700: render immediately with pending points (event-time
                   // positions) and let the enriched scatterData animate the rarity
                   // in when it lands — no full-panel spinner blocking the view.
-                  <PrevalenceScatterPlot data={(scatterData ?? pendingScatterData)!} onArtifactClick={handleArtifactClick} onSelectionChange={handleSelectionChange} height={180} loading={isLoading} timeRange={timeRange} onMaxHostCountChange={isAssetMode ? handleMaxHostCountChange : undefined} />
+                  <>
+                    {extractedData.droppedCount > 0 && (
+                      <div className="text-[10px] text-amber-400/80 text-center pb-1">
+                        showing first {RARITY_MAX_ARTIFACTS.toLocaleString()} of {(RARITY_MAX_ARTIFACTS + extractedData.droppedCount).toLocaleString()} artifacts — narrow the window to score the rest
+                      </div>
+                    )}
+                    <PrevalenceScatterPlot data={(scatterData ?? pendingScatterData)!} onArtifactClick={handleArtifactClick} onSelectionChange={handleSelectionChange} height={180} loading={isLoading} timeRange={timeRange} onMaxHostCountChange={isAssetMode ? handleMaxHostCountChange : undefined} />
+                  </>
                 ) : (isLoading || artifactFetchLoading) ? (
                   <div className="flex items-center justify-center py-8 text-muted-foreground text-sm"><Loader2 className="w-4 h-4 mr-2 animate-spin" />Loading rarity index...</div>
                 ) : (
