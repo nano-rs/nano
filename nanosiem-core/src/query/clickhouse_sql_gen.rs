@@ -761,6 +761,59 @@ pub(super) fn has_selective_indexed_eq(expr: &SearchExpr, profile: &dyn SchemaPr
     check(expr, profile)
 }
 
+/// True when `expr` is exactly the audit-gate conjunct that
+/// `enforce_source_type_exclusion` (NAN-704) appends for users lacking
+/// `audit:view`: `source_type != "audit"` (case-insensitive on both sides).
+fn is_injected_audit_gate_filter(expr: &SearchExpr) -> bool {
+    matches!(
+        expr,
+        SearchExpr::FieldFilter {
+            field,
+            op: Comparator::Ne,
+            value: Value::String(s),
+        } if field.eq_ignore_ascii_case("source_type") && s.eq_ignore_ascii_case("audit")
+    )
+}
+
+/// Strip the injected non-audit gate from a query so it is NOT emitted on the
+/// spans/metrics datasets (O45 / NAN-1733).
+///
+/// `enforce_source_type_exclusion` wraps the base search as
+/// `(<expr>) AND source_type != "audit"` for users without `audit:view`. On
+/// `Dataset::Logs` that resolves to a cheap `source_type` column compare and is
+/// correct — audit rows live only in the `logs` table (`source_type = 'audit'`).
+/// On the OTLP spans/metrics datasets there IS no `source_type` column: the
+/// spans/metrics profile resolves it to a per-row `attributes` / `resource_attributes`
+/// Map lookup, so the gate (a) costs a double Map probe for a row class that can
+/// never exist there and (b) silently drops any span/metric a tenant legitimately
+/// tagged `source_type=audit`. This is the exact structural inverse of the
+/// injection in `query_processing::inject_source_type_exclusion_recursive`:
+/// unwrap `And(Group(inner), <audit filter>)` back to `inner`, recursing through
+/// piped sources exactly as the injection does. Only the auto-injected wrap
+/// (`Group` on the left) is matched, so a user's own top-level
+/// `source_type!="audit"` term is left untouched. Callers gate this to
+/// non-`Logs` datasets, so the logs path stays byte-identical.
+fn strip_injected_audit_gate(query: &Query) -> Query {
+    match query {
+        Query::Search(expr) => Query::Search(strip_injected_audit_gate_expr(expr)),
+        Query::Piped { source, command } => Query::Piped {
+            source: Box::new(strip_injected_audit_gate(source)),
+            command: command.clone(),
+        },
+    }
+}
+
+fn strip_injected_audit_gate_expr(expr: &SearchExpr) -> SearchExpr {
+    if let SearchExpr::And(left, right) = expr {
+        if is_injected_audit_gate_filter(right) {
+            if let SearchExpr::Group(inner) = left.as_ref() {
+                return (**inner).clone();
+            }
+        }
+    }
+    expr.clone()
+}
+
 /// Default max elements for groupArray/groupUniqArray to prevent OOM from unbounded array aggregation.
 /// Capped at 100 — high-cardinality fields (e.g., a parser that maps session UUIDs into `user`)
 /// can produce 780K+ unique values per group, and 10K × thousands of groups was enough to OOM
@@ -852,6 +905,37 @@ pub struct ClickHouseSqlGenerator {
     /// until the first dataset swap; logs-only queries never swap, so it stays
     /// `None` and behavior is byte-identical.
     base_profile: Option<Arc<dyn SchemaProfile>>,
+    /// The tenant logs STORAGE table captured on the first
+    /// [`with_dataset`](ClickHouseSqlGenerator::with_dataset) swap, alongside
+    /// [`base_profile`](Self::base_profile) (NAN-1721 / O8). A later
+    /// `Dataset::Logs` restore (a cross-dataset subsearch INTO logs from a
+    /// spans/metrics outer query) points `table_name` back at THIS table
+    /// (`ocsf_logs` / tenant-prefixed) rather than the literal `"logs"` that
+    /// `Dataset::table_name()` returns — which on an OCSF/tenant-prefixed tenant
+    /// is the wrong (empty or legacy-UDM) table, so the correlation silently
+    /// joins zero rows. `None` until the first dataset swap; logs-only queries
+    /// never swap, so it stays `None` and behavior is byte-identical.
+    base_table: Option<String>,
+    /// The dataset the generator currently targets (NAN-1721 / O8). Defaults to
+    /// [`Dataset::Logs`]; set in lock-step with `table_name`/`time_column`/
+    /// `profile` by [`with_dataset`](ClickHouseSqlGenerator::with_dataset).
+    /// Cross-dataset subsearch detection compares this DATASET IDENTITY against
+    /// the subsearch's dataset — not `table_name` strings, which falsely flags an
+    /// OCSF/tenant-prefixed logs table (`ocsf_logs` != `"logs"`) as cross-dataset
+    /// and re-points the sub at the wrong table.
+    dataset: otel::Dataset,
+    /// Whether this deployment is a multi-shard ClickHouse cluster (NAN-1728 / C5).
+    /// Set from `DualPool::TableNames::is_clustered()` at construction via
+    /// [`with_cluster_routing`](Self::with_cluster_routing). When `true`, a
+    /// dataset/rollup swap ([`with_dataset`](Self::with_dataset) Spans/Metrics,
+    /// [`with_metrics_rollup`](Self::with_metrics_rollup)) routes its otel storage
+    /// table to the `_distributed` wrapper so spans/metrics searches fan in across
+    /// all shards — mirroring how the logs lane is pre-routed via `read_bare` in
+    /// `ch_generator_for_pool`. Defaults to `false`, so single-shard (dev/Saturn/
+    /// most tenants) and every `::new()`/`::with_table()` site keep byte-identical
+    /// literal-local output. The `Dataset::Logs` restore arm is unaffected: its
+    /// table comes from `base_table`, already routed by `read_bare`.
+    is_clustered: bool,
 }
 
 impl Clone for ClickHouseSqlGenerator {
@@ -870,6 +954,9 @@ impl Clone for ClickHouseSqlGenerator {
             agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
             profile: Arc::clone(&self.profile),
             base_profile: self.base_profile.clone(),
+            base_table: self.base_table.clone(),
+            dataset: self.dataset,
+            is_clustered: self.is_clustered,
         }
     }
 }
@@ -898,6 +985,9 @@ impl ClickHouseSqlGenerator {
             agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
             profile: Arc::new(UdmProfile::new()),
             base_profile: None,
+            base_table: None,
+            dataset: otel::Dataset::Logs,
+            is_clustered: false,
         }
     }
 
@@ -918,6 +1008,9 @@ impl ClickHouseSqlGenerator {
             agg_reference_aliases: RwLock::new(std::collections::HashMap::new()),
             profile: Arc::new(UdmProfile::new()),
             base_profile: None,
+            base_table: None,
+            dataset: otel::Dataset::Logs,
+            is_clustered: false,
         }
     }
 
@@ -927,6 +1020,38 @@ impl ClickHouseSqlGenerator {
     pub fn with_profile(mut self, profile: Arc<dyn SchemaProfile>) -> Self {
         self.profile = profile;
         self
+    }
+
+    /// Enable multi-shard cluster routing for otel dataset/rollup swaps
+    /// (NAN-1728 / C5). Builder-style; pass `DualPool::TableNames::is_clustered()`.
+    /// When `true`, [`with_dataset`](Self::with_dataset) (Spans/Metrics) and
+    /// [`with_metrics_rollup`](Self::with_metrics_rollup) point their otel storage
+    /// table at the `_distributed` wrapper so those searches fan in across all
+    /// shards — mirroring the logs lane, which is pre-routed via
+    /// `TableNames::read_bare` in `ch_generator_for_pool`. `false` (the default and
+    /// every `::new()`/`::with_table()` site) keeps literal-local output, so
+    /// single-shard deployments are byte-identical.
+    pub fn with_cluster_routing(mut self, is_clustered: bool) -> Self {
+        self.is_clustered = is_clustered;
+        self
+    }
+
+    /// Route a bare read table to its `_distributed` wrapper on clustered
+    /// deployments (NAN-1728 / C5, R2). Mirrors `TableNames::read_bare`: the
+    /// tables this is called for (otel dataset/rollup storage tables in
+    /// `with_dataset`/`with_metrics_rollup`, `identity_observations` in the ASOF
+    /// build side) are all members of the distributed set, so appending
+    /// `_distributed` when clustered is the same resolution `read_bare` performs
+    /// for the logs lane. `is_clustered=false` returns the bare literal unchanged
+    /// — byte-identical single-shard output. The generator relies on the CH
+    /// client's default `nanosiem` database, so this returns the BARE name (no
+    /// `nanosiem.` prefix), like the logs lane.
+    fn route_dataset_table(&self, base: &str) -> String {
+        if self.is_clustered {
+            format!("{base}_distributed")
+        } else {
+            base.to_string()
+        }
     }
 
     /// Point the generator at an OTLP [`Dataset`] (NAN-1534). Builder-style; sets
@@ -950,8 +1075,27 @@ impl ClickHouseSqlGenerator {
         // Map access → a correlated subquery CH rejects).
         if self.base_profile.is_none() {
             self.base_profile = Some(Arc::clone(&self.profile));
+            // O8 (NAN-1721): capture the tenant logs STORAGE table too, so a later
+            // `Dataset::Logs` restore points back at THIS table (`ocsf_logs` /
+            // tenant-prefixed) rather than the literal `"logs"` — see the
+            // `Dataset::Logs` arm below.
+            self.base_table = Some(self.table_name.clone());
         }
-        self.table_name = dataset.table_name().to_string();
+        self.dataset = dataset;
+        // O8 (NAN-1721): for a `Dataset::Logs` restore, keep the captured tenant
+        // logs table (`base_table`) rather than the literal `Dataset::table_name()`
+        // (`"logs"`), which is the wrong table on OCSF/tenant-prefixed tenants.
+        self.table_name = match dataset {
+            otel::Dataset::Logs => self
+                .base_table
+                .clone()
+                .unwrap_or_else(|| dataset.table_name().to_string()),
+            // NAN-1728 (C5): route the spans/metrics storage table to its
+            // `_distributed` wrapper when clustered so the search reads all
+            // shards; single-shard (default) keeps the bare literal.
+            // (The Logs arm restores `base_table`, already routed by `read_bare`.)
+            _ => self.route_dataset_table(dataset.table_name()),
+        };
         self.time_column = dataset.time_column().to_string();
         self.dataset_columns = dataset.columns().iter().copied().collect();
         self.dataset_numeric_columns = dataset.numeric_columns().iter().copied().collect();
@@ -990,14 +1134,25 @@ impl ClickHouseSqlGenerator {
     /// the rollup); tag access does NOT (the rollup carries no tag maps — which is
     /// exactly why core_search never routes a tag-filtered/grouped query here).
     pub fn with_metrics_rollup(mut self, grain: otel::MetricRollup) -> Self {
-        self.table_name = grain.table_name().to_string();
+        // NAN-1728 (C5): route the rollup storage table to its `_distributed`
+        // wrapper when clustered; single-shard (default) keeps the bare literal.
+        self.table_name = self.route_dataset_table(grain.table_name());
         self.time_column = grain.time_column().to_string();
         self
     }
 
     /// Whether the generator is currently pointed at a metrics rollup table.
+    /// NAN-1728 (C5): also recognizes the `_distributed` wrapper names, since a
+    /// clustered [`with_metrics_rollup`](Self::with_metrics_rollup) points
+    /// `table_name` at `otel_metrics_1m_distributed`/`_1h_distributed`.
     pub(crate) fn is_metrics_rollup(&self) -> bool {
-        self.table_name == "otel_metrics_1m" || self.table_name == "otel_metrics_1h"
+        matches!(
+            self.table_name.as_str(),
+            "otel_metrics_1m"
+                | "otel_metrics_1h"
+                | "otel_metrics_1m_distributed"
+                | "otel_metrics_1h_distributed"
+        )
     }
 
     /// Whether `field` is a promoted column of the active OTLP dataset (NAN-1534).
@@ -1017,6 +1172,22 @@ impl ClickHouseSqlGenerator {
     /// default ORDER BY, and the `rate()` counter window (NAN-1534).
     pub(crate) fn time_column(&self) -> &str {
         &self.time_column
+    }
+
+    /// The physical per-row identity column for the active dataset (NAN-1721 /
+    /// O27) — the deterministic tie-break in window `ORDER BY` clauses and the
+    /// `dedup` survivor key. `id` on logs (UDM/OCSF), `span_id` on spans; `None`
+    /// for a profile with no unique per-row id (metrics), where callers drop the
+    /// tie-break / fall back to the sort-based shape. Keyed off `core_fields` so
+    /// it stays in lock-step with the profile's own identity contract.
+    pub(crate) fn row_identity_column(&self) -> Option<&'static str> {
+        if self.profile.core_fields().contains(&"id") {
+            Some("id")
+        } else if self.profile.core_fields().contains(&"span_id") {
+            Some("span_id")
+        } else {
+            None
+        }
     }
 
     // Phase 2b: route the storage binding (table name / timestamp expression)
@@ -1089,6 +1260,39 @@ impl ClickHouseSqlGenerator {
             crate::schema::SchemaId::Spans => crate::schema::canonicalize_span_field(field),
             crate::schema::SchemaId::Metrics => crate::schema::canonicalize_metric_field(field),
             _ => normalize_field_name(field),
+        }
+    }
+
+    /// The column `bin` buckets/reads for a given user field token (NAN-1721 / O7).
+    /// The default (`bin span=…`) and the time aliases (`bin _time` / `bin
+    /// timestamp`) resolve to the active dataset's [`time_column`](Self::time_column)
+    /// — `start_time` on spans, where a literal `timestamp` column does not exist —
+    /// while an explicit non-time field is canonicalized through the profile
+    /// (`duration` → `duration_ns`). Logs keep `timestamp` byte-identical: the free
+    /// `normalize_field_name` maps `_time`→`timestamp` and leaves `timestamp` itself
+    /// untouched, matching the pre-fix literal default.
+    pub(crate) fn bin_field_name(&self, field: Option<&str>) -> String {
+        match field {
+            Some("_time") | None => self.time_column().to_string(),
+            Some(f) => self.canonicalize_field(f).to_string(),
+        }
+    }
+
+    /// The output column name `bin` projects for `cmd` (NAN-1721 / O7), mirroring
+    /// the Bin generator's alias resolution exactly: an explicit `as <alias>`, else
+    /// the canonicalized binned field (`bin_field_name`) when a field was given,
+    /// else `time_bucket`. Registered in `upstream_computed_fields` so a downstream
+    /// `by <alias>` references this real bucket column directly instead of — on
+    /// spans — resolving the un-promoted name to an `attributes['<alias>']` Map
+    /// subscript. `None` for non-bin commands.
+    fn bin_output_alias(&self, cmd: &Command) -> Option<String> {
+        match cmd {
+            Command::Bin { field, alias, .. } => Some(match (alias, field.is_some()) {
+                (Some(a), _) => a.clone(),
+                (None, true) => self.bin_field_name(field.as_deref()),
+                (None, false) => "time_bucket".to_string(),
+            }),
+            _ => None,
         }
     }
 
@@ -1292,13 +1496,26 @@ impl ClickHouseSqlGenerator {
     /// Record the value-computed outputs of a just-generated pipeline stage so
     /// the stages after it see them as shadowing columns (NAN-1341).
     fn note_upstream_computed(&self, cmd: &Command) {
-        let added = {
+        let mut added = {
             let guard = self
                 .upstream_computed_fields
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             field_analysis::upstream_computed_added_by_command(cmd, &guard)
         };
+        // O7 (NAN-1721): `field_analysis` deliberately omits `bin` from the
+        // computed set (its floored values can precede the window start — the
+        // resolve_identity bound is handled separately by
+        // `upstream_timestamp_rewritten`). But bin's OUTPUT alias is still a real
+        // in-scope column, and a downstream `by <alias>` must reference it
+        // directly. On spans an un-registered alias canonicalizes to the raw time
+        // column (`by timestamp` → `start_time`, silently per-event) or resolves
+        // to an `attributes['<alias>']` Map subscript — both silently wrong.
+        // Registering it is byte-identical on logs (the alias already fell through
+        // to a bare identifier there).
+        if let Some(alias) = self.bin_output_alias(cmd) {
+            added.insert(alias);
+        }
         match self.upstream_computed_fields.write() {
             Ok(mut guard) => guard.extend(added),
             Err(poisoned) => poisoned.into_inner().extend(added),
@@ -1396,6 +1613,22 @@ impl ClickHouseSqlGenerator {
         time_range: &TimeRange,
         options: &QueryOptions,
     ) -> Result<String, SqlGenError> {
+        // O45 (NAN-1733): the audit-view gate (`… AND source_type != "audit"`,
+        // injected by `enforce_source_type_exclusion` for users without
+        // `audit:view`) is a logs-domain concern — audit rows live only in the
+        // `logs` table. On the OTLP spans/metrics datasets `source_type` has no
+        // column and resolves to a per-row Map lookup, so the gate is pure cost
+        // and can hide rows a tenant tagged `source_type=audit`. Drop it here for
+        // every non-`Logs` dataset; the logs path keeps `query` untouched and
+        // stays byte-identical.
+        let stripped_query;
+        let query = if matches!(self.dataset, otel::Dataset::Logs) {
+            query
+        } else {
+            stripped_query = strip_injected_audit_gate(query);
+            &stripped_query
+        };
+
         // Store time range for subsearch IN subquery generation
         // Use write_or_default to avoid panic on poisoned lock
         match self.generation_time_range.write() {
@@ -2375,11 +2608,15 @@ impl ClickHouseSqlGenerator {
         prior_stages: &[QueryStage],
         subsearch_dataset: Option<otel::Dataset>,
     ) -> Result<String, SqlGenError> {
-        // NAN-1562: cross-dataset only when the selected dataset's table differs
-        // from the outer table — `dataset=logs` from a logs query stays
+        // NAN-1562: cross-dataset only when the subsearch targets a DIFFERENT
+        // dataset than the outer query — `dataset=logs` from a logs query stays
         // byte-identical (no clone, no settings, same ctx).
+        // O8 (NAN-1721): compare by DATASET IDENTITY, not `table_name` strings —
+        // an OCSF/tenant-prefixed logs table (`ocsf_logs` != `"logs"`) is NOT a
+        // different dataset, and the string form falsely flagged it cross-dataset
+        // → re-pointed the sub at the wrong (`"logs"`) table.
         let cross_dataset = subsearch_dataset
-            .map(|ds| ds.table_name() != self.table_name)
+            .map(|ds| ds != self.dataset)
             .unwrap_or(false);
 
         // NAN-1562 bound: a cross-dataset join MUST have positional key fields —
@@ -2411,9 +2648,13 @@ impl ClickHouseSqlGenerator {
         };
         let sub_gen: &ClickHouseSqlGenerator = sub_gen_owned.as_ref().unwrap_or(self);
         // Sub table + time column the subsearch reads against (own dataset when cross).
+        // O8 (NAN-1721): read the SUB generator's RESTORED table/time column, not
+        // the literal `Dataset::table_name()`. For `dataset=logs` the sub generator
+        // restored the tenant-aware logs table (`ocsf_logs`/tenant-prefixed) from
+        // the captured `base_table`; the bare `"logs"` literal targets the wrong
+        // (empty or legacy-UDM) table → silently zero correlated rows.
         let (sub_table, sub_time_col): (String, String) = if cross_dataset {
-            let ds = subsearch_dataset.unwrap();
-            (ds.table_name().to_string(), ds.time_column().to_string())
+            (sub_gen.table_name.clone(), sub_gen.time_column.clone())
         } else {
             (ctx.table_name.to_string(), ctx.time_column.to_string())
         };

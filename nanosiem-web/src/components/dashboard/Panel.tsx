@@ -85,6 +85,20 @@ export interface DrilldownFilter {
   operator: '=' | '!=' | '>' | '<' | '>=' | '<=';
 }
 
+/**
+ * NAN-1719 (CONTRACT 3): the payload a visualization emits on a drilldown click.
+ * `filters` carries ALL group-by field/value pairs for the clicked element (never
+ * just the first, and including numeric group-bys). For time-bucketed (timechart)
+ * clicks, `anchorStart`/`anchorEnd` carry the clicked bucket's [start, start+span]
+ * ISO window instead of a synthetic `time_bucket` filter. Panel is a thin
+ * pass-through: it forwards this object unchanged to its parent (DashboardView).
+ */
+export interface DrilldownPayload {
+  filters: { field: string; value: string }[];
+  anchorStart?: string;
+  anchorEnd?: string;
+}
+
 // Panel component props
 export interface PanelProps {
   config: PanelConfig;
@@ -94,8 +108,13 @@ export interface PanelProps {
   onEdit?: () => void;
   onDuplicate?: () => void;
   onDelete?: () => void;
-  onDrilldown?: (filter: DrilldownFilter) => void;
-  onRefresh: () => void;
+  /** CONTRACT 3: forwarded unchanged from the visualization up to DashboardView. */
+  onDrilldown?: (payload: DrilldownPayload) => void;
+  /**
+   * NAN-1719 (DSH8): a manual Refresh passes `true` to bypass the server cache
+   * so hammering Refresh during an incident actually re-runs the query.
+   */
+  onRefresh: (bypassCache?: boolean) => void;
   /**
    * NAN-1183 lazy-load: fired when this panel enters/leaves the viewport so the
    * dashboard can run its query only once it scrolls into view. `scrollRoot` is
@@ -111,6 +130,30 @@ export interface PanelProps {
    * they're actively loading when nothing is fetching.
    */
   hasRunOnce: boolean;
+  /**
+   * NAN-1719 (DSH8, CONTRACT 4): true when this panel's data came from the
+   * server cache. Drives the "cached · refresh" footer affordance and suppresses
+   * the misleading "Updated just now" stamp.
+   */
+  cached?: boolean;
+  /** Age of the cached entry in seconds (DSH8). */
+  cacheAgeSecs?: number;
+  /**
+   * NAN-1719 (DSH40, CONTRACT 4): true when the result hit the 10000-row panel
+   * cap (or `totalCount` exceeds the shown row count). Drives a truncation badge
+   * so a capped page isn't presented as complete.
+   */
+  truncated?: boolean;
+  /** Total matching rows before the panel cap, for the truncation badge (DSH40). */
+  totalCount?: number;
+  /**
+   * NAN-1719 (DSH52, CONTRACT 4): the panel query with `$variables` already
+   * substituted, used for "Open in Search" so the opened search matches what the
+   * panel actually ran (not raw `config.query` with unresolved `$vars`).
+   */
+  resolvedQuery?: string;
+  /** The panel's effective absolute window, carried into "Open in Search" (DSH52). */
+  effectiveTimeRange?: { start: string; end: string };
   children?: React.ReactNode;
 }
 
@@ -130,6 +173,14 @@ function getVisualizationIcon(type: VisualizationType) {
   }
 }
 
+// Compact cache age: "12s", "4m", "1h" — mirrors the search CachedNotice style.
+function formatCacheAge(ageSecs?: number): string {
+  if (ageSecs == null || ageSecs < 0) return 'just now';
+  if (ageSecs < 60) return `${ageSecs}s`;
+  if (ageSecs < 3600) return `${Math.floor(ageSecs / 60)}m`;
+  return `${Math.floor(ageSecs / 3600)}h`;
+}
+
 export function Panel({
   config,
   data,
@@ -142,6 +193,12 @@ export function Panel({
   onVisibilityChange,
   scrollRoot,
   hasRunOnce,
+  cached,
+  cacheAgeSecs,
+  truncated,
+  totalCount,
+  resolvedQuery,
+  effectiveTimeRange,
   children,
 }: PanelProps) {
   const [showQueryDialog, setShowQueryDialog] = useState(false);
@@ -166,7 +223,8 @@ export function Panel({
 
   const handleRefresh = async () => {
     setIsRefreshing(true);
-    await onRefresh();
+    // DSH8: a manual refresh bypasses the server cache so it always re-runs.
+    await onRefresh(true);
     // Small delay to show the animation
     setTimeout(() => setIsRefreshing(false), 500);
   };
@@ -176,13 +234,24 @@ export function Panel({
   };
 
   const handleOpenInSearch = () => {
-    // Navigate to search page with the query
+    // DSH52: open Search with the SUBSTITUTED query (so `$variables` are resolved
+    // to what the panel actually ran) and the panel's effective absolute window,
+    // rather than raw `config.query` with unresolved `$vars` and no time range.
     const params = new URLSearchParams({
-      q: config.query,
+      q: resolvedQuery ?? config.query,
       mode: config.queryMode,
     });
+    if (effectiveTimeRange) {
+      params.set('start', effectiveTimeRange.start);
+      params.set('end', effectiveTimeRange.end);
+    }
     window.open(`/search?${params.toString()}`, '_blank');
   };
+
+  // DSH40: the result is capped/truncated when the backend says so, or when the
+  // total match count exceeds the rows actually rendered.
+  const shownRows = data?.data?.length ?? 0;
+  const isTruncated = truncated === true || (totalCount != null && totalCount > shownRows);
 
   return (
     <>
@@ -285,10 +354,38 @@ export function Panel({
           </PanelContent>
         </div>
 
-        {/* Updated stamp footer */}
-        {data?.lastRefresh && (
-          <div className="px-3 h-[20px] shrink-0 border-t border-border flex items-center text-[9.5px] font-mono uppercase tracking-[0.1em] text-muted-foreground/70">
-            <span>Updated {formatRelativeUTC(data.lastRefresh)}</span>
+        {/* Footer — cache transparency (DSH8), updated stamp, truncation (DSH40) */}
+        {(cached || data?.lastRefresh || isTruncated) && (
+          <div className="px-3 h-[20px] shrink-0 border-t border-border flex items-center gap-2 text-[9.5px] font-mono uppercase tracking-[0.1em] text-muted-foreground/70">
+            {cached ? (
+              // DSH8: never show "Updated just now" for a cache hit — surface the
+              // cache age with an explicit refresh (bypasses cache) affordance.
+              <button
+                type="button"
+                onClick={() => onRefresh(true)}
+                title="Served from cache — click to refresh from server"
+                className="normal-case tracking-normal text-amber-500 dark:text-amber-400 hover:underline cursor-pointer"
+              >
+                cached {formatCacheAge(cacheAgeSecs)} ago · refresh
+              </button>
+            ) : data?.lastRefresh ? (
+              <span>Updated {formatRelativeUTC(data.lastRefresh)}</span>
+            ) : null}
+            {isTruncated && (
+              <>
+                <span className="flex-1" />
+                <span
+                  className="normal-case tracking-normal text-amber-500 dark:text-amber-400"
+                  title={
+                    totalCount != null
+                      ? `Showing ${shownRows.toLocaleString()} of ${totalCount.toLocaleString()} matching rows — results truncated at the panel cap`
+                      : 'Results truncated at the panel row cap'
+                  }
+                >
+                  truncated{totalCount != null ? ` · ${shownRows.toLocaleString()}/${totalCount.toLocaleString()}` : ''}
+                </span>
+              </>
+            )}
           </div>
         )}
       </div>
@@ -401,8 +498,29 @@ export function Panel({
           {data?.status === 'success' && data.data && (
             <div className="shrink-0 h-[24px] px-4 border-t border-border flex items-center gap-3 font-mono text-[10.5px] text-muted-foreground bg-card/40">
               <span className="tabular-nums">
-                {data.data.length} {data.data.length === 1 ? 'row' : 'rows'}
+                {isTruncated && totalCount != null
+                  ? `${shownRows.toLocaleString()} of ${totalCount.toLocaleString()} rows`
+                  : `${data.data.length} ${data.data.length === 1 ? 'row' : 'rows'}`}
               </span>
+              {isTruncated && (
+                <>
+                  <span className="text-muted-foreground/50">·</span>
+                  <span className="text-amber-400">truncated at panel cap</span>
+                </>
+              )}
+              {cached && (
+                <>
+                  <span className="text-muted-foreground/50">·</span>
+                  <button
+                    type="button"
+                    onClick={() => onRefresh(true)}
+                    title="Served from cache — click to refresh from server"
+                    className="text-amber-400 hover:underline cursor-pointer"
+                  >
+                    cached {formatCacheAge(cacheAgeSecs)} ago · refresh
+                  </button>
+                </>
+              )}
               {config.timeRangeMode === 'custom' && (
                 <>
                   <span className="text-muted-foreground/50">·</span>
@@ -531,7 +649,7 @@ function getSkeletonForType(type: VisualizationType) {
 interface PanelContentProps {
   data?: PanelDataState;
   config: PanelConfig;
-  onDrilldown?: (filter: DrilldownFilter) => void;
+  onDrilldown?: (payload: DrilldownPayload) => void;
   isFullscreen?: boolean;
   hasRunOnce: boolean;
   children?: React.ReactNode;
@@ -631,7 +749,7 @@ function PanelContent({ data, config, hasRunOnce, children }: PanelContentProps)
 interface FullscreenPanelContentProps {
   data?: PanelDataState;
   config: PanelConfig;
-  onDrilldown?: (filter: DrilldownFilter) => void;
+  onDrilldown?: (payload: DrilldownPayload) => void;
   hasRunOnce: boolean;
   children?: React.ReactNode;
 }

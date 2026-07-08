@@ -73,8 +73,15 @@ impl NotebookRepository {
     }
 
     /// Find a notebook by ID, checking access for a specific user.
-    /// User has access if: owner, public, shared with them, or case-linked
-    /// (case notebooks are shared investigation workspaces accessible to all analysts).
+    /// User has access if: owner, public, shared with them, or — for a
+    /// case-linked notebook — they can see the underlying case.
+    ///
+    /// NAN-1739: case notebooks previously granted access to ANY analyst
+    /// whenever `case_id IS NOT NULL`, ignoring case visibility. A notebook
+    /// must never expose more than its underlying case: the case-linked
+    /// disjunct now requires that the caller passes the SAME visibility rules
+    /// enforced by `CaseRepository::check_user_access`
+    /// (created_by / assigned_to / public / group-membership).
     pub async fn find_by_id_for_user(
         &self,
         id: Uuid,
@@ -90,10 +97,31 @@ impl NotebookRepository {
             WHERE n.id = $1
               AND (
                   n.owner_id = $2
-                  OR n.visibility = 'public'
-                  OR n.case_id IS NOT NULL
+                  -- NAN-1739: `public` only frees NON-case notebooks. Case
+                  -- notebooks are stamped visibility='public' at creation
+                  -- (notebooks/cases.rs), so an unconditional public disjunct
+                  -- would make the case-access EXISTS below dead code and
+                  -- re-open the bypass. Gate it on case_id IS NULL.
+                  OR (n.case_id IS NULL AND n.visibility = 'public')
                   OR ns.shared_with_user_id = $2
                   OR ug.user_id IS NOT NULL
+                  OR (
+                      n.case_id IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1 FROM cases c
+                          WHERE c.id = n.case_id
+                            AND (
+                                c.created_by = $2
+                                OR c.assigned_to = $2
+                                OR c.visibility = 'public'
+                                OR (c.visibility = 'group' AND EXISTS (
+                                    SELECT 1 FROM case_groups cg
+                                    JOIN user_groups cug ON cug.group_id = cg.group_id
+                                    WHERE cg.case_id = c.id AND cug.user_id = $2
+                                ))
+                            )
+                      )
+                  )
               )
             "#,
         )
@@ -104,6 +132,45 @@ impl NotebookRepository {
         .ok_or(NotebookRepositoryError::AccessDenied(id))?;
 
         Ok(result)
+    }
+
+    /// Whether `user_id` can see the given case, mirroring
+    /// `CaseRepository::check_user_access` visibility rules
+    /// (created_by / assigned_to / public / group-membership).
+    ///
+    /// NAN-1739: used to gate access to case-linked notebooks so a notebook
+    /// can never expose or accept mutations beyond the underlying case's
+    /// visibility. Kept in the notebook repo (nanosiem-core) which can query
+    /// the `cases` / `case_groups` / `user_groups` tables directly.
+    pub async fn user_can_access_case(
+        &self,
+        case_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<bool, NotebookRepositoryError> {
+        let has_access = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM cases c
+                WHERE c.id = $1
+                  AND (
+                      c.created_by = $2
+                      OR c.assigned_to = $2
+                      OR c.visibility = 'public'
+                      OR (c.visibility = 'group' AND EXISTS (
+                          SELECT 1 FROM case_groups cg
+                          JOIN user_groups ug ON ug.group_id = cg.group_id
+                          WHERE cg.case_id = c.id AND ug.user_id = $2
+                      ))
+                  )
+            )
+            "#,
+        )
+        .bind(case_id)
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(has_access)
     }
 
     /// Check if user can edit a notebook (owner or has edit permission)
@@ -156,9 +223,29 @@ impl NotebookRepository {
                 GROUP BY notebook_id
             ) ec ON ec.notebook_id = n.id
             WHERE n.owner_id = $1
-               OR n.visibility = 'public'
+               -- NAN-1739: case notebooks are visibility='public'; gate the
+               -- public disjunct on case_id IS NULL and govern case notebooks
+               -- by case visibility so they don't leak into every user's list.
+               OR (n.case_id IS NULL AND n.visibility = 'public')
                OR ns.shared_with_user_id = $1
                OR ug.user_id IS NOT NULL
+               OR (
+                   n.case_id IS NOT NULL
+                   AND EXISTS (
+                       SELECT 1 FROM cases c
+                       WHERE c.id = n.case_id
+                         AND (
+                             c.created_by = $1
+                             OR c.assigned_to = $1
+                             OR c.visibility = 'public'
+                             OR (c.visibility = 'group' AND EXISTS (
+                                 SELECT 1 FROM case_groups cg
+                                 JOIN user_groups cug ON cug.group_id = cg.group_id
+                                 WHERE cg.case_id = c.id AND cug.user_id = $1
+                             ))
+                         )
+                   )
+               )
             ORDER BY n.updated_at DESC
             "#,
         )
@@ -305,8 +392,13 @@ impl NotebookRepository {
     }
 
     /// Update a notebook, verifying ownership or access rights.
-    /// Case-linked notebooks (created by auto-investigation) are editable by
-    /// any user with notebooks:edit permission since they are shared investigation artifacts.
+    ///
+    /// Case-linked notebooks are shared investigation workspaces editable by
+    /// case collaborators — but NAN-1739: only by callers who can actually
+    /// SEE the underlying case. Previously any caller could mutate a case
+    /// notebook merely because `case_id IS NOT NULL`, ignoring case
+    /// visibility. The case-linked branch now requires the same visibility
+    /// the case itself enforces.
     pub async fn update_owned(
         &self,
         id: Uuid,
@@ -317,16 +409,19 @@ impl NotebookRepository {
 
         // Owner always has access
         let is_owner = notebook.owner_id == user_id;
-        // Case-linked notebooks are shared investigation workspaces
-        let is_case_notebook = notebook.case_id.is_some();
-        // Explicit share grants access
-        let has_edit_share = if !is_owner && !is_case_notebook {
+        // Case-linked notebooks: caller must be able to see the underlying case.
+        let has_case_access = match notebook.case_id {
+            Some(case_id) if !is_owner => self.user_can_access_case(case_id, user_id).await?,
+            _ => false,
+        };
+        // Explicit share grants access (only relevant for non-case notebooks).
+        let has_edit_share = if !is_owner && notebook.case_id.is_none() {
             self.can_user_edit(id, user_id).await?
         } else {
             false
         };
 
-        if !is_owner && !is_case_notebook && !has_edit_share {
+        if !is_owner && !has_case_access && !has_edit_share {
             return Err(NotebookRepositoryError::AccessDenied(id));
         }
 

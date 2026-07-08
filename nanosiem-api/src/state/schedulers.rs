@@ -402,6 +402,9 @@ impl AppState {
         let runner = nanosiem_core::observability::SyntheticRunner::new(
             self.pool.clone(),
             self.dual_pool.clickhouse().clone(),
+            // NAN-1721 O1: route the `due_for` read to the `_distributed` wrapper
+            // on a cluster so it sees every shard's results (INSERT stays local).
+            self.dual_pool.table_names().is_clustered(),
         )
         // NAN-1546: forward synthetic-failure alerts to observability-subscribed
         // webhooks (same wiring pattern as the detection service).
@@ -474,6 +477,20 @@ impl AppState {
 
         let pool = self.pool.clone();
         let search_service = self.search_service.clone();
+        // NAN-1741 A1: forward metric-monitor breach alerts to
+        // observability-subscribed webhooks (kind "metric_monitor" → obs_alert
+        // stream, migration 217). Same wiring pattern as the synthetics runner.
+        let webhook_service = nanosiem_core::webhooks::WebhookService::new(
+            nanosiem_core::webhooks::WebhookRepository::new(self.pool.clone()),
+        );
+
+        // Per-(monitor, series) durable re-arm window: a persistent breach raises
+        // at most one alert per this window (O14; mirrors the SLO scheduler's
+        // durable re-arm). Defaults to 1h.
+        let rearm_secs: u64 = std::env::var("METRIC_MONITOR_REARM_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3600);
 
         tokio::spawn(async move {
             let repo =
@@ -497,6 +514,13 @@ impl AppState {
                     }
                 };
 
+                // Drop due-gate entries for monitors that no longer exist so the
+                // map doesn't grow unbounded across deletes (O46; mirrors the SLO
+                // loop's retain at start_slo_scheduler).
+                let live: std::collections::HashSet<Uuid> =
+                    monitors.iter().map(|m| m.id).collect();
+                last_eval.retain(|id, _| live.contains(id));
+
                 let now = Instant::now();
                 for monitor in monitors {
                     // Per-monitor due gate: skip until eval_interval_secs elapsed.
@@ -506,7 +530,6 @@ impl AppState {
                             continue;
                         }
                     }
-                    last_eval.insert(monitor.id, now);
 
                     // Isolate each monitor's evaluation so a panic cannot abort
                     // the evaluator (NAN-1102).
@@ -514,9 +537,18 @@ impl AppState {
                         &search_service,
                         &pool,
                         &monitor,
+                        rearm_secs,
+                        &webhook_service,
                     );
                     match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
-                        Ok(Ok(())) => {}
+                        // O4: advance the due gate ONLY on success. On error or
+                        // panic we deliberately do NOT advance `last_eval`, so the
+                        // failed window is re-evaluated on the next tick instead of
+                        // being marked evaluated and silently skipped (mirrors the
+                        // SLO scheduler's skip-tick-on-failure behavior).
+                        Ok(Ok(())) => {
+                            last_eval.insert(monitor.id, now);
+                        }
                         Ok(Err(e)) => {
                             tracing::warn!(
                                 monitor = %monitor.name,
@@ -541,10 +573,22 @@ impl AppState {
     /// high-severity alert per breaching series. Errors are returned (logged by
     /// the caller); a per-series alert-insert failure is logged but does not
     /// abort the remaining series.
+    ///
+    /// No-data (O13 / Contract #1): each series value arrives as `Option<f64>`
+    /// (`None` when the window had no data — never a fabricated 0.0). A `None`
+    /// series is skipped: no comparison, no alert.
+    ///
+    /// Re-arm (O14): each breaching series is gated by the durable
+    /// [`AlertRepository::latest_alert_at_for_source`] check keyed by
+    /// `(monitor, series)` with a `rearm_secs` window, so a persistent breach
+    /// raises at most one alert per series per window instead of one per eval
+    /// interval (mirrors the SLO scheduler's durable re-arm).
     async fn evaluate_one_metric_monitor(
         search_service: &nanosiem_core::SearchService,
         pool: &sqlx::PgPool,
         monitor: &nanosiem_core::observability::MetricMonitor,
+        rearm_secs: u64,
+        webhook_service: &nanosiem_core::webhooks::WebhookService,
     ) -> anyhow::Result<()> {
         use nanosiem_core::query::{MetricAgg, MetricQuery, MetricTagFilter, TimeRange};
 
@@ -569,15 +613,20 @@ impl AppState {
 
         let query = MetricQuery {
             metric_name: &monitor.metric_name,
-            service_name: None,
+            // O31 (NAN-1721): scope the aggregate to the monitor's stored service
+            // (the promoted `service_name` column). None = fleet-wide. Applied by
+            // `metric_scalar_sql` to both the group_by and no-group_by paths.
+            service_name: monitor.service_name.as_deref(),
             agg,
             group_by: monitor.group_by.as_deref(),
             filters: &filters,
             step_secs: monitor.window_secs.max(1) as u64,
         };
 
-        // One (series_key, value) per series over the window. Empty => no data
-        // in the window, treated as no breach.
+        // One (series_key, value) per series over the window. `value` is
+        // `Option<f64>` (Contract #1): `None` = no data in the window
+        // (row_count == 0 or a JSON-null aggregate) — never coerced to 0.0. An
+        // empty vec (no rows at all) is likewise no breach.
         let results = search_service
             .evaluate_metric_monitor(&query, &time_range)
             .await
@@ -587,9 +636,63 @@ impl AppState {
         let alert_repo = nanosiem_core::db::repository::AlertRepository::new(pool.clone());
 
         for (series_key, value) in results {
+            // O13: a `None` scalar is no-data — neither a breach nor a
+            // comparison. Skip it rather than fabricate a 0.0 that would
+            // false-fire `lt`/`lte` monitors when the metric stops reporting.
+            let value = match value {
+                Some(v) => v,
+                None => continue,
+            };
+
             if !monitor.comparator.breached(value, monitor.threshold) {
                 continue;
             }
+
+            // Durable, time-based re-arm keyed by (monitor, series) — O14.
+            // Without this a persistent breach raises one High alert per series
+            // every eval interval (an alert storm). The authority is the
+            // persisted `alerts` table (survives jobs restart / leader
+            // failover), keyed via the per-series `source_id`; mirrors the SLO
+            // scheduler's re-arm gate.
+            let source_id = metric_monitor_source_id(monitor.id, &series_key);
+            match alert_repo
+                .latest_alert_at_for_source("metric_monitor", &source_id)
+                .await
+            {
+                Ok(Some(last_created)) => {
+                    if slo_alert_within_rearm(last_created, chrono::Utc::now(), rearm_secs) {
+                        // Within the re-arm window — this series already alerted
+                        // recently; skip to avoid a storm.
+                        continue;
+                    }
+                }
+                Ok(None) => {
+                    // No prior alert for this (monitor, series) — proceed to raise.
+                }
+                Err(e) => {
+                    // Re-arm lookup failed: skip raising this series rather than
+                    // risk a storm without the durable guard (mirrors the SLO
+                    // scheduler). The evaluation itself still succeeded, so the
+                    // due gate advances and the next due tick re-checks.
+                    tracing::warn!(
+                        monitor = %monitor.name,
+                        series = %series_key,
+                        error = %e,
+                        "Metric-monitor: re-arm lookup failed; skipping series this tick"
+                    );
+                    continue;
+                }
+            }
+
+            // Entity for webhook context (NAN-1741 A1): which series breached.
+            // Un-grouped monitors have an empty series key, so fall back to the
+            // monitor's service scope. Computed before `payload` so the move of
+            // `series_key` into the JSON below can't race it.
+            let webhook_entity = if series_key.is_empty() {
+                monitor.service_name.clone()
+            } else {
+                Some(series_key.clone())
+            };
 
             // Breach payload — captured in the alert's matched_events so the
             // console can render which monitor/series/value tripped.
@@ -598,6 +701,7 @@ impl AppState {
                 "monitor_name": monitor.name,
                 "metric_name": monitor.metric_name,
                 "agg": monitor.agg,
+                "service_name": monitor.service_name,
                 "group_by": monitor.group_by,
                 "series_key": series_key,
                 "comparator": monitor.comparator.as_str(),
@@ -608,36 +712,60 @@ impl AppState {
             }]);
 
             // Metric-monitor alerts are not tied to a detection rule, so
-            // `rule_id` is NULL (the FK is nullable) and the monitor id rides
-            // in `source_id`. High severity by default. No event-hash dedup
-            // (matches the pre-spine behavior — the evaluator's window cadence
-            // is the dedup boundary).
-            if let Err(e) = alert_repo
+            // `rule_id` is NULL (the FK is nullable) and the per-series key
+            // (monitor id + series) rides in `source_id`. High severity by
+            // default. No event-hash dedup — the durable re-arm gate above is
+            // the dedup boundary.
+            match alert_repo
                 .create_alert(nanosiem_core::db::repository::AlertInsert {
                     kind: "metric_monitor",
                     rule_id: None,
-                    source_id: Some(monitor.id.to_string()),
+                    source_id: Some(source_id),
                     severity: &nanosiem_core::Severity::High,
                     matched_events: &payload,
                     event_hash: None,
+                    // A13 (NAN-1752): metric-monitor alerts have no match count.
+                    match_count: None,
                 })
                 .await
             {
-                tracing::warn!(
-                    monitor = %monitor.name,
-                    series = %series_key,
-                    error = %e,
-                    "Metric-monitor: failed to raise alert"
-                );
-            } else {
-                tracing::info!(
-                    monitor = %monitor.name,
-                    series = %series_key,
-                    value,
-                    threshold = monitor.threshold,
-                    comparator = monitor.comparator.as_str(),
-                    "Metric-monitor breach — alert raised"
-                );
+                Ok(alert) => {
+                    tracing::info!(
+                        monitor = %monitor.name,
+                        series = %series_key,
+                        value,
+                        threshold = monitor.threshold,
+                        comparator = monitor.comparator.as_str(),
+                        "Metric-monitor breach — alert raised"
+                    );
+
+                    // NAN-1741 A1: forward to obs_alert-subscribed webhooks.
+                    // kind "metric_monitor" maps to the obs_alert stream
+                    // (migration 217); mirrors the synthetic runner's fire shape.
+                    // Fire only after the row is durably created (never on error).
+                    let severity_str =
+                        format!("{:?}", nanosiem_core::Severity::High).to_lowercase();
+                    webhook_service
+                        .fire_alert(
+                            alert.id,
+                            "metric_monitor",
+                            None,
+                            &monitor.name,
+                            &severity_str,
+                            webhook_entity,
+                            &payload,
+                            alert.created_at,
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        monitor = %monitor.name,
+                        series = %series_key,
+                        error = %e,
+                        "Metric-monitor: failed to raise alert"
+                    );
+                }
             }
         }
 
@@ -691,6 +819,12 @@ impl AppState {
 
         let pool = self.pool.clone();
         let search_service = self.search_service.clone();
+        // NAN-1741 A1: forward SLO breach alerts to observability-subscribed
+        // webhooks (kind "slo" → obs_alert stream, migration 217). Same wiring
+        // pattern as the synthetics runner / metric-monitor scheduler.
+        let webhook_service = nanosiem_core::webhooks::WebhookService::new(
+            nanosiem_core::webhooks::WebhookRepository::new(self.pool.clone()),
+        );
 
         // Per-SLO re-arm interval: a persistent breach raises at most one alert
         // per this window. Defaults to 1h.
@@ -792,7 +926,7 @@ impl AppState {
                         }
                     }
 
-                    if let Err(e) = alert_repo
+                    match alert_repo
                         .create_alert(nanosiem_core::db::repository::AlertInsert {
                             kind: "slo",
                             rule_id: None,
@@ -800,15 +934,39 @@ impl AppState {
                             severity: &nanosiem_core::Severity::High,
                             matched_events: &payload,
                             event_hash: None,
+                            // A13 (NAN-1752): SLO alerts have no match count.
+                            match_count: None,
                         })
                         .await
                     {
-                        tracing::warn!(slo = %slo.name, error = %e, "SLO: failed to raise alert");
-                        // Leave the in-memory guard unset so we retry next tick;
-                        // the durable check will also see no new row.
-                    } else {
-                        last_alerted.insert(slo.id, now);
-                        tracing::info!(slo = %slo.name, "SLO breach — alert raised");
+                        Ok(alert) => {
+                            last_alerted.insert(slo.id, now);
+                            tracing::info!(slo = %slo.name, "SLO breach — alert raised");
+
+                            // NAN-1741 A1: forward to obs_alert-subscribed
+                            // webhooks. kind "slo" maps to the obs_alert stream
+                            // (migration 217); the SLO's tracked service is the
+                            // entity. Fire only after the row is durably created.
+                            let severity_str =
+                                format!("{:?}", nanosiem_core::Severity::High).to_lowercase();
+                            webhook_service
+                                .fire_alert(
+                                    alert.id,
+                                    "slo",
+                                    None,
+                                    &slo.name,
+                                    &severity_str,
+                                    Some(slo.service.clone()),
+                                    &payload,
+                                    alert.created_at,
+                                )
+                                .await;
+                        }
+                        Err(e) => {
+                            tracing::warn!(slo = %slo.name, error = %e, "SLO: failed to raise alert");
+                            // Leave the in-memory guard unset so we retry next tick;
+                            // the durable check will also see no new row.
+                        }
                     }
                 }
             }
@@ -818,7 +976,8 @@ impl AppState {
     /// Evaluate one SLO: recompute the SLI over its rolling window, apply the
     /// budget/burn/status math, and — if *breaching* — return the burn payload
     /// (single-element JSON array) to be carried in the alert's `matched_events`.
-    /// Returns `Ok(None)` when the SLO is not breaching.
+    /// Returns `Ok(None)` when the SLO is not breaching or when the window has
+    /// no data.
     ///
     /// The budget/burn math mirrors `handlers::observability_slos::enrich` so the
     /// scheduler and the read path agree on the number.
@@ -833,7 +992,7 @@ impl AppState {
         let begin = now - chrono::Duration::days(slo.window_days.max(1) as i64);
         let time_range = TimeRange::new(begin, now);
 
-        let (current, total_spans) = search_service
+        let (current, total_spans, no_data) = search_service
             .observability_slo_compute(
                 &slo.service,
                 slo.sli_kind.to_query_kind(),
@@ -843,15 +1002,23 @@ impl AppState {
             .await
             .map_err(|e| anyhow::anyhow!("SLO compute failed: {e}"))?;
 
+        // O17 (Contract #2): a no-data window (total_spans == 0) is neither a
+        // breach nor a recovery. A hard-down service / stopped collector emits
+        // no spans → `current` computes to 1.0, and the rolling window sliding
+        // past old errors would otherwise make the SLO *improve* while the
+        // service is dead. Do NOT alert on it (the API surfaces "no_data"
+        // status separately).
+        if no_data {
+            return Ok(None);
+        }
+
         // Error budget math — identical to the read path's `enrich`.
         let allowed = (1.0 - slo.target).max(f64::EPSILON);
         let consumed = (1.0 - current).max(0.0);
         let budget_remaining_pct = ((allowed - consumed) / allowed) * 100.0;
         let burn_rate = consumed / allowed;
 
-        // Breach = SLI below target (the read path's "breaching" status). A
-        // window with no spans computes current = 1.0 (not breaching), so an
-        // idle service never alerts.
+        // Breach = SLI below target (the read path's "breaching" status).
         let breaching = current < slo.target;
         if !breaching {
             return Ok(None);
@@ -874,6 +1041,19 @@ impl AppState {
 
         Ok(Some(payload))
     }
+}
+
+/// O14: durable per-series re-arm key for metric-monitor alerts.
+///
+/// Encodes `(monitor id, series key)` into the alert's `source_id` text so the
+/// durable [`AlertRepository::latest_alert_at_for_source`] lookup can re-arm per
+/// series (a monitor with `group_by` raises independent alerts per series). The
+/// monitor id is a hyphenated UUID (never contains `:`), so the first `:` cleanly
+/// separates the fixed prefix from the verbatim series key — the mapping is
+/// injective, which is all the durable lookup needs (it never parses the key
+/// back). A no-`group_by` monitor yields `""` as the series key → `"<id>:"`.
+fn metric_monitor_source_id(monitor_id: uuid::Uuid, series_key: &str) -> String {
+    format!("{}:{}", monitor_id, series_key)
 }
 
 /// NAN-1563: pure re-arm decision for SLO alerting. Returns `true` when the most

@@ -14,6 +14,7 @@
 // borders, no shadows. Colors flow through CSS custom props so they track theme.
 
 import { useMemo, useState } from 'react';
+import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import {
   ArrowLeft,
@@ -25,6 +26,30 @@ import {
 import { cn } from '@/lib/utils';
 import { parseUTCTimestamp } from '@/lib/date-utils';
 import type { OtelSpan } from '@/lib/api/types';
+
+// Padding added either side of the trace's own [start,end] when pivoting to the
+// correlated logs (NAN-1721 / O34). Without a window the /search lands in its
+// default preset, so a day-old trace opened via a shared link searches the wrong
+// range and shows "no logs". ±10 min mirrors the per-event log pivot elsewhere
+// (CaseAlertsSheet) — tight enough to stay scannable, wide enough for clock skew
+// and immediately-surrounding context.
+const TRACE_LOGS_PAD_MS = 10 * 60 * 1000;
+
+// Build the trace→logs pivot URL, centered on the trace's own time window so the
+// analyst lands on the correlated logs rather than the search's default preset.
+// Falls back to a window-less `q=` pivot when the spans carry no usable
+// timestamps (traceStartMs === 0), matching the "don't fabricate a window" rule.
+function buildTraceLogsHref(traceId: string, traceStartMs: number, durMs: number): string {
+  const params = new URLSearchParams();
+  params.set('q', `trace_id="${traceId}"`);
+  if (Number.isFinite(traceStartMs) && traceStartMs > 0) {
+    const startMs = traceStartMs - TRACE_LOGS_PAD_MS;
+    const endMs = traceStartMs + (Number.isFinite(durMs) ? Math.max(durMs, 0) : 0) + TRACE_LOGS_PAD_MS;
+    params.set('start', new Date(startMs).toISOString());
+    params.set('end', new Date(endMs).toISOString());
+  }
+  return `/search?${params.toString()}`;
+}
 
 // Span-kind → short tag tone (mirrors the design's SPAN_KIND_TONE).
 const SPAN_KIND_TONE: Record<string, string> = {
@@ -53,6 +78,23 @@ function fmtMs(ms: number): string {
   return `${ms.toFixed(ms < 10 ? 2 : 1)}ms`;
 }
 
+// Milliseconds-since-epoch for a span timestamp, preserving sub-millisecond
+// precision (NAN-1721 / O56). CH emits DateTime64(9) as
+// "YYYY-MM-DD HH:MM:SS.fffffffff"; a JS Date truncates the fractional part to
+// whole milliseconds, which collapses every span of a sub-ms trace onto offset
+// 0 (identical bars stacked at the left edge). We keep the Date's ms value
+// (correctly UTC-parsed via parseUTCTimestamp) and add back the digits beyond
+// milliseconds as a fractional millisecond.
+function parseStartMsPrecise(ts: string): number {
+  const base = parseUTCTimestamp(ts).getTime();
+  if (!Number.isFinite(base)) return base;
+  const frac = /\.(\d+)/.exec(ts)?.[1];
+  if (!frac || frac.length <= 3) return base;
+  // Digits past the millisecond place → fractional milliseconds (e.g. the
+  // "456789" in …123456789 → +0.456789 ms on top of the 123 ms already in base).
+  return base + Number(`0.${frac.slice(3)}`);
+}
+
 // A span laid out for the waterfall: ms offsets relative to trace start + depth.
 interface LayoutSpan {
   span: OtelSpan;
@@ -74,11 +116,11 @@ function layout(spans: OtelSpan[]): {
   let traceEndMs = -Infinity;
 
   for (const span of spans) {
-    const startMs = parseUTCTimestamp(span.start_time).getTime();
+    const startMs = parseStartMsPrecise(span.start_time);
     const durMs =
       span.duration_ns > 0
         ? span.duration_ns / 1e6
-        : Math.max(0, parseUTCTimestamp(span.end_time).getTime() - startMs);
+        : Math.max(0, parseStartMsPrecise(span.end_time) - startMs);
     if (Number.isFinite(startMs)) {
       traceStartMs = Math.min(traceStartMs, startMs);
       traceEndMs = Math.max(traceEndMs, startMs + durMs);
@@ -97,14 +139,26 @@ function layout(spans: OtelSpan[]): {
   if (!Number.isFinite(traceEndMs)) traceEndMs = traceStartMs;
 
   const rows: LayoutSpan[] = [];
+  const visited = new Set<string>();
   const walk = (nodes: Node[], depth: number) => {
     nodes.sort((a, b) => a.startMs - b.startMs);
     for (const n of nodes) {
+      if (visited.has(n.span.span_id)) continue; // cycle back-edge — already placed
+      visited.add(n.span.span_id);
       rows.push({ span: n.span, depth, startMs: n.startMs - traceStartMs, durMs: n.durMs });
       walk(n.children, depth + 1);
     }
   };
   walk(roots, 0);
+  // Cycle-break (NAN-1721 / O56): parent_span_id can form a cycle (A→B→A), whose
+  // members are never reached from a real root and would otherwise be dropped
+  // from the waterfall while the meta strip still counts them (rows < spans). Any
+  // span the walk didn't reach is on such a cycle — surface it as a root at depth
+  // 0 (the visited guard above stops the walk from looping back through it) so
+  // every span renders exactly once.
+  for (const node of byId.values()) {
+    if (!visited.has(node.span.span_id)) walk([node], 0);
+  }
 
   return { rows, traceStartMs, durMs: Math.max(traceEndMs - traceStartMs, 0.001) };
 }
@@ -116,10 +170,13 @@ function layout(spans: OtelSpan[]): {
 function SpanDrawer({
   span,
   traceId,
+  logsHref,
   onClose,
 }: {
   span: OtelSpan;
   traceId: string;
+  /** Trace→logs pivot URL, pre-built with the trace's time window (O34). */
+  logsHref: string;
   onClose: () => void;
 }) {
   const isError = span.status_code === 'ERROR';
@@ -138,8 +195,6 @@ function SpanDrawer({
   ];
   const attrEntries = Object.entries(span.attributes ?? {});
   const resEntries = Object.entries(span.resource_attributes ?? {});
-
-  const searchQ = `trace_id="${traceId}"`;
 
   return (
     <div className="w-[320px] shrink-0 border-l border-border bg-card flex flex-col min-h-0">
@@ -236,7 +291,7 @@ function SpanDrawer({
 
       <div className="mt-auto p-3 border-t border-border">
         <Link
-          to={`/search?q=${encodeURIComponent(searchQ)}`}
+          to={logsHref}
           className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-md border border-border text-[11px] text-fg-2 hover:border-border-2 hover:text-foreground w-full justify-center"
         >
           <Search className="w-[12px] h-[12px] text-fg-3" />
@@ -261,11 +316,23 @@ export interface TraceWaterfallProps {
    * Services, a log→trace pivot, or a direct link — not just the Traces list.
    */
   backLabel?: string;
+  /**
+   * Cache-transparency badge for the trace fetch (NAN-1721 / O36). Each surface
+   * owns its own getTrace query, so it passes the rendered `<CachedNotice/>` in
+   * to sit in the header rather than the waterfall reaching for the meta itself.
+   */
+  cacheNotice?: ReactNode;
 }
 
-export function TraceWaterfall({ traceId, spans, onBack, backLabel = 'Traces' }: TraceWaterfallProps) {
+export function TraceWaterfall({ traceId, spans, onBack, backLabel = 'Traces', cacheNotice }: TraceWaterfallProps) {
   const [sel, setSel] = useState<OtelSpan | null>(null);
-  const { rows, durMs } = useMemo(() => layout(spans), [spans]);
+  const { rows, durMs, traceStartMs } = useMemo(() => layout(spans), [spans]);
+
+  // Trace→logs pivot, centered on the trace's own window (O34).
+  const logsHref = useMemo(
+    () => buildTraceLogsHref(traceId, traceStartMs, durMs),
+    [traceId, traceStartMs, durMs]
+  );
 
   const services = useMemo(
     () => [...new Set(spans.map((s) => s.service_name).filter(Boolean))],
@@ -295,8 +362,9 @@ export function TraceWaterfall({ traceId, spans, onBack, backLabel = 'Traces' }:
         <h2 className="text-[15px] font-semibold text-foreground">Distributed trace</h2>
         <span className="font-mono text-[11.5px] text-fg-3 truncate">{traceId}</span>
         <span className="flex-1" aria-hidden />
+        {cacheNotice}
         <Link
-          to={`/search?q=${encodeURIComponent(`trace_id="${traceId}"`)}`}
+          to={logsHref}
           className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-md border border-border text-[11px] text-fg-2 hover:border-border-2 hover:text-foreground"
         >
           <Search className="w-[12px] h-[12px] text-fg-3" />
@@ -414,7 +482,9 @@ export function TraceWaterfall({ traceId, spans, onBack, backLabel = 'Traces' }:
             })
           )}
         </div>
-        {sel && <SpanDrawer span={sel} traceId={traceId} onClose={() => setSel(null)} />}
+        {sel && (
+          <SpanDrawer span={sel} traceId={traceId} logsHref={logsHref} onClose={() => setSel(null)} />
+        )}
       </div>
     </div>
   );

@@ -298,13 +298,6 @@ pub async fn create_detection(
     // Persist next_run_at for distributed scheduling
     state.detection_service.sync_next_run_at(&rule).await;
 
-    // Add to real-time evaluator if alerting and realtime-enabled
-    if rule.mode == RuleMode::Alerting && rule.realtime_enabled {
-        if let Err(e) = state.realtime_evaluator.add_rule(&rule).await {
-            tracing::warn!("Failed to add rule to real-time evaluator: {}", e);
-        }
-    }
-
     // Emit audit event
     state.emit_audit(
         AuditEvent::builder(AuditSource::Detection, RULE_CREATED)
@@ -464,14 +457,6 @@ pub async fn update_detection(
     // Recompute next_run_at for distributed scheduling (sets or clears based on rule state)
     state.detection_service.sync_next_run_at(&rule).await;
 
-    // Update in real-time evaluator (handles enabled/disabled state internally)
-    // This is for legacy real-time detection
-    if rule.realtime_enabled {
-        if let Err(e) = state.realtime_evaluator.add_rule(&rule).await {
-            tracing::warn!("Failed to update rule in real-time evaluator: {}", e);
-        }
-    }
-
     // Build audit diff: only include fields that actually changed
     let mut changes = serde_json::Map::new();
     if old_rule.name != rule.name {
@@ -606,9 +591,6 @@ pub async fn delete_detection(
         .detection_service
         .delete_rule_with_mode(*id, state.materialized_view_generator.as_ref())
         .await?;
-
-    // Remove from real-time evaluator (legacy real-time detection)
-    state.realtime_evaluator.remove_rule(*id).await;
 
     // Emit audit event
     state.emit_audit(

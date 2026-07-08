@@ -139,6 +139,20 @@ fn default_stream_limit() -> i64 {
     100
 }
 
+/// A10 (NAN-1747): clamp a page limit into `[1, 1000]`. Both the list and the
+/// stream funnel through this. `limit=0` on the stream path returns an empty
+/// page with `has_more=true` and `next_cursor=None`, so a spec-following SOAR
+/// client loops forever; a negative limit reaches Postgres as `LIMIT -1` and
+/// 500s. The upper bound is the existing 1000 sanity cap.
+fn clamp_page_limit(limit: i64) -> i64 {
+    limit.clamp(1, 1000)
+}
+
+/// A10 (NAN-1747): a negative `OFFSET` is a Postgres error (500); clamp to 0.
+fn clamp_offset(offset: i64) -> i64 {
+    offset.max(0)
+}
+
 /// Response for alert stream
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct AlertStreamResponse {
@@ -210,18 +224,32 @@ pub async fn list_alerts(
     ensure_permission(&auth, permissions::ALERTS_VIEW)?;
 
     let kinds = parse_kinds(&query.kinds);
+    let limit = clamp_page_limit(query.limit);
+    let offset = clamp_offset(query.offset);
+    // A4 (NAN-1747): route the `rule_id` filter through the same unified list as
+    // every other filter, so status/severity/kinds + limit/offset all apply. The
+    // old `list_alerts_by_rule` short-circuit hard-capped at 100 and silently
+    // dropped every other query param (a `status=new` filter would still return
+    // closed alerts; alerts past the first 100 were unreachable). DetectionService
+    // exposes no rule-scoped *filtered* list and is outside this fix's edit
+    // scope, so build the repo from the shared pool directly (same pattern as
+    // NotificationRepository in `assign_alert`).
     let alerts = if let Some(rule_id) = query.rule_id {
-        state.detection_service.list_alerts_by_rule(rule_id).await?
+        nanosiem_core::db::repository::AlertRepository::new(state.pool.clone())
+            .list_filtered(
+                query.status,
+                query.severity,
+                Some(rule_id),
+                kinds.as_deref(),
+                limit,
+                offset,
+            )
+            .await
+            .map_err(|e| ApiError::DatabaseError(e.to_string()))?
     } else {
         state
             .detection_service
-            .list_alerts(
-                query.status,
-                query.severity,
-                kinds.as_deref(),
-                query.limit,
-                query.offset,
-            )
+            .list_alerts(query.status, query.severity, kinds.as_deref(), limit, offset)
             .await?
     };
 
@@ -295,7 +323,10 @@ pub async fn stream_alerts(
         (chrono::DateTime::UNIX_EPOCH, Uuid::nil())
     };
 
-    let limit = query.limit.min(1000); // Sanity check
+    // A10 (NAN-1747): clamp to [1, 1000]. `limit=0` previously returned an empty
+    // page with `has_more=true`/`next_cursor=None` → an infinite SOAR poll loop;
+    // a negative limit 500'd at the DB.
+    let limit = clamp_page_limit(query.limit);
     let alerts = state
         .detection_service
         .list_alerts_after(after_timestamp, after_id, limit)
@@ -529,9 +560,17 @@ pub async fn assign_alert(
         .assign_alert(*id, &request.assigned_to)
         .await?;
 
-    // Send notification to assignee if assigned to someone other than self
-    if let Ok(assigned_user_id) = Uuid::parse_str(&request.assigned_to) {
-        if assigned_user_id != auth.user_id() {
+    // Send notification to assignee if assigned to someone other than self.
+    // A3 (NAN-1747): the FE sends a typeid (`user_<base32>`), which
+    // `Uuid::parse_str` always rejects — so the `if let Ok` silently skipped and
+    // the assignee never got notified. `parse_any` accepts both the typeid and
+    // the raw-UUID forms.
+    if let Ok((prefix, assigned_user_id)) = nanosiem_core::typeid::parse_any(&request.assigned_to) {
+        // Only treat this as a user id when it's a `user_…` typeid or a bare
+        // UUID — a mismatched prefix (e.g. `case_…`) whose decoded UUID happens
+        // to match a real user must NOT trigger a notification to that user.
+        let is_user_id = prefix.is_empty() || prefix == nanosiem_core::typeid::user::PREFIX;
+        if is_user_id && assigned_user_id != auth.user_id() {
             let notification_repo = NotificationRepository::new(state.pool.clone());
             // Fetch user name from database (JWT no longer contains PII)
             let assigner_name = state
@@ -541,18 +580,33 @@ pub async fn assign_alert(
                 .map(|u| u.name)
                 .unwrap_or_else(|_| "Unknown User".to_string());
 
+            // The `assign_alert` return is a bare `RETURNING *` with no joined
+            // `rule_name`, so it was always None here — every assignment
+            // notification rendered "Unknown Rule". Resolve the rule name via
+            // the joined fetch (only on the notify path) (NAN-1754).
+            let rule_display = state
+                .detection_service
+                .get_alert(*id)
+                .await
+                .ok()
+                .and_then(|a| a.rule_name)
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "an alert".to_string());
+
             let notification = NewNotification {
                 user_id: assigned_user_id,
                 notification_type: NotificationType::AlertAssigned,
-                title: format!(
-                    "Alert assigned to you: {}",
-                    alert.rule_name.as_deref().unwrap_or("Unknown Rule")
-                ),
+                title: format!("Alert assigned to you: {}", rule_display),
                 message: Some(format!(
                     "{} assigned you to a {:?} severity alert",
                     assigner_name, alert.severity
                 )),
-                link: Some(format!("/alerts/{}", id)),
+                // A3: canonical prefixed typeid (matches the webhook link-back
+                // form); `id`'s Display renders a prefix-less base32.
+                link: Some(format!(
+                    "/alerts/{}",
+                    nanosiem_core::typeid::encode(nanosiem_core::typeid::alert::PREFIX, &id)
+                )),
                 metadata: serde_json::json!({
                     "alert_id": id.to_string(),
                     "rule_id": alert.rule_id.map(|r| r.to_string()),
@@ -635,10 +689,18 @@ pub async fn bulk_alerts(
         } else {
             let mut allowed = Vec::new();
             for id in &request.ids {
-                if let Ok(alert) = state.detection_service.get_alert(*id).await {
-                    if alert.rule_id.map_or(true, |rid| !exclude_rule_ids.contains(&rid)) {
-                        allowed.push(*id);
+                // A14 (NAN-1747): distinguish "not found" (skip this id) from a
+                // transient DB error (fail the whole bulk op). The old
+                // `if let Ok(..)` swallowed every error, silently shrinking the
+                // affected set with no signal to the caller.
+                match state.detection_service.get_alert(*id).await {
+                    Ok(alert) => {
+                        if alert.rule_id.map_or(true, |rid| !exclude_rule_ids.contains(&rid)) {
+                            allowed.push(*id);
+                        }
                     }
+                    Err(nanosiem_core::DetectionError::AlertNotFound(_)) => continue,
+                    Err(e) => return Err(e.into()),
                 }
             }
             allowed
@@ -670,12 +732,25 @@ pub async fn bulk_alerts(
         BulkAction::Acknowledge => ALERT_BULK_ACKNOWLEDGED,
         BulkAction::Close => ALERT_BULK_CLOSED,
     };
+    // A7 (NAN-1747): record WHICH alerts were operated on (the post-demo-filter
+    // set) plus the disposition, so a bulk close/ack is reconstructable from the
+    // audit trail. `count` is the requested id count; `affected` is the number
+    // of rows the UPDATE actually touched; `alert_ids` is the filtered target set.
+    let affected_typeids: Vec<String> = ids
+        .iter()
+        .map(|id| nanosiem_core::typeid::encode(nanosiem_core::typeid::alert::PREFIX, id))
+        .collect();
     state.emit_audit(
         AuditEvent::builder(AuditSource::Alert, audit_action)
             .actor(Some(auth.user_id()), None)
             .api_key(auth.api_key_id, auth.api_key_name.clone())
             .client_context(&client)
-            .details(serde_json::json!({ "count": request.ids.len(), "affected": affected }))
+            .details(serde_json::json!({
+                "count": request.ids.len(),
+                "affected": affected,
+                "alert_ids": affected_typeids,
+                "disposition": request.disposition.map(|d| format!("{:?}", d)),
+            }))
             .build(),
     );
 
@@ -717,25 +792,27 @@ pub async fn alert_counts(
             .get_demo_exclude_ids(auth.user_id(), nanosiem_core::demo::DemoResourceType::Rule)
             .await;
         if !exclude_rule_ids.is_empty() {
-            let all_alerts = state
-                .detection_service
-                .list_alerts(None, None, kinds.as_deref(), 10000, 0)
-                .await?;
-            let filtered: Vec<_> = all_alerts
-                .into_iter()
-                .filter(|a| a.rule_id.map_or(true, |rid| !exclude_rule_ids.contains(&rid)))
-                .collect();
+            // A12 (NAN-1747): count with a single SQL aggregate (exclusion in the
+            // WHERE) instead of materializing a 10k-row list and counting in Rust
+            // — the old path also silently capped the demo total at 10k. NULL
+            // rule_id rows (observability alerts) are kept, matching the
+            // non-demo filter semantics.
+            let exclude_vec: Vec<Uuid> = exclude_rule_ids.iter().copied().collect();
+            let counts = nanosiem_core::db::repository::AlertRepository::new(state.pool.clone())
+                .count_by_status_excluding_rules(kinds.as_deref(), &exclude_vec)
+                .await
+                .map_err(|e| ApiError::DatabaseError(e.to_string()))?;
 
             let mut total = 0i64;
             let mut new = 0i64;
             let mut acknowledged = 0i64;
             let mut closed = 0i64;
-            for alert in &filtered {
-                total += 1;
-                match alert.status {
-                    AlertStatus::New => new += 1,
-                    AlertStatus::Acknowledged => acknowledged += 1,
-                    AlertStatus::Closed => closed += 1,
+            for (status, count) in counts {
+                total += count;
+                match status {
+                    AlertStatus::New => new = count,
+                    AlertStatus::Acknowledged => acknowledged = count,
+                    AlertStatus::Closed => closed = count,
                 }
             }
             return Ok(Json(AlertCounts {
@@ -889,6 +966,11 @@ pub async fn alert_velocity(
 
     Ok(Json(buckets))
 }
+
+// NAN-1747 pure-logic tests (limit clamp A10, typeid parse A3) in a sibling file.
+#[cfg(test)]
+#[path = "alerts_nan1747_tests.rs"]
+mod alerts_nan1747_tests;
 
 /// OpenAPI documentation for alerts endpoints
 pub struct AlertsApiDoc;

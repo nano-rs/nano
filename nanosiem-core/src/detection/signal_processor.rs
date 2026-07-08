@@ -35,14 +35,20 @@ use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::db::DualPool;
+use crate::db::repository::detection_rules::DetectionRuleRepositoryError;
 use crate::db::repository::{AlertRepository, AlertRepositoryError, DetectionRuleRepository};
 use crate::detection::findings::FindingLogger;
-use crate::detection::risk::{score_rule_match, RiskModifier, ScoreCalculator};
+use crate::detection::risk::{score_rule_match, RiskModifier, RiskResult, ScoreCalculator};
+use crate::detection::service::helpers::{
+    realtime_finding_candidate, record_finding_emissions_with_pool, retain_unemitted_with_pool,
+};
+use crate::detection::service::ClaimedFinding;
 use crate::extensions::{
     AlertCasePermissions, CaseGroupingHook, NoopCaseGroupingHook, NoopShadowInvestigationHook,
     ShadowInvestigationHook,
 };
-use crate::models::NewAlert;
+use crate::models::{AlertMode, DetectionRule, NewAlert, RuleMode};
+use crate::webhooks::WebhookService;
 
 /// Configuration for the signal processor
 #[derive(Debug, Clone)]
@@ -103,6 +109,13 @@ enum SignalOutcome {
     MatchedLogMissing,
     /// The signal's detection rule no longer exists.
     RuleMissing,
+    /// The rule's mode (Staging/Paused) means this signal must not produce an
+    /// alert or finding (audit D11).
+    ModeSkipped,
+    /// A Grouped rule already alerted this (rule, entity, window) — the signal
+    /// is a genuine match (counted in stats) but its alert/finding is
+    /// suppressed by the per-window dedup (audit D13).
+    WindowDeduped,
 }
 
 /// Watermark for tracking processed signals
@@ -111,6 +124,11 @@ pub struct ProcessorWatermark {
     pub last_inserted_at: DateTime<Utc>,
     pub last_signal_id: Option<Uuid>,
     pub processed_count: u64,
+    /// Transient (in-memory only): the `(inserted_at, id)` of the signal that
+    /// stalled the current batch, so the force-skip can dead-letter *exactly*
+    /// that signal instead of a coarse 1-second window (audit D7). Cleared on
+    /// any fully-successful poll.
+    pub last_error_signal: Option<(DateTime<Utc>, Uuid)>,
 }
 
 impl Default for ProcessorWatermark {
@@ -119,6 +137,7 @@ impl Default for ProcessorWatermark {
             last_inserted_at: DateTime::from_timestamp(0, 0).unwrap_or_else(Utc::now),
             last_signal_id: None,
             processed_count: 0,
+            last_error_signal: None,
         }
     }
 }
@@ -185,6 +204,12 @@ pub struct SignalProcessor {
     /// Shadow investigation hook for auto-triage on new case creation
     /// (open-core default no-op)
     shadow_investigation: Arc<dyn ShadowInvestigationHook>,
+    /// Webhook delivery service. NAN-1741 A2: real-time (materialized-view)
+    /// detection alerts fire webhooks through this, mirroring the scheduled
+    /// path's `DetectionService::webhook_service`. Optional/None-safe:
+    /// open-core builds and tests that don't wire it leave `None` and simply
+    /// skip webhook delivery (mirrors how `case_grouping` is optional).
+    webhook_service: Option<WebhookService>,
 }
 
 impl SignalProcessor {
@@ -197,6 +222,7 @@ impl SignalProcessor {
             running: Arc::new(AtomicBool::new(false)),
             case_grouping: Arc::new(NoopCaseGroupingHook),
             shadow_investigation: Arc::new(NoopShadowInvestigationHook),
+            webhook_service: None,
         }
     }
 
@@ -221,6 +247,16 @@ impl SignalProcessor {
     /// construction time.
     pub fn with_case_grouping(mut self, hook: Arc<dyn CaseGroupingHook>) -> Self {
         self.case_grouping = hook;
+        self
+    }
+
+    /// Set the webhook delivery service so real-time (materialized-view)
+    /// detection alerts fire webhooks (NAN-1741 A2). Mirrors the scheduled
+    /// path, which wires the same `WebhookService` onto `DetectionService`.
+    /// Optional: open-core builds and tests that don't wire it leave `None`
+    /// and simply skip webhook delivery (like the no-op `case_grouping`).
+    pub fn with_webhook_service(mut self, service: WebhookService) -> Self {
+        self.webhook_service = Some(service);
         self
     }
 
@@ -249,6 +285,9 @@ impl SignalProcessor {
         let running = self.running.clone();
         let case_grouping = self.case_grouping.clone();
         let shadow_investigation = self.shadow_investigation.clone();
+        // NAN-1741 A2: clone the optional webhook service into the task so
+        // real-time alerts fire webhooks. `None` in open-core / tests → no-op.
+        let webhook_service = self.webhook_service.clone();
 
         let handle = tokio::spawn(async move {
             let mut consecutive_errors: u32 = 0;
@@ -264,11 +303,15 @@ impl SignalProcessor {
                     &config,
                     &watermark,
                     shadow_investigation.as_ref(),
+                    webhook_service.as_ref(),
                 )
                 .await
                 {
                     Ok(processed) => {
                         consecutive_errors = 0;
+                        // Fully-successful poll → we're unstuck; forget any
+                        // dead-letter candidate.
+                        watermark.write().await.last_error_signal = None;
                         if processed > 0 {
                             debug!("Processed {} signals", processed);
                         }
@@ -277,18 +320,23 @@ impl SignalProcessor {
                         consecutive_errors = consecutive_errors.saturating_add(1);
 
                         if consecutive_errors >= config.max_skip_threshold {
-                            // After too many consecutive errors, advance the watermark
-                            // to skip the problematic batch and prevent permanent stuckness
+                            // After too many consecutive errors, dead-letter the
+                            // problematic batch by advancing the watermark to
+                            // prevent permanent stuckness. Audit D7/D33: this must
+                            // advance the PERSISTED watermark — poll_and_process
+                            // re-reads the PG row each cycle, so the previous
+                            // in-memory-only advance was ignored while the seeded
+                            // row exists, making the force-skip a no-op.
                             error!(
                                 consecutive_errors,
-                                "Signal processor stuck for {} consecutive errors, advancing watermark to skip problematic signals",
+                                "Signal processor stuck for {} consecutive errors, advancing persisted watermark to skip problematic signals",
                                 consecutive_errors
                             );
-                            let mut wm = watermark.write().await;
-                            // Advance watermark by 1 second to skip the current batch
-                            wm.last_inserted_at =
-                                wm.last_inserted_at + chrono::Duration::seconds(1);
-                            wm.last_signal_id = None; // Reset signal ID to avoid tie-breaking issues
+                            if let Err(e) =
+                                Self::force_advance_watermark(&dual_pool, &watermark).await
+                            {
+                                error!("Failed to persist force-skip watermark advance: {}", e);
+                            }
                             consecutive_errors = 0;
                         } else if consecutive_errors >= config.max_retries {
                             error!(
@@ -460,6 +508,7 @@ impl SignalProcessor {
         config: &SignalProcessorConfig,
         watermark: &Arc<RwLock<ProcessorWatermark>>,
         shadow_investigation: &dyn ShadowInvestigationHook,
+        webhook_service: Option<&WebhookService>,
     ) -> anyhow::Result<usize> {
         // Acquire row-level lock on the watermark within a transaction.
         // This prevents two leaders from processing the same signals concurrently.
@@ -545,9 +594,18 @@ impl SignalProcessor {
 
         let mut processed = 0;
         let mut last_processed_signal: Option<ClickHouseSignal> = None;
+        // Audit D7: a signal that fails to process stops the batch here so the
+        // watermark is NOT advanced past it. The error is propagated after the
+        // watermark commits progress up to the last SUCCESSFUL signal.
+        let mut batch_error: Option<anyhow::Error> = None;
+        // The exact (inserted_at, id) of the stalled signal, so the force-skip
+        // can dead-letter precisely it rather than a coarse 1s window (audit D7).
+        let mut stuck_signal: Option<(DateTime<Utc>, Uuid)> = None;
         // Per-cycle skip aggregation (see the summary logs after the loop).
         let mut missing_log_count: u64 = 0;
         let mut missing_rule_count: u64 = 0;
+        let mut mode_skipped_count: u64 = 0;
+        let mut window_deduped_count: u64 = 0;
         let mut missing_log_sample: Option<(Uuid, Uuid, DateTime<Utc>)> = None;
 
         for signal in signals {
@@ -561,6 +619,7 @@ impl SignalProcessor {
                 shadow_investigation,
                 &score_calculator,
                 global_weight,
+                webhook_service,
             )
             .await
             {
@@ -575,20 +634,28 @@ impl SignalProcessor {
                             }
                         }
                         SignalOutcome::RuleMissing => missing_rule_count += 1,
+                        SignalOutcome::ModeSkipped => mode_skipped_count += 1,
+                        SignalOutcome::WindowDeduped => window_deduped_count += 1,
                         SignalOutcome::Processed | SignalOutcome::Duplicate => {}
                     }
                     last_processed_signal = Some(signal);
                 }
                 Err(e) => {
-                    // Log error but continue processing other signals
+                    // Audit D7: do NOT advance the watermark past a signal that
+                    // failed to process — a transient CH/PG/alert error would
+                    // otherwise drop the detection forever. Stop the batch here
+                    // (watermark stays at the last successful signal) and
+                    // propagate below so the run loop retries next poll; its
+                    // consecutive-error force-skip dead-letters a poison signal.
                     warn!(
                         signal_id = %signal.id,
                         rule_id = %signal.rule_id,
-                        "Failed to process signal: {}",
+                        "Failed to process signal, holding watermark for retry: {}",
                         e
                     );
-                    // Still update watermark to avoid reprocessing this signal forever
-                    last_processed_signal = Some(signal);
+                    batch_error = Some(e);
+                    stuck_signal = Some((signal.inserted_at, signal.id));
+                    break;
                 }
             }
         }
@@ -614,20 +681,37 @@ impl SignalProcessor {
                 "Skipped signals whose detection rule no longer exists"
             );
         }
+        if mode_skipped_count > 0 {
+            debug!(
+                skipped = mode_skipped_count,
+                "Skipped signals for rules in Staging/Paused mode (audit D11)"
+            );
+        }
+        if window_deduped_count > 0 {
+            debug!(
+                deduped = window_deduped_count,
+                "Suppressed signals whose (rule, entity, window) was already alerted (audit D13)"
+            );
+        }
 
         // Update watermark after processing and commit the transaction
         // (releasing the FOR UPDATE row lock)
         if let Some(signal) = last_processed_signal {
             let new_count = processed_count.saturating_add(processed as u64);
 
+            // Audit D33: UPSERT (not UPDATE-only) so a missing/deleted 'default'
+            // row is recreated instead of silently persisting nothing — which
+            // would reprocess the whole signals table on every restart.
             sqlx::query(
                 r#"
-                UPDATE signal_processor_watermarks
-                SET last_inserted_at = $1,
-                    last_signal_id = $2,
-                    processed_count = $3,
+                INSERT INTO signal_processor_watermarks
+                    (id, last_inserted_at, last_signal_id, processed_count, updated_at)
+                VALUES ('default', $1, $2, $3, NOW())
+                ON CONFLICT (id) DO UPDATE SET
+                    last_inserted_at = EXCLUDED.last_inserted_at,
+                    last_signal_id = EXCLUDED.last_signal_id,
+                    processed_count = EXCLUDED.processed_count,
                     updated_at = NOW()
-                WHERE id = 'default'
                 "#,
             )
             .bind(signal.inserted_at)
@@ -648,7 +732,114 @@ impl SignalProcessor {
             tx.commit().await?;
         }
 
+        // Record the stalled signal (in-memory only) so the run loop's force-skip
+        // can dead-letter exactly it.
+        if stuck_signal.is_some() {
+            watermark.write().await.last_error_signal = stuck_signal;
+        }
+
+        // Audit D7: if a signal errored mid-batch, propagate now — AFTER
+        // committing progress up to the last successful signal — so the run
+        // loop counts it toward the force-skip threshold and retries the failed
+        // signal on the next poll (rather than skipping past it).
+        if let Some(e) = batch_error {
+            return Err(e);
+        }
+
         Ok(processed)
+    }
+
+    /// Advance the PERSISTED watermark by 1s (dropping the tie-break signal id)
+    /// to dead-letter signals that have failed `max_skip_threshold` polls in a
+    /// row. `poll_and_process` re-reads the PG row each cycle, so the previous
+    /// in-memory-only advance was ignored while the seeded row exists — the
+    /// force-skip was a no-op (audit D7/D33). Upserts so a missing row is
+    /// recreated rather than silently dropped.
+    async fn force_advance_watermark(
+        dual_pool: &DualPool,
+        watermark: &Arc<RwLock<ProcessorWatermark>>,
+    ) -> anyhow::Result<()> {
+        let (stuck, seed_ts) = {
+            let wm = watermark.read().await;
+            (
+                wm.last_error_signal,
+                wm.last_inserted_at + chrono::Duration::seconds(1),
+            )
+        };
+
+        // Advance the PERSISTED watermark MONOTONICALLY against the authoritative
+        // PG value (GREATEST / self-referential increment) so a stale in-memory
+        // cache can never move it backward — which would reprocess signals and
+        // re-attempt alerts (codex). When the exact stalled signal is known,
+        // dead-letter precisely it; otherwise (a poll-level failure) skip the
+        // current 1s window. RETURNING syncs the in-memory cache to what PG now
+        // holds.
+        let (new_ts, new_id): (DateTime<Utc>, Option<Uuid>) = match stuck {
+            Some((ts, id)) => {
+                // Advance to exactly the stalled signal, but ONLY if that
+                // position is strictly ahead of the persisted watermark in the
+                // poll's `(inserted_at, id)` tie-break order — where a NULL
+                // persisted id means "already past every signal at that
+                // microsecond", so it must never be regressed to a concrete id.
+                // Both columns move together under one predicate so the tuple
+                // can't rewind (codex). `updated_at` always changes, so
+                // RETURNING yields the current row even when the position holds.
+                sqlx::query_as(
+                    r#"
+                    INSERT INTO signal_processor_watermarks
+                        (id, last_inserted_at, last_signal_id, updated_at)
+                    VALUES ('default', $1, $2, NOW())
+                    ON CONFLICT (id) DO UPDATE SET
+                        last_inserted_at = CASE
+                            WHEN EXCLUDED.last_inserted_at > signal_processor_watermarks.last_inserted_at
+                              OR (EXCLUDED.last_inserted_at = signal_processor_watermarks.last_inserted_at
+                                  AND signal_processor_watermarks.last_signal_id IS NOT NULL
+                                  AND EXCLUDED.last_signal_id > signal_processor_watermarks.last_signal_id)
+                            THEN EXCLUDED.last_inserted_at
+                            ELSE signal_processor_watermarks.last_inserted_at
+                        END,
+                        last_signal_id = CASE
+                            WHEN EXCLUDED.last_inserted_at > signal_processor_watermarks.last_inserted_at
+                              OR (EXCLUDED.last_inserted_at = signal_processor_watermarks.last_inserted_at
+                                  AND signal_processor_watermarks.last_signal_id IS NOT NULL
+                                  AND EXCLUDED.last_signal_id > signal_processor_watermarks.last_signal_id)
+                            THEN EXCLUDED.last_signal_id
+                            ELSE signal_processor_watermarks.last_signal_id
+                        END,
+                        updated_at = NOW()
+                    RETURNING last_inserted_at, last_signal_id
+                    "#,
+                )
+                .bind(ts)
+                .bind(id)
+                .fetch_one(dual_pool.postgres())
+                .await?
+            }
+            None => {
+                sqlx::query_as(
+                    r#"
+                    INSERT INTO signal_processor_watermarks
+                        (id, last_inserted_at, last_signal_id, updated_at)
+                    VALUES ('default', $1, NULL, NOW())
+                    ON CONFLICT (id) DO UPDATE SET
+                        last_inserted_at =
+                            signal_processor_watermarks.last_inserted_at + INTERVAL '1 second',
+                        last_signal_id = NULL,
+                        updated_at = NOW()
+                    RETURNING last_inserted_at, last_signal_id
+                    "#,
+                )
+                .bind(seed_ts)
+                .fetch_one(dual_pool.postgres())
+                .await?
+            }
+        };
+
+        let mut wm = watermark.write().await;
+        wm.last_inserted_at = new_ts;
+        wm.last_signal_id = new_id;
+        wm.last_error_signal = None;
+        Ok(())
     }
 
     /// Process a single signal: create alert, group into case, log finding
@@ -664,18 +855,39 @@ impl SignalProcessor {
         shadow_investigation: &dyn ShadowInvestigationHook,
         score_calculator: &ScoreCalculator,
         global_weight: f64,
+        webhook_service: Option<&WebhookService>,
     ) -> anyhow::Result<SignalOutcome> {
         // Fetch the rule FIRST — its `risk_modifiers` decide which extra columns
         // the matched-log fetch must project so the real-time score sees the same
         // fields the scheduled path does (NAN-1663).
         let rule = match rule_repo.find_by_id(signal.rule_id).await {
             Ok(rule) => rule,
-            Err(_) => {
-                // Aggregated by the batch loop (see MatchedLogMissing) so a large
-                // backlog of signals for a deleted rule cannot flood the log.
+            Err(DetectionRuleRepositoryError::NotFound(_)) => {
+                // Rule genuinely deleted. Aggregated by the batch loop (see
+                // MatchedLogMissing) so a large backlog of signals for a deleted
+                // rule cannot flood the log.
                 return Ok(SignalOutcome::RuleMissing);
             }
+            Err(e) => {
+                // Transient error (PG saturation / connection blip). Audit D6:
+                // propagate — do NOT classify as RuleMissing, or the whole batch
+                // is dropped and the watermark advances past real detections.
+                return Err(anyhow::anyhow!(
+                    "Transient error fetching rule {}: {}",
+                    signal.rule_id,
+                    e
+                ));
+            }
         };
+
+        // Audit D11: honor rule.mode in the real-time path. Staging and Paused
+        // rules must NOT produce alerts or findings — a paused noisy rule that
+        // keeps paging, or a rule created in default Staging that immediately
+        // alerts production, breaks the Staging→Live→Alerting contract. Skip
+        // before the matched-log fetch so we don't pay CH cost for a no-op.
+        if matches!(rule.mode, RuleMode::Staging | RuleMode::Paused) {
+            return Ok(SignalOutcome::ModeSkipped);
+        }
 
         // Fetch the matched log from ClickHouse, bounded to a tight window around
         // the signal's event time so `id =` prunes to a single partition instead
@@ -731,6 +943,112 @@ impl SignalProcessor {
             risk_result.entity_field = rule.risk_entity_field.clone();
         }
 
+        // Audit D13: Grouped rules (the default) dedup per (rule, entity, window
+        // bucket) through the SAME persistent emission store the scheduled path
+        // uses (`detection_finding_emissions`), so a burst of N signals for one
+        // entity within a bucket yields ONE alert/finding — not an alert storm.
+        // PerEvent rules get `None`: each event is its own alert by design, gated
+        // only by the single-event `event_hash` (mirroring the scheduled
+        // per-event path, which also skips the emission store).
+        let dedup_candidate =
+            Self::build_window_dedup_candidate(&rule, &risk_result, signal.timestamp);
+
+        // Audit D11/D12: Live mode BAKES IN — record the match for tuning and log
+        // a live finding, but never create a production alert or open a case.
+        // Only Alerting pages. This also gives real-time Live rules real
+        // match/sparkline data instead of looking dead (D12).
+        if matches!(rule.mode, RuleMode::Live) {
+            // Match counters accrue per signal (the scheduled path counts every
+            // matched event too, before finding dedup).
+            if let Err(e) = rule_repo.update_live_match_count(rule.id, 1).await {
+                warn!(rule_id = %rule.id, "Real-time bake-in: update_live_match_count failed: {}", e);
+            }
+            let today = chrono::Utc::now().date_naive();
+            if let Err(e) = rule_repo.record_daily_stats(rule.id, today, 1, 0).await {
+                warn!(rule_id = %rule.id, "Real-time bake-in: record_daily_stats failed: {}", e);
+            }
+
+            // Audit D13: Grouped rules emit ONE live finding per (rule, entity,
+            // window) — repeated signals for the same entity in the bucket would
+            // otherwise inflate entity risk the scheduled Live path dedups.
+            if let Some(candidate) = dedup_candidate {
+                let mut new_findings = retain_unemitted_with_pool(
+                    dual_pool.postgres(),
+                    rule.id,
+                    vec![candidate],
+                )
+                .await;
+                let Some(candidate) = new_findings.pop() else {
+                    debug!(
+                        rule_id = %rule.id,
+                        entity = %risk_result.entity,
+                        "Real-time bake-in: live finding already emitted for this (entity, window) — suppressing (audit D13)"
+                    );
+                    return Ok(SignalOutcome::WindowDeduped);
+                };
+                // Record before logging, mirroring the scheduled
+                // `log_live_findings` ordering. Best-effort: a failed write only
+                // risks a duplicate live finding later (fail open).
+                record_finding_emissions_with_pool(
+                    dual_pool.postgres(),
+                    rule.id,
+                    std::slice::from_ref(&candidate),
+                )
+                .await;
+            }
+
+            if let Err(e) = finding_logger
+                .log_detection_match(&rule, &events_vec, true, risk_result)
+                .await
+            {
+                error!(rule_id = %rule.id, "Real-time bake-in: log_detection_match failed: {}", e);
+            }
+            return Ok(SignalOutcome::Processed);
+        }
+
+        // Audit D13: Alerting + Grouped — claim the (rule, entity, window) slot
+        // BEFORE creating the alert. Read-only here (fail-open on store errors:
+        // `retain_unemitted_with_pool` treats every candidate as new); the
+        // emission is recorded only after the alert durably exists, mirroring the
+        // scheduled `handle_grouped_alert` ordering (audit D5/D20).
+        let claimed_finding: Option<ClaimedFinding> = match dedup_candidate {
+            Some(candidate) => {
+                let mut new_findings = retain_unemitted_with_pool(
+                    dual_pool.postgres(),
+                    rule.id,
+                    vec![candidate],
+                )
+                .await;
+                match new_findings.pop() {
+                    Some(candidate) => Some(candidate),
+                    None => {
+                        // Already alerted this (entity, window). The signal is a
+                        // genuine match — count it like the scheduled path counts
+                        // matches on a suppressed duplicate alert — but do not
+                        // page again.
+                        if let Err(e) = rule_repo.update_execution_stats(rule.id, 1).await {
+                            warn!(rule_id = %rule.id, "Real-time window-dedup: update_execution_stats failed: {}", e);
+                        }
+                        let today = chrono::Utc::now().date_naive();
+                        if let Err(e) =
+                            rule_repo.record_daily_stats(rule.id, today, 1, 0).await
+                        {
+                            warn!(rule_id = %rule.id, "Real-time window-dedup: record_daily_stats failed: {}", e);
+                        }
+                        debug!(
+                            rule_id = %rule.id,
+                            entity = %risk_result.entity,
+                            event_ts = %signal.timestamp,
+                            "Grouped rule already alerted this (entity, window) — suppressing duplicate real-time alert (audit D13)"
+                        );
+                        return Ok(SignalOutcome::WindowDeduped);
+                    }
+                }
+            }
+            // PerEvent: one alert per signal by design (no window dedup).
+            None => None,
+        };
+
         let matched_events = serde_json::Value::Array(events_vec);
 
         // Create alert with deduplication
@@ -739,6 +1057,9 @@ impl SignalProcessor {
             severity: rule.severity,
             matched_events: matched_events.clone(),
             event_hash: None, // Will be computed by AlertRepository
+            // A13 (NAN-1752): the real-time path creates one alert per signal
+            // (a single matched event — `events_vec = vec![matched_log]`).
+            match_count: Some(1),
         };
 
         let alert = match alert_repo.create(&new_alert).await {
@@ -752,6 +1073,34 @@ impl SignalProcessor {
                 alert
             }
             Err(AlertRepositoryError::DuplicateAlert(rule_id, hash)) => {
+                // Audit D20 parity: a crash between the alert INSERT and the
+                // emission record below leaves an alert without its emission row;
+                // the replayed signal passes the window-dedup check and hits the
+                // (rule_id, event_hash) unique index here. Record the emission
+                // now so later same-window signals dedup instead of re-alerting.
+                if let Some(candidate) = &claimed_finding {
+                    record_finding_emissions_with_pool(
+                        dual_pool.postgres(),
+                        rule_id,
+                        std::slice::from_ref(candidate),
+                    )
+                    .await;
+                    // The (rule, entity, window) match is genuine but the alert
+                    // already exists (crash-recovery: the first pass created the
+                    // alert then crashed before recording stats — otherwise the
+                    // WindowDeduped branch above would have caught it). Count the
+                    // match (1, 0 alerts) like that branch and the scheduled D20
+                    // arm. Grouped only: a PerEvent exact-content duplicate has no
+                    // `claimed_finding` and is the SAME event — it must not
+                    // double-count.
+                    if let Err(e) = rule_repo.update_execution_stats(rule.id, 1).await {
+                        warn!(rule_id = %rule.id, "Real-time dup-repair: update_execution_stats failed: {}", e);
+                    }
+                    let today = chrono::Utc::now().date_naive();
+                    if let Err(e) = rule_repo.record_daily_stats(rule.id, today, 1, 0).await {
+                        warn!(rule_id = %rule.id, "Real-time dup-repair: record_daily_stats failed: {}", e);
+                    }
+                }
                 debug!(
                     rule_id = %rule_id,
                     event_hash = %hash,
@@ -763,6 +1112,34 @@ impl SignalProcessor {
                 return Err(anyhow::anyhow!("Failed to create alert: {}", e));
             }
         };
+
+        // Audit D13: record the (rule, entity, window) emission only now that the
+        // alert durably exists (scheduled `handle_grouped_alert` ordering, audit
+        // D5) — a failed alert insert must not orphan a dedup row that would
+        // silently suppress a future alert. Best-effort: a failed write here
+        // fails OPEN (a later same-window signal may re-alert; never suppressed).
+        if let Some(candidate) = &claimed_finding {
+            record_finding_emissions_with_pool(
+                dual_pool.postgres(),
+                rule.id,
+                std::slice::from_ref(candidate),
+            )
+            .await;
+        }
+
+        // Audit D12: real-time Alerting rules must accrue execution stats too, or
+        // they show match_count=0 / an empty sparkline and look dead. Bumped
+        // (1 match, 1 alert) after a NEW alert. Genuine-but-deduped matches count
+        // (1, 0) elsewhere — the window-dedup branch and the grouped dup-repair
+        // arm above; only a PerEvent exact-content duplicate returns without
+        // stats (same event, must not inflate the counters).
+        if let Err(e) = rule_repo.update_execution_stats(rule.id, 1).await {
+            warn!(rule_id = %rule.id, "Real-time: update_execution_stats failed: {}", e);
+        }
+        let today = chrono::Utc::now().date_naive();
+        if let Err(e) = rule_repo.record_daily_stats(rule.id, today, 1, 1).await {
+            warn!(rule_id = %rule.id, "Real-time: record_daily_stats failed: {}", e);
+        }
 
         // Group alert into case with case permissions from the rule.
         // Open-core builds use a no-op CaseGroupingHook that returns Ok(None);
@@ -827,6 +1204,43 @@ impl SignalProcessor {
             }
         }
 
+        // Fire webhook notifications for the real-time detection alert (NAN-1741
+        // A2). Mirrors the scheduled path
+        // (`detection::service::alerts::process_alert_post_create`): the alert's
+        // `kind` is "detection", which maps to the `siem_alert` subscription
+        // stream (migration 217); the webhook service filters by subscription +
+        // severity. The primary entity is pulled from the first matched event via
+        // the rule's risk-entity field so the consumer gets "who/what" without
+        // parsing the raw events. Optional/None-safe: open-core builds and tests
+        // without a wired `webhook_service` simply skip.
+        if let Some(webhook_service) = webhook_service {
+            let severity_str = format!("{:?}", rule.severity).to_lowercase();
+            let entity = rule.risk_entity_field.as_deref().and_then(|field| {
+                alert
+                    .matched_events
+                    .as_array()
+                    .and_then(|arr| arr.first())
+                    .and_then(|ev| ev.get(field))
+                    .and_then(|v| match v {
+                        serde_json::Value::String(s) => Some(s.clone()),
+                        serde_json::Value::Null => None,
+                        other => Some(other.to_string()),
+                    })
+            });
+            webhook_service
+                .fire_alert(
+                    alert.id,
+                    &alert.kind,
+                    Some(rule.id),
+                    &rule.name,
+                    &severity_str,
+                    entity,
+                    &alert.matched_events,
+                    alert.created_at,
+                )
+                .await;
+        }
+
         // Log finding for analytics with the unified risk result (computed above).
         if let Err(e) = finding_logger
             .log_alert(&rule, &alert, true, risk_result)
@@ -841,6 +1255,46 @@ impl SignalProcessor {
         }
 
         Ok(SignalOutcome::Processed)
+    }
+
+    /// Derive the per-(rule, entity, window) dedup candidate for a signal
+    /// (audit D13), or `None` when the rule's `alert_mode` is PerEvent (each
+    /// event is its own alert by design — only the exact-content `event_hash`
+    /// dedup applies, mirroring the scheduled per-event path).
+    ///
+    /// The identity reuses the scheduled path's derivation
+    /// (`finding_dedup_identity` via `realtime_finding_candidate`): kind + rule
+    /// + entity field + entity + a fixed 60s bucket floored from the signal's
+    /// EVENT time (see `REALTIME_DEDUP_BUCKET_SECS` for why 60s). `kind`
+    /// namespaces Live bake-in (`"live"`) apart from Alerting (`"alert"`) so a
+    /// bake-in emission can't suppress the first real alert after promotion
+    /// (audit D17). The entity/field are the ATTRIBUTED values `process_signal`
+    /// resolved (scorer first, MV `risk_entity` fallback), so dedup keys on the
+    /// same entity the finding is emitted for.
+    fn build_window_dedup_candidate(
+        rule: &DetectionRule,
+        risk_result: &RiskResult,
+        event_ts: DateTime<Utc>,
+    ) -> Option<ClaimedFinding> {
+        if !matches!(rule.alert_mode, AlertMode::Grouped) {
+            return None;
+        }
+        let kind = if matches!(rule.mode, RuleMode::Live) {
+            "live"
+        } else {
+            "alert"
+        };
+        let field = risk_result.entity_field.as_deref().unwrap_or_default();
+        Some(realtime_finding_candidate(
+            kind,
+            rule.id,
+            field,
+            &risk_result.entity,
+            event_ts,
+            // The emission store persists only (entity, hash, window_end); the
+            // event payload is not part of the identity — skip the clone.
+            Vec::new(),
+        ))
     }
 
     /// Build the matched-log fetch SQL for the active schema profile (NAN-1377).
@@ -1322,6 +1776,142 @@ mod tests {
                 && q1.contains("AND id > '019ea2f0-9453-7db5-aec0-12fb99f7b373'))"),
             "strict lower bound must be parenthesized as a unit: {q1}"
         );
+    }
+
+    // ------------------------------------------------------------------------
+    // Audit D13: per-(rule, entity, window) dedup candidate dispatch
+    // ------------------------------------------------------------------------
+
+    fn d13_test_rule(mode: RuleMode, alert_mode: AlertMode) -> DetectionRule {
+        use crate::models::detection_rule::{AiTriageHints, DetectionMode, Severity};
+        DetectionRule {
+            id: Uuid::parse_str("00000000-0000-0000-0000-0000000000d1").unwrap(),
+            name: "d13 test rule".to_string(),
+            description: None,
+            query: "source_type=\"d13_test\"".to_string(),
+            severity: Severity::High,
+            mitre_tactics: vec![],
+            mitre_techniques: vec![],
+            schedule_cron: None,
+            mode,
+            narrative: None,
+            reference_url: None,
+            author: None,
+            tags: vec![],
+            ai_generated: false,
+            realtime_enabled: true,
+            detection_mode: DetectionMode::RealTime,
+            materialized_view_name: None,
+            risk_score: Some(75),
+            risk_entity_field: Some("src_ip".to_string()),
+            risk_modifiers: sqlx::types::Json(vec![]),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_run_at: None,
+            last_match_at: None,
+            match_count: 0,
+            live_match_count: 0,
+            archived: false,
+            folder: None,
+            ai_triage_hints: sqlx::types::Json(AiTriageHints::default()),
+            lookback_minutes: None,
+            dataset: None,
+            auto_tuning_enabled: false,
+            auto_tuning_min_confidence: 0.8,
+            auto_tuning_critical: false,
+            auto_tuning_disabled_until: None,
+            case_visibility: "public".to_string(),
+            case_assigned_group: None,
+            alert_mode,
+            next_run_at: None,
+            claimed_by: None,
+            claimed_at: None,
+            playbook_selector_mode: "none".to_string(),
+            playbook_id: None,
+        }
+    }
+
+    fn d13_risk_result(entity: &str) -> RiskResult {
+        RiskResult::new(
+            75,
+            75,
+            entity.to_string(),
+            Some("src_ip".to_string()),
+            vec![],
+        )
+    }
+
+    /// Grouped rules get a window-dedup candidate; PerEvent rules must get NONE
+    /// (each event is its own alert by design — only event_hash dedup applies).
+    #[test]
+    fn window_dedup_candidate_honors_alert_mode() {
+        use chrono::TimeZone;
+        let ts = Utc.with_ymd_and_hms(2026, 7, 6, 10, 0, 30).unwrap();
+        let rr = d13_risk_result("10.0.0.9");
+
+        let grouped = d13_test_rule(RuleMode::Alerting, AlertMode::Grouped);
+        assert!(
+            SignalProcessor::build_window_dedup_candidate(&grouped, &rr, ts).is_some(),
+            "Grouped rules must dedup per (rule, entity, window)"
+        );
+
+        let per_event = d13_test_rule(RuleMode::Alerting, AlertMode::PerEvent);
+        assert!(
+            SignalProcessor::build_window_dedup_candidate(&per_event, &rr, ts).is_none(),
+            "PerEvent rules keep one-alert-per-signal (no window dedup)"
+        );
+    }
+
+    /// Regression (D13): repeated signals for the same entity within one window
+    /// bucket collide; a later bucket or a different entity re-keys and emits.
+    #[test]
+    fn window_dedup_candidate_collides_within_window_re_emits_across() {
+        use chrono::TimeZone;
+        let rule = d13_test_rule(RuleMode::Alerting, AlertMode::Grouped);
+        let rr = d13_risk_result("10.0.0.9");
+
+        let burst_1 = Utc.with_ymd_and_hms(2026, 7, 6, 10, 0, 2).unwrap();
+        let burst_2 = Utc.with_ymd_and_hms(2026, 7, 6, 10, 0, 57).unwrap(); // same bucket
+        let later = Utc.with_ymd_and_hms(2026, 7, 6, 10, 1, 5).unwrap(); // next bucket
+
+        let c1 = SignalProcessor::build_window_dedup_candidate(&rule, &rr, burst_1).unwrap();
+        let c2 = SignalProcessor::build_window_dedup_candidate(&rule, &rr, burst_2).unwrap();
+        let c3 = SignalProcessor::build_window_dedup_candidate(&rule, &rr, later).unwrap();
+
+        assert_eq!(
+            c1.finding_hash, c2.finding_hash,
+            "a burst within one window must collide to ONE alert"
+        );
+        assert_ne!(
+            c1.finding_hash, c3.finding_hash,
+            "a genuinely later window must re-emit"
+        );
+
+        let other = d13_risk_result("10.0.0.10");
+        let c4 = SignalProcessor::build_window_dedup_candidate(&rule, &other, burst_1).unwrap();
+        assert_ne!(
+            c1.finding_hash, c4.finding_hash,
+            "a different entity in the same window must emit its own alert"
+        );
+        assert_eq!(c4.entity, "10.0.0.10");
+        assert_eq!(c4.field, "src_ip");
+    }
+
+    /// Live bake-in emissions are namespaced apart from Alerting emissions so a
+    /// bake-in record can't suppress the first real alert after promotion
+    /// (audit D17 parity).
+    #[test]
+    fn window_dedup_candidate_namespaces_live_vs_alerting() {
+        use chrono::TimeZone;
+        let ts = Utc.with_ymd_and_hms(2026, 7, 6, 10, 0, 30).unwrap();
+        let rr = d13_risk_result("10.0.0.9");
+
+        let live = d13_test_rule(RuleMode::Live, AlertMode::Grouped);
+        let alerting = d13_test_rule(RuleMode::Alerting, AlertMode::Grouped);
+
+        let c_live = SignalProcessor::build_window_dedup_candidate(&live, &rr, ts).unwrap();
+        let c_alert = SignalProcessor::build_window_dedup_candidate(&alerting, &rr, ts).unwrap();
+        assert_ne!(c_live.finding_hash, c_alert.finding_hash);
     }
 
     #[test]

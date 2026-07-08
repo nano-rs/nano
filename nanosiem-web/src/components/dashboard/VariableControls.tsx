@@ -7,7 +7,7 @@
  * Supports dropdown (static options), text input, and query-based (dynamic) variables.
  */
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
@@ -21,13 +21,25 @@ import {
 } from '@/components/ui/select';
 import { Loader2 } from 'lucide-react';
 import { api, type DashboardVariable, type TimeRange } from '@/lib/api';
+import { substituteVariables } from './variable-substitution';
 
 export interface VariableControlsProps {
   variables: DashboardVariable[];
   values: Record<string, string>;
   onChange: (values: Record<string, string>) => void;
   timeRange: TimeRange;
+  /**
+   * NAN-711 (DSH54): query-backed option fetches must not fire before the user
+   * has run the dashboard at least once. Defaults to true so other callers keep
+   * eager behaviour.
+   */
+  hasRunOnce?: boolean;
 }
+
+// DSH22: Radix Select can't represent "no selection", so an explicit sentinel
+// option maps back to the empty value (which the substitution module treats as
+// "unfiltered"). Radix also forbids an empty-string item value, hence a token.
+const ANY_OPTION = '__any__';
 
 interface QueryOptionsCache {
   [variableName: string]: {
@@ -42,72 +54,93 @@ export function VariableControls({
   values,
   onChange,
   timeRange,
+  hasRunOnce = true,
 }: VariableControlsProps) {
   const [queryCache, setQueryCache] = useState<QueryOptionsCache>({});
   // Local state for text inputs - only apply on Enter or button click
   const [textValues, setTextValues] = useState<Record<string, string>>({});
   // Track if any text value has pending changes
   const [hasPendingChanges, setHasPendingChanges] = useState(false);
+  // DSH55: names of text variables with un-applied edits, so an external
+  // `values` change (dropdown pick) doesn't wipe pending typing.
+  const pendingKeys = useRef<Set<string>>(new Set());
+  // DSH54: per-variable request sequence so a stale (slower / older time-range /
+  // older sibling-value) option response can't overwrite a newer one.
+  const fetchSeq = useRef<Record<string, number>>({});
 
-  // Sync textValues with external values on mount and when values change
+  // Sync textValues with external values, PRESERVING keys the user is mid-edit
+  // on (DSH55).
   useEffect(() => {
-    setTextValues(values);
-    setHasPendingChanges(false);
+    setTextValues(prev => {
+      const next: Record<string, string> = { ...values };
+      for (const key of pendingKeys.current) {
+        if (key in prev) next[key] = prev[key];
+      }
+      return next;
+    });
+    setHasPendingChanges(pendingKeys.current.size > 0);
   }, [values]);
 
   // Fetch options for query-type variables
   const fetchQueryOptions = useCallback(async (variable: DashboardVariable) => {
     if (!variable.query || !variable.queryField) return;
+    const queryField = variable.queryField;
+
+    const seq = (fetchSeq.current[variable.name] ?? 0) + 1;
+    fetchSeq.current[variable.name] = seq;
+    const isStale = () => fetchSeq.current[variable.name] !== seq;
 
     setQueryCache(prev => ({
       ...prev,
-      [variable.name]: { options: [], loading: true },
+      [variable.name]: { options: prev[variable.name]?.options ?? [], loading: true },
     }));
 
     try {
+      // DSH54: pass sibling variable values into the option query via the shared
+      // substitution so CHAINED variables (e.g. `source=$src | stats count by
+      // host`) filter by the current selections instead of the literal `$src`.
+      const definedNames = variables.map(v => v.name);
+      const optionQuery = substituteVariables(variable.query, values, definedNames);
+
       const response = await api.panelQuery({
-        query: variable.query,
+        query: optionQuery,
         query_mode: 'piped',
         time_range: timeRange,
       });
+      if (isStale()) return; // a newer fetch superseded this one (DSH54)
 
       // Extract unique values from the specified field
       const options = new Set<string>();
       for (const row of response.results) {
-        const value = row[variable.queryField];
+        const value = row[queryField];
         if (value !== undefined && value !== null) {
           options.add(String(value));
         }
       }
 
       // NAN-710: if 0 options came back from a non-empty result set AND the
-      // requested field is actually missing from the response shape, surface
-      // a diagnostic. The most likely cause is the AI agent (or a hand-edited
-      // dashboard) used the display label as `queryField` instead of the
-      // actual snake_case column name. Distinguishing "field absent" from
-      // "field present but all values null" prevents a misleading error on
-      // the rare all-null case.
-      //
-      // ClickHouse returns identically-shaped rows so the first row's keys
-      // are authoritative — no need to walk the whole response.
+      // requested field is actually missing from the response shape, surface a
+      // diagnostic. Most likely cause: the display label was used as
+      // `queryField` instead of the snake_case column name. ClickHouse returns
+      // identically-shaped rows so the first row's keys are authoritative.
       if (options.size === 0 && response.results.length > 0) {
         const availableFields = Object.keys(response.results[0] ?? {}).sort();
-        if (!availableFields.includes(variable.queryField)) {
+        if (!availableFields.includes(queryField)) {
+          if (isStale()) return;
           setQueryCache(prev => ({
             ...prev,
             [variable.name]: {
               options: [],
               loading: false,
-              error: `field "${variable.queryField}" not found — available: ${availableFields.join(', ')}`,
+              error: `field "${queryField}" not found — available: ${availableFields.join(', ')}`,
             },
           }));
           return;
         }
-        // Field is present but every value was null/undefined — fall through
-        // to the regular empty-dropdown path. Genuinely empty data, not an
-        // authoring error.
+        // Field is present but every value was null/undefined — genuinely empty.
       }
 
+      if (isStale()) return;
       setQueryCache(prev => ({
         ...prev,
         [variable.name]: {
@@ -116,6 +149,7 @@ export function VariableControls({
         },
       }));
     } catch (err) {
+      if (isStale()) return;
       setQueryCache(prev => ({
         ...prev,
         [variable.name]: {
@@ -125,16 +159,18 @@ export function VariableControls({
         },
       }));
     }
-  }, [timeRange]);
+  }, [timeRange, variables, values]);
 
-  // Fetch query options on mount and when time range changes
+  // Fetch query options once the dashboard has run (NAN-711 gate, DSH54) and
+  // whenever the time range or sibling variable values change.
   useEffect(() => {
+    if (!hasRunOnce) return;
     for (const variable of variables) {
       if (variable.type === 'query') {
         fetchQueryOptions(variable);
       }
     }
-  }, [variables, timeRange, fetchQueryOptions]);
+  }, [variables, timeRange, fetchQueryOptions, hasRunOnce]);
 
   // Handler for dropdown/query changes - applies immediately
   const handleChange = (name: string, value: string) => {
@@ -143,6 +179,7 @@ export function VariableControls({
 
   // Handler for text input changes - only updates local state
   const handleTextChange = useCallback((name: string, value: string) => {
+    pendingKeys.current.add(name);
     setTextValues(prev => ({ ...prev, [name]: value }));
     setHasPendingChanges(true);
   }, []);
@@ -151,6 +188,7 @@ export function VariableControls({
   const applyTextChanges = useCallback(() => {
     // Merge text values with existing dropdown/query values
     onChange({ ...values, ...textValues });
+    pendingKeys.current.clear();
     setHasPendingChanges(false);
   }, [onChange, values, textValues]);
 
@@ -188,13 +226,18 @@ export function VariableControls({
 
           {variable.type === 'dropdown' && (
             <Select
-              value={values[variable.name] || variable.defaultValue || ''}
-              onValueChange={value => handleChange(variable.name, value)}
+              value={(values[variable.name] ?? variable.defaultValue ?? '') === '' ? ANY_OPTION : (values[variable.name] ?? variable.defaultValue ?? '')}
+              onValueChange={value => handleChange(variable.name, value === ANY_OPTION ? '' : value)}
             >
               <SelectTrigger className="h-[26px] w-[150px] text-[12px]">
                 <SelectValue placeholder={`— any —`} />
               </SelectTrigger>
               <SelectContent>
+                {/* DSH22: explicit clear-to-"any" so a narrowed variable can be
+                    widened back to the fleet view without a full reload. */}
+                <SelectItem value={ANY_OPTION} className="text-[12px] text-muted-foreground">
+                  — any —
+                </SelectItem>
                 {variable.options?.map(option => (
                   <SelectItem key={option} value={option} className="text-[12px]">
                     {option}
@@ -230,13 +273,17 @@ export function VariableControls({
                 </div>
               ) : (
                 <Select
-                  value={values[variable.name] || variable.defaultValue || ''}
-                  onValueChange={value => handleChange(variable.name, value)}
+                  value={(values[variable.name] ?? variable.defaultValue ?? '') === '' ? ANY_OPTION : (values[variable.name] ?? variable.defaultValue ?? '')}
+                  onValueChange={value => handleChange(variable.name, value === ANY_OPTION ? '' : value)}
                 >
                   <SelectTrigger className="h-[26px] w-[150px] text-[12px]">
                     <SelectValue placeholder={`— any —`} />
                   </SelectTrigger>
                   <SelectContent className="max-h-[300px]">
+                    {/* DSH22: explicit clear-to-"any" (see dropdown variant). */}
+                    <SelectItem value={ANY_OPTION} className="text-[12px] text-muted-foreground">
+                      — any —
+                    </SelectItem>
                     {queryCache[variable.name]?.options.map(option => (
                       <SelectItem key={option} value={option} className="text-[12px]">
                         {option}

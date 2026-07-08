@@ -24,8 +24,8 @@ import { useCallback, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { AlertTriangle, Bell, CircleCheck, Eye, Search as SearchIcon } from 'lucide-react';
 
-import { useAlertCounts, useAlerts, useAlertVelocity } from '@/hooks/use-api';
-import type { Alert, AlertVelocityBucket } from '@/lib/api/types';
+import { useAlertCounts, useAlerts } from '@/hooks/use-api';
+import type { Alert } from '@/lib/api/types';
 import { cn } from '@/lib/utils';
 import { api } from '@/lib/api';
 import { useAuth } from '@/contexts/AuthContext';
@@ -59,7 +59,6 @@ import {
 } from '@/components/alerts/monitorAlert';
 import { SegmentedSev, FilterSelect } from '@/components/rules/RulesToolbarChips';
 import { normalizeSeverity } from '@/components/matches/helpers';
-import { Sparkline } from './charts';
 
 // ---------------------------------------------------------------------------
 // adapter — alert → monitor
@@ -149,9 +148,6 @@ function toMonitor(a: Alert): Monitor {
   };
 }
 
-const velocitySeries = (buckets: AlertVelocityBucket[] | null): number[] =>
-  (buckets ?? []).map((b) => b.count);
-
 // NAN-1541: this surface shows OBSERVABILITY monitor alerts ONLY. Security
 // detection alerts live on the SIEM /alerts page. The unified alert spine
 // discriminates by `kind`; we scope every read here to the monitor kinds so
@@ -167,7 +163,9 @@ const SUMMARY: Array<{ k: Exclude<FilterKey, 'all'> | 'total'; label: string; to
   { k: 'new', label: 'Firing', tone: 'danger' },
   { k: 'acknowledged', label: 'Acknowledged', tone: 'warn' },
   { k: 'closed', label: 'Resolved', tone: 'good' },
-  { k: 'total', label: 'Total monitors', tone: 'brand' },
+  // O55 (NAN-1721): this card reads `counts.total` from `useAlertCounts` — the
+  // total monitor-alert count, NOT a count of monitors. Label it honestly.
+  { k: 'total', label: 'Total alerts', tone: 'brand' },
 ];
 
 const HEALTH_BG: Record<'danger' | 'warn' | 'good' | 'brand', string> = {
@@ -219,7 +217,6 @@ export function AlertsMonitors() {
   const [closeDisposition, setCloseDisposition] = useState<Disposition>('true_positive');
 
   const { data: counts, refetch: refetchCounts } = useAlertCounts(MONITOR_KINDS);
-  const { data: velocity } = useAlertVelocity(24, MONITOR_KINDS);
   // The table re-queries when the status filter changes; 'all' fetches the
   // recent slice unfiltered. Bounded by the backend default limit.
   const {
@@ -231,8 +228,6 @@ export function AlertsMonitors() {
       ? { kinds: MONITOR_KINDS, limit: 200 }
       : { status: filter, kinds: MONITOR_KINDS, limit: 200 },
   );
-
-  const evalSeries = useMemo(() => velocitySeries(velocity), [velocity]);
 
   const monitors = useMemo(() => (alerts ?? []).map(toMonitor), [alerts]);
   // Active = unhandled, high-urgency alerts. Pulled separately so the banner is
@@ -338,9 +333,11 @@ export function AlertsMonitors() {
 
   // Shared column template — the trailing actions column only exists when the
   // viewer can triage (keeps the table from reserving dead space otherwise).
+  // O55 (NAN-1721): the per-row "Eval" sparkline column was dropped (it showed
+  // the same global velocity on every row), so its 56px track is gone too.
   const gridCols = showActions
-    ? '18px minmax(0,1.4fr) 88px minmax(120px,1.3fr) 72px minmax(110px,1fr) 56px 64px'
-    : '18px minmax(0,1.4fr) 88px minmax(120px,1.3fr) 72px minmax(110px,1fr) 56px';
+    ? '18px minmax(0,1.4fr) 88px minmax(120px,1.3fr) 72px minmax(110px,1fr) 64px'
+    : '18px minmax(0,1.4fr) 88px minmax(120px,1.3fr) 72px minmax(110px,1fr)';
 
   return (
     <div className="flex flex-col gap-3.5">
@@ -441,10 +438,10 @@ export function AlertsMonitors() {
                     </div>
                   </div>
                 </div>
-                <div className="flex items-center gap-3">
-                  <div className="flex-1 min-w-0 [&>svg]:w-full">
-                    <Sparkline data={evalSeries} color="var(--color-danger)" fill w={240} h={28} />
-                  </div>
+                {/* O55 (NAN-1721): dropped the per-incident velocity sparkline —
+                    it plotted the single global alert-velocity series on every
+                    card, implying a per-incident trend that didn't exist. */}
+                <div className="flex items-center justify-end">
                   <div className="text-right shrink-0">
                     <div className="font-mono text-[15px] text-danger tabular-nums leading-none">{m.breachPrimary}</div>
                     <div className="font-mono text-[9.5px] text-fg-4 mt-0.5">{m.breachSecondary || 'breach'}</div>
@@ -482,7 +479,6 @@ export function AlertsMonitors() {
           <span>Metric / target</span>
           <span>Severity</span>
           <span className="text-right">Breach</span>
-          <span className="text-right">Eval</span>
           {showActions && <span className="text-right">Actions</span>}
         </div>
 
@@ -535,20 +531,6 @@ export function AlertsMonitors() {
               <span className="text-right font-mono text-[11px] tabular-nums truncate">
                 <span className={cn(m.status === 'alerting' ? 'text-danger' : 'text-fg')}>{m.breachPrimary}</span>
                 {m.breachSecondary && <span className="text-fg-4"> {m.breachSecondary}</span>}
-              </span>
-              <span className="flex justify-end">
-                <Sparkline
-                  data={evalSeries}
-                  color={
-                    m.status === 'alerting'
-                      ? 'var(--color-danger)'
-                      : m.status === 'warn'
-                        ? 'var(--color-warn)'
-                        : 'var(--color-fg-3)'
-                  }
-                  w={56}
-                  h={18}
-                />
               </span>
               {showActions && (
                 <span className="flex justify-end items-center gap-0.5">

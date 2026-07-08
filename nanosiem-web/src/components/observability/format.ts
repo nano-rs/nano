@@ -37,7 +37,9 @@ export function fmtRate(v: number | null | undefined): string {
   if (a >= 10) return v.toFixed(0);
   if (a >= 1) return v.toFixed(1);
   if (a >= 0.01) return v.toFixed(2);
-  return '<0.01';
+  // Sub-0.01 but nonzero: keep the sign visible. A tiny negative rate must not
+  // collapse to "<0.01" (which reads as a small POSITIVE value).
+  return v > 0 ? '<0.01' : '>-0.01';
 }
 
 /** Duration in ms → `42.3ms` / `1.20s`. */

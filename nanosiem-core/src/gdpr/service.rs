@@ -18,7 +18,7 @@ use super::{
 };
 use std::sync::Arc;
 
-use crate::db::dual_pool::TableNames;
+use crate::db::dual_pool::{on_cluster_clause, TableNames};
 use crate::db::DualPool;
 use crate::schema::{SchemaId, SchemaProfile};
 
@@ -600,6 +600,10 @@ impl AnonymizationService {
         // find matches — same function as Rust's salted_hash().
         let mutation_id = format!("gdpr_user_{}", Uuid::now_v7().simple());
         let salt_escaped = Self::escape_ch_string(salt);
+        // NAN-1728 C1: mutations must fan out to every shard's LOCAL table on a
+        // cluster (the Distributed engine can't take mutations). Empty string on
+        // single-node → byte-identical to the pre-cluster SQL.
+        let on_cluster = on_cluster_clause();
         let user_columns: &[&str] = &[
             "user",
             "src_user",
@@ -623,7 +627,7 @@ impl AnonymizationService {
                 Self::build_hash_match_where(ocsf_user_cols, &salt_escaped, anon_hash);
             let ocsf_local = self.table_names.local(self.logs_key());
             format!(
-                "ALTER TABLE {ocsf_local} DELETE WHERE {where_match} SETTINGS mutations_sync = 0"
+                "ALTER TABLE {ocsf_local}{on_cluster} DELETE WHERE {where_match} SETTINGS mutations_sync = 0"
             )
         } else {
             let message_expr =
@@ -632,7 +636,7 @@ impl AnonymizationService {
                 Self::build_freetext_replace("ext", user_columns, &salt_escaped, anon_hash);
             let logs_local = self.table_names.local("logs");
             format!(
-            "ALTER TABLE {logs_local} \
+            "ALTER TABLE {logs_local}{on_cluster} \
              UPDATE \
                 `user` = if(`user` != '' AND lower(hex(SHA256(concat('{salt_escaped}', lower(`user`))))) = '{anon_hash}', '{anon_hash}', `user`), \
                 src_user = if(src_user != '' AND lower(hex(SHA256(concat('{salt_escaped}', lower(src_user))))) = '{anon_hash}', '{anon_hash}', src_user), \
@@ -688,7 +692,7 @@ impl AnonymizationService {
         let obs_mutation_id = format!("gdpr_obs_user_{}", Uuid::now_v7().simple());
         let identity_obs_local = self.table_names.local("identity_observations");
         let obs_sql = format!(
-            "ALTER TABLE {identity_obs_local} \
+            "ALTER TABLE {identity_obs_local}{on_cluster} \
              UPDATE `user` = '{anon_hash}' \
              WHERE lower(hex(SHA256(concat('{salt_escaped}', lower(`user`))))) = '{anon_hash}' \
              SETTINGS mutations_sync = 0",
@@ -703,7 +707,7 @@ impl AnonymizationService {
         let cloud_mutation_id = format!("gdpr_cloud_user_{}", Uuid::now_v7().simple());
         let cloud_local = self.table_names.local("cloud_user_activity_agg");
         let cloud_sql = format!(
-            "ALTER TABLE {cloud_local} \
+            "ALTER TABLE {cloud_local}{on_cluster} \
              DELETE WHERE lower(hex(SHA256(concat('{salt_escaped}', lower(`user`))))) = '{anon_hash}' \
              SETTINGS mutations_sync = 0",
         );
@@ -726,6 +730,9 @@ impl AnonymizationService {
     ) -> Result<(), AnonymizationError> {
         let mutation_id = format!("gdpr_ip_{}", Uuid::now_v7().simple());
         let salt_escaped = Self::escape_ch_string(salt);
+        // NAN-1728 C1: fan the mutation to every shard's LOCAL table on a cluster;
+        // empty on single-node (byte-identical to pre-cluster SQL).
+        let on_cluster = on_cluster_clause();
         let ip_columns: &[&str] = &["src_ip", "dest_ip", "dvc_ip"];
         let sql = if self.profile.id() == SchemaId::Ocsf {
             // OCSF (NAN-1443): `event` is EPHEMERAL and the IP columns are
@@ -737,7 +744,7 @@ impl AnonymizationService {
                 Self::build_hash_match_where(ocsf_ip_cols, &salt_escaped, anon_hash);
             let ocsf_local = self.table_names.local(self.logs_key());
             format!(
-                "ALTER TABLE {ocsf_local} DELETE WHERE {where_match} SETTINGS mutations_sync = 0"
+                "ALTER TABLE {ocsf_local}{on_cluster} DELETE WHERE {where_match} SETTINGS mutations_sync = 0"
             )
         } else {
             let message_expr =
@@ -746,7 +753,7 @@ impl AnonymizationService {
                 Self::build_freetext_replace("ext", ip_columns, &salt_escaped, anon_hash);
             let logs_local = self.table_names.local("logs");
             format!(
-            "ALTER TABLE {logs_local} \
+            "ALTER TABLE {logs_local}{on_cluster} \
              UPDATE \
                 src_ip = if(src_ip != '' AND lower(hex(SHA256(concat('{salt_escaped}', lower(src_ip))))) = '{anon_hash}', '{anon_hash}', src_ip), \
                 dest_ip = if(dest_ip != '' AND lower(hex(SHA256(concat('{salt_escaped}', lower(dest_ip))))) = '{anon_hash}', '{anon_hash}', dest_ip), \
@@ -790,7 +797,7 @@ impl AnonymizationService {
         let obs_mutation_id = format!("gdpr_obs_ip_{}", Uuid::now_v7().simple());
         let identity_obs_local = self.table_names.local("identity_observations");
         let obs_sql = format!(
-            "ALTER TABLE {identity_obs_local} \
+            "ALTER TABLE {identity_obs_local}{on_cluster} \
              UPDATE ip = '{anon_hash}' \
              WHERE lower(hex(SHA256(concat('{salt_escaped}', lower(ip))))) = '{anon_hash}' \
              SETTINGS mutations_sync = 0",
@@ -854,8 +861,12 @@ impl AnonymizationService {
         };
 
         let mutation_id = format!("gdpr_user_registry_{}", Uuid::now_v7().simple());
+        // NAN-1728 C1: user_registry is cluster-wide replicated (complete on every
+        // node), so the bare local name is correct for reads; the mutation still
+        // needs ON CLUSTER to run on all nodes. Empty on single-node.
+        let on_cluster = on_cluster_clause();
         let sql = format!(
-            "ALTER TABLE nanosiem.user_registry UPDATE {set_clause} \
+            "ALTER TABLE nanosiem.user_registry{on_cluster} UPDATE {set_clause} \
              WHERE {where_clause} SETTINGS mutations_sync = 0"
         );
         ch.query(&sql)

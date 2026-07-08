@@ -30,70 +30,272 @@ pub(crate) fn inject_detected_at(events: &mut [serde_json::Value], detected_at: 
     }
 }
 
+/// Dedup namespace for `detection_matched_events` (audit D17): Live bake-in
+/// records must not suppress the first Alerting alert after promotion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MatchedEventKind {
+    Live,
+    Alert,
+}
+
+impl MatchedEventKind {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Alert => "alert",
+        }
+    }
+
+    /// The namespace a given execution mode records/filters under. Staging and
+    /// Paused never reach execution; treat anything non-Alerting as bake-in.
+    pub(super) fn for_mode(mode: RuleMode) -> Self {
+        match mode {
+            RuleMode::Alerting => Self::Alert,
+            _ => Self::Live,
+        }
+    }
+}
+
+/// Stable per-event id for lookback dedup: `log_id` > `id` > SHA-256 of the
+/// canonical event JSON. Shared by the filter (read) and record (write) halves
+/// so both agree on the key.
+///
+/// The fallback hash strips the injected `_nano_*` fields first: filtering runs
+/// on the raw event but recording now runs *after* `inject_detected_at` stamps
+/// `_nano_detected_at`, so hashing the raw JSON would give the two halves
+/// different ids and re-alert the event forever (codex/audit D5). Stripping also
+/// keeps the hash byte-identical to pre-upgrade rows (which were hashed before
+/// injection), so existing dedup rows keep matching.
+pub(super) fn matched_event_id(event: &serde_json::Value) -> String {
+    if let Some(log_id) = event.get("log_id").and_then(|v| v.as_str()) {
+        log_id.to_string()
+    } else if let Some(id) = event.get("id").and_then(|v| v.as_str()) {
+        id.to_string()
+    } else {
+        use sha2::{Digest, Sha256};
+        let canonical = strip_nano_fields(event);
+        let event_str = serde_json::to_string(&canonical).unwrap_or_default();
+        hex::encode(Sha256::digest(event_str.as_bytes()))
+    }
+}
+
+/// Clone `event` with top-level `_nano_*` keys removed (the detection engine
+/// only injects `_nano_detected_at` at the top level).
+fn strip_nano_fields(event: &serde_json::Value) -> serde_json::Value {
+    match event {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .filter(|(k, _)| !k.starts_with("_nano_"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+// ============================================================================
+// Real-time finding dedup (audit D13)
+// ============================================================================
+
+/// Width of the real-time per-(rule, entity, window) dedup bucket, in seconds.
+///
+/// The real-time path drains signals one at a time, so a Grouped rule has no
+/// execution batch to group by. The window bucket substitutes for it: a fixed
+/// 60s bucket aligned to the event's timestamp matches the scheduled path's
+/// DEFAULT cadence (`*/1 * * * *` — one execution, hence at most one grouped
+/// alert per entity, per minute). It is deliberately NOT derived from
+/// `lookback_minutes` (a scheduled-path *query window*, not an alert cadence —
+/// scheduled rules still alert once per cron cycle on new events inside the
+/// lookback) and it is the conservative choice: a smaller bucket fails toward
+/// EMITTING (worst case one alert per entity per minute during a sustained
+/// burst — visible, not a storm), never toward suppressing later activity.
+pub(crate) const REALTIME_DEDUP_BUCKET_SECS: i64 = 60;
+
+/// Floor an event timestamp to its real-time dedup bucket (epoch-aligned,
+/// [`REALTIME_DEDUP_BUCKET_SECS`] wide). Derived from the signal's EVENT time
+/// (not processing time), so replayed/backfilled events for an already-alerted
+/// historical window still collide with it.
+pub(crate) fn realtime_window_bucket(event_ts: DateTime<Utc>) -> DateTime<Utc> {
+    let secs = event_ts
+        .timestamp()
+        .div_euclid(REALTIME_DEDUP_BUCKET_SECS)
+        * REALTIME_DEDUP_BUCKET_SECS;
+    DateTime::from_timestamp(secs, 0).unwrap_or(event_ts)
+}
+
+/// Build the real-time per-(rule, entity, window-bucket) dedup candidate
+/// (audit D13).
+///
+/// Reuses the scheduled path's identity derivation instead of forking it: the
+/// bucket is synthesized as the finding's `_first_seen`/`_last_seen` activity
+/// window, so [`DetectionService::finding_dedup_identity`]'s aggregate branch
+/// produces the hash — `kind + rule + field + entity + bucket`. Two signals for
+/// the same entity in the same bucket collide; a later bucket (genuinely later
+/// activity) re-keys and re-emits. `kind` namespaces `"live"` (bake-in) vs
+/// `"alert"` emissions apart, mirroring audit D17.
+///
+/// `events` is carried for parity with the scheduled candidates but is NOT part
+/// of the identity and is not persisted by the emission store; the real-time
+/// caller passes an empty slice.
+pub(crate) fn realtime_finding_candidate(
+    kind: &str,
+    rule_id: Uuid,
+    field: &str,
+    entity: &str,
+    event_ts: DateTime<Utc>,
+    events: Vec<serde_json::Value>,
+) -> ClaimedFinding {
+    let bucket = realtime_window_bucket(event_ts);
+    let synthetic_window = serde_json::json!({
+        "_first_seen": bucket.to_rfc3339(),
+        "_last_seen": bucket.to_rfc3339(),
+    });
+    let (finding_hash, window_end) = DetectionService::finding_dedup_identity(
+        kind,
+        rule_id,
+        field,
+        entity,
+        std::slice::from_ref(&synthetic_window),
+    );
+    ClaimedFinding {
+        entity: entity.to_string(),
+        field: field.to_string(),
+        events,
+        window_end,
+        finding_hash,
+    }
+}
+
+/// Filter `candidates` down to the findings NOT yet emitted for this rule — a
+/// single batched `SELECT ... = ANY($hashes)` against the persistent dedup
+/// store (NAN-1305). Fails open: on a query error every candidate is treated as
+/// new (emit rather than silently drop).
+///
+/// Pool-parameterized so both the scheduled path ([`DetectionService`]) and the
+/// real-time `SignalProcessor` (audit D13) share ONE dedup mechanism.
+pub(crate) async fn retain_unemitted_with_pool(
+    pool: &sqlx::PgPool,
+    rule_id: Uuid,
+    candidates: Vec<ClaimedFinding>,
+) -> Vec<ClaimedFinding> {
+    if candidates.is_empty() {
+        return candidates;
+    }
+
+    let hashes: Vec<String> = candidates.iter().map(|c| c.finding_hash.clone()).collect();
+    let existing: std::collections::HashSet<String> = match sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT finding_hash
+        FROM detection_finding_emissions
+        WHERE rule_id = $1 AND finding_hash = ANY($2)
+        "#,
+    )
+    .bind(rule_id)
+    .bind(&hashes)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows.into_iter().collect(),
+        Err(e) => {
+            warn!(
+                "finding-emission dedup read failed for rule {}: {}. Emitting all without dedup.",
+                rule_id, e
+            );
+            std::collections::HashSet::new()
+        }
+    };
+
+    candidates
+        .into_iter()
+        .filter(|c| !existing.contains(&c.finding_hash))
+        .collect()
+}
+
+/// Record `findings` as emitted in the dedup store — a single batched
+/// `INSERT ... ON CONFLICT DO NOTHING` (NAN-1305). Best-effort: a failure is
+/// logged, not propagated (the finding has been / will be emitted regardless;
+/// at worst it can re-emit on a later overlapping run).
+///
+/// Pool-parameterized so both the scheduled path ([`DetectionService`]) and the
+/// real-time `SignalProcessor` (audit D13) share ONE dedup mechanism.
+pub(crate) async fn record_finding_emissions_with_pool(
+    pool: &sqlx::PgPool,
+    rule_id: Uuid,
+    findings: &[ClaimedFinding],
+) {
+    if findings.is_empty() {
+        return;
+    }
+
+    let mut qb = sqlx::QueryBuilder::new(
+        "INSERT INTO detection_finding_emissions (rule_id, entity, finding_hash, window_end) ",
+    );
+    qb.push_values(findings, |mut b, f| {
+        b.push_bind(rule_id)
+            .push_bind(&f.entity)
+            .push_bind(&f.finding_hash)
+            .push_bind(f.window_end);
+    });
+    qb.push(" ON CONFLICT (rule_id, finding_hash) DO NOTHING");
+
+    if let Err(e) = qb.build().execute(pool).await {
+        warn!(
+            "Failed to record {} finding emissions for rule {}: {}. They may re-emit on a later overlapping run.",
+            findings.len(),
+            rule_id,
+            e
+        );
+    }
+}
+
 impl DetectionService {
     // ========================================================================
     // Entity Grouping Helpers
     // ========================================================================
 
-    /// Filter out events that have already been matched by this rule
+    /// Return the subset of `events` this rule has NOT already matched in the
+    /// given `kind` namespace (audit D5/D17).
     ///
-    /// This prevents re-detection when rules have long lookback windows that overlap
-    /// with previous runs. For example, a rule running every 10 seconds with a 15-minute
-    /// lookback would otherwise re-detect the same events 90 times.
+    /// **READ ONLY.** Recording is a separate step (`record_matched_events`) run
+    /// *after* the alert/finding is durably created — previously this function
+    /// recorded as a side effect *before* the alert existed, so a crash between
+    /// match and alert permanently suppressed the detection (audit D5). The
+    /// `kind` namespace keeps Live bake-in records from filtering out the first
+    /// Alerting alert after promotion (audit D17).
     ///
-    /// This function:
-    /// 1. Extracts event IDs from the results
-    /// 2. Queries the detection_matched_events table to find which ones were already matched
-    /// 3. Filters out the already-matched events
-    /// 4. Records the new events as matched
+    /// This prevents re-detection when rules have long lookback windows that
+    /// overlap with previous runs (a rule running every 10s with a 15-minute
+    /// lookback would otherwise re-detect the same events 90 times).
     ///
-    /// Returns only the events that haven't been matched before.
+    /// Input order is preserved (webhook "primary entity" + content-hash
+    /// stability).
     pub(super) async fn filter_already_matched_events(
         &self,
         rule_id: Uuid,
+        kind: MatchedEventKind,
         events: &[serde_json::Value],
     ) -> Result<Vec<serde_json::Value>, DetectionError> {
         if events.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Extract event IDs and timestamps from events
-        let mut event_ids = Vec::new();
-        let mut event_map = std::collections::HashMap::new();
+        let event_ids: Vec<String> = events.iter().map(matched_event_id).collect();
 
-        for event in events {
-            // Try to get a unique ID for this event
-            // Priority: log_id > id > compute hash from event
-            let event_id = if let Some(log_id) = event.get("log_id").and_then(|v| v.as_str()) {
-                log_id.to_string()
-            } else if let Some(id) = event.get("id").and_then(|v| v.as_str()) {
-                id.to_string()
-            } else {
-                // Compute a hash of the event as fallback
-                use sha2::{Digest, Sha256};
-                let event_str = serde_json::to_string(event).unwrap_or_default();
-                let hash = Sha256::digest(event_str.as_bytes());
-                hex::encode(hash)
-            };
-
-            event_ids.push(event_id.clone());
-            event_map.insert(event_id, event.clone());
-        }
-
-        // Query which events have already been matched
         let already_matched: Vec<String> = sqlx::query_scalar(
             r#"
             SELECT event_id
             FROM detection_matched_events
-            WHERE rule_id = $1 AND event_id = ANY($2)
+            WHERE rule_id = $1 AND kind = $2 AND event_id = ANY($3)
             "#,
         )
         .bind(rule_id)
+        .bind(kind.as_str())
         .bind(&event_ids)
         .fetch_all(&self.pg_pool)
         .await
         .unwrap_or_else(|e| {
-            // If query fails (e.g., table doesn't exist yet), log warning and continue
+            // Fail open: if the query fails (e.g. table missing on a partial
+            // upgrade), log and treat nothing as already-matched.
             warn!(
                 "Failed to query detection_matched_events: {}. Deduplication disabled.",
                 e
@@ -101,44 +303,38 @@ impl DetectionService {
             Vec::new()
         });
 
-        // Filter out already-matched events
-        let already_matched_set: std::collections::HashSet<_> =
+        let already_matched_set: std::collections::HashSet<String> =
             already_matched.into_iter().collect();
-        let new_events: Vec<_> = event_map
-            .into_iter()
-            .filter(|(id, _)| !already_matched_set.contains(id))
-            .collect();
 
-        // Record the new events as matched
-        if !new_events.is_empty() {
-            if let Err(e) = self.record_matched_events(rule_id, &new_events).await {
-                // Log error but don't fail the detection
-                warn!(
-                    "Failed to record matched events: {}. Events may be re-detected.",
-                    e
-                );
-            }
-        }
-
-        Ok(new_events.into_iter().map(|(_, event)| event).collect())
+        Ok(events
+            .iter()
+            .zip(event_ids)
+            .filter(|(_, id)| !already_matched_set.contains(id))
+            .map(|(event, _)| event.clone())
+            .collect())
     }
 
-    /// Record events as matched by a rule to prevent re-detection
-    async fn record_matched_events(
+    /// Record events as matched by a rule to prevent re-detection.
+    ///
+    /// Call this **after** the alert/finding for these events is durably created
+    /// (audit D5), in the namespace matching the execution mode (audit D17).
+    /// Idempotent via `ON CONFLICT`.
+    pub(super) async fn record_matched_events(
         &self,
         rule_id: Uuid,
-        events: &[(String, serde_json::Value)],
+        kind: MatchedEventKind,
+        events: &[serde_json::Value],
     ) -> Result<(), DetectionError> {
         if events.is_empty() {
             return Ok(());
         }
 
-        // Build bulk insert query
         let mut query_builder = sqlx::QueryBuilder::new(
-            "INSERT INTO detection_matched_events (rule_id, event_id, event_timestamp) ",
+            "INSERT INTO detection_matched_events (rule_id, kind, event_id, event_timestamp) ",
         );
 
-        query_builder.push_values(events, |mut b, (event_id, event)| {
+        query_builder.push_values(events, |mut b, event| {
+            let event_id = matched_event_id(event);
             // Extract timestamp from event
             let timestamp = event
                 .get("timestamp")
@@ -148,17 +344,18 @@ impl DetectionService {
                 .unwrap_or_else(chrono::Utc::now);
 
             b.push_bind(rule_id)
+                .push_bind(kind.as_str())
                 .push_bind(event_id)
                 .push_bind(timestamp);
         });
 
-        query_builder.push(" ON CONFLICT (rule_id, event_id) DO NOTHING");
+        query_builder.push(" ON CONFLICT (rule_id, kind, event_id) DO NOTHING");
 
         query_builder
             .build()
             .execute(&self.pg_pool)
             .await
-            .map_err(|e| DetectionError::DatabaseError(e))?;
+            .map_err(DetectionError::DatabaseError)?;
 
         Ok(())
     }
@@ -239,76 +436,30 @@ impl DetectionService {
     /// a single batched `SELECT ... = ANY($hashes)` against the dedup store
     /// (NAN-1305). Fails open: on a query error every candidate is treated as new
     /// (emit rather than silently drop).
+    ///
+    /// Thin wrapper over [`retain_unemitted_with_pool`], which the real-time
+    /// SignalProcessor shares (audit D13).
     pub(super) async fn retain_unemitted(
         &self,
         rule_id: Uuid,
         candidates: Vec<ClaimedFinding>,
     ) -> Vec<ClaimedFinding> {
-        if candidates.is_empty() {
-            return candidates;
-        }
-
-        let hashes: Vec<String> = candidates.iter().map(|c| c.finding_hash.clone()).collect();
-        let existing: std::collections::HashSet<String> = match sqlx::query_scalar::<_, String>(
-            r#"
-            SELECT finding_hash
-            FROM detection_finding_emissions
-            WHERE rule_id = $1 AND finding_hash = ANY($2)
-            "#,
-        )
-        .bind(rule_id)
-        .bind(&hashes)
-        .fetch_all(&self.pg_pool)
-        .await
-        {
-            Ok(rows) => rows.into_iter().collect(),
-            Err(e) => {
-                warn!(
-                    "finding-emission dedup read failed for rule {}: {}. Emitting all without dedup.",
-                    rule_id, e
-                );
-                std::collections::HashSet::new()
-            }
-        };
-
-        candidates
-            .into_iter()
-            .filter(|c| !existing.contains(&c.finding_hash))
-            .collect()
+        retain_unemitted_with_pool(&self.pg_pool, rule_id, candidates).await
     }
 
     /// Record `findings` as emitted in the dedup store — a single batched
     /// `INSERT ... ON CONFLICT DO NOTHING` (NAN-1305). Best-effort: a failure is
     /// logged, not propagated (the finding has been / will be emitted regardless;
     /// at worst it can re-emit on a later overlapping run).
+    ///
+    /// Thin wrapper over [`record_finding_emissions_with_pool`], which the
+    /// real-time SignalProcessor shares (audit D13).
     pub(super) async fn record_finding_emissions(
         &self,
         rule_id: Uuid,
         findings: &[ClaimedFinding],
     ) {
-        if findings.is_empty() {
-            return;
-        }
-
-        let mut qb = sqlx::QueryBuilder::new(
-            "INSERT INTO detection_finding_emissions (rule_id, entity, finding_hash, window_end) ",
-        );
-        qb.push_values(findings, |mut b, f| {
-            b.push_bind(rule_id)
-                .push_bind(&f.entity)
-                .push_bind(&f.finding_hash)
-                .push_bind(f.window_end);
-        });
-        qb.push(" ON CONFLICT (rule_id, finding_hash) DO NOTHING");
-
-        if let Err(e) = qb.build().execute(&self.pg_pool).await {
-            warn!(
-                "Failed to record {} finding emissions for rule {}: {}. They may re-emit on a later overlapping run.",
-                findings.len(),
-                rule_id,
-                e
-            );
-        }
+        record_finding_emissions_with_pool(&self.pg_pool, rule_id, findings).await
     }
 
     /// Derive the stable cross-execution identity of a finding:
@@ -408,7 +559,7 @@ impl DetectionService {
     /// Parse a ClickHouse / ISO-8601 timestamp string from an event field into
     /// a UTC instant. Handles CH's offset-less `YYYY-MM-DD HH:MM:SS[.fff]`
     /// (assumed UTC) and RFC 3339.
-    fn event_field_time(event: &serde_json::Value, key: &str) -> Option<DateTime<Utc>> {
+    pub(super) fn event_field_time(event: &serde_json::Value, key: &str) -> Option<DateTime<Utc>> {
         let s = event.get(key)?.as_str()?;
         if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
             return Some(DateTime::from_naive_utc_and_offset(naive, Utc));
@@ -476,9 +627,24 @@ impl DetectionService {
                         }
                     }
 
-                    // If no entities found, add to "unknown" group
+                    // If no entities found, fall back to the row's time bucket
+                    // when it has one (NAN-1711 / audit D15), else "unknown".
+                    //
+                    // Aggregate rows from an un-split `| timechart` (or
+                    // `stats … by time_bucket`) carry NO entity fields. Lumping
+                    // them all into one "unknown" group made the group's finding
+                    // identity (max `_last_seen` across rows) depend on WHICH
+                    // rows survived the already-matched pre-filter that cycle —
+                    // a changed old bucket shrank the group to just itself, the
+                    // group max regressed, and the finding re-keyed → re-emit.
+                    // Keying each bucket as its own finding entity gives every
+                    // row a self-contained identity (`bucket + its own
+                    // _last_seen`) that no other row's fate can perturb.
                     if !found_any {
-                        let key = ("unknown".to_string(), "unknown".to_string());
+                        let key = match Self::get_string_field_from_event(event, "time_bucket") {
+                            Some(bucket) => (bucket, "time_bucket".to_string()),
+                            None => ("unknown".to_string(), "unknown".to_string()),
+                        };
                         grouped.entry(key).or_default().push(event.clone());
                     }
                 }
@@ -729,6 +895,96 @@ mod finding_dedup_tests {
         assert_ne!(a, b);
     }
 
+    /// NAN-1711 / audit D15: a `| top`-shaped row (field value + count + percent
+    /// + injected bounds) must key on `entity + _last_seen` ONLY — drifting
+    /// count/percent and a creeping `_first_seen` (sliding-lookback trailing
+    /// edge) must NOT re-key. Pre-fix these rows carried no bounds at all and
+    /// fell to the content hash, re-emitting every cycle.
+    #[test]
+    fn top_shaped_rows_key_on_last_seen_despite_count_percent_drift() {
+        let cycle_1 = vec![json!({
+            "src_ip": "10.1.1.10",
+            "count": 42,
+            "percent": 61.5,
+            "_first_seen": "2026-06-07 10:00:00.000",
+            "_last_seen": "2026-06-07 11:00:00.000",
+        })];
+        let cycle_2 = vec![json!({
+            "src_ip": "10.1.1.10",
+            "count": 17,          // old events aged out of the window
+            "percent": 23.9,      // mix shifted
+            "_first_seen": "2026-06-07 10:25:00.000", // trailing edge crept up
+            "_last_seen": "2026-06-07 11:00:00.000",  // newest activity unchanged
+        })];
+
+        let (h1, _) = DetectionService::finding_dedup_identity(
+            "alert", rule_id(), "src_ip", "10.1.1.10", &cycle_1,
+        );
+        let (h2, _) = DetectionService::finding_dedup_identity(
+            "alert", rule_id(), "src_ip", "10.1.1.10", &cycle_2,
+        );
+        assert_eq!(h1, h2, "count/percent/_first_seen drift must not re-key top rows");
+    }
+
+    /// NAN-1711 / audit D15: a `| timechart`-shaped row — the dedup "entity"
+    /// for an un-split timechart is the row's OWN time bucket (the
+    /// `group_events_by_entity` fallback), so its identity is `bucket + its
+    /// own _last_seen`, self-contained regardless of which other bucket rows
+    /// survive the already-matched pre-filter that cycle. Intra-bucket count
+    /// drift must not re-key; a later `_last_seen` within the bucket (new
+    /// newest activity) re-emits.
+    #[test]
+    fn timechart_bucket_rows_key_on_their_own_last_seen() {
+        let bucket = "2026-06-07T10:00:00Z";
+        let cycle_1 = vec![json!({
+            "time_bucket": bucket,
+            "count": 30,
+            "_first_seen": "2026-06-07 10:01:00.000",
+            "_last_seen": "2026-06-07 10:04:00.000",
+        })];
+        // Late-arriving event OLDER than the bucket's newest: count drifts,
+        // _last_seen unchanged.
+        let cycle_2 = vec![json!({
+            "time_bucket": bucket,
+            "count": 31,
+            "_first_seen": "2026-06-07 10:00:30.000",
+            "_last_seen": "2026-06-07 10:04:00.000",
+        })];
+        // Genuinely newer activity inside the bucket → later _last_seen.
+        let cycle_3 = vec![json!({
+            "time_bucket": bucket,
+            "count": 32,
+            "_first_seen": "2026-06-07 10:00:30.000",
+            "_last_seen": "2026-06-07 10:04:45.000",
+        })];
+
+        let ident = |events: &Vec<serde_json::Value>| {
+            DetectionService::finding_dedup_identity(
+                "alert", rule_id(), "time_bucket", bucket, events,
+            )
+        };
+        let (h1, end1) = ident(&cycle_1);
+        let (h2, _) = ident(&cycle_2);
+        let (h3, end3) = ident(&cycle_3);
+
+        assert_eq!(h1, h2, "intra-bucket count drift must not re-key");
+        assert_eq!(end1.to_rfc3339(), "2026-06-07T10:04:00+00:00");
+        assert_ne!(h1, h3, "a later _last_seen in the bucket must re-emit");
+        assert_eq!(end3.to_rfc3339(), "2026-06-07T10:04:45+00:00");
+
+        // Distinct buckets are distinct entities.
+        let other = vec![json!({
+            "time_bucket": "2026-06-07T11:00:00Z",
+            "count": 30,
+            "_first_seen": "2026-06-07 11:01:00.000",
+            "_last_seen": "2026-06-07 10:04:00.000",
+        })];
+        let (h4, _) = DetectionService::finding_dedup_identity(
+            "alert", rule_id(), "time_bucket", "2026-06-07T11:00:00Z", &other,
+        );
+        assert_ne!(h1, h4, "distinct buckets must not collide");
+    }
+
     /// Raw (non-aggregate) groups dedup by event *content*: the same entity with
     /// different matched events re-emits, while an identical re-match collides.
     /// (Aggregate rows dedup by window instead — see the window tests above.)
@@ -881,6 +1137,116 @@ mod finding_dedup_tests {
         );
     }
 
+    // ------------------------------------------------------------------------
+    // Real-time window-bucket dedup identity (audit D13)
+    // ------------------------------------------------------------------------
+
+    /// D13 core: signals for the same (rule, entity) inside one 60s bucket must
+    /// collide (one alert per entity per window), while a signal in a later
+    /// bucket re-keys and re-emits.
+    #[test]
+    fn realtime_same_bucket_collides_later_bucket_re_emits() {
+        use chrono::TimeZone;
+        let t0 = chrono::Utc.with_ymd_and_hms(2026, 7, 6, 10, 0, 3).unwrap();
+        let t1 = chrono::Utc.with_ymd_and_hms(2026, 7, 6, 10, 0, 58).unwrap(); // same minute
+        let t2 = chrono::Utc.with_ymd_and_hms(2026, 7, 6, 10, 1, 1).unwrap(); // next minute
+
+        let c0 = realtime_finding_candidate("alert", rule_id(), "src_ip", "10.0.0.9", t0, vec![]);
+        let c1 = realtime_finding_candidate("alert", rule_id(), "src_ip", "10.0.0.9", t1, vec![]);
+        let c2 = realtime_finding_candidate("alert", rule_id(), "src_ip", "10.0.0.9", t2, vec![]);
+
+        assert_eq!(
+            c0.finding_hash, c1.finding_hash,
+            "same entity + same bucket must collide"
+        );
+        assert_ne!(
+            c0.finding_hash, c2.finding_hash,
+            "a later bucket is new activity and must re-emit"
+        );
+        // window_end is the bucket start (the identity's activity window).
+        assert_eq!(c0.window_end.to_rfc3339(), "2026-07-06T10:00:00+00:00");
+        assert_eq!(c2.window_end.to_rfc3339(), "2026-07-06T10:01:00+00:00");
+    }
+
+    /// Distinct entities and distinct rules in the same bucket must not collide.
+    #[test]
+    fn realtime_bucket_distinct_entities_and_rules() {
+        use chrono::TimeZone;
+        let ts = chrono::Utc.with_ymd_and_hms(2026, 7, 6, 10, 0, 30).unwrap();
+        let other_rule = Uuid::parse_str("00000000-0000-0000-0000-0000000000bb").unwrap();
+
+        let a = realtime_finding_candidate("alert", rule_id(), "src_ip", "10.0.0.9", ts, vec![]);
+        let b = realtime_finding_candidate("alert", rule_id(), "src_ip", "10.0.0.10", ts, vec![]);
+        let c = realtime_finding_candidate("alert", other_rule, "src_ip", "10.0.0.9", ts, vec![]);
+
+        assert_ne!(a.finding_hash, b.finding_hash, "entities must not collide");
+        assert_ne!(a.finding_hash, c.finding_hash, "rules must not collide");
+    }
+
+    /// Live bake-in and Alerting emissions must be namespaced apart (audit D17
+    /// parity): a live emission over a bucket must not suppress the first real
+    /// alert after promotion to Alerting.
+    #[test]
+    fn realtime_bucket_kind_namespaced() {
+        use chrono::TimeZone;
+        let ts = chrono::Utc.with_ymd_and_hms(2026, 7, 6, 10, 0, 30).unwrap();
+        let live = realtime_finding_candidate("live", rule_id(), "src_ip", "10.0.0.9", ts, vec![]);
+        let alert =
+            realtime_finding_candidate("alert", rule_id(), "src_ip", "10.0.0.9", ts, vec![]);
+        assert_ne!(live.finding_hash, alert.finding_hash);
+    }
+
+    /// The bucket floors to the containing minute, epoch-aligned.
+    #[test]
+    fn realtime_window_bucket_floors_to_minute() {
+        use chrono::TimeZone;
+        let base = chrono::Utc.with_ymd_and_hms(2026, 7, 6, 10, 0, 0).unwrap();
+        for secs in [0, 1, 30, 59] {
+            assert_eq!(
+                realtime_window_bucket(base + chrono::Duration::seconds(secs)),
+                base,
+                "second {secs} must floor to the minute start"
+            );
+        }
+        assert_eq!(
+            realtime_window_bucket(base + chrono::Duration::seconds(60)),
+            base + chrono::Duration::seconds(60)
+        );
+        // Sub-second precision floors too.
+        assert_eq!(
+            realtime_window_bucket(base + chrono::Duration::milliseconds(59_999)),
+            base
+        );
+    }
+
+    /// The real-time identity is DERIVED FROM (not a fork of) the scheduled
+    /// path's `finding_dedup_identity`: it must be byte-identical to hashing an
+    /// aggregate whose `_last_seen` is the bucket start. This pins the shared
+    /// derivation so the two paths can never silently diverge.
+    #[test]
+    fn realtime_identity_matches_scheduled_aggregate_derivation() {
+        use chrono::TimeZone;
+        let ts = chrono::Utc.with_ymd_and_hms(2026, 7, 6, 10, 0, 45).unwrap();
+        let bucket = realtime_window_bucket(ts);
+
+        let candidate =
+            realtime_finding_candidate("alert", rule_id(), "src_ip", "10.0.0.9", ts, vec![]);
+        let scheduled_events = vec![json!({
+            "_first_seen": bucket.to_rfc3339(),
+            "_last_seen": bucket.to_rfc3339(),
+        })];
+        let (scheduled_hash, scheduled_end) = DetectionService::finding_dedup_identity(
+            "alert",
+            rule_id(),
+            "src_ip",
+            "10.0.0.9",
+            &scheduled_events,
+        );
+
+        assert_eq!(candidate.finding_hash, scheduled_hash);
+        assert_eq!(candidate.window_end, scheduled_end);
+    }
+
     /// But genuinely new activity — a later `_last_seen` — must still re-emit.
     #[test]
     fn advancing_last_seen_re_emits() {
@@ -901,5 +1267,53 @@ mod finding_dedup_tests {
             "alert", rule_id(), "src_endpoint.ip", "10.1.1.234", &later,
         );
         assert_ne!(h1, h2, "a later last_seen is new activity and must re-emit");
+    }
+}
+
+#[cfg(test)]
+mod matched_events_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn kind_namespaces_live_and_alert() {
+        // Audit D17: Live bake-in and Alerting must record/filter under distinct
+        // namespaces so bake-in records don't suppress the first real alert.
+        assert_eq!(MatchedEventKind::for_mode(RuleMode::Alerting), MatchedEventKind::Alert);
+        assert_eq!(MatchedEventKind::for_mode(RuleMode::Live), MatchedEventKind::Live);
+        // Staging/Paused never reach execution; treated as bake-in if they did.
+        assert_eq!(MatchedEventKind::for_mode(RuleMode::Staging), MatchedEventKind::Live);
+        assert_eq!(MatchedEventKind::for_mode(RuleMode::Paused), MatchedEventKind::Live);
+        assert_eq!(MatchedEventKind::Live.as_str(), "live");
+        assert_eq!(MatchedEventKind::Alert.as_str(), "alert");
+    }
+
+    #[test]
+    fn matched_event_id_prefers_log_id_then_id_then_hash() {
+        assert_eq!(
+            matched_event_id(&json!({"log_id": "L1", "id": "I1", "x": 1})),
+            "L1"
+        );
+        assert_eq!(matched_event_id(&json!({"id": "I1", "x": 1})), "I1");
+        // No log_id/id → stable SHA-256 of the canonical JSON.
+        let h1 = matched_event_id(&json!({"x": 1, "y": 2}));
+        let h2 = matched_event_id(&json!({"x": 1, "y": 2}));
+        assert_eq!(h1, h2, "hash must be stable for identical content");
+        assert_eq!(h1.len(), 64, "sha256 hex is 64 chars");
+        assert_ne!(h1, matched_event_id(&json!({"x": 1, "y": 3})));
+    }
+
+    #[test]
+    fn matched_event_id_ignores_injected_nano_fields() {
+        // Codex/D5: filter runs on the raw event, record runs AFTER
+        // inject_detected_at adds `_nano_detected_at`. The fallback id must be
+        // identical either way, or the event re-alerts forever.
+        let raw = json!({"src_ip": "10.0.0.1", "action": "login"});
+        let mut injected = raw.clone();
+        injected
+            .as_object_mut()
+            .unwrap()
+            .insert("_nano_detected_at".to_string(), json!("2026-07-05T12:00:00Z"));
+        assert_eq!(matched_event_id(&raw), matched_event_id(&injected));
     }
 }

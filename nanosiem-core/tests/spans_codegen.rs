@@ -220,3 +220,51 @@ fn logs_dataset_is_byte_identical_default() {
     let svc = logs_sql(r#"service_name="x""#);
     assert!(svc.contains("cloud_service"), "logs keeps the UDM service_name alias: {svc}");
 }
+
+// --- O45 (NAN-1733): the audit-view gate is a logs-only concern -------------
+
+/// Reproduce the real search path: `enforce_non_audit_query` wraps the query as
+/// `(…) AND source_type != "audit"` for users lacking `audit:view`, then the
+/// generator runs over `dataset`.
+fn audit_gated_sql(q: &str, dataset: Dataset) -> String {
+    let enforced = nanosiem_core::search::query_processing::enforce_non_audit_query(q)
+        .unwrap_or_else(|e| panic!("enforce {q}: {e}"));
+    ClickHouseSqlGenerator::new()
+        .with_dataset(dataset)
+        .generate(
+            &parse_query(&enforced).unwrap_or_else(|e| panic!("parse {enforced}: {e}")),
+            &tr(),
+        )
+        .unwrap_or_else(|e| panic!("generate {enforced}: {e}"))
+}
+
+#[test]
+fn spans_drop_the_logs_audit_exclusion() {
+    // On spans there is no `source_type` column — the gate would resolve to a
+    // per-row attributes-Map lookup that hides any span a tenant tagged
+    // `source_type=audit`. It must not survive into the generated SQL.
+    for q in ["error", "* | stats count by span_kind"] {
+        let sql = audit_gated_sql(q, Dataset::Spans);
+        assert!(
+            !sql.contains("!= 'audit'"),
+            "spans must not carry the audit gate for `{q}`: {sql}"
+        );
+        assert!(
+            !sql.contains("'audit'"),
+            "spans must not reference the audit source_type for `{q}`: {sql}"
+        );
+    }
+}
+
+#[test]
+fn logs_keep_the_audit_exclusion() {
+    // The same gate MUST remain on the logs dataset — audit rows live only in the
+    // `logs` table, and non-`audit:view` users must not see them.
+    for q in ["error", "* | stats count by src_ip"] {
+        let sql = audit_gated_sql(q, Dataset::Logs);
+        assert!(
+            sql.contains("!= 'audit'"),
+            "logs must keep the audit gate for `{q}`: {sql}"
+        );
+    }
+}

@@ -13,7 +13,7 @@ use clickhouse::Client as ClickHouseClient;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 use super::repository::{DictArtifactKind, PrevalenceRepository};
 use super::types::*;
@@ -24,6 +24,15 @@ const DEFAULT_CACHE_SIZE: usize = 10_000;
 
 /// Maximum artifacts per bulk query
 pub const MAX_BULK_ARTIFACTS: usize = 100;
+
+/// Backend for the bounded bulk prevalence lookups (NAN-1705, D4b): the CACHE
+/// dicts (fast, but negative-cache brand-new artifacts for their LIFETIME) or
+/// the real-time `*_prevalence_summary` tables the dicts source from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BulkPrevalenceSource {
+    Dict,
+    Summary,
+}
 
 /// Cache entry with TTL
 #[derive(Debug, Clone)]
@@ -527,6 +536,38 @@ impl PrevalenceService {
         artifacts: &[String],
         time_window: TimeWindow,
     ) -> Result<Vec<PrevalenceData>, PrevalenceError> {
+        self.get_bulk_prevalence_bounded(artifacts, time_window, BulkPrevalenceSource::Dict)
+            .await
+    }
+
+    /// NAN-1705 (D4b): bulk prevalence lookup straight from the real-time
+    /// `*_prevalence_summary` tables — the dicts' own source data, bypassing the
+    /// CACHE dicts' negative caching. Used by the in-memory prevalence filter to
+    /// rescue dict-missed artifacts (a brand-new artifact is negative-cached for
+    /// the dict LIFETIME — 15–30 min — while the summary already carries it at
+    /// its real host_count). Same contract as the dict source: common
+    /// (`host_count >= 1000`) and out-of-window entities return no row.
+    ///
+    /// Same result shape and cache behavior as [`Self::get_bulk_prevalence_via_dict`].
+    #[instrument(skip(self, artifacts))]
+    pub async fn get_bulk_summary_prevalence(
+        &self,
+        artifacts: &[String],
+        time_window: TimeWindow,
+    ) -> Result<Vec<PrevalenceData>, PrevalenceError> {
+        self.get_bulk_prevalence_bounded(artifacts, time_window, BulkPrevalenceSource::Summary)
+            .await
+    }
+
+    /// Shared body for the two bounded bulk lookups above — identical cache
+    /// handling, kind detection, tracking gates, and result shaping; only the
+    /// repository call differs (dict vs summary).
+    async fn get_bulk_prevalence_bounded(
+        &self,
+        artifacts: &[String],
+        time_window: TimeWindow,
+        source: BulkPrevalenceSource,
+    ) -> Result<Vec<PrevalenceData>, PrevalenceError> {
         if artifacts.is_empty() {
             return Ok(Vec::new());
         }
@@ -574,10 +615,23 @@ impl PrevalenceService {
             artifact: row.artifact,
         };
 
+        let fetch = |kind_artifacts: Vec<String>, kind: DictArtifactKind| async move {
+            match source {
+                BulkPrevalenceSource::Dict => {
+                    self.repository
+                        .get_bulk_prevalence_via_dict(&kind_artifacts, kind, time_window)
+                        .await
+                }
+                BulkPrevalenceSource::Summary => {
+                    self.repository
+                        .get_bulk_summary_prevalence(&kind_artifacts, kind, time_window)
+                        .await
+                }
+            }
+        };
+
         if config.enable_hash_tracking && !hashes.is_empty() {
-            let rows = self
-                .repository
-                .get_bulk_prevalence_via_dict(&hashes, DictArtifactKind::Hash, time_window)
+            let rows = fetch(hashes, DictArtifactKind::Hash)
                 .await
                 .map_err(PrevalenceError::ClickHouse)?;
             for row in rows {
@@ -586,9 +640,7 @@ impl PrevalenceService {
         }
 
         if config.enable_domain_tracking && !domains.is_empty() {
-            let rows = self
-                .repository
-                .get_bulk_prevalence_via_dict(&domains, DictArtifactKind::Domain, time_window)
+            let rows = fetch(domains, DictArtifactKind::Domain)
                 .await
                 .map_err(PrevalenceError::ClickHouse)?;
             for row in rows {
@@ -597,9 +649,7 @@ impl PrevalenceService {
         }
 
         if config.enable_ip_tracking && !ips.is_empty() {
-            let rows = self
-                .repository
-                .get_bulk_prevalence_via_dict(&ips, DictArtifactKind::Ip, time_window)
+            let rows = fetch(ips, DictArtifactKind::Ip)
                 .await
                 .map_err(PrevalenceError::ClickHouse)?;
             for row in rows {
@@ -617,6 +667,20 @@ impl PrevalenceService {
 
         Ok(results)
     }
+
+    /// The widest window an IP rarity/newness lookup can run without exhausting
+    /// shared-ClickHouse memory (NAN-1729, P2-B): the `uniqMerge` GROUP BY
+    /// aggregates every in-window IP entity, so 24h is fine, 7d is ~47 s / 2 GiB,
+    /// and 30d OOMs on Saturn. Lifts once the pre-finalized IP table (shared with
+    /// P2-D) removes the per-request aggregation.
+    const IP_RARITY_MAX_WINDOW_HOURS: i64 = 7 * 24;
+
+    /// Actionable message returned (as HTTP 400) when an explicit IP lookup
+    /// exceeds `IP_RARITY_MAX_WINDOW_HOURS`.
+    const IP_RARITY_WINDOW_MSG: &'static str =
+        "Rare/new IP lookups are limited to a 7-day window for now — a wider window \
+         aggregates every observed IP and exhausts memory. Use 24h or 7d, or filter \
+         to hashes or domains.";
 
     /// Get list of rare artifacts (below threshold)
     #[instrument(skip(self))]
@@ -667,17 +731,33 @@ impl PrevalenceService {
         // Get rare IPs if requested or no filter
         let include_ips = artifact_type.map_or(true, |t| t.is_ip());
         if include_ips && config.enable_ip_tracking {
-            let ip_rows = self
-                .repository
-                .get_rare_ips(rarity_threshold, time_window, limit)
-                .await
-                .map_err(PrevalenceError::ClickHouse)?;
+            // NAN-1729 (P2-B): gate the IP aggregation to a viable window. Explicit
+            // `type=ip` past the bound → actionable 400 (WindowNotViable) instead of
+            // a shared-CH OOM / 300s slog; the all-types view degrades to
+            // hash/domain (the IP path is the only non-viable one).
+            if time_window.hours() <= Self::IP_RARITY_MAX_WINDOW_HOURS {
+                let ip_rows = self
+                    .repository
+                    .get_rare_ips(rarity_threshold, time_window, limit)
+                    .await
+                    .map_err(PrevalenceError::ClickHouse)?;
 
-            for row in ip_rows {
-                results.push(PrevalenceRepository::ip_row_to_prevalence_data(
-                    row,
-                    rarity_threshold,
+                for row in ip_rows {
+                    results.push(PrevalenceRepository::ip_row_to_prevalence_data(
+                        row,
+                        rarity_threshold,
+                    ));
+                }
+            } else if artifact_type.is_some() {
+                return Err(PrevalenceError::WindowNotViable(
+                    Self::IP_RARITY_WINDOW_MSG.to_string(),
                 ));
+            } else {
+                warn!(
+                    window_hours = time_window.hours(),
+                    "prevalence rare: skipping IP path for non-viable window \
+                     (all-types view degraded to hash/domain)"
+                );
             }
         }
 
@@ -737,17 +817,34 @@ impl PrevalenceService {
         // Get new IPs if requested or no filter
         let include_ips = artifact_type.map_or(true, |t| t.is_ip());
         if include_ips && config.enable_ip_tracking {
-            let ip_rows = self
-                .repository
-                .get_new_ips(since, limit)
-                .await
-                .map_err(PrevalenceError::ClickHouse)?;
+            // NAN-1729 (P2-B): `since` is a free-form timestamp, so derive the
+            // window age and gate the IP aggregation the same way as the rare path.
+            // A small margin keeps an exact 7-day request (whose `since` is ~168h
+            // old by eval time) on the viable side.
+            let window_hours = (Utc::now() - since).num_hours();
+            if window_hours <= Self::IP_RARITY_MAX_WINDOW_HOURS + 6 {
+                let ip_rows = self
+                    .repository
+                    .get_new_ips(since, limit)
+                    .await
+                    .map_err(PrevalenceError::ClickHouse)?;
 
-            for row in ip_rows {
-                results.push(PrevalenceRepository::ip_row_to_prevalence_data(
-                    row,
-                    rarity_threshold,
+                for row in ip_rows {
+                    results.push(PrevalenceRepository::ip_row_to_prevalence_data(
+                        row,
+                        rarity_threshold,
+                    ));
+                }
+            } else if artifact_type.is_some() {
+                return Err(PrevalenceError::WindowNotViable(
+                    Self::IP_RARITY_WINDOW_MSG.to_string(),
                 ));
+            } else {
+                warn!(
+                    window_hours,
+                    "prevalence new: skipping IP path for non-viable window \
+                     (all-types view degraded to hash/domain)"
+                );
             }
         }
 
@@ -1303,6 +1400,14 @@ pub enum PrevalenceError {
 
     #[error("Configuration error: {0}")]
     Config(String),
+
+    /// NAN-1729 (P2-B): the requested window is too wide for an IP rarity/newness
+    /// lookup to run without exhausting shared-ClickHouse memory (the `uniqMerge`
+    /// GROUP BY aggregates every in-window IP; Saturn-measured OOM at 30d). Surfaced
+    /// as a 400 so the caller narrows the window rather than hitting a shared-CH
+    /// OOM / multi-minute timeout. Lifts once the pre-finalized IP table lands.
+    #[error("{0}")]
+    WindowNotViable(String),
 }
 
 #[cfg(test)]

@@ -33,6 +33,7 @@ pub mod crypto;
 pub mod db;
 pub mod demo;
 pub mod detection;
+pub mod detection_code_target;
 pub mod enrichment;
 pub mod entity_extraction;
 pub mod extensions;
@@ -187,7 +188,7 @@ pub use db::{
 pub use detection::{
     calculate_next_run_with_jitter, generate_node_id, DailyMatchCount, DetectionError,
     DetectionService, DistributedDetectionScheduler, DistributedSchedulerConfig,
-    HistoricalAnalysisResult, MaterializedViewError, MaterializedViewGenerator, RealtimeEvaluator,
+    HistoricalAnalysisResult, MaterializedViewError, MaterializedViewGenerator,
     RiskError, RiskModifier, RiskResult, ScoreCalculator, SignalProcessor, SignalProcessorConfig,
     TimeBucket,
 };

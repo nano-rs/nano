@@ -28,6 +28,13 @@ use crate::{SearchState, error::SearchError, metrics::record_search_query};
 // Trace by id (ordered spans for the waterfall)
 // ============================================================================
 
+/// Hard cap on the number of spans returned for a single trace (O41 / NAN-1721).
+/// The trace SQL fetches `TRACE_SPAN_CAP + 1` rows so this handler can detect
+/// overflow: when the extra row is present the trace is larger than we serve, so
+/// the response is trimmed to the cap and [`TraceResponse::truncated`] is set —
+/// the UI shows a partial-waterfall indicator instead of silently dropping spans.
+const TRACE_SPAN_CAP: usize = 100_000;
+
 /// Response for a single trace: every span, ordered by `start_time` so the
 /// caller can build the waterfall directly. Spans are returned as raw JSON
 /// objects (the full `otel_spans` column set incl. the `attributes` /
@@ -38,8 +45,12 @@ pub struct TraceResponse {
     pub trace_id: String,
     /// Ordered spans (`start_time ASC`). Empty when the trace id is unknown.
     pub spans: Vec<serde_json::Value>,
-    /// Number of spans returned.
+    /// Number of spans returned (after any trim to [`TRACE_SPAN_CAP`]).
     pub span_count: usize,
+    /// True when the trace exceeded [`TRACE_SPAN_CAP`] spans and `spans` was
+    /// trimmed to the cap (O41). The waterfall is partial; the UI should
+    /// surface a "trace truncated" state.
+    pub truncated: bool,
 }
 
 /// Fetch a distributed trace by id.
@@ -91,22 +102,37 @@ pub async fn get_trace(
     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
     record_search_query("otel_trace", duration_ms, result.is_ok());
 
-    let spans = result.map_err(|e| {
+    let mut spans = result.map_err(|e| {
         tracing::error!(error = %e, "OTEL trace fetch failed");
         SearchError::QueryError("Failed to fetch trace".to_string())
     })?;
 
+    // O41: the SQL fetches TRACE_SPAN_CAP + 1 rows. If the extra row came back
+    // the trace is larger than we return — trim to the cap and flag it so the
+    // waterfall renders a "truncated" state rather than silently losing spans.
+    let truncated = spans.len() > TRACE_SPAN_CAP;
+    if truncated {
+        spans.truncate(TRACE_SPAN_CAP);
+    }
+
     let response = TraceResponse {
         trace_id: trace_id.to_ascii_lowercase(),
         span_count: spans.len(),
+        truncated,
         spans,
     };
-    if let Some(cache) = state.result_cache.as_ref() {
-        let cache = cache.clone();
-        let resp = response.clone();
-        tokio::spawn(async move {
-            cache.set_cached(&cache_key, &resp).await;
-        });
+    // O42: never cache an empty span list. A trace opened mid-ingest (or an
+    // unknown id) returns zero spans; caching that for the full TTL would serve
+    // every later viewer a stale "empty trace". Trace analog of NAN-1027's
+    // "0 hits" no-cache rule. Non-empty traces (incl. truncated) still cache.
+    if !response.spans.is_empty() {
+        if let Some(cache) = state.result_cache.as_ref() {
+            let cache = cache.clone();
+            let resp = response.clone();
+            tokio::spawn(async move {
+                cache.set_cached(&cache_key, &resp).await;
+            });
+        }
     }
 
     Ok((crate::cache::cache_status_headers(false, None), Json(response)))
@@ -543,8 +569,10 @@ pub async fn list_traces(
     let start = Instant::now();
 
     // Resolve the time window: explicit start/end win; otherwise look back
-    // `window_hours` from now (clamped to a sane 1..=720h / 30d range).
-    let now = chrono::Utc::now();
+    // `window_hours` from now (clamped to a sane 1..=720h / 30d range). O43: the
+    // `now` fallback is floored to the quantization grid so default-window loads
+    // share a cache key instead of each minting a microsecond-unique window.
+    let now = floor_to_window_grid(chrono::Utc::now());
     let window_hours = params.window_hours.clamp(1, 720);
     let end = params.end.unwrap_or(now);
     let begin = params
@@ -720,16 +748,37 @@ fn default_services_window_hours() -> i64 {
     1
 }
 
+/// Quantization grid (seconds) for the `now`-derived default window (O43). The
+/// observability tabs default to a `now`-anchored lookback; unquantized, every
+/// load minted a microsecond-unique window → a distinct cache key each time →
+/// near-zero hit rate plus a dead 300s cache write. Flooring the `now` fallback
+/// to this grid lets concurrent / rapid-refresh default-window loads share a
+/// key. Explicit `start`/`end` are left exact.
+const WINDOW_QUANTIZE_SECS: i64 = 30;
+
+/// Floor `dt` to the [`WINDOW_QUANTIZE_SECS`] grid (UTC epoch-aligned). Applied
+/// only to the `now` fallback so `now`-derived default windows are cache-key
+/// stable across the quantum; the result is also what the query runs against, so
+/// keying and querying stay consistent.
+fn floor_to_window_grid(dt: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    let secs = dt.timestamp();
+    let floored = secs - secs.rem_euclid(WINDOW_QUANTIZE_SECS);
+    chrono::DateTime::from_timestamp(floored, 0).unwrap_or(dt)
+}
+
 /// Resolve an explicit `start`/`end` window, falling back to `now -
 /// window_hours .. now` when `start` is omitted. Clamps `window_hours` to
 /// `1..=720` (30 days) and validates `start < end`. Shared by the services
 /// overview + detail handlers.
+///
+/// O43: the `now` fallback is floored to [`WINDOW_QUANTIZE_SECS`] so default
+/// (unspecified-`end`) windows are cache-key stable; explicit `end` stays exact.
 fn resolve_window(
     start: Option<chrono::DateTime<chrono::Utc>>,
     end: Option<chrono::DateTime<chrono::Utc>>,
     window_hours: i64,
 ) -> Result<TimeRange, SearchError> {
-    let now = chrono::Utc::now();
+    let now = floor_to_window_grid(chrono::Utc::now());
     let window_hours = window_hours.clamp(1, 720);
     let end = end.unwrap_or(now);
     let begin = start.unwrap_or_else(|| end - chrono::Duration::hours(window_hours));

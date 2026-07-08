@@ -8,49 +8,45 @@ use uuid::Uuid;
 use super::types::{DailyStat, DetectionRuleRepository, DetectionRuleRepositoryError};
 
 impl DetectionRuleRepository {
-    /// Update last run timestamp and match count
-    /// Also updates last_match_at if there were matches
+    /// Increment `match_count` (and `last_match_at` when there were matches).
+    ///
+    /// Does **not** touch `last_run_at` — that column is owned solely by
+    /// `release_claim`, which advances it to the executed window end on success
+    /// only (audit D1+D2, NAN-1703). This function runs mid-execution, *before*
+    /// alert creation; writing `last_run_at` here re-opened the window-drop bug
+    /// whenever the alert path failed afterward.
     pub async fn update_execution_stats(
         &self,
         id: Uuid,
         matches: i64,
     ) -> Result<(), DetectionRuleRepositoryError> {
-        if matches > 0 {
-            // Update both last_run_at and last_match_at when there are matches
-            sqlx::query(
-                r#"
-                UPDATE detection_rules SET
-                    last_run_at = NOW(),
-                    last_match_at = NOW(),
-                    match_count = match_count + $2
-                WHERE id = $1
-                "#,
-            )
-            .bind(id)
-            .bind(matches)
-            .execute(&self.pool)
-            .await?;
-        } else {
-            // Only update last_run_at when there are no matches
-            sqlx::query(
-                r#"
-                UPDATE detection_rules SET
-                    last_run_at = NOW(),
-                    match_count = match_count + $2
-                WHERE id = $1
-                "#,
-            )
-            .bind(id)
-            .bind(matches)
-            .execute(&self.pool)
-            .await?;
+        // No matches → nothing to record here: match_count wouldn't change and
+        // last_run_at is owned by release_claim (audit D1). Skip the no-op write.
+        if matches <= 0 {
+            return Ok(());
         }
+
+        sqlx::query(
+            r#"
+            UPDATE detection_rules SET
+                last_match_at = NOW(),
+                match_count = match_count + $2
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .bind(matches)
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
 
-    /// Update live match count (for bake-in mode)
-    /// Also updates last_match_at if there were matches.
+    /// Update live match count (for bake-in mode).
+    /// Also updates `last_match_at` if there were matches.
+    ///
+    /// Like `update_execution_stats`, this does **not** touch `last_run_at`
+    /// (owned by `release_claim`; audit D1+D2, NAN-1703).
     ///
     /// NAN-869: `match_count` is the true lifetime counter (always incremented
     /// in both modes); `live_match_count` is the current bake-in phase counter
@@ -62,38 +58,25 @@ impl DetectionRuleRepository {
         id: Uuid,
         matches: i64,
     ) -> Result<(), DetectionRuleRepositoryError> {
-        if matches > 0 {
-            // Update both last_run_at and last_match_at when there are matches
-            sqlx::query(
-                r#"
-                UPDATE detection_rules SET
-                    last_run_at = NOW(),
-                    last_match_at = NOW(),
-                    live_match_count = live_match_count + $2,
-                    match_count = match_count + $2
-                WHERE id = $1
-                "#,
-            )
-            .bind(id)
-            .bind(matches)
-            .execute(&self.pool)
-            .await?;
-        } else {
-            // Only update last_run_at when there are no matches
-            sqlx::query(
-                r#"
-                UPDATE detection_rules SET
-                    last_run_at = NOW(),
-                    live_match_count = live_match_count + $2,
-                    match_count = match_count + $2
-                WHERE id = $1
-                "#,
-            )
-            .bind(id)
-            .bind(matches)
-            .execute(&self.pool)
-            .await?;
+        // No matches → nothing to record (counters unchanged; last_run_at owned
+        // by release_claim, audit D1). Skip the no-op write.
+        if matches <= 0 {
+            return Ok(());
         }
+
+        sqlx::query(
+            r#"
+            UPDATE detection_rules SET
+                last_match_at = NOW(),
+                live_match_count = live_match_count + $2,
+                match_count = match_count + $2
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .bind(matches)
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
@@ -137,7 +120,7 @@ impl DetectionRuleRepository {
             r#"
             SELECT date, match_count, alert_count
             FROM detection_daily_stats
-            WHERE rule_id = $1 AND date >= CURRENT_DATE - $2::integer
+            WHERE rule_id = $1 AND date >= (now() AT TIME ZONE 'UTC')::date - $2::integer
             ORDER BY date ASC
             "#,
         )
@@ -172,13 +155,13 @@ impl DetectionRuleRepository {
                     (detected_at AT TIME ZONE 'UTC')::date AS date,
                     COUNT(*)::bigint AS match_count
                 FROM detection_matches
-                WHERE detected_at >= (CURRENT_DATE - $1::integer)::timestamptz
+                WHERE detected_at >= (((now() AT TIME ZONE 'UTC')::date - $1::integer)::timestamp AT TIME ZONE 'UTC')
                 GROUP BY rule_id, (detected_at AT TIME ZONE 'UTC')::date
             ) m
             FULL OUTER JOIN (
                 SELECT rule_id, date, alert_count
                 FROM detection_daily_stats
-                WHERE date >= CURRENT_DATE - $1::integer
+                WHERE date >= (now() AT TIME ZONE 'UTC')::date - $1::integer
             ) d ON m.rule_id = d.rule_id AND m.date = d.date
             ORDER BY rule_id, date ASC
             "#,

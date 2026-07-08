@@ -5,7 +5,8 @@ use axum::{
     Extension, Json,
 };
 use nanosiem_core::audit::{
-    AuditEvent, AuditSource, ClientContext, PROPOSAL_APPROVED, PROPOSAL_REJECTED,
+    AuditEvent, AuditSource, ClientContext, DETECTION_CODE_PR_OPENED, PROPOSAL_APPROVED,
+    PROPOSAL_REJECTED,
 };
 use nanosiem_core::auth::permissions;
 use nanosiem_core::tuning::{ProposalType, TuningProposal, TuningStatus};
@@ -367,6 +368,76 @@ pub async fn approve_proposal(
                         Fix the query using Edit Query, or set skip_validation to override.\n\nParse error: {}",
                         parse_err
                     ),
+                    version_id: None,
+                }));
+            }
+        }
+
+        // NAN-1745: if a detection-as-code push target is configured, open a PR
+        // with the (possibly analyst-modified) query instead of applying it to
+        // the DB. Git is the source of truth for these tenants.
+        {
+            let dac_repo =
+                nanosiem_core::detection_code_target::DetectionCodeTargetRepository::with_crypto(
+                    state.pool.clone(),
+                    (*state.encryption_service).clone(),
+                );
+            if let Some(target) = dac_repo.find_active().await.map_err(|e| {
+                ApiError::InternalError(format!("Failed to load push target: {e}"))
+            })? {
+                let full_rule: nanosiem_core::models::detection_rule::DetectionRule =
+                    sqlx::query_as("SELECT * FROM detection_rules WHERE id = $1")
+                        .bind(proposal.rule_id)
+                        .fetch_optional(&state.pool)
+                        .await
+                        .map_err(|e| {
+                            ApiError::InternalError(format!("Failed to fetch rule: {e}"))
+                        })?
+                        .ok_or_else(|| ApiError::NotFound("Rule not found".to_string()))?;
+
+                // PR the final (possibly analyst-edited) query.
+                let mut pr_proposal = proposal.clone();
+                pr_proposal.proposed_query = final_query.to_string();
+
+                let push =
+                    nanosiem_core::detection_code_target::DetectionCodePushService::new(dac_repo);
+                let pr = push
+                    .open_pr_for_proposal(&target, &full_rule, &pr_proposal)
+                    .await
+                    .map_err(|e| {
+                        ApiError::InternalError(format!("Failed to open pull request: {e}"))
+                    })?;
+
+                state
+                    .tuning_repository
+                    .set_pr_opened(proposal.id, &pr.html_url, pr.number)
+                    .await
+                    .map_err(|e| ApiError::InternalError(format!("Failed to record PR: {e}")))?;
+
+                if let Some(ref comment) = request.comment {
+                    let _ = state
+                        .tuning_repository
+                        .set_reviewer_notes(proposal.id, comment)
+                        .await;
+                }
+
+                state.emit_audit(
+                    AuditEvent::builder(AuditSource::Tuning, DETECTION_CODE_PR_OPENED)
+                        .actor(Some(auth.user_id()), None)
+                        .api_key(auth.api_key_id, auth.api_key_name.clone())
+                        .resource("tuning_proposal", Some(proposal.id), Some(rule_name.clone()))
+                        .client_context(&client)
+                        .details(serde_json::json!({
+                            "rule_id": proposal.rule_id,
+                            "pr_url": pr.html_url,
+                            "pr_number": pr.number,
+                        }))
+                        .build(),
+                );
+
+                return Ok(Json(ApprovalResponse {
+                    success: true,
+                    message: format!("Pull request opened for review: {}", pr.html_url),
                     version_id: None,
                 }));
             }

@@ -522,6 +522,11 @@ function TestDrawerHeader({
   const matched = run?.total_matches ?? 0;
   const sampled = run?.sample_events.length ?? 0;
   const ms = run?.execution_time_ms ?? 0;
+  // Audit D3b: a stepped backtest can silently swallow per-window query errors
+  // as `count: 0`. Surface them so a rule that errors every cycle isn't mistaken
+  // for a healthy "0 matches" rule.
+  const failedWindows = run?.failed_windows ?? 0;
+  const errorSample = run?.error_sample ?? null;
 
   return (
     <div className="h-10 shrink-0 flex items-center px-4 gap-3 border-b border-border bg-[var(--panel)]">
@@ -591,6 +596,20 @@ function TestDrawerHeader({
       <div className="flex-1 min-w-0" />
 
       <div className="flex items-center gap-3 text-[11px] font-mono text-muted-foreground overflow-hidden min-w-0">
+        {failedWindows > 0 && (
+          <span
+            className="inline-flex items-center gap-1 h-5 px-1.5 rounded-[3px] text-[9.5px] font-mono font-semibold tracking-[0.08em] uppercase text-[var(--warning)] whitespace-nowrap"
+            style={{ background: 'color-mix(in srgb, var(--warning) 15%, transparent)' }}
+            title={
+              errorSample
+                ? `Query errored in ${failedWindows} window(s) — counts undercount. e.g. ${errorSample}`
+                : `Query errored in ${failedWindows} window(s) — counts undercount`
+            }
+          >
+            <span className="w-1 h-1 rounded-full bg-[var(--warning)]" />
+            {failedWindows.toLocaleString()} errored
+          </span>
+        )}
         <span className="whitespace-nowrap">
           <span className="text-[var(--destructive)] font-semibold">{matched.toLocaleString()}</span>{' '}
           <span className="text-muted-foreground/80">matched</span>

@@ -244,6 +244,14 @@
 
             <!-- Allow deduplication for idempotent inserts -->
             <insert_deduplicate>1</insert_deduplicate>
+            <!-- NAN-1728: async-insert retries must dedup too (insert_deduplicate
+                 alone only covers synchronous inserts), and the block dedup must
+                 propagate into the MV cascade so the ENGINE=Null raw lanes
+                 (ocsf_logs_raw, otel_*_raw) don't double-insert into their
+                 Replicated targets on a Vector retry-after-commit. Harmless on
+                 single-shard. -->
+            <async_insert_deduplicate>1</async_insert_deduplicate>
+            <deduplicate_blocks_in_dependent_materialized_views>1</deduplicate_blocks_in_dependent_materialized_views>
 
             <!-- Parallel inserts -->
             <parallel_distributed_insert_select>2</parallel_distributed_insert_select>

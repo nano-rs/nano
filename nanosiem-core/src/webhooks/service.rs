@@ -267,6 +267,11 @@ impl WebhookService {
             Some(arr) => arr.iter().take(MAX_MATCHED_EVENTS).cloned().collect(),
             None => vec![],
         };
+        // A13 (NAN-1747): this counts the STORED matched_events array, which is
+        // capped at max_events_per_alert when the alert is written — so it is the
+        // sample size, not the true match count. A large match undercounts here
+        // (and in the payload's `matched_event_count`). Carrying the true count
+        // would need it stored on the alert row (schema+model change, out of scope).
         let matched_event_count = matched_events.as_array().map_or(0, |a| a.len()) as i64;
 
         let payload = WebhookPayload {
@@ -327,6 +332,22 @@ impl WebhookService {
                         webhook_name = %webhook.name,
                         "Webhook delivery shed: in-flight cap reached (alert storm or slow endpoint)"
                     );
+                    // A11 (NAN-1747): persist the shed as a failed delivery-log
+                    // row so the delivery-log UI shows a trace precisely during a
+                    // storm — otherwise a shed webhook leaves no record at all.
+                    // No HTTP attempted → duration 0. Bounded: only fires once the
+                    // in-flight cap (512) is reached.
+                    self.record(
+                        &webhook,
+                        Some(alert_id),
+                        "alert.created",
+                        None,
+                        None,
+                        false,
+                        Some("shed: in-flight cap"),
+                        0,
+                    )
+                    .await;
                     continue;
                 }
             };
@@ -407,6 +428,20 @@ impl WebhookService {
                         webhook_name = %webhook.name,
                         "Webhook case delivery shed: in-flight cap reached"
                     );
+                    // A11 (NAN-1747): persist the shed as a failed delivery-log
+                    // row (see fire_alert). `event_type` is the fine-grained case
+                    // event name; no alert id for case events.
+                    self.record(
+                        &webhook,
+                        None,
+                        event_type,
+                        None,
+                        None,
+                        false,
+                        Some("shed: in-flight cap"),
+                        0,
+                    )
+                    .await;
                     continue;
                 }
             };

@@ -349,6 +349,16 @@ pub struct TuningProposal {
     /// Diff showing what changed in hints (for hint_update proposals)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hints_diff: Option<HintsDiff>,
+    /// URL of the GitHub PR opened for this proposal when a detection-as-code
+    /// push target is configured (NAN-1745). Set when `status` is `pr_opened`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_url: Option<String>,
+    /// GitHub PR number for this proposal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<i32>,
+    /// Last-known PR state (open/merged/closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_state: Option<String>,
 }
 
 fn default_tuning_status() -> TuningStatus {
@@ -484,6 +494,10 @@ pub enum TuningStatus {
     ManuallyApproved,
     /// Rejected by user or system
     Rejected,
+    /// A Pull Request was opened in the detection-as-code push target; the
+    /// change applies when the customer merges it and their DaC pipeline
+    /// redeploys the rule to nano (NAN-1745).
+    PrOpened,
 }
 
 impl std::fmt::Display for TuningStatus {
@@ -498,6 +512,7 @@ impl std::fmt::Display for TuningStatus {
             TuningStatus::Reverted => write!(f, "reverted"),
             TuningStatus::ManuallyApproved => write!(f, "manually_approved"),
             TuningStatus::Rejected => write!(f, "rejected"),
+            TuningStatus::PrOpened => write!(f, "pr_opened"),
         }
     }
 }

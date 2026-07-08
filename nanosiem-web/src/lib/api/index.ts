@@ -41,6 +41,7 @@ import { LookupTablesApi } from './lookup-tables';
 import { AuditApi } from './audit';
 import { ContextApi } from './context';
 import { RuleRepositoriesApi } from './rule-repositories';
+import { DetectionCodeTargetsApi } from './detection-code-targets';
 import { ParserRepositoriesApi } from './parser-repositories';
 import { WebhooksApi } from './webhooks';
 import { MarketplaceApi } from './marketplace';
@@ -158,6 +159,7 @@ class ApiClient {
   private _audit: AuditApi;
   private _context: ContextApi;
   private _ruleRepositories: RuleRepositoriesApi;
+  private _detectionCodeTargets: DetectionCodeTargetsApi;
   private _parserRepositories: ParserRepositoriesApi;
   private _webhooks: WebhooksApi;
   private _marketplace: MarketplaceApi;
@@ -184,7 +186,6 @@ class ApiClient {
       // Traces/Metrics passthroughs delegate to the SearchApi instance so the
       // console consumes a single `api.observability` facade (NAN-1536).
       (req, cacheOpts) => this._search.listTraces(req, cacheOpts),
-      (id) => this._search.getTrace(id),
       (service) => this._search.listMetricNames(service),
       (req) => this._search.queryMetrics(req),
       // NAN-1540: multi-series metrics + tag discovery.
@@ -225,6 +226,7 @@ class ApiClient {
     this._audit = new AuditApi(this.request.bind(this));
     this._context = new ContextApi(this.request.bind(this));
     this._ruleRepositories = new RuleRepositoriesApi(this.request.bind(this));
+    this._detectionCodeTargets = new DetectionCodeTargetsApi(this.request.bind(this));
     this._parserRepositories = new ParserRepositoriesApi(this.request.bind(this));
     this._webhooks = new WebhooksApi(this.request.bind(this));
     this._marketplace = new MarketplaceApi(this.request.bind(this));
@@ -260,6 +262,10 @@ class ApiClient {
 
   get ruleRepositories(): RuleRepositoriesApi {
     return this._ruleRepositories;
+  }
+
+  get detectionCodeTargets(): DetectionCodeTargetsApi {
+    return this._detectionCodeTargets;
   }
 
   get parserRepositories(): ParserRepositoriesApi {

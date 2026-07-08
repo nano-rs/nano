@@ -62,6 +62,22 @@ pub enum CaseDisposition {
     Merged,
 }
 
+impl CaseDisposition {
+    /// Map a human disposition to the workflow `close_reason` key persisted on
+    /// `cases.close_reason` (CHECK-constrained in migration 152). Single source
+    /// of truth so every close path — HTTP handler, bulk, AI auto-close,
+    /// notebook chat — records a consistent, valid reason (NAN-1748 / C4).
+    pub fn to_close_reason(self) -> &'static str {
+        match self {
+            CaseDisposition::TruePositive => "tp",
+            CaseDisposition::FalsePositive => "fp",
+            CaseDisposition::Benign => "btp",
+            CaseDisposition::Inconclusive => "inconc",
+            CaseDisposition::Merged => "dup",
+        }
+    }
+}
+
 /// AI-recommended disposition from the shadow investigator (NAN-1251).
 ///
 /// Mirrors `CaseDisposition` but adds `NeedsInvestigation` — the third verdict
@@ -562,14 +578,20 @@ pub struct NewCase {
     pub group_ids: Option<Vec<Uuid>>,
 }
 
-/// Input for updating a case
+/// Input for updating a case.
+///
+/// Deliberately carries NO `status`/`disposition`: closing or resolving a case
+/// is a lifecycle transition that must go through the dedicated status-change
+/// path (`POST /api/cases/{id}/status` → `change_status`), which enforces the
+/// `CASES_CLOSE` permission and runs the full close pipeline (timestamps, wall
+/// entry, workflow event, close note, webhook, audit). Routing status through
+/// this generic `update` (gated only on `CASES_EDIT`) bypassed all of that
+/// (NAN-1742).
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpdateCase {
     pub title: Option<String>,
     pub description: Option<String>,
     pub severity: Option<Severity>,
-    pub status: Option<CaseStatus>,
-    pub disposition: Option<CaseDisposition>,
     pub priority: Option<i32>,
     pub ai_summary: Option<String>,
     pub ai_recommendations: Option<serde_json::Value>,

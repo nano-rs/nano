@@ -47,16 +47,23 @@ import {
 } from 'lucide-react';
 import { PivtIcon } from '@/enterprise/icons/PivtIcon';
 import { Textarea } from '@/components/ui/textarea';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { api } from '@/lib/api';
 import type { MelodApiResponse } from '@/lib/api';
 import { useMelodJob } from '@/enterprise/hooks/use-melod-job';
 import { DateTimeRangePicker } from '@/components/ui/date-time-range-picker';
 import { QueryTestModal } from './QueryTestModal';
-import { toApiTimeRange, type TimeRangeValue } from '@/hooks/use-api';
-import type { 
-  PanelConfig, 
-  VisualizationType, 
+import { type TimeRangeValue } from '@/hooks/use-api';
+import {
+  hydrateDashboardTimeRange,
+  serializeDashboardTimeRange,
+} from '@/lib/dashboard-time-range';
+import type {
+  PanelConfig,
+  VisualizationType,
   VisualizationConfig,
+  TimeRange,
+  SerializedTimeRange,
 } from '@/lib/api';
 
 export interface PanelEditorProps {
@@ -88,6 +95,18 @@ function generateTempId(): string {
   return `temp-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
 }
 
+// DSH25: a panel's custom range is now persisted as a RELATIVE SerializedTimeRange
+// (e.g. { type: 'preset', preset: 'Last 7 days' }) so "Last 7 days" stays a
+// rolling window instead of being frozen to absolute save-time timestamps.
+// Older panels persisted an absolute { start, end } — hydrate both shapes.
+function hydratePanelCustomRange(cr: TimeRange | undefined): TimeRangeValue {
+  if (!cr) return { type: 'preset', preset: 'Last 24 hours' };
+  if ('type' in cr) {
+    return hydrateDashboardTimeRange(cr as unknown as SerializedTimeRange);
+  }
+  return { type: 'custom', start: new Date(cr.start), end: new Date(cr.end) };
+}
+
 export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorProps) {
   const [title, setTitle] = useState(panel?.title || '');
   const [query, setQuery] = useState(panel?.query || '');
@@ -101,13 +120,12 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
   const [timeRangeMode, setTimeRangeMode] = useState<'dashboard' | 'custom'>(
     panel?.timeRangeMode || 'dashboard'
   );
-  const [customTimeRange, setCustomTimeRange] = useState<TimeRangeValue>(
-    panel?.customTimeRange 
-      ? { type: 'custom', start: new Date(panel.customTimeRange.start), end: new Date(panel.customTimeRange.end) }
-      : { type: 'preset', preset: 'Last 24 hours' }
+  const [customTimeRange, setCustomTimeRange] = useState<TimeRangeValue>(() =>
+    hydratePanelCustomRange(panel?.customTimeRange),
   );
   const [drilldownEnabled, setDrilldownEnabled] = useState(panel?.drilldownEnabled ?? true);
   const [drilldownTemplate, setDrilldownTemplate] = useState(panel?.drilldownTemplate || '');
+  const [showDiscardConfirm, setShowDiscardConfirm] = useState(false);
   const [queryTestResult, setQueryTestResult] = useState<{
     status: 'idle' | 'success' | 'error';
     message?: string;
@@ -125,6 +143,48 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
   const queryJob = useMelodJob<MelodApiResponse>();
 
   const isValid = useMemo(() => title.trim().length > 0 && query.trim().length > 0, [title, query]);
+
+  // DSH47: track whether the form differs from what it opened with, so an
+  // Escape / overlay-click / Cancel doesn't silently discard a whole panel of
+  // edits. (customTimeRange is intentionally excluded — comparing hydrated Date
+  // objects is noisy; the fields below cover the discard-worthy signals.)
+  const initialSnapshot = useMemo(
+    () =>
+      JSON.stringify({
+        title: (panel?.title || '').trim(),
+        query: (panel?.query || '').trim(),
+        queryMode: panel?.queryMode || 'piped',
+        visualizationType: panel?.visualizationType || 'bar',
+        visualizationConfig: panel?.visualizationConfig || {},
+        timeRangeMode: panel?.timeRangeMode || 'dashboard',
+        drilldownEnabled: panel?.drilldownEnabled ?? true,
+        drilldownTemplate: (panel?.drilldownTemplate || '').trim(),
+      }),
+    [panel],
+  );
+  const isDirty = useMemo(
+    () =>
+      JSON.stringify({
+        title: title.trim(),
+        query: query.trim(),
+        queryMode,
+        visualizationType,
+        visualizationConfig,
+        timeRangeMode,
+        drilldownEnabled,
+        drilldownTemplate: drilldownTemplate.trim(),
+      }) !== initialSnapshot,
+    [title, query, queryMode, visualizationType, visualizationConfig, timeRangeMode, drilldownEnabled, drilldownTemplate, initialSnapshot],
+  );
+
+  // DSH47: close the sheet only after a dirty-confirm.
+  const handleRequestClose = useCallback(() => {
+    if (isDirty) {
+      setShowDiscardConfirm(true);
+    } else {
+      onCancel();
+    }
+  }, [isDirty, onCancel]);
 
   const handleTestResult = useCallback((result: { 
     valid: boolean; 
@@ -157,7 +217,13 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
       visualizationType,
       visualizationConfig,
       timeRangeMode,
-      customTimeRange: timeRangeMode === 'custom' ? toApiTimeRange(customTimeRange) : undefined,
+      // DSH25: persist the RELATIVE range (preset stays rolling); resolved to
+      // absolute at query time in the view/editor. Runtime shape is a
+      // SerializedTimeRange; PanelConfig types it as TimeRange for back-compat.
+      customTimeRange:
+        timeRangeMode === 'custom'
+          ? (serializeDashboardTimeRange(customTimeRange) as unknown as TimeRange)
+          : undefined,
       drilldownEnabled,
       drilldownTemplate: drilldownTemplate.trim() || undefined,
     };
@@ -203,7 +269,8 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
   }, [aiPrompt, queryMode, queryJob]);
 
   return (
-    <Sheet open onOpenChange={open => !open && onCancel()}>
+    <>
+    <Sheet open onOpenChange={open => { if (!open) handleRequestClose(); }}>
       <SheetContent
         side="right"
         className="w-[680px] max-w-[min(680px,calc(100vw-24px))] bg-card border-border p-0 overflow-hidden flex flex-col gap-0"
@@ -352,6 +419,25 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
                   maxHeight={300}
                   onSubmit={() => query.trim() && setShowTestModal(true)}
                 />
+                {queryMode === 'sql' && (
+                  <p className="text-[10.5px] leading-relaxed text-muted-foreground">
+                    Raw SQL isn't bound to the dashboard time range unless you say
+                    so. Use{' '}
+                    <code className="font-mono text-[10.5px] text-foreground">
+                      $__timeFilter(timestamp)
+                    </code>{' '}
+                    in a{' '}
+                    <span className="font-mono">WHERE</span> clause (or{' '}
+                    <code className="font-mono text-[10.5px] text-foreground">
+                      $__timeFrom
+                    </code>
+                    {' / '}
+                    <code className="font-mono text-[10.5px] text-foreground">
+                      $__timeTo
+                    </code>
+                    ) to scope the panel to the picker.
+                  </p>
+                )}
               </div>
               <div className="flex items-center gap-3">
                 <Button
@@ -471,7 +557,7 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
         </div>
 
         <div className="px-4 py-3 border-t border-border flex items-center justify-end gap-2 shrink-0">
-          <Button variant="ghost" size="sm" className="h-[28px] gap-1.5" onClick={onCancel}>
+          <Button variant="ghost" size="sm" className="h-[28px] gap-1.5" onClick={handleRequestClose}>
             <X className="w-[12px] h-[12px]" />
             Cancel
           </Button>
@@ -493,6 +579,22 @@ export function PanelEditor({ panel, onSave, onCancel, variables }: PanelEditorP
         onTestResult={handleTestResult}
       />
     </Sheet>
+
+    {/* DSH47: confirm before discarding an edited panel (Escape / overlay / Cancel). */}
+    <ConfirmDialog
+      open={showDiscardConfirm}
+      onOpenChange={setShowDiscardConfirm}
+      variant="danger"
+      title="Discard panel changes?"
+      description="You have unsaved changes to this panel. Discard them?"
+      confirmLabel="Discard changes"
+      cancelLabel="Keep editing"
+      onConfirm={() => {
+        setShowDiscardConfirm(false);
+        onCancel();
+      }}
+    />
+    </>
   );
 }
 

@@ -73,37 +73,81 @@ if !is_timestamp(ts) { ts = now() }
 
 # RFC3339/timestamp -> epoch-nanos string (the MV parses with
 # toUInt64OrZero(JSONExtractString(...)) so a numeric string is required).
-start_nanos = "0"
+# O2: missing/unparseable nanos fall back to the event ingest timestamp (ts,
+# always a real timestamp above) — NOT "0", which the MV maps to 1970-01-01 and
+# the spans table's 30d TTL then silently reaps.
+fallback_nanos = to_string(to_unix_timestamp(ts, unit: "nanoseconds") ?? 0)
+
+start_nanos = fallback_nanos
 st = .start_time_unix_nano
 if is_timestamp(st) {
     start_nanos = to_string(to_unix_timestamp(st, unit: "nanoseconds") ?? 0)
 } else if is_integer(st) {
-    start_nanos = to_string(st) ?? "0"
+    start_nanos = to_string(st) ?? fallback_nanos
 } else if is_string(st) {
-    pt, err = parse_timestamp(st, "%Y-%m-%dT%H:%M:%S%.fZ")
+    # O2: accept RFC3339 with a numeric offset (+00:00) via %+, not only the Z
+    # form; on parse failure keep the ingest-timestamp fallback (never "0").
+    pt, err = parse_timestamp(st, "%+")
+    if err != null { pt, err = parse_timestamp(st, "%Y-%m-%dT%H:%M:%S%.fZ") }
     if err == null { start_nanos = to_string(to_unix_timestamp(pt, unit: "nanoseconds")) }
 }
 
-end_nanos = "0"
+end_nanos = fallback_nanos
 et = .end_time_unix_nano
 if is_timestamp(et) {
     end_nanos = to_string(to_unix_timestamp(et, unit: "nanoseconds") ?? 0)
 } else if is_integer(et) {
-    end_nanos = to_string(et) ?? "0"
+    end_nanos = to_string(et) ?? fallback_nanos
 } else if is_string(et) {
-    pt2, err2 = parse_timestamp(et, "%Y-%m-%dT%H:%M:%S%.fZ")
+    pt2, err2 = parse_timestamp(et, "%+")
+    if err2 != null { pt2, err2 = parse_timestamp(et, "%Y-%m-%dT%H:%M:%S%.fZ") }
     if err2 == null { end_nanos = to_string(to_unix_timestamp(pt2, unit: "nanoseconds")) }
 }
 
 # Flat attribute maps -> OTLP KeyValue arrays the MV's arrayFirst()/JSONExtract
 # idiom understands. Span attributes and resource attributes are separate arrays.
+# O38: non-scalar (array/object) attribute values are JSON-encoded rather than
+# collapsed to "" so structured attrs survive round-trip.
 attrs = []
 for_each(object(.attributes) ?? {}) -> |k, v| {
-    attrs = push(attrs, { "key": k, "value": { "stringValue": to_string(v) ?? "" } })
+    sv = if is_object(v) || is_array(v) { encode_json(v) } else { to_string(v) ?? "" }
+    attrs = push(attrs, { "key": k, "value": { "stringValue": sv } })
 }
 res_attrs = []
 for_each(object(.resources) ?? {}) -> |k, v| {
-    res_attrs = push(res_attrs, { "key": k, "value": { "stringValue": to_string(v) ?? "" } })
+    sv = if is_object(v) || is_array(v) { encode_json(v) } else { to_string(v) ?? "" }
+    res_attrs = push(res_attrs, { "key": k, "value": { "stringValue": sv } })
+}
+
+# O38: re-encode span events + links to OTLP/JSON so they are preserved. The MV
+# stores JSONExtractRaw(event,'events') into the events column; the rebuilt
+# object previously had no events/links key, so every Vector-lane span lost its
+# events (incl. SDK exception events) and links.
+events = []
+for_each(array(.events) ?? []) -> |_ie, ev| {
+    ev_attrs = []
+    for_each(object(ev.attributes) ?? {}) -> |k, v| {
+        sv = if is_object(v) || is_array(v) { encode_json(v) } else { to_string(v) ?? "" }
+        ev_attrs = push(ev_attrs, { "key": k, "value": { "stringValue": sv } })
+    }
+    events = push(events, {
+        "timeUnixNano": to_string(ev.time_unix_nano) ?? "",
+        "name": to_string(ev.name) ?? "",
+        "attributes": ev_attrs
+    })
+}
+links = []
+for_each(array(.links) ?? []) -> |_il, ln| {
+    ln_attrs = []
+    for_each(object(ln.attributes) ?? {}) -> |k, v| {
+        sv = if is_object(v) || is_array(v) { encode_json(v) } else { to_string(v) ?? "" }
+        ln_attrs = push(ln_attrs, { "key": k, "value": { "stringValue": sv } })
+    }
+    links = push(links, {
+        "traceId": to_string(ln.trace_id) ?? "",
+        "spanId": to_string(ln.span_id) ?? "",
+        "attributes": ln_attrs
+    })
 }
 
 otlp = {
@@ -119,6 +163,8 @@ otlp = {
         "message": to_string(.status.message) ?? ""
     },
     "attributes": attrs,
+    "events": events,
+    "links": links,
     "resource": { "attributes": res_attrs }
 }
 
@@ -173,6 +219,14 @@ otlp = {
     "resource": { "attributes": res_attrs }
 }
 
+# O26: Vector's metric kind carries temporality — `absolute` == cumulative,
+# `incremental` == delta. Map to OTLP aggregationTemporality (2 CUMULATIVE,
+# 1 DELTA, 0 UNSPECIFIED) so sum/histogram consumers can delta-decode running
+# totals instead of summing cumulative counters (SDKs export CUMULATIVE sums by
+# default).
+mkind = to_string(.kind) ?? ""
+temporality = if mkind == "absolute" { 2 } else if mkind == "incremental" { 1 } else { 0 }
+
 # metric_to_log emits the value under .gauge / .counter / .histogram keyed by the
 # metric kind. Map to the OTLP `type` discriminator + value the MV reads.
 if exists(.gauge) {
@@ -181,17 +235,28 @@ if exists(.gauge) {
 } else if exists(.counter) {
     otlp = set!(otlp, ["type"], "sum")
     otlp = set!(otlp, ["asDouble"], to_float(.counter.value) ?? 0.0)
+    otlp = set!(otlp, ["aggregationTemporality"], temporality)
 # metric_to_log emits histograms under `aggregated_histogram`
 # ({buckets:[{count, upper_limit}], count, sum}).
 } else if exists(.aggregated_histogram) {
     otlp = set!(otlp, ["type"], "histogram")
+    otlp = set!(otlp, ["aggregationTemporality"], temporality)
     otlp = set!(otlp, ["count"], to_int(.aggregated_histogram.count) ?? 0)
     otlp = set!(otlp, ["sum"], to_float(.aggregated_histogram.sum) ?? 0.0)
+    # O25: OTLP requires bucketCounts to hold exactly ONE more element than
+    # explicitBounds — the terminal (+Inf) bucket has a count but no explicit
+    # bound. Emit every bucket's count, but exclude the last bucket's bound: its
+    # upper_limit is +Inf, which can't JSON-encode (-> null -> CH reads 0.0 and
+    # corrupts bound ordering).
+    buckets = array(.aggregated_histogram.buckets) ?? []
+    last_bucket = length(buckets) - 1
     bc = []
     eb = []
-    for_each(array(.aggregated_histogram.buckets) ?? []) -> |_i, b| {
+    for_each(buckets) -> |i, b| {
         bc = push(bc, to_int(b.count) ?? 0)
-        eb = push(eb, to_float(b.upper_limit) ?? 0.0)
+        if i < last_bucket {
+            eb = push(eb, to_float(b.upper_limit) ?? 0.0)
+        }
     }
     otlp = set!(otlp, ["bucketCounts"], bc)
     otlp = set!(otlp, ["explicitBounds"], eb)
@@ -221,7 +286,11 @@ type = "remap"
 inputs = ["otlp_ingest.logs"]
 source = '''
 .source_type = "otlp_log"
-.auth_status = "authenticated"
+# O37: honest provenance, not a token-verified claim. Open OTLP ports are by
+# design in open core (the deployer fronts them with LB/mTLS for managed); this
+# value only records the ingest lane so downstream can distinguish OTLP-lane
+# logs from token-gated HTTP-lane events instead of them reading "authenticated".
+.auth_status = "otlp"
 .content_format = "otlp"
 .routing_timestamp = now()
 
@@ -272,8 +341,19 @@ if is_object(.attributes) { tail = merge(tail, object!(.attributes)) }
 # =============================================================================
 # ClickHouse Sink — spans raw (ENGINE=Null; MV derives otel_spans)
 # COPIED from the `clickhouse_logs` sink (sources/parsers/_pipeline.toml):
-# basic auth, gzip, memory buffer (drop_newest), batch, adaptive concurrency,
-# acknowledgements off. Table is env-overridable.
+# basic auth, gzip, memory buffer, batch, adaptive concurrency. Table is
+# env-overridable.
+# O3: end-to-end acknowledgements are ON, so the OTLP source only 200-acks an
+# exporter once the CH insert is confirmed — a down/overloaded CH now returns a
+# retryable error to the exporter instead of silently acking-then-dropping.
+# buffer.when_full = "drop_newest" is kept ONLY as the last-resort shed.
+# O24: batch idempotency (dedup of a batch re-POSTed after a client-side request
+# timeout) is NOT achievable from the Vector clickhouse sink — it exposes no
+# per-batch, content-derived insert_deduplication_token, and the staging tables
+# are ENGINE=Null so block-hash dedup can't apply. The durable fix is a
+# ReplacingMergeTree keyed (trace_id, span_id, start_time) for spans /
+# (metric identity, timeUnixNano) for metrics in clickhouse/138 & 140 — tracked
+# outside this file (see O24 in OBSERVABILITY_AUDIT_FINDINGS.md).
 # =============================================================================
 [sinks.clickhouse_otel_spans]
 type = "clickhouse"
@@ -291,13 +371,33 @@ compression = "gzip"
 date_time_best_effort = true
 skip_unknown_fields = true
 
+# NAN-1728 (C4/W10): async-insert block dedup for the raw span lane.
+# `deduplicate = true` emits `async_insert_deduplicate=1` so an identical batch
+# re-POSTed after an HTTP timeout is dropped at the async-insert layer instead of
+# duplicating (otel_spans_raw is ENGINE=Null → MV → otel_spans). Its MV-cascade
+# companion `deduplicate_blocks_in_dependent_materialized_views=1` is set in the
+# server-side ingestion profile (query_limits.xml) — Vector's clickhouse sink
+# cannot express it (query_settings exposes only async_insert_settings, and
+# endpoint query params corrupt the sink's own generated query string). These
+# reduce but do not eliminate dupes on cross-shard retries — the raw Null lane
+# has no content-hash wrapper to re-pin a retry to the origin shard, so this lane
+# is at-least-once by construction (O24). Harmless on single-shard.
+[sinks.clickhouse_otel_spans.query_settings.async_insert_settings]
+deduplicate = true
+
 [sinks.clickhouse_otel_spans.buffer]
 type = "memory"
 max_events = 100000
+# O3: last-resort shed only — with acknowledgements on, drops happen solely when
+# this in-memory buffer is saturated, and the exporter still sees a retryable
+# error for anything not accepted.
 when_full = "drop_newest"
 
+# O3: end-to-end acknowledgements — the OTLP source withholds its 200/OK until
+# this CH insert is confirmed, so exporters retry on failure instead of the
+# source acking success while the batch is dropped.
 [sinks.clickhouse_otel_spans.acknowledgements]
-enabled = false
+enabled = true
 
 [sinks.clickhouse_otel_spans.batch]
 max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}
@@ -312,6 +412,9 @@ retry_max_duration_secs = 300
 
 # =============================================================================
 # ClickHouse Sink — metrics raw (ENGINE=Null; MV derives otel_metrics)
+# O3: end-to-end acknowledgements ON (see the spans sink note above); drop_newest
+# stays only as the last-resort shed. O24: same insert_deduplication_token
+# limitation — the durable dedup fix is a ReplacingMergeTree in clickhouse/140.
 # =============================================================================
 [sinks.clickhouse_otel_metrics]
 type = "clickhouse"
@@ -329,13 +432,25 @@ compression = "gzip"
 date_time_best_effort = true
 skip_unknown_fields = true
 
+# NAN-1728 (C4/W10): async-insert block dedup for the raw metrics lane — see the
+# clickhouse_otel_spans sink note above. `deduplicate = true` emits
+# `async_insert_deduplicate=1` (otel_metrics_raw is ENGINE=Null → MV →
+# otel_metrics); the MV-cascade companion setting lives server-side in
+# query_limits.xml. Reduces (not eliminates) cross-shard-retry dupes; harmless
+# on single-shard.
+[sinks.clickhouse_otel_metrics.query_settings.async_insert_settings]
+deduplicate = true
+
 [sinks.clickhouse_otel_metrics.buffer]
 type = "memory"
 max_events = 100000
+# O3: last-resort shed only — see the spans sink buffer note above.
 when_full = "drop_newest"
 
+# O3: end-to-end acknowledgements — exporters get a retryable error on CH
+# failure instead of a silent ack-then-drop.
 [sinks.clickhouse_otel_metrics.acknowledgements]
-enabled = false
+enabled = true
 
 [sinks.clickhouse_otel_metrics.batch]
 max_bytes = ${VECTOR_BATCH_MAX_BYTES:-52428800}

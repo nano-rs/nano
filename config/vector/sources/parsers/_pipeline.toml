@@ -367,6 +367,24 @@ for_each(keys(.)) -> |_idx, key| {
 # retries and surfaces in metrics, instead of a silently discarded pre-ACKed
 # batch. Measured: zero throughput cost at 5k eps; sustained-overload shedding
 # unchanged (the drop_newest buffer below sheds either way, now visibly).
+#
+# Cluster routing contract (NAN-1728, C4/W1). `table` is env-driven and
+# defaults to the shard-LOCAL `logs`:
+#   * SINGLE-SHARD (dev / Saturn / most tenants, compose, install.sh): leave
+#     CLICKHOUSE_LOGS_TABLE UNSET -> writes the plain local `logs` table, exactly
+#     as before. There is no `logs_distributed` wrapper on those deployments, so
+#     the default MUST stay `logs`. Do not hardcode a `_distributed` name here.
+#   * ENTERPRISE 3x2 CLUSTER (deploy/k8s/rackspace/vector.yaml): that manifest
+#     sets CLICKHOUSE_LOGS_TABLE=logs_distributed so writes go THROUGH the
+#     Distributed wrapper. The wrapper is sharded by cityHash64(id) (content
+#     hash, not rand()), so a batch that times out and is retried on a new
+#     `clickhouse-ingest` connection re-hashes each row to the SAME shard —
+#     per-shard block dedup then catches the duplicate. Routing via the wrapper
+#     also removes the per-connection sharding skew of writing the local table
+#     through the load-balanced Service.
+# The dynamically-generated sink in nanosiem-core/src/parsers/vector_config/
+# deploy.rs::pipeline_config_content() carries the identical env/table so both
+# paths agree.
 # =============================================================================
 [sinks.clickhouse_logs]
 type = "clickhouse"
@@ -383,6 +401,19 @@ auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
 compression = "gzip"
 date_time_best_effort = true
 skip_unknown_fields = true
+
+# NAN-1728 (C4/W10): async-insert block dedup. `deduplicate = true` emits the
+# ClickHouse query setting `async_insert_deduplicate=1` (async_insert=1 itself is
+# on via the server-side ingestion profile, deploy/k8s/clickhouse/users.d/
+# query_limits.xml). An identical batch re-POSTed after an HTTP timeout hashes to
+# the same async-insert block and is dropped rather than re-inserted. Harmless on
+# single-shard (pure win). NOTE: the MV-cascade companion
+# `deduplicate_blocks_in_dependent_materialized_views=1` is NOT expressible from
+# Vector's clickhouse sink (its query_settings only exposes async_insert_settings,
+# and appending it to the endpoint URL corrupts the sink's own query string) — it
+# must be set in the server-side ingestion profile (query_limits.xml).
+[sinks.clickhouse_logs.query_settings.async_insert_settings]
+deduplicate = true
 
 [sinks.clickhouse_logs.buffer]
 type = "memory"

@@ -477,3 +477,73 @@ fn test_metric_command_not_greedy_on_pipe() {
         _ => panic!("Expected Piped query"),
     }
 }
+
+// === NAN-1711 / audit D15: internal `_bounds=` token on top/rare ===
+
+#[test]
+fn test_top_rare_bounds_token_parses_and_defaults_false() {
+    // Default: no token → inject_bounds=false.
+    match parse_query("* | top src_ip").unwrap() {
+        Query::Piped {
+            command: Command::Top { inject_bounds, .. },
+            ..
+        } => assert!(!inject_bounds, "bare top must default inject_bounds=false"),
+        other => panic!("Expected Top, got {other:?}"),
+    }
+
+    // The internal token (emitted by detection query enrichment via
+    // pretty_print) round-trips back into the flag.
+    match parse_query("* | top limit=10 src_ip _bounds=true").unwrap() {
+        Query::Piped {
+            command:
+                Command::Top {
+                    field,
+                    limit,
+                    inject_bounds,
+                    ..
+                },
+            ..
+        } => {
+            assert_eq!(field, "src_ip");
+            assert_eq!(limit, 10);
+            assert!(inject_bounds);
+        }
+        other => panic!("Expected Top, got {other:?}"),
+    }
+
+    // With a by-clause the token must not be swallowed as a by-field.
+    match parse_query("* | rare limit=5 status by user _bounds=true").unwrap() {
+        Query::Piped {
+            command:
+                Command::Rare {
+                    field,
+                    by_fields,
+                    inject_bounds,
+                    ..
+                },
+            ..
+        } => {
+            assert_eq!(field, "status");
+            assert_eq!(by_fields, vec!["user".to_string()]);
+            assert!(inject_bounds);
+        }
+        other => panic!("Expected Rare, got {other:?}"),
+    }
+
+    // Mixed with the existing trailing params, any order.
+    match parse_query("* | top src_ip _bounds=true showperc=false").unwrap() {
+        Query::Piped {
+            command:
+                Command::Top {
+                    inject_bounds,
+                    show_percent,
+                    ..
+                },
+            ..
+        } => {
+            assert!(inject_bounds);
+            assert!(!show_percent);
+        }
+        other => panic!("Expected Top, got {other:?}"),
+    }
+}

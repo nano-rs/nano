@@ -24,9 +24,50 @@ use tracing::{error, info, warn};
 use utoipa::ToSchema;
 
 use crate::audit::{AuditEmitter, AuditEvent, AuditSource};
+use crate::db::dual_pool::on_cluster_clause;
 use crate::db::NotificationRepository;
 use crate::health::{HealthIssueType, HealthRepository};
 use crate::models::notification::{NewNotification, NotificationType};
+
+// ---------------------------------------------------------------------------
+// Cluster-aware runtime helpers (NAN-1728 H1)
+//
+// `DiskPressureService` holds a bare admin `ClickHouseClient` (no `DualPool`),
+// so cluster mode is derived from the same `CLICKHOUSE_CLUSTER` env signal that
+// gates `on_cluster_clause` — the deploy sets it only on clustered ClickHouse.
+// On single-node / open-core (`CLICKHOUSE_CLUSTER` unset) every helper below
+// falls back to the exact pre-cluster query, so this file is byte-identical
+// there.
+// ---------------------------------------------------------------------------
+
+/// Configured ClickHouse cluster name, or `None` on single-node deployments.
+fn clickhouse_cluster_name() -> Option<String> {
+    std::env::var("CLICKHOUSE_CLUSTER").ok().and_then(|c| {
+        let t = c.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    })
+}
+
+/// `system.<table>` source visiting EVERY node (both replicas of every shard)
+/// on a cluster via `clusterAllReplicas(...)`. Used for disk-pressure reads
+/// where each physical node's own disk/parts matter (max usage / oldest
+/// partition across the whole cluster). Plain `system.<table>` on single-node.
+fn all_replicas_system(table: &str) -> String {
+    match clickhouse_cluster_name() {
+        Some(cl) => format!("clusterAllReplicas('{}', system.{})", cl, table),
+        None => format!("system.{}", table),
+    }
+}
+
+/// `system.parts` source that dedupes replicas to one per shard on a cluster
+/// (`cluster(...)`), so byte sums count each shard exactly once. Plain
+/// `system.parts` on single-node.
+fn parts_source_dedup() -> String {
+    match clickhouse_cluster_name() {
+        Some(cl) => format!("cluster('{}', system.parts)", cl),
+        None => "system.parts".to_string(),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -248,10 +289,14 @@ impl DiskPressureService {
             "Applying warm deletion TTL to core tables"
         );
 
+        // NAN-1728 H1: warm-TTL runs on the LOCAL MergeTree; `ON CLUSTER` fans
+        // the ALTER out to every shard (empty clause → byte-identical on
+        // single-node) so warm deletion applies cluster-wide.
+        let on_cluster = on_cluster_clause();
         for (table, col) in WARM_TTL_TABLES {
             let stmt = format!(
-                "ALTER TABLE nanosiem.{} MODIFY TTL {} + toIntervalDay({})",
-                table, col, days
+                "ALTER TABLE nanosiem.{}{} MODIFY TTL {} + toIntervalDay({})",
+                table, on_cluster, col, days
             );
             match self.ch_admin.query(&stmt).execute().await {
                 Ok(_) => info!(table = table, days = days, "Applied warm deletion TTL"),
@@ -302,11 +347,16 @@ impl DiskPressureService {
     /// On query error, returns false and logs — we'd rather drop partitions
     /// at high watermark than wedge the daemon if ClickHouse is flaky.
     async fn clickhouse_tiering_configured(&self) -> bool {
+        // NAN-1728 H1: tiering may be configured on any node — scan every node
+        // (`clusterAllReplicas`) so detection isn't blind to shards the LB'd
+        // connection didn't land on. Plain `system.*` on single-node.
+        let storage_policies_src = all_replicas_system("storage_policies");
+        let disks_src = all_replicas_system("disks");
         match self
             .ch_admin
-            .query(
-                "SELECT count() FROM system.storage_policies WHERE volume_priority > 1",
-            )
+            .query(&format!(
+                "SELECT count() FROM {storage_policies_src} WHERE volume_priority > 1"
+            ))
             .fetch_one::<u64>()
             .await
         {
@@ -323,7 +373,9 @@ impl DiskPressureService {
 
         match self
             .ch_admin
-            .query("SELECT count() FROM system.disks WHERE type != 'Local'")
+            .query(&format!(
+                "SELECT count() FROM {disks_src} WHERE type != 'Local'"
+            ))
             .fetch_one::<u64>()
             .await
         {
@@ -359,9 +411,24 @@ impl DiskPressureService {
 
         // Exclude ObjectStorage disks (S3/Wasabi) which report u64::MAX for total_space.
         // Only consider Local disks for pressure monitoring.
+        //
+        // NAN-1728 H1: on a cluster, disk pressure is the MAX usage across every
+        // physical node (both replicas of every shard) — the emergency valve
+        // must fire when ANY node is filling. Scan `clusterAllReplicas(system.disks)`
+        // and pick the disk with the highest used-fraction so the caller's
+        // `used/total` matches the worst node. On single-node this is
+        // byte-identical: `system.disks` ordered by `total_space DESC`.
+        let disks_src = all_replicas_system("disks");
+        let order_by = if clickhouse_cluster_name().is_some() {
+            "(total_space - free_space) / total_space DESC"
+        } else {
+            "total_space DESC"
+        };
         let row = self
             .ch_admin
-            .query("SELECT total_space, free_space FROM system.disks WHERE type = 'Local' AND total_space > 0 ORDER BY total_space DESC LIMIT 1")
+            .query(&format!(
+                "SELECT total_space, free_space FROM {disks_src} WHERE type = 'Local' AND total_space > 0 ORDER BY {order_by} LIMIT 1"
+            ))
             .fetch_optional::<DiskRow>()
             .await
             .map_err(|e| DiskPressureError::ClickHouse(e.to_string()))?
@@ -408,9 +475,13 @@ impl DiskPressureService {
             .collect::<Vec<_>>()
             .join(",");
 
+        // NAN-1728 H1: oldest partition = MIN across all shards. `min(partition)`
+        // is replica-invariant, so scan every node via `clusterAllReplicas`.
+        // Plain `system.parts` on single-node (byte-identical).
+        let parts_src = all_replicas_system("parts");
         let query = format!(
-            "SELECT min(partition) AS oldest FROM system.parts WHERE table IN ({}) AND active = 1 AND partition != ''",
-            tables_list
+            "SELECT min(partition) AS oldest FROM {} WHERE table IN ({}) AND active = 1 AND partition != ''",
+            parts_src, tables_list
         );
 
         #[derive(clickhouse::Row, serde::Deserialize)]
@@ -439,9 +510,14 @@ impl DiskPressureService {
             .collect::<Vec<_>>()
             .join(",");
 
+        // NAN-1728 H1: distinct partition dates across all shards.
+        // `count(DISTINCT partition)` dedupes the replica rows, so scanning every
+        // node via `clusterAllReplicas` yields the true cluster-wide date count.
+        // Plain `system.parts` on single-node (byte-identical).
+        let parts_src = all_replicas_system("parts");
         let query = format!(
-            "SELECT count(DISTINCT partition) AS cnt FROM system.parts WHERE table IN ({}) AND active = 1 AND partition != ''",
-            tables_list
+            "SELECT count(DISTINCT partition) AS cnt FROM {} WHERE table IN ({}) AND active = 1 AND partition != ''",
+            parts_src, tables_list
         );
 
         #[derive(clickhouse::Row, serde::Deserialize)]
@@ -461,8 +537,13 @@ impl DiskPressureService {
 
     /// Drop a specific partition date from all daily tables.
     async fn drop_partitions_for_date(&self, date: &str) -> Result<(), DiskPressureError> {
+        // NAN-1728 H1: DROP PARTITION runs on the LOCAL MergeTree; `ON CLUSTER`
+        // fans it out to every shard (empty clause → byte-identical on
+        // single-node) so the emergency valve relieves the whole cluster, not
+        // just the node the LB'd connection landed on.
+        let on_cluster = on_cluster_clause();
         for table in DAILY_TABLES {
-            let stmt = format!("ALTER TABLE {} DROP PARTITION '{}'", table, date);
+            let stmt = format!("ALTER TABLE {}{} DROP PARTITION '{}'", table, on_cluster, date);
             self.ch_admin
                 .query(&stmt)
                 .execute()
@@ -480,10 +561,15 @@ impl DiskPressureService {
             .collect::<Vec<_>>()
             .join(",");
 
+        // NAN-1728 H1: average partition size across the whole cluster. Dedupe
+        // replicas to one per shard (`cluster(...)`) so `sum(bytes_on_disk)` is
+        // not doubled by the replica; `countDistinct(partition)` is date-count.
+        // Plain `system.parts` on single-node (byte-identical).
+        let parts_src = parts_source_dedup();
         let query = format!(
             "SELECT sum(bytes_on_disk) / countDistinct(partition) AS avg_partition_bytes \
-             FROM system.parts WHERE table IN ({}) AND active = 1 AND partition != ''",
-            tables_list
+             FROM {} WHERE table IN ({}) AND active = 1 AND partition != ''",
+            parts_src, tables_list
         );
 
         #[derive(clickhouse::Row, serde::Deserialize)]

@@ -130,7 +130,7 @@ pub async fn bulk_update_rules(
                 // Handle scheduling side effects based on target mode
                 match target_mode {
                     RuleMode::Paused | RuleMode::Staging => {
-                        // Clear scheduling and remove from real-time evaluator
+                        // Clear scheduling
                         if let Err(e) = state
                             .detection_service
                             .update_next_run_at(rule_id, None)
@@ -142,18 +142,10 @@ pub async fn bulk_update_rules(
                                 e
                             );
                         }
-                        state.realtime_evaluator.remove_rule(rule_id).await;
                     }
                     RuleMode::Live | RuleMode::Alerting => {
-                        // Sync scheduling and update real-time evaluator
+                        // Sync scheduling
                         state.detection_service.sync_next_run_at(&rule).await;
-                        if let Err(e) = state.realtime_evaluator.add_rule(&rule).await {
-                            tracing::warn!(
-                                "Failed to update real-time evaluator for rule {}: {}",
-                                rule_id,
-                                e
-                            );
-                        }
                     }
                 }
                 updated += 1;

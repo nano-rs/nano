@@ -185,7 +185,11 @@ impl RiskModifier {
         events.iter().any(|event| {
             Self::get_field_value(event, field)
                 .map(|v| !Self::value_equals(&v, value))
-                .unwrap_or(true) // Missing field != value is true
+                // Audit D38: a MISSING field must NOT satisfy the inequality.
+                // `unwrap_or(true)` made `status != success` fire on every event
+                // that simply had no `status` — near-always-on for heterogeneous
+                // grouped events, silently inflating entity risk.
+                .unwrap_or(false)
         })
     }
 

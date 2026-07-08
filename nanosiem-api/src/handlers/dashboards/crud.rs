@@ -17,6 +17,7 @@ use nanosiem_core::{
     ShareDashboardRequest, UpdateDashboard,
 };
 
+use super::export::{validate_dashboard_name, validate_layout, validate_panels};
 use super::types::{
     CreateDashboardRequest, DashboardSummary, ListDashboardsQuery, UpdateDashboardRequest,
 };
@@ -69,6 +70,18 @@ pub async fn list_dashboards(
         }
     }
 
+    // DSH42: populate `shared_groups` (both `From` impls default it to empty).
+    // A share edit seeded from list data would otherwise wipe the real group
+    // set, since `share()` replaces groups wholesale. Fetched in one query to
+    // avoid an N+1 per dashboard.
+    let ids: Vec<_> = summaries.iter().map(|d| d.id).collect();
+    let groups_by_dashboard = repo.get_shared_groups_for_dashboards(&ids).await?;
+    for summary in &mut summaries {
+        if let Some(groups) = groups_by_dashboard.get(&summary.id) {
+            summary.shared_groups = groups.clone();
+        }
+    }
+
     Ok(Json(summaries))
 }
 
@@ -93,12 +106,13 @@ pub async fn create_dashboard(
 ) -> Result<Json<Dashboard>, ApiError> {
     ensure_permission(&auth, permissions::DASHBOARDS_CREATE)?;
 
-    // Validate request
-    if request.name.trim().is_empty() {
-        return Err(ApiError::ValidationError(
-            "Dashboard name cannot be empty".to_string(),
-        ));
-    }
+    // DSH14: enforce the same field limits as import on create — name length,
+    // panels-is-array + count + per-panel + unique ids, layout structure.
+    // Previously only import validated these, so the product could create
+    // dashboards its own exporter could not re-import.
+    validate_dashboard_name(&request.name)?;
+    validate_layout(&request.layout)?;
+    validate_panels(&request.panels)?;
 
     // Validate visibility
     let visibility = request.visibility.as_str();
@@ -200,13 +214,16 @@ pub async fn update_dashboard(
 ) -> Result<Json<Dashboard>, ApiError> {
     ensure_permission(&auth, permissions::DASHBOARDS_EDIT)?;
 
-    // Validate name if provided
+    // DSH14: enforce the same field limits as import/create, but only for the
+    // fields actually being changed (partial PUT).
     if let Some(ref name) = request.name {
-        if name.trim().is_empty() {
-            return Err(ApiError::ValidationError(
-                "Dashboard name cannot be empty".to_string(),
-            ));
-        }
+        validate_dashboard_name(name)?;
+    }
+    if let Some(ref layout) = request.layout {
+        validate_layout(layout)?;
+    }
+    if let Some(ref panels) = request.panels {
+        validate_panels(panels)?;
     }
 
     let repo = DashboardRepository::new(state.pool.clone());
@@ -219,8 +236,19 @@ pub async fn update_dashboard(
         refresh_interval: request.refresh_interval,
     };
 
-    // Use ownership-aware update
-    let dashboard = repo.update_owned(*id, auth.user_id(), &update).await?;
+    // DSH2: owner-or-admin only. Public/legacy (owner-less) dashboards are no
+    // longer world-editable by any `dashboards:edit` user — admins go through
+    // the explicit admin path (mirrors share/share_as_admin). DSH9: forward the
+    // client's last-seen `updated_at` so a concurrent edit yields 409 Conflict
+    // instead of a silent clobber.
+    let is_admin = check_permission(&auth, permissions::SETTINGS_SYSTEM).is_ok();
+    let dashboard = if is_admin {
+        repo.update_as_admin(*id, &update, request.expected_updated_at)
+            .await?
+    } else {
+        repo.update_owned(*id, auth.user_id(), &update, request.expected_updated_at)
+            .await?
+    };
 
     state.emit_audit(
         AuditEvent::builder(AuditSource::Dashboard, DASHBOARD_UPDATED)
@@ -347,7 +375,14 @@ pub async fn delete_dashboard(
     ensure_permission(&auth, permissions::DASHBOARDS_DELETE)?;
 
     let repo = DashboardRepository::new(state.pool.clone());
-    repo.delete_owned(*id, auth.user_id()).await?;
+    // DSH2: owner-or-admin only. Legacy (owner-less) dashboards are no longer
+    // deletable by arbitrary users; admins use the explicit admin path.
+    let is_admin = check_permission(&auth, permissions::SETTINGS_SYSTEM).is_ok();
+    if is_admin {
+        repo.delete_as_admin(*id).await?;
+    } else {
+        repo.delete_owned(*id, auth.user_id()).await?;
+    }
 
     state.emit_audit(
         AuditEvent::builder(AuditSource::Dashboard, DASHBOARD_DELETED)

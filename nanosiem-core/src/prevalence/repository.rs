@@ -171,6 +171,20 @@ impl PrevalenceRepository {
         Utc::now() - Duration::hours(time_window.hours())
     }
 
+    /// Index-eligible recency predicate (NAN-1729, P2-B): compare the RAW
+    /// `DateTime64(6)` column against a constant so the `idx_last_seen` /
+    /// `idx_first_seen` minmax skip indexes (migration 155) and part-level
+    /// min/max metadata can prune. The prior `reinterpretAsInt64(col) >= micros`
+    /// form wrapped the column in a function, which is opaque to the skip index —
+    /// forcing a full column scan of the `*_prevalence_summary` table on every
+    /// rare/new lookup. `micros` is epoch-microseconds (the DateTime64(6) tick
+    /// scale), so `fromUnixTimestamp64Micro` reconstructs the identical instant:
+    /// same rows, prunable predicate (verified byte-identical vs the reinterpret
+    /// form on local CH).
+    fn recency_at_least(col: &str, micros: i64) -> String {
+        format!("{col} >= fromUnixTimestamp64Micro(toInt64({micros}))")
+    }
+
     /// Query hash prevalence for a single hash
     #[instrument(skip(self))]
     pub async fn get_hash_prevalence(
@@ -597,6 +611,134 @@ impl PrevalenceRepository {
         self.client.query(&query).fetch_all().await
     }
 
+    /// NAN-1705 (D4b): fresh bulk prevalence straight from the per-entity
+    /// `*_prevalence_summary` tables — the CACHE dicts' OWN source data, read
+    /// directly so the dicts' negative caching (LIFETIME 900–1800s) cannot mask
+    /// a brand-new artifact. A brand-new artifact's absence is negative-cached
+    /// at ingest (the `logs.prevalence_*` MATERIALIZED-column lookups run before
+    /// the same insert block's summary-MV rows land), so `dictGetOrDefault`
+    /// returns the 9999 sentinel for 15–30 minutes after first sighting; the
+    /// summary itself is populated by insert-time MV chains and already carries
+    /// the artifact at its real host_count.
+    ///
+    /// Applies the dict source's exact contract (keep in lock-step with
+    /// clickhouse/130_memory_bound_dict_source_queries.sql):
+    ///   - entities with `host_count >= 1000` are excluded (the HAVING mirror) —
+    ///     a masked-common artifact can never be "rescued" into a rarity filter;
+    ///   - entities whose fresh `last_seen` falls outside the window cutoff are
+    ///     excluded (the NAN-364 mask the dict path applies at lookup time);
+    ///   - private IPs are excluded for [`DictArtifactKind::Ip`] (the source's
+    ///     `WHERE is_private = 0`).
+    ///
+    /// Bounded: the `GROUP BY` aggregates only the `IN (...)` artifacts (chunked
+    /// at [`DICT_QUERY_CHUNK`]), never the summary universe.
+    pub async fn get_bulk_summary_prevalence(
+        &self,
+        artifacts: &[String],
+        kind: DictArtifactKind,
+        time_window: TimeWindow,
+    ) -> Result<Vec<DictPrevalenceRow>, clickhouse::error::Error> {
+        if artifacts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut all_rows = Vec::with_capacity(artifacts.len().min(DICT_QUERY_CHUNK));
+        for chunk in artifacts.chunks(DICT_QUERY_CHUNK) {
+            let mut rows = self
+                .get_bulk_summary_prevalence_chunk(chunk, kind, time_window)
+                .await?;
+            all_rows.append(&mut rows);
+        }
+        Ok(all_rows)
+    }
+
+    /// Single-shot summary query for a bounded chunk. Caller must ensure
+    /// `chunk.len() <= DICT_QUERY_CHUNK`.
+    async fn get_bulk_summary_prevalence_chunk(
+        &self,
+        artifacts: &[String],
+        kind: DictArtifactKind,
+        time_window: TimeWindow,
+    ) -> Result<Vec<DictPrevalenceRow>, clickhouse::error::Error> {
+        // Same window-cutoff mapping as `get_bulk_prevalence_via_dict_chunk`
+        // (1h is defense-in-depth-coerced to 24h; search rejects it upstream).
+        let cutoff_sql = match time_window {
+            TimeWindow::OneHour | TimeWindow::TwentyFourHours => "now() - INTERVAL 1 DAY",
+            TimeWindow::SevenDays => "now() - INTERVAL 7 DAY",
+            TimeWindow::ThirtyDays => "toDateTime64(0, 6)",
+        };
+
+        // Summary storage is MV-lowercased for hash/domain; raw for IP —
+        // mirrors `DictArtifactKind::key_expr`.
+        let normalize = |a: &String| match kind {
+            DictArtifactKind::Hash | DictArtifactKind::Domain => a.to_lowercase(),
+            DictArtifactKind::Ip => a.clone(),
+        };
+        let artifact_list: String = artifacts
+            .iter()
+            .map(|a| format!("'{}'", escape_sql_string(normalize(a))))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let (table, key_col, state_col, extra_where) = match kind {
+            DictArtifactKind::Hash => (
+                self.hash_prevalence_summary.as_str(),
+                "file_hash",
+                "host_count",
+                "",
+            ),
+            DictArtifactKind::Domain => (
+                self.domain_prevalence_summary.as_str(),
+                "domain",
+                "source_host_count",
+                "",
+            ),
+            DictArtifactKind::Ip => (
+                self.ip_prevalence_summary.as_str(),
+                "ip",
+                "source_host_count",
+                "is_private = 0 AND ",
+            ),
+        };
+
+        let query = format!(
+            r#"
+            SELECT
+                artifact,
+                toUInt64(hc) AS host_count,
+                reinterpretAsInt64(fs) AS first_seen,
+                reinterpretAsInt64(ls) AS last_seen,
+                occ AS total_occurrences
+            FROM (
+                SELECT
+                    {key_col} AS artifact,
+                    toUInt16(least(9998, uniqMerge({state_col}))) AS hc,
+                    min(first_seen) AS fs,
+                    max(last_seen) AS ls,
+                    toUInt64(sum(total_count)) AS occ
+                FROM {table}
+                WHERE {extra_where}{key_col} IN ({artifact_list})
+                GROUP BY {key_col}
+            )
+            WHERE hc < 1000 AND ls >= {cutoff_sql}
+            "#,
+            key_col = key_col,
+            state_col = state_col,
+            table = table,
+            extra_where = extra_where,
+            artifact_list = artifact_list,
+            cutoff_sql = cutoff_sql,
+        );
+
+        debug!(
+            "Executing summary-based prevalence rescue query for {} {:?} artifacts",
+            artifacts.len(),
+            kind
+        );
+
+        self.client.query(&query).fetch_all().await
+    }
+
     /// Get rare artifacts (below threshold) that were active within the window.
     ///
     /// Reads the per-entity `hash_prevalence_summary` table (audit P10): the
@@ -645,6 +787,7 @@ impl PrevalenceRepository {
     ) -> Result<Vec<HashPrevalenceRow>, clickhouse::error::Error> {
         let cutoff = Self::get_cutoff_time(time_window);
         let cutoff_micros = cutoff.timestamp_micros();
+        let recency = Self::recency_at_least("last_seen", cutoff_micros);
 
         let query = format!(
             r#"
@@ -665,7 +808,7 @@ impl PrevalenceRepository {
                     sum(total_count) AS total_count
                 FROM (
                     SELECT * FROM {hash_prevalence_summary}
-                    WHERE reinterpretAsInt64(last_seen) >= {cutoff_micros}
+                    WHERE {recency}
                 )
                 GROUP BY file_hash, hash_type
             )
@@ -675,7 +818,7 @@ impl PrevalenceRepository {
             "#,
             hash_prevalence_summary = self.hash_prevalence_summary,
             threshold = threshold,
-            cutoff_micros = cutoff_micros,
+            recency = recency,
             limit = limit
         );
 
@@ -698,6 +841,7 @@ impl PrevalenceRepository {
     ) -> Result<Vec<DomainPrevalenceRow>, clickhouse::error::Error> {
         let cutoff = Self::get_cutoff_time(time_window);
         let cutoff_micros = cutoff.timestamp_micros();
+        let recency = Self::recency_at_least("last_seen", cutoff_micros);
 
         let query = format!(
             r#"
@@ -718,7 +862,7 @@ impl PrevalenceRepository {
                     sum(total_count) AS total_count
                 FROM (
                     SELECT * FROM {domain_prevalence_summary}
-                    WHERE reinterpretAsInt64(last_seen) >= {cutoff_micros}
+                    WHERE {recency}
                 )
                 GROUP BY domain
             )
@@ -727,7 +871,7 @@ impl PrevalenceRepository {
             LIMIT {limit}
             "#,
             domain_prevalence_summary = self.domain_prevalence_summary,
-            cutoff_micros = cutoff_micros,
+            recency = recency,
             threshold = threshold,
             limit = limit
         );
@@ -758,8 +902,11 @@ impl PrevalenceRepository {
         since: DateTime<Utc>,
         limit: i64,
     ) -> Result<Vec<HashPrevalenceRow>, clickhouse::error::Error> {
-        // Convert since to microseconds for comparison with reinterpretAsInt64
+        // NAN-1729 (P2-B): the recency predicate compares the raw `first_seen`
+        // column so the idx_first_seen minmax index prunes; `since_micros` feeds
+        // fromUnixTimestamp64Micro in recency_at_least (same instant, same rows).
         let since_micros = since.timestamp_micros();
+        let recency = Self::recency_at_least("first_seen", since_micros);
 
         let query = format!(
             r#"
@@ -780,7 +927,7 @@ impl PrevalenceRepository {
                     sum(total_count) AS total_count
                 FROM (
                     SELECT * FROM {hash_prevalence_summary}
-                    WHERE reinterpretAsInt64(first_seen) >= {since_micros}
+                    WHERE {recency}
                 )
                 GROUP BY file_hash, hash_type
             )
@@ -788,7 +935,7 @@ impl PrevalenceRepository {
             LIMIT {limit}
             "#,
             hash_prevalence_summary = self.hash_prevalence_summary,
-            since_micros = since_micros,
+            recency = recency,
             limit = limit
         );
 
@@ -807,8 +954,10 @@ impl PrevalenceRepository {
         since: DateTime<Utc>,
         limit: i64,
     ) -> Result<Vec<DomainPrevalenceRow>, clickhouse::error::Error> {
-        // Convert since to microseconds for comparison with reinterpretAsInt64
+        // NAN-1729 (P2-B): raw `first_seen` predicate (index-eligible) — see
+        // get_new_hashes.
         let since_micros = since.timestamp_micros();
+        let recency = Self::recency_at_least("first_seen", since_micros);
 
         let query = format!(
             r#"
@@ -829,7 +978,7 @@ impl PrevalenceRepository {
                     sum(total_count) AS total_count
                 FROM (
                     SELECT * FROM {domain_prevalence_summary}
-                    WHERE reinterpretAsInt64(first_seen) >= {since_micros}
+                    WHERE {recency}
                 )
                 GROUP BY domain
             )
@@ -837,7 +986,7 @@ impl PrevalenceRepository {
             LIMIT {limit}
             "#,
             domain_prevalence_summary = self.domain_prevalence_summary,
-            since_micros = since_micros,
+            recency = recency,
             limit = limit
         );
 
@@ -859,6 +1008,7 @@ impl PrevalenceRepository {
     ) -> Result<Vec<IpPrevalenceRow>, clickhouse::error::Error> {
         let cutoff = Self::get_cutoff_time(time_window);
         let cutoff_micros = cutoff.timestamp_micros();
+        let recency = Self::recency_at_least("last_seen", cutoff_micros);
 
         let query = format!(
             r#"
@@ -882,7 +1032,7 @@ impl PrevalenceRepository {
                 FROM (
                     SELECT * FROM {ip_prevalence_summary}
                     WHERE is_private = 0
-                      AND reinterpretAsInt64(last_seen) >= {cutoff_micros}
+                      AND {recency}
                 )
                 GROUP BY ip
             )
@@ -891,7 +1041,7 @@ impl PrevalenceRepository {
             LIMIT {limit}
             "#,
             ip_prevalence_summary = self.ip_prevalence_summary,
-            cutoff_micros = cutoff_micros,
+            recency = recency,
             threshold = threshold,
             limit = limit
         );
@@ -910,8 +1060,10 @@ impl PrevalenceRepository {
         since: DateTime<Utc>,
         limit: i64,
     ) -> Result<Vec<IpPrevalenceRow>, clickhouse::error::Error> {
-        // Convert since to microseconds for comparison with reinterpretAsInt64
+        // NAN-1729 (P2-B): raw `first_seen` predicate (index-eligible) — see
+        // get_new_hashes.
         let since_micros = since.timestamp_micros();
+        let recency = Self::recency_at_least("first_seen", since_micros);
 
         let query = format!(
             r#"
@@ -935,7 +1087,7 @@ impl PrevalenceRepository {
                 FROM (
                     SELECT * FROM {ip_prevalence_summary}
                     WHERE is_private = 0
-                      AND reinterpretAsInt64(first_seen) >= {since_micros}
+                      AND {recency}
                 )
                 GROUP BY ip
             )
@@ -943,7 +1095,7 @@ impl PrevalenceRepository {
             LIMIT {limit}
             "#,
             ip_prevalence_summary = self.ip_prevalence_summary,
-            since_micros = since_micros,
+            recency = recency,
             limit = limit
         );
 
@@ -1794,6 +1946,28 @@ impl PrevalenceRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NAN-1729 (P2-B): the recency predicate must compare the RAW DateTime64
+    /// column so the idx_last_seen / idx_first_seen minmax indexes (migration
+    /// 155) can prune. The old `reinterpretAsInt64(col) >= micros` form wrapped
+    /// the column and was opaque to the skip index — a full summary-column scan
+    /// on every rare/new lookup (Saturn: 30d rare-IP OOM'd at 1.86 GiB).
+    #[test]
+    fn recency_predicate_is_index_eligible() {
+        let p = PrevalenceRepository::recency_at_least("last_seen", 1_700_000_000_000_000);
+        assert_eq!(
+            p,
+            "last_seen >= fromUnixTimestamp64Micro(toInt64(1700000000000000))"
+        );
+        // Must NOT wrap the column in a function — that defeats the skip index.
+        assert!(
+            !p.contains("reinterpretAsInt64"),
+            "recency predicate must compare the raw column, got: {p}"
+        );
+        // first_seen (newness) variant compares the raw first_seen column too.
+        let f = PrevalenceRepository::recency_at_least("first_seen", 42);
+        assert_eq!(f, "first_seen >= fromUnixTimestamp64Micro(toInt64(42))");
+    }
 
     #[test]
     fn dict_artifact_kind_picks_correct_dict_and_key_expr() {

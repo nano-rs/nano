@@ -456,10 +456,6 @@ pub fn create_router(state: AppState) -> Router {
             get(handlers::get_fleet_health),
         )
         .route("/api/rules/noisy", get(handlers::get_noisy_rules))
-        .route(
-            "/api/rules/reload-realtime",
-            post(handlers::reload_realtime_rules),
-        )
         // Per-match review state (NAN-494)
         .route(
             "/api/matches/{id}/review",
@@ -1776,6 +1772,26 @@ pub fn create_router(state: AppState) -> Router {
         )
         // MITRE ATT&CK framework
         .route("/api/mitre/sync", post(handlers::mitre::sync_mitre_data))
+        // Detection-as-code push targets: AI tuning opens PRs here (NAN-1745).
+        .route(
+            "/api/detection-code-targets",
+            get(handlers::detection_code_targets::list_targets)
+                .post(handlers::detection_code_targets::create_target),
+        )
+        .route(
+            "/api/detection-code-targets/{id}",
+            get(handlers::detection_code_targets::get_target)
+                .put(handlers::detection_code_targets::update_target)
+                .delete(handlers::detection_code_targets::delete_target),
+        )
+        .route(
+            "/api/detection-code-targets/{id}/token",
+            post(handlers::detection_code_targets::set_token),
+        )
+        .route(
+            "/api/detection-code-targets/{id}/test",
+            post(handlers::detection_code_targets::test_connection),
+        )
         // Rule Repositories (external Sigma rule syncing)
         .route(
             "/api/rule-repositories",

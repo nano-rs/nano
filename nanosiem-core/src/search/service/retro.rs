@@ -303,7 +303,10 @@ impl SearchService {
 
         let sql = format!(
             "{} LIMIT {}",
-            ioc_feed_indicator_subquery(feed),
+            // Route the IOC feed subquery's source through the `_distributed`
+            // wrapper on clusters (completeness across shards); single-node emits
+            // the local name unchanged.
+            ioc_feed_indicator_subquery(feed, self.table_names.is_clustered()),
             RETRO_MAX_INDICATORS
         );
         match clickhouse.query(&sql).fetch_all::<String>().await {
@@ -627,9 +630,15 @@ impl SearchService {
             None => return Ok(("query".to_string(), None, 0)),
         };
         let escaped = escape_sql_string(&value.to_lowercase());
+        // Reads via the `_distributed` wrapper on clusters (custom_enrichment_results
+        // is in DISTRIBUTED_TABLES — per-shard table + additive wrapper) so the
+        // intel lookup sees all shards; `.read()` returns the local name on
+        // single-node → byte-identical. `ORDER BY confidence DESC LIMIT 1` already
+        // picks a single best row across shards (best-effort metadata).
+        let intel_table = self.table_names.read("custom_enrichment_results");
         let sql = format!(
             "SELECT enrichment_name, arrayStringConcat(tags, ','), toUInt32(confidence) \
-             FROM nanosiem.custom_enrichment_results \
+             FROM {intel_table} \
              WHERE is_ioc = 1 AND lower(key_value) = '{escaped}' \
              ORDER BY confidence DESC LIMIT 1"
         );

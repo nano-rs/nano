@@ -152,14 +152,25 @@ pub async fn disable_enrichment_source(
     // its LIFETIME. Best-effort: a CH hiccup must not fail the config write.
     if let Err(e) = enrichment.clear_ip_enrichments_for_source(&source_id).await {
         tracing::warn!(source_id = %source_id, error = %e, "Failed to tombstone CH IP enrichment rows on disable");
-    } else if let Err(e) = state
-        .dual_pool
-        .clickhouse()
-        .query("SYSTEM RELOAD DICTIONARY nanosiem.ip_enrichment_dict")
-        .execute()
-        .await
-    {
-        tracing::warn!(error = %e, "Failed to reload ip_enrichment_dict after disable");
+    } else {
+        // Fan the reload out to every node when clustered: the dict loads
+        // per-node, so a single-node reload would leave the other 5 nodes
+        // serving the disabled source's data until their LIFETIME expires
+        // (NAN-1728 H3). `on_cluster_clause()` is empty on single-node → the
+        // emitted `SYSTEM RELOAD DICTIONARY …` is byte-identical to before.
+        // TODO(NAN-1728 H3 follow-up): the dict sources from
+        // `ip_enrichment_dict_staging`, refreshed on a schedule (5m–6h); a
+        // `SYSTEM REFRESH VIEW ip_enrichment_dict_refresh` (+ WAIT) before the
+        // reload would make the tombstone visible immediately rather than at
+        // the next staging refresh. Deferred (async-refresh/reload race +
+        // pre-existing single-node staleness) — tracked separately.
+        let reload_sql = format!(
+            "SYSTEM RELOAD DICTIONARY{on_cluster} nanosiem.ip_enrichment_dict",
+            on_cluster = nanosiem_core::db::dual_pool::on_cluster_clause()
+        );
+        if let Err(e) = state.dual_pool.clickhouse().query(&reload_sql).execute().await {
+            tracing::warn!(error = %e, "Failed to reload ip_enrichment_dict after disable");
+        }
     }
     drop(enrichment);
 

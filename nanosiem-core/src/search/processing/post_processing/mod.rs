@@ -269,12 +269,17 @@ pub fn apply_post_prevalence_commands_with_limit(
                     })
                     .collect();
             }
+            // `inject_bounds` (NAN-1711 / audit D15) is intentionally ignored on
+            // this in-memory path: the SQL pushdown is the detection path; here
+            // the rows simply fall back to content-hash finding dedup (the
+            // pre-enrichment behavior — safe, never an error).
             Command::Top {
                 field,
                 limit,
                 by_fields,
                 show_count,
                 show_percent,
+                ..
             } => {
                 let (top_results, capped) = apply_top_rare_post_processing(
                     &results,
@@ -299,6 +304,7 @@ pub fn apply_post_prevalence_commands_with_limit(
                 by_fields,
                 show_count,
                 show_percent,
+                ..
             } => {
                 let (rare_results, capped) = apply_top_rare_post_processing(
                     &results,

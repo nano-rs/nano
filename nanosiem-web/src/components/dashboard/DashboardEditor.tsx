@@ -39,13 +39,52 @@ import { PanelEditor } from './PanelEditor';
 import { VariableEditor } from './VariableEditor';
 import { DashboardShareDialog } from './DashboardShareDialog';
 import { useUpdateDashboard, useCreateDashboard, usePanelQuery, toApiTimeRange, type TimeRangeValue } from '@/hooks/use-api';
-import type { Dashboard, PanelConfig, LayoutItem, DashboardLayout, DashboardVariable, CreateDashboardRequest, DashboardVisibility, DashboardShareResult } from '@/lib/api';
+import type { Dashboard, PanelConfig, LayoutItem, DashboardLayout, DashboardVariable, CreateDashboardRequest, UpdateDashboardRequest, DashboardVisibility, DashboardShareResult, TimeRange, SerializedTimeRange } from '@/lib/api';
 import { api } from '@/lib/api';
+import { isDashboardConflictError } from '@/lib/api/dashboards';
 import { DateTimeRangePicker } from '@/components/ui/date-time-range-picker';
 import {
   hydrateDashboardTimeRange,
   serializeDashboardTimeRange,
 } from '@/lib/dashboard-time-range';
+import { substituteVariables as substituteQueryVariables } from './variable-substitution';
+
+// DSH25: a panel's custom range may be persisted either as the new relative
+// SerializedTimeRange (preset stays rolling) or a legacy absolute { start, end }.
+// Resolve either to an absolute window at query time.
+function resolvePanelCustomRange(
+  cr: TimeRange | SerializedTimeRange | undefined,
+  fallback: TimeRange,
+): TimeRange {
+  if (!cr) return fallback;
+  if ('type' in cr) {
+    return toApiTimeRange(hydrateDashboardTimeRange(cr));
+  }
+  return cr;
+}
+
+// DSH49: only a real geometry change (x/y/w/h) should mark the layout dirty —
+// react-grid-layout fires onLayoutChange at mount just to inject minW/minH
+// defaults (and can vertically compact AI layouts that lack them), which used to
+// flag "Unsaved changes" on an untouched dashboard.
+function layoutPositionsDiffer(a: LayoutItem[], b: LayoutItem[]): boolean {
+  if (a.length !== b.length) return true;
+  const prevById = new Map(a.map(it => [it.i, it]));
+  for (const it of b) {
+    const prev = prevById.get(it.i);
+    if (!prev) return true;
+    if (prev.x !== it.x || prev.y !== it.y || prev.w !== it.w || prev.h !== it.h) return true;
+  }
+  return false;
+}
+
+// Stable empty-variables sentinel. `layout.variables || []` mints a FRESH array
+// on every render for a variable-less dashboard, which changes the identity of
+// `substituteVariables` (useCallback dep) and re-fires the panel-fetch effect
+// every render → infinite render loop + a flood of /panel/query requests the
+// moment such a dashboard is opened in edit mode. A shared frozen empty array
+// keeps the reference stable (variables is only ever read, never mutated).
+const EMPTY_VARIABLES: DashboardVariable[] = [];
 
 export interface DashboardEditorProps {
   /** Existing dashboard to edit (undefined for new dashboard) */
@@ -56,6 +95,11 @@ export interface DashboardEditorProps {
   onCancel?: () => void;
   /** Whether to start in edit mode */
   initialEditMode?: boolean;
+  /**
+   * DSH24: report unsaved-changes state up so the wrapping page can guard
+   * navigation (its Back button / beforeunload) against losing edits.
+   */
+  onDirtyChange?: (dirty: boolean) => void;
 }
 
 // Default layout configuration
@@ -135,6 +179,7 @@ export function DashboardEditor({
   onSave,
   onCancel,
   initialEditMode = true,
+  onDirtyChange,
 }: DashboardEditorProps) {
   const navigate = useNavigate();
   const { mutate: updateDashboard, loading: updating } = useUpdateDashboard();
@@ -147,8 +192,10 @@ export function DashboardEditor({
   const [description, setDescription] = useState(dashboard?.description || '');
   const [panels, setPanels] = useState<PanelConfig[]>(dashboard?.panels || []);
   const [layout, setLayout] = useState<DashboardLayout>(dashboard?.layout || DEFAULT_LAYOUT);
-  // Variables are stored inside layout for persistence
-  const variables = layout.variables || [];
+  // Variables are stored inside layout for persistence. Fall back to the shared
+  // stable sentinel (NOT a fresh `[]`) so a variable-less layout doesn't change
+  // `variables`' identity every render and spin the panel-fetch effect forever.
+  const variables = layout.variables ?? EMPTY_VARIABLES;
   const setVariables = (newVars: DashboardVariable[]) => {
     setLayout(prev => ({ ...prev, variables: newVars }));
   };
@@ -207,45 +254,33 @@ export function DashboardEditor({
     }
   }, [name, description, panels, layout, variables, dashboard]);
 
-  // Substitute variables in query string
-  // If a variable has no value, remove the entire "field=$var" clause to avoid type errors
+  // DSH24: surface dirty state to the wrapping page (its Back button + a
+  // beforeunload guard) so unsaved edits aren't lost on navigation.
+  useEffect(() => {
+    onDirtyChange?.(isDirty);
+  }, [isDirty, onDirtyChange]);
+
+  // Substitute variables in query string via the SHARED module (CONTRACT 5) so
+  // the editor preview matches the saved view exactly. In the editor we only
+  // have the authored defaults (no live selections), so those drive the values.
   const substituteVariables = useCallback((query: string): string => {
-    // Build variable map from defined variables
-    const varMap: Record<string, string> = {};
+    const definedNames = variables.map(v => v.name);
+    const values: Record<string, string> = {};
     for (const variable of variables) {
-      varMap[variable.name] = variable.defaultValue || '';
+      values[variable.name] = variable.defaultValue ?? '';
     }
-
-    // First, remove entire "field=$var" or "field = $var" clauses where variable is empty
-    // This handles cases like "duration=$duration" where duration is numeric
-    let result = query.replace(/\b(\w+)\s*=\s*\$([a-zA-Z_][a-zA-Z0-9_]*)\b/g, (_match, field, varName) => {
-      const value = varMap[varName];
-      if (!value) {
-        // Remove the entire clause
-        return '';
-      }
-      return `${field}=${value}`;
-    });
-
-    // Clean up any remaining $var patterns (not in field=$var format)
-    result = result.replace(/\$([a-zA-Z_][a-zA-Z0-9_]*)/g, (_, varName) => {
-      return varMap[varName] || '*';
-    });
-
-    // Clean up multiple spaces and trim
-    result = result.replace(/\s+/g, ' ').trim();
-
-    return result;
+    return substituteQueryVariables(query, values, definedNames);
   }, [variables]);
 
-  // Build complete variable map with fallback values for any undefined variables
+  // Build the variable map the Test modal previews with. Uses authored defaults
+  // (empty when unset) — NOT a `*` fallback — so the preview's empty-variable
+  // behaviour matches the saved view (DSH21 parity).
   const getCompleteVariables = useCallback(() => {
     if (!variables || variables.length === 0) return undefined;
 
     const completeVars: Record<string, string> = {};
     for (const variable of variables) {
-      // Use default value or '*' as fallback for preview
-      completeVars[variable.name] = variable.defaultValue || '*';
+      completeVars[variable.name] = variable.defaultValue ?? '';
     }
     return completeVars;
   }, [variables]);
@@ -260,7 +295,7 @@ export function DashboardEditor({
 
     try {
       const effectiveTimeRange = panel.timeRangeMode === 'custom' && panel.customTimeRange
-        ? panel.customTimeRange
+        ? resolvePanelCustomRange(panel.customTimeRange, toApiTimeRange(timeRange))
         : toApiTimeRange(timeRange);
 
       // NAN-1540: obs_metric widgets fetch from the metrics-v2 endpoint, not the
@@ -323,11 +358,12 @@ export function DashboardEditor({
     }
   }, [executePanelQuery, timeRange, substituteVariables]);
 
-  // Fetch data for all panels in batches (re-fetches when variables change).
-  // Cap concurrent queries at CONCURRENCY_LIMIT to stay under the backend
-  // per-user search admission limit (per_user_limit=5); otherwise a dashboard
-  // with >5 panels self-sheds (429 AdmissionDenied) on open / variable change.
-  // Mirrors DashboardView.refreshAllPanels. (NAN-1182)
+  // Fetch ALL panels on mount and whenever the time range or variable values
+  // change — both affect every panel. DSH45: we intentionally do NOT key this on
+  // the `panels` array, so renaming/adding one panel no longer refetches all N;
+  // per-panel edits/adds fetch just that panel in handleSavePanel. Cap concurrent
+  // queries at CONCURRENCY_LIMIT to stay under the backend per-user admission
+  // limit (per_user_limit=5). Mirrors DashboardView.refreshAllPanels. (NAN-1182)
   useEffect(() => {
     let cancelled = false;
     const CONCURRENCY_LIMIT = 4;
@@ -352,18 +388,21 @@ export function DashboardEditor({
     return () => {
       cancelled = true;
     };
-    // Re-fetch when panels change or when substituteVariables changes (due to variable changes)
+    // `panels`/`layout.items` are read but intentionally omitted so panel
+    // renames/adds don't trigger a full N-panel refetch (DSH45); `timeRange` is
+    // included so range changes refresh (which the old deps missed).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [panels, substituteVariables]);
+  }, [timeRange, substituteVariables]);
 
-  // Handle layout changes
+  // Handle layout changes. DSH49: ignore mount-time minW/minH-only churn.
   const handleLayoutChange = useCallback((newItems: LayoutItem[]) => {
+    if (!layoutPositionsDiffer(layout.items, newItems)) return;
     setLayout(prev => ({
       ...prev,
       items: newItems,
     }));
     setIsDirty(true);
-  }, []);
+  }, [layout.items]);
 
   // Add new panel
   const handleAddPanel = useCallback(() => {
@@ -382,6 +421,9 @@ export function DashboardEditor({
     if (editingPanel) {
       // Update existing panel
       setPanels(prev => prev.map(p => p.id === panelConfig.id ? panelConfig : p));
+      // DSH45: refetch ONLY the edited panel (the batch effect no longer keys on
+      // `panels`, so it won't re-run all N on this edit).
+      fetchPanelData(panelConfig);
     } else {
       // Add new panel
       const newPanel = {
@@ -389,7 +431,7 @@ export function DashboardEditor({
         id: generatePanelId(),
       };
       setPanels(prev => [...prev, newPanel]);
-      
+
       // Add layout item for new panel
       const position = findNextPosition(layout.items, layout.columns);
       setLayout(prev => ({
@@ -408,10 +450,11 @@ export function DashboardEditor({
         ],
       }));
 
-      // Fetch data for new panel
+      // Fetch data for the new panel (once — DSH45: the batch effect no longer
+      // also fetches it on the `panels` change).
       fetchPanelData(newPanel);
     }
-    
+
     setShowPanelEditor(false);
     setEditingPanel(null);
     setIsDirty(true);
@@ -499,32 +542,47 @@ export function DashboardEditor({
     }
 
     try {
-      const dashboardData: CreateDashboardRequest = {
-        name: name.trim(),
-        description: description.trim() || undefined,
-        layout, // variables are embedded in layout
-        panels,
-      };
-
       let savedDashboard: Dashboard;
-      
+
       if (dashboard?.id) {
-        savedDashboard = await updateDashboard({ id: dashboard.id, data: dashboardData });
+        // CONTRACT 2 / DSH13: send explicit `null` to CLEAR the description
+        // (undefined would leave it unchanged). DSH9: send the last-seen
+        // updated_at for optimistic concurrency; a mismatch → 409. The runtime
+        // body carries `description: null` / `expected_updated_at`; cast because
+        // the TS request type predates the clearable/concurrency fields.
+        const updateBody = {
+          name: name.trim(),
+          description: description.trim() === '' ? null : description.trim(),
+          layout, // variables are embedded in layout
+          panels,
+          expected_updated_at: dashboard.updated_at,
+        } as unknown as UpdateDashboardRequest;
+        savedDashboard = await updateDashboard({ id: dashboard.id, data: updateBody });
         toast.success('Dashboard saved');
       } else {
+        const dashboardData: CreateDashboardRequest = {
+          name: name.trim(),
+          description: description.trim() || undefined,
+          layout, // variables are embedded in layout
+          panels,
+        };
         savedDashboard = await createDashboard(dashboardData);
         toast.success('Dashboard created');
       }
 
       setIsDirty(false);
       onSave?.(savedDashboard);
-      
+
       if (!dashboard?.id) {
         // Navigate to the new dashboard
         navigate(`/dashboards/${savedDashboard.id}`);
       }
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed to save dashboard');
+      if (isDashboardConflictError(err)) {
+        toast.error('This dashboard changed on the server since you opened it. Reload to see the latest version before saving.');
+      } else {
+        toast.error(err instanceof Error ? err.message : 'Failed to save dashboard');
+      }
     }
   }, [name, description, layout, panels, variables, dashboard, updateDashboard, createDashboard, onSave, navigate]);
 

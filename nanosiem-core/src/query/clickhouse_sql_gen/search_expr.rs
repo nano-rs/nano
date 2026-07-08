@@ -188,12 +188,18 @@ pub(crate) fn scope_observables(
 /// (exact membership), so `threatfox("apt29")` finds rows tagged `apt29` or
 /// whose feed name contains `apt29`. `lower(key_value)` aligns with the
 /// `lower(col)` comparison legs and the raw ingest-lowercased columns.
-pub(crate) fn ioc_feed_indicator_subquery(feed: &IocFeed) -> String {
+pub(crate) fn ioc_feed_indicator_subquery(feed: &IocFeed, is_clustered: bool) -> String {
     let name = escape_string(&feed.name.to_lowercase());
     let arg = escape_string(&feed.arg.to_lowercase());
     let arg_raw = escape_string(&feed.arg);
+    // Reads via the `_distributed` wrapper on clusters (custom_enrichment_results
+    // is in DISTRIBUTED_TABLES — per-shard table + additive wrapper) so the IN
+    // set is complete across shards; on single-node `.read()` returns the local
+    // `nanosiem.custom_enrichment_results` → byte-identical. Dupes are harmless in
+    // an IN-subquery, so no version-collapse is needed here.
+    let table = crate::db::dual_pool::TableNames::new(is_clustered).read("custom_enrichment_results");
     format!(
-        "SELECT lower(key_value) FROM nanosiem.custom_enrichment_results \
+        "SELECT lower(key_value) FROM {table} \
          WHERE is_ioc = 1 AND expires_at > now() \
          AND (lower(enrichment_name) LIKE '%{name}%' \
          OR lower(enrichment_name) LIKE '%{arg}%' OR has(tags, '{arg_raw}'))"
@@ -772,7 +778,10 @@ impl ClickHouseSqlGenerator {
     /// `custom_enrichment_results` for the named feed (live IOC rows only).
     /// OCSF-aware: columns resolve per the active profile (NAN-1580).
     fn ioc_feed_match_filter(&self, feed: &IocFeed) -> String {
-        let subquery = ioc_feed_indicator_subquery(feed);
+        // `self.is_clustered` (set from `DualPool::TableNames::is_clustered()` via
+        // `with_cluster_routing`) routes the subquery source to the wrapper on
+        // clusters; single-node emits the local table name unchanged.
+        let subquery = ioc_feed_indicator_subquery(feed, self.is_clustered);
         let observables = resolve_ioc_observables(self.profile.as_ref());
         let mut clauses = Vec::new();
         for obs in &observables {
@@ -1788,6 +1797,27 @@ impl ClickHouseSqlGenerator {
             _ => {
                 // Numeric comparisons
                 let sql_op = comparator_to_sql(op);
+                // O44 (NAN-1721): a span/metrics attribute Map value is a String
+                // (`attributes['x']`), so a numeric range against it (`x > 5`) is
+                // otherwise String-vs-number → CH "no common type". Coerce the Map
+                // access to Float64 (and a non-numeric literal likewise → NULL, so
+                // the row is excluded) so the comparison is numeric. MapKey targets
+                // are spans/metrics-only; UDM `ext`/`metadata` and OCSF `event`
+                // numeric compares already emit a typed `JSONExtract*`/subcolumn
+                // extractor, so those stay byte-identical.
+                if self.resolves_to_map_key(&field_path) {
+                    let rhs = match value {
+                        Value::String(s) if s.parse::<f64>().is_err() => {
+                            format!("toFloat64OrNull({})", value_to_sql(value))
+                        }
+                        Value::String(s) => s.clone(),
+                        _ => value_to_sql(value),
+                    };
+                    return Ok(format!(
+                        "toFloat64OrNull({}) {} {}",
+                        field_expr, sql_op, rhs
+                    ));
+                }
                 Ok(format!("{} {} {}", field_expr, sql_op, value_to_sql(value)))
             }
         }
@@ -2133,6 +2163,26 @@ impl ClickHouseSqlGenerator {
                     _ => {
                         // Numeric comparisons
                         let sql_op = comparator_to_sql(op);
+                        // O44 (NAN-1721): when `column_ref` is a spans/metrics
+                        // attribute Map access (the same guard that produced it
+                        // above), a numeric range against its String value is
+                        // otherwise String-vs-number → CH "no common type". Coerce
+                        // both sides to Float64 (a non-numeric literal → NULL, so
+                        // the row is excluded). Non-map targets (columns, computed/
+                        // agg names) are untouched → byte-identical for logs.
+                        if self.resolves_to_map_key(field) && !self.is_computed_field(field) {
+                            let rhs = match value {
+                                Value::String(s) if s.parse::<f64>().is_err() => {
+                                    format!("toFloat64OrNull({})", value_sql)
+                                }
+                                Value::String(s) => s.clone(),
+                                _ => value_sql.clone(),
+                            };
+                            return Ok(format!(
+                                "toFloat64OrNull({}) {} {}",
+                                column_ref, sql_op, rhs
+                            ));
+                        }
                         Ok(format!("{} {} {}", column_ref, sql_op, value_sql))
                     }
                 }
@@ -2337,13 +2387,18 @@ impl ClickHouseSqlGenerator {
         })?;
 
         // NAN-1562: scope the subsearch to its own dataset. Cross-dataset only
-        // when the selected dataset's table differs from the outer table —
+        // when the subsearch targets a DIFFERENT dataset than the outer query —
         // `dataset=logs` from a logs query stays byte-identical. The clone shares
         // the Arc<profile> until `with_dataset` swaps it; its own
         // `generation_time_range` starts empty, so seed it from the outer range
         // for any nested subsearch resolution.
+        // O8 (NAN-1721): compare by DATASET IDENTITY, not `table_name` strings —
+        // an OCSF/tenant-prefixed logs table (`ocsf_logs` != `"logs"`) is NOT a
+        // different dataset; the string form falsely flagged it cross-dataset and
+        // re-pointed the sub at the wrong (`"logs"`) table (see `with_dataset`,
+        // which now restores the captured `base_table` on a `Dataset::Logs` swap).
         let cross_dataset = subsearch_dataset
-            .map(|ds| ds.table_name() != self.table_name)
+            .map(|ds| ds != self.dataset)
             .unwrap_or(false);
         let sub_gen_owned: Option<ClickHouseSqlGenerator> = if cross_dataset {
             let g = self.clone().with_dataset(subsearch_dataset.unwrap());

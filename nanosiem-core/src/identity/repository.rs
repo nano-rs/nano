@@ -10,6 +10,34 @@ use tracing::instrument;
 
 use super::types::*;
 use crate::crypto::EncryptionService;
+use crate::db::dual_pool::{on_cluster_clause, TableNames};
+
+/// Deduped read source for `user_registry` (NAN-1728).
+///
+/// `user_registry` is a per-shard ReplacingMergeTree with an additive
+/// `_distributed` wrapper (in DISTRIBUTED_TABLES). Reads MUST route through the
+/// wrapper so a user is visible regardless of which shard the sync INSERT landed
+/// on. But `FINAL` on a Distributed table only collapses WITHIN each shard, so
+/// the same `(provider_id, external_id)` written to two shards survives as two
+/// rows. On a cluster we therefore wrap the wrapper in a subquery that keeps the
+/// single highest-`version` row per logical user across shards
+/// (`ORDER BY version DESC LIMIT 1 BY provider_id, external_id`). `SELECT *`
+/// omits MATERIALIZED columns, so the `*_lc` filter columns are re-exposed
+/// explicitly. On single-node `.read()` returns the local name and this yields
+/// exactly `nanosiem.user_registry FINAL` — byte-identical to the pre-NAN-1728
+/// query.
+fn user_registry_read_source() -> String {
+    let tn = TableNames::new(!on_cluster_clause().is_empty());
+    let table = tn.read("user_registry");
+    if tn.is_clustered() {
+        format!(
+            "(SELECT *, username_lc, upn_lc, email_lc FROM {table} FINAL \
+             ORDER BY version DESC LIMIT 1 BY provider_id, external_id)"
+        )
+    } else {
+        format!("{table} FINAL")
+    }
+}
 
 // =============================================================================
 // Error Types
@@ -308,6 +336,13 @@ impl IdentityRepository {
         version_ms: i64,
         rows: &[UserRecordUpsert],
     ) -> Result<(), clickhouse::error::Error> {
+        // Writes the LOCAL name. NAN-1728: user_registry is a per-shard
+        // ReplacingMergeTree with an additive `_distributed` wrapper; this INSERT
+        // (used for both fresh upserts and the higher-version tombstones that
+        // implement soft-delete) lands on whichever shard the connection hit. The
+        // write path is deliberately left per-shard; reads route through the
+        // wrapper and collapse cross-shard duplicates by latest version (see
+        // `user_registry_read_source`). Single-node: the one shard holds all rows.
         let tuples = vec![Self::USER_VALUE_TUPLE; rows.len()].join(", ");
         let sql = format!(
             "INSERT INTO nanosiem.user_registry {} VALUES {}",
@@ -381,9 +416,15 @@ impl IdentityRepository {
         &self,
         provider_id: &str,
     ) -> Result<Vec<UserRegistryRow>, IdentityRepositoryError> {
+        // Routes through the `_distributed` wrapper on clusters (see
+        // `user_registry_read_source`) so the read half of the soft-delete
+        // read-mutate cycle sees every shard's live rows, cross-shard collapsed to
+        // the latest version per user. Single-node → local `… FINAL`,
+        // byte-identical.
         let ch = self.ch()?;
+        let src = user_registry_read_source();
         let rows: Vec<UserRegistryRow> = ch
-            .query(
+            .query(&format!(
                 "SELECT provider_id, external_id, username, upn, email, display_name, \
                     first_name, last_name, department, title, manager_upn, \
                     manager_display_name, company, office_location, city, country, groups, \
@@ -392,9 +433,9 @@ impl IdentityRepository {
                     toUnixTimestamp64Milli(created_in_directory_at) AS created_in_directory_at, \
                     phone, employee_id, employee_type, sync_hash, \
                     toUnixTimestamp64Milli(last_synced_at) AS last_synced_at, version \
-                 FROM nanosiem.user_registry FINAL \
+                 FROM {src} \
                  WHERE provider_id = ? AND account_status != 'deleted'",
-            )
+            ))
             .bind(provider_id)
             .fetch_all()
             .await?;
@@ -456,6 +497,14 @@ impl IdentityRepository {
 
     // ========================================================================
     // User Registry — Queries
+    //
+    // NAN-1728: `user_registry` is a per-shard ReplacingMergeTree with an additive
+    // `_distributed` wrapper (in DISTRIBUTED_TABLES). Every read below builds its
+    // FROM via `user_registry_read_source()`, which routes to the wrapper on
+    // clusters and cross-shard-collapses to the latest version per
+    // (provider_id, external_id) — because `FINAL` on a Distributed table only
+    // dedups within a shard. On single-node it degrades to `nanosiem.user_registry
+    // FINAL`, byte-identical to the pre-NAN-1728 queries.
     // ========================================================================
 
     #[instrument(skip(self))]
@@ -531,15 +580,20 @@ impl IdentityRepository {
             q
         };
 
-        // Count over the deduped (FINAL) set.
+        // Count over the deduped set — routed through the `_distributed` wrapper
+        // + cross-shard version-collapse on clusters (see
+        // `user_registry_read_source`); local `… FINAL` on single-node. Counting
+        // over the collapsed source avoids the ~Nx over-count a bare
+        // `Distributed FINAL` would produce (FINAL only dedups within a shard).
+        let src = user_registry_read_source();
         let count_sql = format!(
-            "SELECT count() FROM nanosiem.user_registry FINAL WHERE {where_clause}"
+            "SELECT count() FROM {src} WHERE {where_clause}"
         );
         let total: u64 = apply_binds(ch.query(&count_sql)).fetch_one().await?;
 
-        // Page of rows.
+        // Page of rows (same deduped source).
         let data_sql = format!(
-            "SELECT {cols} FROM nanosiem.user_registry FINAL WHERE {where_clause} \
+            "SELECT {cols} FROM {src} WHERE {where_clause} \
              ORDER BY display_name LIMIT ? OFFSET ?",
             cols = Self::SELECT_COLS
         );
@@ -563,8 +617,9 @@ impl IdentityRepository {
     ) -> Result<Option<UserRecord>, IdentityRepositoryError> {
         let ch = self.ch()?;
         let lower = identifier.to_lowercase();
+        let src = user_registry_read_source();
         let sql = format!(
-            "SELECT {cols} FROM nanosiem.user_registry FINAL \
+            "SELECT {cols} FROM {src} \
              WHERE account_status != 'deleted' \
                AND (username_lc = ? OR upn_lc = ? OR email_lc = ?) \
              ORDER BY account_status = 'active' DESC, version DESC \
@@ -588,8 +643,13 @@ impl IdentityRepository {
         let ch = self.ch()?;
         let (provider_id, external_id) = UserRecord::split_composite_id(id)
             .ok_or_else(|| IdentityRepositoryError::ProviderNotFound(format!("User {}", id)))?;
+        // Deduped source (wrapper + cross-shard collapse on clusters): without it
+        // a `Distributed FINAL … LIMIT 1` could return a stale-version row from
+        // one shard. The collapse keeps one latest-version row per user, so
+        // LIMIT 1 is unambiguous.
+        let src = user_registry_read_source();
         let sql = format!(
-            "SELECT {cols} FROM nanosiem.user_registry FINAL \
+            "SELECT {cols} FROM {src} \
              WHERE provider_id = ? AND external_id = ? LIMIT 1",
             cols = Self::SELECT_COLS
         );
@@ -608,11 +668,12 @@ impl IdentityRepository {
     #[instrument(skip(self))]
     pub async fn get_user_count(&self, provider_id: &str) -> Result<i64, IdentityRepositoryError> {
         let ch = self.ch()?;
+        let src = user_registry_read_source();
         let count: u64 = ch
-            .query(
-                "SELECT count() FROM nanosiem.user_registry FINAL \
+            .query(&format!(
+                "SELECT count() FROM {src} \
                  WHERE provider_id = ? AND account_status != 'deleted'",
-            )
+            ))
             .bind(provider_id)
             .fetch_one()
             .await?;
@@ -627,26 +688,31 @@ impl IdentityRepository {
     pub async fn get_stats(&self) -> Result<IdentityStats, IdentityRepositoryError> {
         let ch = self.ch()?;
 
-        // Aggregate counts over the deduped CH set.
+        // Aggregate counts over the deduped CH set — wrapper + cross-shard
+        // version-collapse on clusters (see `user_registry_read_source`), local
+        // `… FINAL` on single-node. Counting over the collapsed source is what
+        // makes these totals correct on a cluster (a bare `Distributed FINAL`
+        // count would multiply by the number of shards a user was written to).
+        let src = user_registry_read_source();
         let total_users: u64 = ch
-            .query(
-                "SELECT count() FROM nanosiem.user_registry FINAL \
+            .query(&format!(
+                "SELECT count() FROM {src} \
                  WHERE account_status != 'deleted'",
-            )
+            ))
             .fetch_one()
             .await?;
         let active_users: u64 = ch
-            .query(
-                "SELECT count() FROM nanosiem.user_registry FINAL \
+            .query(&format!(
+                "SELECT count() FROM {src} \
                  WHERE account_status = 'active'",
-            )
+            ))
             .fetch_one()
             .await?;
         let disabled_users: u64 = ch
-            .query(
-                "SELECT count() FROM nanosiem.user_registry FINAL \
+            .query(&format!(
+                "SELECT count() FROM {src} \
                  WHERE account_status IN ('disabled', 'suspended')",
-            )
+            ))
             .fetch_one()
             .await?;
 
@@ -660,10 +726,10 @@ impl IdentityRepository {
             cnt: u64,
         }
         let provider_counts: Vec<ProviderCount> = ch
-            .query(
-                "SELECT provider_id, count() AS cnt FROM nanosiem.user_registry FINAL \
+            .query(&format!(
+                "SELECT provider_id, count() AS cnt FROM {src} \
                  WHERE account_status != 'deleted' GROUP BY provider_id",
-            )
+            ))
             .fetch_all()
             .await?;
         let count_by_provider: std::collections::HashMap<String, i64> = provider_counts

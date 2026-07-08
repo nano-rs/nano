@@ -179,6 +179,24 @@ impl MaterializedViewGenerator {
         }
     }
 
+    /// ` ON CLUSTER \`<name>\`` when `CLICKHOUSE_CLUSTER` is set (the deploy sets
+    /// it only on clustered ClickHouse), else empty. Real-time MV DDL is built at
+    /// runtime, so — unlike migrations, which the cluster init auto-injects
+    /// `ON CLUSTER` into — it must add the clause itself (audit D8).
+    ///
+    /// NAN-1728: the pure-formatting half now delegates to the canonical runtime
+    /// helper in `crate::db::dual_pool` (no behavior change — that helper
+    /// preserves the backtick-quoted form). The env read stays here.
+    fn on_cluster_clause() -> String {
+        Self::format_on_cluster(std::env::var("CLICKHOUSE_CLUSTER").ok().as_deref())
+    }
+
+    /// Pure formatter for [`Self::on_cluster_clause`] (testable without env).
+    /// Thin re-export of the shared formatter.
+    fn format_on_cluster(cluster: Option<&str>) -> String {
+        crate::db::dual_pool::format_on_cluster(cluster)
+    }
+
     /// Set the active schema profile (OCSF, NAN-1241). Makes the generated MV
     /// DDL schema-aware end to end: FROM table, `<table>.id` matched-log key,
     /// WHERE-clause column resolution, risk-entity auto-detection, and DDL
@@ -284,7 +302,12 @@ impl MaterializedViewGenerator {
     pub async fn drop_view(&self, view_name: &str) -> Result<(), MaterializedViewError> {
         info!("Dropping materialized view {}", view_name);
 
-        let ddl = format!("DROP VIEW IF EXISTS {}", view_name);
+        // Audit D8: drop ON CLUSTER too, or the view lingers on other nodes.
+        let ddl = format!(
+            "DROP VIEW IF EXISTS {}{}",
+            view_name,
+            Self::on_cluster_clause()
+        );
 
         self.clickhouse_client
             .query(&ddl)
@@ -460,8 +483,21 @@ impl MaterializedViewGenerator {
         // where none of the outer projection aliases are in scope, so the WHERE
         // always references the TRUE base columns. The outer projection then only
         // re-labels already-filtered rows and can safely reuse base-column names.
+        // Audit D8: on a cluster the MV must be created ON CLUSTER so it exists
+        // (and fires) on every node — otherwise it lives on only the node the
+        // admin pool hit, and logs ingested on any other shard/replica never
+        // pass it (silent zero alerts). Empty on single-node/open-core, so that
+        // DDL is byte-identical. The MV writes `TO signals` (the LOCAL table on
+        // each node); `signals_distributed` (already in DISTRIBUTED_TABLE_SET)
+        // fans the SignalProcessor's reads across shards.
+        //
+        // Audit D9: widened the freshness floor from 1h to 24h. Parsed events
+        // carry the LOG timestamp, not ingest time, so a 1h floor dropped
+        // normal batch-forwarded / outage-replayed events; 24h keeps a bound so
+        // the MV doesn't rescan unbounded history per insert.
+        let on_cluster = Self::on_cluster_clause();
         let ddl = format!(
-            r#"CREATE MATERIALIZED VIEW {} TO signals AS
+            r#"CREATE MATERIALIZED VIEW {}{} TO signals AS
 SELECT
     generateUUIDv4() AS id,
     timestamp,
@@ -479,9 +515,10 @@ FROM (
         {}.id AS matched_log_id
     FROM {}
     WHERE {}
-      AND timestamp >= now() - INTERVAL 1 HOUR
+      AND timestamp >= now() - INTERVAL 24 HOUR
 ) AS matched_logs"#,
             view_name,
+            on_cluster,
             rule.id,
             crate::sql_hygiene::escape_sql_string(&rule.name), // Escape backslashes + single quotes
             format!("{:?}", rule.severity).to_lowercase(),
@@ -699,6 +736,19 @@ mod tests {
     use chrono::Utc;
     use uuid::Uuid;
 
+    #[test]
+    fn format_on_cluster_gates_on_cluster_name() {
+        // Audit D8: single-node/open-core (no cluster name) → no clause, so the
+        // MV DDL is byte-identical. A configured cluster → the ON CLUSTER clause.
+        assert_eq!(MaterializedViewGenerator::format_on_cluster(None), "");
+        assert_eq!(MaterializedViewGenerator::format_on_cluster(Some("")), "");
+        assert_eq!(MaterializedViewGenerator::format_on_cluster(Some("  ")), "");
+        assert_eq!(
+            MaterializedViewGenerator::format_on_cluster(Some("nano_cluster")),
+            " ON CLUSTER `nano_cluster`"
+        );
+    }
+
     /// DetectionRule fixture matching the current struct shape. `DetectionRule`
     /// has no `Default`, so every field is set explicitly; keep this in sync when
     /// the model changes (the previous fixture rotted, which is why this whole
@@ -854,7 +904,10 @@ mod tests {
         assert!(ddl.contains("TO signals"));
         assert!(ddl.contains("src_ip AS risk_entity"));
         assert!(ddl.contains("75 AS risk_score"));
-        assert!(ddl.contains("AND timestamp >= now() - INTERVAL 1 HOUR"));
+        assert!(ddl.contains("AND timestamp >= now() - INTERVAL 24 HOUR"));
+        // No CLICKHOUSE_CLUSTER in tests → no ON CLUSTER clause (single-node DDL
+        // is byte-identical). Audit D8.
+        assert!(!ddl.contains("ON CLUSTER"));
     }
 
     /// NAN-1142: the real-time WHERE clause must be byte-for-byte identical to the

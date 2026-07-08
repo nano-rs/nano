@@ -158,6 +158,9 @@ impl TuningRepository {
                 current_hints: None,
                 proposed_hints: None,
                 hints_diff: None,
+                pr_url: None,
+                pr_number: None,
+                pr_state: None,
             };
 
             let test_results = if let Ok(_test_id) = row.try_get::<Uuid, _>("test_id") {
@@ -283,6 +286,9 @@ impl TuningRepository {
                 current_hints: None,
                 proposed_hints: None,
                 hints_diff: None,
+                pr_url: None,
+                pr_number: None,
+                pr_state: None,
             };
 
             let test_results = if let Ok(_test_id) = row.try_get::<Uuid, _>("test_id") {
@@ -408,6 +414,9 @@ impl TuningRepository {
                 current_hints: None,
                 proposed_hints: None,
                 hints_diff: None,
+                pr_url: None,
+                pr_number: None,
+                pr_state: None,
             };
 
             let test_results = if let Ok(_test_id) = row.try_get::<Uuid, _>("test_id") {

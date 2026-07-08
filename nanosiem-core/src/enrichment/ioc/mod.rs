@@ -18,6 +18,7 @@ mod types;
 
 pub use types::IocLookupResult;
 
+use crate::db::dual_pool::{on_cluster_clause, TableNames};
 use clickhouse::Row;
 use serde::Deserialize as SerdeDeserialize;
 use thiserror::Error;
@@ -83,8 +84,22 @@ pub async fn lookup_ioc_all_sources(
     // suppress immediately, join against `marketplace_catalog` /
     // `custom_enrichments` on `enrichment_id` and filter on
     // `enabled = true`.
+    // Reads via the `_distributed` wrapper on clusters (custom_enrichment_results
+    // is in DISTRIBUTED_TABLES — a per-shard table with an additive wrapper); on
+    // single-node `.read()` returns the local name, so the emitted table
+    // reference is byte-identical. Routing through the wrapper is required so the
+    // read covers ALL shards, not the one this connection landed on.
+    //
+    // No `argMax(…, version)` collapse here — unlike a single-row lookup, this
+    // query DELIBERATELY reads every version of a row to recover first_seen /
+    // last_seen from `min/max(fetched_at)` (see the note above). Cross-shard
+    // duplicates of the same content merge into the same GROUP BY bucket (min/max
+    // are idempotent, tags are arrayDistinct'd), so completeness — not
+    // version-collapse — is the correct multi-shard fix; this matches the
+    // existing single-shard pre-merge semantics.
+    let table = TableNames::new(!on_cluster_clause().is_empty()).read("custom_enrichment_results");
     let rows: Vec<CustomEnrichmentIocRow> = ch
-        .query(
+        .query(&format!(
             "SELECT
                  enrichment_name,
                  key_type,
@@ -94,13 +109,13 @@ pub async fn lookup_ioc_all_sources(
                  toUnixTimestamp(min(fetched_at)) AS first_seen,
                  toUnixTimestamp(max(fetched_at)) AS last_seen,
                  arrayDistinct(arrayFlatten(groupArray(tags))) AS tags
-             FROM nanosiem.custom_enrichment_results
+             FROM {table}
              WHERE key_value = ?
                AND is_ioc = 1
                AND expires_at > now()
              GROUP BY enrichment_name, key_type, threat_type, malware, confidence
              ORDER BY confidence DESC, enrichment_name",
-        )
+        ))
         .bind(value)
         .fetch_all()
         .await?;

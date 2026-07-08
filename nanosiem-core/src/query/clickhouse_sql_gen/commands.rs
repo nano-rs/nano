@@ -31,13 +31,17 @@ impl ClickHouseSqlGenerator {
         // rewrite may scan twice (NAN-1636).
         source_is_deterministic_base: bool,
     ) -> Result<String, SqlGenError> {
-        // Whether the raw `timestamp` column still exists at this pipeline stage:
+        // Whether the raw time column still exists at this pipeline stage:
         // false after an aggregating command (stats/timechart/top/...) or after a
         // table/fields projection that dropped it. tail/reverse branch on this.
+        // O27 (NAN-1721): key on the active dataset's time column (`start_time`
+        // for spans), not the literal `timestamp` — which does not exist on
+        // `otel_spans`, so a bare `dataset=spans * | tail 5` errored. Logs keep
+        // `timestamp` byte-identical.
         let timestamp_available = !aggregated
             && match available_columns {
                 None => true,
-                Some(cols) => cols.contains("timestamp"),
+                Some(cols) => cols.contains(self.time_column()),
             };
         match cmd {
             Command::Stats {
@@ -113,9 +117,12 @@ impl ClickHouseSqlGenerator {
             Command::Tail { count } => {
                 if timestamp_available {
                     // Raw events: last N by time = oldest N (search default order is newest-first),
-                    // presented oldest-first. Unchanged behavior.
+                    // presented oldest-first. Unchanged behavior. O27 (NAN-1721):
+                    // order on the dataset time column (`start_time` for spans);
+                    // logs keep `timestamp` byte-identical.
+                    let tc = self.time_column();
                     Ok(format!(
-                        "  SELECT * FROM (\n    SELECT * FROM {}\n    ORDER BY timestamp DESC\n    LIMIT {}\n  )\n  ORDER BY timestamp ASC",
+                        "  SELECT * FROM (\n    SELECT * FROM {}\n    ORDER BY {tc} DESC\n    LIMIT {}\n  )\n  ORDER BY {tc} ASC",
                         source, count
                     ))
                 } else {
@@ -278,28 +285,45 @@ impl ClickHouseSqlGenerator {
                 //  - `id` must still exist at this stage — an upstream
                 //    include-mode `fields`/`table` that pruned it would make the
                 //    IN-subquery UNKNOWN_IDENTIFIER;
-                //  - `id`/`timestamp` must be the physical row identity — not an
-                //    upstream `eval id=…`/`eval timestamp=…` reassignment, and
-                //    only on profiles whose core columns carry them (logs, not
-                //    spans/metrics).
-                let id_available = match available_columns {
-                    None => true,
-                    Some(cols) => cols.contains("id"),
+                //  - the survivor id / time column must be the physical row
+                //    identity — not an upstream `eval id=…`/`eval timestamp=…`
+                //    reassignment.
+                // O27 (NAN-1721): the survivor id and time columns are
+                // profile-relative. Logs carry `(id, timestamp)` — byte-identical
+                // to the legacy shape; spans carry `(span_id, start_time)` (the
+                // spans-safe survivor key). Profiles with no per-row id column
+                // (metrics) fall to the LIMIT-BY shape below, whose ORDER BY now
+                // uses the dataset time column instead of a hardcoded `timestamp`
+                // that does not exist on `otel_spans`.
+                let time_col = self.time_column();
+                let survivor_id = self.row_identity_column();
+                let survivor_available = match survivor_id {
+                    None => false,
+                    Some(sid) => match available_columns {
+                        None => true,
+                        Some(cols) => cols.contains(sid),
+                    },
                 };
-                let id_is_row_identity = self.profile.core_fields().contains(&"id")
-                    && self.profile.core_fields().contains(&"timestamp")
-                    && !self.is_upstream_computed_field("id")
-                    && !self.is_upstream_computed_field("timestamp");
-                if source_is_deterministic_base && id_available && id_is_row_identity {
+                let survivor_is_row_identity = match survivor_id {
+                    None => false,
+                    Some(sid) => {
+                        self.profile.core_fields().contains(&time_col)
+                            && !self.is_upstream_computed_field(sid)
+                            && !self.is_upstream_computed_field(time_col)
+                    }
+                };
+                if source_is_deterministic_base && survivor_available && survivor_is_row_identity {
+                    let sid = survivor_id
+                        .expect("survivor_id is Some under the row-identity guard");
                     Ok(format!(
-                        "  SELECT * FROM {src}\n  WHERE id IN (\n    SELECT argMin(id, timestamp) FROM {src}\n    GROUP BY {partition_by}\n  )",
+                        "  SELECT * FROM {src}\n  WHERE {sid} IN (\n    SELECT argMin({sid}, {time_col}) FROM {src}\n    GROUP BY {partition_by}\n  )",
                         src = source
                     ))
                 } else {
                     // ClickHouse uses LIMIT 1 BY for deduplication
                     Ok(format!(
-                        "  SELECT * FROM {}\n  ORDER BY {}, timestamp\n  LIMIT 1 BY {}",
-                        source, partition_by, partition_by
+                        "  SELECT * FROM {}\n  ORDER BY {}, {}\n  LIMIT 1 BY {}",
+                        source, partition_by, time_col, partition_by
                     ))
                 }
             }
@@ -311,23 +335,27 @@ impl ClickHouseSqlGenerator {
             } => {
                 match span {
                     BinSpan::Time(duration) => {
-                        // Generate ClickHouse SQL for time-based bin command
-                        // Map _time (PPL convention) to timestamp (ClickHouse column)
-                        let field_name = match field.as_deref() {
-                            Some("_time") | None => "timestamp",
-                            Some(f) => f,
-                        };
+                        // Generate ClickHouse SQL for time-based bin command.
+                        // O7 (NAN-1721): resolve the binned field to the active
+                        // dataset's time column — `bin`/`bin _time`/`bin timestamp`
+                        // all bucket on `start_time` for spans (a literal
+                        // `timestamp` column does not exist there), and an explicit
+                        // non-time field canonicalizes through the profile. Logs
+                        // keep `timestamp` byte-identical (`time_column()` matches
+                        // the pre-fix literal default and the free alias map).
+                        let field_name = self.bin_field_name(field.as_deref());
                         // Determine alias:
                         // - If alias provided, use it
                         // - If field was explicitly specified, use field name (in-place modification)
-                        // - If no field specified (default timestamp), use "time_bucket"
-                        let alias_name = alias.as_deref().unwrap_or_else(|| {
-                            if field.is_some() {
-                                field_name
-                            } else {
-                                "time_bucket"
-                            }
-                        });
+                        // - If no field specified (default time column), use "time_bucket"
+                        let alias_name: String =
+                            alias.as_deref().map(String::from).unwrap_or_else(|| {
+                                if field.is_some() {
+                                    field_name.clone()
+                                } else {
+                                    "time_bucket".to_string()
+                                }
+                            });
                         let span_seconds = duration.as_secs();
 
                         match window_type {
@@ -335,9 +363,14 @@ impl ClickHouseSqlGenerator {
                                 // Standard tumbling window - non-overlapping fixed windows
                                 let time_bucket_expr = self.generate_time_bucket(duration);
 
-                                // Replace "timestamp" with the actual field name if different
-                                let bucket_expr = if field_name != "timestamp" {
-                                    time_bucket_expr.replace("timestamp", field_name)
+                                // `generate_time_bucket` buckets on the dataset time
+                                // column; retarget it when the user binned a DIFFERENT
+                                // field. O7 (NAN-1721): compare/replace against the
+                                // time column, not a hardcoded `timestamp` (which is
+                                // `start_time` on spans).
+                                let time_col = self.time_column();
+                                let bucket_expr = if field_name.as_str() != time_col {
+                                    time_bucket_expr.replace(time_col, field_name.as_str())
                                 } else {
                                     time_bucket_expr
                                 };
@@ -347,16 +380,16 @@ impl ClickHouseSqlGenerator {
                                 if alias_name == field_name {
                                     Ok(format!(
                                         "  SELECT * EXCEPT ({}), {} AS {} FROM {}",
-                                        escape_identifier(field_name),
+                                        escape_identifier(&field_name),
                                         bucket_expr,
-                                        escape_identifier(alias_name),
+                                        escape_identifier(&alias_name),
                                         source
                                     ))
                                 } else {
                                     Ok(format!(
                                         "  SELECT *, {} AS {} FROM {}",
                                         bucket_expr,
-                                        escape_identifier(alias_name),
+                                        escape_identifier(&alias_name),
                                         source
                                     ))
                                 }
@@ -375,10 +408,10 @@ impl ClickHouseSqlGenerator {
                                     toDateTime(toInt64(toDateTime({field})) - toInt64(toDateTime({field})) % {advance} + window_offset + {span}) AS {alias}_end \
                                     FROM {source} \
                                     ARRAY JOIN arrayMap(x -> -x * {advance}, range(0, {num_windows})) AS window_offset",
-                                    field = escape_identifier(field_name),
+                                    field = escape_identifier(&field_name),
                                     advance = advance_seconds,
                                     span = span_seconds,
-                                    alias = escape_identifier(alias_name),
+                                    alias = escape_identifier(&alias_name),
                                     source = source,
                                     num_windows = num_windows
                                 ))
@@ -392,9 +425,9 @@ impl ClickHouseSqlGenerator {
                                     {field} AS {alias}, \
                                     toDateTime(toInt64(toDateTime({field})) + {span}) AS {alias}_end \
                                     FROM {source}",
-                                    field = escape_identifier(field_name),
+                                    field = escape_identifier(&field_name),
                                     span = span_seconds,
-                                    alias = escape_identifier(alias_name),
+                                    alias = escape_identifier(&alias_name),
                                     source = source
                                 ))
                             }
@@ -563,6 +596,7 @@ impl ClickHouseSqlGenerator {
                 by_fields,
                 show_count,
                 show_percent,
+                inject_bounds,
             } => {
                 // Normalized output alias (raw name for an upstream
                 // value-computed field — it shadows the schema alias, NAN-1341)
@@ -593,6 +627,15 @@ impl ClickHouseSqlGenerator {
                     select_parts.push(
                         "round(count() * 100.0 / sum(count()) OVER (), 2) AS percent".to_string(),
                     );
+                }
+                if *inject_bounds && !top_rare_bounds_alias_collision(field, by_fields, self) {
+                    // NAN-1711 / audit D15: canonical per-group activity window,
+                    // set only by detection query enrichment (gated on the raw
+                    // `timestamp` still being in the stream — D3). Resolved via
+                    // field_to_sql_expr so it matches the stats-path emission.
+                    let (ts_expr, _) = field_to_sql_expr("timestamp", self);
+                    select_parts.push(format!("min({}) AS _first_seen", ts_expr));
+                    select_parts.push(format!("max({}) AS _last_seen", ts_expr));
                 }
 
                 let mut group_by_parts = vec![field_group_by.clone()];
@@ -637,6 +680,7 @@ impl ClickHouseSqlGenerator {
                 by_fields,
                 show_count,
                 show_percent,
+                inject_bounds,
             } => {
                 // Normalized output alias (raw name for an upstream
                 // value-computed field — it shadows the schema alias, NAN-1341)
@@ -667,6 +711,12 @@ impl ClickHouseSqlGenerator {
                     select_parts.push(
                         "round(count() * 100.0 / sum(count()) OVER (), 2) AS percent".to_string(),
                     );
+                }
+                if *inject_bounds && !top_rare_bounds_alias_collision(field, by_fields, self) {
+                    // NAN-1711 / audit D15 — see the `top` arm.
+                    let (ts_expr, _) = field_to_sql_expr("timestamp", self);
+                    select_parts.push(format!("min({}) AS _first_seen", ts_expr));
+                    select_parts.push(format!("max({}) AS _last_seen", ts_expr));
                 }
 
                 let mut group_by_parts = vec![field_group_by.clone()];
@@ -738,15 +788,28 @@ impl ClickHouseSqlGenerator {
                     })
                     .collect();
 
+                // O27 (NAN-1721): transaction aggregates on the dataset time column
+                // (`start_time` for spans) and captures the dataset's free-text
+                // column (`span_name` for spans) — not the logs-only
+                // `timestamp`/`message` columns, absent on `otel_spans`. The window
+                // ORDER BY tie-break uses the profile row-identity column (`span_id`
+                // on spans). Logs keep `timestamp`/`message`/`id` byte-identical.
+                let tc = self.time_column();
+                let kw = self.profile.keyword_search_column();
+                let order_tiebreak = match self.row_identity_column() {
+                    Some(id) => format!("{tc}, {id}"),
+                    None => tc.to_string(),
+                };
+
                 let having_clause = match (maxspan, maxevents) {
                     (Some(d), Some(n)) => {
                         let secs = d.as_secs();
-                        format!("\n  HAVING count() <= {} AND dateDiff('second', min(timestamp), max(timestamp)) <= {}", n, secs)
+                        format!("\n  HAVING count() <= {} AND dateDiff('second', min({tc}), max({tc})) <= {}", n, secs)
                     }
                     (Some(d), None) => {
                         let secs = d.as_secs();
                         format!(
-                            "\n  HAVING dateDiff('second', min(timestamp), max(timestamp)) <= {}",
+                            "\n  HAVING dateDiff('second', min({tc}), max({tc})) <= {}",
                             secs
                         )
                     }
@@ -762,7 +825,7 @@ impl ClickHouseSqlGenerator {
                 // No start/end markers: one transaction per group key (legacy form).
                 if startswith.is_none() && endswith.is_none() {
                     return Ok(format!(
-                        "  SELECT \n    {fields},\n    count() AS eventcount,\n    dateDiff('second', min(timestamp), max(timestamp)) AS duration,\n    min(timestamp) AS transaction_start,\n    max(timestamp) AS transaction_end,\n    groupArray({limit})(message) AS _raw_events\n  FROM {source}\n  GROUP BY {group_by}{having}\n  ORDER BY transaction_start DESC",
+                        "  SELECT \n    {fields},\n    count() AS eventcount,\n    dateDiff('second', min({tc}), max({tc})) AS duration,\n    min({tc}) AS transaction_start,\n    max({tc}) AS transaction_end,\n    groupArray({limit})({kw}) AS _raw_events\n  FROM {source}\n  GROUP BY {group_by}{having}\n  ORDER BY transaction_start DESC",
                         fields = group_by_fields.join(", "),
                         limit = array_limit,
                         source = source,
@@ -797,20 +860,20 @@ impl ClickHouseSqlGenerator {
                 let partition = group_by_refs.join(", ");
                 let session_expr = if startswith.is_some() {
                     format!(
-                        "sum(_txn_is_start) OVER (PARTITION BY {partition} ORDER BY timestamp, id ROWS UNBOUNDED PRECEDING)"
+                        "sum(_txn_is_start) OVER (PARTITION BY {partition} ORDER BY {order_tiebreak} ROWS UNBOUNDED PRECEDING)"
                     )
                 } else {
                     // endswith only: a new transaction begins on the row AFTER an
                     // end marker, so count only strictly-preceding end markers.
                     format!(
-                        "1 + sum(_txn_is_end) OVER (PARTITION BY {partition} ORDER BY timestamp, id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)"
+                        "1 + sum(_txn_is_end) OVER (PARTITION BY {partition} ORDER BY {order_tiebreak} ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)"
                     )
                 };
                 // Rows after a session's first end marker are evicted; when an
                 // end marker is required, sessions without one are too.
                 let end_filters = if endswith.is_some() {
                     format!(
-                        ",\n      sum(_txn_is_end) OVER (PARTITION BY {partition}, _txn_session ORDER BY timestamp, id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS _txn_ends_before,\n      max(_txn_is_end) OVER (PARTITION BY {partition}, _txn_session) AS _txn_has_end"
+                        ",\n      sum(_txn_is_end) OVER (PARTITION BY {partition}, _txn_session ORDER BY {order_tiebreak} ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS _txn_ends_before,\n      max(_txn_is_end) OVER (PARTITION BY {partition}, _txn_session) AS _txn_has_end"
                     )
                 } else {
                     String::new()
@@ -822,7 +885,7 @@ impl ClickHouseSqlGenerator {
                 };
 
                 Ok(format!(
-                    "  SELECT \n    {fields},\n    count() AS eventcount,\n    dateDiff('second', min(timestamp), max(timestamp)) AS duration,\n    min(timestamp) AS transaction_start,\n    max(timestamp) AS transaction_end,\n    groupArray({limit})(message) AS _raw_events\n  FROM (\n    SELECT *{end_filters}\n    FROM (\n      SELECT *, {session_expr} AS _txn_session\n      FROM (\n        SELECT *, {start_flag} AS _txn_is_start, {end_flag} AS _txn_is_end\n        FROM {source}\n      )\n    )\n  )\n  WHERE {row_filter}\n  GROUP BY {group_by}, _txn_session{having}\n  ORDER BY transaction_start DESC",
+                    "  SELECT \n    {fields},\n    count() AS eventcount,\n    dateDiff('second', min({tc}), max({tc})) AS duration,\n    min({tc}) AS transaction_start,\n    max({tc}) AS transaction_end,\n    groupArray({limit})({kw}) AS _raw_events\n  FROM (\n    SELECT *{end_filters}\n    FROM (\n      SELECT *, {session_expr} AS _txn_session\n      FROM (\n        SELECT *, {start_flag} AS _txn_is_start, {end_flag} AS _txn_is_end\n        FROM {source}\n      )\n    )\n  )\n  WHERE {row_filter}\n  GROUP BY {group_by}, _txn_session{having}\n  ORDER BY transaction_start DESC",
                     fields = group_by_fields.join(", "),
                     limit = array_limit,
                     end_filters = end_filters,
@@ -1021,10 +1084,13 @@ impl ClickHouseSqlGenerator {
             )),
             Command::Reverse => {
                 if timestamp_available {
-                    // Raw events: reverse the default newest-first order → oldest-first. Unchanged.
+                    // Raw events: reverse the default newest-first order → oldest-first.
+                    // O27 (NAN-1721): order on the dataset time column (`start_time`
+                    // for spans); logs keep `timestamp` byte-identical.
                     Ok(format!(
-                        "  SELECT * FROM {}\n  ORDER BY timestamp ASC",
-                        source
+                        "  SELECT * FROM {}\n  ORDER BY {} ASC",
+                        source,
+                        self.time_column()
                     ))
                 } else {
                     // Post-aggregation / timestamp pruned: reverse the CURRENT result order via
@@ -1206,4 +1272,22 @@ impl ClickHouseSqlGenerator {
             }
         }
     }
+}
+
+/// NAN-1711 / audit D15 (defensive): true when the injected canonical bounds
+/// aliases (`_first_seen`/`_last_seen`) would collide with the top/rare ranked
+/// field's (or a by-field's) OUTPUT name — e.g. `… | top _first_seen`. Emitting
+/// both would be ClickHouse MULTIPLE_EXPRESSIONS_FOR_ALIAS, erroring the rule
+/// every cycle (the D3 failure class); skipping injection just degrades that
+/// (pathological) rule's finding dedup to the content-hash fallback.
+fn top_rare_bounds_alias_collision(
+    field: &str,
+    by_fields: &[String],
+    generator: &ClickHouseSqlGenerator,
+) -> bool {
+    const CANONICAL: [&str; 2] = ["_first_seen", "_last_seen"];
+    CANONICAL.contains(&by_field_output_name(field, generator))
+        || by_fields
+            .iter()
+            .any(|b| CANONICAL.contains(&by_field_output_name(b, generator)))
 }

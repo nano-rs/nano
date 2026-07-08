@@ -330,8 +330,34 @@ pub struct TableNames {
     is_clustered: bool,
 }
 
-/// Tables that have `_distributed` variants created by `ensure_distributed_tables()`.
-const DISTRIBUTED_TABLE_SET: &[&str] = &[
+/// **The** canonical list of tables that get `_distributed` wrappers on a
+/// cluster.
+///
+/// This is the single source of truth shared by BOTH consumers so they can
+/// never drift (findings L-5 / D9 — they were split into two hand-maintained
+/// lists that had silently diverged before):
+///   1. Read routing here (`TableNames::read` / `read_bare`) — a table listed
+///      here is read via `{table}_distributed` on a cluster.
+///   2. The wrapper reconciler in `clickhouse_migrate::distributed`
+///      (`ClickHouseMigrator::DISTRIBUTED_TABLES` re-exports this slice) which
+///      CREATEs the wrappers and column-/sharding-key-syncs them.
+/// A table read-routed here without a wrapper created there would target a
+/// non-existent `_distributed` table on a cluster, and vice-versa.
+///
+/// **Reference tables get ADDITIVE `_distributed` wrappers** (NAN-1728, revised
+/// approach). `custom_enrichment_results`, `ip_enrichments`, `user_registry`,
+/// and `lookup_rows` are small, key-addressed reference tables
+/// (IOC/enrichment/identity/lookup sources) whose rows scatter across shards
+/// (writers reach one arbitrary shard through the load-balanced ingest Service).
+/// A read via the `_distributed` wrapper fans across all shards so the complete
+/// keyspace is visible — WITHOUT any engine change, DROP, or recreate of the
+/// populated local tables (the cluster-wide-replication rewrite was abandoned as
+/// unshippable: it would DROP+recreate live enrichment/IOC data). The wrappers
+/// are **read-only** — writes and per-node dictionary sources still target the
+/// LOCAL table; only cross-shard SELECTs route to the wrapper. No inserts are
+/// routed through these four wrappers, so their sharding key is irrelevant
+/// (`sharding_key_for` gives them the default `rand()`).
+pub(crate) const DISTRIBUTED_TABLES: &[&str] = &[
     "logs",
     // OCSF canonical log table (NAN-1241). Listed so cluster-mode read routing
     // (`ocsf_logs_distributed`) applies identically to the UDM `logs` table when
@@ -341,13 +367,82 @@ const DISTRIBUTED_TABLE_SET: &[&str] = &[
     "domain_prevalence_agg",
     "hash_prevalence_agg",
     "ip_prevalence_agg",
+    // Per-shard prevalence SUMMARIES (AggregatingMergeTree read with uniqMerge,
+    // NAN-1728 C3 / Lane L4). Without a wrapper the summary reads (rare/common
+    // verdicts, D4b rescue, cache-dict pushdown) see only ~1/N of the hosts and
+    // an artifact on N×k hosts reads as "rare" everywhere. Wrappers make the
+    // uniqMerge GROUP BY fan out; the reconciler auto-creates them.
+    "hash_prevalence_summary",
+    "domain_prevalence_summary",
+    "ip_prevalence_summary",
+    // Reference tables — read-only additive wrappers (see doc above): the
+    // reconciler creates `<t>_distributed` on clusters so cross-shard reads see
+    // the complete scattered keyspace; writes/dict sources stay LOCAL.
+    "custom_enrichment_results",
+    "ip_enrichments",
+    "user_registry",
+    "lookup_rows",
     "entity_time_range_agg",
     "cloud_user_activity_agg",
     "ingestion_errors",
-    "custom_enrichment_results",
     "identity_observations",
     "logs_per_source_5m",
+    // Observability / OTLP native-storage tables (NAN-1721 O1). Their READ SQL
+    // (traces, RED charts, metrics, synthetics) routes to the `_distributed`
+    // wrapper on clusters so it unions all shards, mirroring the `logs` lane.
+    "otel_spans",
+    "otel_spans_trace_id_ts",
+    "otel_metrics",
+    "otel_metrics_1m",
+    "otel_metrics_1h",
+    "otel_service_red_1m",
+    "synthetic_check_results",
 ];
+
+/// Canonical ` ON CLUSTER \`<name>\`` clause for **runtime** DDL sites.
+///
+/// This is THE way runtime (non-migration) DDL should emit `ON CLUSTER`. Unlike
+/// migration SQL — which the migrator's `transform_for_cluster` auto-injects
+/// `ON CLUSTER` into — DDL built at runtime (GDPR erasure mutations, retention
+/// `MODIFY TTL`, `DROP PARTITION`, `KILL QUERY`, dictionary reloads, real-time
+/// detection MVs, …) has to add the clause itself. Downstream NAN-1728 fixes
+/// call this so every runtime DDL site gates on the cluster identically.
+///
+/// Returns ` ON CLUSTER \`<name>\`` when `CLICKHOUSE_CLUSTER` is set to a
+/// non-empty value (the deploy sets it only on clustered ClickHouse), else an
+/// empty string — so on single-node / open-core the emitted DDL is
+/// byte-identical to the pre-cluster form. Splice the result verbatim (it is
+/// pre-spaced and self-quoting).
+pub fn on_cluster_clause() -> String {
+    format_on_cluster(std::env::var("CLICKHOUSE_CLUSTER").ok().as_deref())
+}
+
+/// NAN-1728 (P1) decision (pure, testable): given the current
+/// `CLICKHOUSE_CLUSTER` env value and the cluster name probed from
+/// `system.clusters`, return `Some(name)` when we should SET the env — i.e. the
+/// env is unset/blank AND a non-empty cluster name was probed. Returns `None`
+/// when the env already has a usable value (keep it) or nothing was probed
+/// (nothing to converge to). Trims both sides.
+pub(crate) fn cluster_env_to_set(current_env: Option<&str>, probed: Option<&str>) -> Option<String> {
+    if current_env.map(str::trim).is_some_and(|v| !v.is_empty()) {
+        return None;
+    }
+    probed
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+}
+
+/// Pure formatter behind [`on_cluster_clause`] (testable without touching env).
+/// Backtick-quoted to match the pre-existing runtime convention in
+/// `detection::materialized_view` (backticks and `'…'` are both valid CH
+/// `ON CLUSTER` identifier forms); the clause is spliced verbatim by callers.
+pub fn format_on_cluster(cluster: Option<&str>) -> String {
+    match cluster {
+        Some(c) if !c.trim().is_empty() => format!(" ON CLUSTER `{}`", c.trim()),
+        _ => String::new(),
+    }
+}
 
 impl TableNames {
     /// Create a new TableNames resolver.
@@ -359,7 +454,7 @@ impl TableNames {
     /// Returns `nanosiem.{table}_distributed` in cluster mode for tables that have
     /// distributed variants, `nanosiem.{table}` otherwise.
     pub fn read(&self, table: &str) -> String {
-        if self.is_clustered && DISTRIBUTED_TABLE_SET.contains(&table) {
+        if self.is_clustered && DISTRIBUTED_TABLES.contains(&table) {
             format!("nanosiem.{}_distributed", table)
         } else {
             format!("nanosiem.{}", table)
@@ -375,7 +470,7 @@ impl TableNames {
     /// Bare table name (without database prefix) for read queries.
     /// Used by components like ClickHouseSqlGenerator that prepend `nanosiem.` themselves.
     pub fn read_bare(&self, table: &str) -> String {
-        if self.is_clustered && DISTRIBUTED_TABLE_SET.contains(&table) {
+        if self.is_clustered && DISTRIBUTED_TABLES.contains(&table) {
             format!("{}_distributed", table)
         } else {
             table.to_string()
@@ -534,6 +629,20 @@ impl DualPool {
             tracing::info!(
                 "Detected clustered ClickHouse — will use distributed tables for queries"
             );
+            // NAN-1728 (P1): unify the three cluster signals. `is_clustered`
+            // (logs_distributed present), `detect_cluster()` (env or
+            // system.clusters probe), and `on_cluster_clause()` (CLICKHOUSE_CLUSTER
+            // env) MUST agree — otherwise runtime DDL built via on_cluster_clause
+            // (GDPR erasure, retention MODIFY TTL, dict reload, KILL QUERY) runs on
+            // ONE shard while reads route distributed, re-opening the exact
+            // single-shard bugs this epic fixes. If a cluster is detected but
+            // CLICKHOUSE_CLUSTER is unset (auto-detected via system.clusters, no
+            // explicit env), resolve the authoritative name and set the env so
+            // every env-reading helper converges with is_clustered()/detect_cluster().
+            // Safe here: DualPool::new runs at early boot before request handling,
+            // and edition 2021's set_var is not `unsafe` (matches crypto.rs /
+            // migrations.rs boot-time env writes).
+            Self::converge_cluster_env(&clickhouse).await;
         }
 
         tracing::info!(
@@ -559,6 +668,54 @@ impl DualPool {
             is_clustered,
             logs_table,
         })
+    }
+
+    /// NAN-1728 (P1): converge `CLICKHOUSE_CLUSTER` with the detected cluster.
+    /// Called from `new` only when a cluster is detected (logs_distributed
+    /// present). If the env is already set (deploy provided it) we keep it; else
+    /// we probe `system.clusters` for the authoritative name (same query +
+    /// deterministic tiebreak as the migrator's `detect_cluster`) and set the env
+    /// so `on_cluster_clause()` and every other env-reading helper fan runtime
+    /// DDL out ON CLUSTER instead of running on a single shard.
+    async fn converge_cluster_env(client: &ClickHouseClient) {
+        let current = std::env::var("CLICKHOUSE_CLUSTER").ok();
+        // Fast path: env already provides a usable name.
+        if current.as_deref().map(str::trim).is_some_and(|v| !v.is_empty()) {
+            tracing::info!(
+                "Cluster mode: using CLICKHOUSE_CLUSTER='{}' (from env)",
+                current.as_deref().unwrap_or("").trim()
+            );
+            return;
+        }
+        let probed: Option<String> = client
+            .query(
+                "SELECT cluster FROM system.clusters \
+                 WHERE cluster NOT IN ('_all_databases', 'system') \
+                 GROUP BY cluster HAVING count() > 1 \
+                 ORDER BY count() DESC, cluster ASC LIMIT 1",
+            )
+            .fetch_all::<String>()
+            .await
+            .ok()
+            .and_then(|rows| rows.into_iter().next());
+
+        match cluster_env_to_set(current.as_deref(), probed.as_deref()) {
+            Some(name) => {
+                std::env::set_var("CLICKHOUSE_CLUSTER", &name);
+                tracing::info!(
+                    "Cluster mode: resolved CLICKHOUSE_CLUSTER='{}' from system.clusters and set \
+                     it (was unset) so runtime ON CLUSTER DDL fans out to all shards",
+                    name
+                );
+            }
+            None => {
+                tracing::warn!(
+                    "Cluster mode (logs_distributed present) but no multi-node cluster found in \
+                     system.clusters and CLICKHOUSE_CLUSTER unset — runtime ON CLUSTER DDL will be \
+                     NODE-LOCAL. Set CLICKHOUSE_CLUSTER to the operator's cluster name."
+                );
+            }
+        }
     }
 
     /// Get a reference to the PostgreSQL connection pool
@@ -755,6 +912,109 @@ mod tests {
             clickhouse_error: Some("timeout".to_string()),
         };
         assert!(!unhealthy_ch.is_healthy());
+    }
+
+    #[test]
+    fn format_on_cluster_gates_on_cluster_name() {
+        // Single-node / open-core (no cluster name) → no clause, so runtime DDL
+        // is byte-identical to the pre-cluster form. A configured cluster → the
+        // clause. Whitespace-only is treated as unset.
+        assert_eq!(format_on_cluster(None), "");
+        assert_eq!(format_on_cluster(Some("")), "");
+        assert_eq!(format_on_cluster(Some("   ")), "");
+        assert_eq!(
+            format_on_cluster(Some("nanosiem_cluster")),
+            " ON CLUSTER `nanosiem_cluster`"
+        );
+        // Trimmed.
+        assert_eq!(
+            format_on_cluster(Some("  nanosiem_cluster  ")),
+            " ON CLUSTER `nanosiem_cluster`"
+        );
+    }
+
+    #[test]
+    fn cluster_env_to_set_converges_only_when_needed() {
+        // Env already set → keep it (return None), regardless of probe.
+        assert_eq!(cluster_env_to_set(Some("nanosiem_cluster"), Some("default")), None);
+        assert_eq!(cluster_env_to_set(Some("  ncl  "), None), None);
+        // Env unset/blank + a probed cluster → set the probed name (trimmed).
+        assert_eq!(
+            cluster_env_to_set(None, Some("nanosiem_cluster")),
+            Some("nanosiem_cluster".to_string())
+        );
+        assert_eq!(
+            cluster_env_to_set(Some(""), Some("  auto_cluster  ")),
+            Some("auto_cluster".to_string())
+        );
+        assert_eq!(
+            cluster_env_to_set(Some("   "), Some("c")),
+            Some("c".to_string())
+        );
+        // Env unset AND nothing probed → nothing to converge (None).
+        assert_eq!(cluster_env_to_set(None, None), None);
+        assert_eq!(cluster_env_to_set(None, Some("   ")), None);
+    }
+
+    #[test]
+    fn distributed_tables_membership_invariant() {
+        // L-5/D9: the read-routing set and the reconciler's wrapper list are the
+        // SAME canonical slice — they cannot drift.
+        //
+        // Reference tables get ADDITIVE read-only `_distributed` wrappers so
+        // cross-shard reads see the complete scattered keyspace (the cluster-wide
+        // replication rewrite was abandoned). They MUST be present.
+        for t in [
+            "custom_enrichment_results",
+            "ip_enrichments",
+            "user_registry",
+            "lookup_rows",
+        ] {
+            assert!(
+                DISTRIBUTED_TABLES.contains(&t),
+                "{t} must be distributed so cross-shard reads see its full scattered keyspace"
+            );
+        }
+        // The per-shard prevalence summaries MUST be present (C3/Lane L4).
+        for t in [
+            "hash_prevalence_summary",
+            "domain_prevalence_summary",
+            "ip_prevalence_summary",
+        ] {
+            assert!(
+                DISTRIBUTED_TABLES.contains(&t),
+                "{t} must be distributed so its uniqMerge summary fans across shards (C3)"
+            );
+        }
+        // No duplicates.
+        let mut seen = std::collections::HashSet::new();
+        for t in DISTRIBUTED_TABLES {
+            assert!(seen.insert(*t), "duplicate table in DISTRIBUTED_TABLES: {t}");
+        }
+    }
+
+    #[test]
+    fn table_names_routing_uses_canonical_list() {
+        let clustered = TableNames::new(true);
+        assert_eq!(clustered.read("logs"), "nanosiem.logs_distributed");
+        assert_eq!(
+            clustered.read("hash_prevalence_summary"),
+            "nanosiem.hash_prevalence_summary_distributed"
+        );
+        // Reference table: additive read-only wrapper fans reads across shards.
+        assert_eq!(
+            clustered.read("custom_enrichment_results"),
+            "nanosiem.custom_enrichment_results_distributed"
+        );
+        assert_eq!(
+            clustered.read("ip_enrichments"),
+            "nanosiem.ip_enrichments_distributed"
+        );
+        // DDL/mutation always local.
+        assert_eq!(clustered.local("logs"), "nanosiem.logs");
+        // Standalone: never routes.
+        let standalone = TableNames::new(false);
+        assert_eq!(standalone.read("logs"), "nanosiem.logs");
     }
 
     #[test]

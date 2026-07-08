@@ -22,7 +22,11 @@ use super::DetectionService;
 /// A per-entity finding candidate with its stable cross-execution identity
 /// (NAN-1305). Built by `build_finding_candidates`, filtered to the new ones by
 /// `retain_unemitted`, then recorded by `record_finding_emissions`.
-pub(super) struct ClaimedFinding {
+///
+/// `pub(crate)` (audit D13): the real-time `SignalProcessor` reuses the same
+/// candidate type + emission store for its per-(rule, entity, window) dedup —
+/// see `helpers::realtime_finding_candidate`.
+pub(crate) struct ClaimedFinding {
     /// Entity value (e.g. the `src_ip`).
     pub entity: String,
     /// Field the entity was extracted from (e.g. `src_ip`).
@@ -92,10 +96,19 @@ impl DetectionService {
         results: &[serde_json::Value],
         global_weight: f64,
     ) -> (bool, Vec<(String, String, Vec<serde_json::Value>)>) {
+        // Audit D10: inspect the WHOLE batch, not just the first row. Sampling
+        // `results.first()` meant a leading null-scored row disabled query
+        // scoring for the entire batch. The query produced per-event scores iff
+        // ANY event carries a real (non-null) score. An all-null batch is now
+        // `false` → rule-level grouping → the alert fires (instead of empty
+        // groups being misread as "already alerted" and suppressed).
+        //
+        // In a genuinely mixed batch, an event whose `| risk` score is null
+        // produces no per-event finding — the query authored it as no-risk
+        // (`score=if(cond, X, null)`), so this is intentional, not a drop.
         let has_query_scores = results
-            .first()
-            .map(super::super::risk::ScoreCalculator::has_query_risk_score)
-            .unwrap_or(false);
+            .iter()
+            .any(super::super::risk::ScoreCalculator::has_query_risk_score);
 
         let groups = if has_query_scores {
             results
@@ -291,6 +304,120 @@ impl DetectionService {
         }
     }
 
+    /// G2 (NAN-1749): reconcile alerting-mode alerts that were never grouped
+    /// into a case.
+    ///
+    /// Grouping is fire-once and terminal: a transient PG blip during
+    /// `process_alert_for_grouping`, or the rule-execution `tokio::time::timeout`
+    /// cancelling `process_alert_post_create` mid-flight, leaves the alert row
+    /// created but `case_id IS NULL` forever — no case, no queue, no retry. This
+    /// periodic sweep finds those orphans and re-runs grouping for them.
+    ///
+    /// Bounded + idempotent:
+    /// * only `kind = 'detection'` alerts whose rule is still in `alerting` mode
+    ///   (observability alerts have no rule and never group; deleted-rule alerts
+    ///   are excluded by the JOIN),
+    /// * `case_id IS NULL` AND older than `min_age_minutes` (so we don't race the
+    ///   normal inline grouping that runs right after alert creation),
+    /// * within a `lookback_hours` window so a pre-deploy backlog can't trigger
+    ///   an unbounded scan,
+    /// * `LIMIT max_per_pass` per invocation.
+    ///
+    /// Idempotent because a successful `group_alert` sets `alerts.case_id`
+    /// (create path: `create_with_primary_alert`; attach path: `add_alert`), so a
+    /// reconciled alert drops out of the next pass' result set.
+    ///
+    /// GAP: this re-runs GROUPING only, not the webhook fire. Re-firing webhooks
+    /// from a sweep would double-deliver for the common case where grouping
+    /// failed but the (later) webhook block still ran, so it is intentionally
+    /// omitted. Returns the number of alerts successfully (re-)grouped.
+    pub async fn reconcile_ungrouped_alerts(
+        &self,
+        min_age_minutes: i64,
+        lookback_hours: i64,
+        max_per_pass: i64,
+    ) -> Result<usize, DetectionError> {
+        // Fetch the orphan (alert_id, rule_id) pairs. Kept minimal — full alert
+        // rows are loaded per-id below only for the ones we actually re-group.
+        let orphans: Vec<(Uuid, Uuid)> = sqlx::query_as::<_, (Uuid, Uuid)>(
+            r#"
+            SELECT a.id, a.rule_id
+            FROM alerts a
+            JOIN detection_rules r ON r.id = a.rule_id
+            WHERE a.case_id IS NULL
+              AND a.kind = 'detection'
+              AND r.mode = 'alerting'
+              AND a.created_at < NOW() - make_interval(mins => $1::int)
+              AND a.created_at > NOW() - make_interval(hours => $2::int)
+            ORDER BY a.created_at ASC
+            LIMIT $3
+            "#,
+        )
+        .bind(min_age_minutes as i32)
+        .bind(lookback_hours as i32)
+        .bind(max_per_pass)
+        .fetch_all(&self.pg_pool)
+        .await?;
+
+        if orphans.is_empty() {
+            return Ok(0);
+        }
+
+        let mut reconciled = 0usize;
+        for (alert_id, rule_id) in orphans {
+            // Load the rule + full alert. Skip (don't abort the whole sweep) on
+            // any per-item error — a subsequent pass retries.
+            let rule = match self.rule_repo.find_by_id(rule_id).await {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!(alert_id = %alert_id, rule_id = %rule_id, error = %e, "Reconcile: rule load failed; skipping");
+                    continue;
+                }
+            };
+            let alert = match self.alert_repo.find_by_id(alert_id).await {
+                Ok(a) => a,
+                Err(e) => {
+                    debug!(alert_id = %alert_id, error = %e, "Reconcile: alert load failed; skipping");
+                    continue;
+                }
+            };
+
+            let permissions = self.get_case_permissions(&rule).await;
+            match self
+                .case_grouping
+                .group_alert(&alert, Some(rule.name.as_str()), permissions)
+                .await
+            {
+                Ok(Some(grouped)) => {
+                    reconciled += 1;
+                    info!(
+                        alert_id = %alert_id,
+                        case_id = %grouped.case_id,
+                        is_new_case = grouped.is_new_case,
+                        "Reconcile: grouped previously-orphaned alert into a case"
+                    );
+                    if grouped.is_new_case {
+                        if let Err(e) = self
+                            .shadow_investigation
+                            .on_case_created(grouped.case_id, &alert, grouped.notebook_id)
+                            .await
+                        {
+                            debug!(alert_id = %alert_id, case_id = %grouped.case_id, error = %e, "Reconcile: shadow investigation hook returned error");
+                        }
+                    }
+                }
+                // Open-core no-op hook returns Ok(None) — nothing to do.
+                Ok(None) => {}
+                Err(e) => {
+                    // Still failing — leave case_id NULL for the next pass.
+                    error!(alert_id = %alert_id, error = %e, "Reconcile: re-grouping failed; will retry next pass");
+                }
+            }
+        }
+
+        Ok(reconciled)
+    }
+
     /// Handle grouped alert mode: all matched events -> single alert (default behavior)
     ///
     /// NAN-1305: before creating the alert, claim a per-entity finding for each
@@ -334,21 +461,64 @@ impl DetectionService {
             return Ok(None);
         }
 
-        self.rule_repo
-            .record_daily_stats(rule.id, today, match_count, 1)
-            .await?;
-
         self.store_detection_match(rule, results).await?;
 
-        let matched_events = serde_json::Value::Array(results.to_vec());
+        // Audit D19: the query now returns ALL matches (not the newest 100), so
+        // match_count/grouping are accurate — but bound the sample STORED in the
+        // alert row to `max_events_per_alert` so a large grouped match can't write
+        // a multi-MB jsonb blob. The stored sample is the newest N (SQL orders
+        // timestamp DESC); the full count lives in match_count / detection_matches.
+        let sample: Vec<serde_json::Value> = results
+            .iter()
+            .take(self.config.max_events_per_alert)
+            .cloned()
+            .collect();
+        let matched_events = serde_json::Value::Array(sample);
         let new_alert = NewAlert {
             rule_id: rule.id,
             severity: rule.severity,
             matched_events,
             event_hash: None,
+            // A13 (NAN-1752): the stored `matched_events` is capped at
+            // max_events_per_alert (D19), so persist the TRUE match count for
+            // this window rather than letting the read side undercount from the
+            // capped sample.
+            match_count: Some(match_count),
         };
 
-        let alert = self.alert_repo.create(&new_alert).await?;
+        let alert = match self.alert_repo.create(&new_alert).await {
+            Ok(alert) => alert,
+            Err(AlertRepositoryError::DuplicateAlert(_, _)) => {
+                // Audit D20: a fail-open dedup read, or a crash between the alert
+                // INSERT and record_finding_emissions, can leave an alert whose
+                // emissions weren't recorded; the next run re-tries the SAME
+                // insert and hits the unique index. Treat it as already-alerted
+                // (mirroring the per-event path's `continue`) instead of erroring
+                // the whole execution every cycle until the window slides past.
+                //
+                // The alert already exists for these entities, so record the
+                // emissions now (repairing the crash-before-emissions case) — this
+                // stops retain_unemitted from re-surfacing them every cycle — and
+                // count no new alert.
+                self.record_finding_emissions(rule.id, &new_findings).await;
+                self.rule_repo
+                    .record_daily_stats(rule.id, today, match_count, 0)
+                    .await?;
+                debug!(
+                    "Rule {} (ALERTING/grouped) alert already exists (dedup conflict) — recording emissions, suppressing",
+                    rule.name
+                );
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        // Audit D20: count alert_count=1 only now that the alert was actually
+        // created. The old code recorded it BEFORE the insert, so a dedup/failure
+        // counted an alert that never existed.
+        self.rule_repo
+            .record_daily_stats(rule.id, today, match_count, 1)
+            .await?;
 
         // Record the emissions only now that the alert exists, then emit a
         // finding per new entity stamped with its source event window.
@@ -490,7 +660,23 @@ impl DetectionService {
         let mut first_alert: Option<Alert> = None;
         let mut alerts_created: i64 = 0;
 
-        for event in results {
+        // Audit D19: the detection query now returns ALL matches (so match_count
+        // is accurate), but per-event mode creates one alert per event. Cap the
+        // number of ALERTS created per window at max_events_per_alert so a broad
+        // or misconfigured per-event rule can't storm PG with up to 1M
+        // inserts/case-groupings/findings in a single cycle. The overflow is
+        // VISIBLE (warn + accurate match_count), not silently dropped at 100.
+        let alert_cap = self.config.max_events_per_alert;
+        if results.len() > alert_cap {
+            tracing::warn!(
+                "Rule {} (per-event) matched {} events but is capping alert creation at {} this window — narrow the rule or use grouped mode",
+                rule.name,
+                results.len(),
+                alert_cap
+            );
+        }
+
+        for event in results.iter().take(alert_cap) {
             // Store each event as its own detection match (1:1 with alerts)
             self.store_detection_match(rule, std::slice::from_ref(event))
                 .await?;
@@ -500,6 +686,8 @@ impl DetectionService {
                 severity: rule.severity,
                 matched_events,
                 event_hash: None, // Hash computed from single event -- dedup works per-event
+                // A13 (NAN-1752): per-event mode is exactly one event per alert.
+                match_count: Some(1),
             };
 
             // Call repo directly to catch DuplicateAlert before conversion to DetectionError

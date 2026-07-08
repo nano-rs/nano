@@ -571,11 +571,46 @@ pub(super) fn top_command(input: &str) -> ParseResult<'_, Command> {
     )
     .parse(input)?;
 
-    // Parse optional trailing parameters in any order: showcount=, showperc=, limit=
-    let mut show_count = true;
-    let mut show_percent = true;
-    let mut final_limit = limit;
-    let mut input = input;
+    // Parse optional trailing parameters in any order: showcount=, showperc=,
+    // limit=, _bounds= (internal — detection query enrichment, NAN-1711)
+    let (input, params) = top_rare_trailing_params(input, limit)?;
+
+    Ok((
+        input,
+        Command::Top {
+            field,
+            limit: params.limit.unwrap_or(10),
+            by_fields,
+            show_count: params.show_count,
+            show_percent: params.show_percent,
+            inject_bounds: params.inject_bounds,
+        },
+    ))
+}
+
+/// Trailing parameters shared by `top` / `rare`.
+struct TopRareParams {
+    show_count: bool,
+    show_percent: bool,
+    limit: Option<usize>,
+    inject_bounds: bool,
+}
+
+/// Parse the optional trailing parameters of `top`/`rare` in any order:
+/// `showcount=`, `showperc=`, `limit=` and the internal `_bounds=` token that
+/// detection query enrichment emits via pretty_print (NAN-1711 / audit D15) so
+/// the injected-window flag survives the enrich → pretty_print → re-parse
+/// round-trip.
+fn top_rare_trailing_params(
+    mut input: &str,
+    limit: Option<usize>,
+) -> ParseResult<'_, TopRareParams> {
+    let mut params = TopRareParams {
+        show_count: true,
+        show_percent: true,
+        limit,
+        inject_bounds: false,
+    };
 
     loop {
         let ws: Result<(&str, &str), nom::Err<nom::error::Error<&str>>> = multispace1(input);
@@ -594,7 +629,7 @@ pub(super) fn top_command(input: &str) -> ParseResult<'_, Command> {
             ))
             .parse(r)
             {
-                show_count = val;
+                params.show_count = val;
                 input = r;
                 continue;
             }
@@ -606,19 +641,31 @@ pub(super) fn top_command(input: &str) -> ParseResult<'_, Command> {
             ))
             .parse(r)
             {
-                show_percent = val;
+                params.show_percent = val;
                 input = r;
                 continue;
             }
         }
-        if final_limit.is_none() {
+        if let Ok((r, _)) = tag_no_case::<_, _, nom::error::Error<&str>>("_bounds=").parse(rest) {
+            if let Ok((r, val)) = alt((
+                value(false, tag_no_case::<_, _, nom::error::Error<&str>>("false")),
+                value(true, tag_no_case("true")),
+            ))
+            .parse(r)
+            {
+                params.inject_bounds = val;
+                input = r;
+                continue;
+            }
+        }
+        if params.limit.is_none() {
             if let Ok((r, _)) = tag_no_case::<_, _, nom::error::Error<&str>>("limit=").parse(rest) {
                 if let Ok((r, n)) = map_res(digit1::<_, nom::error::Error<&str>>, |s: &str| {
                     s.parse::<usize>()
                 })
                 .parse(r)
                 {
-                    final_limit = Some(n);
+                    params.limit = Some(n);
                     input = r;
                     continue;
                 }
@@ -627,16 +674,7 @@ pub(super) fn top_command(input: &str) -> ParseResult<'_, Command> {
         break;
     }
 
-    Ok((
-        input,
-        Command::Top {
-            field,
-            limit: final_limit.unwrap_or(10),
-            by_fields,
-            show_count,
-            show_percent,
-        },
-    ))
+    Ok((input, params))
 }
 
 /// Parse rare command: rare [limit=N | N] field [by field1, field2]
@@ -678,70 +716,19 @@ pub(super) fn rare_command(input: &str) -> ParseResult<'_, Command> {
     )
     .parse(input)?;
 
-    // Parse optional trailing parameters in any order: showcount=, showperc=, limit=
-    let mut show_count = true;
-    let mut show_percent = true;
-    let mut final_limit = limit;
-    let mut input = input;
-
-    loop {
-        let ws: Result<(&str, &str), nom::Err<nom::error::Error<&str>>> = multispace1(input);
-        let rest = match ws {
-            Ok((rest, _)) => rest,
-            Err(_) => break,
-        };
-        if rest.is_empty() || rest.starts_with('|') {
-            break;
-        }
-
-        if let Ok((r, _)) = tag_no_case::<_, _, nom::error::Error<&str>>("showcount=").parse(rest) {
-            if let Ok((r, val)) = alt((
-                value(false, tag_no_case::<_, _, nom::error::Error<&str>>("false")),
-                value(true, tag_no_case("true")),
-            ))
-            .parse(r)
-            {
-                show_count = val;
-                input = r;
-                continue;
-            }
-        }
-        if let Ok((r, _)) = tag_no_case::<_, _, nom::error::Error<&str>>("showperc=").parse(rest) {
-            if let Ok((r, val)) = alt((
-                value(false, tag_no_case::<_, _, nom::error::Error<&str>>("false")),
-                value(true, tag_no_case("true")),
-            ))
-            .parse(r)
-            {
-                show_percent = val;
-                input = r;
-                continue;
-            }
-        }
-        if final_limit.is_none() {
-            if let Ok((r, _)) = tag_no_case::<_, _, nom::error::Error<&str>>("limit=").parse(rest) {
-                if let Ok((r, n)) = map_res(digit1::<_, nom::error::Error<&str>>, |s: &str| {
-                    s.parse::<usize>()
-                })
-                .parse(r)
-                {
-                    final_limit = Some(n);
-                    input = r;
-                    continue;
-                }
-            }
-        }
-        break;
-    }
+    // Parse optional trailing parameters in any order: showcount=, showperc=,
+    // limit=, _bounds= (internal — detection query enrichment, NAN-1711)
+    let (input, params) = top_rare_trailing_params(input, limit)?;
 
     Ok((
         input,
         Command::Rare {
             field,
-            limit: final_limit.unwrap_or(10),
+            limit: params.limit.unwrap_or(10),
             by_fields,
-            show_count,
-            show_percent,
+            show_count: params.show_count,
+            show_percent: params.show_percent,
+            inject_bounds: params.inject_bounds,
         },
     ))
 }

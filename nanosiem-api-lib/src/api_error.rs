@@ -618,16 +618,27 @@ impl From<nanosiem_core::identity::IdentityServiceError> for ApiError {
 impl From<nanosiem_core::DashboardRepositoryError> for ApiError {
     fn from(err: nanosiem_core::DashboardRepositoryError) -> Self {
         use nanosiem_core::DashboardRepositoryError;
+        // DSH42: render dashboard ids as `dash_<base32>` typeids (the form the
+        // API exposes everywhere else) rather than leaking a bare UUID.
+        fn dash_typeid(id: &uuid::Uuid) -> String {
+            nanosiem_core::typeid::encode(nanosiem_core::typeid::dashboard::PREFIX, id)
+        }
         match err {
             DashboardRepositoryError::NotFound(id) => {
-                ApiError::NotFound(format!("Dashboard not found: {}", id))
+                ApiError::NotFound(format!("Dashboard not found: {}", dash_typeid(&id)))
             }
             DashboardRepositoryError::AccessDenied(id) => {
-                ApiError::Forbidden(format!("Access denied to dashboard: {}", id))
+                ApiError::Forbidden(format!("Access denied to dashboard: {}", dash_typeid(&id)))
             }
             DashboardRepositoryError::NotOwner => {
                 ApiError::Forbidden("Only the dashboard owner can perform this action".to_string())
             }
+            // DSH9: optimistic-concurrency precondition failed — the dashboard
+            // changed on the server since the client last read it. 409 Conflict.
+            DashboardRepositoryError::Conflict(id) => ApiError::Conflict(format!(
+                "Dashboard {} was modified by another update. Please reload and try again.",
+                dash_typeid(&id)
+            )),
             DashboardRepositoryError::DatabaseError(e) => ApiError::DatabaseError(e.to_string()),
         }
     }

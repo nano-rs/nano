@@ -4,15 +4,17 @@
 // Visual layer rebuilt to redesign density tokens; data fetching, drilldown,
 // auto-refresh, edit-mode plumbing, and share/settings dialogs preserved.
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useParams, useSearchParams, useNavigate } from 'react-router-dom';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
 import { Button } from '@/components/ui/button';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { DateTimeRangePicker } from '@/components/ui/date-time-range-picker';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { GridLayout, Panel, VisualizationRenderer, DashboardEditor, buildSearchUrl, VariableControls, DashboardShareDialog, ObsMetricWidget, metricSeriesToRows } from '@/components/dashboard';
-import type { PanelDataState, DrilldownFilter } from '@/components/dashboard';
+import type { PanelDataState, DrilldownPayload } from '@/components/dashboard/Panel';
+import { substituteVariables as substituteQueryVariables } from '@/components/dashboard/variable-substitution';
 import {
   ArrowLeft,
   CircleAlert,
@@ -47,10 +49,62 @@ import { useRecentlyViewedDashboards } from '@/hooks/useRecentlyViewedDashboards
 import { useRecordActivity } from '@/hooks/useRecentActivity';
 import { formatRelativeUTC } from '@/lib/date-utils';
 import { cn } from '@/lib/utils';
-import type { Dashboard, PanelConfig, LayoutItem, DashboardShareResult } from '@/lib/api';
+import type { Dashboard, PanelConfig, LayoutItem, DashboardShareResult, UpdateDashboardRequest, TimeRange, SerializedTimeRange } from '@/lib/api';
 import { api } from '@/lib/api';
+import { isDashboardConflictError } from '@/lib/api/dashboards';
 
 type AutoRefreshInterval = '30s' | '1m' | '5m' | '15m' | 'off';
+
+// DSH8/DSH40/DSH52 (CONTRACT 4): the view stores a little extra per-panel metadata
+// alongside PanelDataState so <Panel> can render cache/truncation transparency and
+// carry the substituted query + resolved window into "Open in Search".
+type ViewPanelDataState = PanelDataState & {
+  cached?: boolean;
+  cacheAgeSecs?: number;
+  truncated?: boolean;
+  totalCount?: number;
+  resolvedQuery?: string;
+  effectiveTimeRange?: { start: string; end: string };
+  // DSH6/DSH53: the search service's column order (group-by fields first,
+  // aggregates last) so VisualizationRenderer classifies label/value columns
+  // deterministically and tables render in query order, not alphabetically.
+  columnOrder?: string[];
+};
+
+// DSH25: resolve a panel's persisted custom range — new relative
+// SerializedTimeRange (preset stays rolling) OR legacy absolute { start, end } —
+// to an absolute window at query time.
+function resolvePanelCustomRange(
+  cr: TimeRange | SerializedTimeRange | undefined,
+  fallback: TimeRange,
+): TimeRange {
+  if (!cr) return fallback;
+  if ('type' in cr) {
+    return toApiTimeRange(hydrateDashboardTimeRange(cr));
+  }
+  return cr;
+}
+
+// DSH27: the panel's pre-aggregation search stages — everything before the first
+// top-level pipe (the aggregation command). Quote-aware so a literal '|' inside a
+// quoted value isn't treated as a stage boundary. Preserves the panel's own scope
+// (e.g. `source_type="firewall" error`) when drilling down.
+function extractBaseQuery(resolvedQuery: string): string {
+  let inQuote: string | null = null;
+  for (let i = 0; i < resolvedQuery.length; i++) {
+    const ch = resolvedQuery[i];
+    if (inQuote) {
+      if (ch === inQuote) inQuote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      inQuote = ch;
+      continue;
+    }
+    if (ch === '|') return resolvedQuery.slice(0, i).trim();
+  }
+  return resolvedQuery.trim();
+}
 
 const AUTO_REFRESH_OPTIONS: { value: AutoRefreshInterval; label: string; ms: number | null }[] = [
   { value: 'off', label: 'Off', ms: null },
@@ -81,9 +135,13 @@ export function DashboardView() {
 
   const [timeRange, setTimeRange] = useState<TimeRangeValue>(DEFAULT_DASHBOARD_TIME_RANGE);
   const [autoRefresh, setAutoRefresh] = useState<AutoRefreshInterval>('off');
-  const [panelData, setPanelData] = useState<Map<string, PanelDataState>>(new Map());
+  const [panelData, setPanelData] = useState<Map<string, ViewPanelDataState>>(new Map());
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [variableValues, setVariableValues] = useState<Record<string, string>>({});
+  // DSH24: unsaved-editor-changes state, lifted from DashboardEditor so the
+  // edit-mode wrapper Back button + a beforeunload guard can protect edits.
+  const [editorDirty, setEditorDirty] = useState(false);
+  const [showEditDiscard, setShowEditDiscard] = useState(false);
   // NAN-711: dashboards default to NOT auto-running on open. The user picks
   // variables / time range and clicks Run before any panel queries fire.
   // `hasRunOnce` flips to true on the first explicit Run; afterwards the
@@ -109,6 +167,7 @@ export function DashboardView() {
   const [scrollRoot, setScrollRoot] = useState<HTMLElement | null>(null);
   const visiblePanelIds = useRef<Set<string>>(new Set());       // panels currently in view
   const inFlightPanels = useRef<Set<string>>(new Set());        // dedup guard
+  const pendingReload = useRef<Set<string>>(new Set());         // DSH5: reload once the in-flight fetch settles
   const loadedEpoch = useRef<Map<string, number>>(new Map());   // params-epoch each panel last loaded at
   const paramsEpoch = useRef(0);                                // bumped on refresh / time-range / variable change
   const panelDataRef = useRef(panelData);                       // mirror, for the observer-failure safety net
@@ -142,18 +201,24 @@ export function DashboardView() {
     setTimeRange(hydrateDashboardTimeRange(dashboard.layout?.defaultTimeRange));
   }, [dashboard?.id, dashboard?.layout?.defaultTimeRange, isEditMode]);
 
-  // Initialize variable values from dashboard defaults (variables are in layout)
+  // Seed any variable defaults not already chosen, WITHOUT clobbering existing
+  // user selections (DSH23: cross-dashboard resets are handled by the
+  // dashboard-id effect below, not here). DSH16: guard against a malformed
+  // imported layout whose `variables` isn't an array.
   useEffect(() => {
     const variables = dashboard?.layout?.variables;
-    if (variables) {
-      const defaults: Record<string, string> = {};
+    if (!Array.isArray(variables)) return;
+    setVariableValues(prev => {
+      let changed = false;
+      const next = { ...prev };
       for (const variable of variables) {
-        if (variable.defaultValue) {
-          defaults[variable.name] = variable.defaultValue;
+        if (variable.defaultValue && next[variable.name] === undefined) {
+          next[variable.name] = variable.defaultValue;
+          changed = true;
         }
       }
-      setVariableValues(prev => ({ ...defaults, ...prev }));
-    }
+      return changed ? next : prev;
+    });
   }, [dashboard?.layout?.variables]);
 
   // Handle share - copy URL to clipboard
@@ -186,15 +251,19 @@ export function DashboardView() {
 
   // Handle saving settings
   const handleSaveSettings = useCallback(async () => {
-    if (!id) return;
+    if (!id || !dashboard) return;
+    const trimmedDesc = settingsForm.description.trim();
+    // CONTRACT 2 / DSH13: send explicit `null` to CLEAR the description
+    // (undefined would leave it unchanged via COALESCE). DSH9: send the
+    // last-seen updated_at for optimistic concurrency; a mismatch → 409. Cast
+    // because the TS request type predates the clearable/concurrency fields.
+    const data = {
+      name: settingsForm.name.trim(),
+      description: trimmedDesc === '' ? null : trimmedDesc,
+      expected_updated_at: dashboard.updated_at,
+    } as unknown as UpdateDashboardRequest;
     try {
-      await updateDashboard({
-        id,
-        data: {
-          name: settingsForm.name,
-          description: settingsForm.description || undefined,
-        },
-      });
+      await updateDashboard({ id, data });
       toast({
         title: 'Settings saved',
         description: 'Dashboard settings have been updated',
@@ -202,13 +271,21 @@ export function DashboardView() {
       setSettingsOpen(false);
       refetch();
     } catch (err) {
-      toast({
-        title: 'Failed to save',
-        description: err instanceof Error ? err.message : 'Failed to update settings',
-        variant: 'destructive',
-      });
+      if (isDashboardConflictError(err)) {
+        toast({
+          title: 'Dashboard changed on server',
+          description: 'Someone else updated this dashboard. Reload to see the latest version before saving.',
+          variant: 'destructive',
+        });
+      } else {
+        toast({
+          title: 'Failed to save',
+          description: err instanceof Error ? err.message : 'Failed to update settings',
+          variant: 'destructive',
+        });
+      }
     }
-  }, [id, settingsForm, updateDashboard, toast, refetch]);
+  }, [id, dashboard, settingsForm, updateDashboard, toast, refetch]);
 
   // Handle export - download dashboard as JSON
   const handleExport = useCallback(async () => {
@@ -237,43 +314,51 @@ export function DashboardView() {
     }
   }, [id, dashboard?.name, exportDashboard, toast]);
 
-  // Substitute variables in query string
-  // If a variable has no value, remove the entire "field=$var" clause to avoid type errors
+  // Substitute variables via the SHARED module (CONTRACT 5) — quote-aware, only
+  // touches DEFINED names, quotes/escapes per nPL, unified empty-value semantics.
   const substituteVariables = useCallback((query: string): string => {
     const variables = dashboard?.layout?.variables;
-    if (!variables) return query;
+    if (!Array.isArray(variables) || variables.length === 0) return query;
 
-    // Build variable map from defined variables
-    const varMap: Record<string, string> = {};
+    const definedNames = variables.map(v => v.name);
+    const values: Record<string, string> = {};
     for (const variable of variables) {
-      varMap[variable.name] = variableValues[variable.name] || variable.defaultValue || '';
+      values[variable.name] = variableValues[variable.name] ?? variable.defaultValue ?? '';
     }
-
-    // First, remove entire "field=$var" or "field = $var" clauses where variable is empty
-    // This handles cases like "duration=$duration" where duration is numeric
-    let result = query.replace(/\b(\w+)\s*=\s*\$([a-zA-Z_][a-zA-Z0-9_]*)\b/g, (_match, field, varName) => {
-      const value = varMap[varName];
-      if (!value) {
-        // Remove the entire clause (return empty string, will clean up extra spaces later)
-        return '';
-      }
-      // Replace with actual value
-      return `${field}=${value}`;
-    });
-
-    // Clean up any remaining $var patterns (not in field=$var format)
-    result = result.replace(/\$([a-zA-Z_][a-zA-Z0-9_]*)/g, (_, varName) => {
-      return varMap[varName] || '*';
-    });
-
-    // Clean up multiple spaces and trim
-    result = result.replace(/\s+/g, ' ').trim();
-
-    return result;
+    return substituteQueryVariables(query, values, definedNames);
   }, [dashboard?.layout?.variables, variableValues]);
 
-  // Fetch data for a single panel
-  const fetchPanelData = useCallback(async (panel: PanelConfig) => {
+  // DSH5: keep the latest time range + substitution fn in refs so a fetch that
+  // resolves after a params change (or a reload triggered from an older callback
+  // closure) always builds the request from CURRENT params — never a superseded
+  // window. `fetchPanelData` reads these refs instead of closing over the values.
+  const timeRangeRef = useRef(timeRange);
+  useEffect(() => { timeRangeRef.current = timeRange; }, [timeRange]);
+  const substituteVariablesRef = useRef(substituteVariables);
+  useEffect(() => { substituteVariablesRef.current = substituteVariables; }, [substituteVariables]);
+
+  // DSH46: the footer "Updated …" stamp reflects the most recent panel fetch,
+  // not render time. Undefined until at least one panel has actually loaded.
+  const lastUpdated = useMemo(() => {
+    let latest: Date | undefined;
+    for (const state of panelData.values()) {
+      if (state.lastRefresh && (!latest || state.lastRefresh > latest)) {
+        latest = state.lastRefresh;
+      }
+    }
+    return latest;
+  }, [panelData]);
+
+  // Fetch data for a single panel. `bypassCache` is threaded from a manual
+  // Refresh (CONTRACT 4) and sent as `bypass_cache` on the panel-query request,
+  // so a user-initiated refresh skips the server-side result cache (DSH8/DSH52).
+  const fetchPanelData = useCallback(async (panel: PanelConfig, bypassCache = false) => {
+    // DSH5: capture the params-epoch at the START of the fetch. If it advances
+    // (time-range / variable change) before the response lands, the result is
+    // for a superseded window and must be discarded rather than rendered.
+    const startedEpoch = paramsEpoch.current;
+    const isStale = () => paramsEpoch.current !== startedEpoch;
+
     setPanelData(prev => {
       const newMap = new Map(prev);
       newMap.set(panel.id, { status: 'loading' });
@@ -281,9 +366,12 @@ export function DashboardView() {
     });
 
     try {
+      // DSH5: read the CURRENT time range from the ref (not a closure) so a
+      // reload after a params change queries the current window.
+      const currentApiTimeRange = toApiTimeRange(timeRangeRef.current);
       const effectiveTimeRange = panel.timeRangeMode === 'custom' && panel.customTimeRange
-        ? panel.customTimeRange
-        : toApiTimeRange(timeRange);
+        ? resolvePanelCustomRange(panel.customTimeRange, currentApiTimeRange)
+        : currentApiTimeRange;
 
       // NAN-1540: obs_metric widgets fetch from the metrics-v2 timeseries
       // endpoint (not the nPL/SQL panel-query path). Series are stashed as one
@@ -300,6 +388,7 @@ export function DashboardView() {
           group_by: mc.group_by,
           filters: mc.filters,
         });
+        if (isStale()) return; // DSH5: superseded — don't render stale-window data
         const rows = metricSeriesToRows(resp.series ?? []);
         const hasPoints = rows.some(
           r => Array.isArray(r.points) && (r.points as unknown[]).length > 0
@@ -310,31 +399,55 @@ export function DashboardView() {
             status: hasPoints ? 'success' : 'empty',
             data: rows,
             lastRefresh: new Date(),
+            effectiveTimeRange,
           });
           return newMap;
         });
         return;
       }
 
-      // Substitute variables client-side to handle undefined vars with '*' fallback
-      const substitutedQuery = substituteVariables(panel.query);
+      // Substitute variables client-side (CONTRACT 5) with the CURRENT values
+      // (via ref, so a post-change reload uses current selections).
+      const substitutedQuery = substituteVariablesRef.current(panel.query);
 
       const response = await executePanelQuery({
         query: substitutedQuery,
         query_mode: panel.queryMode,
         time_range: effectiveTimeRange,
+        bypass_cache: bypassCache,
       });
+      if (isStale()) return; // DSH5: superseded — discard this response
+
+      // DSH8/DSH40/DSH52 (CONTRACT 1/4): read cache + truncation metadata. Typed
+      // via a local view so this compiles regardless of when the shared
+      // PanelQueryResponse type gains these fields.
+      const meta = response as typeof response & {
+        cached?: boolean;
+        cache_age_secs?: number;
+        truncated?: boolean;
+        column_order?: string[];
+      };
 
       setPanelData(prev => {
         const newMap = new Map(prev);
         newMap.set(panel.id, {
           status: response.results.length > 0 ? 'success' : 'empty',
           data: response.results,
-          lastRefresh: new Date(),
+          // DSH52: don't stamp "Updated just now" on a cache hit — surface the
+          // cache age instead (Panel renders the "cached · refresh" affordance).
+          lastRefresh: meta.cached ? undefined : new Date(),
+          cached: meta.cached,
+          cacheAgeSecs: meta.cache_age_secs,
+          truncated: meta.truncated,
+          totalCount: response.total_count,
+          resolvedQuery: substitutedQuery,
+          effectiveTimeRange,
+          columnOrder: meta.column_order,
         });
         return newMap;
       });
     } catch (err) {
+      if (isStale()) return; // DSH5: superseded — don't render a stale error
       setPanelData(prev => {
         const newMap = new Map(prev);
         // NAN-712: ApiClientError carries `code` and `details`. Threading
@@ -359,20 +472,35 @@ export function DashboardView() {
         return newMap;
       });
     }
-  }, [executePanelQuery, timeRange, substituteVariables]);
+    // Reads timeRange / substituteVariables via refs (DSH5) so its identity is
+    // stable across params changes; only executePanelQuery affects it.
+  }, [executePanelQuery]);
 
   // NAN-1183: load one panel, de-duplicated against in-flight requests, stamping
   // the params-epoch it was fetched at so a later refresh/visibility check knows
   // whether it's stale. Stamps on completion (success or error) to avoid loops.
-  const loadPanel = useCallback(async (panel: PanelConfig) => {
-    if (inFlightPanels.current.has(panel.id)) return;
+  //
+  // DSH5: if a params-epoch bump arrives WHILE this panel is already in flight,
+  // record a pending reload and re-run with the current params once the in-flight
+  // fetch settles — so a time-range/variable change is never silently swallowed.
+  const loadPanel = useCallback(async (panel: PanelConfig, bypassCache = false) => {
+    if (inFlightPanels.current.has(panel.id)) {
+      pendingReload.current.add(panel.id);
+      return;
+    }
     inFlightPanels.current.add(panel.id);
     const epoch = paramsEpoch.current;
     try {
-      await fetchPanelData(panel);
+      await fetchPanelData(panel, bypassCache);
     } finally {
       inFlightPanels.current.delete(panel.id);
       loadedEpoch.current.set(panel.id, epoch);
+      // Re-run if params advanced during the fetch, or a reload was requested
+      // while this one was in flight (DSH5). Only while still on-screen.
+      const superseded = pendingReload.current.delete(panel.id) || epoch !== paramsEpoch.current;
+      if (superseded && visiblePanelIds.current.has(panel.id)) {
+        void loadPanel(panel, bypassCache);
+      }
     }
   }, [fetchPanelData]);
 
@@ -394,7 +522,8 @@ export function DashboardView() {
     paramsEpoch.current += 1;
     setIsRefreshing(true);
     for (let i = 0; i < targets.length; i += CONCURRENCY_LIMIT) {
-      await Promise.all(targets.slice(i, i + CONCURRENCY_LIMIT).map(loadPanel));
+      // Wrap so Array.map's index arg isn't passed as loadPanel's bypassCache.
+      await Promise.all(targets.slice(i, i + CONCURRENCY_LIMIT).map(panel => loadPanel(panel)));
     }
     setIsRefreshing(false);
   }, [dashboard?.panels, dashboard?.layout.items, loadPanel]);
@@ -409,12 +538,26 @@ export function DashboardView() {
   // unmount) doesn't carry "I already ran" state from the previous dashboard
   // into a fresh one.
   useEffect(() => {
-    if (!dashboard?.panels || isEditMode) return;
+    if (isEditMode) return;
+    // DSH23: reset variable selections to THIS dashboard's defaults when the
+    // dashboard changes in place — otherwise the previous dashboard's selections
+    // (e.g. host=web1) silently filter the new dashboard's panels.
+    const variables = dashboard?.layout?.variables;
+    const defaults: Record<string, string> = {};
+    if (Array.isArray(variables)) {
+      for (const variable of variables) {
+        if (variable.defaultValue) defaults[variable.name] = variable.defaultValue;
+      }
+    }
+    setVariableValues(defaults);
+
+    if (!dashboard?.panels) return;
     // NAN-1183: reset lazy-load tracking when switching dashboards in place
     // (same component instance, new id) so stale visibility / epoch state from
     // the previous dashboard can't suppress or stale-gate the new one's panels.
     visiblePanelIds.current.clear();
     inFlightPanels.current.clear();
+    pendingReload.current.clear();
     loadedEpoch.current.clear();
     paramsEpoch.current = 0;
     const shouldAutoRun = dashboard?.layout?.autoRun === true;
@@ -450,16 +593,28 @@ export function DashboardView() {
     if (!hasRunOnce) return;
 
     const option = AUTO_REFRESH_OPTIONS.find(o => o.value === autoRefresh);
-    if (option?.ms) {
-      autoRefreshRef.current = setInterval(() => {
-        refreshAllPanels();
-      }, option.ms);
-    }
+    if (!option?.ms) return;
+
+    autoRefreshRef.current = setInterval(() => {
+      // DSH50: don't fire full panel-query batches in a hidden/background tab —
+      // it burns per-user admission slots and triggers 429 retries that slow the
+      // active tab. Ticks resume on the visibilitychange handler below.
+      if (document.hidden) return;
+      refreshAllPanels();
+    }, option.ms);
+
+    // DSH50: on returning to a visible tab, refresh once so data isn't stale
+    // after several skipped background ticks.
+    const onVisibility = () => {
+      if (!document.hidden) refreshAllPanels();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
 
     return () => {
       if (autoRefreshRef.current) {
         clearInterval(autoRefreshRef.current);
       }
+      document.removeEventListener('visibilitychange', onVisibility);
     };
   }, [autoRefresh, refreshAllPanels, isEditMode, hasRunOnce]);
 
@@ -489,7 +644,7 @@ export function DashboardView() {
       const sorted = sortPanelsByLayout(dashboard.panels, dashboard.layout.items);
       void (async () => {
         for (let i = 0; i < sorted.length; i += 4) {
-          await Promise.all(sorted.slice(i, i + 4).map(loadPanel));
+          await Promise.all(sorted.slice(i, i + 4).map(panel => loadPanel(panel)));
         }
       })();
     }, 1500);
@@ -497,27 +652,69 @@ export function DashboardView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasRunOnce, isEditMode, dashboard?.id]);
 
+  // DSH24: warn on browser close / refresh while the editor has unsaved changes.
+  // (The app uses BrowserRouter, so useBlocker isn't available for SPA nav —
+  // the edit-mode Back button routes through handleEditBack's confirm instead.)
+  useEffect(() => {
+    if (!isEditMode || !editorDirty) return;
+    const handler = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, [isEditMode, editorDirty]);
+
   // Handle edit mode toggle
   const handleEnterEditMode = useCallback(() => {
     setSearchParams({ edit: 'true' });
   }, [setSearchParams]);
 
   const handleExitEditMode = useCallback(() => {
+    setEditorDirty(false);
     setSearchParams({});
     refetch(); // Refresh dashboard data after editing
   }, [setSearchParams, refetch]);
 
   const handleSaveComplete = useCallback(() => {
+    setEditorDirty(false);
     setSearchParams({});
     refetch();
   }, [setSearchParams, refetch]);
 
-  // Handle drilldown navigation - navigates to search page with filter and time range
-  const handleDrilldown = useCallback((filter: DrilldownFilter) => {
-    // Build the search URL with the filter and current time range
-    const searchUrl = buildSearchUrl([filter], timeRange);
+  // DSH24: the edit-mode wrapper Back button routes through here so unsaved
+  // edits prompt a confirm instead of being discarded by navigate(-1).
+  const handleEditBack = useCallback(() => {
+    if (editorDirty) {
+      setShowEditDiscard(true);
+    } else {
+      navigate(-1);
+    }
+  }, [editorDirty, navigate]);
+
+  // Handle drilldown navigation → Search. DSH26/DSH27 (CONTRACT 3): carry the
+  // panel's pre-aggregation scope as baseQuery, ALL clicked group-by filters, an
+  // anchored absolute window (the clicked bucket for timecharts, else the panel's
+  // effective window), and the panel's custom drilldown template if set.
+  const handleDrilldown = useCallback((panel: PanelConfig, payload: DrilldownPayload) => {
+    const baseQuery =
+      panel.queryMode === 'piped' ? extractBaseQuery(substituteVariables(panel.query)) : undefined;
+
+    const effectiveAbs = panel.timeRangeMode === 'custom' && panel.customTimeRange
+      ? resolvePanelCustomRange(panel.customTimeRange, toApiTimeRange(timeRange))
+      : toApiTimeRange(timeRange);
+
+    const startTime = payload.anchorStart ?? effectiveAbs.start;
+    const endTime = payload.anchorEnd ?? effectiveAbs.end;
+
+    const searchUrl = buildSearchUrl(payload.filters, {
+      baseQuery,
+      startTime,
+      endTime,
+      template: panel.drilldownTemplate,
+    });
     navigate(searchUrl);
-  }, [navigate, timeRange]);
+  }, [navigate, timeRange, substituteVariables]);
 
   if (loading) {
     return (
@@ -559,7 +756,7 @@ export function DashboardView() {
             variant="ghost"
             size="sm"
             className="h-[26px] text-muted-foreground hover:text-primary"
-            onClick={() => navigate(-1)}
+            onClick={handleEditBack}
           >
             <ArrowLeft className="w-[12px] h-[12px]" />
             Back
@@ -570,6 +767,22 @@ export function DashboardView() {
           onSave={handleSaveComplete}
           onCancel={handleExitEditMode}
           initialEditMode={true}
+          onDirtyChange={setEditorDirty}
+        />
+        {/* DSH24: discard-confirm for the wrapper Back button while dirty. */}
+        <ConfirmDialog
+          open={showEditDiscard}
+          onOpenChange={setShowEditDiscard}
+          variant="danger"
+          title="Discard changes?"
+          description="You have unsaved changes to this dashboard. Leaving now will discard them."
+          confirmLabel="Discard changes"
+          cancelLabel="Keep editing"
+          onConfirm={() => {
+            setShowEditDiscard(false);
+            setEditorDirty(false);
+            navigate(-1);
+          }}
         />
       </div>
     );
@@ -704,8 +917,8 @@ export function DashboardView() {
         </DropdownMenu>
       </div>
 
-      {/* Variable strip — only when variables exist */}
-      {dashboard.layout.variables && dashboard.layout.variables.length > 0 && (
+      {/* Variable strip — only when variables exist (DSH16: guard a malformed import) */}
+      {Array.isArray(dashboard.layout.variables) && dashboard.layout.variables.length > 0 && (
         <div className="shrink-0 border-b border-border bg-card/30 px-4 py-2">
           <VariableControls
             variables={dashboard.layout.variables}
@@ -715,6 +928,7 @@ export function DashboardView() {
               if (!hasRunOnce) setHasRunOnce(true);
             }}
             timeRange={toApiTimeRange(timeRange)}
+            hasRunOnce={hasRunOnce}
           />
         </div>
       )}
@@ -768,8 +982,12 @@ export function DashboardView() {
         <span className="tabular-nums">
           {dashboard.panels.length} {dashboard.panels.length === 1 ? 'panel' : 'panels'}
         </span>
-        <span className="text-muted-foreground/50">·</span>
-        <span>Updated {formatRelativeUTC(new Date())}</span>
+        {lastUpdated && (
+          <>
+            <span className="text-muted-foreground/50">·</span>
+            <span>Updated {formatRelativeUTC(lastUpdated)}</span>
+          </>
+        )}
         <span className="flex-1" />
         {dashboard.description && (
           <span className="truncate max-w-[60%] text-muted-foreground/60">{dashboard.description}</span>
@@ -861,11 +1079,14 @@ export function DashboardView() {
 }
 
 // Sort panels top-to-bottom (then left-to-right) by grid layout position, so
-// "above the fold" panels load first.
+// "above the fold" panels load first. DSH16: tolerate a malformed imported
+// layout whose `items` isn't an array instead of throwing on `.find`.
 function sortPanelsByLayout(panels: PanelConfig[], layoutItems: LayoutItem[]): PanelConfig[] {
-  return [...panels].sort((a, b) => {
-    const aLayout = layoutItems.find(l => l.i === a.id);
-    const bLayout = layoutItems.find(l => l.i === b.id);
+  const items = Array.isArray(layoutItems) ? layoutItems : [];
+  const list = Array.isArray(panels) ? panels : [];
+  return [...list].sort((a, b) => {
+    const aLayout = items.find(l => l.i === a.id);
+    const bLayout = items.find(l => l.i === b.id);
     const aY = aLayout?.y ?? Infinity;
     const bY = bLayout?.y ?? Infinity;
     if (aY === bY) return (aLayout?.x ?? 0) - (bLayout?.x ?? 0);
@@ -875,14 +1096,14 @@ function sortPanelsByLayout(panels: PanelConfig[], layoutItems: LayoutItem[]): P
 
 interface DashboardGridProps {
   dashboard: Dashboard;
-  panelData: Map<string, PanelDataState>;
-  onRefreshPanel: (panel: PanelConfig) => void;
+  panelData: Map<string, ViewPanelDataState>;
+  onRefreshPanel: (panel: PanelConfig, bypassCache?: boolean) => void;
   onPanelVisibilityChange?: (panelId: string, visible: boolean) => void;
   scrollRoot?: Element | null;
   timeRange: TimeRangeValue;
   isEditing?: boolean;
   onLayoutChange?: (layout: LayoutItem[]) => void;
-  onDrilldown?: (filter: DrilldownFilter) => void;
+  onDrilldown?: (panel: PanelConfig, payload: DrilldownPayload) => void;
   hasRunOnce?: boolean;
 }
 
@@ -899,7 +1120,7 @@ function DashboardGrid({
   hasRunOnce = false,
 }: DashboardGridProps) {
   const { layout, panels } = dashboard;
-  
+
   // Handle layout changes (only in edit mode)
   const handleLayoutChange = useCallback((newLayout: LayoutItem[]) => {
     if (onLayoutChange) {
@@ -910,21 +1131,33 @@ function DashboardGrid({
   // Render function for each panel
   const renderPanel = useCallback((panel: PanelConfig) => {
     const data = panelData.get(panel.id);
-    
+
     // Check if drilldown is enabled for this panel (default to true if not specified)
     const drilldownEnabled = panel.drilldownEnabled !== false;
-    
+    // CONTRACT 3: bind the panel into the drilldown callback so DashboardView can
+    // derive baseQuery / template / anchored window from it.
+    const drilldownHandler =
+      drilldownEnabled && onDrilldown
+        ? (payload: DrilldownPayload) => onDrilldown(panel, payload)
+        : undefined;
+
     return (
       <Panel
         config={panel}
         data={data}
         timeRange={timeRange}
         isEditing={isEditing}
-        onRefresh={() => onRefreshPanel(panel)}
+        onRefresh={(bypassCache) => onRefreshPanel(panel, bypassCache)}
         onVisibilityChange={onPanelVisibilityChange}
         scrollRoot={scrollRoot}
-        onDrilldown={drilldownEnabled ? onDrilldown : undefined}
+        onDrilldown={drilldownHandler}
         hasRunOnce={hasRunOnce}
+        cached={data?.cached}
+        cacheAgeSecs={data?.cacheAgeSecs}
+        truncated={data?.truncated}
+        totalCount={data?.totalCount}
+        resolvedQuery={data?.resolvedQuery}
+        effectiveTimeRange={data?.effectiveTimeRange}
       >
         {data?.status === 'success' && data.data && (
           panel.visualizationType === 'obs_metric' && panel.metricConfig ? (
@@ -934,7 +1167,8 @@ function DashboardGrid({
               type={panel.visualizationType}
               config={panel.visualizationConfig}
               data={data.data}
-              onDrilldown={drilldownEnabled ? onDrilldown : undefined}
+              columnOrder={data.columnOrder}
+              onDrilldown={drilldownHandler}
             />
           )
         )}

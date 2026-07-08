@@ -436,6 +436,10 @@ export function MetricsExplorer({
         seed={{
           metric_name: metric,
           agg,
+          // O31 (NAN-1721): carry the active service scope (promoted
+          // `service_name` column, NAN-1564) so the monitor evaluates the same
+          // scope the chart shows. '' ⇒ undefined = fleet-wide.
+          service_name: service || undefined,
           group_by: groupBy === NO_GROUP ? undefined : groupBy,
           filters,
         }}

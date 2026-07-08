@@ -263,10 +263,18 @@ fn count_if(pred: Option<String>) -> String {
 /// unchanged. Drives the marketplace coverage hero under OCSF instead of the old
 /// hardcoded `FROM logs` query (which would 500: `logs` doesn't exist under OCSF
 /// and the bare UDM `enriched_*`/`ioc_*` columns aren't promoted there).
-fn build_coverage_sql(profile: &dyn SchemaProfile) -> String {
+fn build_coverage_sql(profile: &dyn SchemaProfile, is_clustered: bool) -> String {
     // FROM the active schema's logs table (`nanosiem.ocsf_logs` for OCSF). The
     // PREWHERE timestamp column is the same in both schemas (`timestamp`).
+    // NAN-1728 (H5/R11): on a cluster the read fans in across all shards via the
+    // `_distributed` wrapper; single-node keeps the bare local name
+    // (byte-identical). Both logs and ocsf_logs are in the distributed set.
     let table = profile.table_name();
+    let table = if is_clustered {
+        format!("{table}_distributed")
+    } else {
+        table.to_string()
+    };
 
     // --- ip ---
     let src_ip = col(profile, "src_ip");
@@ -415,15 +423,32 @@ fn build_coverage_sql(profile: &dyn SchemaProfile) -> String {
 /// Resolve the coverage SQL for the active profile. UDM uses the verbatim
 /// long-lived const (byte-identical, zero behavioral drift); every other schema
 /// synthesizes a profile-aware query.
-fn coverage_sql(profile: &dyn SchemaProfile) -> String {
+fn coverage_sql(profile: &dyn SchemaProfile, is_clustered: bool) -> String {
     match profile.id() {
+        // NAN-1728 (H5/R11): route the verbatim UDM aggregate's `FROM logs` to
+        // the `_distributed` wrapper on a cluster so the hero counts all shards;
+        // single-node returns the const byte-for-byte.
+        SchemaId::Udm if is_clustered => {
+            UDM_COVERAGE_SQL.replace("\nFROM logs\n", "\nFROM logs_distributed\n")
+        }
         SchemaId::Udm => UDM_COVERAGE_SQL.to_string(),
-        _ => build_coverage_sql(profile),
+        _ => build_coverage_sql(profile, is_clustered),
     }
 }
 
+/// Whether this deployment is a multi-shard ClickHouse cluster, derived from the
+/// `CLICKHOUSE_CLUSTER` env — `MarketplaceCoverageService` holds a bare `ChClient`
+/// (no `DualPool`), so it uses the same env signal `on_cluster_clause` /
+/// retention.rs use. Unset (single-node / open-core) → the coverage SQL is
+/// byte-identical to the pre-cluster form (NAN-1728).
+fn coverage_is_clustered() -> bool {
+    std::env::var("CLICKHOUSE_CLUSTER")
+        .ok()
+        .is_some_and(|c| !c.trim().is_empty())
+}
+
 async fn fetch_counts(ch: &ChClient, profile: &dyn SchemaProfile) -> CoverageCounts {
-    let sql = coverage_sql(profile);
+    let sql = coverage_sql(profile, coverage_is_clustered());
     match ch.query(&sql).fetch_one::<CoverageCounts>().await {
         Ok(row) => row,
         Err(e) => {
@@ -624,13 +649,34 @@ mod tests {
         // The profile-aware resolver must reproduce the long-lived UDM query
         // verbatim — zero behavioral drift for the dominant deployment.
         let p = crate::schema::UdmProfile::new();
-        assert_eq!(coverage_sql(&p), UDM_COVERAGE_SQL);
+        assert_eq!(coverage_sql(&p, false), UDM_COVERAGE_SQL);
+    }
+
+    #[test]
+    fn clustered_coverage_sql_routes_to_distributed_wrappers() {
+        // NAN-1728 (H5/R11): on a cluster the coverage hero must read the
+        // `_distributed` wrapper so it counts all shards, not the LB-connected one.
+        let udm = coverage_sql(&crate::schema::UdmProfile::new(), true);
+        assert!(
+            udm.contains("\nFROM logs_distributed\n"),
+            "clustered UDM must read the distributed wrapper:\n{udm}"
+        );
+        assert!(
+            !udm.contains("\nFROM logs\n"),
+            "clustered UDM must not read the bare local table:\n{udm}"
+        );
+
+        let ocsf = coverage_sql(&crate::schema::OcsfProfile::new(), true);
+        assert!(
+            ocsf.contains("FROM nanosiem.ocsf_logs_distributed"),
+            "clustered OCSF must read the distributed wrapper:\n{ocsf}"
+        );
     }
 
     #[test]
     fn ocsf_coverage_sql_targets_ocsf_table_and_omits_unmapped_columns() {
         let p = crate::schema::OcsfProfile::new();
-        let sql = coverage_sql(&p);
+        let sql = coverage_sql(&p, false);
 
         // FROM the OCSF table, not the nonexistent `logs`.
         assert!(sql.contains("FROM nanosiem.ocsf_logs"), "sql:\n{sql}");

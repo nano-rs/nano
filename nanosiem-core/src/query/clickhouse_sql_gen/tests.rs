@@ -3093,19 +3093,23 @@
         );
     }
 
-    /// Spans/metrics profiles have no `id`/`timestamp` core columns — the
-    /// survivor-id shape can't apply; the legacy shape is preserved.
+    /// Spans have no logs `id`/`timestamp` columns, but they DO have
+    /// `span_id`/`start_time` — so dedup (O27) uses the spans-safe deterministic
+    /// survivor key `argMin(span_id, start_time)` rather than erroring on the
+    /// logs `id`/`timestamp` identity. (Before O27 this hard-errored on spans.)
     #[test]
-    fn dedup_on_spans_dataset_falls_back() {
+    fn dedup_on_spans_dataset_uses_span_id_survivor() {
         let query = parse_query("* | dedup service_name").unwrap();
         let sql = ClickHouseSqlGenerator::new()
             .with_dataset(otel::Dataset::Spans)
             .generate(&query, &time_range())
             .unwrap();
         assert!(
-            sql.contains("LIMIT 1 BY service_name") && !sql.contains("argMin(id"),
-            "spans dedup must keep the legacy shape (no id row identity), got:\n{sql}"
+            sql.contains("argMin(span_id, start_time)") && sql.contains("GROUP BY service_name"),
+            "spans dedup must use the span_id/start_time survivor key, got:\n{sql}"
         );
+        // Never the logs-only id/timestamp identity on spans.
+        assert!(!sql.contains("argMin(id"), "{sql}");
     }
 
     /// OCSF: dedup keys resolve through the active profile (src_ip → the
@@ -3699,4 +3703,85 @@
             !sql.contains("WHERE is_anomaly = 1") && sql.contains("ORDER BY anomaly_score DESC"),
             "aggregation-first path must keep score-all semantics, got:\n{sql}"
         );
+    }
+    // === NAN-1711 / audit D15: canonical window bounds on top/rare/timechart ===
+
+    /// The detection flow is parse → inject_timestamp_bounds → pretty_print →
+    /// re-parse (in the search service) → SQL. Drive that EXACT flow for each
+    /// previously-skipped aggregate command and assert the canonical
+    /// `_first_seen`/`_last_seen` pair lands in the generated SQL, so the
+    /// finding dedup can key on `entity + _last_seen` instead of re-hashing the
+    /// drifting count every cycle.
+    #[test]
+    fn detection_enrichment_bounds_reach_sql_for_top_rare_timechart() {
+        let gen = ClickHouseSqlGenerator::new();
+        for q in [
+            "* | top src_ip",
+            "* | rare status by user",
+            "* | timechart span=1h count by src_ip",
+        ] {
+            let enriched =
+                crate::detection::query_enrichment::inject_timestamp_bounds(&parse_query(q).unwrap());
+            let printed = crate::query::PrettyPrint::pretty_print(&enriched);
+            let reparsed = parse_query(&printed)
+                .unwrap_or_else(|e| panic!("{q}: re-parse of `{printed}` failed: {e}"));
+            let sql = gen.generate(&reparsed, &time_range()).unwrap();
+            assert!(
+                sql.contains("min(timestamp) AS _first_seen")
+                    && sql.contains("max(timestamp) AS _last_seen"),
+                "{q}: enriched SQL must carry the canonical bounds, got:\n{sql}"
+            );
+        }
+    }
+
+    /// `_bounds=true` is the internal token the enrichment round-trips through
+    /// pretty_print; a bare (user) top/rare must NOT emit the bounds columns.
+    #[test]
+    fn top_rare_without_bounds_flag_emit_no_bounds_columns() {
+        let gen = ClickHouseSqlGenerator::new();
+        for q in ["* | top src_ip", "* | rare status"] {
+            let sql = gen.generate(&parse_query(q).unwrap(), &time_range()).unwrap();
+            assert!(
+                !sql.contains("_first_seen") && !sql.contains("_last_seen"),
+                "{q}: unflagged top/rare must not emit bounds, got:\n{sql}"
+            );
+        }
+    }
+
+    /// Audit D3 gate at the SQL level: a top after a projection that dropped
+    /// `timestamp` must still generate VALID SQL (no min(timestamp) over a
+    /// stream without the column) — the enrichment leaves it unflagged.
+    #[test]
+    fn enriched_top_after_timestamp_drop_generates_sql_without_bounds() {
+        let gen = ClickHouseSqlGenerator::new();
+        let enriched = crate::detection::query_enrichment::inject_timestamp_bounds(
+            &parse_query("* | fields src_ip | top src_ip").unwrap(),
+        );
+        let printed = crate::query::PrettyPrint::pretty_print(&enriched);
+        let sql = gen
+            .generate(&parse_query(&printed).unwrap(), &time_range())
+            .unwrap();
+        assert!(
+            !sql.contains("_first_seen"),
+            "top after `fields src_ip` must stay bounds-free (D3), got:\n{sql}"
+        );
+    }
+
+    /// Defensive collision guard: a (pathological) rule whose ranked/by field
+    /// OUTPUT name is a canonical bound alias must not get the injection — a
+    /// second `AS _first_seen` would be MULTIPLE_EXPRESSIONS_FOR_ALIAS,
+    /// erroring the rule every cycle (the D3 failure class).
+    #[test]
+    fn top_bounds_injection_skipped_on_canonical_alias_collision() {
+        let gen = ClickHouseSqlGenerator::new();
+        for q in [
+            "* | top _first_seen _bounds=true",
+            "* | top src_ip by _last_seen _bounds=true",
+        ] {
+            let sql = gen.generate(&parse_query(q).unwrap(), &time_range()).unwrap();
+            assert!(
+                !sql.contains("min(timestamp) AS _first_seen"),
+                "{q}: injection must be skipped on alias collision, got:\n{sql}"
+            );
+        }
     }

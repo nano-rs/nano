@@ -173,11 +173,18 @@ impl NotebookRepository {
     }
 
     /// Reorder tabs by setting tab_order based on the provided list of tab IDs
+    ///
+    /// N8: the per-id UPDATEs run inside a single transaction so concurrent
+    /// reorders can't interleave and leave `tab_order` in an inconsistent state
+    /// (partial application of two competing orderings). Either the whole new
+    /// ordering commits or none of it does.
     pub async fn reorder_tabs(
         &self,
         user_id: Uuid,
         tab_ids: &[Uuid],
     ) -> Result<(), NotebookRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+
         for (index, tab_id) in tab_ids.iter().enumerate() {
             sqlx::query(
                 r#"
@@ -189,9 +196,11 @@ impl NotebookRepository {
             .bind(tab_id)
             .bind(user_id)
             .bind(index as i32)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         }
+
+        tx.commit().await?;
 
         Ok(())
     }

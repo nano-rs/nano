@@ -51,7 +51,7 @@ interface DrawerShellProps {
   children: React.ReactNode;
 }
 
-function SideDrawer({
+export function SideDrawer({
   open,
   onClose,
   title,
@@ -861,7 +861,7 @@ export function AddRepoDrawer({ open, onClose, onSubmit, submitting }: AddRepoPr
   );
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+export function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div>
       <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1">{label}</div>

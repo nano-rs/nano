@@ -62,11 +62,6 @@ async fn main() -> Result<()> {
         Err(e) => tracing::warn!("Failed to initialize meloD AI service: {}", e),
     }
 
-    // Initialize real-time evaluator (needed for rule change listener)
-    if let Err(e) = state.init_realtime_evaluator().await {
-        tracing::warn!("Failed to initialize real-time evaluator: {}", e);
-    }
-
     // === License enforcement (24h check) ===
     // Enterprise-only: the open edition ships no license / phone-home machinery
     // (NAN-1193). The checker (and its 24h GET /license/status call) is absent.
@@ -129,11 +124,6 @@ async fn main() -> Result<()> {
         let melod_handle = state.start_melod_config_poller();
         state.add_task_handle(melod_handle).await;
     }
-
-    // Rule change listener (needed for distributed detection scheduler cache)
-    tracing::info!("Starting rule change listener...");
-    let rule_listener_handle = state.start_rule_change_listener();
-    state.add_task_handle(rule_listener_handle).await;
 
     // Case change listener (SSE broadcast via pg_notify).
     // Phase 3.2 (NAN-744): cases moved to enterprise; only register when

@@ -286,9 +286,30 @@ impl NotebookRepository {
             {}
             AND (
                 n.owner_id = $2
-                OR n.visibility = 'public'
+                -- NAN-1739: case notebooks are visibility='public'; gate the
+                -- public disjunct on case_id IS NULL and govern case notebooks
+                -- by case visibility (the exclude flag above may already drop
+                -- them entirely; when included they must respect case access).
+                OR (n.case_id IS NULL AND n.visibility = 'public')
                 OR ns.shared_with_user_id = $2
                 OR ug.user_id IS NOT NULL
+                OR (
+                    n.case_id IS NOT NULL
+                    AND EXISTS (
+                        SELECT 1 FROM cases c
+                        WHERE c.id = n.case_id
+                          AND (
+                              c.created_by = $2
+                              OR c.assigned_to = $2
+                              OR c.visibility = 'public'
+                              OR (c.visibility = 'group' AND EXISTS (
+                                  SELECT 1 FROM case_groups cg
+                                  JOIN user_groups cug ON cug.group_id = cg.group_id
+                                  WHERE cg.case_id = c.id AND cug.user_id = $2
+                              ))
+                          )
+                    )
+                )
             )
             ORDER BY n.updated_at DESC
             LIMIT 20

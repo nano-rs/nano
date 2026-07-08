@@ -82,6 +82,15 @@ export function ObservabilityConsole() {
   const apiTimeRange = useMemo(() => toApiTimeRange(timeRange), [timeRange]);
 
   const goTab = (next: ObservabilityTab) => {
+    // O30 (NAN-1721): presets must track "now". `apiTimeRange` is memoized on
+    // `timeRange`, so a preset resolved at mount stays frozen at that absolute
+    // window forever. Bump `refreshedAt` on tab switch so the resolved window
+    // re-resolves to the current time for the tab we're navigating to (custom
+    // absolute ranges are left untouched). Owned data tabs additionally
+    // re-resolve at fetch time to cover in-tab filter changes and refreshes.
+    setTimeRange((prev) =>
+      prev.type === 'preset' ? { ...prev, refreshedAt: Date.now() } : prev,
+    );
     // Switching tabs clears any service drill-in.
     navigate(`/observability/${next}`);
   };

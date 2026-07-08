@@ -231,6 +231,12 @@ impl LogSourceRepository {
         } else {
             "length(message) + length(metadata) + length(source_type) + 100"
         };
+        // NAN-1728 (H5): route the FROM through the `_distributed` wrapper on a
+        // cluster so per-source health covers all shards; bare local name on
+        // single-node (byte-identical). The `logs_table` base name above still
+        // drives the `size_expr` selection (the wrapper name would never match
+        // `"ocsf_logs"`).
+        let logs_read = self.table_names.read_bare(logs_table);
 
         // Query recent data with PREWHERE for partition pruning
         // Use 90-day window for total_events, dedicated counts for 24h/1h
@@ -243,7 +249,7 @@ impl LogSourceRepository {
                 max(timestamp) as last_event_at,
                 min(timestamp) as first_event_at,
                 sum({size_expr}) as total_size_bytes
-            FROM {logs_table}
+            FROM {logs_read}
             PREWHERE timestamp >= now() - INTERVAL 90 DAY
             WHERE {where_clause}
             "#
@@ -502,13 +508,17 @@ impl LogSourceRepository {
                 rollup, hours, in_clause
             )
         } else {
+            // NAN-1728 (H5): route the raw-logs fallback through the
+            // `_distributed` wrapper on a cluster so the history covers all
+            // shards; bare `logs` on single-node (byte-identical).
+            let logs_table = self.table_names.read_bare("logs");
             format!(
                 r#"
                 SELECT
                     source_type,
                     toStartOfHour(timestamp) as hour,
                     count(*) as count
-                FROM logs
+                FROM {logs_table}
                 WHERE timestamp >= now() - INTERVAL {} HOUR
                   AND lower(source_type) IN ({})
                 GROUP BY source_type, hour

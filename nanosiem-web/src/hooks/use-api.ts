@@ -5,7 +5,7 @@
  * Provides loading states, error handling, and data caching
  */
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { 
   api, 
   DetectionRule, 
@@ -47,7 +47,15 @@ function useQuery<T>(
   const [loading, setLoading] = useState(!options?.skip);
   const [error, setError] = useState<ApiClientError | null>(null);
 
+  // NAN-1719 (DSH10): monotonic request token. Every fetch captures the current
+  // value up-front and the effect cleanup bumps it, so a slow response whose
+  // token no longer matches the latest is dropped instead of overwriting a newer
+  // fetch's data. Without this a slow dashboard-A response can land after a fast
+  // dashboard-B fetch and render A's content under B's URL.
+  const requestSeq = useRef(0);
+
   const fetch = useCallback(async () => {
+    const seq = ++requestSeq.current;
     if (options?.skip) {
       setLoading(false);
       return;
@@ -56,16 +64,23 @@ function useQuery<T>(
     setError(null);
     try {
       const result = await queryFn();
+      if (seq !== requestSeq.current) return; // superseded by a newer fetch
       setData(result);
     } catch (err) {
+      if (seq !== requestSeq.current) return; // superseded by a newer fetch
       setError(err instanceof ApiClientError ? err : new ApiClientError(String(err), 'UNKNOWN_ERROR'));
     } finally {
-      setLoading(false);
+      if (seq === requestSeq.current) setLoading(false);
     }
   }, [...deps, options?.skip]);
 
   useEffect(() => {
     fetch();
+    // Invalidate the in-flight request on deps change / unmount so its late
+    // resolve is discarded (DSH10).
+    return () => {
+      requestSeq.current++;
+    };
   }, [fetch]);
 
   return { data, loading, error, refetch: fetch };

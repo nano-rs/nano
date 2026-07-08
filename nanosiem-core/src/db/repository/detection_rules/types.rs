@@ -40,22 +40,4 @@ impl DetectionRuleRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
-
-    /// Notify all nodes of a rule change via PostgreSQL LISTEN/NOTIFY.
-    ///
-    /// Non-fatal: if the notification fails, rule caches will eventually
-    /// be refreshed on the next manual reload.
-    pub(super) async fn notify_rule_change(pool: &PgPool, rule_id: Uuid) {
-        if let Err(e) = sqlx::query("SELECT pg_notify('rule_changes', $1::text)")
-            .bind(rule_id.to_string())
-            .execute(pool)
-            .await
-        {
-            tracing::warn!(
-                "Failed to send rule_changes notification for {}: {}",
-                rule_id,
-                e
-            );
-        }
-    }
 }

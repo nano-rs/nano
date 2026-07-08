@@ -31,6 +31,18 @@ function isAdmissionDenied(err: unknown): boolean {
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
+/**
+ * CONTRACT 2 (DSH9): detect the 409 the dashboard update returns when its
+ * optimistic-concurrency `expected_updated_at` precondition fails, so editors
+ * can surface a "dashboard changed on server — reload" message instead of a
+ * silent success. Kept here so both the view settings save and the editor save
+ * share one predicate.
+ */
+export function isDashboardConflictError(err: unknown): boolean {
+  const e = err as { status?: number; code?: string } | null;
+  return !!e && (e.status === 409 || e.code === 'CONFLICT' || e.code === 'CONFLICT_ERROR');
+}
+
 async function retryOn429<T>(fn: () => Promise<T>): Promise<T> {
   for (let attempt = 1; ; attempt++) {
     try {
@@ -65,10 +77,24 @@ export class DashboardsApi {
     });
   }
 
-  async updateDashboard(id: string, request: UpdateDashboardRequest): Promise<Dashboard> {
+  async updateDashboard(
+    id: string,
+    request: UpdateDashboardRequest,
+    expectedUpdatedAt?: string,
+  ): Promise<Dashboard> {
+    // CONTRACT 2 (DSH9): optimistic concurrency. When the caller passes the
+    // last-seen `updated_at`, forward it as `expected_updated_at`; the backend
+    // 409s on a mismatch. Kept optional so existing callers/hooks don't break.
+    // (Callers that route through the `useUpdateDashboard` hook — which drops
+    // extra args — can instead embed `expected_updated_at` directly in the
+    // request body; this method merges whichever is supplied.)
+    const body =
+      expectedUpdatedAt !== undefined
+        ? { ...request, expected_updated_at: expectedUpdatedAt }
+        : request;
     return this.request(`/api/dashboards/${id}`, {
       method: 'PUT',
-      body: JSON.stringify(request),
+      body: JSON.stringify(body),
     });
   }
 

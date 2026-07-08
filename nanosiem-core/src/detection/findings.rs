@@ -94,8 +94,9 @@ impl FindingEvent {
                         match v {
                             serde_json::Value::Null => None,
                             serde_json::Value::String(s) if s.is_empty() => None,
-                            serde_json::Value::Number(n) if n.as_f64() == Some(0.0) => None,
-                            serde_json::Value::Bool(false) => None,
+                            // Audit D37: `0` and `false` are MEANINGFUL evidence
+                            // (status: 0, auth_result: false, port 0) — only
+                            // genuinely empty values (null, "", [], {}) are stripped.
                             serde_json::Value::Array(arr) if arr.is_empty() => None,
                             serde_json::Value::Object(obj) if obj.is_empty() => None,
                             // Recursively strip nested objects
@@ -1053,10 +1054,67 @@ mod timestamp_basis_tests {
     }
 }
 
-#[cfg(any())]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::detection::risk::RiskResult;
+    use crate::models::detection_rule::{AlertMode, DetectionMode};
+
+    /// Minimal valid `DetectionRule` for finding tests. Override only the fields
+    /// under test via struct-update syntax:
+    /// `DetectionRule { mode: RuleMode::Live, ..sample_rule() }`.
+    ///
+    /// Keeping the full field list in one place means a schema change is a
+    /// one-line fix here instead of across every test — this module sat disabled
+    /// behind `#[cfg(any())]` for months precisely because inline struct literals
+    /// went stale (NAN-1722).
+    fn sample_rule() -> DetectionRule {
+        DetectionRule {
+            id: Uuid::now_v7(),
+            name: "Test Rule".to_string(),
+            description: None,
+            query: "error".to_string(),
+            severity: Severity::High,
+            mitre_tactics: vec![],
+            mitre_techniques: vec![],
+            schedule_cron: None,
+            mode: RuleMode::Alerting,
+            narrative: None,
+            reference_url: None,
+            author: None,
+            tags: vec![],
+            ai_generated: false,
+            realtime_enabled: false,
+            detection_mode: DetectionMode::Scheduled,
+            materialized_view_name: None,
+            risk_score: None,
+            risk_entity_field: None,
+            risk_modifiers: sqlx::types::Json(vec![]),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_run_at: None,
+            last_match_at: None,
+            match_count: 0,
+            live_match_count: 0,
+            archived: false,
+            folder: None,
+            ai_triage_hints: sqlx::types::Json(Default::default()),
+            lookback_minutes: None,
+            dataset: None,
+            auto_tuning_enabled: true,
+            auto_tuning_min_confidence: 0.8,
+            auto_tuning_critical: false,
+            auto_tuning_disabled_until: None,
+            case_visibility: "private".to_string(),
+            case_assigned_group: None,
+            alert_mode: AlertMode::Grouped,
+            next_run_at: None,
+            claimed_by: None,
+            claimed_at: None,
+            playbook_selector_mode: "none".to_string(),
+            playbook_id: None,
+        }
+    }
 
     #[test]
     fn test_finding_type_display() {
@@ -1067,42 +1125,8 @@ mod tests {
     #[test]
     fn test_finding_event_message() {
         let rule = DetectionRule {
-            id: Uuid::now_v7(),
-            name: "Test Rule".to_string(),
-            description: None,
-            query: "error".to_string(),
-            severity: Severity::High,
-            mitre_tactics: vec![],
-            mitre_techniques: vec![],
-            schedule_cron: None,
-            enabled: true,
             mode: RuleMode::Live,
-            narrative: None,
-            reference_url: None,
-            author: None,
-            tags: vec![],
-            ai_generated: false,
-            realtime_enabled: false,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            last_run_at: None,
-            last_match_at: None,
-            match_count: 0,
-            live_match_count: 0,
-            risk_score: None,
-            risk_entity_field: None,
-            risk_modifiers: sqlx::types::Json(vec![]),
-            detection_mode: crate::models::detection_rule::DetectionMode::Scheduled,
-            materialized_view_name: None,
-            archived: false,
-            lookback_minutes: None,
-            dataset: None,
-            auto_tuning_enabled: true,
-            auto_tuning_min_confidence: 0.8,
-            auto_tuning_critical: false,
-            auto_tuning_disabled_until: None,
-            folder: None,
-            ai_triage_hints: sqlx::types::Json(Default::default()),
+            ..sample_rule()
         };
 
         let events = vec![serde_json::json!({"message": "test"})];
@@ -1117,7 +1141,8 @@ mod tests {
 
         assert!(finding.message().contains("[LIVE]"));
         assert!(finding.message().contains("Test Rule"));
-        // Should include the entity info
+        // The entity summary is seeded from the risk entity (src_ip) even when
+        // the sample event itself doesn't carry the field.
         assert!(finding.message().contains("src_ip=192.168.1.1"));
         assert_eq!(finding.matched_event_count, 1);
         assert_eq!(finding.raw_risk_score, 75);
@@ -1128,42 +1153,11 @@ mod tests {
     #[test]
     fn test_finding_event_to_json() {
         let rule = DetectionRule {
-            id: Uuid::now_v7(),
-            name: "Test Rule".to_string(),
-            description: None,
-            query: "error".to_string(),
             severity: Severity::Critical,
             mitre_tactics: vec!["TA0001".to_string()],
             mitre_techniques: vec!["T1059".to_string()],
-            schedule_cron: None,
-            enabled: true,
-            mode: RuleMode::Alerting,
-            narrative: None,
-            reference_url: None,
-            author: None,
-            tags: vec![],
-            ai_generated: false,
             realtime_enabled: true,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            last_run_at: None,
-            last_match_at: None,
-            match_count: 0,
-            live_match_count: 0,
-            risk_score: None,
-            risk_entity_field: None,
-            risk_modifiers: sqlx::types::Json(vec![]),
-            detection_mode: crate::models::detection_rule::DetectionMode::Scheduled,
-            materialized_view_name: None,
-            archived: false,
-            lookback_minutes: None,
-            dataset: None,
-            auto_tuning_enabled: true,
-            auto_tuning_min_confidence: 0.8,
-            auto_tuning_critical: false,
-            auto_tuning_disabled_until: None,
-            folder: None,
-            ai_triage_hints: sqlx::types::Json(Default::default()),
+            ..sample_rule()
         };
 
         let events = vec![
@@ -1193,42 +1187,10 @@ mod tests {
     #[test]
     fn test_finding_event_risk_fields() {
         let rule = DetectionRule {
-            id: Uuid::now_v7(),
             name: "Risk Test Rule".to_string(),
-            description: None,
-            query: "error".to_string(),
-            severity: Severity::High,
-            mitre_tactics: vec![],
-            mitre_techniques: vec![],
-            schedule_cron: None,
-            enabled: true,
-            mode: RuleMode::Alerting,
-            narrative: None,
-            reference_url: None,
-            author: None,
-            tags: vec![],
-            ai_generated: false,
-            realtime_enabled: false,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            last_run_at: None,
-            last_match_at: None,
-            detection_mode: crate::models::detection_rule::DetectionMode::Scheduled,
-            materialized_view_name: None,
-            match_count: 0,
-            live_match_count: 0,
             risk_score: Some(85),
             risk_entity_field: Some("user".to_string()),
-            risk_modifiers: sqlx::types::Json(vec![]),
-            archived: false,
-            lookback_minutes: None,
-            dataset: None,
-            auto_tuning_enabled: true,
-            auto_tuning_min_confidence: 0.8,
-            auto_tuning_critical: false,
-            auto_tuning_disabled_until: None,
-            folder: None,
-            ai_triage_hints: sqlx::types::Json(Default::default()),
+            ..sample_rule()
         };
 
         let events = vec![serde_json::json!({"user": "attacker", "action": "login_failed"})];
@@ -1241,7 +1203,7 @@ mod tests {
         );
         let finding = FindingEvent::detection_match(&rule, &events, true, risk_result);
 
-        // Verify risk fields are set correctly
+        // Risk fields are surfaced verbatim on the finding.
         assert_eq!(finding.raw_risk_score, 85);
         assert_eq!(finding.risk_score, 42);
         assert_eq!(finding.risk_entity, "attacker");
@@ -1251,17 +1213,17 @@ mod tests {
             .contains(&"modifier:count > 5".to_string()));
         assert!(finding.risk_factors.contains(&"brute_force".to_string()));
 
-        // Verify JSON output includes risk fields
+        // And in the log JSON.
         let json = finding.to_log_json();
         assert_eq!(json["raw_risk_score"], 85);
         assert_eq!(json["risk_score"], 42);
         assert_eq!(json["risk_entity"], "attacker");
-        assert!(json["risk_factors"].as_array().unwrap().len() == 2);
+        assert_eq!(json["risk_factors"].as_array().unwrap().len(), 2);
     }
 
     #[test]
     fn test_strip_empty_fields() {
-        // Test event with many empty fields (like UDM schema)
+        // Event mixing genuinely-empty fields with meaningful falsy values.
         let event = serde_json::json!({
             "src_ip": "10.0.1.30",
             "dest_host": "legacy-erp-2015.internal",
@@ -1269,24 +1231,25 @@ mod tests {
             "bytes_out": 49885,
             "status_code": 200,
             "url": "http://legacy-erp-2015.internal/",
-            // Empty fields that should be stripped
-            "action_mode": "",
-            "action_name": "",
+            // Meaningful falsy evidence — MUST be kept (audit D37).
             "access_count": 0,
             "access_time": 0,
             "additional_answer_count": 0,
-            "app": "",
             "app_id": 0,
+            "false_bool": false,
+            // Genuinely empty — stripped.
+            "action_mode": "",
+            "action_name": "",
+            "app": "",
             "auth_result": "",
             "auth_type": "",
             "empty_array": [],
             "empty_object": {},
             "null_field": null,
-            "false_bool": false,
             "nested": {
                 "has_value": "test",
-                "empty_string": "",
                 "zero_number": 0,
+                "empty_string": "",
                 "empty_nested": {}
             }
         });
@@ -1294,7 +1257,7 @@ mod tests {
         let stripped = FindingEvent::strip_empty_fields(&event);
         let obj = stripped.as_object().unwrap();
 
-        // Verify non-empty fields are kept
+        // Non-empty scalars kept.
         assert!(obj.contains_key("src_ip"));
         assert!(obj.contains_key("dest_host"));
         assert!(obj.contains_key("user"));
@@ -1302,79 +1265,47 @@ mod tests {
         assert!(obj.contains_key("status_code"));
         assert!(obj.contains_key("url"));
 
-        // Verify empty fields are removed
+        // Audit D37: 0 and false are MEANINGFUL evidence (status 0, port 0,
+        // auth_result false) — kept, not stripped.
+        assert!(obj.contains_key("access_count"));
+        assert!(obj.contains_key("access_time"));
+        assert!(obj.contains_key("additional_answer_count"));
+        assert!(obj.contains_key("app_id"));
+        assert!(obj.contains_key("false_bool"));
+
+        // Only genuinely empty values (null / "" / [] / {}) are stripped.
         assert!(!obj.contains_key("action_mode"));
         assert!(!obj.contains_key("action_name"));
-        assert!(!obj.contains_key("access_count"));
-        assert!(!obj.contains_key("access_time"));
-        assert!(!obj.contains_key("additional_answer_count"));
         assert!(!obj.contains_key("app"));
-        assert!(!obj.contains_key("app_id"));
         assert!(!obj.contains_key("auth_result"));
         assert!(!obj.contains_key("auth_type"));
         assert!(!obj.contains_key("empty_array"));
         assert!(!obj.contains_key("empty_object"));
         assert!(!obj.contains_key("null_field"));
-        assert!(!obj.contains_key("false_bool"));
 
-        // Verify nested object handling
+        // Nested objects are stripped recursively with the same rule.
         assert!(obj.contains_key("nested"));
         let nested = obj["nested"].as_object().unwrap();
         assert!(nested.contains_key("has_value"));
+        assert!(nested.contains_key("zero_number")); // 0 kept (D37)
         assert!(!nested.contains_key("empty_string"));
-        assert!(!nested.contains_key("zero_number"));
         assert!(!nested.contains_key("empty_nested"));
     }
 
     #[test]
     fn test_detection_match_strips_empty_fields() {
         let rule = DetectionRule {
-            id: Uuid::now_v7(),
-            name: "Test Rule".to_string(),
-            description: None,
-            query: "error".to_string(),
-            severity: Severity::High,
-            mitre_tactics: vec![],
-            mitre_techniques: vec![],
-            schedule_cron: None,
-            enabled: true,
             mode: RuleMode::Live,
-            narrative: None,
-            reference_url: None,
-            author: None,
-            tags: vec![],
-            ai_generated: false,
-            realtime_enabled: false,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            last_run_at: None,
-            last_match_at: None,
-            match_count: 0,
-            live_match_count: 0,
-            risk_score: None,
-            risk_entity_field: None,
-            risk_modifiers: sqlx::types::Json(vec![]),
-            detection_mode: crate::models::detection_rule::DetectionMode::Scheduled,
-            materialized_view_name: None,
-            archived: false,
-            lookback_minutes: None,
-            dataset: None,
-            auto_tuning_enabled: true,
-            auto_tuning_min_confidence: 0.8,
-            auto_tuning_critical: false,
-            auto_tuning_disabled_until: None,
-            folder: None,
-            ai_triage_hints: sqlx::types::Json(Default::default()),
+            ..sample_rule()
         };
 
-        // Event with many empty UDM fields
         let events = vec![serde_json::json!({
             "src_ip": "192.168.1.1",
             "message": "test error",
-            "action": "",
+            "count": 0,          // meaningful falsy — kept (D37)
+            "action": "",        // empty — stripped
             "app": "",
             "bytes": "",
-            "count": 0,
             "empty_field": null,
         })];
 
@@ -1387,20 +1318,19 @@ mod tests {
         );
         let finding = FindingEvent::detection_match(&rule, &events, true, risk_result);
 
-        // Verify sample has stripped empty fields
         assert_eq!(finding.matched_events_sample.len(), 1);
         let sample = &finding.matched_events_sample[0];
         let obj = sample.as_object().unwrap();
 
-        // Should keep non-empty fields
+        // Non-empty + meaningful-falsy kept.
         assert!(obj.contains_key("src_ip"));
         assert!(obj.contains_key("message"));
+        assert!(obj.contains_key("count")); // 0 kept (D37)
 
-        // Should remove empty fields
+        // Genuinely-empty stripped.
         assert!(!obj.contains_key("action"));
         assert!(!obj.contains_key("app"));
         assert!(!obj.contains_key("bytes"));
-        assert!(!obj.contains_key("count"));
         assert!(!obj.contains_key("empty_field"));
     }
 }

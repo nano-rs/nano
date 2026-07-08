@@ -195,10 +195,29 @@ impl SearchService {
                 interval.tick().await;
 
                 if let Some(ref client) = ch_client {
+                    // NAN-1728 (H2): `system.processes` is node-local. On a cluster
+                    // the poll connection is LB'd and can land on a different node
+                    // than the search's initiator, so a plain read returns no row
+                    // and progress silently stalls at 0. Wrap in `clusterAllReplicas`
+                    // when `CLICKHOUSE_CLUSTER` is set (matching `on_cluster_clause`'s
+                    // source) so the initiator's row is found on whichever node it
+                    // ran; on single-node / open-core the env is unset and the SQL is
+                    // byte-identical to the pre-cluster `system.processes` read.
+                    let progress_source = match std::env::var("CLICKHOUSE_CLUSTER")
+                        .ok()
+                        .map(|c| c.trim().to_string())
+                        .filter(|c| !c.is_empty())
+                    {
+                        Some(cluster) => format!(
+                            "clusterAllReplicas('{}', system.processes)",
+                            crate::sql_hygiene::escape_sql_string(&cluster)
+                        ),
+                        None => "system.processes".to_string(),
+                    };
                     let progress_sql = format!(
                         "SELECT read_rows, total_rows_approx, elapsed \
-                         FROM system.processes WHERE query_id = '{}'",
-                        safe_qid
+                         FROM {} WHERE query_id = '{}'",
+                        progress_source, safe_qid
                     );
                     if let Ok(mut cursor) = client.query(&progress_sql).fetch_bytes("JSONEachRow") {
                         let mut bytes = Vec::new();

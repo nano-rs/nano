@@ -14,10 +14,14 @@ impl DetectionRuleRepository {
         &self,
         id: Uuid,
     ) -> Result<DetectionRule, DetectionRuleRepositoryError> {
+        // Audit D28: entering Live starts a fresh bake-in phase, so reset the
+        // live_match_count — otherwise it carries over a previous bake-in's count
+        // and misleads the tuning signal.
         let result = sqlx::query_as::<_, DetectionRule>(
             r#"
             UPDATE detection_rules SET
                 mode = 'live',
+                live_match_count = 0,
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -189,6 +193,9 @@ impl DetectionRuleRepository {
             r#"
             UPDATE detection_rules SET
                 mode = $2,
+                -- Audit D28: bulk transitions into Live must reset the bake-in
+                -- counter too (single-rule demote_to_live already does).
+                live_match_count = CASE WHEN $2 = 'live' THEN 0 ELSE live_match_count END,
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *

@@ -220,8 +220,19 @@ impl EnrichmentScheduler {
                                     _ => None,
                                 };
                                 if let Some(dict) = dict_name {
+                                    // ON CLUSTER when clustered so every node's
+                                    // dict reloads after the auto-sync, not just
+                                    // the connected one (NAN-1728 H3). Empty
+                                    // clause on single-node → identical DDL.
+                                    // TODO(H3 follow-up): REFRESH VIEW (+ WAIT)
+                                    // before reload for immediate staging
+                                    // freshness — deferred.
                                     match ch
-                                        .query(&format!("SYSTEM RELOAD DICTIONARY {}", dict))
+                                        .query(&format!(
+                                            "SYSTEM RELOAD DICTIONARY{on_cluster} {dict}",
+                                            on_cluster =
+                                                crate::db::dual_pool::on_cluster_clause()
+                                        ))
                                         .execute()
                                         .await
                                     {

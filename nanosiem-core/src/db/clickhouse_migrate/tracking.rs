@@ -39,8 +39,20 @@ impl ClickHouseMigrator {
         //     and the Replicated DB auto-propagates DDL so ON CLUSTER would be
         //     redundant. See NAN-1094.
         //   - Explicit operator-managed cluster (e.g. nanosiem_cluster from the
-        //     CH operator): supply zoo path + replica macro + ON CLUSTER.
+        //     CH operator): supply a CLUSTER-WIDE zoo path + replica macro + ON
+        //     CLUSTER.
         //   - No cluster (single-node): plain MergeTree.
+        //
+        // NAN-1728 (C6/D1): the explicit-cluster zoo path OMITS the `{shard}`
+        // macro. Migration state must be GLOBAL, not per-shard. With `{shard}` in
+        // the path each shard was an independent replication group, so a migrator
+        // connection that the LB pinned to shard 0 recorded state only there;
+        // the next run landing on shard 1 saw an empty `_migrations` and
+        // re-applied every migration (double-counting non-idempotent backfills),
+        // while api/search pods on other shards failed `check_schema_up_to_date`
+        // with `SchemaBehind`. Dropping `{shard}` makes every node across all
+        // shards one replication group — a single, complete, globally-consistent
+        // `_migrations`. Single-node and Replicated-DB/cloud paths are unchanged.
         let is_cloud = self.is_cloud.unwrap_or(false);
         let (on_cluster, engine) = match self.cluster.as_ref().and_then(|c| c.as_ref()) {
             Some(cluster) if is_cloud || cluster == &self.database => (
@@ -48,8 +60,8 @@ impl ClickHouseMigrator {
                 "ReplicatedMergeTree()".to_string(),
             ),
             Some(cluster) => {
-                let zoo_path =
-                    format!("/clickhouse/tables/{{shard}}/{}/_migrations", self.database);
+                // No `{shard}` → one cluster-wide replication group.
+                let zoo_path = format!("/clickhouse/tables/{}/_migrations", self.database);
                 (
                     format!(" ON CLUSTER '{}'", cluster),
                     format!("ReplicatedMergeTree('{}', '{{replica}}')", zoo_path),

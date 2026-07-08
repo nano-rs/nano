@@ -18,6 +18,8 @@ import { api } from '@/lib/api';
 import { useReportPhase2Status } from '@/components/search/footer-reporter';
 import { useIsLiveRun } from '@/components/search/live-run-context';
 import type { CacheMeta } from '@/lib/api';
+import { toApiTimeRange } from '@/hooks/use-api';
+import type { TimeRange } from '@/lib/api/types';
 import { cn } from '@/lib/utils';
 import { CachedNotice } from '@/components/search/CachedNotice';
 import { Sparkline } from '@/components/observability/charts';
@@ -67,24 +69,31 @@ function SummaryStrip({ services, total }: { services: ServiceSummary[]; total: 
   const worstP95 = services.length ? Math.max(...services.map((s) => s.p95_ms)) : 0;
   const healthy = services.filter((s) => s.health === 'good').length;
 
+  // O51 (NAN-1721): these figures aggregate only the loaded page of services,
+  // not the whole fleet. When more services exist than are loaded, annotate the
+  // cards as a loaded slice (matching the Services card's "50/300 loaded") so
+  // they don't read as fleet-wide request rate / error rate / worst p95.
+  const isSlice = total > services.length;
+  const sliceUnit = isSlice ? `of ${services.length}/${total}` : '';
+
   const cards: Array<{ label: string; value: string; unit: string; tone: DesignHealth }> = [
-    { label: 'Request rate', value: fmtRate(totalRate), unit: 'req/s', tone: 'good' },
+    { label: 'Request rate', value: fmtRate(totalRate), unit: isSlice ? `req/s · ${sliceUnit}` : 'req/s', tone: 'good' },
     {
       label: 'Error rate',
       value: fmtPct(weightedErrPct),
-      unit: '',
+      unit: sliceUnit,
       tone: weightedErrPct >= 5 ? 'danger' : weightedErrPct >= 1 ? 'warn' : 'good',
     },
     {
       label: 'Latency p95',
       value: fmtMs(worstP95),
-      unit: 'worst',
+      unit: isSlice ? `worst · ${sliceUnit}` : 'worst',
       tone: worstP95 >= 1800 ? 'danger' : worstP95 >= 600 ? 'warn' : 'good',
     },
     {
       label: 'Services',
-      value: total > services.length ? `${services.length}/${total}` : `${healthy}/${services.length}`,
-      unit: total > services.length ? 'loaded' : 'healthy',
+      value: isSlice ? `${services.length}/${total}` : `${healthy}/${services.length}`,
+      unit: isSlice ? 'loaded' : 'healthy',
       tone: healthy === services.length ? 'good' : 'warn',
     },
   ];
@@ -278,7 +287,7 @@ function ServicesGrid({ services, onOpen }: { services: ServiceSummary[]; onOpen
 // Tab
 // ---------------------------------------------------------------------------
 
-export function ServicesTab({ apiTimeRange, onOpenService }: ObservabilityTabProps) {
+export function ServicesTab({ apiTimeRange, timeRange, onOpenService }: ObservabilityTabProps) {
   const [services, setServices] = useState<ServiceSummary[] | null>(null);
   const [total, setTotal] = useState(0);
   const [hasMore, setHasMore] = useState(false);
@@ -297,6 +306,15 @@ export function ServicesTab({ apiTimeRange, onOpenService }: ObservabilityTabPro
   const [health, setHealth] = useState<ServiceHealth | 'all'>('all');
   const [sort, setSort] = useState<ServicesSort>('rate');
 
+  // O30 (NAN-1721): resolve the window fresh at fetch time so presets track
+  // "now" across filter/sort changes and manual refreshes rather than reusing
+  // the absolute window frozen at console mount. The window used by the current
+  // page-0 fetch is captured so "Load more" pages stay inside it. The fetch
+  // effect keys on the stable `apiTimeRange` prop (this tab is also embedded in
+  // the search page via a fresh-each-render `timeRange` object, so keying on
+  // `timeRange` identity there would refetch on every parent render).
+  const windowRef = useRef<TimeRange>(toApiTimeRange(timeRange));
+
   useEffect(() => {
     const t = setTimeout(() => setDebouncedQ(q.trim()), 250);
     return () => clearTimeout(t);
@@ -314,9 +332,11 @@ export function ServicesTab({ apiTimeRange, onOpenService }: ObservabilityTabPro
     setCacheMeta(null); // clear stale badge while the fresh (page-0) list loads
     const bypass = liveOnceRef.current;
     liveOnceRef.current = false;
+    const resolved = toApiTimeRange(timeRange);
+    windowRef.current = resolved;
     api.observability
       .listServices(
-        apiTimeRange,
+        resolved,
         {
           q: debouncedQ || undefined,
           health: health === 'all' ? undefined : health,
@@ -341,6 +361,9 @@ export function ServicesTab({ apiTimeRange, onOpenService }: ObservabilityTabPro
     return () => {
       cancelled = true;
     };
+    // `timeRange` is intentionally resolved inside (fresh "now" for presets) and
+    // omitted from deps in favor of the stable `apiTimeRange` identity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [apiTimeRange, debouncedQ, health, sort]);
 
   // NAN-1595: force a live re-fetch of the first page, bypassing the server cache.
@@ -348,9 +371,11 @@ export function ServicesTab({ apiTimeRange, onOpenService }: ObservabilityTabPro
     if (refreshing) return;
     setRefreshing(true);
     setError(null);
+    const resolved = toApiTimeRange(timeRange);
+    windowRef.current = resolved;
     api.observability
       .listServices(
-        apiTimeRange,
+        resolved,
         {
           q: debouncedQ || undefined,
           health: health === 'all' ? undefined : health,
@@ -374,7 +399,7 @@ export function ServicesTab({ apiTimeRange, onOpenService }: ObservabilityTabPro
     const offset = services?.length ?? 0;
     setLoadingMore(true);
     api.observability
-      .listServices(apiTimeRange, {
+      .listServices(windowRef.current, {
         q: debouncedQ || undefined,
         health: health === 'all' ? undefined : health,
         sort,

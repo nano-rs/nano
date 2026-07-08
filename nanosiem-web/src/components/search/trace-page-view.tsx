@@ -6,11 +6,13 @@
 // fetch here (same query as TracePage). The nPL command short-circuits to a
 // marker row carrying `_trace_id`.
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { Loader2 } from 'lucide-react';
 import { api } from '@/lib/api';
+import type { CacheMeta } from '@/lib/api';
+import { CachedNotice } from '@/components/search/CachedNotice';
 import { TraceWaterfall } from '@/components/observability/TraceWaterfall';
 import { useReportPhase2 } from './footer-reporter';
 
@@ -21,11 +23,31 @@ export interface TracePageViewProps {
 export function TracePageView({ traceId }: TracePageViewProps) {
   const navigate = useNavigate();
   const reportPhase2 = useReportPhase2();
-  const { data, isLoading, isFetching, error } = useQuery({
+
+  // NAN-1721 (O36): the trace fetch is server-cached — surface the "cached ·
+  // refresh" badge and let a refresh force a live refetch, via the
+  // api.observability.getTrace variant that threads cacheOpts.
+  const [cacheMeta, setCacheMeta] = useState<CacheMeta | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const bypassRef = useRef(false);
+
+  const { data, isLoading, isFetching, error, refetch } = useQuery({
     queryKey: ['otel-trace', traceId],
-    queryFn: () => api.getTrace(traceId),
+    queryFn: () => {
+      const bypass = bypassRef.current;
+      bypassRef.current = false;
+      return api.observability.getTrace(traceId, { onMeta: setCacheMeta, bypass });
+    },
     enabled: traceId.length > 0,
   });
+
+  const refresh = () => {
+    if (refreshing) return;
+    bypassRef.current = true;
+    setRefreshing(true);
+    void refetch().finally(() => setRefreshing(false));
+  };
+
   const spans = data?.spans ?? [];
 
   // NAN-1599: publish the real trace fetch status to the search footer (first
@@ -82,6 +104,9 @@ export function TracePageView({ traceId }: TracePageViewProps) {
         spans={spans}
         onBack={() => navigate(-1)}
         backLabel="Back"
+        cacheNotice={
+          <CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={refreshing} />
+        }
       />
     </div>
   );

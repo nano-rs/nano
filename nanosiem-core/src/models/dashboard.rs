@@ -133,12 +133,19 @@ fn default_visibility() -> String {
     "public".to_string()
 }
 
-/// Input for updating a dashboard
+/// Input for updating a dashboard.
+///
+/// `description` and `refresh_interval` use tri-state semantics so they can be
+/// explicitly cleared (DSH13): `None` = leave unchanged, `Some(None)` = set to
+/// NULL, `Some(Some(v))` = set to `v`. The API request type maps its
+/// double-`Option` wire fields onto these.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpdateDashboard {
     pub name: Option<String>,
-    pub description: Option<String>,
+    #[schema(value_type = Option<String>)]
+    pub description: Option<Option<String>>,
     pub layout: Option<serde_json::Value>,
     pub panels: Option<serde_json::Value>,
-    pub refresh_interval: Option<i32>,
+    #[schema(value_type = Option<i32>)]
+    pub refresh_interval: Option<Option<i32>>,
 }

@@ -33,9 +33,14 @@ interface HeaderProps {
    * control with an offline bundle-sync affordance.
    */
   airgapSlot?: ReactNode;
+  /**
+   * Detection-as-Code push-target control (NAN-1745). Rendered in the header
+   * action cluster next to the repo pill — distinct from the pull-only repos.
+   */
+  pushTargetsSlot?: ReactNode;
 }
 
-export function ReposHeader({ repo, onSyncNow, onOpenHistory, syncing, airgapSlot }: HeaderProps) {
+export function ReposHeader({ repo, onSyncNow, onOpenHistory, syncing, airgapSlot, pushTargetsSlot }: HeaderProps) {
   return (
     <div className="shrink-0 border-b border-border bg-card/30 px-5 py-3.5 flex items-start gap-4">
       <div className="w-[38px] h-[38px] rounded-lg border border-border bg-card flex items-center justify-center shrink-0">
@@ -55,6 +60,8 @@ export function ReposHeader({ repo, onSyncNow, onOpenHistory, syncing, airgapSlo
           or one-by-one. Local edits are preserved; drift is surfaced when upstream changes.
         </div>
       </div>
+
+      {pushTargetsSlot}
 
       {airgapSlot ? (
         <div className="flex items-center shrink-0">{airgapSlot}</div>

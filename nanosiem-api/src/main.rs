@@ -179,17 +179,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Initialize real-time evaluator (load rules for real-time detection)
-    tracing::info!("Initializing real-time evaluator...");
-    if let Err(e) = state.init_realtime_evaluator().await {
-        tracing::warn!(
-            "Failed to initialize real-time evaluator: {}. Real-time detection disabled.",
-            e
-        );
-    } else {
-        tracing::info!("Real-time evaluator initialized");
-    }
-
     // === License status poller (reads cached status from PG, written by nanosiem-jobs) ===
     // Enterprise-only: the open edition ships no license / phone-home machinery
     // and runs unrestricted by construction (NAN-1193).
@@ -288,12 +277,6 @@ async fn main() -> Result<()> {
         nanosiem_enterprise::melod::usage_recorder::init(state.pool.clone());
         tracing::info!("AI usage recorder started");
     }
-
-    // Rule change listener (per-instance cache invalidation via pg_notify)
-    tracing::info!("Starting rule change listener...");
-    let rule_listener_handle = state.start_rule_change_listener();
-    state.add_task_handle(rule_listener_handle).await;
-    tracing::info!("Rule change listener started");
 
     // Case change listener (per-instance SSE broadcast via pg_notify).
     // Phase 3.2 (NAN-744): cases moved to enterprise; the SSE listener

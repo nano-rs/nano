@@ -36,6 +36,13 @@ interface DashboardShareDialogProps {
   currentVisibility: DashboardVisibility;
   currentSharedGroups: SharedGroup[];
   isOwner: boolean;
+  /**
+   * NAN-1719 (DSH42): admins can re-share dashboards they don't own (the backend
+   * already supports admin re-share). When true, the editable dialog opens for a
+   * non-owner instead of the view-only block. Optional so existing callers keep
+   * the owner-only behavior.
+   */
+  isAdmin?: boolean;
   onShare: (result: DashboardShareResult) => void;
 }
 
@@ -47,6 +54,7 @@ export function DashboardShareDialog({
   currentVisibility,
   currentSharedGroups,
   isOwner,
+  isAdmin,
   onShare,
 }: DashboardShareDialogProps) {
   const [visibility, setVisibility] = useState<DashboardVisibility>(currentVisibility);
@@ -58,6 +66,9 @@ export function DashboardShareDialog({
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [affectedUsers, setAffectedUsers] = useState<{ user_name: string; user_email: string }[]>([]);
+  // DSH41: the share result is held here while the "users lost access" banner is
+  // shown, and only handed to the parent (onShare) when the user dismisses.
+  const [pendingResult, setPendingResult] = useState<DashboardShareResult | null>(null);
 
   // Reset state when dialog opens
   useEffect(() => {
@@ -66,6 +77,7 @@ export function DashboardShareDialog({
       setSelectedGroups(currentSharedGroups.map(g => g.id));
       setError(null);
       setAffectedUsers([]);
+      setPendingResult(null);
       loadGroups();
     }
   }, [open, currentVisibility, currentSharedGroups]);
@@ -106,13 +118,18 @@ export function DashboardShareDialog({
         group_ids: visibility === 'group' ? selectedGroups : undefined,
       });
 
-      // Show affected users if any
+      // DSH41: if this share revoked access for some users, keep the sheet open
+      // so the amber "users lost access" banner is actually visible — closing
+      // synchronously unmounts before it can render. Hold the result and notify
+      // the parent only when the user dismisses (Done). With no affected users,
+      // notify + close immediately as before.
       if (result.users_who_lost_access.length > 0) {
         setAffectedUsers(result.users_who_lost_access);
+        setPendingResult(result);
+      } else {
+        onShare(result);
+        onOpenChange(false);
       }
-
-      onShare(result);
-      onOpenChange(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to update sharing settings');
     } finally {
@@ -149,7 +166,9 @@ export function DashboardShareDialog({
     </SheetHeader>
   );
 
-  if (!isOwner) {
+  // DSH42: owners edit their own dashboards; admins may re-share any dashboard.
+  // Everyone else sees the view-only block.
+  if (!isOwner && !isAdmin) {
     return (
       <Sheet open={open} onOpenChange={onOpenChange}>
         <SheetContent
@@ -315,27 +334,44 @@ export function DashboardShareDialog({
         </div>
 
         <div className="px-4 py-3 border-t border-border flex items-center justify-end gap-2 shrink-0">
-          <Button variant="ghost" size="sm" className="h-[28px]" onClick={() => onOpenChange(false)}>
-            Cancel
-          </Button>
-          <Button
-            size="sm"
-            className="h-[28px] gap-1.5"
-            onClick={handleSave}
-            disabled={isSaving || !hasChanges || isLoading}
-          >
-            {isSaving ? (
-              <>
-                <Loader2 className="w-[12px] h-[12px] animate-spin" />
-                Saving…
-              </>
-            ) : (
-              <>
-                <Shield className="w-[12px] h-[12px]" />
-                Save
-              </>
-            )}
-          </Button>
+          {pendingResult ? (
+            // DSH41: the share succeeded and revoked access — the banner above is
+            // visible; dismiss explicitly, handing the result to the parent now.
+            <Button
+              size="sm"
+              className="h-[28px]"
+              onClick={() => {
+                if (pendingResult) onShare(pendingResult);
+                onOpenChange(false);
+              }}
+            >
+              Done
+            </Button>
+          ) : (
+            <>
+              <Button variant="ghost" size="sm" className="h-[28px]" onClick={() => onOpenChange(false)}>
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                className="h-[28px] gap-1.5"
+                onClick={handleSave}
+                disabled={isSaving || !hasChanges || isLoading}
+              >
+                {isSaving ? (
+                  <>
+                    <Loader2 className="w-[12px] h-[12px] animate-spin" />
+                    Saving…
+                  </>
+                ) : (
+                  <>
+                    <Shield className="w-[12px] h-[12px]" />
+                    Save
+                  </>
+                )}
+              </Button>
+            </>
+          )}
         </div>
       </SheetContent>
     </Sheet>

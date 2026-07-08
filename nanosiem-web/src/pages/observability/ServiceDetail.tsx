@@ -33,9 +33,10 @@ import { useIsLiveRun } from '@/components/search/live-run-context';
 import { useCapabilities } from '@/hooks/use-capabilities';
 import { REDChart, LatencyScatter, BudgetBar, type RedSeries, type ScatterTrace } from '@/components/observability/charts';
 import { ServiceSecuritySignals } from '@/components/observability/ServiceSecuritySignals';
-import { HEALTH, fmtNum, fmtMs, fmtPct, type DesignHealth } from '@/components/observability/format';
-import type { ServiceDetailResponse, Slo } from '@/lib/api/observability';
+import { HEALTH, fmtNum, fmtRate, fmtMs, fmtPct, type DesignHealth } from '@/components/observability/format';
+import type { ServiceDetailResponse, SeriesPoint, Slo } from '@/lib/api/observability';
 import type { TimeRange } from '@/lib/api/types';
+import { parseUTCTimestamp } from '@/lib/date-utils';
 
 export interface ServiceDetailProps {
   service: string;
@@ -158,7 +159,9 @@ function ExemplarTraces({
     () =>
       exemplars.map((e) => ({
         id: e.trace_id,
-        startTs: Date.parse(e.start_time) || 0,
+        // O12: backend start_time is CH-format ("YYYY-MM-DD HH:MM:SS", no zone);
+        // parseUTCTimestamp reads it as UTC instead of the browser's local zone.
+        startTs: parseUTCTimestamp(e.start_time).getTime() || 0,
         durationMs: e.duration_ms,
         errors: e.error ? 1 : 0,
         root: e.span_name,
@@ -239,6 +242,7 @@ function SloStrip({ slos }: { slos: Slo[] }) {
       ok: 'text-good',
       at_risk: 'text-warn',
       breaching: 'text-danger',
+      no_data: 'text-fg-4',
     };
   return (
     <div className="rounded-lg border border-border bg-card px-3.5 py-2.5 flex items-center gap-x-4 gap-y-2 flex-wrap text-[11.5px]">
@@ -283,17 +287,33 @@ function SloStrip({ slos }: { slos: Slo[] }) {
 // Aggregate helpers — collapse RED timeseries into header summary figures
 // ---------------------------------------------------------------------------
 
+// Seconds per RED bucket, derived from the first two (evenly spaced) bucket
+// timestamps. Backend `rate[].v` is a per-bucket COUNT, so dividing by this
+// width converts it to req/s. Falls back to 1 when a step can't be derived
+// (single/empty bucket or unparseable timestamps) so callers never divide by 0.
+function bucketStepSecs(points: SeriesPoint[]): number {
+  if (points.length < 2) return 1;
+  const a = parseUTCTimestamp(points[0].t).getTime();
+  const b = parseUTCTimestamp(points[1].t).getTime();
+  const secs = (b - a) / 1000;
+  return secs > 0 ? secs : 1;
+}
+
 function summarize(detail: ServiceDetailResponse) {
   const { rate, errors, latency } = detail.red;
   const totalReq = rate.reduce((s, p) => s + p.v, 0);
   const totalErr = errors.reduce((s, p) => s + p.v, 0);
   const errPct = totalReq > 0 ? (totalErr / totalReq) * 100 : 0;
-  const avgRate = rate.length ? rate.reduce((s, p) => s + p.v, 0) / rate.length : 0;
-  const worstP95 = latency.length ? Math.max(...latency.map((p) => p.p95)) : 0;
-  const worstP99 = latency.length ? Math.max(...latency.map((p) => p.p99)) : 0;
-  const lastP50 = latency.length ? latency[latency.length - 1].p50 : 0;
-  const health: DesignHealth = errPct >= 5 || worstP95 >= 1800 ? 'danger' : errPct >= 1 || worstP95 >= 600 ? 'warn' : 'good';
-  return { totalReq, totalErr, errPct, avgRate, worstP95, worstP99, lastP50, health };
+  // O50: window-consistent peak percentiles (all worst-bucket, labeled in the
+  // header) instead of mixing a last-bucket p50 with worst-bucket p95/p99.
+  const peakP50 = latency.length ? Math.max(...latency.map((p) => p.p50)) : 0;
+  const peakP95 = latency.length ? Math.max(...latency.map((p) => p.p95)) : 0;
+  const peakP99 = latency.length ? Math.max(...latency.map((p) => p.p99)) : 0;
+  // O50: mirror the server's service_health thresholds (error_rate 5%/1%,
+  // p95 1000/600 ms) so the badge agrees with the Services-tab classification.
+  const health: DesignHealth =
+    errPct >= 5 || peakP95 >= 1000 ? 'danger' : errPct >= 1 || peakP95 >= 600 ? 'warn' : 'good';
+  return { totalReq, totalErr, errPct, peakP50, peakP95, peakP99, health };
 }
 
 // ---------------------------------------------------------------------------
@@ -430,8 +450,20 @@ export function ServiceDetail({ service, apiTimeRange, onBack, onOpenTrace }: Se
 
   const sum = summarize(detail);
   const buckets = detail.red.rate.map((p) => p.t);
+  // O9: `rate[].v` is a per-bucket span COUNT (not a rate). The chart plots each
+  // bucket's true req/s (count / bucket width); the header shows the window
+  // average req/s = total requests / window seconds, exactly matching
+  // ServicesTab's server-side rate_per_sec so overview and drill-in agree. (RED
+  // buckets are sparse — no zero-fill — so averaging over the bucket COUNT would
+  // overstate a low-traffic service and re-open the very disagreement O9 fixes.)
+  const rateStepSecs = bucketStepSecs(detail.red.rate);
+  const windowSecs = Math.max(
+    1,
+    (parseUTCTimestamp(apiTimeRange.end).getTime() - parseUTCTimestamp(apiTimeRange.start).getTime()) / 1000
+  );
+  const avgRate = sum.totalReq / windowSecs;
   const rateSeries: RedSeries[] = [
-    { points: detail.red.rate.map((p) => p.v), color: 'var(--color-brand)', label: 'req/s', fill: true },
+    { points: detail.red.rate.map((p) => p.v / rateStepSecs), color: 'var(--color-brand)', label: 'req/s', fill: true },
   ];
   const errSeries: RedSeries[] = [
     { points: detail.red.errors.map((p) => p.v), color: 'var(--color-danger)', label: 'errors', fill: true },
@@ -460,7 +492,7 @@ export function ServiceDetail({ service, apiTimeRange, onBack, onOpenTrace }: Se
         <RedPanel
           title="Request rate"
           icon={<AreaChart className="w-[12px] h-[12px] text-brand" />}
-          value={fmtNum(sum.avgRate)}
+          value={fmtRate(avgRate)}
           unit="req/s"
           sub={`${fmtNum(sum.totalReq)} requests in range`}
         >
@@ -480,16 +512,18 @@ export function ServiceDetail({ service, apiTimeRange, onBack, onOpenTrace }: Se
         <RedPanel
           title="Latency"
           icon={<LineChart className="w-[12px] h-[12px] text-brand" />}
-          value={fmtMs(sum.worstP95)}
-          unit="p95"
-          sub={`p50 ${fmtMs(sum.lastP50)} · p99 ${fmtMs(sum.worstP99)}`}
+          value={fmtMs(sum.peakP95)}
+          unit="peak p95"
+          sub={`peak p50 ${fmtMs(sum.peakP50)} · peak p99 ${fmtMs(sum.peakP99)}`}
         >
           <REDChart
             buckets={latencyBuckets}
             height={132}
             unit="ms"
             series={latencySeries}
-            yFmt={(v) => fmtMs(v).replace('ms', '').replace('s', '')}
+            // O10: percentile values are already ms; render them as-is with the
+            // "ms" unit. The old strip-'s'/'ms' chain turned 1.5s into "1.50ms".
+            yFmt={(v) => String(Math.round(v))}
           />
         </RedPanel>
       </div>

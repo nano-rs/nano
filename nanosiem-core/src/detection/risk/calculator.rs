@@ -176,8 +176,12 @@ impl ScoreCalculator {
         event: &Value,
         global_weight: f64,
     ) -> Option<RiskResult> {
-        // Extract raw_risk_score from event
-        let raw_score = Self::get_numeric_field(event, "raw_risk_score")?;
+        // Extract raw_risk_score from event.
+        // Audit D39: clamp to the valid 0-100 range. The `| risk` SQL generator
+        // clamps, but a query that sets `raw_risk_score` another way (e.g.
+        // `eval raw_risk_score=...`) would otherwise bypass it and yield an
+        // out-of-range score.
+        let raw_score = Self::get_numeric_field(event, "raw_risk_score")?.clamp(0.0, 100.0);
 
         // Check for weight override from query
         let weight = Self::get_numeric_field(event, "risk_weight")
@@ -208,9 +212,18 @@ impl ScoreCalculator {
         })
     }
 
-    /// Check if an event has query-derived risk score columns
+    /// Check if an event has a query-derived risk score.
+    ///
+    /// Audit D10: a JSON `null` `raw_risk_score` (e.g. from `| risk
+    /// score=if(cond, X, null)` when `cond` is false) counts as ABSENT, not
+    /// present. Counting null as present made a null-scored batch look like it
+    /// had query scores, then `calculate_from_query_result` dropped every null
+    /// row (`filter_map`) → empty groups → the grouped path misread that as
+    /// "already alerted" and suppressed the whole alert.
     pub fn has_query_risk_score(event: &Value) -> bool {
-        event.get("raw_risk_score").is_some()
+        event
+            .get("raw_risk_score")
+            .is_some_and(|v| !v.is_null())
     }
 
     /// Get a numeric field value from an event
@@ -395,3 +408,6 @@ impl ScoreCalculator {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

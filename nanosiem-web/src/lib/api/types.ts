@@ -348,13 +348,19 @@ export interface OtelSpan {
   host: string;
 }
 
-/** GET trace-by-id → spans ordered by start_time, plus the resolved window. */
+/**
+ * GET trace-by-id → spans ordered by start_time. Matches the backend wire shape
+ * exactly (`nanosiem-search` `TraceResponse`): the trace id, the ordered spans,
+ * the returned span count, and a `truncated` flag set when the trace exceeded
+ * the server's span cap and `spans` was trimmed (O41 / O53, NAN-1721).
+ */
 export interface TraceResponse {
   trace_id: string;
   spans: OtelSpan[];
-  start_time: string;
-  end_time: string;
-  duration_ns: number;
+  /** Number of spans returned (after any trim to the server cap). */
+  span_count: number;
+  /** True when the trace exceeded the span cap and `spans` was trimmed. */
+  truncated?: boolean;
 }
 
 /**
@@ -488,6 +494,11 @@ export interface MetricMonitor {
   name: string;
   metric_name: string;
   agg: MetricAgg;
+  /**
+   * Optional service scope (the promoted `otel_metrics.service_name` column,
+   * NAN-1564). null/undefined evaluates the metric fleet-wide.
+   */
+  service_name?: string | null;
   /** Splits the evaluation into one series per value of this tag key. */
   group_by?: string;
   filters: MetricFilter[];
@@ -508,6 +519,8 @@ export interface MetricMonitorRequest {
   name: string;
   metric_name: string;
   agg: MetricAgg;
+  /** Optional service scope (promoted `service_name` column); null = fleet-wide. */
+  service_name?: string | null;
   group_by?: string;
   filters: MetricFilter[];
   comparator: MetricMonitorComparator;
@@ -1248,6 +1261,14 @@ export interface TestDetectionResult {
   /** Bucket size used for `matches_by_bucket`, in seconds. `0` when unbucketed. */
   bucket_size_seconds?: number;
   execution_time_ms: number;
+  /**
+   * Number of per-window sub-queries that errored during the stepped backtest.
+   * `> 0` means `total_matches`/the histogram UNDERCOUNT — the rule actually
+   * errors on those windows, so a "0 matches" result is misleading. Surface it.
+   */
+  failed_windows?: number;
+  /** A representative error message when `failed_windows > 0`. */
+  error_sample?: string | null;
 }
 
 export interface ValidateDetectionResult {
@@ -2913,12 +2934,37 @@ export interface PanelQueryRequest {
   query_mode: string;
   time_range: TimeRange;
   variables?: Record<string, string>;
+  /**
+   * NAN-1719 (DSH8/DSH52): when true, a user-initiated panel refresh skips the
+   * server-side result cache so late-arriving events in a fixed window appear.
+   */
+  bypass_cache?: boolean;
 }
 
 export interface PanelQueryResponse {
   results: Record<string, unknown>[];
   total_count: number;
   execution_time_ms: number;
+  /**
+   * NAN-1719 (DSH53): column order from the `| table` command / search service,
+   * so panel tables render columns in the author-specified order instead of the
+   * serde_json-alphabetical `Object.keys(row)` order.
+   */
+  column_order?: string[];
+  /**
+   * NAN-1719 (DSH40): true when the result hit the 10000-row panel cap, so the
+   * UI can surface a truncation badge instead of presenting a capped page as
+   * complete. Compare `total_count` against `results.length` as a fallback.
+   */
+  truncated?: boolean;
+  /**
+   * NAN-1719 (DSH8): cache transparency. `cached` is true when the row set was
+   * served from the search result cache; `cache_age_secs` is the age of the
+   * cached entry. Mirrors the search handlers' `x-nano-cache` convention so the
+   * panel can show a "cached · refresh" affordance instead of "Updated just now".
+   */
+  cached?: boolean;
+  cache_age_secs?: number;
 }
 
 export interface DashboardExport {

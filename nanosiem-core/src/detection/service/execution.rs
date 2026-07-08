@@ -4,7 +4,7 @@
 //!
 //! Execute detection rules against log data and generate alerts/signals.
 
-use chrono::{DateTime, Duration, FixedOffset, Utc};
+use chrono::{Duration, Utc};
 use metrics::{counter, histogram};
 use tracing::{debug, info, instrument, warn};
 
@@ -49,7 +49,13 @@ impl DetectionService {
         let request = SearchRequest {
             query: enriched_query,
             time_range,
-            limit: Some(self.config.max_events_per_alert),
+            // Audit D19: the detection window must see ALL matches (up to the
+            // standard 1M search safety cap), not the newest `max_events_per_alert`
+            // (100). Capping the QUERY at 100 silently shadowed older events on
+            // every overlapping run (they never alerted) and understated
+            // match_count / daily stats to <=100. `max_events_per_alert` still
+            // caps the *stored grouped-alert sample* (see handle_grouped_alert).
+            limit: Some(crate::query::ClickHouseSqlGenerator::DEFAULT_RESULT_LIMIT),
             offset: None,
             include_sql: Some(false),
             skip_histogram: true,
@@ -120,17 +126,39 @@ impl DetectionService {
             .evaluate_window(&rule.query, time_range, rule.dataset.clone())
             .await?;
 
-        // Filter out events that have already been matched by this rule
-        // This prevents re-detection when rules have long lookback windows
-        if rule.lookback_minutes.is_some() {
+        // Audit D19: if a single window hit the 1M safety cap the rule is far too
+        // broad — matches beyond 1M are still truncated, but now VISIBLY (a warn)
+        // instead of silently at 100.
+        if results.len() >= crate::query::ClickHouseSqlGenerator::DEFAULT_RESULT_LIMIT {
+            warn!(
+                rule_id = %rule.id,
+                "Rule {} hit the 1M result cap in a single window — the query is too broad; some matches are truncated",
+                rule.name
+            );
+        }
+
+        // Dedup namespace: Live bake-in and Alerting record/filter separately so
+        // a rule promoted Live→Alerting isn't suppressed by bake-in records (D17).
+        let matched_kind = super::helpers::MatchedEventKind::for_mode(rule.mode);
+
+        // Filter out events already matched by this rule in this namespace. This
+        // is READ-only; the surviving events are RECORDED as matched *after* the
+        // alert/finding is durably created (audit D5), in the mode branch below.
+        //
+        // Audit D29: dedup runs for EVERY scheduled rule, not only those with an
+        // explicit `lookback_minutes`. A lookback-NULL rule still overlaps the
+        // previous window by the 5s ingestion-lag buffer, so without this its
+        // boundary events re-matched every cycle and inflated match_count /
+        // detection_matches.
+        {
             let original_count = results.len();
             results = self
-                .filter_already_matched_events(rule.id, &results)
+                .filter_already_matched_events(rule.id, matched_kind, &results)
                 .await?;
             let filtered_count = original_count - results.len();
             if filtered_count > 0 {
                 debug!(
-                    "Filtered out {} already-matched events for rule {} (lookback window deduplication)",
+                    "Filtered out {} already-matched events for rule {} (overlap deduplication)",
                     filtered_count, rule.name
                 );
             }
@@ -155,17 +183,16 @@ impl DetectionService {
             )
             .increment(match_count as u64);
 
-            // MTTD: find earliest event timestamp and measure time-to-detect
+            // MTTD: find earliest event timestamp and measure time-to-detect.
+            // Audit D23: use the shared event_field_time parser — the old inline
+            // `parse_from_str(..., "%Y-%m-%d %H:%M:%S%.f")` targets DateTime<FixedOffset>
+            // but the format carries no offset, so it ALWAYS errored (and the
+            // RFC-3339 fallback can't parse the offset-less CH format either), so
+            // MTTD never recorded for the normal CH timestamp format.
             let detection_time = Utc::now();
             let earliest_ts = results
                 .iter()
-                .filter_map(|e| e.get("timestamp").and_then(|t| t.as_str()))
-                .filter_map(|t| {
-                    // Try ClickHouse format first, then ISO 8601
-                    DateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S%.f")
-                        .ok()
-                        .or_else(|| t.parse::<DateTime<FixedOffset>>().ok())
-                })
+                .filter_map(|e| Self::event_field_time(e, "timestamp"))
                 .min();
 
             if let Some(earliest) = earliest_ts {
@@ -223,6 +250,14 @@ impl DetectionService {
                     // (NAN-1305).
                     let emitted = self.log_live_findings(rule, &results, global_weight).await;
 
+                    // Record matched events AFTER live processing (audit D5), in
+                    // the 'live' namespace (audit D17). A crash before here leaves
+                    // them un-recorded so the next run re-evaluates them.
+                    // Unconditional (audit D29): the 5s overlap dedups even
+                    // lookback-NULL rules.
+                    self.record_matched_events(rule.id, matched_kind, &results)
+                        .await?;
+
                     info!(
                         "Rule {} (LIVE mode) matched {} events, emitted {} new findings",
                         rule.name, match_count, emitted
@@ -240,7 +275,7 @@ impl DetectionService {
 
                 // Generate alert if there are matches
                 if !results.is_empty() {
-                    match rule.alert_mode {
+                    let alert = match rule.alert_mode {
                         AlertMode::Grouped => {
                             self.handle_grouped_alert(
                                 rule,
@@ -249,7 +284,7 @@ impl DetectionService {
                                 today,
                                 global_weight,
                             )
-                            .await
+                            .await?
                         }
                         AlertMode::PerEvent => {
                             self.handle_per_event_alerts(
@@ -259,9 +294,20 @@ impl DetectionService {
                                 today,
                                 global_weight,
                             )
-                            .await
+                            .await?
                         }
-                    }
+                    };
+
+                    // Record matched events only AFTER the alert path succeeds
+                    // (audit D5), in the 'alert' namespace (audit D17). An error
+                    // before here (propagated by `?`) leaves them un-recorded so
+                    // the next run re-evaluates them instead of dropping the
+                    // detection forever. Unconditional (audit D29): the 5s overlap
+                    // dedups even lookback-NULL rules.
+                    self.record_matched_events(rule.id, matched_kind, &results)
+                        .await?;
+
+                    Ok(alert)
                 } else {
                     debug!("Rule {} had no matches", rule.name);
                     Ok(None)

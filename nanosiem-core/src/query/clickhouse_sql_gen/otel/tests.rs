@@ -27,7 +27,7 @@
 
     #[test]
     fn trace_by_id_lowercases_and_escapes() {
-        let sql = trace_by_id_sql("ABCD1234");
+        let sql = trace_by_id_sql("ABCD1234", false);
         // Stored ids are lowercase hex.
         assert!(sql.contains("trace_id = 'abcd1234'"), "{sql}");
         // Two-step: index table then span window scan.
@@ -35,7 +35,7 @@
         assert!(sql.contains("FROM nanosiem.otel_spans\n"), "{sql}");
         assert!(sql.contains("ORDER BY start_time ASC"), "{sql}");
         // Single-quote injection is escaped.
-        let evil = trace_by_id_sql("a' OR '1'='1");
+        let evil = trace_by_id_sql("a' OR '1'='1", false);
         assert!(evil.contains("''"), "{evil}");
         assert!(!evil.contains("OR '1'='1'"), "{evil}");
     }
@@ -125,7 +125,7 @@
             end: Utc.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap(),
         };
         // Defaults: every trace, recent first, LIMIT 200, no HAVING.
-        let sql = recent_traces_sql(&tr, &TraceListFilters::default());
+        let sql = recent_traces_sql(&tr, &TraceListFilters::default(), false);
         assert!(sql.contains("FROM nanosiem.otel_spans"), "{sql}");
         assert!(sql.contains("GROUP BY trace_id"), "{sql}");
         assert!(sql.contains("countIf(status_code = 'ERROR') AS error_count"), "{sql}");
@@ -142,7 +142,7 @@
             limit: Some(50),
             before: None,
         };
-        let f = recent_traces_sql(&tr, &filters);
+        let f = recent_traces_sql(&tr, &filters, false);
         assert!(f.contains("HAVING root_service = 'api'"), "{f}");
         assert!(f.contains("error_count > 0"), "{f}");
         assert!(f.contains("duration_ns >= 1000000"), "{f}");
@@ -150,30 +150,89 @@
         // No cursor predicate when `before` is None (first page).
         assert!(!f.contains("otel_spans.start_time < "), "{f}");
 
-        // Keyset cursor (NAN-1539): a strict `<` on the raw start_time column,
-        // outside the HAVING, for partition-pruned pagination.
+        // Keyset cursor (O28/NAN-1721): a strict `<` on the per-trace
+        // `min(start_time)` in the HAVING (post-aggregation), so paging prunes
+        // whole TRACES, not spans. The old pre-aggregation WHERE on the raw
+        // start_time column dropped later spans of a straddling trace and could
+        // silently drop error traces under `errors_only`.
         let paged = recent_traces_sql(
             &tr,
             &TraceListFilters {
                 before: Some(Utc.with_ymd_and_hms(2024, 1, 1, 12, 0, 0).unwrap()),
                 ..Default::default()
             },
+            false,
         );
+        assert!(paged.contains("HAVING"), "{paged}");
+        // NAN-1730: the cursor column is TABLE-QUALIFIED (`min(otel_spans.start_time)`)
+        // so it binds to the COLUMN, not the `min(start_time) AS start_time` alias.
+        // The bare `min(start_time)` form self-nests to `min(min(start_time))` and
+        // throws CH Code 184 ILLEGAL_AGGREGATION.
         assert!(
-            paged.contains("AND otel_spans.start_time < '2024-01-01 12:00:00"),
+            paged.contains("min(otel_spans.start_time) < '2024-01-01 12:00:00"),
             "{paged}"
         );
+        assert!(
+            !paged.contains("min(start_time) < "),
+            "cursor HAVING must not use the bare (alias-shadowed) form: {paged}"
+        );
+        // The cursor is NOT a pre-aggregation predicate on the raw column.
+        assert!(!paged.contains("otel_spans.start_time < "), "{paged}");
         // service value is escaped.
-        let evil = recent_traces_sql(&tr, &TraceListFilters { service: Some("a'b"), ..Default::default() });
+        let evil = recent_traces_sql(&tr, &TraceListFilters { service: Some("a'b"), ..Default::default() }, false);
         assert!(evil.contains("root_service = 'a''b'"), "{evil}");
         // limit clamps.
-        let clamp = recent_traces_sql(&tr, &TraceListFilters { limit: Some(99999), ..Default::default() });
+        let clamp = recent_traces_sql(&tr, &TraceListFilters { limit: Some(99999), ..Default::default() }, false);
         assert!(clamp.contains("LIMIT 1000"), "{clamp}");
     }
 
     #[test]
+    fn recent_traces_cursor_having_is_table_qualified() {
+        // NAN-1730 regression: the keyset-pagination cursor is emitted as a HAVING
+        // over the per-trace `min(start_time)`. The SELECT list aliases
+        // `min(start_time) AS start_time`, so a BARE `min(start_time)` cursor arg
+        // binds to that alias → CH parses `min(min(start_time))` → Code 184
+        // ILLEGAL_AGGREGATION, 400-ing every "Load more" page. Qualifying the arg
+        // with the routed table_ref (`min(<table>.start_time)`) binds it to the
+        // COLUMN instead — mirroring the time-bound WHERE.
+        let tr = TimeRange {
+            start: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            end: Utc.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap(),
+        };
+        let before = Utc.with_ymd_and_hms(2024, 1, 1, 18, 2, 47).unwrap();
+
+        // Single-shard (local/Saturn): qualifier is the bare base table name.
+        let local = recent_traces_sql(
+            &tr,
+            &TraceListFilters { before: Some(before), ..Default::default() },
+            false,
+        );
+        assert!(local.contains("min(otel_spans.start_time) < '2024-01-01 18:02:47"), "{local}");
+        assert!(
+            !local.contains("min(start_time) < "),
+            "single-shard cursor HAVING must not use the alias-shadowed bare form: {local}"
+        );
+
+        // Clustered: FROM routes to `_distributed`, so the column qualifier must too.
+        let clustered = recent_traces_sql(
+            &tr,
+            &TraceListFilters { before: Some(before), ..Default::default() },
+            true,
+        );
+        assert!(clustered.contains("FROM nanosiem.otel_spans_distributed"), "{clustered}");
+        assert!(
+            clustered.contains("min(otel_spans_distributed.start_time) < '2024-01-01 18:02:47"),
+            "{clustered}"
+        );
+        assert!(
+            !clustered.contains("min(start_time) < "),
+            "clustered cursor HAVING must not use the alias-shadowed bare form: {clustered}"
+        );
+    }
+
+    #[test]
     fn metric_names_sql_optional_service_filter() {
-        let all = metric_names_sql(None);
+        let all = metric_names_sql(None, false);
         assert!(all.contains("SELECT DISTINCT metric_name"), "{all}");
         // NAN-1632 3.12: the (deliberately) time-unbounded name list reads the
         // 1-minute rollup, NOT raw otel_metrics and NOT the 400d-TTL _1h rollup
@@ -181,10 +240,10 @@
         assert!(all.contains("FROM nanosiem.otel_metrics_1m"), "{all}");
         assert!(!all.contains("otel_metrics_1h"), "{all}");
         assert!(!all.contains("WHERE"), "{all}");
-        let svc = metric_names_sql(Some("api"));
+        let svc = metric_names_sql(Some("api"), false);
         assert!(svc.contains("WHERE service_name = 'api'"), "{svc}");
         // empty service is dropped.
-        let empty = metric_names_sql(Some(""));
+        let empty = metric_names_sql(Some(""), false);
         assert!(!empty.contains("WHERE"), "{empty}");
     }
 
@@ -219,7 +278,7 @@
             filters: &[],
             step_secs: 60,
         };
-        let sql = metric_timeseries_v2_sql(&q, &day_range());
+        let sql = metric_timeseries_v2_sql(&q, &day_range(), false);
         assert!(sql.contains("metric_name = 'http.server.duration'"), "{sql}");
         assert!(sql.contains("service_name = 'api'"), "{sql}");
         assert!(sql.contains("avg(value) AS v"), "{sql}");
@@ -244,7 +303,7 @@
             filters: &filters,
             step_secs: 30,
         };
-        let sql = metric_timeseries_v2_sql(&q, &day_range());
+        let sql = metric_timeseries_v2_sql(&q, &day_range(), false);
         assert!(sql.contains("quantileTDigest(0.95)(value) AS v"), "{sql}");
         // group_by resolves over both maps and becomes a split key.
         assert!(sql.contains("attributes['http.method']"), "{sql}");
@@ -268,23 +327,61 @@
             filters: &[],
             step_secs: 60,
         };
-        // The whole-window scalar uses the window length (1 day = 86400s) as the
-        // rate denominator, not step_secs.
-        let sql = metric_scalar_sql(&q, &day_range());
-        assert!(sql.contains("(max(value) - min(value)) / greatest(86400"), "{sql}");
+        // O15/NAN-1721: reset-aware rate = sum of positive per-point deltas over
+        // the OBSERVED window seconds (dateDiff over min/max timestamp), not the
+        // reset-unsafe `max-min` over a fixed 86400. O13: a `count() AS row_count`
+        // companion lets the evaluator distinguish a no-data window from a real 0.
+        let sql = metric_scalar_sql(&q, &day_range(), false);
+        assert!(sql.contains("arrayDifference"), "{sql}");
+        assert!(sql.contains("dateDiff('second', min(timestamp), max(timestamp))"), "{sql}");
+        assert!(!sql.contains("max(value) - min(value)"), "{sql}");
         assert!(sql.contains("AS v"), "{sql}");
+        assert!(sql.contains("count() AS row_count"), "{sql}");
         // No group_by → no GROUP BY clause (single scalar row).
         assert!(!sql.contains("GROUP BY"), "{sql}");
+        // O26/NAN-1734: temporality-gated — cumulative branch delta-decodes, the
+        // DELTA/UNSPECIFIED branch raw-sums the increments; both over the window.
+        assert!(sql.contains("if(max(aggregation_temporality) = 2"), "{sql}");
+        assert!(sql.contains("sum(value)) / greatest(dateDiff"), "{sql}");
+    }
+
+    #[test]
+    fn metric_sum_agg_delta_decodes_cumulative() {
+        // O26/NAN-1734: `sum` on the metrics dataset must NOT naively sum
+        // CUMULATIVE running totals — it delta-decodes them to the window increment
+        // when the grouping is cumulative (aggregation_temporality = 2), and passes
+        // DELTA/UNSPECIFIED (0, the pre-158 default & gauges) through as raw sum.
+        let q = MetricQuery {
+            metric_name: "requests.total",
+            service_name: None,
+            agg: MetricAgg::Sum,
+            group_by: None,
+            filters: &[],
+            step_secs: 60,
+        };
+        // Scalar form (metric-monitor evaluator).
+        let scalar = metric_scalar_sql(&q, &day_range(), false);
+        assert!(
+            scalar.contains("if(max(aggregation_temporality) = 2, arraySum(arrayMap(d -> if(d > 0, d, 0), arrayDifference(arrayMap(p -> p.2, arraySort(p -> p.1, groupArray((timestamp, value))))))), sum(value)) AS v"),
+            "{scalar}"
+        );
+        // Timeseries (bucketed) form (dashboard panel) — same gated expression.
+        let ts = metric_timeseries_v2_sql(&q, &day_range(), false);
+        assert!(ts.contains("if(max(aggregation_temporality) = 2"), "{ts}");
+        assert!(ts.contains("sum(value)) AS v"), "{ts}");
+        // The cumulative branch is a window delta, NOT a per-second rate — no
+        // dateDiff denominator on a bare `sum`.
+        assert!(!ts.contains("dateDiff"), "{ts}");
     }
 
     #[test]
     fn metric_tag_keys_and_values_sql() {
-        let keys = metric_tag_keys_sql("http.server.duration", &day_range());
+        let keys = metric_tag_keys_sql("http.server.duration", &day_range(), false);
         assert!(keys.contains("arrayConcat(mapKeys(attributes), mapKeys(resource_attributes))"), "{keys}");
         assert!(keys.contains("metric_name = 'http.server.duration'"), "{keys}");
         assert!(keys.contains("SELECT DISTINCT k"), "{keys}");
 
-        let vals = metric_tag_values_sql("m", "http.method", &day_range());
+        let vals = metric_tag_values_sql("m", "http.method", &day_range(), false);
         assert!(vals.contains("attributes['http.method']"), "{vals}");
         assert!(vals.contains("AS tag_value"), "{vals}");
         // empty-string drop is applied in the outer query, not a HAVING on DISTINCT.
@@ -297,12 +394,12 @@
             start: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
             end: Utc.with_ymd_and_hms(2024, 1, 2, 0, 0, 0).unwrap(),
         };
-        let sql = metric_timeseries_sql("http.server.duration", Some("api"), &tr, 60);
+        let sql = metric_timeseries_sql("http.server.duration", Some("api"), &tr, 60, false);
         assert!(sql.contains("metric_name = 'http.server.duration'"), "{sql}");
         assert!(sql.contains("service_name = 'api'"), "{sql}");
         assert!(sql.contains("toIntervalSecond(60)"), "{sql}");
         // No service filter when None.
-        let sql2 = metric_timeseries_sql("m", None, &tr, 0);
+        let sql2 = metric_timeseries_sql("m", None, &tr, 0, false);
         assert!(!sql2.contains("service_name ="), "{sql2}");
         // step clamps to >= 1.
         assert!(sql2.contains("toIntervalSecond(1)"), "{sql2}");
@@ -317,7 +414,7 @@
 
     #[test]
     fn services_overview_aggregates_red_per_service() {
-        let sql = services_overview_sql(&day_range(), &ServicesOverviewFilters::default());
+        let sql = services_overview_sql(&day_range(), &ServicesOverviewFilters::default(), false);
         assert!(sql.contains("GROUP BY service_name"), "{sql}");
         // NAN-1539: reads the minute rollup, summing SimpleAggregateFunction
         // counts and merging the latency t-digest (already ms — no /1e6).
@@ -341,7 +438,7 @@
 
     #[test]
     fn services_sparkline_buckets_per_service() {
-        let sql = services_sparkline_sql(&day_range(), 60);
+        let sql = services_sparkline_sql(&day_range(), 60, false);
         assert!(sql.contains("GROUP BY service, bucket"), "{sql}");
         assert!(sql.contains("toIntervalSecond(60)"), "{sql}");
         // NAN-1539: bucket the rollup minutes, sum the rollup counts.
@@ -349,13 +446,13 @@
         assert!(sql.contains("toStartOfInterval(minute,"), "{sql}");
         assert!(sql.contains("sum(request_count) AS v"), "{sql}");
         // step clamps to >= 1.
-        let z = services_sparkline_sql(&day_range(), 0);
+        let z = services_sparkline_sql(&day_range(), 0, false);
         assert!(z.contains("toIntervalSecond(1)"), "{z}");
     }
 
     #[test]
     fn service_red_timeseries_buckets_and_escapes() {
-        let sql = service_red_timeseries_sql("checkout-api", &day_range(), 60);
+        let sql = service_red_timeseries_sql("checkout-api", &day_range(), 60, false);
         assert!(sql.contains("service_name = 'checkout-api'"), "{sql}");
         assert!(sql.contains("toIntervalSecond(60)"), "{sql}");
         // NAN-1539: rollup-backed — summed counts + merged digest.
@@ -368,13 +465,13 @@
         );
         assert!(sql.contains("GROUP BY bucket"), "{sql}");
         // injection-safe.
-        let evil = service_red_timeseries_sql("a'b", &day_range(), 60);
+        let evil = service_red_timeseries_sql("a'b", &day_range(), 60, false);
         assert!(evil.contains("service_name = 'a''b'"), "{evil}");
     }
 
     #[test]
     fn service_endpoints_group_by_span_name() {
-        let sql = service_endpoints_sql("payments", &day_range());
+        let sql = service_endpoints_sql("payments", &day_range(), false);
         assert!(sql.contains("GROUP BY span_name"), "{sql}");
         assert!(sql.contains("service_name = 'payments'"), "{sql}");
         assert!(sql.contains("ORDER BY request_count DESC"), "{sql}");
@@ -383,15 +480,15 @@
 
     #[test]
     fn service_exemplars_orders_errors_first_and_clamps() {
-        let sql = service_exemplars_sql("payments", &day_range(), Some(25));
+        let sql = service_exemplars_sql("payments", &day_range(), Some(25), false);
         assert!(sql.contains("status_code = 'ERROR' AS error"), "{sql}");
         assert!(sql.contains("duration_ns / 1e6 AS duration_ms"), "{sql}");
         assert!(sql.contains("ORDER BY error DESC, start_time DESC"), "{sql}");
         assert!(sql.contains("LIMIT 25"), "{sql}");
         // default + clamp.
-        let def = service_exemplars_sql("p", &day_range(), None);
+        let def = service_exemplars_sql("p", &day_range(), None, false);
         assert!(def.contains("LIMIT 20"), "{def}");
-        let clamp = service_exemplars_sql("p", &day_range(), Some(99999));
+        let clamp = service_exemplars_sql("p", &day_range(), Some(99999), false);
         assert!(clamp.contains("LIMIT 200"), "{clamp}");
     }
 
@@ -400,7 +497,7 @@
         // Availability reads the RED minute rollup, not raw spans (NAN-1632
         // 3.13): sum(request_count) / sum(request_count)-sum(error_count) are
         // exactly the raw count() / countIf(status_code != 'ERROR').
-        let avail = slo_compute_sql("checkout-api", SliKind::Availability, None, &day_range());
+        let avail = slo_compute_sql("checkout-api", SliKind::Availability, None, &day_range(), false);
         assert!(
             avail.contains("FROM nanosiem.otel_service_red_1m"),
             "{avail}"
@@ -416,21 +513,21 @@
 
         // Latency stays on raw spans (no rollup carries the per-span duration
         // threshold): threshold ms → ns literal.
-        let lat = slo_compute_sql("payments", SliKind::Latency, Some(300.0), &day_range());
+        let lat = slo_compute_sql("payments", SliKind::Latency, Some(300.0), &day_range(), false);
         assert!(lat.contains("FROM nanosiem.otel_spans"), "{lat}");
         assert!(lat.contains("count() AS total"), "{lat}");
         assert!(lat.contains("countIf(duration_ns <= 300000000) AS good"), "{lat}");
 
         // Latency with missing threshold degrades to the availability GOOD
         // definition but keeps its historical raw-spans shape.
-        let lat_none = slo_compute_sql("payments", SliKind::Latency, None, &day_range());
+        let lat_none = slo_compute_sql("payments", SliKind::Latency, None, &day_range(), false);
         assert!(lat_none.contains("FROM nanosiem.otel_spans"), "{lat_none}");
         assert!(
             lat_none.contains("countIf(status_code != 'ERROR') AS good"),
             "{lat_none}"
         );
         // Non-finite threshold is rejected the same way.
-        let lat_nan = slo_compute_sql("p", SliKind::Latency, Some(f64::NAN), &day_range());
+        let lat_nan = slo_compute_sql("p", SliKind::Latency, Some(f64::NAN), &day_range(), false);
         assert!(
             lat_nan.contains("countIf(status_code != 'ERROR') AS good"),
             "{lat_nan}"
@@ -447,7 +544,7 @@
             start: Utc.with_ymd_and_hms(2024, 1, 1, 10, 15, 42).unwrap(),
             end: Utc.with_ymd_and_hms(2024, 1, 2, 10, 15, 42).unwrap(),
         };
-        let sql = slo_compute_sql("api", SliKind::Availability, None, &tr);
+        let sql = slo_compute_sql("api", SliKind::Availability, None, &tr, false);
         assert!(
             sql.contains("BETWEEN '2024-01-01 10:15:00' AND '2024-01-02 10:15:42'"),
             "{sql}"
@@ -459,7 +556,7 @@
 
     #[test]
     fn infra_hosts_latest_per_host_metric() {
-        let sql = infra_hosts_sql(&day_range(), &InfraHostsFilters::default());
+        let sql = infra_hosts_sql(&day_range(), &InfraHostsFilters::default(), false);
         assert!(sql.contains("resource_attributes['host.name'] AS host"), "{sql}");
         assert!(
             sql.contains("argMaxIf(value, timestamp, metric_name = 'system.cpu.utilization') AS cpu_util"),
@@ -487,7 +584,7 @@
 
     #[test]
     fn rum_web_vitals_p75_with_counts() {
-        let sql = rum_web_vitals_sql(&day_range(), &RumFilters::default());
+        let sql = rum_web_vitals_sql(&day_range(), &RumFilters::default(), false);
         assert!(
             sql.contains("quantileTDigestIf(0.75)(value, metric_name = 'web.vitals.lcp') AS lcp_ms"),
             "{sql}"
@@ -505,7 +602,7 @@
 
     #[test]
     fn rum_pageviews_series_buckets_and_predicates() {
-        let sql = rum_pageviews_series_sql(&day_range(), 60, &RumFilters::default());
+        let sql = rum_pageviews_series_sql(&day_range(), 60, &RumFilters::default(), false);
         assert!(sql.contains("toIntervalSecond(60)"), "{sql}");
         assert!(sql.contains("AS views"), "{sql}");
         assert!(sql.contains("AS js_errors"), "{sql}");
@@ -513,39 +610,39 @@
         assert!(sql.contains("exception.type"), "{sql}");
         assert!(sql.contains("GROUP BY bucket"), "{sql}");
         // step clamps to >= 1.
-        let z = rum_pageviews_series_sql(&day_range(), 0, &RumFilters::default());
+        let z = rum_pageviews_series_sql(&day_range(), 0, &RumFilters::default(), false);
         assert!(z.contains("toIntervalSecond(1)"), "{z}");
     }
 
     #[test]
     fn rum_top_pages_group_and_clamp() {
-        let sql = rum_top_pages_sql(&day_range(), Some(5), &RumFilters::default());
+        let sql = rum_top_pages_sql(&day_range(), Some(5), &RumFilters::default(), false);
         assert!(sql.contains("attributes['page.url'] AS page"), "{sql}");
         assert!(sql.contains("count() AS views"), "{sql}");
         assert!(sql.contains("ORDER BY views DESC"), "{sql}");
         assert!(sql.contains("LIMIT 5"), "{sql}");
-        let def = rum_top_pages_sql(&day_range(), None, &RumFilters::default());
+        let def = rum_top_pages_sql(&day_range(), None, &RumFilters::default(), false);
         assert!(def.contains("LIMIT 10"), "{def}");
-        let clamp = rum_top_pages_sql(&day_range(), Some(99999), &RumFilters::default());
+        let clamp = rum_top_pages_sql(&day_range(), Some(99999), &RumFilters::default(), false);
         assert!(clamp.contains("LIMIT 100"), "{clamp}");
     }
 
     #[test]
     fn rum_recent_errors_orders_recent_and_clamps() {
-        let sql = rum_recent_errors_sql(&day_range(), Some(25), &RumFilters::default());
+        let sql = rum_recent_errors_sql(&day_range(), Some(25), &RumFilters::default(), false);
         assert!(sql.contains("AS message"), "{sql}");
         assert!(sql.contains("attributes['page.url'] AS page"), "{sql}");
         assert!(sql.contains("ORDER BY start_time DESC"), "{sql}");
         assert!(sql.contains("LIMIT 25"), "{sql}");
-        let def = rum_recent_errors_sql(&day_range(), None, &RumFilters::default());
+        let def = rum_recent_errors_sql(&day_range(), None, &RumFilters::default(), false);
         assert!(def.contains("LIMIT 20"), "{def}");
-        let clamp = rum_recent_errors_sql(&day_range(), Some(99999), &RumFilters::default());
+        let clamp = rum_recent_errors_sql(&day_range(), Some(99999), &RumFilters::default(), false);
         assert!(clamp.contains("LIMIT 200"), "{clamp}");
     }
 
     #[test]
     fn synthetic_summary_aggregates_per_check() {
-        let sql = synthetic_summary_sql(&day_range());
+        let sql = synthetic_summary_sql(&day_range(), false);
         assert!(sql.contains("FROM nanosiem.synthetic_check_results"), "{sql}");
         assert!(sql.contains("count() AS total"), "{sql}");
         assert!(sql.contains("sum(success) AS good"), "{sql}");
@@ -560,18 +657,18 @@
 
     #[test]
     fn synthetic_history_escapes_and_clamps() {
-        let sql = synthetic_history_sql("abc-123", &day_range(), Some(50));
+        let sql = synthetic_history_sql("abc-123", &day_range(), Some(50), false);
         assert!(sql.contains("check_id = 'abc-123'"), "{sql}");
         assert!(sql.contains("AS ts"), "{sql}");
         assert!(sql.contains("ORDER BY timestamp DESC"), "{sql}");
         assert!(sql.contains("LIMIT 50"), "{sql}");
         // default + clamp.
-        let def = synthetic_history_sql("c", &day_range(), None);
+        let def = synthetic_history_sql("c", &day_range(), None, false);
         assert!(def.contains("LIMIT 90"), "{def}");
-        let clamp = synthetic_history_sql("c", &day_range(), Some(99999));
+        let clamp = synthetic_history_sql("c", &day_range(), Some(99999), false);
         assert!(clamp.contains("LIMIT 365"), "{clamp}");
         // injection-safe.
-        let evil = synthetic_history_sql("a'b", &day_range(), None);
+        let evil = synthetic_history_sql("a'b", &day_range(), None, false);
         assert!(evil.contains("check_id = 'a''b'"), "{evil}");
     }
 
@@ -586,7 +683,7 @@
             q: Some("Check'out"),
             sort: Some(ServicesSort::P95),
         };
-        let sql = services_overview_sql(&day_range(), &f);
+        let sql = services_overview_sql(&day_range(), &f, false);
         assert!(
             sql.contains("AND lower(service_name) LIKE '%check''out%'"),
             "{sql}"
@@ -600,6 +697,7 @@
                 sort: Some(ServicesSort::Name),
                 ..Default::default()
             },
+            false,
         );
         assert!(n.contains("ORDER BY service ASC"), "{n}");
         // error_rate sort falls back to the count order in SQL (glue re-sorts).
@@ -609,12 +707,13 @@
                 sort: Some(ServicesSort::ErrorRate),
                 ..Default::default()
             },
+            false,
         );
         assert!(e.contains("ORDER BY request_count DESC"), "{e}");
         assert!(ServicesSort::ErrorRate.needs_glue_sort());
         assert!(!ServicesSort::Rate.needs_glue_sort());
         // default (no filters) keeps the historical count order, no q clause.
-        let d = services_overview_sql(&day_range(), &ServicesOverviewFilters::default());
+        let d = services_overview_sql(&day_range(), &ServicesOverviewFilters::default(), false);
         assert!(d.contains("ORDER BY request_count DESC"), "{d}");
         assert!(!d.contains("LIKE"), "{d}");
     }
@@ -639,7 +738,7 @@
             group: Some("frontend"),
             env: Some("prod'"),
         };
-        let sql = infra_hosts_sql(&day_range(), &f);
+        let sql = infra_hosts_sql(&day_range(), &f, false);
         assert!(
             sql.contains("AND lower(resource_attributes['host.name']) LIKE '%web-01%'"),
             "{sql}"
@@ -655,7 +754,7 @@
         // default → no extra filter predicates (the host_group SELECT always
         // references host.group, so assert the FILTER form is absent, not the
         // bare attribute name).
-        let d = infra_hosts_sql(&day_range(), &InfraHostsFilters::default());
+        let d = infra_hosts_sql(&day_range(), &InfraHostsFilters::default(), false);
         assert!(!d.contains("AND resource_attributes['host.group'] ="), "{d}");
         assert!(!d.contains("deployment.environment"), "{d}");
         assert!(!d.contains("LIKE"), "{d}");
@@ -670,7 +769,7 @@
             env: Some("prod"),
         };
         // spans-side: page (lowercased substring), browser + env (exact).
-        let series = rum_pageviews_series_sql(&day_range(), 60, &f);
+        let series = rum_pageviews_series_sql(&day_range(), 60, &f, false);
         assert!(
             series.contains("AND lower(attributes['page.url']) LIKE '%/checkout%'"),
             "{series}"
@@ -683,12 +782,12 @@
             series.contains("AND resource_attributes['deployment.environment'] = 'prod'"),
             "{series}"
         );
-        let top = rum_top_pages_sql(&day_range(), None, &f);
+        let top = rum_top_pages_sql(&day_range(), None, &f, false);
         assert!(top.contains("AND attributes['browser.name'] = 'Chrome'"), "{top}");
-        let errs = rum_recent_errors_sql(&day_range(), None, &f);
+        let errs = rum_recent_errors_sql(&day_range(), None, &f, false);
         assert!(errs.contains("AND lower(attributes['page.url']) LIKE '%/checkout%'"), "{errs}");
         // metrics-side: only env applies to the vitals.
-        let vitals = rum_web_vitals_sql(&day_range(), &f);
+        let vitals = rum_web_vitals_sql(&day_range(), &f, false);
         assert!(
             vitals.contains("AND resource_attributes['deployment.environment'] = 'prod'"),
             "{vitals}"
@@ -696,7 +795,7 @@
         assert!(!vitals.contains("page.url"), "{vitals}");
         assert!(!vitals.contains("browser.name"), "{vitals}");
         // default → no pushed predicates.
-        let d = rum_pageviews_series_sql(&day_range(), 60, &RumFilters::default());
+        let d = rum_pageviews_series_sql(&day_range(), 60, &RumFilters::default(), false);
         assert!(!d.contains("browser.name"), "{d}");
     }
 
@@ -706,7 +805,7 @@
 
     #[test]
     fn service_entities_single_scan_array_join_escapes() {
-        let sql = service_entities_sql("checkout'api", &day_range());
+        let sql = service_entities_sql("checkout'api", &day_range(), false);
         // NAN-1632 3.14: one scan arrayJoining both entity columns — the old
         // UNION ALL read the same granules twice under an identical predicate.
         assert!(
@@ -731,7 +830,7 @@
     #[test]
     fn security_signals_for_entities_in_list_and_escape() {
         let entities = vec!["10.0.0.1".to_string(), "web'01".to_string()];
-        let sql = security_signals_for_entities_sql(&entities, &day_range(), Some(50));
+        let sql = security_signals_for_entities_sql(&entities, &day_range(), Some(50), false);
         assert!(sql.contains("FROM nanosiem.signals"), "{sql}");
         assert!(
             sql.contains("risk_entity IN ('10.0.0.1', 'web''01')"),
@@ -745,10 +844,10 @@
         assert!(sql.contains("WHERE signals.timestamp BETWEEN"), "{sql}");
         assert!(!sql.contains("PREWHERE"), "{sql}");
         // empty entities → unsatisfiable guard, still valid SQL, default + clamp.
-        let none = security_signals_for_entities_sql(&[], &day_range(), None);
+        let none = security_signals_for_entities_sql(&[], &day_range(), None, false);
         assert!(none.contains("AND (0)"), "{none}");
         assert!(none.contains("LIMIT 100"), "{none}");
-        let clamp = security_signals_for_entities_sql(&entities, &day_range(), Some(99999));
+        let clamp = security_signals_for_entities_sql(&entities, &day_range(), Some(99999), false);
         assert!(clamp.contains("LIMIT 1000"), "{clamp}");
     }
 

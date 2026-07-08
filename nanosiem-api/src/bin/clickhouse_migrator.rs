@@ -231,6 +231,24 @@ async fn run() -> Result<()> {
         );
     }
 
+    // NAN-1728 (C2/P0): now that the reference-table `_distributed` wrappers
+    // exist, repoint the five dict-refresh MVs' FROM at them so each per-node
+    // staging dict sees the COMPLETE cross-shard keyspace. This MUST run AFTER
+    // ensure_distributed_tables — init.sql created the MVs reading the LOCAL base
+    // because refreshable-MV DDL validates its FROM eagerly and the wrapper did
+    // not exist at init time. Cluster-only; a no-op on single-node (MVs keep
+    // reading the local, complete base). Idempotent, so safe every boot.
+    let repointed_mvs = migrator
+        .repoint_dict_refresh_mvs_distributed()
+        .await
+        .context("repointing dict-refresh MVs to distributed reference-table wrappers")?;
+    if repointed_mvs > 0 {
+        tracing::info!(
+            "Repointed {} dict-refresh MV(s) to distributed reference-table wrappers",
+            repointed_mvs
+        );
+    }
+
     // NAN-1116: surface any FAILED dictionaries in the deploy log. A FAILED
     // dict referenced by a dictGet()-backed MATERIALIZED column silently drops
     // 100% of ingestion at runtime; this makes it loud at every migrate instead

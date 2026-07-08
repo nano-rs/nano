@@ -16,11 +16,13 @@
 // detail panel shows the latest snapshot + status (no per-host CPU sparkline)
 // and pivots to search rather than faking history.
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Server, Box, BarChart3, RefreshCw, Search } from 'lucide-react';
 import { api } from '@/lib/api';
 import type { CacheMeta } from '@/lib/api';
+import { toApiTimeRange } from '@/hooks/use-api';
+import type { TimeRange } from '@/lib/api/types';
 import { cn } from '@/lib/utils';
 import { CachedNotice } from '@/components/search/CachedNotice';
 import { HEALTH, toDesignHealth } from '@/components/observability/format';
@@ -64,6 +66,12 @@ function HostDetail({ host, metric }: { host: InfraHost | null; metric: InfraMet
   }
 
   const tone = toDesignHealth(host.status);
+  // O34 (NAN-1721): pivot on the real UDM/OCSF host columns via an OR-query
+  // (mirrors ServiceSecuritySignals). The old `host.name="…"` resolved to
+  // `ext.host.name` on the logs table, which UDM/OCSF parsers never populate —
+  // so "Explore in search" always came back empty.
+  const hq = host.host.replace(/"/g, '\\"');
+  const hostSearchQuery = `src_host="${hq}" OR dest_host="${hq}" OR hostname="${hq}" OR device.hostname="${hq}"`;
   const fmtCell = (v: number | null, fmt: (n: number) => string) => (v == null ? '–' : fmt(v));
   const stats: Array<{ k: string; v: string; hot: boolean }> = [
     { k: 'CPU', v: fmtCell(host.cpu_pct, (n) => Math.round(n) + '%'), hot: (host.cpu_pct ?? 0) >= 90 },
@@ -111,7 +119,7 @@ function HostDetail({ host, metric }: { host: InfraHost | null; metric: InfraMet
       </div>
       <div className="p-3 border-t border-border">
         <Link
-          to={`/search?q=${encodeURIComponent(`host.name="${host.host}"`)}`}
+          to={`/search?q=${encodeURIComponent(hostSearchQuery)}`}
           className="inline-flex items-center gap-1.5 h-8 px-2.5 rounded-md border border-border text-[11.5px] text-fg-2 hover:border-border-2 hover:text-foreground"
         >
           <Search className="w-[12px] h-[12px] text-fg-3" />
@@ -182,7 +190,7 @@ function HottestList({
 // tab
 // ---------------------------------------------------------------------------
 
-export function InfraTab({ apiTimeRange }: ObservabilityTabProps) {
+export function InfraTab({ timeRange }: ObservabilityTabProps) {
   const [hosts, setHosts] = useState<InfraHost[] | null>(null);
   const [total, setTotal] = useState(0);
   const [hasMore, setHasMore] = useState(false);
@@ -203,6 +211,12 @@ export function InfraTab({ apiTimeRange }: ObservabilityTabProps) {
   const [env, setEnv] = useState('');
   const [debouncedEnv, setDebouncedEnv] = useState('');
   const [status, setStatus] = useState<HostStatus | 'all'>('all');
+
+  // O30 (NAN-1721): resolve the window fresh at fetch time so presets track
+  // "now" across filter changes and manual refreshes rather than reusing the
+  // absolute window frozen when the console first mounted. The window used by
+  // the current page-0 fetch is captured so "Load more" pages stay inside it.
+  const windowRef = useRef<TimeRange>(toApiTimeRange(timeRange));
 
   useEffect(() => {
     const t = setTimeout(() => setDebouncedQ(q.trim()), 250);
@@ -228,9 +242,11 @@ export function InfraTab({ apiTimeRange }: ObservabilityTabProps) {
     setLoading(true);
     setError(null);
     setCacheMeta(null); // clear stale badge while the fresh (page-0) list loads
+    const resolved = toApiTimeRange(timeRange);
+    windowRef.current = resolved;
     api.observability
       .getInfraHosts(
-        apiTimeRange,
+        resolved,
         { ...filterArgs, limit: PAGE_SIZE, offset: 0 },
         { onMeta: (m) => !cancelled && setCacheMeta(m) }
       )
@@ -250,16 +266,18 @@ export function InfraTab({ apiTimeRange }: ObservabilityTabProps) {
     return () => {
       cancelled = true;
     };
-  }, [apiTimeRange, filterArgs]);
+  }, [timeRange, filterArgs]);
 
   // NAN-1595: force a live re-fetch of the first page, bypassing the server cache.
   const refresh = () => {
     if (refreshing) return;
     setRefreshing(true);
     setError(null);
+    const resolved = toApiTimeRange(timeRange);
+    windowRef.current = resolved;
     api.observability
       .getInfraHosts(
-        apiTimeRange,
+        resolved,
         { ...filterArgs, limit: PAGE_SIZE, offset: 0 },
         { onMeta: setCacheMeta, bypass: true }
       )
@@ -278,7 +296,7 @@ export function InfraTab({ apiTimeRange }: ObservabilityTabProps) {
     const offset = hosts?.length ?? 0;
     setLoadingMore(true);
     api.observability
-      .getInfraHosts(apiTimeRange, { ...filterArgs, limit: PAGE_SIZE, offset })
+      .getInfraHosts(windowRef.current, { ...filterArgs, limit: PAGE_SIZE, offset })
       .then((res) => {
         setHosts((prev) => [...(prev ?? []), ...res.hosts]);
         setTotal(res.total ?? offset + res.hosts.length);

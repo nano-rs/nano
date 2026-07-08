@@ -78,8 +78,6 @@ impl DetectionRuleRepository {
             }
         }
 
-        Self::notify_rule_change(&self.pool, result.id).await;
-
         Ok(result)
     }
 
@@ -232,8 +230,6 @@ impl DetectionRuleRepository {
             }
         }
 
-        Self::notify_rule_change(&self.pool, id).await;
-
         Ok(result)
     }
 
@@ -247,8 +243,6 @@ impl DetectionRuleRepository {
         if result.rows_affected() == 0 {
             return Err(DetectionRuleRepositoryError::NotFound(id));
         }
-
-        Self::notify_rule_change(&self.pool, id).await;
 
         Ok(())
     }

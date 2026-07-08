@@ -103,9 +103,14 @@ export function TracesTab({ apiTimeRange }: ObservabilityTabProps) {
     getNextPageParam: (lastPage) => {
       const rows = lastPage.traces ?? [];
       // A full page implies there may be more; the next cursor is the oldest
-      // (last, since most-recent-first) row's start_time.
-      if (rows.length < TRACE_PAGE_SIZE) return undefined;
-      return rows[rows.length - 1]?.start_time;
+      // (last, since most-recent-first) row's start_time. The backend `before`
+      // param deserializes as chrono::DateTime<Utc> (RFC3339 only), but the row
+      // start_time is raw CH JSONEachRow ("YYYY-MM-DD HH:MM:SS", no T/Z) — pass
+      // it through and every next-page fetch 400s, silently killing pagination
+      // (NAN-1721 / O29). Normalize to RFC3339 first.
+      const cursor = rows[rows.length - 1]?.start_time;
+      if (rows.length < TRACE_PAGE_SIZE || !cursor) return undefined;
+      return parseUTCTimestamp(cursor).toISOString();
     },
   });
 
@@ -144,12 +149,16 @@ export function TracesTab({ apiTimeRange }: ObservabilityTabProps) {
       id: t.trace_id,
       startTs: parseUTCTimestamp(t.start_time).getTime(),
       durationMs: t.duration_ns / NS_PER_MS,
-      errors: t.error_count,
+      errors: Number(t.error_count),
       root: t.root_service,
     });
     if (traces.length <= SCATTER_CAP) return traces.map(toPoint);
-    const errored = traces.filter((t) => t.error_count > 0);
-    const ok = traces.filter((t) => t.error_count === 0);
+    // CH's default output_format_json_quote_64bit_integers=1 can surface
+    // error_count as a quoted string ("0"), so a strict `=== 0` never matches and
+    // the "keep errored, fill with the rest" split drops every non-errored trace
+    // past the cap — the scatter shows only red dots (NAN-1721 / O32). Coerce.
+    const errored = traces.filter((t) => Number(t.error_count) > 0);
+    const ok = traces.filter((t) => Number(t.error_count) === 0);
     return [...errored, ...ok].slice(0, SCATTER_CAP).map(toPoint);
   }, [traces]);
 
@@ -168,12 +177,34 @@ export function TracesTab({ apiTimeRange }: ObservabilityTabProps) {
     return `/search?dataset=spans${q ? `&q=${encodeURIComponent(q)}` : ''}`;
   }, [svc, errOnly, minDurMs]);
 
+  // NAN-1721 (O36): the trace fetch is Dragonfly-cached like every other obs
+  // read, so the drill-in surfaces the same "cached · refresh" badge. Its cache
+  // state is separate from the list's — a refresh flips the bypass flag then
+  // refetches live, bypassing the server cache for that one fetch.
+  const [traceCacheMeta, setTraceCacheMeta] = useState<CacheMeta | null>(null);
+  const [traceRefreshing, setTraceRefreshing] = useState(false);
+  const traceBypassRef = useRef(false);
+
   // Fetch the selected trace's spans for the inline waterfall.
   const traceQuery = useQuery({
     queryKey: ['obs-trace', openTraceId],
-    queryFn: () => api.observability.getTrace(openTraceId as string),
+    queryFn: () => {
+      const bypass = traceBypassRef.current;
+      traceBypassRef.current = false;
+      return api.observability.getTrace(openTraceId as string, {
+        onMeta: setTraceCacheMeta,
+        bypass,
+      });
+    },
     enabled: !!openTraceId,
   });
+
+  const refreshTrace = () => {
+    if (traceRefreshing) return;
+    traceBypassRef.current = true;
+    setTraceRefreshing(true);
+    void traceQuery.refetch().finally(() => setTraceRefreshing(false));
+  };
 
   // ---- inline drill-in view ----
   if (openTraceId) {
@@ -201,6 +232,13 @@ export function TracesTab({ apiTimeRange }: ObservabilityTabProps) {
         traceId={openTraceId}
         spans={traceQuery.data.spans}
         onBack={() => setOpenTraceId(null)}
+        cacheNotice={
+          <CachedNotice
+            meta={traceCacheMeta}
+            onRefresh={refreshTrace}
+            refreshing={traceRefreshing}
+          />
+        }
       />
     );
   }
@@ -361,7 +399,10 @@ export function TracesTab({ apiTimeRange }: ObservabilityTabProps) {
                   {fmtMs(durMs)}
                 </span>
                 <span className="font-mono text-[11px] text-fg-3 tabular-nums text-right">
-                  {formatTimeUTC(t.start_time)}
+                  {/* Parse the bare CH timestamp as UTC first; formatTimeUTC's own
+                      `new Date(string)` would read it as LOCAL and shift the
+                      "Start (UTC)" column by the browser offset (NAN-1721 / O12). */}
+                  {formatTimeUTC(parseUTCTimestamp(t.start_time))}
                 </span>
                 <ChevronRight className="w-3.5 h-3.5 text-fg-4 group-hover:text-fg-2" />
               </button>
@@ -372,7 +413,15 @@ export function TracesTab({ apiTimeRange }: ObservabilityTabProps) {
         {/* Load more — keyset pagination (NAN-1539). Appends the next page via
             the oldest visible trace's start_time cursor. */}
         {!tracesQuery.isLoading && traces.length > 0 && (
-          <div className="flex items-center justify-center px-3.5 py-2.5">
+          <div className="flex flex-col items-center gap-1.5 px-3.5 py-2.5">
+            {/* A next-page fetch that fails (e.g. a rejected cursor) used to be
+                silent — useInfiniteQuery recorded the error but the button just
+                never appended. Surface it with a retry affordance (O29). */}
+            {tracesQuery.isFetchNextPageError && (
+              <span className="text-[10.5px] font-mono text-danger tabular-nums">
+                Failed to load more traces.
+              </span>
+            )}
             {tracesQuery.hasNextPage ? (
               <button
                 type="button"
@@ -382,7 +431,9 @@ export function TracesTab({ apiTimeRange }: ObservabilityTabProps) {
               >
                 {tracesQuery.isFetchingNextPage
                   ? 'Loading…'
-                  : `Load more (${traces.length} shown)`}
+                  : tracesQuery.isFetchNextPageError
+                    ? 'Retry'
+                    : `Load more (${traces.length} shown)`}
               </button>
             ) : (
               <span className="text-[10.5px] font-mono text-fg-4 tabular-nums">

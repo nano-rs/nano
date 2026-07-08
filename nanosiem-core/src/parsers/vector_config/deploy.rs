@@ -478,6 +478,15 @@ impl VectorConfigManager {
              # wait_for_async_insert=1, so HTTP 200 means the flush succeeded —\n\
              # a flush failure (NAN-1404 class) is a visible, retryable sink\n\
              # error instead of a silently discarded pre-ACKed batch.\n\
+             # NAN-1728 (C4/W10): the OCSF ingest lane writes the ENGINE=Null\n\
+             # `ocsf_logs_raw` table; a ClickHouse MV maps it into the Replicated\n\
+             # `ocsf_logs`. It is deliberately NOT routed to `ocsf_logs_distributed`\n\
+             # — the raw table carries the JSON `event` shape, not the mapped\n\
+             # columns, so writing the wrapper would bypass the MV. Cross-shard\n\
+             # retry dedup on this lane relies on the query settings below (plus the\n\
+             # server-side deduplicate_blocks_in_dependent_materialized_views=1);\n\
+             # this reduces but cannot fully eliminate dupes when a retry lands on a\n\
+             # different shard (at-least-once on the raw lane, documented).\n\
              [sinks.clickhouse_ocsf_logs]\n\
              type = \"clickhouse\"\n\
              inputs = [{inputs}]\n\
@@ -490,6 +499,10 @@ impl VectorConfigManager {
              compression = \"gzip\"\n\
              date_time_best_effort = true\n\
              skip_unknown_fields = true\n\
+             \n\
+             # NAN-1728 (C4/W10): async_insert_deduplicate=1 for the raw lane.\n\
+             [sinks.clickhouse_ocsf_logs.query_settings.async_insert_settings]\n\
+             deduplicate = true\n\
              \n\
              [sinks.clickhouse_ocsf_logs.buffer]\n\
              type = \"memory\"\n\
@@ -940,6 +953,18 @@ for_each(keys(.)) -> |_idx, key| {
 # retries and surfaces in metrics, instead of a silently discarded pre-ACKed
 # batch. Measured: zero throughput cost at 5k eps; sustained-overload shedding
 # unchanged (the drop_newest buffer below sheds either way, now visibly).
+#
+# Cluster routing contract (NAN-1728, C4/W1) — kept byte-for-byte in sync with
+# config/vector/sources/parsers/_pipeline.toml. `table` is env-driven and
+# defaults to the shard-LOCAL `logs`:
+#   * SINGLE-SHARD (dev / Saturn / most tenants): leave CLICKHOUSE_LOGS_TABLE
+#     UNSET -> writes the plain local `logs`, unchanged. No `logs_distributed`
+#     wrapper exists there, so the default MUST stay `logs`.
+#   * ENTERPRISE 3x2 CLUSTER: deploy/k8s/rackspace/vector.yaml sets
+#     CLICKHOUSE_LOGS_TABLE=logs_distributed so writes go THROUGH the Distributed
+#     wrapper (sharded by cityHash64(id), content hash not rand()), so a
+#     timed-out-then-retried batch re-hashes to the SAME shard and per-shard
+#     block dedup catches the duplicate; also removes per-connection shard skew.
 # =============================================================================
 [sinks.clickhouse_logs]
 type = "clickhouse"
@@ -956,6 +981,15 @@ auth.password = "${CLICKHOUSE_PASSWORD:-nanosiem}"
 compression = "gzip"
 date_time_best_effort = true
 skip_unknown_fields = true
+
+# NAN-1728 (C4/W10): async-insert block dedup — `deduplicate = true` emits the
+# ClickHouse query setting `async_insert_deduplicate=1` so an identical batch
+# re-POSTed after an HTTP timeout is dropped, not re-inserted. Harmless on
+# single-shard. The MV-cascade companion
+# `deduplicate_blocks_in_dependent_materialized_views=1` is not expressible from
+# the Vector clickhouse sink and lives in the server-side profile (query_limits.xml).
+[sinks.clickhouse_logs.query_settings.async_insert_settings]
+deduplicate = true
 
 [sinks.clickhouse_logs.buffer]
 type = "memory"

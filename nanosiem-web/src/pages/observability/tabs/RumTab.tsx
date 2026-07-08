@@ -18,6 +18,8 @@ import { useNavigate } from 'react-router-dom';
 import { Globe, AlertTriangle, RefreshCw, MonitorSmartphone, Search } from 'lucide-react';
 import { api } from '@/lib/api';
 import type { CacheMeta } from '@/lib/api';
+import { toApiTimeRange } from '@/hooks/use-api';
+import { parseUTCTimestamp } from '@/lib/date-utils';
 import { cn } from '@/lib/utils';
 import { CachedNotice } from '@/components/search/CachedNotice';
 import { useCapabilities } from '@/hooks/use-capabilities';
@@ -65,7 +67,10 @@ function ErrorEntityPivots({
 
 // Short relative-time label for the recent-errors strip ("38s ago", "4m ago").
 const timeAgo = (ts: string): string => {
-  const t = new Date(ts).getTime();
+  // O12 (NAN-1721): backend `ts` is bare "YYYY-MM-DD HH:MM:SS" (no timezone) —
+  // parse as UTC, not browser-local. A local parse shifts the age by the
+  // browser's UTC offset (a 10s-old error shows "2h ago" in UTC+2).
+  const t = parseUTCTimestamp(ts).getTime();
   if (Number.isNaN(t)) return '';
   const s = Math.max(0, Math.round((Date.now() - t) / 1000));
   if (s < 60) return `${s}s ago`;
@@ -192,7 +197,7 @@ function RecentErrors({ rum, onPickPage }: { rum: RumResponse; onPickPage: (page
 // Tab
 // ---------------------------------------------------------------------------
 
-export function RumTab({ apiTimeRange }: ObservabilityTabProps) {
+export function RumTab({ timeRange }: ObservabilityTabProps) {
   const [rum, setRum] = useState<RumResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -227,9 +232,12 @@ export function RumTab({ apiTimeRange }: ObservabilityTabProps) {
     setLoading(true);
     setError(null);
     setCacheMeta(null); // clear stale badge while the fresh payload loads
+    // O30 (NAN-1721): resolve the window fresh at fetch time so presets track
+    // "now" across filter changes rather than reusing the window frozen at
+    // console mount.
     api.observability
       .getRum(
-        apiTimeRange,
+        toApiTimeRange(timeRange),
         {
           page: debouncedPage || undefined,
           browser: debouncedBrowser || undefined,
@@ -249,7 +257,7 @@ export function RumTab({ apiTimeRange }: ObservabilityTabProps) {
     return () => {
       cancelled = true;
     };
-  }, [apiTimeRange, debouncedPage, debouncedBrowser, debouncedEnv]);
+  }, [timeRange, debouncedPage, debouncedBrowser, debouncedEnv]);
 
   // NAN-1595: force a live re-fetch of the RUM payload, bypassing the server cache.
   const refresh = () => {
@@ -258,7 +266,7 @@ export function RumTab({ apiTimeRange }: ObservabilityTabProps) {
     setError(null);
     api.observability
       .getRum(
-        apiTimeRange,
+        toApiTimeRange(timeRange),
         {
           page: debouncedPage || undefined,
           browser: debouncedBrowser || undefined,

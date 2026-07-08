@@ -1,7 +1,32 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use super::prevalence_processing::{rescue_transform_sql, PrevalenceRescue, RescueAttr};
 use super::*;
 use crate::sql_hygiene::escape_sql_string;
+
+/// Schema-resolved artifact lookup-key expressions (`_domain_lookup` /
+/// `_ip_lookup` / `_hash_lookup`), shared between the pushdown SQL build and
+/// the NAN-1705 rescue probe. "NULL" means the active schema maps no column
+/// for that concept (the branch is dropped / never probed).
+pub(crate) struct PrevalenceLookupExprs {
+    pub domain: String,
+    pub ip: String,
+    pub hash: String,
+}
+
+/// Static shape of one NAN-1705 rescue probe: which lookup expression to
+/// DISTINCT over the base scan, which dict identifies the blind keys, and
+/// which summary table/columns re-resolve them.
+struct RescueProbeSpec<'a> {
+    lookup_expr: &'a str,
+    dict: &'static str,
+    summary_table: String,
+    key_col: &'static str,
+    state_col: &'static str,
+    /// Extra summary predicate (must end ` AND ` if non-empty). `is_private = 0 `
+    /// for IP (mirrors the ip dict source), empty for hash/domain.
+    extra_summary_filter: &'static str,
+}
 
 impl SearchService {
     /// Execute a search with JOIN-based prevalence filtering
@@ -33,16 +58,34 @@ impl SearchService {
             3 // default
         };
 
+        // NAN-1705 (D4b): before building the pushdown SQL, re-resolve the
+        // window's dict-blind artifacts (negative-cached misses / stale window
+        // masks) against the real-time summary. The rescued sets extend the
+        // filter predicates with literal IN-lists; an empty rescue (the steady
+        // state) leaves the SQL byte-identical to the rescue-free build. The
+        // probe fails OPEN to an empty rescue — a probe error must degrade to
+        // today's behavior, never fail the search.
+        let rescue = self
+            .compute_prevalence_rescue(
+                query,
+                prevalence_commands,
+                post_prevalence_commands,
+                time_range,
+            )
+            .await;
+
         // NAN-1694: the entire pushdown SQL build (window pick + base scan + dictGet
         // JOIN) is now the shared sync `generate_prevalence_pushdown_sql`, so the
         // explain path renders byte-identical SQL. Only the async rarity_threshold
-        // fetch above stays here.
+        // fetch above stays here (and the rescue probe, which explain skips — its
+        // effect is an additive IN-list in the filter predicates).
         let (sql, num_commands_pushed) = self.generate_prevalence_pushdown_sql(
             query,
             prevalence_commands,
             post_prevalence_commands,
             time_range,
             rarity_threshold,
+            &rescue,
         )?;
 
         tracing::debug!(
@@ -65,6 +108,13 @@ impl SearchService {
             result_count = results.len(),
             "Prevalence JOIN executed"
         );
+
+        // NAN-1705 (D4b): rescued rows already carry their TRUE prevalence
+        // decoration — the `_hp/_dp_host_count` projection aliases were rewritten
+        // in-SQL via `transform(...)` (see `generate_prevalence_join_sql`), so the
+        // host_count / is_rare / first_seen / … CASEs, the pushed predicate, AND
+        // any downstream `| where host_count < N` all saw the real count in
+        // ClickHouse. No post-query decoration patch is needed.
 
         // Strip internal lookup fields used for SQL JOINs (these are implementation details)
         strip_internal_lookup_fields(&mut results);
@@ -304,27 +354,44 @@ impl SearchService {
         })
     }
 
-    /// Build the JOIN-based prevalence pushdown SQL (window pick + base scan +
-    /// dictGet host_count JOIN), WITHOUT executing it or fetching config.
+    /// Map the prevalence window to the dict `last_seen` mask cutoff.
     ///
-    /// NAN-1694: extracted from `search_with_prevalence_join` so the explain path
-    /// (`SearchService::explain`) renders the SAME SQL that actually executes. Kept
-    /// SYNC — the only async dependency (`rarity_threshold`) is passed in by the
-    /// caller. Returns `(sql, num_commands_pushed_to_sql)`.
-    pub(crate) fn generate_prevalence_pushdown_sql(
-        &self,
-        query: &Query,
+    /// NAN-364: per-window sibling dicts (_1d/_7d) were rolled back — their source queries
+    /// did unbounded `uniqMerge GROUP BY entity` over prevalence_agg before the host_count
+    /// filter, reproducing the same OOM at dict-refresh time that NAN-362 tried to kill
+    /// at query time. We now use the single 30d dict for all windows and mask entries
+    /// whose `last_seen` is older than the requested window to the 9999 sentinel. 1h is
+    /// still rejected — dict refresh is 5–10 min, so sub-day granularity isn't meaningful.
+    fn prevalence_window_cutoff_sql(
+        time_window: PrevalenceTimeWindow,
+    ) -> Result<&'static str, SearchError> {
+        match time_window {
+            PrevalenceTimeWindow::OneHour => {
+                // NAN-1689: SqlValidationError → clean 400 carrying the real
+                // message (error.rs maps it to QueryError without masking).
+                // Previously SqlGenError, which was masked to "Query processing
+                // failed". Matches the dict-fallback rejection in service/mod.rs.
+                Err(SearchError::SqlValidationError(
+                    "prevalence window=1h is not supported; use 24h, 7d, or 30d".to_string(),
+                ))
+            }
+            PrevalenceTimeWindow::TwentyFourHours => Ok("now() - INTERVAL 1 DAY"),
+            PrevalenceTimeWindow::SevenDays => Ok("now() - INTERVAL 7 DAY"),
+            // 30d: use epoch-0 so the mask is a no-op (dict already windowed to 30d).
+            PrevalenceTimeWindow::ThirtyDays => Ok("toDateTime64(0, 6)"),
+        }
+    }
+
+    /// Resolve the single prevalence time window shared by every `| prevalence`
+    /// command in the query. All conditions are flattened into ONE dictGet mask
+    /// (a single window_cutoff_sql), so mixed windows across multiple
+    /// `| prevalence` commands can't be honored per-command. Reject that rather
+    /// than silently applying the first command's window to every condition
+    /// (NAN-1691 Codex review) — the old in-memory path evaluated each
+    /// command's window independently.
+    fn resolve_prevalence_window(
         prevalence_commands: &[PrevalenceCommandInfo],
-        post_prevalence_commands: &[Command],
-        time_range: &TimeRange,
-        rarity_threshold: u64,
-    ) -> Result<(String, usize), SearchError> {
-        // Get the time window from the prevalence command(s). All conditions are
-        // flattened into ONE dictGet mask (a single window_cutoff_sql), so mixed
-        // windows across multiple `| prevalence` commands can't be honored
-        // per-command. Reject that rather than silently applying the first
-        // command's window to every condition (NAN-1691 Codex review) — the old
-        // in-memory path evaluated each command's window independently.
+    ) -> Result<PrevalenceTimeWindow, SearchError> {
         let mut time_window: Option<PrevalenceTimeWindow> = None;
         for cmd in prevalence_commands {
             if let Some(tw) = cmd.time_window.as_ref() {
@@ -340,33 +407,372 @@ impl SearchService {
                 time_window = Some(tw);
             }
         }
-        let time_window = time_window.unwrap_or(PrevalenceTimeWindow::ThirtyDays);
+        Ok(time_window.unwrap_or(PrevalenceTimeWindow::ThirtyDays))
+    }
 
-        // Strip prevalence and post-prevalence commands from query for base SQL generation
+    /// Generate the base SQL for the search part (the query with prevalence and
+    /// everything after it stripped). Shared by the pushdown build and the
+    /// NAN-1705 rescue probe so both scan the identical base.
+    ///
+    /// NAN-1635: `limit: None` — the prevalence wrapper owns the result
+    /// bound (generate_prevalence_join_sql appends its own LIMIT) and the
+    /// ORDER-BY-anchored stripper below only removes a trailing
+    /// `ORDER BY … [LIMIT …]`. With the CTE tail now applying the default
+    /// safety limit (finding 3.6), a projected base (`… | fields - x |
+    /// prevalence`) ends in a bare `LIMIT 1000000 SETTINGS …` the stripper
+    /// would miss, silently truncating the prevalence base set. Emitting no
+    /// generator LIMIT reproduces the pre-3.6 base byte-for-byte after the
+    /// strip. The implicit trailing ORDER BY is kept (NOT `unordered`): the
+    /// stripper anchors on the LAST ` order by `, and removing the final
+    /// one would make it truncate mid-CTE at an internal stage's ORDER BY
+    /// (e.g. dedup's `ORDER BY … LIMIT 1 BY …`).
+    fn generate_prevalence_base_sql(
+        &self,
+        query: &Query,
+        time_range: &TimeRange,
+    ) -> Result<String, SearchError> {
         let base_query = strip_prevalence_and_after(query);
-
-        // Generate base SQL for the search part.
-        //
-        // NAN-1635: `limit: None` — the prevalence wrapper owns the result
-        // bound (generate_prevalence_join_sql appends its own LIMIT) and the
-        // ORDER-BY-anchored stripper below only removes a trailing
-        // `ORDER BY … [LIMIT …]`. With the CTE tail now applying the default
-        // safety limit (finding 3.6), a projected base (`… | fields - x |
-        // prevalence`) ends in a bare `LIMIT 1000000 SETTINGS …` the stripper
-        // would miss, silently truncating the prevalence base set. Emitting no
-        // generator LIMIT reproduces the pre-3.6 base byte-for-byte after the
-        // strip. The implicit trailing ORDER BY is kept (NOT `unordered`): the
-        // stripper anchors on the LAST ` order by `, and removing the final
-        // one would make it truncate mid-CTE at an internal stage's ORDER BY
-        // (e.g. dedup's `ORDER BY … LIMIT 1 BY …`).
         let base_options = crate::query::QueryOptions {
             limit: None,
             ..Default::default()
         };
-        let base_sql = self
-            .ch_sql_generator
+        self.ch_sql_generator
             .generate_with_options(&base_query, time_range, &base_options)
-            .map_err(|e| SearchError::SqlGenError(e.to_string()))?;
+            .map_err(|e| SearchError::SqlGenError(e.to_string()))
+    }
+
+    /// Build the schema-resolved artifact lookup-key expressions the prevalence
+    /// pushdown computes per row (`_domain_lookup` / `_ip_lookup` /
+    /// `_hash_lookup`). Shared by `generate_prevalence_join_sql` and the
+    /// NAN-1705 rescue probe so both key off byte-identical expressions.
+    ///
+    /// NAN-1241: resolve the UDM-semantic lookup columns to the active schema's
+    /// physical columns. UDM returns the same bare literal (byte-identical
+    /// output); OCSF returns the promoted dotted column (e.g.
+    /// `"dst_endpoint.hostname"`). `None` => the schema has no column for that
+    /// concept, so that lookup branch is dropped rather than referencing a
+    /// missing column (which would 500 on OCSF).
+    fn prevalence_lookup_exprs(&self) -> PrevalenceLookupExprs {
+        let profile = self.active_profile.as_ref();
+        let dest_host_col = profile.udm_column_sql("dest_host");
+        let src_host_col = profile.udm_column_sql("src_host");
+        let query_col = profile.udm_column_sql("query");
+        let dest_ip_col = profile.udm_column_sql("dest_ip");
+        let src_ip_col = profile.udm_column_sql("src_ip");
+        let file_hash_col = profile.udm_column_sql("file_hash");
+        let process_hash_col = profile.udm_column_sql("process_hash");
+
+        // Domain lookup key: first non-empty non-IP domain field. Skip any branch whose column
+        // is unmapped; if no domain column maps at all, emit NULL (dictGet then falls through to
+        // the 9999 sentinel — i.e. "not tracked").
+        let domain = {
+            let mut branches: Vec<String> = Vec::new();
+            if let Some(c) = &dest_host_col {
+                branches.push(format!("nullIf(CASE WHEN {c} != '' AND match({c}, '^[0-9]+\\\\.[0-9]+\\\\.[0-9]+\\\\.[0-9]+$') = 0 THEN lower({c}) ELSE '' END, '')"));
+            }
+            if let Some(c) = &src_host_col {
+                branches.push(format!("nullIf(CASE WHEN {c} != '' AND match({c}, '^[0-9]+\\\\.[0-9]+\\\\.[0-9]+\\\\.[0-9]+$') = 0 THEN lower({c}) ELSE '' END, '')"));
+            }
+            if let Some(c) = &query_col {
+                branches.push(format!("nullIf(lower({c}), '')"));
+            }
+            if branches.is_empty() {
+                "NULL".to_string()
+            } else {
+                format!("COALESCE(\n            {}\n        )", branches.join(",\n            "))
+            }
+        };
+
+        // IP lookup key: first non-empty IP field (or dest_host when it's an IP literal).
+        let ip = {
+            let mut branches: Vec<String> = Vec::new();
+            if let Some(c) = &dest_ip_col {
+                branches.push(format!("nullIf({c}, '')"));
+            }
+            if let Some(c) = &src_ip_col {
+                branches.push(format!("nullIf({c}, '')"));
+            }
+            if let Some(c) = &dest_host_col {
+                branches.push(format!("nullIf(CASE WHEN match({c}, '^[0-9]+\\\\.[0-9]+\\\\.[0-9]+\\\\.[0-9]+$') THEN {c} ELSE '' END, '')"));
+            }
+            if branches.is_empty() {
+                "NULL".to_string()
+            } else {
+                format!("COALESCE(\n            {}\n        )", branches.join(",\n            "))
+            }
+        };
+
+        // Hash lookup key: first non-empty hash field, lowercased for case-insensitive match.
+        let hash = {
+            let mut branches: Vec<String> = Vec::new();
+            if let Some(c) = &file_hash_col {
+                branches.push(format!("nullIf({c}, '')"));
+            }
+            if let Some(c) = &process_hash_col {
+                branches.push(format!("nullIf({c}, '')"));
+            }
+            if branches.is_empty() {
+                "NULL".to_string()
+            } else {
+                format!(
+                    "lower(COALESCE(\n            {}\n        ))",
+                    branches.join(",\n            ")
+                )
+            }
+        };
+
+        PrevalenceLookupExprs { domain, ip, hash }
+    }
+
+    /// NAN-1705 (D4b): re-resolve dict-blind artifacts against the real-time
+    /// summary before the pushdown SQL is built.
+    ///
+    /// The prevalence CACHE dicts negative-cache a brand-new artifact's absence
+    /// for LIFETIME(900–1800s) — poisoned at ingest by the `logs.prevalence_*`
+    /// MATERIALIZED-column lookups that run before the same insert block's
+    /// summary-MV rows land. A rarity rule riding the `< 9999` presence guard is
+    /// therefore blind to an artifact for the first 15–30 minutes of its life —
+    /// exactly the artifacts it exists to catch. The probe finds the window's
+    /// dict-missed keys and re-checks them against `*_prevalence_summary` (the
+    /// dict's own real-time source) under the dict source's exact contract; see
+    /// `build_prevalence_rescue_probe_sql`.
+    ///
+    /// Fail-open BY DESIGN: any probe failure returns an empty rescue and the
+    /// generated SQL is byte-identical to the pre-NAN-1705 build — the rescue
+    /// can only ADD rows the dict path wrongly dropped, never remove or block.
+    /// Skipped entirely (zero cost) unless a pushable count condition exists OR
+    /// (NAN-1705 residual #2) `enrich=true` is paired with a downstream
+    /// rare-direction filter on a decorated column (`| where host_count < N`,
+    /// `| where is_rare`). Pure-decorate `enrich=true` (no such filter) triggers
+    /// NO probe and stays byte-identical.
+    pub(crate) async fn compute_prevalence_rescue(
+        &self,
+        query: &Query,
+        prevalence_commands: &[PrevalenceCommandInfo],
+        post_prevalence_commands: &[Command],
+        time_range: &TimeRange,
+    ) -> PrevalenceRescue {
+        use crate::query::{
+            PrevalenceCondition, PrevalenceField, PrevalenceOperator, PrevalenceThreshold,
+        };
+
+        let mut rescue = PrevalenceRescue::default();
+
+        // Explicit `| prevalence <field> <op> N` count conditions (hash/domain only).
+        let conditions: Vec<PrevalenceCondition> = prevalence_commands
+            .iter()
+            .flat_map(|cmd| cmd.conditions.iter().cloned())
+            .collect();
+        let count_conds = |field: PrevalenceField| -> Vec<PrevalenceCondition> {
+            conditions
+                .iter()
+                .filter(|c| {
+                    c.field == field && matches!(c.threshold, PrevalenceThreshold::Count(_))
+                })
+                .cloned()
+                .collect()
+        };
+        let mut hash_conds = count_conds(PrevalenceField::HashPrevalence);
+        let mut domain_conds = count_conds(PrevalenceField::DomainPrevalence);
+        let mut ip_conds: Vec<PrevalenceCondition> = Vec::new();
+
+        // NAN-1705 residual #2: `enrich=true | where <decorated> …`. The
+        // decorated `host_count = least(_dp, _ip, _hp)` includes IP (the ONLY way
+        // to reach IP rarity — there is no `ip_prevalence` filter field), so a
+        // synthetic `<= threshold` condition drives ALL THREE dimensions. The
+        // threshold only BOUNDS the rescue set; the in-SQL `| where` filters
+        // exactly once the aliases are transform-corrected.
+        let enrich = prevalence_commands.iter().any(|cmd| cmd.enrich);
+        if enrich {
+            let rarity_threshold = if let Some(ref s) = self.prevalence_service {
+                s.rarity_threshold().await
+            } else {
+                3
+            };
+            if let Some(threshold) =
+                super::prevalence_processing::decorated_filter_rescue_threshold(
+                    post_prevalence_commands,
+                    rarity_threshold,
+                )
+            {
+                let syn = |field: PrevalenceField| PrevalenceCondition {
+                    field,
+                    operator: PrevalenceOperator::Lte,
+                    threshold: PrevalenceThreshold::Count(threshold),
+                };
+                hash_conds.push(syn(PrevalenceField::HashPrevalence));
+                domain_conds.push(syn(PrevalenceField::DomainPrevalence));
+                // IP reuses HashPrevalence as a placeholder field —
+                // `filter_rescued_artifacts` only reads operator+threshold, never
+                // the field, so the placeholder is inert.
+                ip_conds.push(syn(PrevalenceField::HashPrevalence));
+            }
+        }
+
+        if hash_conds.is_empty() && domain_conds.is_empty() && ip_conds.is_empty() {
+            // No count condition and no enrich+decorated-filter: nothing to
+            // rescue. Zero probe cost; SQL stays byte-identical.
+            return rescue;
+        }
+        if self.ch_executor.is_none() {
+            return rescue;
+        }
+
+        // Window / base-SQL failures are NOT reported here — the pushdown build
+        // right after this will surface the identical error to the user.
+        let Ok(time_window) = Self::resolve_prevalence_window(prevalence_commands) else {
+            return rescue;
+        };
+        let Ok(window_cutoff_sql) = Self::prevalence_window_cutoff_sql(time_window) else {
+            return rescue;
+        };
+        let Ok(base_sql) = self.generate_prevalence_base_sql(query, time_range) else {
+            return rescue;
+        };
+        let base_sql_clean = base_sql.trim().trim_end_matches(';');
+        let base_no_order =
+            if let Some(order_pos) = base_sql_clean.to_lowercase().rfind(" order by ") {
+                &base_sql_clean[..order_pos]
+            } else {
+                base_sql_clean
+            };
+        let exprs = self.prevalence_lookup_exprs();
+
+        // One probe per entity type that has conditions AND a mapped lookup
+        // column ("NULL" ⇒ the active schema has nothing to key on).
+        let hash_refs: Vec<&PrevalenceCondition> = hash_conds.iter().collect();
+        let domain_refs: Vec<&PrevalenceCondition> = domain_conds.iter().collect();
+        let ip_refs: Vec<&PrevalenceCondition> = ip_conds.iter().collect();
+        if !hash_conds.is_empty() && exprs.hash != "NULL" {
+            rescue.hashes = self
+                .run_prevalence_rescue_probe(
+                    base_no_order,
+                    window_cutoff_sql,
+                    RescueProbeSpec {
+                        lookup_expr: &exprs.hash,
+                        dict: "nanosiem.hash_prevalence_dict",
+                        summary_table: self.table_names.read("hash_prevalence_summary"),
+                        key_col: "file_hash",
+                        state_col: "host_count",
+                        extra_summary_filter: "",
+                    },
+                    &hash_refs,
+                )
+                .await;
+        }
+        if !domain_conds.is_empty() && exprs.domain != "NULL" {
+            rescue.domains = self
+                .run_prevalence_rescue_probe(
+                    base_no_order,
+                    window_cutoff_sql,
+                    RescueProbeSpec {
+                        lookup_expr: &exprs.domain,
+                        dict: "nanosiem.domain_prevalence_dict",
+                        summary_table: self.table_names.read("domain_prevalence_summary"),
+                        key_col: "domain",
+                        state_col: "source_host_count",
+                        extra_summary_filter: "",
+                    },
+                    &domain_refs,
+                )
+                .await;
+        }
+        // IP: enrich-only dimension. The ip summary key is RAW (not lowercased),
+        // and the ip dict source is `WHERE is_private = 0`, so the summary probe
+        // mirrors that. Broad rules (Saturn: 133k distinct IPs / 1h `*|`) are
+        // bounded by the miss-key cap (~17s, no OOM) and the rarest-first
+        // artifact cap + WARN; narrow rules are ~0.3s.
+        if !ip_conds.is_empty() && exprs.ip != "NULL" {
+            rescue.ips = self
+                .run_prevalence_rescue_probe(
+                    base_no_order,
+                    window_cutoff_sql,
+                    RescueProbeSpec {
+                        lookup_expr: &exprs.ip,
+                        dict: "nanosiem.ip_prevalence_dict",
+                        summary_table: self.table_names.read("ip_prevalence_summary"),
+                        key_col: "ip",
+                        state_col: "source_host_count",
+                        extra_summary_filter: "is_private = 0 AND ",
+                    },
+                    &ip_refs,
+                )
+                .await;
+        }
+
+        rescue
+    }
+
+    /// Execute one rescue probe (see [`Self::compute_prevalence_rescue`]).
+    /// Fail-open: any error yields an empty rescued set with a WARN.
+    async fn run_prevalence_rescue_probe(
+        &self,
+        base_no_order: &str,
+        window_cutoff_sql: &str,
+        spec: RescueProbeSpec<'_>,
+        conds: &[&crate::query::PrevalenceCondition],
+    ) -> Vec<super::prevalence_processing::RescuedArtifact> {
+        let Some(ch_executor) = self.ch_executor.as_ref() else {
+            return Vec::new();
+        };
+        let probe_sql = super::prevalence_processing::build_prevalence_rescue_probe_sql(
+            base_no_order,
+            spec.lookup_expr,
+            spec.dict,
+            &spec.summary_table,
+            spec.key_col,
+            spec.state_col,
+            window_cutoff_sql,
+            spec.extra_summary_filter,
+        );
+        let probe_start = Instant::now();
+        match ch_executor.execute_dynamic_query(&probe_sql).await {
+            Ok(rows) => {
+                let rescued = super::prevalence_processing::filter_rescued_artifacts(rows, conds);
+                if !rescued.is_empty() {
+                    tracing::info!(
+                        entity = spec.key_col,
+                        rescued = rescued.len(),
+                        duration_ms = probe_start.elapsed().as_millis() as u64,
+                        "Prevalence rescue: dict-blind artifacts re-verified rare against the real-time summary"
+                    );
+                }
+                rescued
+            }
+            Err(e) => {
+                // Fail OPEN to an empty rescue: the main query then behaves
+                // exactly as before NAN-1705 (dict-blind rows stay dropped).
+                tracing::warn!(
+                    entity = spec.key_col,
+                    error = %e,
+                    "Prevalence rescue probe failed; dict-blind artifacts will not be rescued this cycle"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// Build the JOIN-based prevalence pushdown SQL (window pick + base scan +
+    /// dictGet host_count JOIN), WITHOUT executing it or fetching config.
+    ///
+    /// NAN-1694: extracted from `search_with_prevalence_join` so the explain path
+    /// (`SearchService::explain`) renders the SAME SQL that actually executes. Kept
+    /// SYNC — the async dependencies (`rarity_threshold`, and the NAN-1705 rescue
+    /// probe result) are passed in by the caller; explain passes an empty rescue
+    /// (the rescue is an additive literal IN-list, not a shape change). Returns
+    /// `(sql, num_commands_pushed_to_sql)`.
+    pub(crate) fn generate_prevalence_pushdown_sql(
+        &self,
+        query: &Query,
+        prevalence_commands: &[PrevalenceCommandInfo],
+        post_prevalence_commands: &[Command],
+        time_range: &TimeRange,
+        rarity_threshold: u64,
+        rescue: &PrevalenceRescue,
+    ) -> Result<(String, usize), SearchError> {
+        let time_window = Self::resolve_prevalence_window(prevalence_commands)?;
+
+        let base_sql = self.generate_prevalence_base_sql(query, time_range)?;
 
         // NAN-362: Prior to the dict-based rewrite, this path built CTEs that aggregated the
         // full *_prevalence_agg universe and LEFT JOINed them — which OOMed ClickHouse on any
@@ -400,6 +806,7 @@ impl SearchService {
             &filter_conditions,
             time_window,
             rarity_threshold,
+            rescue,
         )
     }
 
@@ -408,6 +815,7 @@ impl SearchService {
     /// Returns (sql, num_commands_pushed_to_sql) — the caller should skip the first
     /// `num_commands_pushed_to_sql` post-prevalence commands in Rust post-processing
     /// since they have already been executed in ClickHouse.
+    #[allow(clippy::too_many_arguments)]
     fn generate_prevalence_join_sql(
         &self,
         base_sql: &str,
@@ -415,6 +823,7 @@ impl SearchService {
         filter_conditions: &[crate::query::PrevalenceCondition],
         time_window: PrevalenceTimeWindow,
         rarity_threshold: u64,
+        rescue: &PrevalenceRescue,
     ) -> Result<(String, usize), SearchError> {
         tracing::debug!(
             "generate_prevalence_join_sql: {} post-prevalence commands",
@@ -424,27 +833,7 @@ impl SearchService {
             tracing::debug!("  Post-prevalence command {}: {:?}", i, cmd);
         }
 
-        // NAN-364: per-window sibling dicts (_1d/_7d) were rolled back — their source queries
-        // did unbounded `uniqMerge GROUP BY entity` over prevalence_agg before the host_count
-        // filter, reproducing the same OOM at dict-refresh time that NAN-362 tried to kill
-        // at query time. We now use the single 30d dict for all windows and mask entries
-        // whose `last_seen` is older than the requested window to the 9999 sentinel. 1h is
-        // still rejected — dict refresh is 5–10 min, so sub-day granularity isn't meaningful.
-        let window_cutoff_sql: &str = match time_window {
-            PrevalenceTimeWindow::OneHour => {
-                // NAN-1689: SqlValidationError → clean 400 carrying the real
-                // message (error.rs maps it to QueryError without masking).
-                // Previously SqlGenError, which was masked to "Query processing
-                // failed". Matches the dict-fallback rejection in service/mod.rs.
-                return Err(SearchError::SqlValidationError(
-                    "prevalence window=1h is not supported; use 24h, 7d, or 30d".to_string(),
-                ));
-            }
-            PrevalenceTimeWindow::TwentyFourHours => "now() - INTERVAL 1 DAY",
-            PrevalenceTimeWindow::SevenDays => "now() - INTERVAL 7 DAY",
-            // 30d: use epoch-0 so the mask is a no-op (dict already windowed to 30d).
-            PrevalenceTimeWindow::ThirtyDays => "toDateTime64(0, 6)",
-        };
+        let window_cutoff_sql: &str = Self::prevalence_window_cutoff_sql(time_window)?;
         // Prevalence summary dicts are SCHEMA-AGNOSTIC (clickhouse/ocsf/init.sql:697-823):
         // OCSF reuses the exact same `nanosiem.{hash,domain,ip}_prevalence_dict`, keyed by the
         // canonical hash/domain/ip string. So the dict names are identical for UDM and OCSF —
@@ -454,10 +843,8 @@ impl SearchService {
         let hash_dict = "nanosiem.hash_prevalence_dict".to_string();
 
         // NAN-1241: resolve the UDM-semantic lookup columns to the active schema's physical
-        // columns. UDM returns the same bare literal (byte-identical output); OCSF returns the
-        // promoted dotted column (e.g. `"dst_endpoint.hostname"`). `None` => the schema has no
-        // column for that concept, so that lookup branch is dropped rather than referencing a
-        // missing column (which would 500 on OCSF).
+        // columns (see `prevalence_lookup_exprs` — shared with the NAN-1705 rescue probe so
+        // both key off byte-identical expressions).
         let profile = self.active_profile.as_ref();
         let dest_host_col = profile.udm_column_sql("dest_host");
         let src_host_col = profile.udm_column_sql("src_host");
@@ -467,64 +854,11 @@ impl SearchService {
         let file_hash_col = profile.udm_column_sql("file_hash");
         let process_hash_col = profile.udm_column_sql("process_hash");
 
-        // Domain lookup key: first non-empty non-IP domain field. Skip any branch whose column
-        // is unmapped; if no domain column maps at all, emit NULL (dictGet then falls through to
-        // the 9999 sentinel — i.e. "not tracked").
-        let domain_lookup_expr = {
-            let mut branches: Vec<String> = Vec::new();
-            if let Some(c) = &dest_host_col {
-                branches.push(format!("nullIf(CASE WHEN {c} != '' AND match({c}, '^[0-9]+\\\\.[0-9]+\\\\.[0-9]+\\\\.[0-9]+$') = 0 THEN lower({c}) ELSE '' END, '')"));
-            }
-            if let Some(c) = &src_host_col {
-                branches.push(format!("nullIf(CASE WHEN {c} != '' AND match({c}, '^[0-9]+\\\\.[0-9]+\\\\.[0-9]+\\\\.[0-9]+$') = 0 THEN lower({c}) ELSE '' END, '')"));
-            }
-            if let Some(c) = &query_col {
-                branches.push(format!("nullIf(lower({c}), '')"));
-            }
-            if branches.is_empty() {
-                "NULL".to_string()
-            } else {
-                format!("COALESCE(\n            {}\n        )", branches.join(",\n            "))
-            }
-        };
-
-        // IP lookup key: first non-empty IP field (or dest_host when it's an IP literal).
-        let ip_lookup_expr = {
-            let mut branches: Vec<String> = Vec::new();
-            if let Some(c) = &dest_ip_col {
-                branches.push(format!("nullIf({c}, '')"));
-            }
-            if let Some(c) = &src_ip_col {
-                branches.push(format!("nullIf({c}, '')"));
-            }
-            if let Some(c) = &dest_host_col {
-                branches.push(format!("nullIf(CASE WHEN match({c}, '^[0-9]+\\\\.[0-9]+\\\\.[0-9]+\\\\.[0-9]+$') THEN {c} ELSE '' END, '')"));
-            }
-            if branches.is_empty() {
-                "NULL".to_string()
-            } else {
-                format!("COALESCE(\n            {}\n        )", branches.join(",\n            "))
-            }
-        };
-
-        // Hash lookup key: first non-empty hash field, lowercased for case-insensitive match.
-        let hash_lookup_expr = {
-            let mut branches: Vec<String> = Vec::new();
-            if let Some(c) = &file_hash_col {
-                branches.push(format!("nullIf({c}, '')"));
-            }
-            if let Some(c) = &process_hash_col {
-                branches.push(format!("nullIf({c}, '')"));
-            }
-            if branches.is_empty() {
-                "NULL".to_string()
-            } else {
-                format!(
-                    "lower(COALESCE(\n            {}\n        ))",
-                    branches.join(",\n            ")
-                )
-            }
-        };
+        let PrevalenceLookupExprs {
+            domain: domain_lookup_expr,
+            ip: ip_lookup_expr,
+            hash: hash_lookup_expr,
+        } = self.prevalence_lookup_exprs();
 
         // `prevalence_artifact` CASE arms project the human-facing artifact value per winning
         // entity type from whichever columns the schema maps.
@@ -647,6 +981,9 @@ impl SearchService {
         // `< 9999` presence guard drops the row for EVERY operator, exactly matching the
         // in-memory `prevalence_passes_filter` (None → false). These AND together with any
         // post-prevalence WHEREs above, mirroring the in-memory per-condition AND loop.
+        // NAN-1705 (D4b): the predicate is UNCHANGED — the `_hp/_dp_host_count`
+        // aliases below are transform-rewritten to the rescued rows' true counts,
+        // so `{alias} < 9999 AND {alias} op N` matches them directly here.
         for cond in filter_conditions {
             if let Some(pred) =
                 super::prevalence_processing::prevalence_filter_condition_to_sql(cond)
@@ -746,6 +1083,84 @@ impl SearchService {
             )
         };
 
+        // NAN-1705 (D4b): build the domain/hash/IP base_logs projection aliases,
+        // each `rescue_transform_sql`-wrapped so a rescued dict-blind key
+        // resolves to its FRESH summary value IN ClickHouse. Because the alias
+        // itself now carries the truth, the pushed predicate, the decoration
+        // CASEs below, AND any downstream `| where host_count < N` all see the
+        // rescued host_count — closing the "downstream reference re-reads 9999"
+        // gap without an OR-branch or post-query patch. Empty rescue →
+        // `rescue_transform_sql` returns the base dict expression verbatim, so
+        // the whole projection (and the whole query) stays byte-identical to the
+        // pre-NAN-1705 form. IP is rescued ONLY for the `enrich=true | where
+        // host_count < N` form (residual #2) — its `rescue.ips` is empty
+        // otherwise, so the IP projection is byte-identical for the filter form.
+        //
+        // Byte-for-byte reproduction of the historical inline expressions (dict
+        // key differs: domain/ip use `ifNull(_x_lookup, '')`, hash uses
+        // `_hash_lookup` bare). The transform match-key always `ifNull(..)`s so
+        // an empty/NULL lookup can never collide with a rescued (non-empty) key.
+        let build_projection =
+            |dict: &str, dict_key: &str, xform_key: &str, rescued: &[_]| {
+                let host_count_base = format!(
+                    "if(dictGetOrDefault('{dict}', 'last_seen', {dict_key}, toDateTime64(0, 6)) >= {w},\n           dictGetOrDefault('{dict}', 'host_count', {dict_key}, toUInt16(9999)),\n           toUInt16(9999))",
+                    w = window_cutoff_sql,
+                );
+                let first_seen_base = format!(
+                    "dictGetOrDefault('{dict}', 'first_seen', {dict_key}, toDateTime64(0, 6))"
+                );
+                let last_seen_base = format!(
+                    "dictGetOrDefault('{dict}', 'last_seen', {dict_key}, toDateTime64(0, 6))"
+                );
+                let total_occ_base = format!(
+                    "dictGetOrDefault('{dict}', 'total_occurrences', {dict_key}, toUInt64(0))"
+                );
+                (
+                    rescue_transform_sql(&host_count_base, xform_key, rescued, RescueAttr::HostCount),
+                    rescue_transform_sql(&first_seen_base, xform_key, rescued, RescueAttr::FirstSeen),
+                    rescue_transform_sql(&last_seen_base, xform_key, rescued, RescueAttr::LastSeen),
+                    rescue_transform_sql(
+                        &total_occ_base,
+                        xform_key,
+                        rescued,
+                        RescueAttr::TotalOccurrences,
+                    ),
+                )
+            };
+        let (
+            dp_host_count_expr,
+            dp_first_seen_expr,
+            dp_last_seen_expr,
+            dp_total_occurrences_expr,
+        ) = build_projection(
+            &domain_dict,
+            "ifNull(_domain_lookup, '')",
+            "ifNull(_domain_lookup, '')",
+            &rescue.domains,
+        );
+        let (
+            hp_host_count_expr,
+            hp_first_seen_expr,
+            hp_last_seen_expr,
+            hp_total_occurrences_expr,
+        ) = build_projection(
+            &hash_dict,
+            "_hash_lookup",
+            "ifNull(_hash_lookup, '')",
+            &rescue.hashes,
+        );
+        let (
+            ip_host_count_expr,
+            ip_first_seen_expr,
+            ip_last_seen_expr,
+            ip_total_occurrences_expr,
+        ) = build_projection(
+            &ip_dict,
+            "ifNull(_ip_lookup, '')",
+            "ifNull(_ip_lookup, '')",
+            &rescue.ips,
+        );
+
         // Build the final SQL using dictGet() against precomputed per-window prevalence dicts.
         // NAN-362: Replaces the old CTE + LEFT JOIN path which aggregated the entire
         // *_prevalence_agg universe before joining (O(universe) memory — OOM on any
@@ -773,24 +1188,18 @@ base_logs AS (
     SELECT *,
         -- Mask host_count to 9999 (sentinel) when last_seen is outside the requested window.
         -- This is how NAN-364 serves sub-30d windows from the 30d dict without per-window dicts.
-        if(dictGetOrDefault('{domain_dict}', 'last_seen', ifNull(_domain_lookup, ''), toDateTime64(0, 6)) >= {window_cutoff_sql},
-           dictGetOrDefault('{domain_dict}', 'host_count', ifNull(_domain_lookup, ''), toUInt16(9999)),
-           toUInt16(9999)) AS _dp_host_count,
-        dictGetOrDefault('{domain_dict}', 'first_seen', ifNull(_domain_lookup, ''), toDateTime64(0, 6)) AS _dp_first_seen,
-        dictGetOrDefault('{domain_dict}', 'last_seen', ifNull(_domain_lookup, ''), toDateTime64(0, 6)) AS _dp_last_seen,
-        dictGetOrDefault('{domain_dict}', 'total_occurrences', ifNull(_domain_lookup, ''), toUInt64(0)) AS _dp_total_occurrences,
-        if(dictGetOrDefault('{ip_dict}', 'last_seen', ifNull(_ip_lookup, ''), toDateTime64(0, 6)) >= {window_cutoff_sql},
-           dictGetOrDefault('{ip_dict}', 'host_count', ifNull(_ip_lookup, ''), toUInt16(9999)),
-           toUInt16(9999)) AS _ip_host_count,
-        dictGetOrDefault('{ip_dict}', 'first_seen', ifNull(_ip_lookup, ''), toDateTime64(0, 6)) AS _ip_first_seen,
-        dictGetOrDefault('{ip_dict}', 'last_seen', ifNull(_ip_lookup, ''), toDateTime64(0, 6)) AS _ip_last_seen,
-        dictGetOrDefault('{ip_dict}', 'total_occurrences', ifNull(_ip_lookup, ''), toUInt64(0)) AS _ip_total_occurrences,
-        if(dictGetOrDefault('{hash_dict}', 'last_seen', _hash_lookup, toDateTime64(0, 6)) >= {window_cutoff_sql},
-           dictGetOrDefault('{hash_dict}', 'host_count', _hash_lookup, toUInt16(9999)),
-           toUInt16(9999)) AS _hp_host_count,
-        dictGetOrDefault('{hash_dict}', 'first_seen', _hash_lookup, toDateTime64(0, 6)) AS _hp_first_seen,
-        dictGetOrDefault('{hash_dict}', 'last_seen', _hash_lookup, toDateTime64(0, 6)) AS _hp_last_seen,
-        dictGetOrDefault('{hash_dict}', 'total_occurrences', _hash_lookup, toUInt64(0)) AS _hp_total_occurrences
+        {dp_host_count_expr} AS _dp_host_count,
+        {dp_first_seen_expr} AS _dp_first_seen,
+        {dp_last_seen_expr} AS _dp_last_seen,
+        {dp_total_occurrences_expr} AS _dp_total_occurrences,
+        {ip_host_count_expr} AS _ip_host_count,
+        {ip_first_seen_expr} AS _ip_first_seen,
+        {ip_last_seen_expr} AS _ip_last_seen,
+        {ip_total_occurrences_expr} AS _ip_total_occurrences,
+        {hp_host_count_expr} AS _hp_host_count,
+        {hp_first_seen_expr} AS _hp_first_seen,
+        {hp_last_seen_expr} AS _hp_last_seen,
+        {hp_total_occurrences_expr} AS _hp_total_occurrences
     FROM logs_with_keys
 )
 SELECT
@@ -841,10 +1250,22 @@ FROM base_logs l{extra_where}
 ORDER BY l.timestamp DESC"#,
             base_sql = base_sql_no_order,
             raw_logs_bound = raw_logs_bound,
-            domain_dict = domain_dict,
-            ip_dict = ip_dict,
-            hash_dict = hash_dict,
-            window_cutoff_sql = window_cutoff_sql,
+            // NAN-1705 (D4b): all three dimensions' projections are pre-built
+            // (rescue-aware); the dict names AND the window_cutoff mask are baked
+            // into those exprs, so `{domain_dict}` / `{ip_dict}` / `{hash_dict}` /
+            // `{window_cutoff_sql}` no longer appear in the template.
+            dp_host_count_expr = dp_host_count_expr,
+            dp_first_seen_expr = dp_first_seen_expr,
+            dp_last_seen_expr = dp_last_seen_expr,
+            dp_total_occurrences_expr = dp_total_occurrences_expr,
+            ip_host_count_expr = ip_host_count_expr,
+            ip_first_seen_expr = ip_first_seen_expr,
+            ip_last_seen_expr = ip_last_seen_expr,
+            ip_total_occurrences_expr = ip_total_occurrences_expr,
+            hp_host_count_expr = hp_host_count_expr,
+            hp_first_seen_expr = hp_first_seen_expr,
+            hp_last_seen_expr = hp_last_seen_expr,
+            hp_total_occurrences_expr = hp_total_occurrences_expr,
             is_rare_sql = is_rare_sql,
             prevalence_score_sql = prevalence_score_sql,
             domain_lookup_expr = domain_lookup_expr,

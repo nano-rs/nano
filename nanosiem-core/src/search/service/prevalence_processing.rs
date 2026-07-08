@@ -220,6 +220,44 @@ impl SearchService {
             }
         }
 
+        // NAN-1705 (D4b): artifacts the dict could not resolve (miss or
+        // window-masked → absent from the map) may be brand-new — their absence
+        // is negative-cached at ingest for the dict's LIFETIME (15–30 min), so a
+        // rarity filter is blind to them exactly while they're newest. Re-check
+        // the misses against the real-time `*_prevalence_summary` (the dict's own
+        // source, which applies the same host_count < 1000 + window-mask
+        // contract), keeping this residual path in LOCK-STEP with the pushdown's
+        // rescue branch. Rescue failure degrades to today's behavior (misses stay
+        // excluded) — it must never fail the whole filter open OR closed.
+        let missing: Vec<String> = artifacts
+            .iter()
+            .filter(|a| !prevalence_map.contains_key(&a.to_lowercase()))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            match prevalence_service
+                .get_bulk_summary_prevalence(&missing, time_window)
+                .await
+            {
+                Ok(rescued) => {
+                    debug!(
+                        missed = missing.len(),
+                        rescued = rescued.len(),
+                        "Prevalence summary rescue for dict-missed artifacts"
+                    );
+                    for data in rescued {
+                        prevalence_map.insert(data.artifact.clone(), data.host_count);
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Prevalence summary rescue failed ({}); dict-missed artifacts stay excluded",
+                        e
+                    );
+                }
+            }
+        }
+
         // Get threshold value
         let threshold_value = match threshold {
             PrevalenceThreshold::Count(n) => *n,
@@ -1206,6 +1244,13 @@ pub(crate) fn extract_prevalence_artifact(
 /// NAN-1691: the `< 9999` presence guard makes a dict miss / out-of-window entry fail
 /// every operator, mirroring `prevalence_passes_filter(None, …) == false` so the pushdown
 /// yields the SAME row set as the in-memory filter.
+///
+/// NAN-1705 (D4b): this predicate is UNCHANGED — the rescue is applied one level
+/// up, on the `_hp/_dp_host_count` projection aliases (see [`rescue_transform_sql`]).
+/// A rescued dict-blind artifact's alias is rewritten to its TRUE fresh host_count
+/// in-SQL, so `{alias} < 9999 AND {alias} {op} N` matches it directly here — and,
+/// crucially, so does every downstream reference (the decoration CASEs, a user
+/// `| where host_count < N`). No OR-branch, no post-query patch, no divergence.
 pub(crate) fn prevalence_filter_condition_to_sql(
     cond: &crate::query::PrevalenceCondition,
 ) -> Option<String> {
@@ -1230,6 +1275,427 @@ pub(crate) fn prevalence_filter_condition_to_sql(
         PrevalenceOperator::Ne => "!=",
     };
     Some(format!("({alias} < 9999 AND {alias} {op} {n})"))
+}
+
+// ============================================================================
+// NAN-1705 (D4b): fresh-prevalence rescue for dict-blind artifacts
+// ============================================================================
+//
+// The prevalence dicts are COMPLEX_KEY_CACHE with LIFETIME(900–1800s)
+// (clickhouse/130_memory_bound_dict_source_queries.sql). A brand-new artifact's
+// FIRST dict lookup happens at ingest time — the `logs.prevalence_*`
+// MATERIALIZED columns call dictGetOrDefault while the insert block's own
+// summary-MV rows haven't landed yet — so the miss is negative-cached and every
+// detection query for the next 15–30 minutes sees the 9999 sentinel. The `<
+// 9999` presence guard then drops the row for every operator: a rarity rule is
+// blind to an artifact exactly while it is newest (audit D4, scenario b).
+//
+// The rescue re-resolves the window's dict-missed keys against
+// `*_prevalence_summary` — the dict's OWN source table, populated by
+// insert-time MV chains (logs → *_prevalence_agg → *_prevalence_summary), i.e.
+// real-time — using the dict source's exact contract:
+//   - `host_count < 1000` (the dict source HAVING): common artifacts stay
+//     excluded, so a masked-common artifact can never sneak into a rarity rule
+//     (no behavior change for scenario-c style conditions);
+//   - `last_seen >= <window cutoff>`: the same NAN-364 mask the dict path
+//     applies at lookup time.
+// A rescued artifact therefore behaves exactly as it would have if the dict
+// had been refreshed at query time. Cold/empty summary ⇒ nothing rescued —
+// identical to today (the D4a fail-loud dict monitor covers that scenario).
+//
+// This is deliberately NOT the full-universe agg JOIN (NAN-362 OOM,
+// re-validated on Saturn 2026-07-06: 228M distinct IPs vs a 3 GiB per-query
+// cap): the probe is bounded by the DISTINCT dict-missed keys of the base
+// query's own window — structurally the common head + the brand-new trickle
+// (Saturn: 400 distinct missed hashes in a 1h window; probe 0.5s) — and the
+// summary GROUP BY is bounded by that IN-set.
+
+/// Upper bound on DISTINCT missed keys the probe will consider. Bounds probe
+/// work under pathological windows (e.g. a DGA storm producing an enormous
+/// distinct-domain set). Artifacts beyond the cap are simply not rescued this
+/// cycle — strictly no worse than the pre-NAN-1705 behavior (all dropped).
+pub(crate) const PREVALENCE_RESCUE_MISS_KEY_CAP: usize = 50_000;
+
+/// Upper bound on rescued artifacts inlined into the main query's IN-list.
+/// Keeps the generated SQL far below CH's `max_query_size`. Exceeding it is
+/// logged; the overflow is not rescued this cycle.
+pub(crate) const PREVALENCE_RESCUE_MAX_ARTIFACTS: usize = 1_000;
+
+/// Host-count cutoff above which the dict source deliberately does not track
+/// entities ("common"). Mirrors `HAVING host_count < 1000` in
+/// clickhouse/130_memory_bound_dict_source_queries.sql — keep in lock-step.
+pub(crate) const PREVALENCE_DICT_HOST_COUNT_CUTOFF: u64 = 1000;
+
+/// An artifact the rescue probe re-verified against the real-time summary.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RescuedArtifact {
+    /// Lowercased lookup key — matches the `_hash_lookup` / `_domain_lookup`
+    /// aliases the pushdown computes (both are `lower(...)` expressions).
+    pub artifact: String,
+    /// Fresh 30d host_count from the summary (always `< 1000` by construction).
+    pub host_count: u64,
+    /// Fresh first/last-seen from the summary, as the probe's `toString(...)`
+    /// renders them (`YYYY-MM-DD HH:MM:SS[.ffffff]`), re-parsed into the
+    /// projection via `toDateTime64('…', 6)` (see [`RescueAttr::literal`]).
+    ///
+    /// NAN-1723: the probe SELECTs these as `fs_raw`/`ls_raw` (NOT
+    /// `first_seen`/`last_seen`) precisely so `execute_dynamic_query`'s
+    /// `convert_timestamps_to_iso8601` leaves the space format untouched —
+    /// otherwise `toDateTime64` chokes on the rewritten `T…Z` form.
+    pub first_seen: String,
+    pub last_seen: String,
+    pub total_occurrences: u64,
+}
+
+/// Rescued artifacts per entity type. `hashes`/`domains` are reachable from the
+/// `| prevalence <field> <op> N` FILTER form (which only supports hash/domain
+/// count fields). `ips` is reachable ONLY via the `enrich=true` decoration —
+/// `host_count = least(_dp, _ip, _hp)` includes the IP dimension, and there is
+/// no `ip_prevalence` filter field — so an IP-rarity rule is necessarily
+/// `... | prevalence enrich=true | where host_count < N` (NAN-1705 residual #2).
+/// Empty by default — an empty rescue leaves the generated SQL byte-identical to
+/// the pre-NAN-1705 output.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PrevalenceRescue {
+    pub hashes: Vec<RescuedArtifact>,
+    pub domains: Vec<RescuedArtifact>,
+    pub ips: Vec<RescuedArtifact>,
+}
+
+/// Build the rescue-probe SQL for one entity type.
+///
+/// Shape (executed OUTSIDE the paginated executor, so its `GROUP BY` cannot
+/// flip `is_aggregation_query` sniffing for the main query — the main query
+/// only ever receives literal IN-lists):
+///
+/// 1. innermost: DISTINCT lookup keys over the rule's own base scan (bounded
+///    by [`PREVALENCE_RESCUE_MISS_KEY_CAP`]), keeping only keys whose
+///    dict-masked lookup is the 9999 sentinel (miss OR out-of-window — the
+///    exact population the pushdown drops);
+/// 2. middle: the dict source query scoped to those keys — summary GROUP BY
+///    bounded by the IN-set;
+/// 3. outer: the dict source's `host_count < 1000` contract plus the NAN-364
+///    window mask on the FRESH `last_seen`, then rarest-first + capped so a
+///    broad rule's rescue set stays bounded.
+///
+/// `dictGetOrDefault` here re-reads the same cache the main query will read
+/// (poisoned negatives stay 9999 for their remaining LIFETIME), which is
+/// exactly what makes the probe find them; it also pre-warms uncached keys for
+/// the main query.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_prevalence_rescue_probe_sql(
+    base_sql_no_order: &str,
+    lookup_expr: &str,
+    dict_name: &str,
+    summary_table: &str,
+    summary_key_col: &str,
+    summary_host_count_col: &str,
+    window_cutoff_sql: &str,
+    // Extra summary predicate ANDed before the IN-clause (e.g. `is_private = 0`
+    // for the IP summary, mirroring the ip dict source's `WHERE is_private = 0`).
+    // Empty string for hash/domain. Must end with ` AND ` if non-empty.
+    extra_summary_filter: &str,
+) -> String {
+    // NAN-1723: the outer alias names MUST NOT be `first_seen`/`last_seen`.
+    // This probe's rows are read back through `execute_dynamic_query`, whose
+    // `convert_timestamps_to_iso8601` post-processor rewrites any field literally
+    // named `first_seen`/`last_seen` (among others) from CH's space format
+    // `YYYY-MM-DD HH:MM:SS.ffffff` into rfc3339 `…T…Z`. `RescueAttr::literal`
+    // then embeds the value into `toDateTime64('…', 6)`, which REJECTS the `T`/`Z`
+    // form → the whole rescued detection query fails (CANNOT_PARSE_TEXT). Aliasing
+    // to `fs_raw`/`ls_raw` (not in that normaliser's field list) keeps the space
+    // format intact so the literal parses. The INNER `min(first_seen)` /
+    // `max(last_seen)` below reference the summary table's real columns and stay.
+    format!(
+        r#"SELECT
+    artifact,
+    toUInt64(_hc) AS host_count,
+    toString(_fs) AS fs_raw,
+    toString(_ls) AS ls_raw,
+    toUInt64(_occ) AS total_occurrences
+FROM (
+    SELECT
+        {summary_key_col} AS artifact,
+        toUInt16(least(9998, uniqMerge({summary_host_count_col}))) AS _hc,
+        min(first_seen) AS _fs,
+        max(last_seen) AS _ls,
+        toUInt64(sum(total_count)) AS _occ
+    FROM {summary_table}
+    WHERE {extra_summary_filter}{summary_key_col} IN (
+        SELECT _k FROM (
+            SELECT DISTINCT {lookup_expr} AS _k FROM (
+                {base_sql_no_order}
+            )
+            LIMIT {miss_key_cap}
+        )
+        WHERE _k IS NOT NULL AND _k != ''
+          AND if(dictGetOrDefault('{dict_name}', 'last_seen', ifNull(_k, ''), toDateTime64(0, 6)) >= {window_cutoff_sql},
+                 dictGetOrDefault('{dict_name}', 'host_count', ifNull(_k, ''), toUInt16(9999)),
+                 toUInt16(9999)) = 9999
+    )
+    GROUP BY {summary_key_col}
+)
+WHERE _hc < {dict_cutoff} AND _ls >= {window_cutoff_sql}
+ORDER BY _hc ASC
+LIMIT {artifact_cap_plus_one}"#,
+        summary_key_col = summary_key_col,
+        summary_host_count_col = summary_host_count_col,
+        summary_table = summary_table,
+        extra_summary_filter = extra_summary_filter,
+        lookup_expr = lookup_expr,
+        base_sql_no_order = base_sql_no_order,
+        miss_key_cap = PREVALENCE_RESCUE_MISS_KEY_CAP,
+        dict_name = dict_name,
+        window_cutoff_sql = window_cutoff_sql,
+        dict_cutoff = PREVALENCE_DICT_HOST_COUNT_CUTOFF,
+        // Rarest-first, capped IN-SQL so a broad rule's rescue set (Saturn: 6k+
+        // rare IPs in a 1h `*|` window) can't blow past the artifact cap — and
+        // the RAREST (most likely brand-new-malicious) win the slots, not
+        // arbitrary ones. `+ 1` so `filter_rescued_artifacts` can SEE the
+        // overflow and WARN (it truncates back to the cap), rather than the LIMIT
+        // silently hiding that artifacts were dropped.
+        artifact_cap_plus_one = PREVALENCE_RESCUE_MAX_ARTIFACTS + 1,
+    )
+}
+
+/// NAN-1705 (D4b, residual #2): detect the `enrich=true | where <decorated> ...`
+/// pattern that has the full blind spot but no `| prevalence` count condition to
+/// drive the rescue, and derive the host_count threshold to bound the rescue set.
+///
+/// The `enrich=true` decoration exposes `host_count` / `is_rare` /
+/// `prevalence_score` (all CASE expressions over `least(_dp, _ip, _hp)`). A
+/// brand-new dict-blind row reads `least(9999,9999,9999)=9999`, so:
+///   - `| where host_count < N` (or `<= N`, `= N`) → `9999 < N` false → DROPPED;
+///   - `| where is_rare` / `is_rare = true` → CASE returns false → DROPPED.
+/// Both silently lose the exact artifact the rule hunts.
+///
+/// Returns the count threshold to rescue up to (rescue artifacts whose real
+/// count `<= threshold`, a superset — the in-SQL `| where` does the exact
+/// filtering once the alias is transform-corrected). `None` ⇒ no such filter, so
+/// NO probe runs and pure-decorate `enrich=true` stays byte-identical.
+///
+/// Deliberately NOT triggered by:
+///   - `prevalence_score < X`: a masked row scores 0, and `0 < X` is TRUE, so the
+///     row is KEPT (wrong score, not dropped) — no drop-bug, out of scope here;
+///   - common-direction filters (`host_count > N`, `is_rare = false`): a masked
+///     row passes those, a different (false-positive) bug, not this one.
+pub(crate) fn decorated_filter_rescue_threshold(
+    post_prevalence_commands: &[crate::query::Command],
+    rarity_threshold: u64,
+) -> Option<u64> {
+    use crate::query::{Command, Comparator, SearchExpr, Value};
+
+    // Walk a WHERE expression, collecting rescue thresholds from rare-direction
+    // filters on decorated prevalence columns. AND/OR/Group are transparent —
+    // rescuing a superset is safe, the in-SQL predicate filters exactly. `Not`
+    // is OPAQUE (audit D4b, codex): it inverts the rare/common direction, so
+    // descending into it would both fire spuriously on common-direction
+    // negations (`NOT(host_count < N)` ⇒ `host_count >= N`, a masked row *passes*
+    // — no drop-bug) and mis-handle rare-direction ones. Skipping `Not` keeps
+    // the common-direction case byte-identical (no spurious probe). The
+    // contrived rare-via-`Not` forms (`NOT(is_rare = false)`,
+    // `NOT(host_count >= N)`) simply aren't rescued — write the un-negated form
+    // (`is_rare`, `host_count < N`), which is fully covered.
+    fn collect(expr: &SearchExpr, rarity_threshold: u64, out: &mut Vec<u64>) {
+        match expr {
+            SearchExpr::FieldFilter { field, op, value } => {
+                match field.as_str() {
+                    "host_count" => {
+                        if matches!(op, Comparator::Lt | Comparator::Lte | Comparator::Eq) {
+                            if let Value::Number(n) = value {
+                                if *n >= 0.0 {
+                                    // `< N` needs artifacts up to N-1; `<= N` / `= N` up to N.
+                                    // Use ceil(N) as an inclusive upper bound (superset-safe).
+                                    out.push(n.ceil() as u64);
+                                }
+                            }
+                        }
+                    }
+                    "is_rare" => {
+                        let truthy = match value {
+                            Value::Bool(b) => *b,
+                            Value::Number(n) => *n != 0.0,
+                            Value::String(s) => {
+                                let l = s.to_lowercase();
+                                l == "true" || l == "1"
+                            }
+                            _ => false,
+                        };
+                        // is_rare = host_count < rarity_threshold, so rescue up to
+                        // rarity_threshold - 1 (inclusive bound rarity_threshold-1).
+                        if truthy && matches!(op, Comparator::Eq) {
+                            out.push(rarity_threshold.saturating_sub(1).max(1));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            SearchExpr::And(a, b) | SearchExpr::Or(a, b) => {
+                collect(a, rarity_threshold, out);
+                collect(b, rarity_threshold, out);
+            }
+            SearchExpr::Group(inner) => collect(inner, rarity_threshold, out),
+            // `Not` is opaque — see the direction-inversion note above.
+            SearchExpr::Not(_) => {}
+            _ => {}
+        }
+    }
+
+    let mut thresholds: Vec<u64> = Vec::new();
+    for cmd in post_prevalence_commands {
+        if let Command::Where { condition } = cmd {
+            collect(condition, rarity_threshold, &mut thresholds);
+        }
+    }
+    // Rescue the SUPERSET covering the loosest filter (the in-SQL WHERE narrows
+    // per-condition), so the transform arrays stay minimal yet complete.
+    thresholds.into_iter().max()
+}
+
+/// Parse probe rows (JSONEachRow via `execute_dynamic_query`) and keep only
+/// artifacts whose FRESH host_count satisfies EVERY count condition of the
+/// probe's entity type — the same `prevalence_passes_filter` the in-memory
+/// path uses, so pushdown and fallback can't diverge on operator semantics.
+/// Caps the output at [`PREVALENCE_RESCUE_MAX_ARTIFACTS`].
+pub(crate) fn filter_rescued_artifacts(
+    rows: Vec<serde_json::Value>,
+    conditions: &[&crate::query::PrevalenceCondition],
+) -> Vec<RescuedArtifact> {
+    use crate::query::PrevalenceThreshold;
+
+    // Tolerant u64 extraction: CH JSON formats may quote 64-bit integers
+    // (output_format_json_quote_64bit_integers) depending on server config.
+    fn get_u64(row: &serde_json::Value, key: &str) -> Option<u64> {
+        match row.get(key)? {
+            serde_json::Value::Number(n) => n.as_u64(),
+            serde_json::Value::String(s) => s.parse().ok(),
+            _ => None,
+        }
+    }
+
+    let mut rescued: Vec<RescuedArtifact> = Vec::new();
+    for row in rows {
+        let Some(artifact) = row.get("artifact").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(host_count) = get_u64(&row, "host_count") else {
+            continue;
+        };
+        let passes_all = conditions.iter().all(|cond| {
+            let PrevalenceThreshold::Count(n) = cond.threshold else {
+                // Non-count conditions never push down (prevalence_filter_condition_to_sql
+                // returns None), so the rescue must not enforce them either.
+                return true;
+            };
+            prevalence_passes_filter(Some(host_count), &cond.operator, n)
+        });
+        if !passes_all {
+            continue;
+        }
+        if rescued.len() >= PREVALENCE_RESCUE_MAX_ARTIFACTS {
+            tracing::warn!(
+                cap = PREVALENCE_RESCUE_MAX_ARTIFACTS,
+                "prevalence rescue: rescued-artifact cap hit; remaining dict-blind artifacts are not rescued this cycle"
+            );
+            break;
+        }
+        rescued.push(RescuedArtifact {
+            artifact: artifact.to_string(),
+            host_count,
+            // NAN-1723: read `fs_raw`/`ls_raw`, NOT `first_seen`/`last_seen` —
+            // the probe deliberately aliases them away from the names that
+            // `execute_dynamic_query`'s timestamp normaliser would rewrite to
+            // rfc3339 (which `toDateTime64` then rejects). See the probe SQL.
+            first_seen: row
+                .get("fs_raw")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            last_seen: row
+                .get("ls_raw")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            total_occurrences: get_u64(&row, "total_occurrences").unwrap_or(0),
+        });
+    }
+    rescued
+}
+
+/// Which fresh summary attribute a base_logs projection alias carries, so
+/// [`rescue_transform_sql`] emits a type-matching `transform(...)` `to_array`
+/// (element type must share a supertype with the dict-default it replaces).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RescueAttr {
+    /// `_*_host_count` — `UInt16` (dict default `toUInt16(9999)`).
+    HostCount,
+    /// `_*_first_seen` / `_*_last_seen` — `DateTime64(6)` (default `toDateTime64(0, 6)`).
+    FirstSeen,
+    LastSeen,
+    /// `_*_total_occurrences` — `UInt64` (default `toUInt64(0)`).
+    TotalOccurrences,
+}
+
+impl RescueAttr {
+    /// Render one rescued artifact's value for this attribute as a CH literal
+    /// with the exact type the wrapped dict default produces.
+    fn literal(self, r: &RescuedArtifact) -> String {
+        match self {
+            // `host_count < 1000` by construction, so `toUInt16` never truncates.
+            RescueAttr::HostCount => format!("toUInt16({})", r.host_count),
+            RescueAttr::FirstSeen => format!(
+                "toDateTime64('{}', 6)",
+                crate::sql_hygiene::escape_sql_string(&r.first_seen)
+            ),
+            RescueAttr::LastSeen => format!(
+                "toDateTime64('{}', 6)",
+                crate::sql_hygiene::escape_sql_string(&r.last_seen)
+            ),
+            RescueAttr::TotalOccurrences => format!("toUInt64({})", r.total_occurrences),
+        }
+    }
+}
+
+/// Wrap a base_logs dict projection so NAN-1705 rescued keys resolve to their
+/// FRESH value in-SQL.
+///
+/// `rescued` empty → `base_expr` is returned **unchanged** (byte-identical to
+/// the pre-NAN-1705 projection, so an empty rescue leaves the whole generated
+/// query byte-for-byte identical). Otherwise emits
+/// `transform(<transform_key>, ['k1',…], [v1,…], <base_expr>)`:
+///
+/// - `transform_key` is the row's lookup key (`ifNull(_hash_lookup, '')` etc.);
+///   a rescued key resolves to its fresh value, any other key falls through to
+///   `base_expr` (the original dict-with-window-mask lookup), and an
+///   empty/NULL key can never match a rescued (non-empty) key → default.
+/// - the `to_array` is bounded by `rescued` (≤ [`PREVALENCE_RESCUE_MAX_ARTIFACTS`]),
+///   so no OOM and the emitted literal stays small.
+///
+/// Because the ALIAS itself now carries the truth, the pushed predicate
+/// (`{alias} < 9999 AND {alias} op N`), the decoration CASEs, AND any
+/// downstream `| where host_count < N` all see the rescued host_count in
+/// ClickHouse — no OR-branch and no post-query patch needed (NAN-1705 D4b, the
+/// downstream-decoration gap).
+pub(crate) fn rescue_transform_sql(
+    base_expr: &str,
+    transform_key: &str,
+    rescued: &[RescuedArtifact],
+    attr: RescueAttr,
+) -> String {
+    if rescued.is_empty() {
+        return base_expr.to_string();
+    }
+    let keys = rescued
+        .iter()
+        .map(|r| format!("'{}'", crate::sql_hygiene::escape_sql_string(&r.artifact)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let vals = rescued
+        .iter()
+        .map(|r| attr.literal(r))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("transform({transform_key}, [{keys}], [{vals}], {base_expr})")
 }
 
 #[cfg(test)]

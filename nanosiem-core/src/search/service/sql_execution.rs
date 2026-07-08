@@ -125,13 +125,37 @@ impl SearchService {
                 3
             };
             let tr = TimeRange::new(time_range.start, time_range.end);
-            let (sql, _num_pushed) = self.generate_prevalence_pushdown_sql(
+            // NAN-1705: explain is SQL-only (no CH execution), so it renders the
+            // pushdown WITHOUT the runtime rescue probe (empty rescue → the base
+            // dict projections, byte-identical to the pre-rescue form). At execute
+            // time a non-empty rescue only rewrites the `_hp/_dp/_ip_host_count`
+            // projection aliases via `transform(...)`; the note keeps "Inspect
+            // SQL" honest about that delta.
+            let (mut sql, _num_pushed) = self.generate_prevalence_pushdown_sql(
                 &parsed,
                 &prevalence_commands,
                 &post_prevalence.commands,
                 &tr,
                 rarity_threshold,
+                &crate::search::service::prevalence_processing::PrevalenceRescue::default(),
             )?;
+            // The rescue runs at execute time when there's a hash/domain count
+            // condition OR (residual #2) an `enrich=true | where host_count < N`
+            // / `| where is_rare` decorated filter.
+            let has_count_conditions = prevalence_commands
+                .iter()
+                .any(|cmd| cmd.conditions.iter().any(|c| c.field.is_count_field()));
+            let enrich_decorated_filter = prevalence_commands.iter().any(|cmd| cmd.enrich)
+                && crate::search::service::prevalence_processing::decorated_filter_rescue_threshold(
+                    &post_prevalence.commands,
+                    rarity_threshold,
+                )
+                .is_some();
+            if has_count_conditions || enrich_decorated_filter {
+                sql.push_str(
+                    "\n\n-- Note: at execute time, artifacts the prevalence dict cannot resolve (brand-new,\n-- inside the dict cache LIFETIME) are re-verified against *_prevalence_summary and, if rare,\n-- their _hp/_dp/_ip_host_count projection is transform()-rewritten to the fresh count so the\n-- filter and every decoration/`| where host_count` see the truth in-SQL (NAN-1705). The IP\n-- dimension is rescued only for the enrich+decorated-filter form; broad rules are bounded\n-- (miss-key cap) and rarest-capped with a WARN on overflow.",
+                );
+            }
             return Ok(sql);
         }
 

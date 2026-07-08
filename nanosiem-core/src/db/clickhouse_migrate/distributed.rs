@@ -6,19 +6,15 @@ use super::{ClickHouseMigrateError, ClickHouseMigrator};
 
 impl ClickHouseMigrator {
     /// Tables that need Distributed wrappers for cross-shard queries.
-    pub(super) const DISTRIBUTED_TABLES: &'static [&'static str] = &[
-        "logs",
-        "signals",
-        "domain_prevalence_agg",
-        "hash_prevalence_agg",
-        "ip_prevalence_agg",
-        "entity_time_range_agg",
-        "cloud_user_activity_agg",
-        "ingestion_errors",
-        "custom_enrichment_results",
-        "identity_observations",
-        "logs_per_source_5m",
-    ];
+    ///
+    /// NAN-1728 (L-5/D9): re-exports the **single canonical list** in
+    /// `crate::db::dual_pool::DISTRIBUTED_TABLES` so the reconciler's wrapper set
+    /// and the read-routing set (`TableNames`) can never drift — they are the
+    /// same slice. See that definition for the reference-table rationale
+    /// (`custom_enrichment_results` etc. are deliberately absent — cluster-wide
+    /// replicated) and the prevalence-summary additions.
+    pub(super) const DISTRIBUTED_TABLES: &'static [&'static str] =
+        crate::db::dual_pool::DISTRIBUTED_TABLES;
 
     /// ALIAS / MATERIALIZED columns that must be re-applied to Distributed
     /// wrappers after they've been added to the underlying local table.
@@ -46,12 +42,28 @@ impl ClickHouseMigrator {
             None => return Ok(0), // Not a cluster, nothing to do
         };
 
+        // M-9: gate ON CLUSTER exactly like the sibling reconcile fns — a
+        // Replicated database (cluster == db) auto-propagates the CREATE, so no
+        // explicit clause; an operator-managed explicit cluster needs it to fan
+        // the DDL out. (Previously this always emitted ON CLUSTER, diverging from
+        // its siblings.)
+        let on_cluster = if cluster_name == self.database {
+            String::new()
+        } else {
+            format!(" ON CLUSTER '{}'", cluster_name)
+        };
+
         let mut created = 0;
 
         for table in Self::DISTRIBUTED_TABLES {
             let dist_name = format!("{}_distributed", table);
 
-            // Check if distributed table already exists
+            // Check if distributed table already exists. NOTE: this is a
+            // create-if-missing path only — it never rewrites an existing
+            // wrapper. A wrapper whose sharding key is stale (e.g. the old
+            // `rand()` before NAN-1728) is repaired by
+            // `reconcile_distributed_columns`, which drops+recreates on
+            // sharding-key or type drift. CREATE IF NOT EXISTS here can't do that.
             let exists: u64 = self
                 .client
                 .query(&format!(
@@ -86,19 +98,23 @@ impl ClickHouseMigrator {
                 continue;
             }
 
-            let sql = format!(
-                "CREATE TABLE IF NOT EXISTS {db}.{dist} ON CLUSTER '{cluster}' \
-                 AS {db}.{table} \
-                 ENGINE = Distributed('{cluster}', '{db}', '{table}', rand())",
-                db = self.database,
-                dist = dist_name,
-                cluster = cluster_name,
-                table = table,
+            let sql = Self::distributed_create_sql(
+                &self.database,
+                &dist_name,
+                &on_cluster,
+                &cluster_name,
+                table,
+                sharding_key_for(table),
             );
 
             match self.client.query(&sql).execute().await {
                 Ok(_) => {
-                    tracing::info!("Created distributed table {}.{}", self.database, dist_name);
+                    tracing::info!(
+                        "Created distributed table {}.{} (sharding key {})",
+                        self.database,
+                        dist_name,
+                        sharding_key_for(table)
+                    );
                     created += 1;
                 }
                 Err(e) => {
@@ -116,6 +132,32 @@ impl ClickHouseMigrator {
             tracing::info!("Created {} distributed table(s)", created);
         }
         Ok(created)
+    }
+
+    /// Build the `CREATE TABLE ... AS <source> ENGINE = Distributed(...)`
+    /// statement for a wrapper. Shared by `ensure_distributed_tables` (initial
+    /// create) and `reconcile_distributed_columns` (drift recreate) so both use
+    /// the same sharding key + ON CLUSTER form. The Distributed engine's first
+    /// arg is the cluster name regardless of ON CLUSTER gating.
+    fn distributed_create_sql(
+        db: &str,
+        dist_name: &str,
+        on_cluster: &str,
+        cluster_name: &str,
+        table: &str,
+        sharding_key: &str,
+    ) -> String {
+        format!(
+            "CREATE TABLE IF NOT EXISTS {db}.{dist}{on_cluster} \
+             AS {db}.{table} \
+             ENGINE = Distributed('{cluster}', '{db}', '{table}', {key})",
+            db = db,
+            dist = dist_name,
+            on_cluster = on_cluster,
+            cluster = cluster_name,
+            table = table,
+            key = sharding_key,
+        )
     }
 
     /// Sync ALIAS / MATERIALIZED columns from local tables onto their existing
@@ -281,19 +323,22 @@ impl ClickHouseMigrator {
 
             // Wrapper must exist (created by ensure_distributed_tables in
             // cluster mode). `"table"` is quoted because it shadows the
-            // system.columns.table column otherwise.
-            let dist_cols: Vec<String> = self
+            // system.columns.table column otherwise. Full specs so we can detect
+            // TYPE drift on columns present in both (M-1/D4).
+            let dist_specs: Vec<(String, String, String, String)> = self
                 .client
                 .query(&format!(
-                    "SELECT name FROM system.columns WHERE database = '{}' AND \"table\" = '{}'",
+                    "SELECT name, type, default_kind, default_expression \
+                     FROM system.columns WHERE database = '{}' AND \"table\" = '{}'",
                     self.database, dist_name
                 ))
-                .fetch_all::<String>()
+                .fetch_all()
                 .await
                 .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?;
-            if dist_cols.is_empty() {
+            if dist_specs.is_empty() {
                 continue;
             }
+            let dist_cols: Vec<String> = dist_specs.iter().map(|(n, ..)| n.clone()).collect();
 
             // Full source specs so a missing column can be re-added with its
             // exact definition (type + DEFAULT/MATERIALIZED/ALIAS expression).
@@ -310,6 +355,103 @@ impl ClickHouseMigrator {
             // A missing/empty source is not a signal to touch the wrapper —
             // skip rather than strip every column.
             if source_specs.is_empty() {
+                continue;
+            }
+
+            // ── Drift repair: DROP + recreate the wrapper (M-1/D4 + C4/W2) ──
+            // Wrappers are metadata-only, so a recreate is cheap and, because it
+            // re-runs `CREATE ... AS source`, it also propagates local-table
+            // TYPE MODIFYs (e.g. migration 127's `ocsf_logs.timestamp` retype)
+            // that plain ADD/DROP-COLUMN can't. Two triggers:
+            //   1. Sharding-key drift — the migration that first added the
+            //      content-hash key can't rewrite an existing wrapper via CREATE
+            //      IF NOT EXISTS, so an old `rand()` wrapper is repaired here
+            //      (C4/W2: retries must land on the same shard for block dedup).
+            //   2. TYPE drift on a column present in both — the wrapper would
+            //      deserialize shard data with the wrong type. (Only TYPE, not
+            //      DEFAULT/MATERIALIZED/ALIAS expressions: the wrapper merely
+            //      forwards those columns — the expression is evaluated on the
+            //      local source — so its own stored expression is not
+            //      query-relevant, and comparing it would risk a recreate loop if
+            //      `AS source` normalizes expressions differently.)
+            // Presence-only differences are left to the idempotent ADD/DROP path
+            // below (recreating for those would churn the ALIAS re-add every run).
+            let intended_key = sharding_key_for(table);
+            let wrapper_create: Option<String> = self
+                .client
+                .query(&format!(
+                    "SELECT create_table_query FROM system.tables \
+                     WHERE database = '{}' AND name = '{}'",
+                    self.database, dist_name
+                ))
+                .fetch_all::<String>()
+                .await
+                .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?
+                .into_iter()
+                .next();
+
+            let key_drift = wrapper_create
+                .as_deref()
+                .map(|cq| !wrapper_sharding_key_matches(cq, intended_key))
+                .unwrap_or(false);
+            let type_drift = columns_type_drift(&dist_specs, &source_specs);
+
+            if key_drift || type_drift {
+                let drop_sql = format!(
+                    "DROP TABLE IF EXISTS {db}.{dist}{on_cluster}{sync}",
+                    db = self.database,
+                    dist = dist_name,
+                    on_cluster = on_cluster,
+                    // SYNC only meaningful/valid with ON CLUSTER; ensures every
+                    // node's wrapper is gone before we recreate.
+                    sync = if on_cluster.is_empty() { "" } else { " SYNC" },
+                );
+                let create_sql = Self::distributed_create_sql(
+                    &self.database,
+                    &dist_name,
+                    &on_cluster,
+                    &cluster_name,
+                    table,
+                    intended_key,
+                );
+                let drop_res = self
+                    .client
+                    .query(&drop_sql)
+                    .execute()
+                    .await
+                    .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()));
+                let recreate_res = match drop_res {
+                    Ok(_) => self
+                        .client
+                        .query(&create_sql)
+                        .execute()
+                        .await
+                        .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string())),
+                    Err(e) => Err(e),
+                };
+                match recreate_res {
+                    Ok(_) => {
+                        tracing::info!(
+                            "Recreated distributed wrapper {}.{} (key_drift={}, type_drift={}, sharding key {})",
+                            self.database,
+                            dist_name,
+                            key_drift,
+                            type_drift,
+                            intended_key
+                        );
+                        changed += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to recreate distributed wrapper {}.{}: {}",
+                            self.database,
+                            dist_name,
+                            e
+                        );
+                    }
+                }
+                // Fresh wrapper is already fully in sync with the source; skip
+                // the ADD/DROP passes for this table.
                 continue;
             }
 
@@ -414,6 +556,189 @@ impl ClickHouseMigrator {
         }
         Ok(changed)
     }
+
+    /// Dictionary-refresh MVs whose FROM base reference table must be repointed
+    /// to its `_distributed` wrapper on a cluster (NAN-1728 C2), keyed
+    /// `(mv_name, base_table)`.
+    ///
+    /// `init.sql` creates these five refreshable MVs reading the LOCAL base
+    /// table. That is mandatory: refreshable-MV DDL validates its FROM source
+    /// EAGERLY (unlike `CREATE OR REPLACE DICTIONARY`, which defers binding), and
+    /// the `<base>_distributed` wrapper does not exist until
+    /// `ensure_distributed_tables` runs — which is AFTER `run_init_sql` /
+    /// `run_migrations`. Reading the wrapper at init time would abort cluster boot
+    /// with `UNKNOWN_TABLE`.
+    const DICT_REFRESH_MV_BASES: &'static [(&'static str, &'static str)] = &[
+        ("ip_enrichment_dict_refresh", "ip_enrichments"),
+        ("ioc_enrichment_dict_refresh", "custom_enrichment_results"),
+        ("custom_enrichment_dict_refresh", "custom_enrichment_results"),
+        ("custom_ioc_enrichment_dict_refresh", "custom_enrichment_results"),
+        ("user_registry_dict_refresh", "user_registry"),
+        // NAN-1732 (P2-D): prevalence finalized-host_count refresh MVs. Their FROM
+        // (and the two-step `GLOBAL IN` recent-keys subquery — repoint_from_table
+        // rewrites EVERY base reference) reads the *_prevalence_summary_distributed
+        // wrapper on clusters so uniqMerge fans in the global count; single-node
+        // keeps the local summary. See clickhouse/160_prevalence_finalized_host_count.sql.
+        ("hash_prevalence_final_refresh", "hash_prevalence_summary"),
+        ("domain_prevalence_final_refresh", "domain_prevalence_summary"),
+        ("ip_prevalence_final_refresh", "ip_prevalence_summary"),
+    ];
+
+    /// Repoint the dict-refresh MVs' FROM at the reference-table `_distributed`
+    /// wrappers, AFTER `ensure_distributed_tables` has created them (NAN-1728 C2 /
+    /// P0). This is the second half of the split that keeps cluster boot working:
+    /// init.sql creates the MVs reading the LOCAL base (so the eager FROM
+    /// validation passes at init time), and this step swaps the FROM to the
+    /// wrapper once it exists so each per-node staging dict sees the COMPLETE
+    /// cross-shard keyspace (otherwise the per-node dicts silently miss IOCs /
+    /// blank `enriched_*` / `user_identity_*` on ~2/3 of rows).
+    ///
+    /// Cluster-only: on single-node (`detect_cluster() == None`) it is a no-op —
+    /// the MVs keep reading the local base (already complete on one shard) and NO
+    /// `_distributed` object is ever created or referenced. Idempotent: the body
+    /// is read live from `system.tables.as_select` and only rewritten when it
+    /// still references the bare local base, so it is safe to run every boot and
+    /// re-applies after a drift-repair wrapper recreate. Because the body is taken
+    /// verbatim from the deployed MV (which came from init.sql) and only the FROM
+    /// table is swapped, the dedup projection can never drift from init.sql.
+    /// Non-fatal per MV.
+    pub async fn repoint_dict_refresh_mvs_distributed(
+        &mut self,
+    ) -> Result<usize, ClickHouseMigrateError> {
+        debug_assert!(
+            is_safe_identifier(&self.database),
+            "CLICKHOUSE_DATABASE must be a plain identifier, got: {}",
+            self.database
+        );
+
+        let cluster_name = match self.detect_cluster().await? {
+            Some(name) => name,
+            None => return Ok(0),
+        };
+
+        // Same ON CLUSTER gating as the sibling reconcile fns (M-9): a Replicated
+        // database auto-propagates DDL; an explicit cluster needs the clause to
+        // fan the MODIFY QUERY out to every node's MV.
+        let on_cluster = if cluster_name == self.database {
+            String::new()
+        } else {
+            format!(" ON CLUSTER '{}'", cluster_name)
+        };
+
+        let mut repointed = 0;
+        for (mv, base) in Self::DICT_REFRESH_MV_BASES {
+            // The MV's current SELECT body, straight from ClickHouse's catalog.
+            // `as_select` is the canonical query text CH will accept back verbatim
+            // via MODIFY QUERY (which takes the SELECT directly — no `AS`, NAN-1727).
+            let body: Option<String> = self
+                .client
+                .query(&format!(
+                    "SELECT as_select FROM system.tables WHERE database = '{}' AND name = '{}'",
+                    self.database, mv
+                ))
+                .fetch_all::<String>()
+                .await
+                .map_err(|e| ClickHouseMigrateError::ClickHouse(e.to_string()))?
+                .into_iter()
+                .next();
+
+            let Some(body) = body else {
+                tracing::debug!(
+                    "dict-refresh MV {}.{} not present — skipping repoint",
+                    self.database,
+                    mv
+                );
+                continue;
+            };
+            if body.trim().is_empty() {
+                continue;
+            }
+
+            let Some(new_body) = repoint_from_table(&body, &self.database, base) else {
+                // Already reads the wrapper (idempotent) or has no bare base ref.
+                continue;
+            };
+
+            let sql = format!(
+                "ALTER TABLE {db}.{mv}{on_cluster} MODIFY QUERY {query}",
+                db = self.database,
+                mv = mv,
+                on_cluster = on_cluster,
+                query = new_body,
+            );
+            match self.client.query(&sql).execute().await {
+                Ok(_) => {
+                    tracing::info!(
+                        "Repointed dict-refresh MV {}.{} FROM {} -> {}_distributed",
+                        self.database,
+                        mv,
+                        base,
+                        base
+                    );
+                    repointed += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to repoint dict-refresh MV {}.{} to {}_distributed: {}",
+                        self.database,
+                        mv,
+                        base,
+                        e
+                    );
+                }
+            }
+        }
+
+        if repointed > 0 {
+            tracing::info!(
+                "Repointed {} dict-refresh MV(s) to _distributed reference-table wrappers",
+                repointed
+            );
+        }
+        Ok(repointed)
+    }
+}
+
+/// Swap a `FROM <db>.<base>` reference in an MV SELECT body to
+/// `<db>.<base>_distributed`, boundary-aware so it never matches the
+/// already-suffixed `<db>.<base>_distributed`, nor a longer identifier that
+/// merely starts with the base name. Returns `None` when the body already
+/// references the wrapper (idempotent no-op) or contains no bare reference to the
+/// base table — in both cases no MODIFY QUERY is issued.
+///
+/// Split out so the rewrite is unit-testable without a live cluster.
+pub(super) fn repoint_from_table(body: &str, db: &str, base: &str) -> Option<String> {
+    let needle = format!("{}.{}", db, base);
+    let wrapper = format!("{}.{}_distributed", db, base);
+    if body.contains(&wrapper) {
+        return None; // already repointed
+    }
+    let nb = needle.as_bytes();
+    let bytes = body.as_bytes();
+    let mut out = String::with_capacity(body.len() + 16);
+    let mut i = 0;
+    let mut replaced = false;
+    while i < body.len() {
+        if body[i..].starts_with(&needle) {
+            let after = bytes.get(i + nb.len()).copied();
+            let is_ident =
+                matches!(after, Some(c) if c.is_ascii_alphanumeric() || c == b'_');
+            if !is_ident {
+                out.push_str(&wrapper);
+                i += nb.len();
+                replaced = true;
+                continue;
+            }
+        }
+        let ch = body[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    if replaced {
+        Some(out)
+    } else {
+        None
+    }
 }
 
 /// Columns present on the Distributed wrapper but absent from its source table.
@@ -468,6 +793,85 @@ pub(super) fn build_add_column_clause(
         "ALIAS" => format!("{name} {typ} ALIAS {default_expr}"),
         _ => format!("{name} {typ}"),
     }
+}
+
+/// The Distributed-wrapper sharding key for `table` (NAN-1728 C4/W2).
+///
+/// The sharding key is evaluated per row only for INSERTs routed **through** the
+/// `_distributed` wrapper; it does not affect reads. It matters because a
+/// committed insert whose HTTP ACK times out is retried on a fresh LB'd
+/// connection: with `rand()` the retry scatters to a different shard where
+/// ClickHouse's per-shard block dedup can't see the original, so the whole batch
+/// duplicates. A **content hash of a stable row id** makes the retry deterministic
+/// — it lands on the same shard, and block dedup suppresses it.
+///
+///   - `logs` / `ocsf_logs` / `signals` / `ingestion_errors`: have a stable `id`
+///     UUID column → `cityHash64(id)`. (logs/ocsf_logs are the real write-through
+///     lanes — audit durable clone, detection findings, and, post-Phase-3, the
+///     Vector sink. signals/ingestion_errors get it for free since they carry an
+///     id and it's strictly better than rand() if ever written through a wrapper.)
+///   - `otel_spans` / `otel_spans_trace_id_ts`: colocate a whole trace on one
+///     shard by `trace_id` → `cityHash64(trace_id)` (no per-row `id`; trace_id is
+///     the natural affinity key for trace-assembly reads).
+///   - Everything else — the MV-fed aggregate/rollup targets (all `*_prevalence_*`,
+///     `entity_time_range_agg`, `cloud_user_activity_agg`, `logs_per_source_5m`,
+///     `identity_observations`, `otel_metrics{,_1m,_1h}`, `otel_service_red_1m`)
+///     and the `synthetic_check_results` sample stream — is written to the LOCAL
+///     table (by a materialized view or a single-writer scheduler), never through
+///     the wrapper, so the wrapper's sharding key is never exercised. Keep
+///     `rand()`; there is no cross-connection retry-dedup hazard to defend.
+pub(super) fn sharding_key_for(table: &str) -> &'static str {
+    match table {
+        "logs" | "ocsf_logs" | "signals" | "ingestion_errors" => "cityHash64(id)",
+        "otel_spans" | "otel_spans_trace_id_ts" => "cityHash64(trace_id)",
+        _ => "rand()",
+    }
+}
+
+/// True when the existing wrapper's `create_table_query` already uses
+/// `intended_key` as its Distributed sharding key. Whitespace- and
+/// case-insensitive; scoped to the `Distributed(...)` engine args so a column
+/// name can't accidentally match. Returns `false` (→ recreate) when the create
+/// query can't be parsed as a Distributed table, which is the safe default.
+///
+/// Split out so the parse is unit-testable without a live cluster.
+pub(super) fn wrapper_sharding_key_matches(create_query: &str, intended_key: &str) -> bool {
+    let cq_lower = create_query.to_lowercase();
+    let Some(idx) = cq_lower.find("distributed(") else {
+        return false;
+    };
+    let args = &cq_lower[idx + "distributed(".len()..];
+    let norm_args: String = args.chars().filter(|c| !c.is_whitespace()).collect();
+    let norm_key: String = intended_key
+        .to_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    // The sharding key is the 4th positional arg — always preceded by the
+    // comma after the `'table'` arg. Matching `,<key>` avoids matching a prefix
+    // of a longer expression.
+    norm_args.contains(&format!(",{}", norm_key))
+}
+
+/// True when any column present on BOTH the wrapper and its source has a
+/// differing `type` (M-1/D4). Only TYPE is compared — DEFAULT/MATERIALIZED/ALIAS
+/// expressions are intentionally ignored (the wrapper forwards the column; the
+/// expression is evaluated on the source, so the wrapper's stored expression is
+/// not query-relevant and comparing it risks a recreate loop). Columns present
+/// on only one side are handled by the idempotent ADD/DROP path, not here.
+///
+/// Split out so the diff is unit-testable without a live cluster.
+pub(super) fn columns_type_drift(
+    wrapper_specs: &[(String, String, String, String)],
+    source_specs: &[(String, String, String, String)],
+) -> bool {
+    let src: std::collections::HashMap<&str, &str> = source_specs
+        .iter()
+        .map(|(n, t, ..)| (n.as_str(), t.as_str()))
+        .collect();
+    wrapper_specs
+        .iter()
+        .any(|(n, t, ..)| matches!(src.get(n.as_str()), Some(&st) if st != t.as_str()))
 }
 
 /// True when `s` is a plain ClickHouse identifier (alphanumeric + `_`,

@@ -192,6 +192,34 @@ impl Dataset {
     }
 }
 
+/// Fully-qualified READ table name, routed to the `_distributed` wrapper on
+/// clustered deployments (mirrors [`DualPool::TableNames::read`]). Local
+/// otherwise. `is_clustered=false` is byte-identical to the pre-NAN-1721 literal
+/// `nanosiem.<base>`, so the single-shard path (local/Saturn) is unchanged.
+///
+/// [`DualPool::TableNames::read`]: crate::db::dual_pool::TableNames::read
+fn otel_read_table(base: &str, is_clustered: bool) -> String {
+    if is_clustered {
+        format!("nanosiem.{base}_distributed")
+    } else {
+        format!("nanosiem.{base}")
+    }
+}
+
+/// Bare (no `nanosiem.` prefix) routed READ table name for a table-qualified
+/// column reference (`{tbl}.col`) in a builder whose FROM is [`otel_read_table`].
+/// On a cluster the FROM becomes `nanosiem.<base>_distributed`, so its column
+/// qualifier must be `<base>_distributed` — the bare `<base>` no longer names any
+/// table in scope and would fail to resolve. `is_clustered=false` returns the
+/// plain `<base>`, keeping the emitted qualifier byte-identical.
+fn otel_read_table_ref(base: &str, is_clustered: bool) -> String {
+    if is_clustered {
+        format!("{base}_distributed")
+    } else {
+        base.to_string()
+    }
+}
+
 /// SQL to fetch every span of one trace, time-ordered.
 ///
 /// Two-step, partition-pruned (NAN-1528):
@@ -207,22 +235,29 @@ impl Dataset {
 /// daily partitions instead of scanning the whole table for the `trace_id`
 /// bloom. The `trace_id` is escaped (single-quote/backslash) and lowercased to
 /// match the ingest-lowercased hex stored in the column.
-pub fn trace_by_id_sql(trace_id: &str) -> String {
+///
+/// The `LIMIT 100001` is deliberately one past the 100k display cap (NAN-1721
+/// O41): the handler detects truncation by the presence of the 100001st row,
+/// sets `truncated` on the response, and trims back to 100000 — otherwise a
+/// giant trace silently loses spans with no indication.
+pub fn trace_by_id_sql(trace_id: &str, is_clustered: bool) -> String {
     let id = escape_string(&trace_id.to_ascii_lowercase());
+    let idx_table = otel_read_table("otel_spans_trace_id_ts", is_clustered);
+    let spans = otel_read_table("otel_spans", is_clustered);
     format!(
         "WITH bounds AS (\n  \
            SELECT min(start) AS w_start, max(end) AS w_end\n  \
-           FROM nanosiem.otel_spans_trace_id_ts\n  \
+           FROM {idx_table}\n  \
            WHERE trace_id = '{id}'\n\
          )\n\
          SELECT trace_id, span_id, parent_span_id, start_time, end_time, duration_ns,\n       \
                 service_name, span_name, span_kind, status_code, status_message,\n       \
                 attributes, resource_attributes, events, src_ip, dest_ip, user, host\n\
-         FROM nanosiem.otel_spans\n\
+         FROM {spans}\n\
          WHERE trace_id = '{id}'\n  \
            AND start_time BETWEEN (SELECT w_start FROM bounds) AND (SELECT w_end FROM bounds)\n\
          ORDER BY start_time ASC, span_id ASC\n\
-         LIMIT 100000"
+         LIMIT 100001"
     )
 }
 
@@ -239,9 +274,11 @@ pub fn metric_timeseries_sql(
     service_name: Option<&str>,
     time_range: &TimeRange,
     step_secs: u64,
+    is_clustered: bool,
 ) -> String {
     let name = escape_string(metric_name);
     let step = step_secs.max(1);
+    let table = otel_read_table("otel_metrics", is_clustered);
     let mut filter = format!("metric_name = '{name}'");
     if let Some(svc) = service_name {
         if !svc.is_empty() {
@@ -251,7 +288,7 @@ pub fn metric_timeseries_sql(
     format!(
         "SELECT toStartOfInterval(timestamp, toIntervalSecond({step})) AS bucket,\n       \
                 avg(value) AS value\n\
-         FROM nanosiem.otel_metrics\n\
+         FROM {table}\n\
          WHERE timestamp BETWEEN '{start}' AND '{end}'\n  \
            AND ({filter})\n\
          GROUP BY bucket\n\
@@ -280,12 +317,19 @@ pub fn metric_timeseries_sql(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricAgg {
     Avg,
+    /// Temporality-aware sum ([`metric_sum_expr`], NAN-1734 O26): the reset-aware
+    /// window delta for a CUMULATIVE counter (each point is a running total), the
+    /// raw `sum(value)` for a DELTA/UNSPECIFIED series. A naive raw sum over
+    /// cumulative running totals silently inflates a "requests over window" panel.
     Sum,
     Min,
     Max,
     Count,
-    /// Cumulative-counter delta over the bucket, per second
-    /// (`(max-min)/bucket_secs`), mirroring the nPL `rate()` idea.
+    /// Per-second rate over the bucket/window ([`metric_rate_expr`]), temporality-
+    /// and reset-aware (NAN-1721 O15 + NAN-1734 O26): the window increment
+    /// (cumulative window delta for a CUMULATIVE counter, raw sum of increments for
+    /// a DELTA/UNSPECIFIED counter) over the OBSERVED window seconds. Replaces the
+    /// old reset-unsafe cross-series `(max-min)/secs` form.
     Rate,
     /// `quantileTDigest(0.50)(value)`.
     P50,
@@ -299,6 +343,52 @@ impl Default for MetricAgg {
     fn default() -> Self {
         MetricAgg::Avg
     }
+}
+
+/// The reset-aware WINDOW DELTA of a CUMULATIVE counter over a grouping: sums the
+/// POSITIVE consecutive deltas of the time-ordered `value`s WITHIN the grouping (a
+/// counter reset yields a negative delta which is dropped rather than counted as a
+/// spike). For a monotonic counter with no reset this equals `last - first`.
+/// Byte-identical to the NUMERATOR of the nPL metrics `rate()` form
+/// (`ClickHouseSqlGenerator::metric_rate_expr` in `aggregation.rs`) and hardcodes
+/// the `otel_metrics` `timestamp` time column and `value` measurement column —
+/// this dataset always carries both. Cross-series contamination within a single
+/// grouping is the same accepted limitation as the nPL rate path (O15).
+const METRIC_CUMULATIVE_WINDOW_DELTA_EXPR: &str = "arraySum(arrayMap(d -> if(d > 0, d, 0), arrayDifference(arrayMap(p -> p.2, arraySort(p -> p.1, groupArray((timestamp, value)))))))";
+
+/// Temporality-aware `sum` for the metrics dataset (NAN-1734, O26 consumer half).
+/// Standard OTel SDKs export SUM metrics as CUMULATIVE by default — each point is
+/// a monotonically increasing RUNNING TOTAL — so a naive `sum(value)` over a
+/// window sums running totals and wildly inflates a "requests over window" panel
+/// (measured: cumulative 100→150→250 sums to 500 vs the true window delta 150).
+///
+/// When the grouping is CUMULATIVE (`aggregation_temporality = 2`, migration 158)
+/// we take the reset-aware window delta ([`METRIC_CUMULATIVE_WINDOW_DELTA_EXPR`]);
+/// DELTA (1) series — where each point is already the interval increment — and
+/// UNSPECIFIED (0 — the pre-158 DEFAULT for already-ingested rows, and gauges,
+/// whose temporality is never stamped) pass through the raw `sum(value)`
+/// unchanged. The gate is `max(aggregation_temporality) = 2`: a single
+/// `metric_name` is exported with ONE temporality, so the grouping's max cleanly
+/// classifies it, and the safe default (0) keeps every existing series and every
+/// gauge byte-identical. Requires the `aggregation_temporality` column — present
+/// on raw `otel_metrics` (which the metrics-v2 builders read); never used against
+/// the rollup tables (which lack it).
+fn metric_sum_expr() -> String {
+    format!("if(max(aggregation_temporality) = 2, {METRIC_CUMULATIVE_WINDOW_DELTA_EXPR}, sum(value))")
+}
+
+/// Temporality-aware per-second `rate` for the metrics dataset (NAN-1721 O15 +
+/// NAN-1734 O26): the window increment ([`metric_sum_expr`] — cumulative window
+/// delta for a CUMULATIVE counter, raw sum of increments for a DELTA/UNSPECIFIED
+/// counter) divided by the grouping's OBSERVED window seconds. For a monotonic
+/// cumulative counter with no reset this equals `(last - first) / secs`. Replaces
+/// the old reset-unsafe, cross-series `(max(value) - min(value)) / secs` form (and
+/// its temporality-blind successor that delta-decoded DELTA counters too).
+fn metric_rate_expr() -> String {
+    format!(
+        "{} / greatest(dateDiff('second', min(timestamp), max(timestamp)), 1)",
+        metric_sum_expr()
+    )
 }
 
 impl MetricAgg {
@@ -336,18 +426,23 @@ impl MetricAgg {
     }
 
     /// The ClickHouse SELECT expression producing the per-bucket scalar `v`.
-    /// `bucket_secs` is the (clamped, ≥1) bucket width, needed only by `Rate`.
-    fn value_expr(self, bucket_secs: u64) -> String {
-        let secs = bucket_secs.max(1);
+    ///
+    /// `Rate` is counter-reset-aware (NAN-1721 O15): it sums the POSITIVE
+    /// consecutive deltas of the time-ordered `value`s WITHIN each grouping over
+    /// the OBSERVED window seconds ([`metric_rate_expr`]) — the same form the nPL
+    /// metrics `rate()` path emits — NOT the reset-unsafe cross-series
+    /// `(max-min)/secs`. Because the rate now derives its denominator from the
+    /// grouping's own `min/max(timestamp)`, no bucket/window seconds are passed.
+    fn value_expr(self) -> String {
         match self {
             Self::Avg => "avg(value)".to_string(),
-            Self::Sum => "sum(value)".to_string(),
+            // O26/NAN-1734: temporality-aware — delta-decode a CUMULATIVE counter
+            // (running total) to its window increment; DELTA/UNSPECIFIED raw-sum.
+            Self::Sum => metric_sum_expr(),
             Self::Min => "min(value)".to_string(),
             Self::Max => "max(value)".to_string(),
             Self::Count => "toFloat64(count())".to_string(),
-            // Cumulative-counter delta over the bucket, per second. greatest(...,1)
-            // guards a single-point bucket (delta 0 / 0 → NaN).
-            Self::Rate => format!("(max(value) - min(value)) / greatest({secs}, 1)"),
+            Self::Rate => metric_rate_expr(),
             Self::P50 => "quantileTDigest(0.50)(value)".to_string(),
             Self::P95 => "quantileTDigest(0.95)(value)".to_string(),
             Self::P99 => "quantileTDigest(0.99)(value)".to_string(),
@@ -423,10 +518,15 @@ pub fn valid_tag_key(key: &str) -> bool {
 ///
 /// Single time-bound WHERE (NAN-1412 — no explicit PREWHERE), every string
 /// escaped, bounded `LIMIT 200000` (buckets × series).
-pub fn metric_timeseries_v2_sql(query: &MetricQuery, time_range: &TimeRange) -> String {
+pub fn metric_timeseries_v2_sql(
+    query: &MetricQuery,
+    time_range: &TimeRange,
+    is_clustered: bool,
+) -> String {
     let name = escape_string(query.metric_name);
     let step = query.step_secs.max(1);
-    let value_expr = query.agg.value_expr(step);
+    let value_expr = query.agg.value_expr();
+    let table = otel_read_table("otel_metrics", is_clustered);
 
     // metric_name + optional service + tag filters → the single WHERE body.
     let mut filter = format!("metric_name = '{name}'");
@@ -461,7 +561,7 @@ pub fn metric_timeseries_v2_sql(query: &MetricQuery, time_range: &TimeRange) -> 
         "SELECT {series_select},\n       \
                 toStartOfInterval(timestamp, toIntervalSecond({step})) AS bucket,\n       \
                 {value_expr} AS v\n\
-         FROM nanosiem.otel_metrics\n\
+         FROM {table}\n\
          WHERE timestamp BETWEEN '{start}' AND '{end}'\n  \
            AND ({filter})\n\
          GROUP BY {group_by_keys}\n\
@@ -476,13 +576,21 @@ pub fn metric_timeseries_v2_sql(query: &MetricQuery, time_range: &TimeRange) -> 
 /// the whole window (no bucketing) — what the metric-monitor evaluator compares
 /// to its threshold (NAN-1540). Mirrors [`metric_timeseries_v2_sql`]'s filters
 /// and group_by, but aggregates the whole `[time_range]` into one row per series
-/// (`series_key`, `v`). `step_secs` is the monitor's window (used only by the
-/// `rate` per-second denominator). Bounded `LIMIT 100000` (series cardinality).
-pub fn metric_scalar_sql(query: &MetricQuery, time_range: &TimeRange) -> String {
+/// (`series_key`, `v`, `row_count`). Bounded `LIMIT 100000` (series cardinality).
+///
+/// The `count() AS row_count` companion (NAN-1721 O13) is how the evaluator
+/// distinguishes a genuine NO-DATA window from a real value: a no-group_by
+/// aggregate over an EMPTY window still returns ONE row (with `v` NULL for
+/// avg/min/max/quantiles, or 0 for count), so the service must read `row_count`
+/// — it returns `None` when `row_count == 0` (or `v` is JSON null) and never
+/// coerces NULL→0.0 into the breach path. A group_by scalar simply returns zero
+/// rows for a vanished series, which the scheduler already treats as no-data.
+/// (The `rate` denominator is the grouping's observed `min/max(timestamp)` — see
+/// [`metric_rate_expr`] — so no window seconds are threaded here anymore.)
+pub fn metric_scalar_sql(query: &MetricQuery, time_range: &TimeRange, is_clustered: bool) -> String {
     let name = escape_string(query.metric_name);
-    // For the whole-window scalar the rate denominator is the window length.
-    let window_secs = ((time_range.end - time_range.start).num_seconds().max(1)) as u64;
-    let value_expr = query.agg.value_expr(window_secs);
+    let value_expr = query.agg.value_expr();
+    let table = otel_read_table("otel_metrics", is_clustered);
 
     let mut filter = format!("metric_name = '{name}'");
     if let Some(svc) = query.service_name {
@@ -512,8 +620,9 @@ pub fn metric_scalar_sql(query: &MetricQuery, time_range: &TimeRange) -> String 
 
     format!(
         "SELECT {series_select},\n       \
-                {value_expr} AS v\n\
-         FROM nanosiem.otel_metrics\n\
+                {value_expr} AS v,\n       \
+                count() AS row_count\n\
+         FROM {table}\n\
          WHERE timestamp BETWEEN '{start}' AND '{end}'\n  \
            AND ({filter}){group_clause}\n\
          ORDER BY series_key ASC\n\
@@ -528,11 +637,12 @@ pub fn metric_scalar_sql(query: &MetricQuery, time_range: &TimeRange) -> String 
 /// keys of `attributes` and `resource_attributes` via `arrayJoin(mapKeys(...))`.
 /// `metric_name` is escaped; bounded `LIMIT 1000` (attribute cardinality is
 /// instrumentation-bounded). A `time_range` keeps the scan partition-pruned.
-pub fn metric_tag_keys_sql(metric_name: &str, time_range: &TimeRange) -> String {
+pub fn metric_tag_keys_sql(metric_name: &str, time_range: &TimeRange, is_clustered: bool) -> String {
     let name = escape_string(metric_name);
+    let table = otel_read_table("otel_metrics", is_clustered);
     format!(
         "SELECT DISTINCT k\n\
-         FROM nanosiem.otel_metrics\n\
+         FROM {table}\n\
          ARRAY JOIN arrayConcat(mapKeys(attributes), mapKeys(resource_attributes)) AS k\n\
          WHERE timestamp BETWEEN '{start}' AND '{end}'\n  \
            AND metric_name = '{name}'\n\
@@ -548,9 +658,15 @@ pub fn metric_tag_keys_sql(metric_name: &str, time_range: &TimeRange) -> String 
 /// maps via [`tag_lookup_expr`]; empty values (key absent) are filtered out.
 /// `key` MUST be validated ([`valid_tag_key`]) by the caller; escaped here too.
 /// Bounded `LIMIT 1000`.
-pub fn metric_tag_values_sql(metric_name: &str, key: &str, time_range: &TimeRange) -> String {
+pub fn metric_tag_values_sql(
+    metric_name: &str,
+    key: &str,
+    time_range: &TimeRange,
+    is_clustered: bool,
+) -> String {
     let name = escape_string(metric_name);
     let lookup = tag_lookup_expr(key);
+    let table = otel_read_table("otel_metrics", is_clustered);
     // The empty-string drop is applied OUTSIDE the DISTINCT (a subquery) so the
     // `tag_value` alias is never referenced in the same SELECT's WHERE (which
     // would either shadow a column or re-evaluate the map lookup). The inner
@@ -558,7 +674,7 @@ pub fn metric_tag_values_sql(metric_name: &str, key: &str, time_range: &TimeRang
     format!(
         "SELECT tag_value FROM (\n  \
            SELECT DISTINCT {lookup} AS tag_value\n  \
-           FROM nanosiem.otel_metrics\n  \
+           FROM {table}\n  \
            WHERE timestamp BETWEEN '{start}' AND '{end}'\n    \
              AND metric_name = '{name}'\n\
          )\n\
@@ -616,8 +732,14 @@ pub struct TraceListFilters<'a> {
 /// not knowable until the trace is assembled). The time bound stays a plain
 /// `WHERE` on `start_time` for partition pruning (NAN-1412 single-WHERE rule;
 /// the HAVING is a post-aggregation refinement, not a pushed-down filter).
-pub fn recent_traces_sql(time_range: &TimeRange, filters: &TraceListFilters) -> String {
+pub fn recent_traces_sql(
+    time_range: &TimeRange,
+    filters: &TraceListFilters,
+    is_clustered: bool,
+) -> String {
     let limit = filters.limit.unwrap_or(200).clamp(1, 1000);
+    let table = otel_read_table("otel_spans", is_clustered);
+    let table_ref = otel_read_table_ref("otel_spans", is_clustered);
 
     // Post-aggregation refinements over the assembled per-trace row.
     let mut having: Vec<String> = Vec::new();
@@ -632,29 +754,40 @@ pub fn recent_traces_sql(time_range: &TimeRange, filters: &TraceListFilters) -> 
     if let Some(min_ns) = filters.min_duration_ns {
         having.push(format!("duration_ns >= {min_ns}"));
     }
+    // Keyset pagination cursor (NAN-1539, corrected NAN-1721 O28): a STRICT `<`
+    // on the trace's START — the per-trace `min(start_time)` — applied
+    // POST-AGGREGATION in the HAVING. Applying it PRE-aggregation in the WHERE
+    // (the old form, `otel_spans.start_time < before`) pruned SPANS, not traces:
+    // a long trace whose later spans (including its only ERROR span) started
+    // AFTER the page-1 boundary would lose those spans from its per-trace
+    // aggregates on page ≥2 — wrong span_count/error_count/duration, and
+    // `errors_only`'s `HAVING error_count > 0` could then silently drop the whole
+    // trace. Keying on `min(start_time)` is stable across pages (a trace's start
+    // never moves) and matches `ORDER BY start_time DESC`. The time-range WHERE
+    // bound stays for partition pruning. None drops the predicate (first page).
+    if let Some(before) = filters.before {
+        // Table-qualify the cursor column (NAN-1730). The SELECT list aliases
+        // `min(start_time) AS start_time`; an UNQUALIFIED `min(start_time)` here
+        // binds the arg to that alias → ClickHouse parses `min(min(start_time))`
+        // → Code 184 ILLEGAL_AGGREGATION, 400-ing every keyset page. Qualifying
+        // as `{table_ref}.start_time` binds to the COLUMN (same trick the
+        // time-bound WHERE uses below), clustered-safe.
+        having.push(format!(
+            "min({table_ref}.start_time) < '{}'",
+            crate::sql_hygiene::format_ch_bound_micros(&before)
+        ));
+    }
     let having_clause = if having.is_empty() {
         String::new()
     } else {
         format!("\nHAVING {}", having.join(" AND "))
     };
 
-    // Keyset pagination cursor (NAN-1539): a STRICT `<` on the raw `start_time`
-    // COLUMN (table-qualified, pre-aggregation) so it prunes partitions and stays
-    // out of the post-aggregation HAVING. Combined with `ORDER BY start_time
-    // DESC`, paging the cursor down the timeline is a partition-pruned keyset, not
-    // an OFFSET scan. NULL/None drops the predicate (first page).
-    let cursor_clause = match filters.before {
-        Some(before) => format!(
-            "\n  AND otel_spans.start_time < '{}'",
-            crate::sql_hygiene::format_ch_bound_micros(&before)
-        ),
-        None => String::new(),
-    };
-
-    // `start_time` is table-qualified in the WHERE so it binds to the COLUMN,
-    // not the `min(start_time) AS start_time` alias below. An unqualified ref
-    // resolves to the alias and lands an aggregate in WHERE → Code 184
-    // ILLEGAL_AGGREGATION (the alias-shadows-column gotcha).
+    // `start_time` is table-qualified in the time-bound WHERE so it binds to the
+    // COLUMN, not the `min(start_time) AS start_time` alias below. An unqualified
+    // ref resolves to the alias and lands an aggregate in WHERE → Code 184
+    // ILLEGAL_AGGREGATION (the alias-shadows-column gotcha). The keyset cursor is
+    // a HAVING refinement on that per-trace aggregate (above), never a WHERE.
     format!(
         "SELECT trace_id,\n       \
                 argMin(service_name, length(parent_span_id)) AS root_service,\n       \
@@ -663,14 +796,13 @@ pub fn recent_traces_sql(time_range: &TimeRange, filters: &TraceListFilters) -> 
                 countIf(status_code = 'ERROR') AS error_count,\n       \
                 argMin(duration_ns, length(parent_span_id)) AS duration_ns,\n       \
                 min(start_time) AS start_time\n\
-         FROM nanosiem.otel_spans\n\
-         WHERE otel_spans.start_time BETWEEN '{start}' AND '{end}'{cursor}\n\
+         FROM {table}\n\
+         WHERE {table_ref}.start_time BETWEEN '{start}' AND '{end}'\n\
          GROUP BY trace_id{having}\n\
          ORDER BY start_time DESC\n\
          LIMIT {limit}",
         start = crate::sql_hygiene::format_ch_bound_micros(&time_range.start),
         end = crate::sql_hygiene::format_ch_bound_micros(&time_range.end),
-        cursor = cursor_clause,
         having = having_clause,
     )
 }
@@ -687,7 +819,8 @@ pub fn recent_traces_sql(time_range: &TimeRange, filters: &TraceListFilters) -> 
 /// identical name universe at orders of magnitude fewer rows (NAN-1632 3.12).
 /// It must stay on `_1m` — the `_1h` rollup keeps 400d vs the shared 90d TTL of
 /// `_1m`/raw, so past day 90 it would return a stale-name superset.
-pub fn metric_names_sql(service_name: Option<&str>) -> String {
+pub fn metric_names_sql(service_name: Option<&str>, is_clustered: bool) -> String {
+    let table = otel_read_table("otel_metrics_1m", is_clustered);
     let mut filter = String::new();
     if let Some(svc) = service_name {
         if !svc.is_empty() {
@@ -696,7 +829,7 @@ pub fn metric_names_sql(service_name: Option<&str>) -> String {
     }
     format!(
         "SELECT DISTINCT metric_name\n\
-         FROM nanosiem.otel_metrics_1m{filter}\n\
+         FROM {table}{filter}\n\
          ORDER BY metric_name ASC\n\
          LIMIT 10000"
     )
@@ -817,8 +950,14 @@ pub struct ServicesOverviewFilters<'a> {
 /// an allowlisted `sort` (`ORDER BY`). The hard `LIMIT 1000` is unchanged — the
 /// no-filter default stays byte-identical. Health filtering + paging happen in
 /// the glue (post-aggregation, see [`ServicesOverviewFilters`]).
-pub fn services_overview_sql(time_range: &TimeRange, filters: &ServicesOverviewFilters) -> String {
+pub fn services_overview_sql(
+    time_range: &TimeRange,
+    filters: &ServicesOverviewFilters,
+    is_clustered: bool,
+) -> String {
     let order_by = filters.sort.unwrap_or_default().order_by();
+    let table = otel_read_table("otel_service_red_1m", is_clustered);
+    let table_ref = otel_read_table_ref("otel_service_red_1m", is_clustered);
 
     // Case-insensitive substring on service_name, pushed into the time-bound
     // WHERE (NAN-1543). `lower(service_name) LIKE '%<q>%'` — the value is
@@ -839,8 +978,8 @@ pub fn services_overview_sql(time_range: &TimeRange, filters: &ServicesOverviewF
                 quantilesTDigestMerge(0.50, 0.95, 0.99)(duration_state)[1] AS p50_ms,\n       \
                 quantilesTDigestMerge(0.50, 0.95, 0.99)(duration_state)[2] AS p95_ms,\n       \
                 quantilesTDigestMerge(0.50, 0.95, 0.99)(duration_state)[3] AS p99_ms\n\
-         FROM nanosiem.otel_service_red_1m\n\
-         WHERE otel_service_red_1m.minute BETWEEN '{start}' AND '{end}'{q_clause}\n\
+         FROM {table}\n\
+         WHERE {table_ref}.minute BETWEEN '{start}' AND '{end}'{q_clause}\n\
          GROUP BY service_name\n\
          ORDER BY {order_by}\n\
          LIMIT 1000",
@@ -864,14 +1003,16 @@ pub fn services_overview_sql(time_range: &TimeRange, filters: &ServicesOverviewF
 /// (service, bucket). `step_secs` is clamped to ≥1; the rollup grain is 1 minute,
 /// so a sub-minute step collapses onto the minute bucket (the rollup's finest
 /// resolution) — fine for a sparkline.
-pub fn services_sparkline_sql(time_range: &TimeRange, step_secs: u64) -> String {
+pub fn services_sparkline_sql(time_range: &TimeRange, step_secs: u64, is_clustered: bool) -> String {
     let step = step_secs.max(1);
+    let table = otel_read_table("otel_service_red_1m", is_clustered);
+    let table_ref = otel_read_table_ref("otel_service_red_1m", is_clustered);
     format!(
         "SELECT service_name AS service,\n       \
                 toStartOfInterval(minute, toIntervalSecond({step})) AS bucket,\n       \
                 sum(request_count) AS v\n\
-         FROM nanosiem.otel_service_red_1m\n\
-         WHERE otel_service_red_1m.minute BETWEEN '{start}' AND '{end}'\n\
+         FROM {table}\n\
+         WHERE {table_ref}.minute BETWEEN '{start}' AND '{end}'\n\
          GROUP BY service, bucket\n\
          ORDER BY service ASC, bucket ASC\n\
          LIMIT 200000",
@@ -897,9 +1038,16 @@ pub fn services_sparkline_sql(time_range: &TimeRange, step_secs: u64) -> String 
 /// via `sum(...)` (SimpleAggregateFunction), latency via the merged t-digest
 /// (`[i]` already ms). The emitted column shape (`rate_count`, `error_count`,
 /// `pXX_ms`) is unchanged — the glue/contract is byte-identical.
-pub fn service_red_timeseries_sql(service: &str, time_range: &TimeRange, step_secs: u64) -> String {
+pub fn service_red_timeseries_sql(
+    service: &str,
+    time_range: &TimeRange,
+    step_secs: u64,
+    is_clustered: bool,
+) -> String {
     let svc = escape_string(service);
     let step = step_secs.max(1);
+    let table = otel_read_table("otel_service_red_1m", is_clustered);
+    let table_ref = otel_read_table_ref("otel_service_red_1m", is_clustered);
     format!(
         "SELECT toStartOfInterval(minute, toIntervalSecond({step})) AS bucket,\n       \
                 sum(request_count) AS rate_count,\n       \
@@ -907,8 +1055,8 @@ pub fn service_red_timeseries_sql(service: &str, time_range: &TimeRange, step_se
                 quantilesTDigestMerge(0.50, 0.95, 0.99)(duration_state)[1] AS p50_ms,\n       \
                 quantilesTDigestMerge(0.50, 0.95, 0.99)(duration_state)[2] AS p95_ms,\n       \
                 quantilesTDigestMerge(0.50, 0.95, 0.99)(duration_state)[3] AS p99_ms\n\
-         FROM nanosiem.otel_service_red_1m\n\
-         WHERE otel_service_red_1m.minute BETWEEN '{start}' AND '{end}'\n  \
+         FROM {table}\n\
+         WHERE {table_ref}.minute BETWEEN '{start}' AND '{end}'\n  \
            AND service_name = '{svc}'\n\
          GROUP BY bucket\n\
          ORDER BY bucket ASC\n\
@@ -926,15 +1074,17 @@ pub fn service_red_timeseries_sql(service: &str, time_range: &TimeRange, step_se
 /// endpoint, busiest first. The glue derives `error_rate` (= error_count/count).
 /// `service` is escaped; bounded `LIMIT 500` (endpoint cardinality per service is
 /// route-bounded, not data-volume-bounded).
-pub fn service_endpoints_sql(service: &str, time_range: &TimeRange) -> String {
+pub fn service_endpoints_sql(service: &str, time_range: &TimeRange, is_clustered: bool) -> String {
     let svc = escape_string(service);
+    let table = otel_read_table("otel_spans", is_clustered);
+    let table_ref = otel_read_table_ref("otel_spans", is_clustered);
     format!(
         "SELECT span_name,\n       \
                 count() AS request_count,\n       \
                 countIf(status_code = 'ERROR') AS error_count,\n       \
                 quantileTDigest(0.95)(duration_ns) / 1e6 AS p95_ms\n\
-         FROM nanosiem.otel_spans\n\
-         WHERE otel_spans.start_time BETWEEN '{start}' AND '{end}'\n  \
+         FROM {table}\n\
+         WHERE {table_ref}.start_time BETWEEN '{start}' AND '{end}'\n  \
            AND service_name = '{svc}'\n\
          GROUP BY span_name\n\
          ORDER BY request_count DESC\n\
@@ -954,17 +1104,24 @@ pub fn service_endpoints_sql(service: &str, time_range: &TimeRange) -> String {
 /// `error` is `status_code = 'ERROR'`; ordering puts errored exemplars first
 /// (`error DESC`) so the UI's "show me a broken trace" affordance has fodder even
 /// when errors are rare. `service` is escaped.
-pub fn service_exemplars_sql(service: &str, time_range: &TimeRange, limit: Option<u32>) -> String {
+pub fn service_exemplars_sql(
+    service: &str,
+    time_range: &TimeRange,
+    limit: Option<u32>,
+    is_clustered: bool,
+) -> String {
     let svc = escape_string(service);
     let lim = limit.unwrap_or(20).clamp(1, 200);
+    let table = otel_read_table("otel_spans", is_clustered);
+    let table_ref = otel_read_table_ref("otel_spans", is_clustered);
     format!(
         "SELECT trace_id,\n       \
                 duration_ns / 1e6 AS duration_ms,\n       \
                 status_code = 'ERROR' AS error,\n       \
                 start_time,\n       \
                 span_name\n\
-         FROM nanosiem.otel_spans\n\
-         WHERE otel_spans.start_time BETWEEN '{start}' AND '{end}'\n  \
+         FROM {table}\n\
+         WHERE {table_ref}.start_time BETWEEN '{start}' AND '{end}'\n  \
            AND service_name = '{svc}'\n\
          ORDER BY error DESC, start_time DESC\n\
          LIMIT {lim}",
@@ -1013,6 +1170,7 @@ pub fn slo_compute_sql(
     sli_kind: SliKind,
     latency_threshold_ms: Option<f64>,
     time_range: &TimeRange,
+    is_clustered: bool,
 ) -> String {
     let svc = escape_string(service);
     if sli_kind == SliKind::Availability {
@@ -1026,11 +1184,13 @@ pub fn slo_compute_sql(
             .with_second(0)
             .and_then(|t| t.with_nanosecond(0))
             .unwrap_or(time_range.start);
+        let table = otel_read_table("otel_service_red_1m", is_clustered);
+        let table_ref = otel_read_table_ref("otel_service_red_1m", is_clustered);
         return format!(
             "SELECT sum(request_count) AS total,\n       \
                     sum(request_count) - sum(error_count) AS good\n\
-             FROM nanosiem.otel_service_red_1m\n\
-             WHERE otel_service_red_1m.minute BETWEEN '{start}' AND '{end}'\n  \
+             FROM {table}\n\
+             WHERE {table_ref}.minute BETWEEN '{start}' AND '{end}'\n  \
                AND service_name = '{svc}'\n\
              LIMIT 1",
             // Second-precision bounds — the rollup `minute` is a DateTime,
@@ -1050,11 +1210,13 @@ pub fn slo_compute_sql(
         }
         None => "countIf(status_code != 'ERROR')".to_string(),
     };
+    let table = otel_read_table("otel_spans", is_clustered);
+    let table_ref = otel_read_table_ref("otel_spans", is_clustered);
     format!(
         "SELECT count() AS total,\n       \
                 {good_expr} AS good\n\
-         FROM nanosiem.otel_spans\n\
-         WHERE otel_spans.start_time BETWEEN '{start}' AND '{end}'\n  \
+         FROM {table}\n\
+         WHERE {table_ref}.start_time BETWEEN '{start}' AND '{end}'\n  \
            AND service_name = '{svc}'\n\
          LIMIT 1",
         start = crate::sql_hygiene::format_ch_bound_micros(&time_range.start),
@@ -1114,7 +1276,13 @@ pub struct InfraHostsFilters<'a> {
 /// time-bound WHERE (NAN-1412), bounded `LIMIT 10000` (host cardinality is
 /// fleet-bounded, not data-volume-bounded). NAN-1543 pushes the optional
 /// `q`/`group`/`env` filters into the WHERE; the no-filter default is unchanged.
-pub fn infra_hosts_sql(time_range: &TimeRange, filters: &InfraHostsFilters) -> String {
+pub fn infra_hosts_sql(
+    time_range: &TimeRange,
+    filters: &InfraHostsFilters,
+    is_clustered: bool,
+) -> String {
+    let table = otel_read_table("otel_metrics", is_clustered);
+    let table_ref = otel_read_table_ref("otel_metrics", is_clustered);
     // Pushed-down predicates on the host name + resource attributes. All values
     // lowercased (for `q`) / escaped. host.group / deployment.environment are
     // exact matches; `q` is a case-insensitive substring on the host name.
@@ -1150,9 +1318,13 @@ pub fn infra_hosts_sql(time_range: &TimeRange, filters: &InfraHostsFilters) -> S
                 argMaxIf(value, timestamp, metric_name = 'system.cpu.utilization') AS cpu_util,\n       \
                 argMaxIf(value, timestamp, metric_name = 'system.memory.utilization') AS mem_util,\n       \
                 argMaxIf(value, timestamp, metric_name = 'system.cpu.load_average.1m') AS load_1m,\n       \
-                argMaxIf(value, timestamp, metric_name = 'system.network.io') AS net_io\n\
-         FROM nanosiem.otel_metrics\n\
-         WHERE otel_metrics.timestamp BETWEEN '{start}' AND '{end}'\n  \
+                argMaxIf(value, timestamp, metric_name = 'system.network.io') AS net_io,\n       \
+                countIf(metric_name = 'system.cpu.utilization') AS cpu_n,\n       \
+                countIf(metric_name = 'system.memory.utilization') AS mem_n,\n       \
+                countIf(metric_name = 'system.cpu.load_average.1m') AS load_n,\n       \
+                countIf(metric_name = 'system.network.io') AS net_n\n\
+         FROM {table}\n\
+         WHERE {table_ref}.timestamp BETWEEN '{start}' AND '{end}'\n  \
            AND resource_attributes['host.name'] != ''{extra}\n\
          GROUP BY host\n\
          ORDER BY host ASC\n\
@@ -1185,7 +1357,9 @@ pub fn infra_hosts_sql(time_range: &TimeRange, filters: &InfraHostsFilters) -> S
 /// data"). Single time-bound WHERE, no GROUP BY (one row), `LIMIT 1`.
 /// NAN-1543: an `env` filter (from [`RumFilters`]) scopes the vitals; page /
 /// browser don't apply to metric rows (they carry no such attribute).
-pub fn rum_web_vitals_sql(time_range: &TimeRange, filters: &RumFilters) -> String {
+pub fn rum_web_vitals_sql(time_range: &TimeRange, filters: &RumFilters, is_clustered: bool) -> String {
+    let table = otel_read_table("otel_metrics", is_clustered);
+    let table_ref = otel_read_table_ref("otel_metrics", is_clustered);
     format!(
         "SELECT quantileTDigestIf(0.75)(value, metric_name = 'web.vitals.lcp') AS lcp_ms,\n       \
                 quantileTDigestIf(0.75)(value, metric_name = 'web.vitals.inp') AS inp_ms,\n       \
@@ -1193,8 +1367,8 @@ pub fn rum_web_vitals_sql(time_range: &TimeRange, filters: &RumFilters) -> Strin
                 countIf(metric_name = 'web.vitals.lcp') AS lcp_n,\n       \
                 countIf(metric_name = 'web.vitals.inp') AS inp_n,\n       \
                 countIf(metric_name = 'web.vitals.cls') AS cls_n\n\
-         FROM nanosiem.otel_metrics\n\
-         WHERE otel_metrics.timestamp BETWEEN '{start}' AND '{end}'\n  \
+         FROM {table}\n\
+         WHERE {table_ref}.timestamp BETWEEN '{start}' AND '{end}'\n  \
            AND metric_name IN ('web.vitals.lcp', 'web.vitals.inp', 'web.vitals.cls'){env}\n\
          LIMIT 1",
         env = filters.metrics_predicate(),
@@ -1296,14 +1470,17 @@ pub fn rum_pageviews_series_sql(
     time_range: &TimeRange,
     step_secs: u64,
     filters: &RumFilters,
+    is_clustered: bool,
 ) -> String {
     let step = step_secs.max(1);
+    let table = otel_read_table("otel_spans", is_clustered);
+    let table_ref = otel_read_table_ref("otel_spans", is_clustered);
     format!(
         "SELECT toStartOfInterval(start_time, toIntervalSecond({step})) AS bucket,\n       \
                 countIf({pv}) AS views,\n       \
                 countIf({err}) AS js_errors\n\
-         FROM nanosiem.otel_spans\n\
-         WHERE otel_spans.start_time BETWEEN '{start}' AND '{end}'{extra}\n\
+         FROM {table}\n\
+         WHERE {table_ref}.start_time BETWEEN '{start}' AND '{end}'{extra}\n\
          GROUP BY bucket\n\
          ORDER BY bucket ASC\n\
          LIMIT 100000",
@@ -1327,14 +1504,17 @@ pub fn rum_top_pages_sql(
     time_range: &TimeRange,
     limit: Option<u32>,
     filters: &RumFilters,
+    is_clustered: bool,
 ) -> String {
     let lim = limit.unwrap_or(10).clamp(1, 100);
+    let table = otel_read_table("otel_spans", is_clustered);
+    let table_ref = otel_read_table_ref("otel_spans", is_clustered);
     format!(
         "SELECT attributes['page.url'] AS page,\n       \
                 count() AS views,\n       \
                 quantileTDigestIf(0.75)(toFloat64OrNull(attributes['web.vitals.lcp']), toFloat64OrNull(attributes['web.vitals.lcp']) IS NOT NULL) AS lcp_ms\n\
-         FROM nanosiem.otel_spans\n\
-         WHERE otel_spans.start_time BETWEEN '{start}' AND '{end}'\n  \
+         FROM {table}\n\
+         WHERE {table_ref}.start_time BETWEEN '{start}' AND '{end}'\n  \
            AND attributes['page.url'] != ''{extra}\n\
          GROUP BY page\n\
          ORDER BY views DESC\n\
@@ -1357,8 +1537,11 @@ pub fn rum_recent_errors_sql(
     time_range: &TimeRange,
     limit: Option<u32>,
     filters: &RumFilters,
+    is_clustered: bool,
 ) -> String {
     let lim = limit.unwrap_or(20).clamp(1, 200);
+    let table = otel_read_table("otel_spans", is_clustered);
+    let table_ref = otel_read_table_ref("otel_spans", is_clustered);
     format!(
         "SELECT if(attributes['exception.message'] != '', attributes['exception.message'], status_message) AS message,\n       \
                 attributes['page.url'] AS page,\n       \
@@ -1366,8 +1549,8 @@ pub fn rum_recent_errors_sql(
                 src_ip,\n       \
                 user,\n       \
                 attributes['session.id'] AS session\n\
-         FROM nanosiem.otel_spans\n\
-         WHERE otel_spans.start_time BETWEEN '{start}' AND '{end}'\n  \
+         FROM {table}\n\
+         WHERE {table_ref}.start_time BETWEEN '{start}' AND '{end}'\n  \
            AND {err}{extra}\n\
          ORDER BY start_time DESC\n\
          LIMIT {lim}",
@@ -1397,14 +1580,16 @@ pub fn rum_recent_errors_sql(
 /// simply has no row → glue defaults to 0% / null). `window_days` is the rolling
 /// window; the time bound stays a plain WHERE on `timestamp` for partition
 /// pruning. Bounded `LIMIT 100000` (check cardinality is config-bounded).
-pub fn synthetic_summary_sql(time_range: &TimeRange) -> String {
+pub fn synthetic_summary_sql(time_range: &TimeRange, is_clustered: bool) -> String {
+    let table = otel_read_table("synthetic_check_results", is_clustered);
+    let table_ref = otel_read_table_ref("synthetic_check_results", is_clustered);
     format!(
         "SELECT check_id,\n       \
                 count() AS total,\n       \
                 sum(success) AS good,\n       \
                 quantileTDigest(0.50)(latency_ms) AS p50_latency_ms\n\
-         FROM nanosiem.synthetic_check_results\n\
-         WHERE synthetic_check_results.timestamp BETWEEN '{start}' AND '{end}'\n\
+         FROM {table}\n\
+         WHERE {table_ref}.timestamp BETWEEN '{start}' AND '{end}'\n\
          GROUP BY check_id\n\
          ORDER BY check_id ASC\n\
          LIMIT 100000",
@@ -1419,15 +1604,22 @@ pub fn synthetic_summary_sql(time_range: &TimeRange) -> String {
 /// `check_id` is escaped. The api glue REVERSES the rows to chronological order
 /// for the bar (we order DESC here to take the newest `limit` cheaply). Raw rows
 /// (a sampling) with a tight LIMIT, time-bound WHERE on `timestamp`.
-pub fn synthetic_history_sql(check_id: &str, time_range: &TimeRange, limit: Option<u32>) -> String {
+pub fn synthetic_history_sql(
+    check_id: &str,
+    time_range: &TimeRange,
+    limit: Option<u32>,
+    is_clustered: bool,
+) -> String {
     let id = escape_string(check_id);
     let lim = limit.unwrap_or(90).clamp(1, 365);
+    let table = otel_read_table("synthetic_check_results", is_clustered);
+    let table_ref = otel_read_table_ref("synthetic_check_results", is_clustered);
     format!(
         "SELECT success,\n       \
                 latency_ms,\n       \
                 formatDateTime(timestamp, '%Y-%m-%dT%H:%i:%S.%fZ') AS ts\n\
-         FROM nanosiem.synthetic_check_results\n\
-         WHERE synthetic_check_results.timestamp BETWEEN '{start}' AND '{end}'\n  \
+         FROM {table}\n\
+         WHERE {table_ref}.timestamp BETWEEN '{start}' AND '{end}'\n  \
            AND check_id = '{id}'\n\
          ORDER BY timestamp DESC\n\
          LIMIT {lim}",
@@ -1467,13 +1659,15 @@ pub const SERVICE_ENTITY_CAP: u32 = 100;
 /// filter on the projected one. Bounded by `SERVICE_ENTITY_CAP` so the
 /// downstream signal `IN (...)` stays small. `service` is escaped; single
 /// time-bound WHERE on `start_time`.
-pub fn service_entities_sql(service: &str, time_range: &TimeRange) -> String {
+pub fn service_entities_sql(service: &str, time_range: &TimeRange, is_clustered: bool) -> String {
     let svc = escape_string(service);
+    let table = otel_read_table("otel_spans", is_clustered);
+    let table_ref = otel_read_table_ref("otel_spans", is_clustered);
     format!(
         "SELECT DISTINCT entity FROM (\n  \
            SELECT arrayJoin([src_ip, host]) AS entity\n  \
-           FROM nanosiem.otel_spans\n  \
-           WHERE otel_spans.start_time BETWEEN '{start}' AND '{end}'\n    \
+           FROM {table}\n  \
+           WHERE {table_ref}.start_time BETWEEN '{start}' AND '{end}'\n    \
              AND service_name = '{svc}'\n\
          )\n\
          WHERE entity != ''\n\
@@ -1504,8 +1698,13 @@ pub fn security_signals_for_entities_sql(
     entities: &[String],
     time_range: &TimeRange,
     limit: Option<u32>,
+    is_clustered: bool,
 ) -> String {
     let lim = limit.unwrap_or(100).clamp(1, 1000);
+    // `signals` is cluster-distributed (NAN-1721 O1): route the read through the
+    // wrapper so the security-convergence panel sees all shards, not just one.
+    let signals = otel_read_table("signals", is_clustered);
+    let signals_ref = otel_read_table_ref("signals", is_clustered);
     // Build the escaped IN-list. Empty → an unsatisfiable predicate so the
     // statement is still valid SQL and returns no rows.
     let entity_pred = if entities.is_empty() {
@@ -1523,8 +1722,8 @@ pub fn security_signals_for_entities_sql(
                 rule_name,\n       \
                 risk_entity,\n       \
                 severity\n\
-         FROM nanosiem.signals\n\
-         WHERE signals.timestamp BETWEEN '{start}' AND '{end}'\n  \
+         FROM {signals}\n\
+         WHERE {signals_ref}.timestamp BETWEEN '{start}' AND '{end}'\n  \
            AND ({entity_pred})\n\
          ORDER BY timestamp DESC\n\
          LIMIT {lim}",

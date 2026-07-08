@@ -33,6 +33,7 @@ use nanosiem_core::observability::{
 };
 use nanosiem_core::query::TimeRange;
 use nanosiem_core::typeid::TypeIdParam;
+use nanosiem_core::webhooks::WebhookService;
 
 const NAME_MAX_LEN: usize = 200;
 const TARGET_URL_MAX_LEN: usize = 2048;
@@ -52,9 +53,16 @@ pub struct Check {
     #[serde(flatten)]
     #[schema(value_type = SyntheticCheck)]
     pub definition: SyntheticCheck,
-    /// Uptime over the summary window as a percentage (`0..100`). `0` when the
-    /// check has no recorded runs yet.
-    pub uptime_pct: f64,
+    /// Whether the check has any recorded runs in the summary window (O33).
+    /// `false` for a just-created check with no probe results yet — the console
+    /// renders a neutral "no data" state for these and excludes them from the
+    /// up/down status counts and the overall-uptime average, so a fresh check no
+    /// longer reads as a phantom outage.
+    pub has_runs: bool,
+    /// Uptime over the summary window as a percentage (`0..100`). `null` when the
+    /// check has no recorded runs yet (`has_runs == false`) — a no-data state,
+    /// deliberately NOT `0`, which would render as a red "Down".
+    pub uptime_pct: Option<f64>,
     /// Median (p50) latency in ms over the window. `null` when there are no
     /// recorded runs.
     pub p50_latency_ms: Option<f64>,
@@ -208,8 +216,11 @@ fn map_repo_err(e: SyntheticCheckRepositoryError) -> ApiError {
 }
 
 /// Merge the live summary + history (from ClickHouse) onto one definition.
-/// `summaries` is keyed by the check's UUID-string (the search-layer key); a
-/// check with no recorded runs defaults to `0% / null / []`.
+/// `summaries` is keyed by the check's UUID-string (the search-layer key). The
+/// summary only carries an entry for a check that has ≥1 run in the window
+/// (`observability_synthetics_summary` GROUP BYs check_id), so a missing entry
+/// means "no recorded runs yet" → `has_runs = false`, `uptime_pct = null`
+/// (a neutral no-data state, NOT `0%`, which would render as "Down" — O33).
 async fn enrich(
     state: &AppState,
     def: SyntheticCheck,
@@ -218,12 +229,13 @@ async fn enrich(
 ) -> Result<Check, ApiError> {
     let key = def.id.to_string();
 
-    let (uptime_pct, p50_latency_ms) = match summaries.get(&key) {
+    let (has_runs, uptime_pct, p50_latency_ms) = match summaries.get(&key) {
         Some(s) => (
-            s.get("uptime_pct").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            true,
+            s.get("uptime_pct").and_then(|v| v.as_f64()),
             s.get("p50_latency_ms").and_then(|v| v.as_f64()),
         ),
-        None => (0.0, None),
+        None => (false, None, None),
     };
 
     let history = state
@@ -237,6 +249,7 @@ async fn enrich(
 
     Ok(Check {
         definition: def,
+        has_runs,
         uptime_pct,
         p50_latency_ms,
         history,
@@ -309,6 +322,14 @@ pub async fn create_synthetic(
     ensure_permission(&auth, permissions::SETTINGS_SYSTEM)?;
 
     let v = req.validate()?;
+    // NAN-1759: reject SSRF targets (loopback, link-local, cloud-metadata, and
+    // alternate IP encodings) before persistence, matching the webhook surface's
+    // shared validator. The synthetics runner also validates at fire time (defense
+    // in depth), but a persisted internal URL is itself a leak — it is readable by
+    // any `search:view` principal via the list/get endpoints.
+    WebhookService::validate_url(&v.target_url)
+        .await
+        .map_err(ApiError::BadRequest)?;
 
     let repo = SyntheticCheckRepository::new(state.pool.clone());
 
@@ -341,7 +362,8 @@ pub async fn create_synthetic(
         .await
         .map_err(map_repo_err)?;
 
-    // A freshly-created check has no runs yet — summary defaults to 0% / null / [].
+    // A freshly-created check has no runs yet — empty summaries → has_runs=false,
+    // uptime null, no history (the neutral no-data state, O33).
     let time_range = summary_time_range();
     let summaries = std::collections::HashMap::new();
     let check = enrich(&state, def, &summaries, &time_range).await?;
@@ -376,7 +398,16 @@ pub async fn update_synthetic(
     // body of only `{ "enabled": … }` (the console toggle) doesn't blank the
     // other columns or fail validation. (NAN-1537 contract fix.)
     let existing = repo.get(*id).await.map_err(map_repo_err)?;
+    // Only re-run the SSRF check when the URL is actually being changed, so a
+    // pause/resume toggle (a body of just `{ "enabled": … }`) on an existing
+    // check isn't blocked by it (NAN-1759). A newly-supplied URL is validated.
+    let url_changed = req.target_url.is_some();
     let v = req.merge_onto(&existing).validate()?;
+    if url_changed {
+        WebhookService::validate_url(&v.target_url)
+            .await
+            .map_err(ApiError::BadRequest)?;
+    }
 
     let def = repo
         .update(
@@ -430,6 +461,13 @@ pub async fn delete_synthetic(
     if !deleted {
         return Err(ApiError::NotFound("Synthetic check not found".to_string()));
     }
+    // O49: the delete removes only the PG *definition*. Any probe already in
+    // flight for this check re-checks existence before it writes its result or
+    // raises an alert (see `SyntheticRunner::probe_and_record`), so a mid-tick
+    // delete can't emit a late result/alert. The check's ClickHouse result rows
+    // are left to age out under the table's 30d TTL (migration 142) rather than
+    // deleted synchronously here — an explicit CH `ALTER … DELETE` on delete is a
+    // possible follow-up but not needed for correctness.
     Ok(StatusCode::NO_CONTENT)
 }
 

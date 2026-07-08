@@ -163,12 +163,14 @@ pub(super) fn collect_command_output_fields(command: &Command, fields: &mut Hash
             field,
             show_count,
             show_percent,
+            inject_bounds,
             ..
         }
         | Command::Rare {
             field,
             show_count,
             show_percent,
+            inject_bounds,
             ..
         } => {
             fields.insert(field.to_lowercase());
@@ -177,6 +179,11 @@ pub(super) fn collect_command_output_fields(command: &Command, fields: &mut Hash
             }
             if *show_percent {
                 fields.insert("percent".to_string());
+            }
+            // NAN-1711 / audit D15: detection-injected canonical window columns.
+            if *inject_bounds {
+                fields.insert("_first_seen".to_string());
+                fields.insert("_last_seen".to_string());
             }
         }
         Command::Timechart {

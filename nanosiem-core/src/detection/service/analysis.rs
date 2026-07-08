@@ -147,20 +147,37 @@ impl DetectionService {
         for ev in &mut sample_events {
             crate::detection::normalize_match_event(ev);
         }
-        let total_matches = sample_events.len() as u64;
+        // Audit D35: the sample is capped at `max_events_per_alert` for display.
+        // While it isn't capped, its length IS the exact post-processing match
+        // count — correct even for `| where count > N` threshold rules that
+        // legitimately return few rows (so we must NOT substitute raw
+        // pre-aggregation volume here). Only when the sample hits the cap do we
+        // fall back to the uncapped SQL `total_count` so a high-volume rule isn't
+        // frozen at exactly the cap (`min(len, 100)`); clamp so we never
+        // under-report the sample.
+        let cap = self.config.max_events_per_alert;
+        let total_matches = if sample_events.len() < cap {
+            sample_events.len() as u64
+        } else {
+            response.total_count.max(sample_events.len() as u64)
+        };
 
         Ok(HistoricalAnalysisResult {
             rule_id: rule.id,
             rule_name: rule.name,
             time_range,
-            // Use actual result count after all post-processing (stats, where, etc.)
-            // not total_count which is from SQL execution before in-memory processing
+            // Uncapped match count (audit D35): exact sample length until the
+            // display cap is hit, then the SQL total_count.
             total_matches,
             sample_events,
             matches_by_day,
             matches_by_bucket,
             bucket_size_seconds,
             execution_time_ms,
+            // Single-search path: a query failure returns Err directly, so no
+            // silent per-window swallowing to report (audit D3b).
+            failed_windows: 0,
+            error_sample: None,
         })
     }
 
@@ -343,6 +360,11 @@ impl DetectionService {
         let mut total_matches: u64 = 0;
         let mut sample_events: Vec<serde_json::Value> = Vec::new();
         let mut buckets: Vec<TimeBucket> = Vec::with_capacity(windows.len());
+        // Audit D3b: track window failures so the tester surfaces "N windows
+        // errored" instead of silently reporting them as `count: 0` — which made
+        // a rule that errors every cycle look like a healthy "0 matches" rule.
+        let mut failed_windows: u32 = 0;
+        let mut error_sample: Option<String> = None;
 
         while let Some((window, result)) = futures.next().await {
             // Use the tick time (window end) as bucket_start so the histogram
@@ -373,6 +395,10 @@ impl DetectionService {
                         "Stepped tester: window {}..{} failed: {}",
                         window.start, window.end, e
                     );
+                    failed_windows += 1;
+                    if error_sample.is_none() {
+                        error_sample = Some(e.to_string());
+                    }
                     buckets.push(TimeBucket {
                         bucket_start,
                         count: 0,
@@ -399,6 +425,8 @@ impl DetectionService {
             matches_by_bucket: buckets,
             bucket_size_seconds,
             execution_time_ms,
+            failed_windows,
+            error_sample,
         }
     }
 
@@ -462,20 +490,37 @@ impl DetectionService {
         for ev in &mut sample_events {
             crate::detection::normalize_match_event(ev);
         }
-        let total_matches = sample_events.len() as u64;
+        // Audit D35: the sample is capped at `max_events_per_alert` for display.
+        // While it isn't capped, its length IS the exact post-processing match
+        // count — correct even for `| where count > N` threshold rules that
+        // legitimately return few rows (so we must NOT substitute raw
+        // pre-aggregation volume here). Only when the sample hits the cap do we
+        // fall back to the uncapped SQL `total_count` so a high-volume rule isn't
+        // frozen at exactly the cap (`min(len, 100)`); clamp so we never
+        // under-report the sample.
+        let cap = self.config.max_events_per_alert;
+        let total_matches = if sample_events.len() < cap {
+            sample_events.len() as u64
+        } else {
+            response.total_count.max(sample_events.len() as u64)
+        };
 
         Ok(HistoricalAnalysisResult {
             rule_id: Uuid::nil(), // No rule ID for ad-hoc query
             rule_name: "Ad-hoc Query".to_string(),
             time_range,
-            // Use actual result count after all post-processing (stats, where, etc.)
-            // not total_count which is from SQL execution before in-memory processing
+            // Uncapped match count (audit D35): exact sample length until the
+            // display cap is hit, then the SQL total_count.
             total_matches,
             sample_events,
             matches_by_day,
             matches_by_bucket,
             bucket_size_seconds,
             execution_time_ms,
+            // Single-search path: a query failure returns Err directly, so no
+            // silent per-window swallowing to report (audit D3b).
+            failed_windows: 0,
+            error_sample: None,
         })
     }
 
@@ -602,11 +647,35 @@ pub fn enumerate_test_windows(
         DetectionError::InvalidCronExpression(format!("{}: {}", schedule_cron, e))
     })?;
 
+    // Audit D36: `Schedule::after` yields ticks strictly greater than its
+    // argument, so a tick landing exactly on `range.start` — which the
+    // production scheduler WOULD evaluate — was excluded. Probe from one second
+    // earlier (cron ticks are second-granular) and drop anything before
+    // `range.start`, so an on-boundary tick is included.
+    // `checked_sub` guards a chrono-min underflow — unreachable in practice
+    // (`validate_test_range` bounds live ranges to a 14-day window near now),
+    // but falling back to `range.start` degrades gracefully to the old
+    // strictly-after behavior rather than panicking.
+    let probe = range
+        .start
+        .checked_sub_signed(Duration::seconds(1))
+        .unwrap_or(range.start);
     let mut windows = Vec::new();
-    for tick in schedule.after(&range.start) {
+    for tick in schedule.after(&probe) {
+        if tick < range.start {
+            continue;
+        }
         if tick > range.end {
             break;
         }
+        // NOTE (audit D36, deferred): when `lookback > step` consecutive windows
+        // overlap, so an event in the overlap is counted in multiple windows —
+        // the stepped tester over-counts raw-event volume by ~lookback/step vs
+        // production, which dedups matched events across cycles. De-duplicating
+        // here means threading per-event ids through the concurrent evaluator
+        // (memory-bound for high-volume rules); tracked on NAN-1716 as a
+        // follow-up so the tester's per-window semantics aren't changed under a
+        // rushed pass.
         windows.push(TimeRangeInput::new(tick - lookback, tick));
     }
     Ok(windows)
@@ -764,16 +833,24 @@ mod tests {
 
     #[test]
     fn enumerate_test_windows_5min_step_15min_lookback() {
-        // 1-hour range, every 5 min, 15-min lookback → 12 windows. Each window
-        // ends at a tick and starts 15 min before. This is what the saturn
-        // bug case (`windows_failed_login_threshold`) would have evaluated.
+        // 1-hour range, every 5 min, 15-min lookback. Both the `12:00:00`
+        // boundary tick (audit D36) and the `13:00:00` end tick are inclusive →
+        // 13 windows. Each window ends at a tick and starts 15 min before. This
+        // is what the saturn bug case (`windows_failed_login_threshold`) would
+        // have evaluated.
         let start = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 0).unwrap();
         let end = Utc.with_ymd_and_hms(2026, 5, 5, 13, 0, 0).unwrap();
         let range = TimeRangeInput::new(start, end);
         let windows = enumerate_test_windows(&range, "*/5 * * * *", Duration::minutes(15))
             .expect("valid cron");
 
-        assert_eq!(windows.len(), 12, "12 ticks in a 1h window at 5min cadence");
+        assert_eq!(
+            windows.len(),
+            13,
+            "13 ticks in an inclusive 1h window at 5min cadence (12:00..=13:00)"
+        );
+        // First window ends exactly on the range start (the D36 boundary tick).
+        assert_eq!(windows[0].end, start);
         // Window ends advance by 5 min each.
         for pair in windows.windows(2) {
             let delta = pair[1].end - pair[0].end;
@@ -783,6 +860,37 @@ mod tests {
         for w in &windows {
             assert_eq!(w.end - w.start, Duration::minutes(15));
         }
+    }
+
+    #[test]
+    fn enumerate_test_windows_includes_boundary_start_tick() {
+        // Audit D36: a tick landing exactly on `range.start` must be included —
+        // `Schedule::after` alone (strictly-greater) dropped it. Here 12:00:00 is
+        // both the range start and an hourly tick.
+        let start = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 5, 5, 14, 0, 0).unwrap();
+        let range = TimeRangeInput::new(start, end);
+        let windows = enumerate_test_windows(&range, "0 * * * *", Duration::minutes(30))
+            .expect("valid cron");
+        // Inclusive on both ends: 12:00, 13:00, 14:00.
+        assert_eq!(windows.len(), 3);
+        assert_eq!(windows[0].end, start, "boundary start tick included");
+        assert_eq!(windows[2].end, end);
+    }
+
+    #[test]
+    fn enumerate_test_windows_offset_start_excludes_pre_start_tick() {
+        // When the range start is NOT on a tick, the 1-second probe must not
+        // pull in a tick before `range.start`.
+        let start = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 30).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 5, 5, 12, 2, 0).unwrap();
+        let range = TimeRangeInput::new(start, end);
+        let windows = enumerate_test_windows(&range, "* * * * *", Duration::minutes(1))
+            .expect("valid cron");
+        // Only 12:01:00 and 12:02:00 fall in [12:00:30, 12:02:00]; 12:00:00 is
+        // before the start and must be excluded.
+        assert_eq!(windows.len(), 2);
+        assert!(windows.iter().all(|w| w.end >= start && w.end <= end));
     }
 
     #[test]

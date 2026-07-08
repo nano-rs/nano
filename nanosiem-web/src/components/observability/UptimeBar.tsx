@@ -14,6 +14,7 @@
  */
 
 import type { SyntheticResult } from '@/lib/api/observability';
+import { parseUTCTimestamp } from '@/lib/date-utils';
 
 const CELLS = 90;
 
@@ -26,7 +27,9 @@ const TONE = {
 type Tone = keyof typeof TONE;
 
 function titleFor(r: SyntheticResult): string {
-  const when = new Date(r.ts);
+  // O12 (NAN-1721): backend `ts` is bare "YYYY-MM-DD HH:MM:SS" (no timezone) —
+  // parse it as UTC, not browser-local, before rendering the hover stamp.
+  const when = parseUTCTimestamp(r.ts);
   const stamp = Number.isNaN(when.getTime()) ? r.ts : when.toLocaleString();
   return `${r.success ? 'up' : 'down'} · ${Math.round(r.latency_ms)}ms · ${stamp}`;
 }

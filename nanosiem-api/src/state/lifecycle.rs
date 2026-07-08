@@ -5,12 +5,6 @@ use super::AppState;
 use std::sync::Arc;
 
 impl AppState {
-    /// Initialize the real-time evaluator by loading rules
-    pub async fn init_realtime_evaluator(&self) -> anyhow::Result<()> {
-        self.realtime_evaluator.load_rules().await?;
-        Ok(())
-    }
-
     /// Initialize and start the signal processor
     ///
     /// The signal processor polls ClickHouse for new signals (from materialized views)
@@ -86,84 +80,6 @@ impl AppState {
         ));
 
         scheduler.start()
-    }
-
-    /// Start the rule change listener for real-time cache invalidation.
-    ///
-    /// Listens on the PostgreSQL `rule_changes` channel. When a detection rule is
-    /// created, updated, or deleted on any node, the real-time evaluator reloads
-    /// its compiled rules, reducing cache inconsistency to milliseconds.
-    pub fn start_rule_change_listener(&self) -> tokio::task::JoinHandle<()> {
-        let pool = self.pool.clone();
-        let evaluator = self.realtime_evaluator.clone();
-
-        tokio::spawn(async move {
-            let mut backoff_secs = 1u64;
-
-            loop {
-                let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
-                    Ok(l) => {
-                        backoff_secs = 1; // reset on successful connect
-                        l
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to create PgListener for rule_changes: {}, retrying in {}s",
-                            e,
-                            backoff_secs
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
-                        backoff_secs = (backoff_secs * 2).min(60);
-                        continue;
-                    }
-                };
-
-                if let Err(e) = listener.listen("rule_changes").await {
-                    tracing::error!(
-                        "Failed to listen on rule_changes channel: {}, retrying in {}s",
-                        e,
-                        backoff_secs
-                    );
-                    tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
-                    backoff_secs = (backoff_secs * 2).min(60);
-                    continue;
-                }
-
-                tracing::info!("Listening for rule_changes notifications");
-
-                loop {
-                    match tokio::time::timeout(
-                        tokio::time::Duration::from_secs(300),
-                        listener.recv(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(notification)) => {
-                            tracing::debug!(
-                                payload = %notification.payload(),
-                                "Received rule_changes notification, reloading rules"
-                            );
-                            if let Err(e) = evaluator.load_rules().await {
-                                tracing::warn!("Failed to reload rules after notification: {}", e);
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!(
-                                "PgListener error on rule_changes: {}, reconnecting...",
-                                e
-                            );
-                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                            break; // break inner loop to reconnect
-                        }
-                        Err(_) => {
-                            // Timeout — no notifications in 5 minutes, reconnect to ensure connection is alive
-                            tracing::debug!("PgListener keepalive timeout, reconnecting");
-                            break;
-                        }
-                    }
-                }
-            }
-        })
     }
 
     /// Start the case change listener for real-time SSE notifications.
@@ -385,11 +301,19 @@ impl AppState {
             // Phase 3.3 (the agent_enrichment module + repository live in
             // nanosiem-enterprise).
             handles.push(self.start_enrichment_cache_cleanup());
+            // G2 (NAN-1749): reconciliation sweep that re-groups alerting-mode
+            // alerts left `case_id NULL` by a grouping failure/timeout. Gated to
+            // enterprise because open-core uses the no-op grouping hook, so its
+            // alerts are caseless by design and the sweep would scan them
+            // pointlessly every pass.
+            handles.push(self.start_ungrouped_alert_reconciliation());
+            tracing::info!("Ungrouped-alert reconciliation sweep started (leader-only, 5m tick)");
         }
         handles.push(self.start_rate_limit_cleanup());
         handles.push(self.start_query_tracker_cleanup());
         handles.push(self.start_search_job_cleanup());
-        handles.push(self.start_finding_emission_cleanup());
+        handles.push(self.start_detection_dedup_cleanup());
+        handles.push(self.start_prevalence_dict_health_monitor());
         tracing::info!("Cleanup tasks started (leader-only)");
 
         handles

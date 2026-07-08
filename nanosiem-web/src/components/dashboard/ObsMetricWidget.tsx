@@ -53,6 +53,25 @@ export function metricSeriesToRows(series: MetricSeries[]): Record<string, unkno
   return series.map((s) => ({ key: s.key, points: s.points }));
 }
 
+// Chronological comparator for bucket timestamps. metrics-v2 emits absolute
+// timestamps, so parse to epoch when possible; fall back to string order.
+function compareBucket(a: string, b: string): number {
+  const ta = Date.parse(a);
+  const tb = Date.parse(b);
+  if (!Number.isNaN(ta) && !Number.isNaN(tb)) return ta - tb;
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+// The union of every series' point timestamps, sorted chronologically. The
+// backend buckets all series on the same step but does NOT gap-fill, so a quiet
+// series simply omits buckets; the union axis lets us place each point by its
+// own `t` instead of by array index (DSH7).
+function unionBuckets(series: MetricSeries[]): string[] {
+  const set = new Set<string>();
+  for (const s of series) for (const p of s.points) set.add(p.t);
+  return Array.from(set).sort(compareBucket);
+}
+
 function fmtValue(v: number, unit?: string): string {
   const n =
     Math.abs(v) >= 10_000
@@ -99,9 +118,16 @@ export function ObsMetricWidget({ config, data }: ObsMetricWidgetProps) {
   }
 
   if (viz === 'toplist') {
-    // Rank series by their latest value (a "top values of group_by" list).
+    // Rank series by their value at the latest SHARED bucket (0 when the series
+    // isn't reporting there), so a series that stopped reporting drops instead
+    // of ranking high on a stale last-ever value. Because the backend buckets
+    // all series on the same step, aligning by timestamp is exact (DSH7).
+    const latest = unionBuckets(series).at(-1);
     const ranked = [...series]
-      .map((s) => ({ key: s.key, value: s.points.length ? s.points[s.points.length - 1].v : 0 }))
+      .map((s) => {
+        const pt = latest != null ? s.points.find((p) => p.t === latest) : undefined;
+        return { key: s.key, value: pt ? pt.v : 0 };
+      })
       .sort((a, b) => b.value - a.value)
       .slice(0, 20);
     const max = Math.max(1, ...ranked.map((r) => r.value));
@@ -128,17 +154,28 @@ export function ObsMetricWidget({ config, data }: ObsMetricWidgetProps) {
     );
   }
 
-  // Default: timeseries via the observability REDChart. Buckets come from the
-  // longest series; series points are aligned by index (the backend buckets all
-  // series on the same step, so indices line up).
-  const longest = series.reduce((a, b) => (b.points.length > a.points.length ? b : a), series[0]);
-  const buckets = longest.points.map((p) => p.t);
-  const redSeries: RedSeries[] = series.map((s, i) => ({
-    points: s.points.map((p) => p.v),
-    color: SERIES_COLORS[i % SERIES_COLORS.length],
-    label: s.key || config.metric_name,
-    fill: series.length === 1,
-  }));
+  // Default: timeseries via the observability REDChart. REDChart aligns every
+  // series positionally to ONE bucket axis (`series[0].points.length` / the
+  // shared `buckets` array), so we must resample each series onto the UNION of
+  // all timestamps and place each point by its own `t`. Aligning by array index
+  // (the old behavior) shifts a series that is missing early buckets, rendering
+  // its spikes at the wrong time (DSH7). REDChart can't draw true gaps and NaN
+  // would poison its y-scale, so absent buckets are filled with 0.
+  const buckets = unionBuckets(series);
+  const bucketIndex = new Map<string, number>(buckets.map((t, i): [string, number] => [t, i]));
+  const redSeries: RedSeries[] = series.map((s, i) => {
+    const points = new Array<number>(buckets.length).fill(0);
+    for (const p of s.points) {
+      const idx = bucketIndex.get(p.t);
+      if (idx !== undefined) points[idx] = p.v;
+    }
+    return {
+      points,
+      color: SERIES_COLORS[i % SERIES_COLORS.length],
+      label: s.key || config.metric_name,
+      fill: series.length === 1,
+    };
+  });
 
   return (
     <ResponsiveRedChart

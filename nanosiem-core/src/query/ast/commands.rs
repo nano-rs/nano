@@ -142,6 +142,15 @@ pub enum Command {
         show_count: bool,
         /// Show percent column
         show_percent: bool,
+        /// Append the canonical `min(timestamp) AS _first_seen` /
+        /// `max(timestamp) AS _last_seen` window bounds to the aggregate output
+        /// (NAN-1711 / audit D15). Set by detection query enrichment (never by
+        /// users) so top-rule findings dedup on `entity + _last_seen` instead of
+        /// re-hashing the drifting count/percent every cycle. Survives the
+        /// pretty_print → re-parse round-trip via the internal `_bounds=true`
+        /// token; defaults to false.
+        #[serde(default)]
+        inject_bounds: bool,
     },
     /// rare command: find least common values
     /// Syntax: rare [limit=N] field [by field1, field2]
@@ -156,6 +165,10 @@ pub enum Command {
         show_count: bool,
         /// Show percent column
         show_percent: bool,
+        /// Same as [`Command::Top::inject_bounds`]: canonical window bounds for
+        /// detection finding dedup (NAN-1711 / audit D15).
+        #[serde(default)]
+        inject_bounds: bool,
     },
     /// transaction command: group related events
     /// Syntax: transaction field [startswith=expr] [endswith=expr] [maxspan=duration]

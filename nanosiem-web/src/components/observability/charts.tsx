@@ -17,6 +17,7 @@
 
 import { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { GitCommit } from 'lucide-react';
+import { parseUTCTimestamp } from '@/lib/date-utils';
 
 // Track the rendered pixel width of a wrapper so SVG charts can size their
 // viewBox to match it 1:1. Without this, a fixed viewBox width stretched to
@@ -97,8 +98,12 @@ export function Sparkline({
 // ---------------------------------------------------------------------------
 
 export interface RedSeries {
-  /** Y values, one per bucket (must align with `buckets`). */
-  points: number[];
+  /**
+   * Y values, one per bucket (must align with `buckets` by index). `null` marks
+   * a gap (no data for that bucket) — the line breaks and the area drops out
+   * there rather than interpolating across the hole.
+   */
+  points: Array<number | null>;
   /** Stroke color (CSS color or var). */
   color: string;
   /** Legend / tooltip label. */
@@ -134,7 +139,10 @@ const niceStep = (v: number): number => {
 };
 
 const hhmm = (ts: number | string): string => {
-  const d = new Date(ts);
+  // Numbers are epoch-ms (timezone-agnostic); strings are backend timestamps
+  // WITHOUT a zone suffix, which `new Date()` would misread as local time.
+  // Route the string case through parseUTCTimestamp so labels stay in UTC (O12).
+  const d = typeof ts === 'number' ? new Date(ts) : parseUTCTimestamp(ts);
   if (Number.isNaN(d.getTime())) return '';
   const p = (x: number) => String(x).padStart(2, '0');
   return `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
@@ -158,10 +166,83 @@ export function REDChart({
   const PB = 22;
   const cw = W - PL - PR;
   const ch = H - PT - PB;
-  const n = series[0]?.points.length || 1;
-  const max = Math.max(1, ...series.flatMap((s) => s.points));
-  const X = (i: number) => PL + (cw * i) / Math.max(1, n - 1);
+  const n = Math.max(...series.map((s) => s.points.length), 1);
+  const max = Math.max(
+    1,
+    ...series.flatMap((s) => s.points).filter((v): v is number => v != null && Number.isFinite(v)),
+  );
+
+  // Position each bucket by its TIMESTAMP across the data's time domain, not by
+  // array index. Metrics-v2 (and the RED aggregations) emit only buckets that
+  // have data — index spacing would compress outage gaps into a seamless line
+  // and make the x-axis nonlinear in time (O11 / O35). Numeric buckets are
+  // epoch-ms; string buckets are zone-less backend timestamps parsed as UTC.
+  const bucketTs = useMemo(
+    () => buckets.map((b) => (typeof b === 'number' ? b : parseUTCTimestamp(b).getTime())),
+    [buckets],
+  );
+  const [t0, t1] = useMemo<[number, number]>(() => {
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const t of bucketTs) {
+      if (!Number.isFinite(t)) continue;
+      if (t < lo) lo = t;
+      if (t > hi) hi = t;
+    }
+    return Number.isFinite(lo) ? [lo, hi] : [0, 1];
+  }, [bucketTs]);
+  const tspan = Math.max(1, t1 - t0);
+  // Fall back to index spacing only for degenerate domains (single/equal bucket
+  // times, or an unparseable bucket) so a lone point still lands on the axis.
+  const X = (i: number) => {
+    const t = bucketTs[i];
+    if (t1 === t0 || !Number.isFinite(t)) return PL + (cw * i) / Math.max(1, n - 1);
+    return PL + ((t - t0) / tspan) * cw;
+  };
   const Y = (v: number) => PT + ch - (v / max) * ch;
+
+  // Build a line path that BREAKS at null gaps (starts a fresh subpath after a
+  // hole) instead of drawing a straight segment across missing buckets.
+  const linePath = (points: Array<number | null>): string => {
+    let d = '';
+    let pen = false;
+    points.forEach((v, i) => {
+      if (v == null || !Number.isFinite(v)) {
+        pen = false;
+        return;
+      }
+      d += `${d ? ' ' : ''}${pen ? 'L' : 'M'} ${X(i).toFixed(1)},${Y(v).toFixed(1)}`;
+      pen = true;
+    });
+    return d;
+  };
+
+  // Area fill as one closed polygon per contiguous run of real points, each
+  // dropped to the zero baseline — so gaps read as empty, not filled-through.
+  const areaPath = (points: Array<number | null>): string => {
+    const baseY = Y(0).toFixed(1);
+    let d = '';
+    let run: number[] = [];
+    const flush = () => {
+      if (run.length === 0) return;
+      const first = run[0];
+      const last = run[run.length - 1];
+      let seg = `M ${X(first).toFixed(1)},${baseY}`;
+      for (const i of run) seg += ` L ${X(i).toFixed(1)},${Y(points[i] as number).toFixed(1)}`;
+      seg += ` L ${X(last).toFixed(1)},${baseY} Z`;
+      d += (d ? ' ' : '') + seg;
+      run = [];
+    };
+    points.forEach((v, i) => {
+      if (v == null || !Number.isFinite(v)) {
+        flush();
+        return;
+      }
+      run.push(i);
+    });
+    flush();
+    return d;
+  };
 
   const yTicks = useMemo(() => {
     const step = niceStep(max / 3);
@@ -178,7 +259,17 @@ export function REDChart({
     if (!svg) return;
     const r = svg.getBoundingClientRect();
     const mx = ((e.clientX - r.left) / r.width) * W;
-    const idx = Math.max(0, Math.min(n - 1, Math.round(((mx - PL) / cw) * (n - 1))));
+    // Nearest bucket by x-position — buckets are time-spaced, not index-spaced,
+    // so map the cursor to the closest one rather than assuming uniform steps.
+    let idx = 0;
+    let best = Infinity;
+    for (let i = 0; i < n; i += 1) {
+      const dx = Math.abs(X(i) - mx);
+      if (dx < best) {
+        best = dx;
+        idx = i;
+      }
+    }
     setHover({ idx });
   };
 
@@ -206,12 +297,12 @@ export function REDChart({
           </text>
         ))}
         {series.map((s, si) => {
-          const pts = s.points.map((v, i) => `${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join(' L ');
+          const line = linePath(s.points);
           return (
             <g key={si}>
-              {s.fill && <path d={`M ${PL},${Y(0)} L ${pts} L ${X(n - 1)},${Y(0)} Z`} fill={s.color} opacity="0.12" />}
+              {s.fill && <path d={areaPath(s.points)} fill={s.color} opacity="0.12" />}
               <path
-                d={`M ${pts}`}
+                d={line}
                 fill="none"
                 stroke={s.color}
                 strokeWidth={s.dashed ? 1.1 : 1.6}
@@ -238,9 +329,13 @@ export function REDChart({
         {hover && (
           <g>
             <line x1={X(hover.idx)} y1={PT} x2={X(hover.idx)} y2={H - PB} stroke="var(--color-fg)" strokeOpacity="0.25" />
-            {series.map((s, si) => (
-              <circle key={si} cx={X(hover.idx)} cy={Y(s.points[hover.idx])} r="2.6" fill="var(--color-bg)" stroke={s.color} strokeWidth="1.4" />
-            ))}
+            {series.map((s, si) => {
+              const v = s.points[hover.idx];
+              if (v == null || !Number.isFinite(v)) return null;
+              return (
+                <circle key={si} cx={X(hover.idx)} cy={Y(v)} r="2.6" fill="var(--color-bg)" stroke={s.color} strokeWidth="1.4" />
+              );
+            })}
           </g>
         )}
       </svg>
@@ -248,7 +343,7 @@ export function REDChart({
         <div
           key={'ml' + i}
           className="absolute pointer-events-none z-20 -translate-x-1/2"
-          style={{ left: `${((PL + (cw * m.idx) / Math.max(1, n - 1)) / W) * 100}%`, top: 1 }}
+          style={{ left: `${(X(m.idx) / W) * 100}%`, top: 1 }}
         >
           <span className="inline-flex items-center gap-1 px-1 py-px rounded-[2px] bg-foreground/10 border border-border text-[8.5px] font-mono text-fg-2 whitespace-nowrap">
             <GitCommit className="w-[8px] h-[8px]" />
@@ -259,19 +354,22 @@ export function REDChart({
       {hover && (
         <div
           className="absolute pointer-events-none z-30 rounded-md border border-border-2 bg-card/95 backdrop-blur px-2.5 py-1.5 text-[11px] shadow-lg min-w-[150px]"
-          style={{ left: `min(calc(100% - 160px), ${(hover.idx / Math.max(1, n - 1)) * 100}%)`, top: 4 }}
+          style={{ left: `min(calc(100% - 160px), ${(X(hover.idx) / W) * 100}%)`, top: 4 }}
         >
           <div className="font-mono text-fg-3 mb-1 text-[10px]">{hhmm(buckets[hover.idx])}</div>
-          {series.map((s, si) => (
-            <div key={si} className="flex items-center gap-1.5 leading-tight">
-              <span className="w-2 h-2 rounded-sm shrink-0" style={{ background: s.color }} />
-              <span className="text-fg-2 flex-1">{s.label}</span>
-              <span className="font-mono text-fg tabular-nums">
-                {yFmt(s.points[hover.idx])}
-                {unit}
-              </span>
-            </div>
-          ))}
+          {series.map((s, si) => {
+            const v = s.points[hover.idx];
+            const gap = v == null || !Number.isFinite(v);
+            return (
+              <div key={si} className="flex items-center gap-1.5 leading-tight">
+                <span className="w-2 h-2 rounded-sm shrink-0" style={{ background: s.color }} />
+                <span className="text-fg-2 flex-1">{s.label}</span>
+                <span className="font-mono text-fg tabular-nums">
+                  {gap ? '–' : `${yFmt(v)}${unit}`}
+                </span>
+              </div>
+            );
+          })}
         </div>
       )}
     </div>

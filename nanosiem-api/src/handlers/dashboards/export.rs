@@ -141,6 +141,15 @@ pub async fn import_dashboard(
             .build(),
     );
 
+    // DSH17: mirror `create_dashboard` — register the imported dashboard for
+    // demo-session cleanup / isolation. Without this, a demo user's imported
+    // dashboards outlive the session and are invisible to the exclude-list.
+    state.track_demo_resource(
+        auth.user_id(),
+        nanosiem_core::demo::DemoResourceType::Dashboard,
+        dashboard.id,
+    );
+
     Ok(Json(dashboard))
 }
 
@@ -150,27 +159,34 @@ pub async fn import_dashboard(
 
 /// Validate a dashboard export structure
 fn validate_dashboard_export(export: &DashboardExport) -> Result<(), ApiError> {
-    // Check version
-    if export.version.is_empty() {
-        return Err(ApiError::ValidationError(
-            "Export version is required".to_string(),
-        ));
+    // DSH44: reject a MAJOR-version mismatch so a newer export doesn't import as
+    // the current schema with dropped/renamed fields (and `deny_unknown_fields`
+    // on the export structs catches structural additions within the major).
+    // Previously any non-empty string was accepted.
+    const SUPPORTED_MAJOR_VERSION: u32 = 1;
+    match export
+        .version
+        .split('.')
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        Some(SUPPORTED_MAJOR_VERSION) => {}
+        Some(_) => {
+            return Err(ApiError::ValidationError(format!(
+                "Unsupported export version '{}': this deployment imports version {}.x dashboards",
+                export.version, SUPPORTED_MAJOR_VERSION
+            )));
+        }
+        None => {
+            return Err(ApiError::ValidationError(format!(
+                "Invalid export version '{}'",
+                export.version
+            )));
+        }
     }
 
-    // Check dashboard name
-    let name = export.dashboard.name.trim();
-    if name.is_empty() {
-        return Err(ApiError::ValidationError(
-            "Dashboard name cannot be empty".to_string(),
-        ));
-    }
-    if name.len() > MAX_NAME_LENGTH {
-        return Err(ApiError::ValidationError(format!(
-            "Dashboard name too long: {} chars (max {})",
-            name.len(),
-            MAX_NAME_LENGTH
-        )));
-    }
+    // Name + panels + layout share the create/update validators (DSH14).
+    validate_dashboard_name(&export.dashboard.name)?;
 
     // Check description length
     if let Some(ref desc) = export.dashboard.description {
@@ -183,15 +199,84 @@ fn validate_dashboard_export(export: &DashboardExport) -> Result<(), ApiError> {
         }
     }
 
-    // Validate layout is an object
-    if !export.dashboard.layout.is_object() {
+    validate_layout(&export.dashboard.layout)?;
+    validate_panels(&export.dashboard.panels)?;
+
+    Ok(())
+}
+
+/// Validate a dashboard name (non-empty after trim, within `MAX_NAME_LENGTH`).
+///
+/// DSH14: shared by create / update / import so all three enforce the same
+/// limits and the product's own export round-trips.
+pub(super) fn validate_dashboard_name(name: &str) -> Result<(), ApiError> {
+    let name = name.trim();
+    if name.is_empty() {
         return Err(ApiError::ValidationError(
-            "Dashboard layout must be an object".to_string(),
+            "Dashboard name cannot be empty".to_string(),
         ));
     }
+    if name.len() > MAX_NAME_LENGTH {
+        return Err(ApiError::ValidationError(format!(
+            "Dashboard name too long: {} chars (max {})",
+            name.len(),
+            MAX_NAME_LENGTH
+        )));
+    }
+    Ok(())
+}
 
-    // Validate panels is an array
-    let panels = export.dashboard.panels.as_array().ok_or_else(|| {
+/// Validate the dashboard layout structurally (DSH14/DSH16).
+///
+/// The layout must be an object with an `items` array of `{i,x,y,w,h}` objects,
+/// and `variables` (if present) must be an array — exactly what `DashboardView`
+/// iterates/positions on. A malformed layout that passed the old
+/// `is_object()`-only check (e.g. `{}` or `variables: {}`) crashed the page at
+/// render time.
+pub(super) fn validate_layout(layout: &serde_json::Value) -> Result<(), ApiError> {
+    let obj = layout.as_object().ok_or_else(|| {
+        ApiError::ValidationError("Dashboard layout must be an object".to_string())
+    })?;
+
+    let items = obj
+        .get("items")
+        .ok_or_else(|| {
+            ApiError::ValidationError("Dashboard layout is missing 'items'".to_string())
+        })?
+        .as_array()
+        .ok_or_else(|| {
+            ApiError::ValidationError("Dashboard layout.items must be an array".to_string())
+        })?;
+
+    for (i, item) in items.iter().enumerate() {
+        let item = item.as_object().ok_or_else(|| {
+            ApiError::ValidationError(format!("Layout item {} must be an object", i))
+        })?;
+        for key in ["i", "x", "y", "w", "h"] {
+            if !item.contains_key(key) {
+                return Err(ApiError::ValidationError(format!(
+                    "Layout item {} is missing '{}'",
+                    i, key
+                )));
+            }
+        }
+    }
+
+    if let Some(vars) = obj.get("variables") {
+        if !vars.is_array() {
+            return Err(ApiError::ValidationError(
+                "Dashboard layout.variables must be an array".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate the dashboard panels array (DSH14/DSH43): array shape, count cap,
+/// per-panel structure, and unique panel ids.
+pub(super) fn validate_panels(panels: &serde_json::Value) -> Result<(), ApiError> {
+    let panels = panels.as_array().ok_or_else(|| {
         ApiError::ValidationError("Dashboard panels must be an array".to_string())
     })?;
 
@@ -204,16 +289,26 @@ fn validate_dashboard_export(export: &DashboardExport) -> Result<(), ApiError> {
         )));
     }
 
-    // Validate each panel structure
+    // DSH43: panel ids must be unique. `GridLayout` keys panels by id (last
+    // wins) and `DashboardView` keys fetch state by id, so duplicates drop
+    // panels / render the wrong panel in multiple slots.
+    let mut seen_ids = std::collections::HashSet::new();
     for (i, panel) in panels.iter().enumerate() {
-        validate_panel(panel, i)?;
+        let id = validate_panel(panel, i)?;
+        if !seen_ids.insert(id.clone()) {
+            return Err(ApiError::ValidationError(format!(
+                "Duplicate panel id '{}'",
+                id
+            )));
+        }
     }
 
     Ok(())
 }
 
-/// Validate an individual panel structure
-fn validate_panel(panel: &serde_json::Value, index: usize) -> Result<(), ApiError> {
+/// Validate an individual panel structure, returning its id (for the caller's
+/// uniqueness check).
+fn validate_panel(panel: &serde_json::Value, index: usize) -> Result<String, ApiError> {
     let obj = panel
         .as_object()
         .ok_or_else(|| ApiError::ValidationError(format!("Panel {} must be an object", index)))?;
@@ -255,8 +350,10 @@ fn validate_panel(panel: &serde_json::Value, index: usize) -> Result<(), ApiErro
         }
     }
 
-    // Validate query_mode if present
-    if let Some(mode) = obj.get("query_mode").and_then(|v| v.as_str()) {
+    // DSH15: real panels are camelCase (`queryMode`/`visualizationType`). The
+    // previous snake_case lookups (`query_mode`/`visualization_type`) never
+    // matched any app-produced panel, so the whitelist was a dead no-op.
+    if let Some(mode) = obj.get("queryMode").and_then(|v| v.as_str()) {
         if !VALID_QUERY_MODES.contains(&mode) {
             return Err(ApiError::ValidationError(format!(
                 "Panel {} has invalid query_mode '{}'. Valid modes: {:?}",
@@ -265,8 +362,7 @@ fn validate_panel(panel: &serde_json::Value, index: usize) -> Result<(), ApiErro
         }
     }
 
-    // Validate visualization_type if present
-    if let Some(viz_type) = obj.get("visualization_type").and_then(|v| v.as_str()) {
+    if let Some(viz_type) = obj.get("visualizationType").and_then(|v| v.as_str()) {
         if !VALID_VIZ_TYPES.contains(&viz_type) {
             return Err(ApiError::ValidationError(format!(
                 "Panel {} has invalid visualization_type '{}'. Valid types: {:?}",
@@ -275,7 +371,7 @@ fn validate_panel(panel: &serde_json::Value, index: usize) -> Result<(), ApiErro
         }
     }
 
-    Ok(())
+    Ok(id.to_string())
 }
 
 #[cfg(test)]
@@ -290,7 +386,8 @@ mod tests {
             dashboard: DashboardExportData {
                 name: name.to_string(),
                 description: None,
-                layout: serde_json::json!({}),
+                // DSH16: layout must carry an `items` array.
+                layout: serde_json::json!({ "items": [] }),
                 panels: serde_json::Value::Array(panels),
                 refresh_interval: None,
             },
@@ -298,12 +395,13 @@ mod tests {
     }
 
     fn make_valid_panel(id: &str) -> serde_json::Value {
+        // DSH15: panels the app produces are camelCase.
         serde_json::json!({
             "id": id,
             "title": "Test Panel",
             "query": "* | stats count()",
-            "query_mode": "piped",
-            "visualization_type": "bar"
+            "queryMode": "piped",
+            "visualizationType": "bar"
         })
     }
 
@@ -368,7 +466,7 @@ mod tests {
     fn test_validate_panel_invalid_viz_type() {
         let panel = serde_json::json!({
             "id": "panel-1",
-            "visualization_type": "invalid_type"
+            "visualizationType": "invalid_type"
         });
         let result = validate_panel(&panel, 0);
         assert!(result.is_err());
@@ -382,7 +480,7 @@ mod tests {
     fn test_validate_panel_invalid_query_mode() {
         let panel = serde_json::json!({
             "id": "panel-1",
-            "query_mode": "graphql"
+            "queryMode": "graphql"
         });
         let result = validate_panel(&panel, 0);
         assert!(result.is_err());

@@ -42,6 +42,7 @@ pub mod credentials;
 pub use nanosiem_enterprise::handlers::custom_enrichment;
 pub mod dashboards;
 pub mod demo;
+pub mod detection_code_targets;
 pub mod detections;
 pub mod enrichment;
 // Entity context handler — lifted to nanosiem-enterprise in NAN-752 (Phase

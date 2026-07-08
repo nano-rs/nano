@@ -12,10 +12,13 @@
 // brings its own header (back / title / id / "Logs for this trace" pivot) and
 // meta strip, so the page is just the data fetch + a padded wrapper.
 
+import { useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { Loader2 } from 'lucide-react';
 import { api } from '@/lib/api';
+import type { CacheMeta } from '@/lib/api';
+import { CachedNotice } from '@/components/search/CachedNotice';
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
 import { useBreadcrumbTitle } from '@/hooks/useBreadcrumbTitle';
 import { TraceWaterfall } from '@/components/observability/TraceWaterfall';
@@ -27,11 +30,29 @@ export function TracePage() {
   useDocumentTitle('Trace');
   useBreadcrumbTitle(traceId ? `Trace ${traceId.slice(0, 12)}…` : 'Trace');
 
-  const { data, isLoading, error } = useQuery({
+  // NAN-1721 (O36): the trace fetch is server-cached (x-nano-cache). Surface the
+  // "cached · refresh" badge and let a refresh force a live refetch. Goes via
+  // api.observability.getTrace, the getTrace variant that threads cacheOpts.
+  const [cacheMeta, setCacheMeta] = useState<CacheMeta | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const bypassRef = useRef(false);
+
+  const { data, isLoading, error, refetch } = useQuery({
     queryKey: ['otel-trace', traceId],
-    queryFn: () => api.getTrace(traceId),
+    queryFn: () => {
+      const bypass = bypassRef.current;
+      bypassRef.current = false;
+      return api.observability.getTrace(traceId, { onMeta: setCacheMeta, bypass });
+    },
     enabled: traceId.length > 0,
   });
+
+  const refresh = () => {
+    if (refreshing) return;
+    bypassRef.current = true;
+    setRefreshing(true);
+    void refetch().finally(() => setRefreshing(false));
+  };
 
   const spans = data?.spans ?? [];
 
@@ -50,7 +71,15 @@ export function TracePage() {
           No spans found for this trace.
         </div>
       ) : (
-        <TraceWaterfall traceId={traceId} spans={spans} onBack={() => navigate(-1)} backLabel="Back" />
+        <TraceWaterfall
+          traceId={traceId}
+          spans={spans}
+          onBack={() => navigate(-1)}
+          backLabel="Back"
+          cacheNotice={
+            <CachedNotice meta={cacheMeta} onRefresh={refresh} refreshing={refreshing} />
+          }
+        />
       )}
     </div>
   );

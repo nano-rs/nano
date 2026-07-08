@@ -229,10 +229,17 @@ impl PrettyPrint for Command {
                 by_fields,
                 show_count: _,
                 show_percent: _,
+                inject_bounds,
             } => {
                 let mut result = format!("top limit={} {}", limit, field);
                 if !by_fields.is_empty() {
                     result.push_str(&format!(" by {}", by_fields.join(", ")));
+                }
+                if *inject_bounds {
+                    // Internal token (NAN-1711 / audit D15): keeps the detection
+                    // enrichment's canonical-window flag alive across the
+                    // pretty_print → re-parse round-trip in evaluate_window.
+                    result.push_str(" _bounds=true");
                 }
                 result
             }
@@ -242,10 +249,15 @@ impl PrettyPrint for Command {
                 by_fields,
                 show_count: _,
                 show_percent: _,
+                inject_bounds,
             } => {
                 let mut result = format!("rare limit={} {}", limit, field);
                 if !by_fields.is_empty() {
                     result.push_str(&format!(" by {}", by_fields.join(", ")));
+                }
+                if *inject_bounds {
+                    // Internal token (NAN-1711 / audit D15) — see the `top` arm.
+                    result.push_str(" _bounds=true");
                 }
                 result
             }

@@ -9,6 +9,10 @@ import { useState, useEffect, useCallback } from 'react';
 
 const STORAGE_KEY = 'nanosiem_recently_viewed_dashboards';
 const MAX_RECENT_DASHBOARDS = 10;
+// DSH48: same-tab change signal. `storage` events only fire in OTHER tabs, so a
+// custom event keeps co-mounted hook instances (e.g. the Dashboards list and a
+// mounted DashboardView) in sync when one of them writes.
+const CHANGE_EVENT = 'nanosiem:recent-dashboards-changed';
 
 export interface RecentDashboard {
   id: string;
@@ -46,6 +50,14 @@ function saveStoredDashboards(dashboards: RecentDashboard[]): void {
   } catch {
     // Ignore storage errors (e.g., quota exceeded)
   }
+  // DSH48: notify other hook instances in this tab to re-read. Deferred to a
+  // microtask because this runs inside a `setRecentDashboards` updater — a
+  // synchronous dispatch would setState on a sibling instance mid-render.
+  try {
+    queueMicrotask(() => window.dispatchEvent(new CustomEvent(CHANGE_EVENT)));
+  } catch {
+    // Ignore (non-browser env / no microtask support)
+  }
 }
 
 /**
@@ -54,9 +66,18 @@ function saveStoredDashboards(dashboards: RecentDashboard[]): void {
 export function useRecentlyViewedDashboards() {
   const [recentDashboards, setRecentDashboards] = useState<RecentDashboard[]>([]);
 
-  // Load from localStorage on mount
+  // Load from localStorage on mount, then keep this instance reconciled with
+  // writes from sibling instances (same tab via CHANGE_EVENT) and other tabs
+  // (native `storage` event) — DSH48.
   useEffect(() => {
-    setRecentDashboards(getStoredDashboards());
+    const resync = () => setRecentDashboards(getStoredDashboards());
+    resync();
+    window.addEventListener(CHANGE_EVENT, resync);
+    window.addEventListener('storage', resync);
+    return () => {
+      window.removeEventListener(CHANGE_EVENT, resync);
+      window.removeEventListener('storage', resync);
+    };
   }, []);
 
   /**

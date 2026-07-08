@@ -138,7 +138,7 @@ export interface ServiceDetailResponse {
 // ---------------------------------------------------------------------------
 
 export type SloKind = 'availability' | 'latency';
-export type SloStatus = 'ok' | 'at_risk' | 'breaching';
+export type SloStatus = 'ok' | 'at_risk' | 'breaching' | 'no_data';
 
 /** A service-level objective with its currently-computed budget figures. */
 export interface Slo {
@@ -291,8 +291,11 @@ export interface ServiceSecuritySignal {
 export interface ServiceSecuritySignalsResponse {
   /** Distinct service hosts/IPs the lookup was scoped to. */
   host_count: number;
-  /** Total detections matched over the window (may exceed `signals.length`). */
+  /** Detections in the returned sample (bounded by `limit`, == `signals.length`). */
   signal_count: number;
+  /** True total matched over the window (unbounded); may exceed `signal_count`
+   * when the sample is `limit`-capped. Drives "+N more in range" (O54). */
+  signal_total: number;
   /** Bounded recent sample, newest-first. */
   signals: ServiceSecuritySignal[];
 }
@@ -334,8 +337,13 @@ export interface SyntheticCheck {
   expected_status: number;
   timeout_secs: number;
   enabled: boolean;
-  /** Uptime over the summary window, as a percentage (0..100). */
-  uptime_pct: number;
+  /** Whether the check has any recorded runs in the summary window. When
+   * false, uptime/latency are null and the check renders as neutral "no data"
+   * rather than a 0% "down" (O33). */
+  has_runs: boolean;
+  /** Uptime over the summary window, as a percentage (0..100). Null when the
+   * check has no recorded runs (`has_runs === false`). */
+  uptime_pct: number | null;
   /** Median latency over the summary window (ms). */
   p50_latency_ms: number | null;
   /** Last ~90 runs, oldest→newest, for the uptime bar. */
@@ -384,7 +392,6 @@ export class ObservabilityApi {
       request: ListTracesRequest,
       cacheOpts?: import('./index').CacheRequestOpts
     ) => Promise<ListTracesResponse>,
-    private getTraceImpl: (traceId: string) => Promise<TraceResponse>,
     private listMetricNamesImpl: (service?: string) => Promise<MetricNamesResponse>,
     private queryMetricsImpl: (request: MetricsQueryRequest) => Promise<MetricsQueryResponse>,
     // NAN-1540: multi-series metrics (agg / group_by / filters) + tag discovery,
@@ -562,8 +569,26 @@ export class ObservabilityApi {
     return this.listTracesImpl(request, cacheOpts);
   }
 
-  getTrace(traceId: string): Promise<TraceResponse> {
-    return this.getTraceImpl(traceId);
+  /**
+   * Fetch a distributed trace by id (NAN-1721 / O36).
+   *
+   * Threads `cacheOpts` so the trace surfaces (Traces-tab waterfall, TracePage,
+   * the `| trace` command page) can render the "cached · refresh" badge and
+   * force a live refetch — the GET is Dragonfly-cached (`x-nano-cache*`) like
+   * every other obs read. Goes through `this.request` directly (rather than the
+   * `getTraceImpl` passthrough, which can't forward cacheOpts) so the cache
+   * headers reach the `onMeta` callback; the URL/behavior is identical to the
+   * SearchApi passthrough.
+   */
+  getTrace(
+    traceId: string,
+    cacheOpts?: import('./index').CacheRequestOpts
+  ): Promise<TraceResponse> {
+    return this.request(
+      `/api/search/trace/${encodeURIComponent(traceId)}`,
+      undefined,
+      cacheOpts
+    );
   }
 
   listMetricNames(service?: string): Promise<MetricNamesResponse> {

@@ -97,6 +97,32 @@ impl NotebookRepository {
         Ok(())
     }
 
+    /// Delete a reference only if it belongs to the specified notebook.
+    ///
+    /// NAN-1739: the unscoped `delete_reference` let a caller who could edit
+    /// notebook A delete a reference belonging to notebook B (cross-notebook
+    /// IDOR). Callers that have already authorized edit access to
+    /// `notebook_id` must use this scoped variant. Mirrors
+    /// `delete_entry_in_notebook` / `delete_share_in_notebook`.
+    pub async fn delete_reference_in_notebook(
+        &self,
+        notebook_id: Uuid,
+        reference_id: Uuid,
+    ) -> Result<(), NotebookRepositoryError> {
+        let result =
+            sqlx::query(r#"DELETE FROM notebook_references WHERE id = $1 AND notebook_id = $2"#)
+                .bind(reference_id)
+                .bind(notebook_id)
+                .execute(&self.pool)
+                .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(NotebookRepositoryError::ReferenceNotFound(reference_id));
+        }
+
+        Ok(())
+    }
+
     /// Find notebooks that reference a specific entity
     pub async fn find_notebooks_referencing(
         &self,
@@ -123,9 +149,30 @@ impl NotebookRepository {
             WHERE nr.reference_type = $1 AND nr.reference_id = $2
               AND (
                   n.owner_id = $3
-                  OR n.visibility = 'public'
+                  -- NAN-1739: case notebooks are visibility='public'; the
+                  -- public disjunct only frees non-case notebooks, case
+                  -- notebooks are governed by case visibility so this lookup
+                  -- can't hand a case notebook to a user who can't see the case.
+                  OR (n.case_id IS NULL AND n.visibility = 'public')
                   OR ns.shared_with_user_id = $3
                   OR ug.user_id IS NOT NULL
+                  OR (
+                      n.case_id IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1 FROM cases c
+                          WHERE c.id = n.case_id
+                            AND (
+                                c.created_by = $3
+                                OR c.assigned_to = $3
+                                OR c.visibility = 'public'
+                                OR (c.visibility = 'group' AND EXISTS (
+                                    SELECT 1 FROM case_groups cg
+                                    JOIN user_groups cug ON cug.group_id = cg.group_id
+                                    WHERE cg.case_id = c.id AND cug.user_id = $3
+                                ))
+                            )
+                      )
+                  )
               )
             ORDER BY n.updated_at DESC
             "#,

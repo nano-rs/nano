@@ -132,14 +132,19 @@ pub async fn sync_ipinfo(
                         duration_ms = result.duration_ms,
                         "IPinfo Lite sync completed successfully"
                     );
-                    // Reload ClickHouse dictionary so new enrichment data takes effect immediately
+                    // Reload ClickHouse dictionary so new enrichment data takes effect immediately.
+                    // ON CLUSTER when clustered so every node's dict reloads, not
+                    // just the node this connection landed on (NAN-1728 H3);
+                    // `on_cluster_clause()` is empty on single-node → identical DDL.
+                    // TODO(NAN-1728 H3 follow-up): dict reads staging refreshed on
+                    // a schedule — a REFRESH VIEW (+ WAIT) before reload would make
+                    // the freshly synced CIDRs visible immediately. Deferred.
                     {
-                        if let Err(e) = dual_pool
-                            .clickhouse()
-                            .query("SYSTEM RELOAD DICTIONARY nanosiem.ip_enrichment_dict")
-                            .execute()
-                            .await
-                        {
+                        let reload_sql = format!(
+                            "SYSTEM RELOAD DICTIONARY{on_cluster} nanosiem.ip_enrichment_dict",
+                            on_cluster = nanosiem_core::db::dual_pool::on_cluster_clause()
+                        );
+                        if let Err(e) = dual_pool.clickhouse().query(&reload_sql).execute().await {
                             tracing::warn!("Failed to reload ip_enrichment_dict: {}", e);
                         } else {
                             tracing::info!("Reloaded ip_enrichment_dict after sync");

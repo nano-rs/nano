@@ -20,7 +20,6 @@ pub mod event_envelope;
 pub mod findings;
 pub mod materialized_view;
 pub mod query_enrichment;
-pub mod realtime;
 pub mod risk;
 pub mod scheduler;
 pub mod service;
@@ -34,7 +33,6 @@ pub use distributed_scheduler::{
 pub use error::DetectionError;
 pub use findings::{FindingEvent, FindingLogError, FindingLogger, FindingType};
 pub use materialized_view::{MaterializedViewError, MaterializedViewGenerator};
-pub use realtime::{RealtimeConfig, RealtimeEvaluator};
 pub use risk::{RiskError, RiskModifier, RiskResult, ScoreCalculator};
 pub use scheduler::{calculate_next_run_with_jitter, validate_cron_expression};
 pub use service::{

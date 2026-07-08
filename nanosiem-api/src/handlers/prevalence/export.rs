@@ -13,6 +13,7 @@ use tracing::error;
 use crate::middleware::{AuthContext, check_permission};
 use crate::state::AppState;
 use nanosiem_core::auth::permissions;
+use nanosiem_core::prevalence::PrevalenceError;
 
 use super::types::ExportQuery;
 use super::{MAX_EXPORT_ARTIFACTS, parse_artifact_type, parse_time_window};
@@ -68,9 +69,13 @@ pub async fn export_prevalence(
     let artifacts = prevalence_service
         .get_rare_artifacts(artifact_type, time_window, MAX_EXPORT_ARTIFACTS as i64)
         .await
-        .map_err(|e| {
-            error!("Failed to get artifacts for export: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        .map_err(|e| match e {
+            // NAN-1729 (P2-B): a too-wide IP window is a client error, not a 500.
+            PrevalenceError::WindowNotViable(msg) => (StatusCode::BAD_REQUEST, msg),
+            other => {
+                error!("Failed to get artifacts for export: {}", other);
+                (StatusCode::INTERNAL_SERVER_ERROR, other.to_string())
+            }
         })?;
 
     // Filter by max_prevalence

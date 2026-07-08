@@ -93,7 +93,7 @@ async fn collect_ingestion_metrics(
         }
     }
 
-    let insert_integrity = collect_insert_integrity(ch).await;
+    let insert_integrity = collect_insert_integrity(ch, is_clustered).await;
 
     info!(
         "Collected ingestion metrics: {} source types, {} events (24h), {} silent sources, {} unhealthy logs dicts",
@@ -112,17 +112,61 @@ async fn collect_ingestion_metrics(
     }
 }
 
+/// The `system.<table>` source for an insert-integrity probe: wrapped in
+/// `clusterAllReplicas('<cluster>', system.<table>)` on a clustered deployment
+/// (so every shard's node-local system tables are read), or plain
+/// `system.<table>` on single-node — byte-identical to the pre-cluster SQL.
+///
+/// NAN-1728 (M-3): `system.*` tables are node-local. Reading only the connected
+/// node (a) can pair the NAN-1404 inserts-vs-parts correlation across two
+/// *different* LB'd nodes → false silent-loss alarms, and (b) leaves a real
+/// stall on any *other* shard completely unmonitored.
+fn probe_source(cluster: Option<&str>, table: &str) -> String {
+    match cluster {
+        Some(c) => format!(
+            "clusterAllReplicas('{}', system.{})",
+            crate::sql_hygiene::escape_sql_string(c),
+            table
+        ),
+        None => format!("system.{table}"),
+    }
+}
+
 /// Collect insert-path integrity signals (NAN-1405) — the storage-layer tells
 /// of the NAN-1404 silent-loss class. Every probe is best-effort: on a
 /// pre-NAN-1405 deployment the app user lacks the system-table grants and the
 /// probe degrades to its default (`probes_available` stays false), matching
-/// the warn-and-continue posture of the other collectors. Probes read the
-/// node the client is connected to; in cluster mode that is one replica's
-/// system tables — a sustained failure on the monitored replica still fires.
-async fn collect_insert_integrity(ch: &ClickHouseClient) -> InsertIntegrityMetrics {
+/// the warn-and-continue posture of the other collectors.
+///
+/// NAN-1728 (M-3): on a clustered deployment (`is_clustered` + `CLICKHOUSE_CLUSTER`
+/// set) the `system.query_log` / `part_log` / `errors` / `view_refreshes` /
+/// `asynchronous_insert_log` probes read cluster-wide via `clusterAllReplicas`
+/// so a stall on ANY node is caught, and the inserts-vs-parts correlation is
+/// done per node (`GROUP BY hostName()`) so mismatched LB routing can no longer
+/// forge or mask a NAN-1404 alarm. A `system.distribution_queue` probe surfaces
+/// stuck async-forward inserts. On single-node every probe emits the exact
+/// pre-cluster `system.*` SQL — this whole cluster path is a no-op there.
+async fn collect_insert_integrity(
+    ch: &ClickHouseClient,
+    is_clustered: bool,
+) -> InsertIntegrityMetrics {
     let logs_base = crate::schema::active_logs_table();
     let local_table = format!("nanosiem.{logs_base}");
     let mut m = InsertIntegrityMetrics::default();
+
+    // Cluster name for `clusterAllReplicas(...)`, gated on the authoritative
+    // pool-detected `is_clustered` AND the deploy's `CLICKHOUSE_CLUSTER` env
+    // (the same source `on_cluster_clause` reads). `None` ⇒ single-node ⇒ every
+    // probe below emits its original node-local SQL.
+    let cluster: Option<String> = if is_clustered {
+        std::env::var("CLICKHOUSE_CLUSTER")
+            .ok()
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+    } else {
+        None
+    };
+    let cluster_ref = cluster.as_deref();
 
     // 1) ACK-layer vs storage-layer pairing — the exact NAN-1404 correlation:
     // INSERT queries keep "finishing" (Vector ACKed, HTTP 200) while ZERO new
@@ -132,48 +176,129 @@ async fn collect_insert_integrity(ch: &ClickHouseClient) -> InsertIntegrityMetri
     // attributed to the flush, so parts created is the trustworthy signal.
     // Inserts target the local table even in cluster mode, but match the
     // distributed name too in case a writer routes through it.
-    let sql = format!(
-        "SELECT count() AS inserts \
-         FROM system.query_log \
-         WHERE type = 'QueryFinish' AND query_kind = 'Insert' \
-           AND event_time >= now() - INTERVAL 1 HOUR \
-           AND (has(tables, '{local_table}') OR has(tables, '{local_table}_distributed'))"
+    let inserts_where = format!(
+        "type = 'QueryFinish' AND query_kind = 'Insert' \
+         AND event_time >= now() - INTERVAL 1 HOUR \
+         AND (has(tables, '{local_table}') OR has(tables, '{local_table}_distributed'))"
     );
-    match ch.query(&sql).fetch_one::<u64>().await {
-        Ok(inserts) => {
-            m.probes_available = true;
-            m.logs_inserts_1h = inserts;
-        }
-        Err(e) => warn!(
-            "Insert-integrity probe: system.query_log unavailable (grant missing? NAN-1405): {}",
-            e
-        ),
-    }
-    let sql = format!(
-        "SELECT count() AS new_parts \
-         FROM system.part_log \
-         WHERE database = 'nanosiem' AND table = '{logs_base}' \
-           AND event_type = 'NewPart' \
-           AND event_time >= now() - INTERVAL 1 HOUR"
+    let parts_where = format!(
+        "database = 'nanosiem' AND table = '{logs_base}' \
+         AND event_type = 'NewPart' \
+         AND event_time >= now() - INTERVAL 1 HOUR"
     );
-    match ch.query(&sql).fetch_one::<u64>().await {
-        Ok(new_parts) => {
-            m.probes_available = true;
-            m.new_parts_probe_ok = true;
-            m.new_parts_1h = new_parts;
+    if let Some(cl) = cluster_ref {
+        // NAN-1728 (M-3): correlate per node. Two cluster-wide `count() GROUP BY
+        // hostName()` reads give the inserts and new-parts each node produced;
+        // pairing them WITHIN a node is the only way to distinguish a genuine
+        // NAN-1404 stall (a node ACKing inserts while creating no parts) from the
+        // benign case where inserts and parts simply happened on different nodes.
+        let insert_sql = format!(
+            "SELECT hostName() AS host, count() AS inserts FROM {} WHERE {} GROUP BY host",
+            probe_source(Some(cl), "query_log"),
+            inserts_where
+        );
+        let inserts_by_host = match ch.query(&insert_sql).fetch_all::<(String, u64)>().await {
+            Ok(rows) => {
+                m.probes_available = true;
+                Some(rows)
+            }
+            Err(e) => {
+                warn!("Insert-integrity probe: system.query_log unavailable cluster-wide (grant missing? NAN-1405): {}", e);
+                None
+            }
+        };
+        let parts_sql = format!(
+            "SELECT hostName() AS host, count() AS new_parts FROM {} WHERE {} GROUP BY host",
+            probe_source(Some(cl), "part_log"),
+            parts_where
+        );
+        let parts_by_host = match ch.query(&parts_sql).fetch_all::<(String, u64)>().await {
+            Ok(rows) => {
+                m.probes_available = true;
+                m.new_parts_probe_ok = true;
+                Some(rows)
+            }
+            Err(e) => {
+                warn!("Insert-integrity probe: system.part_log unavailable cluster-wide (grant missing? NAN-1405/1461): {}", e);
+                None
+            }
+        };
+        match (inserts_by_host, parts_by_host) {
+            (Some(ins), Some(parts)) => {
+                let parts_map: std::collections::HashMap<String, u64> = parts.into_iter().collect();
+                let total_inserts: u64 = ins.iter().map(|(_, n)| *n).sum();
+                let total_parts: u64 = parts_map.values().sum();
+                // A stall on ANY node: it finished inserts but produced no parts.
+                // Report that node's figures so the analyzer's `inserts >= 10 &&
+                // new_parts == 0` rule fires (it would be masked by a cluster-wide
+                // SUM that other healthy nodes' parts inflate).
+                let stalled = ins
+                    .iter()
+                    .find(|(host, n)| *n >= 10 && parts_map.get(host).copied().unwrap_or(0) == 0);
+                if let Some((host, n)) = stalled {
+                    warn!(
+                        "Insert-integrity: node {} finished {} inserts in 1h but created 0 new parts \
+                         (per-node NAN-1404 stall — other nodes may be masking it in aggregate)",
+                        host, n
+                    );
+                    m.logs_inserts_1h = *n;
+                    m.new_parts_1h = 0;
+                } else {
+                    m.logs_inserts_1h = total_inserts;
+                    m.new_parts_1h = total_parts;
+                }
+            }
+            // One probe's grant is missing: fall back to the cluster-wide totals
+            // for whichever succeeded (matches the single-node independent handling).
+            (Some(ins), None) => m.logs_inserts_1h = ins.iter().map(|(_, n)| *n).sum(),
+            (None, Some(parts)) => m.new_parts_1h = parts.iter().map(|(_, n)| *n).sum(),
+            (None, None) => {}
         }
-        Err(e) => warn!(
-            "Insert-integrity probe: system.part_log unavailable (grant missing? NAN-1405/1461): {}",
-            e
-        ),
+    } else {
+        let sql = format!("SELECT count() AS inserts FROM system.query_log WHERE {inserts_where}");
+        match ch.query(&sql).fetch_one::<u64>().await {
+            Ok(inserts) => {
+                m.probes_available = true;
+                m.logs_inserts_1h = inserts;
+            }
+            Err(e) => warn!(
+                "Insert-integrity probe: system.query_log unavailable (grant missing? NAN-1405): {}",
+                e
+            ),
+        }
+        let sql = format!("SELECT count() AS new_parts FROM system.part_log WHERE {parts_where}");
+        match ch.query(&sql).fetch_one::<u64>().await {
+            Ok(new_parts) => {
+                m.probes_available = true;
+                m.new_parts_probe_ok = true;
+                m.new_parts_1h = new_parts;
+            }
+            Err(e) => warn!(
+                "Insert-integrity probe: system.part_log unavailable (grant missing? NAN-1405/1461): {}",
+                e
+            ),
+        }
     }
 
     // 2) Error-counter tells from system.errors. The counters never reset, so
-    // gate on last_error_time recency to keep them actionable.
-    let sql = "SELECT name, value FROM system.errors \
+    // gate on last_error_time recency to keep them actionable. NAN-1728 (M-3):
+    // sum per-name across all nodes so an error spiking on any one shard surfaces
+    // (`system.errors` is per-node); single-node emits the original ungrouped SQL.
+    let sql = if let Some(cl) = cluster_ref {
+        format!(
+            "SELECT name, sum(value) AS value FROM {} \
+             WHERE name IN ('MEMORY_LIMIT_EXCEEDED', 'CACHE_DICTIONARY_UPDATE_FAIL') \
+               AND last_error_time >= now() - INTERVAL 24 HOUR \
+             GROUP BY name",
+            probe_source(Some(cl), "errors")
+        )
+    } else {
+        "SELECT name, value FROM system.errors \
                WHERE name IN ('MEMORY_LIMIT_EXCEEDED', 'CACHE_DICTIONARY_UPDATE_FAIL') \
-                 AND last_error_time >= now() - INTERVAL 24 HOUR";
-    match ch.query(sql).fetch_all::<(String, u64)>().await {
+                 AND last_error_time >= now() - INTERVAL 24 HOUR"
+            .to_string()
+    };
+    match ch.query(&sql).fetch_all::<(String, u64)>().await {
         Ok(rows) => {
             m.probes_available = true;
             for (name, value) in rows {
@@ -283,14 +408,33 @@ async fn collect_insert_integrity(ch: &ClickHouseClient) -> InsertIntegrityMetri
     // note: system.view_refreshes has NO last_refresh_result column —
     // exception / status / next_refresh_time / last_success_time are the
     // signal columns.
-    let sql = "SELECT view, substring(exception, 1, 300) AS exception, \
+    // NAN-1728 (M-3): the refreshable *_dict_refresh MVs are per-node, so a
+    // refresh wedged on one shard is invisible from another. Read cluster-wide
+    // and label each hit with its node (`hostName()/view`) so any node's stall
+    // surfaces without collapsing distinct nodes into one row. Single-node emits
+    // the original ungrouped, unlabeled SQL.
+    let sql = if let Some(cl) = cluster_ref {
+        format!(
+            "SELECT concat(hostName(), '/', view) AS view, substring(exception, 1, 300) AS exception, \
+                      toUInt64(if(last_success_time IS NULL, 0, \
+                                  dateDiff('second', last_success_time, now()))) AS age \
+               FROM {} \
+               WHERE database = 'nanosiem' AND view LIKE '%\\_dict\\_refresh' \
+                 AND (exception != '' OR status = 'Disabled' \
+                      OR next_refresh_time < now() - INTERVAL 1 HOUR)",
+            probe_source(Some(cl), "view_refreshes")
+        )
+    } else {
+        "SELECT view, substring(exception, 1, 300) AS exception, \
                       toUInt64(if(last_success_time IS NULL, 0, \
                                   dateDiff('second', last_success_time, now()))) AS age \
                FROM system.view_refreshes \
                WHERE database = 'nanosiem' AND view LIKE '%\\_dict\\_refresh' \
                  AND (exception != '' OR status = 'Disabled' \
-                      OR next_refresh_time < now() - INTERVAL 1 HOUR)";
-    match ch.query(sql).fetch_all::<(String, String, u64)>().await {
+                      OR next_refresh_time < now() - INTERVAL 1 HOUR)"
+            .to_string()
+    };
+    match ch.query(&sql).fetch_all::<(String, String, u64)>().await {
         Ok(rows) => {
             m.probes_available = true;
             m.stale_dict_refreshes = rows
@@ -311,13 +455,18 @@ async fn collect_insert_integrity(ch: &ClickHouseClient) -> InsertIntegrityMetri
     // 5) Flush failures from asynchronous_insert_log — only populated once the
     // NAN-1405 server config ships (the table does not exist before that, and
     // None distinguishes "log not enabled" from "no failures").
+    // NAN-1728 (M-3): the countIf/anyLastIf aggregates run over the union of
+    // every node's rows when `probe_source` wraps the table in
+    // `clusterAllReplicas`, so a flush failure on any shard is counted; on
+    // single-node the source is plain `system.asynchronous_insert_log`.
     let sql = format!(
         "SELECT countIf(status != 'Ok') AS failures, \
                 anyLastIf(substring(exception, 1, 300), status != 'Ok') AS last_error \
-         FROM system.asynchronous_insert_log \
+         FROM {} \
          WHERE event_time >= now() - INTERVAL 1 HOUR \
            AND database = 'nanosiem' \
-           AND table IN ('{logs_base}', '{logs_base}_distributed')"
+           AND table IN ('{logs_base}', '{logs_base}_distributed')",
+        probe_source(cluster_ref, "asynchronous_insert_log")
     );
     match ch.query(&sql).fetch_one::<(u64, String)>().await {
         Ok((failures, last_error)) => {
@@ -333,6 +482,53 @@ async fn collect_insert_integrity(ch: &ClickHouseClient) -> InsertIntegrityMetri
                 "Insert-integrity probe: asynchronous_insert_log unavailable (not enabled yet?): {}",
                 e
             );
+        }
+    }
+
+    // 6) NAN-1728 (H7 tail): stuck async-forward inserts. When the ingest profile
+    // uses insert_distributed_sync=0, a row acked by the receiving node sits in
+    // its `.bin` distribution send queue until forwarded to the target shard — a
+    // wedged or erroring queue means acked rows are NOT yet durable on any shard,
+    // the exact hazard H7 flags for the audit path. `system.distribution_queue`
+    // is per-node and only populated for Distributed tables, so this probe runs
+    // cluster-wide and ONLY when clustered — a pure no-op on single-node.
+    if let Some(cl) = cluster_ref {
+        let sql = format!(
+            "SELECT hostName() AS host, database, table, data_files, error_count, \
+                    substring(last_exception, 1, 300) AS last_exception \
+             FROM {} \
+             WHERE database = 'nanosiem' AND (error_count > 0 OR data_files > 0)",
+            probe_source(Some(cl), "distribution_queue")
+        );
+        match ch
+            .query(&sql)
+            .fetch_all::<(String, String, String, u64, u64, String)>()
+            .await
+        {
+            Ok(rows) => {
+                m.probes_available = true;
+                for (host, db, table, data_files, error_count, last_exception) in rows {
+                    if error_count > 0 {
+                        warn!(
+                            "Insert-integrity: distribution queue erroring on {} for {}.{} \
+                             ({} pending .bin files, {} errors): {} — acked rows may not be \
+                             durable on the target shard (NAN-1728 H7)",
+                            host, db, table, data_files, error_count, last_exception
+                        );
+                    } else {
+                        info!(
+                            "Insert-integrity: distribution queue backlog on {} for {}.{} \
+                             ({} pending .bin files, forwarding not yet complete)",
+                            host, db, table, data_files
+                        );
+                    }
+                }
+            }
+            Err(e) => info!(
+                "Insert-integrity probe: system.distribution_queue unavailable \
+                 (grant missing or no distributed tables?): {}",
+                e
+            ),
         }
     }
 

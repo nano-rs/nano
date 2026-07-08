@@ -321,6 +321,23 @@ fn is_valid_field(
                 if p.is_known_field(field_name) {
                     return Ok(());
                 }
+                // O6 (NAN-1721): a name the active profile resolves to a `Map`
+                // attribute key — the spans `attributes`/`resource_attributes`
+                // tail or the metrics tags tail (`FieldResolution::MapKey`) — is
+                // a real attribute reference, never a UDM typo. Un-promoted OTel
+                // attributes are the flagship span/metric filter surface
+                // (NAN-1555), but common dotted names sit within one edit of a
+                // UDM column (`http.method` vs `http_method`, `user.name` vs
+                // `user_name`) and the distance gate below 400-rejects them.
+                // Accept MapKey-resolvable names before the typo gate. UDM/OCSF
+                // never resolve to `MapKey` (their tail is a JSON column), so
+                // this is inert under the logs profiles.
+                if matches!(
+                    p.resolve(field_name),
+                    crate::schema::FieldResolution::MapKey { .. }
+                ) {
+                    return Ok(());
+                }
             }
             // Format already passed above, so `err` here is an "unknown field".
             // Compute minimum edit distance to any UDM field. Use a tight threshold

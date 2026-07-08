@@ -123,6 +123,13 @@ if deleted != 1 { deleted = 0 }
 
 '''
 
+# NAN-1728: `ip_enrichments` is a CLUSTER-WIDE REPLICATED table (shared ZK path,
+# no {shard} macro), so a write landing on ANY node via the load-balanced
+# clickhouse-ingest Service replicates to every node and is globally visible —
+# each node's local `ip_enrichment_dict` refresh then reads a complete table.
+# Deliberately write the plain LOCAL name (NOT a `_distributed` wrapper): routing
+# reference-table writes through a Distributed wrapper is unnecessary and would
+# break the per-node dict source chain.
 [sinks.clickhouse_ip_enrichments]
 type = "clickhouse"
 inputs = ["enrichment_normalize_custom"]
@@ -154,6 +161,11 @@ timeout_secs = 60
 retry_initial_backoff_secs = 1
 retry_max_duration_secs = 60
 
+# NAN-1728: `user_registry` is a CLUSTER-WIDE REPLICATED table (shared ZK path,
+# no {shard} macro) — a single-node write replicates to all nodes and is globally
+# visible, so each node's `user_registry_dict` refresh reads a complete table.
+# Deliberately write the plain LOCAL name, NOT a `_distributed` wrapper (see the
+# ip_enrichments sink note above).
 [sinks.clickhouse_user_registry]
 type = "clickhouse"
 inputs = ["enrichment_normalize_ad"]

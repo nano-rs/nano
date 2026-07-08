@@ -9,7 +9,7 @@ use nanosiem_core::auth::{OidcRepository, OidcService};
 use nanosiem_enterprise::cases::ShadowInvestigationService;
 use nanosiem_core::db::{ClickHouseMigrator, DualPool, DualPoolConfig, DualPoolError};
 use nanosiem_core::detection::{
-    MaterializedViewGenerator, RealtimeEvaluator, SignalProcessor, SignalProcessorConfig,
+    MaterializedViewGenerator, SignalProcessor, SignalProcessorConfig,
 };
 use nanosiem_core::enrichment::{EnrichmentRepository, EnrichmentService};
 use nanosiem_core::identity::{IdentityRepository, IdentitySyncService};
@@ -216,7 +216,7 @@ impl AppState {
         // Phase 3.2 (NAN-744): cases lifted to enterprise — the whole shadow
         // investigation hook only wires up in enterprise builds. Open-core
         // builds default to `NoopShadowInvestigationHook` on signal_processor /
-        // realtime_evaluator / detection_service.
+        // detection_service.
         #[cfg(feature = "enterprise")]
         let shadow_investigation = {
             let shadow_ai_client: Arc<dyn nanosiem_core::extensions::AiClient> = Arc::new(
@@ -249,7 +249,7 @@ impl AppState {
 
         // Build the case-grouping hook for enterprise builds. NAN-744 Phase 2.3
         // added the `CaseGroupingHook` trait surface on detection_service /
-        // signal_processor / realtime_evaluator, but the AppState wire-up was
+        // signal_processor, but the AppState wire-up was
         // never written — so saturn fired alerts but never created cases
         // (case_id stayed NULL). NAN-872 restores the wiring. Open-core
         // builds keep `NoopCaseGroupingHook` on all three services.
@@ -263,7 +263,16 @@ impl AppState {
         // Create signal processor; in enterprise also wire shadow investigation
         // and case grouping.
         let signal_processor = {
-            let sp = SignalProcessor::new(dual_pool.clone(), SignalProcessorConfig::default());
+            // NAN-1741 A2: wire the webhook service so real-time (materialized-
+            // view) detection alerts actually fire webhooks — previously the
+            // SignalProcessor had no webhook wiring, so MV-produced alerts
+            // created a row but never notified. Webhooks are a core feature (not
+            // enterprise-gated), so this is wired unconditionally, mirroring the
+            // scheduled `detection_service` wiring above.
+            let sp = SignalProcessor::new(dual_pool.clone(), SignalProcessorConfig::default())
+                .with_webhook_service(nanosiem_core::webhooks::WebhookService::new(
+                    nanosiem_core::webhooks::WebhookRepository::new(pg_pool.clone()),
+                ));
             #[cfg(feature = "enterprise")]
             let sp = sp
                 .with_shadow_investigation(shadow_investigation.clone())
@@ -277,16 +286,6 @@ impl AppState {
         let detection_service = detection_service
             .with_shadow_investigation(shadow_investigation.clone())
             .with_case_grouping(case_grouping_hook.clone());
-
-        // Create realtime evaluator; enterprise wires shadow investigation
-        // and case grouping too.
-        #[cfg_attr(not(feature = "enterprise"), allow(unused_mut))]
-        let mut realtime_evaluator = RealtimeEvaluator::with_dual_pool(&dual_pool);
-        #[cfg(feature = "enterprise")]
-        {
-            realtime_evaluator.set_shadow_investigation(shadow_investigation.clone());
-            realtime_evaluator.set_case_grouping(case_grouping_hook);
-        }
 
         // Trait-object form of the shadow hook stored on AppState so handler-
         // built CaseService instances can wire it up (NAN-1059 re-triage on
@@ -342,7 +341,6 @@ impl AppState {
             // NAN-1581: flag-aware lookup service shared with the management
             // handlers so create/upload/row ops follow LOOKUP_STORAGE_BACKEND.
             lookup_service: lookup_service_for_state,
-            realtime_evaluator: Arc::new(realtime_evaluator),
             feed_service: FeedService::with_dual_pool(&dual_pool),
 
             // Services using PostgreSQL only (or with optional ClickHouse for stats)

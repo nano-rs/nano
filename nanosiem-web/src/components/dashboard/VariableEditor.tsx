@@ -12,7 +12,6 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Textarea } from '@/components/ui/textarea';
-import { Switch } from '@/components/ui/switch';
 import {
   Sheet,
   SheetContent,
@@ -48,6 +47,15 @@ export interface VariableEditorProps {
 interface VariableFormState extends DashboardVariable {
   isExpanded: boolean;
   optionsText: string; // For editing options as newline-separated text
+}
+
+// DSH56: variable names are referenced as `$name` in queries and must be
+// normalized (lowercase, spaces -> underscores). Normalize LIVE as the author
+// types so the `$token` shown in help matches what actually resolves — a name
+// authored as `$Host` used to normalize only at save, silently breaking the
+// query that referenced the displayed casing.
+function normalizeVariableName(raw: string): string {
+  return raw.replace(/\s+/g, '_').toLowerCase();
 }
 
 function createEmptyVariable(): VariableFormState {
@@ -313,9 +321,9 @@ export function VariableEditor({
                           </Label>
                           <Input
                             value={variable.name}
-                            onChange={e => handleUpdateVariable(index, { name: e.target.value })}
+                            onChange={e => handleUpdateVariable(index, { name: normalizeVariableName(e.target.value) })}
                             placeholder="e.g., host"
-                            className="h-[28px] text-[12px]"
+                            className="h-[28px] text-[12px] font-mono"
                           />
                           <p className="text-[10.5px] text-muted-foreground">
                             Use <code className="font-mono text-primary">${variable.name || 'name'}</code> in queries
@@ -421,17 +429,16 @@ export function VariableEditor({
                         </>
                       )}
 
-                      {(variable.type === 'dropdown' || variable.type === 'query') && (
-                        <div className="flex items-center justify-between">
-                          <Label className="font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground font-semibold">
-                            Allow multiple selections
-                          </Label>
-                          <Switch
-                            checked={variable.multi || false}
-                            onCheckedChange={checked => handleUpdateVariable(index, { multi: checked })}
-                          />
-                        </div>
-                      )}
+                      {/*
+                        DSH22: the "Allow multiple selections" toggle was a dead
+                        switch — it persisted `multi` but neither VariableControls
+                        (single-value `Record<string,string>`) nor any substitution
+                        path (client or server) rendered/serialized an IN-list, so
+                        enabling it silently did nothing. Removed rather than left
+                        as a lie; VariableControls instead gains an explicit
+                        "(any)" clear option. Multi-select can return as a real
+                        feature once IN-list quoting exists end-to-end.
+                      */}
                     </div>
                   )}
                 </div>

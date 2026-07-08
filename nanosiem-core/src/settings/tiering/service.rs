@@ -5,10 +5,51 @@
 use super::types::*;
 use super::validation::*;
 use crate::crypto::{EncryptedData, EncryptionService};
+use crate::db::dual_pool::on_cluster_clause;
 use chrono::Utc;
 use clickhouse::Client as ClickHouseClient;
 use sqlx::PgPool;
 use std::path::PathBuf;
+
+// ---------------------------------------------------------------------------
+// Cluster-aware runtime helpers (NAN-1728 H1)
+//
+// `TieringService` holds a bare `ClickHouseClient` (no `DualPool`), so cluster
+// mode is derived from the same `CLICKHOUSE_CLUSTER` env signal that gates
+// `on_cluster_clause` — the deploy sets it only on clustered ClickHouse. On
+// single-node / open-core (`CLICKHOUSE_CLUSTER` unset) every helper below falls
+// back to the exact pre-cluster form, so this file is byte-identical there.
+// ---------------------------------------------------------------------------
+
+/// Configured ClickHouse cluster name, or `None` on single-node deployments.
+fn clickhouse_cluster_name() -> Option<String> {
+    std::env::var("CLICKHOUSE_CLUSTER").ok().and_then(|c| {
+        let t = c.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    })
+}
+
+/// `system.parts` source that dedupes replicas to one per shard on a cluster
+/// (`cluster(...)`), so per-disk byte/row sums count each shard exactly once.
+/// Plain `system.parts` on single-node.
+fn parts_source_dedup() -> String {
+    match clickhouse_cluster_name() {
+        Some(cl) => format!("cluster('{}', system.parts)", cl),
+        None => "system.parts".to_string(),
+    }
+}
+
+/// Database predicate for `system.parts` reads. `currentDatabase()` is unsafe
+/// inside `cluster(...)` (evaluated on remote shards, where the default DB may
+/// not be `nanosiem`), so on a cluster pin the literal DB the app owns; keep
+/// `currentDatabase()` on single-node so the query is byte-identical.
+fn cluster_db_filter() -> &'static str {
+    if clickhouse_cluster_name().is_some() {
+        "database = 'nanosiem'"
+    } else {
+        "database = currentDatabase()"
+    }
+}
 
 /// Service for managing storage tiering
 pub struct TieringService {
@@ -453,10 +494,13 @@ impl TieringService {
         // First, modify the TTL to remove any volume references
         // This must happen BEFORE removing the storage config.
         // NAN-1241: target the active ingested-events table (ocsf_logs under OCSF).
+        // NAN-1728 H1: TTL runs on the LOCAL MergeTree; `ON CLUSTER` fans the
+        // ALTER out to every shard (empty clause → byte-identical on single-node).
         let logs_table = crate::schema::active_logs_table();
+        let on_cluster = on_cluster_clause();
         self.ch_client
             .query(&format!(
-                "ALTER TABLE nanosiem.{logs_table} MODIFY TTL timestamp + INTERVAL 90 DAY DELETE"
+                "ALTER TABLE nanosiem.{logs_table}{on_cluster} MODIFY TTL timestamp + INTERVAL 90 DAY DELETE"
             ))
             .execute()
             .await
@@ -609,6 +653,24 @@ impl TieringService {
     /// Signal ClickHouse to reload configuration
     /// Note: Storage policy changes require a full restart, SYSTEM RELOAD CONFIG is not sufficient
     async fn reload_clickhouse_config(&self) -> Result<(), TieringError> {
+        // NAN-1728 H1: this whole flow — writing a node-local `storage.xml`,
+        // `SYSTEM RELOAD CONFIG`, and a single-container `docker restart` — is
+        // inherently single-node. On a cluster it would reconfigure exactly one
+        // of 3×2 nodes and leave the rest on a divergent storage policy, so it
+        // is NOT supported here: fail loudly rather than silently configuring
+        // one node. (Storage tiering on clustered deployments is provisioned at
+        // the platform layer.) Both entry points — `apply_config` and
+        // `disable_tiering` — route through here, so this gate blocks the entire
+        // tiering-config mutation flow on clusters. No-op on single-node.
+        if clickhouse_cluster_name().is_some() {
+            return Err(TieringError::Config(
+                "storage tiering config is managed at the platform layer on clustered \
+                 deployments — the in-app SYSTEM RELOAD CONFIG + docker restart flow cannot \
+                 reconfigure a multi-node ClickHouse cluster"
+                    .to_string(),
+            ));
+        }
+
         // First try SYSTEM RELOAD CONFIG for basic config changes
         self.ch_client
             .query("SYSTEM RELOAD CONFIG")
@@ -660,11 +722,14 @@ impl TieringService {
     /// guaranteed to be doing the moves.
     async fn apply_ttl_rules(&self, config: &TieringConfig) -> Result<(), TieringError> {
         // NAN-1241: target the active ingested-events table (ocsf_logs under OCSF).
+        // NAN-1728 H1: these ALTERs run on the LOCAL MergeTree; `ON CLUSTER` fans
+        // them out to every shard (empty clause → byte-identical on single-node).
         let logs_table = crate::schema::active_logs_table();
+        let on_cluster = on_cluster_clause();
         // First, update the storage policy
         self.ch_client
             .query(&format!(
-                "ALTER TABLE {logs_table} MODIFY SETTING storage_policy = 'tiered'"
+                "ALTER TABLE {logs_table}{on_cluster} MODIFY SETTING storage_policy = 'tiered'"
             ))
             .execute()
             .await
@@ -674,7 +739,7 @@ impl TieringService {
 
         // DELETE TTL only — moves are handled by move_factor on the policy.
         let ttl_query = format!(
-            "ALTER TABLE {logs_table} MODIFY TTL timestamp + INTERVAL {} DAY DELETE",
+            "ALTER TABLE {logs_table}{on_cluster} MODIFY TTL timestamp + INTERVAL {} DAY DELETE",
             config.retention_days
         );
 
@@ -727,7 +792,13 @@ impl TieringService {
 
         // Get stats grouped by disk.
         // NAN-1241: stats for the active ingested-events table (ocsf_logs under OCSF).
+        // NAN-1728 H1: on a cluster, aggregate per-disk byte/row sums across all
+        // shards via `cluster(...)` (one replica per shard → no double-count).
+        // Plain `system.parts` on single-node. Parts belong to the LOCAL
+        // MergeTree, so the table filter uses the bare local name.
         let logs_table = crate::schema::active_logs_table();
+        let parts_source = parts_source_dedup();
+        let db_filter = cluster_db_filter();
         let stats: Vec<VolumeStats> = self
             .ch_client
             .query(&format!(
@@ -736,8 +807,8 @@ impl TieringService {
                     disk_name,
                     sum(bytes_on_disk) as total_bytes,
                     sum(rows) as total_rows
-                FROM system.parts
-                WHERE database = currentDatabase()
+                FROM {parts_source}
+                WHERE {db_filter}
                   AND table = '{logs_table}'
                   AND active = 1
                 GROUP BY disk_name

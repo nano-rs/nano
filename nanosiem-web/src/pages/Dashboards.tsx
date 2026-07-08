@@ -18,7 +18,6 @@ import {
   Plus,
   RefreshCw,
   Search,
-  Sparkles,
   Trash2,
   Upload,
   User,
@@ -28,6 +27,7 @@ import {
 
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { PivtIcon } from '@/enterprise/icons/PivtIcon';
 import {
   Dialog,
   DialogContent,
@@ -74,6 +74,45 @@ function ownerInitials(name?: string): string {
   if (!name) return '·';
   const parts = name.trim().split(/\s+/).slice(0, 2);
   return parts.map(p => p[0]?.toUpperCase() ?? '').join('') || '·';
+}
+
+/**
+ * DSH16: structurally validate a parsed dashboard export before importing and
+ * navigating into it. A hand-edited or older-tool JSON with a missing/misshaped
+ * layout (e.g. `layout: {}` with no `items`, or `variables: {}`) would otherwise
+ * import successfully and then crash `DashboardView` on render
+ * (`layout.items.find(...)`, `for (const v of variables)`). Returns a
+ * human-readable reason on failure, or null when the shape is acceptable.
+ */
+function validateDashboardImportShape(parsed: unknown): string | null {
+  if (typeof parsed !== 'object' || parsed === null) {
+    return 'File is not a dashboard export object.';
+  }
+  const root = parsed as Record<string, unknown>;
+  if (typeof root.version !== 'string' || root.version.trim() === '') {
+    return 'Missing or invalid export "version".';
+  }
+  if (typeof root.dashboard !== 'object' || root.dashboard === null) {
+    return 'Missing "dashboard" object.';
+  }
+  const d = root.dashboard as Record<string, unknown>;
+  if (typeof d.name !== 'string' || d.name.trim() === '') {
+    return 'Dashboard is missing a name.';
+  }
+  if (!Array.isArray(d.panels)) {
+    return 'Dashboard "panels" must be an array.';
+  }
+  if (typeof d.layout !== 'object' || d.layout === null) {
+    return 'Dashboard "layout" must be an object.';
+  }
+  const layout = d.layout as Record<string, unknown>;
+  if (!Array.isArray(layout.items)) {
+    return 'Dashboard "layout.items" must be an array.';
+  }
+  if (layout.variables !== undefined && !Array.isArray(layout.variables)) {
+    return 'Dashboard "layout.variables" must be an array when present.';
+  }
+  return null;
 }
 
 function VisibilityIcon({ visibility, className }: { visibility?: DashboardVisibility; className?: string }) {
@@ -237,7 +276,7 @@ function NewDashboardCard({ density, onClick }: { density: Density; onClick: () 
         </div>
         <span className="text-[13px] font-semibold">New dashboard</span>
         <span className="text-[11px] text-muted-foreground font-normal">
-          Create a blank or AI-generated board
+          Create a blank or pivt-generated board
         </span>
       </button>
     );
@@ -253,11 +292,11 @@ function NewDashboardCard({ density, onClick }: { density: Density; onClick: () 
       </div>
       <div className="flex flex-col gap-0.5">
         <div className="text-[13px] font-semibold text-foreground">New Dashboard</div>
-        <div className="text-[11px] text-muted-foreground">Blank board or AI-generate</div>
+        <div className="text-[11px] text-muted-foreground">Blank board or pivt-generate</div>
       </div>
       <div className="mt-1 text-[9.5px] font-mono uppercase tracking-[0.12em] text-muted-foreground/70 flex items-center gap-1.5">
-        <Sparkles className="w-[11px] h-[11px] text-primary" />
-        <span>AI · BLANK</span>
+        <PivtIcon className="w-[11px] h-[11px] text-primary" />
+        <span><span className="lowercase">pivt</span> · BLANK</span>
       </div>
     </button>
   );
@@ -360,7 +399,7 @@ export function Dashboards() {
   const [dashboardToDelete, setDashboardToDelete] = useState<DashboardSummary | null>(null);
   const [builderInitialMode, setBuilderInitialMode] = useState<'blank' | 'generate'>('blank');
 
-  // PIVT bridge — `@dashboard <prompt>` opens the builder pre-seeded to AI mode.
+  // PIVT bridge — `@dashboard <prompt>` opens the builder pre-seeded to generate mode.
   useEffect(() => {
     const handler = () => {
       setBuilderInitialMode('generate');
@@ -384,12 +423,18 @@ export function Dashboards() {
   }, [dashboards, searchQuery]);
 
   const recentlyViewedDashboards = useMemo(() => {
-    if (!dashboards) return [];
+    // DSH48: resolve recents against the full ("all") list regardless of the
+    // active tab. Resolving against the active tab (default "my") drops any
+    // shared/public dashboard the user viewed under "All". "all" is a superset
+    // of "my", so it covers both; fall back to the active list if it hasn't
+    // loaded yet.
+    const resolveList = allQuery.data ?? dashboards;
+    if (!resolveList) return [];
     return recentDashboardIds
-      .map(id => dashboards.find(x => x.id === id))
+      .map(id => resolveList.find(x => x.id === id))
       .filter((x): x is DashboardSummary => x !== undefined)
       .slice(0, 4);
-  }, [dashboards, recentDashboardIds]);
+  }, [allQuery.data, dashboards, recentDashboardIds]);
 
   const handleHideRecent = () => {
     setShowRecent(false);
@@ -505,7 +550,7 @@ export function Dashboards() {
       const created = await createDashboard(newDashboard);
       toast({
         title: 'Dashboard created',
-        description: `AI-generated dashboard "${generatedDashboard.name}" has been created.`,
+        description: `pivt-generated dashboard "${generatedDashboard.name}" has been created.`,
       });
       refetch();
       navigate(`/dashboards/${created.id}?edit=true`);
@@ -532,15 +577,25 @@ export function Dashboards() {
 
     try {
       const text = await file.text();
+      let parsed: unknown;
       try {
-        const parsed = JSON.parse(text);
-        if (!parsed.version || !parsed.dashboard) {
-          throw new Error('Invalid dashboard export format');
-        }
+        parsed = JSON.parse(text);
       } catch (parseErr) {
         toast({
           title: 'Invalid JSON',
           description: parseErr instanceof Error ? parseErr.message : 'Failed to parse JSON file',
+          variant: 'destructive',
+        });
+        return;
+      }
+
+      // DSH16: reject a structurally-invalid export up front so we surface a
+      // clear error instead of importing it and navigating into a crash.
+      const shapeError = validateDashboardImportShape(parsed);
+      if (shapeError) {
+        toast({
+          title: 'Invalid dashboard export',
+          description: shapeError,
           variant: 'destructive',
         });
         return;
@@ -842,11 +897,11 @@ function EmptyState({
             className="bg-card border border-dashed border-primary/35 rounded-lg p-4 hover:border-primary hover:bg-primary/5 transition-colors flex flex-col items-center gap-2 group"
           >
             <div className="w-9 h-9 rounded-full bg-primary/10 text-primary flex items-center justify-center group-hover:bg-primary/20 transition-colors">
-              <Sparkles className="w-[16px] h-[16px]" />
+              <PivtIcon className="w-[16px] h-[16px]" />
             </div>
-            <div className="text-[13px] font-semibold text-foreground">Generate with AI</div>
+            <div className="text-[13px] font-semibold text-foreground">Generate with pivt</div>
             <div className="text-[11px] text-muted-foreground text-center">
-              Describe what you need; nano builds the panels for you.
+              Describe what you need; pivt builds the panels for you.
             </div>
           </button>
         </div>

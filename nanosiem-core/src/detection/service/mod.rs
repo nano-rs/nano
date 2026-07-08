@@ -20,6 +20,10 @@ mod rules;
 #[cfg(test)]
 mod tests;
 
+// Audit D13: the real-time SignalProcessor shares the scheduled path's
+// finding-emission dedup (candidate type + store helpers in `helpers`).
+pub(crate) use alerts::ClaimedFinding;
+
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -101,6 +105,17 @@ pub struct HistoricalAnalysisResult {
     pub bucket_size_seconds: u32,
     /// Execution time in milliseconds
     pub execution_time_ms: u64,
+    /// Number of per-window sub-queries that errored during a stepped backtest.
+    /// `> 0` means `total_matches`/the histogram UNDERCOUNT — the tester must
+    /// surface this instead of showing a misleading "0 matches" for a rule that
+    /// actually errors every cycle (audit D3b). Non-stepped paths propagate the
+    /// error directly and leave this `0`.
+    #[serde(default)]
+    pub failed_windows: u32,
+    /// A representative error message from a failed window, for display when
+    /// `failed_windows > 0`.
+    #[serde(default)]
+    pub error_sample: Option<String>,
 }
 
 /// Daily match count for trend analysis

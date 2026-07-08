@@ -226,8 +226,21 @@ export function GridLayout({
     initialWidth: 1200 
   });
 
+  // DSH43: defensively de-duplicate layout items by id. Backend import now
+  // rejects duplicate panel ids, but a hand-edited / older-tool dashboard could
+  // still carry them; keeping the FIRST item per id avoids rendering the same
+  // panel in two slots and colliding React / react-grid-layout keys.
+  const dedupedLayoutItems = useMemo(() => {
+    const seen = new Set<string>();
+    return layoutItems.filter(item => {
+      if (seen.has(item.i)) return false;
+      seen.add(item.i);
+      return true;
+    });
+  }, [layoutItems]);
+
   // Convert layout items to react-grid-layout format
-  const gridLayout = useMemo(() => toGridLayout(layoutItems), [layoutItems]);
+  const gridLayout = useMemo(() => toGridLayout(dedupedLayoutItems), [dedupedLayoutItems]);
 
   // Handle layout change from react-grid-layout
   const handleLayoutChange = useCallback((newLayout: Layout) => {
@@ -235,10 +248,15 @@ export function GridLayout({
     onLayoutChange(convertedLayout);
   }, [onLayoutChange]);
 
-  // Create a map of panel ID to panel for quick lookup
+  // Create a map of panel ID to panel for quick lookup.
+  // DSH43: keep the FIRST panel for a given id (deterministic) rather than the
+  // JS-default last-write-wins, so a duplicate id can't silently swap in the
+  // wrong panel.
   const panelMap = useMemo(() => {
     const map = new Map<string, PanelConfig>();
-    panels.forEach(panel => map.set(panel.id, panel));
+    panels.forEach(panel => {
+      if (!map.has(panel.id)) map.set(panel.id, panel);
+    });
     return map;
   }, [panels]);
 
@@ -281,7 +299,7 @@ export function GridLayout({
           compactor={compactor}
           onLayoutChange={handleLayoutChange}
         >
-          {layoutItems.map(item => {
+          {dedupedLayoutItems.map(item => {
             const panel = panelMap.get(item.i);
             if (!panel) return null;
 

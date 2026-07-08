@@ -28,8 +28,17 @@ impl SearchService {
     ///
     /// Stateless cancellation: the frontend request_id IS used as the ClickHouse
     /// query_id (see search() below), so we can issue KILL QUERY directly without
-    /// needing to look up the mapping on the correct instance. This works in
-    /// active/active deployments because KILL QUERY is global to the ClickHouse cluster.
+    /// needing to look up the mapping on the correct instance.
+    ///
+    /// NAN-1728 (H2): `KILL QUERY` is in fact **node-local** — it only kills
+    /// queries initiated on the connected ClickHouse node, NOT global to the
+    /// cluster as this comment previously (incorrectly) claimed. On a clustered
+    /// deployment the cancel connection is load-balanced and can land on a
+    /// different node than the search's initiator, so a node-local kill would
+    /// no-op and the query would run on unstopped. `cancel_queries` therefore
+    /// fans the kill out with `KILL QUERY ON CLUSTER` (and reads
+    /// `clusterAllReplicas(system.processes)`) when clustered; on single-node it
+    /// emits the exact pre-cluster node-local SQL.
     ///
     /// The local QueryTracker is still maintained for metrics/debugging but is not
     /// required for correctness.

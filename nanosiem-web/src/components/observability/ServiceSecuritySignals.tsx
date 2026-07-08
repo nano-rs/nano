@@ -6,8 +6,10 @@
 // window the RED panels use.
 //
 // Data is REAL: api.observability.getServiceSecuritySignals(service, { start,
-// end }) → { host_count, signal_count, signals: [{ ts, rule_name, src_host,
-// src_ip, severity }] }. The strip is best-effort decoration — it never blocks
+// end }) → { host_count, signal_total, signal_count, signals: [{ ts, rule_name,
+// src_host, src_ip, severity }] }. signal_total is the true range count;
+// signal_count is the bounded sample size (signals.length). The strip is
+// best-effort decoration — it never blocks
 // or errors the parent detail, and the common case is zero (rendered as a clean
 // "no detections" line, NOT a heavy empty panel).
 //
@@ -19,6 +21,7 @@ import { Link } from 'react-router-dom';
 import { ShieldAlert, ChevronRight } from 'lucide-react';
 import { api } from '@/lib/api';
 import { cn } from '@/lib/utils';
+import { parseUTCTimestamp } from '@/lib/date-utils';
 import type { ServiceSecuritySignalsResponse, ServiceSecuritySignal } from '@/lib/api/observability';
 import type { TimeRange } from '@/lib/api/types';
 
@@ -59,7 +62,10 @@ function searchHref(s: ServiceSecuritySignal): string {
 }
 
 function fmtTs(ts: string): string {
-  const d = new Date(ts);
+  // O12: signal timestamps can arrive CH-format ("YYYY-MM-DD HH:MM:SS", no
+  // zone); parseUTCTimestamp reads them as UTC (a bare new Date() would treat
+  // them as the browser's local zone and shift the displayed time).
+  const d = parseUTCTimestamp(ts);
   if (Number.isNaN(d.getTime())) return ts;
   return d.toLocaleString(undefined, {
     month: 'short',
@@ -99,10 +105,13 @@ export function ServiceSecuritySignals({ service, apiTimeRange }: ServiceSecurit
   // While loading, or on failure, render nothing — never disturb the detail.
   if (errored || !data) return null;
 
-  const { signal_count, host_count, signals } = data;
+  // O54: signal_total is the true range total (count query); signal_count only
+  // reflects the bounded sample (signals.length), so the header + overflow must
+  // key off signal_total or they undercount (e.g. "100 · +0 more" for 500 hits).
+  const { signal_total, host_count, signals } = data;
 
   // Zero state: a single quiet line, not a panel.
-  if (signal_count === 0) {
+  if (signal_total === 0) {
     return (
       <div className="flex items-center gap-2 px-1 text-[11px] text-fg-4">
         <ShieldAlert className="w-[13px] h-[13px] text-fg-4 shrink-0" />
@@ -116,7 +125,7 @@ export function ServiceSecuritySignals({ service, apiTimeRange }: ServiceSecurit
   }
 
   const shown = signals.slice(0, SHOWN);
-  const overflow = signal_count - shown.length;
+  const overflow = signal_total - shown.length;
 
   return (
     <div className="rounded-lg border border-danger/30 bg-danger/5 overflow-hidden">
@@ -126,7 +135,7 @@ export function ServiceSecuritySignals({ service, apiTimeRange }: ServiceSecurit
           Related security signals
         </span>
         <span className="font-mono text-[10.5px] text-fg-3 tabular-nums">
-          {signal_count} on {host_count} {host_count === 1 ? 'host' : 'hosts'}
+          {signal_total} on {host_count} {host_count === 1 ? 'host' : 'hosts'}
         </span>
         <div className="flex-1" />
         <Link

@@ -276,6 +276,12 @@ impl SearchResultCache {
     // that scanned all data to prove a negative, or field-stats over a wide
     // window — so companions cache unconditionally, with the same short TTL
     // bounding staleness from late-arriving data.
+    //
+    // O42 exception: the trace-by-id companion opts OUT of caching an empty span
+    // list at its call site. An empty trace is cheap to recompute and usually
+    // means mid-ingest / unknown-id, so a cached empty would serve every later
+    // viewer a stale "empty trace" — the trace analog of NAN-1027's rule. The
+    // helpers below stay unconditional; the emptiness check lives in the handler.
 
     /// Build a deterministic cache key from a keyspace prefix and ordered
     /// components. The prefix keeps each companion's keyspace disjoint from

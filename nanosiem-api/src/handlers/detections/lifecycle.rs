@@ -51,9 +51,6 @@ pub async fn pause_detection(
         tracing::warn!("Failed to clear next_run_at for paused rule: {}", e);
     }
 
-    // Remove from real-time evaluator
-    state.realtime_evaluator.remove_rule(*id).await;
-
     // Emit audit event
     state.emit_audit(
         AuditEvent::builder(AuditSource::Detection, RULE_PAUSED)
@@ -96,11 +93,6 @@ pub async fn resume_detection(
     // Sync next_run_at for distributed scheduling
     state.detection_service.sync_next_run_at(&rule).await;
 
-    // Add to real-time evaluator
-    if let Err(e) = state.realtime_evaluator.add_rule(&rule).await {
-        tracing::warn!("Failed to add resumed rule to real-time evaluator: {}", e);
-    }
-
     // Emit audit event
     state.emit_audit(
         AuditEvent::builder(AuditSource::Detection, RULE_RESUMED)
@@ -142,11 +134,6 @@ pub async fn promote_detection(
     // Sync next_run_at now that rule is in alerting mode
     state.detection_service.sync_next_run_at(&rule).await;
 
-    // Reload the rule in the real-time evaluator so it starts generating alerts
-    if let Err(e) = state.realtime_evaluator.add_rule(&rule).await {
-        tracing::warn!("Failed to update real-time evaluator after promote: {}", e);
-    }
-
     // Emit audit event
     state.emit_audit(
         AuditEvent::builder(AuditSource::Detection, RULE_PROMOTED)
@@ -187,11 +174,6 @@ pub async fn demote_detection(
 
     // Sync next_run_at (rule is still scheduled in live mode, just no alerts)
     state.detection_service.sync_next_run_at(&rule).await;
-
-    // Reload the rule in the real-time evaluator so it stops generating alerts
-    if let Err(e) = state.realtime_evaluator.add_rule(&rule).await {
-        tracing::warn!("Failed to update real-time evaluator after demote: {}", e);
-    }
 
     // Emit audit event
     state.emit_audit(

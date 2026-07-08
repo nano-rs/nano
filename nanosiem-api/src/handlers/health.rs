@@ -15,6 +15,35 @@ use serde::Serialize;
 use crate::middleware::RequestId;
 use crate::state::AppState;
 
+/// NAN-1728 (L-1): all-shard ClickHouse liveness probe. On a multi-shard cluster
+/// the DualPool health `SELECT 1` only touches the LB-connected node, so a dead
+/// shard reports healthy while every `_distributed` read errors. This forces
+/// contact with every shard's replica set via `clusterAllReplicas('<cluster>',
+/// system.one)`; `Ok(())` means all shards answered. `CLICKHOUSE_CLUSTER` is set
+/// only on clustered ClickHouse — unset (single-node / open-core) returns
+/// `Ok(())` without issuing any query, so the health path is byte-identical.
+async fn cluster_all_shard_ch_probe(
+    dual_pool: &nanosiem_core::db::DualPool,
+) -> Result<(), String> {
+    if !dual_pool.is_clustered() {
+        return Ok(());
+    }
+    let Some(cluster) = std::env::var("CLICKHOUSE_CLUSTER")
+        .ok()
+        .filter(|c| !c.trim().is_empty())
+    else {
+        return Ok(());
+    };
+    let sql = format!("SELECT count() FROM clusterAllReplicas('{cluster}', system.one)");
+    dual_pool
+        .clickhouse()
+        .query(&sql)
+        .fetch_one::<u64>()
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// Minimal public health check response (prevents information disclosure)
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct PublicHealthResponse {
@@ -155,7 +184,18 @@ async fn check_service_health(url: &str, request_id: Option<&str>) -> ServiceHea
     security(())
 )]
 pub async fn health_check(State(state): State<AppState>) -> Json<PublicHealthResponse> {
-    let is_healthy = state.dual_pool().health_check().await.is_healthy();
+    let mut is_healthy = state.dual_pool().health_check().await.is_healthy();
+
+    // NAN-1728 (L-1): the DualPool `SELECT 1` only touches the LB-connected node,
+    // so a cluster with a dead shard reports healthy while every distributed read
+    // errors. When clustered, additionally require an all-shard probe to succeed.
+    // Single-node skips the probe (`Ok(())`), so this is byte-identical there.
+    if is_healthy {
+        if let Err(e) = cluster_all_shard_ch_probe(state.dual_pool()).await {
+            tracing::warn!("ClickHouse all-shard health probe failed: {}", e);
+            is_healthy = false;
+        }
+    }
 
     Json(PublicHealthResponse {
         status: if is_healthy {
@@ -221,9 +261,23 @@ pub async fn health_check_detailed(
     // Use DualPool health check for comprehensive status
     let health_status = state.dual_pool().health_check().await;
 
-    let is_healthy = health_status.is_healthy();
     let postgres_healthy = health_status.postgres_healthy;
-    let clickhouse_healthy = health_status.clickhouse_healthy;
+    let mut clickhouse_healthy = health_status.clickhouse_healthy;
+    let mut clickhouse_error = health_status.clickhouse_error;
+
+    // NAN-1728 (L-1): on a cluster, downgrade ClickHouse to error when the
+    // all-shard probe fails even though the LB-connected node answered `SELECT 1`
+    // — a dead shard would otherwise report healthy. Single-node skips the probe
+    // (`Ok(())`), so `clickhouse_healthy` is unchanged and this is byte-identical.
+    if clickhouse_healthy {
+        if let Err(e) = cluster_all_shard_ch_probe(state.dual_pool()).await {
+            tracing::warn!("ClickHouse all-shard health probe failed: {}", e);
+            clickhouse_healthy = false;
+            clickhouse_error = Some(format!("all-shard probe failed: {e}"));
+        }
+    }
+
+    let is_healthy = postgres_healthy && clickhouse_healthy;
 
     let postgres_health = DatabaseHealth {
         status: if postgres_healthy { "connected" } else { "error" }.to_string(),
@@ -234,7 +288,7 @@ pub async fn health_check_detailed(
     let clickhouse_health = DatabaseHealth {
         status: if clickhouse_healthy { "connected" } else { "error" }.to_string(),
         latency_ms: health_status.clickhouse_latency_ms,
-        error: health_status.clickhouse_error,
+        error: clickhouse_error,
     };
 
     let ingest_ok = services_health.ingest.status == "healthy";

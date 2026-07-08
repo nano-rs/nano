@@ -155,6 +155,7 @@ pub fn build_openapi() -> utoipa::openapi::OpenApi {
         handlers::query_library::QueryLibraryApiDoc::openapi(),
         handlers::lookup::LookupApiDoc::openapi(),
         handlers::rule_repositories::RuleRepositoriesApiDoc::openapi(),
+        handlers::detection_code_targets::DetectionCodeTargetsApiDoc::openapi(),
         handlers::parser_repositories::ParserRepositoriesApiDoc::openapi(),
         handlers::playbooks::PlaybooksApiDoc::openapi(),
         handlers::playbook_repositories::PlaybookRepositoriesApiDoc::openapi(),
@@ -304,10 +305,12 @@ mod tests {
         // counts in the enterprise spec only, dropping the open floor by 1.
         // NAN-1580 added 1 shared search-service path (merged below):
         // POST /api/search/retro (IOC retro-hunt rollup), counted in both editions.
+        // NAN-1745 added 4 shared paths (detection-as-code push targets):
+        // /api/detection-code-targets, /{id}, /{id}/token, /{id}/test — both editions.
         #[cfg(feature = "enterprise")]
-        let min_paths = 493;
+        let min_paths = 497;
         #[cfg(not(feature = "enterprise"))]
-        let min_paths = 383;
+        let min_paths = 387;
 
         assert!(
             path_count >= min_paths,

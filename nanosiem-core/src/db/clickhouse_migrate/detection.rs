@@ -50,16 +50,41 @@ impl ClickHouseMigrator {
             return Ok(cluster.clone());
         }
 
+        // NAN-1728 (M-8/D10): prefer the explicit `CLICKHOUSE_CLUSTER` env var
+        // when the deploy sets it. The deploy sets it only on clustered
+        // ClickHouse and knows the operator's authoritative cluster name, so this
+        // avoids the ambiguity of auto-detecting between e.g. an operator's
+        // `nanosiem_cluster` and an auto-created `default`. Empty/whitespace is
+        // treated as unset (open-core / single-node), falling through to probing.
+        if let Ok(env_cluster) = std::env::var("CLICKHOUSE_CLUSTER") {
+            let trimmed = env_cluster.trim();
+            if !trimmed.is_empty() {
+                tracing::info!(
+                    "Using ClickHouse cluster '{}' from CLICKHOUSE_CLUSTER env",
+                    trimmed
+                );
+                let name = Some(trimmed.to_string());
+                self.cluster = Some(name.clone());
+                return Ok(name);
+            }
+        }
+
         // Look for a cluster with multiple shards in system.clusters.
         // The operator creates a 'default' cluster automatically.
         // Exclude built-in system clusters: '_all_databases' and 'system'.
+        //
+        // The `cluster ASC` secondary sort is a deterministic tiebreak: without
+        // it, two clusters with the same node count (e.g. an operator
+        // `nanosiem_cluster` and an auto `default`) would be picked
+        // nondeterministically across runs, so a migrator could target a
+        // different cluster each time (M-8/D10).
         let cluster_name = self
             .client
             .query(
                 "SELECT cluster FROM system.clusters \
                  WHERE cluster NOT IN ('_all_databases', 'system') \
                  GROUP BY cluster HAVING count() > 1 \
-                 ORDER BY count() DESC LIMIT 1",
+                 ORDER BY count() DESC, cluster ASC LIMIT 1",
             )
             .fetch_one::<String>()
             .await

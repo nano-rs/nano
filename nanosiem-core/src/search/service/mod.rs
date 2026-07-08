@@ -752,7 +752,13 @@ impl SearchService {
         let table = dual_pool
             .table_names()
             .read_bare(Self::logs_table_key(profile.as_ref()));
-        ClickHouseSqlGenerator::with_table(table).with_profile(profile)
+        // NAN-1728: propagate cluster mode so non-logs dataset lanes (otel spans/
+        // metrics, identity ASOF join) route their FROM to the `_distributed`
+        // wrapper too — the logs lane is already routed via `read_bare` above.
+        // No-op on single-shard (flag false → bare local table names).
+        ClickHouseSqlGenerator::with_table(table)
+            .with_profile(profile)
+            .with_cluster_routing(dual_pool.table_names().is_clustered())
     }
 
     /// Create a new search service with DualPool (ClickHouse for logs, PostgreSQL

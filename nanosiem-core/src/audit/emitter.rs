@@ -193,7 +193,10 @@ impl AuditEmitter {
     /// When `durable` is true, both the UDM insert and the OCSF mirror write go
     /// through a client cloned with synchronous-write options
     /// (`async_insert=0` + `wait_end_of_query=1`) so the await blocks until the
-    /// write is flushed. When false, the ambient async-insert behavior applies.
+    /// write is flushed. When false (routine events), the client is cloned with
+    /// fire-and-forget options (`async_insert=1` + `wait_for_async_insert=0`) so
+    /// the write ACKs on receipt and never blocks on the `logs` materialized-
+    /// column + MV cascade (NAN-1724).
     ///
     /// Callers reach this only via [`Self::emit_batch_inner`], which holds the
     /// [`AUDIT_INSERT_BOUND`] permit and applies the backstop timeout.
@@ -222,17 +225,51 @@ impl AuditEmitter {
         // the row is flushed to a part rather than merely received (NAN-1625).
         // The options are HTTP query params applied to every request the client
         // makes, so both writes inherit them.
-        let sync_client;
+        //
+        // NAN-1724: the NON-durable (routine) path must be genuinely
+        // fire-and-forget. The ambient `dual_pool.clickhouse()` sets no
+        // async_insert option and the server default is `async_insert=0`, so the
+        // "async" routine path was in fact a SYNCHRONOUS insert — it blocked on
+        // the `logs` table's ~79 MATERIALIZED-column (dictGet) computation + ~13
+        // MVs + the OCSF mirror write, and under CH load intermittently exceeded
+        // the caller's timeout (`ASYNC_AUDIT_EMIT_TIMEOUT`). Setting
+        // `async_insert=1, wait_for_async_insert=0` makes ClickHouse buffer the
+        // row and ACK on receipt (the materialized-column + MV work runs in the
+        // background on flush), so a routine audit write can never block on that
+        // cascade. Routine events tolerate this fire-and-forget contract (the
+        // path already drops under extreme pressure); security-critical events
+        // use the durable branch above, which stays fully synchronous.
+        let write_client;
         let client = if durable {
-            sync_client = self
+            let mut c = self
                 .dual_pool
                 .clickhouse()
                 .clone()
                 .with_option("async_insert", "0")
                 .with_option("wait_end_of_query", "1");
-            &sync_client
+            // NAN-1728 (H7): on a clustered deployment the durable insert targets
+            // `logs_distributed`. With the default `insert_distributed_sync=0` the
+            // ACK only means "queued in the receiving node's `.bin` distribution
+            // send buffer", NOT committed on a shard — so an acked security-audit
+            // event can be lost if that node dies before the buffer forwards,
+            // breaking the NAN-1625 durability contract. `insert_distributed_sync=1`
+            // makes the write block until the row is committed on the target shard,
+            // so the ACK means durable. No-op on single-node: `is_clustered()` is
+            // false there and the write goes to the local `logs` MergeTree (not a
+            // Distributed table), so the emitted request is byte-identical.
+            if self.dual_pool.is_clustered() {
+                c = c.with_option("insert_distributed_sync", "1");
+            }
+            write_client = c;
+            &write_client
         } else {
-            self.dual_pool.clickhouse()
+            write_client = self
+                .dual_pool
+                .clickhouse()
+                .clone()
+                .with_option("async_insert", "1")
+                .with_option("wait_for_async_insert", "0");
+            &write_client
         };
         let mut insert = client
             .insert::<ClickHouseLogRow>(self.dual_pool.logs_table())

@@ -5,8 +5,18 @@
 //! Analyzes parsed queries for patterns that could cause performance problems
 //! at scale, similar to industry-standard SIEM job inspectors.
 
-use crate::query::ast::{AggFunc, BinSpan, Command, Comparator, Query, SearchExpr, WindowType};
+use crate::query::ast::{
+    AggFunc, BinSpan, Command, Comparator, PrevalenceOperator, PrevalenceThreshold, Query,
+    SearchExpr, WindowType,
+};
 use serde::{Deserialize, Serialize};
+
+/// Host-count ceiling the rarity dictionaries index up to. Entities at or above
+/// this are treated as "common" and deliberately NOT loaded into the prevalence
+/// dicts (migration 112: `HAVING host_count < 1000`), so a prevalence *count*
+/// condition whose satisfying set requires `host_count >= CUTOFF` can never
+/// match. Keep in lockstep with that migration.
+const PREVALENCE_HOST_COUNT_CUTOFF: u64 = 1000;
 
 /// Severity level for query warnings
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -573,6 +583,58 @@ fn analyze_command(
             }
         }
 
+        // Audit D4c (NAN-1705): a prevalence *count* condition whose satisfying
+        // set requires `host_count >= PREVALENCE_HOST_COUNT_CUTOFF` can never
+        // match — the rarity dictionaries only load entities below the cutoff,
+        // so a `>`/`>=`/`=` against a threshold at/above it silently matches
+        // NOTHING (fail-closed). This is rule mis-use (prevalence is a rarity
+        // index, not a commonness index); warn in the editor instead of a
+        // pushdown change (the agg reroute is the NAN-362 OOM landmine).
+        Command::Prevalence { conditions, .. } => {
+            for cond in conditions {
+                if !cond.field.is_count_field() {
+                    continue;
+                }
+                let PrevalenceThreshold::Count(threshold) = &cond.threshold else {
+                    continue;
+                };
+                let threshold = *threshold;
+                let requires_at_least_cutoff = match cond.operator {
+                    PrevalenceOperator::Gte | PrevalenceOperator::Eq => {
+                        threshold >= PREVALENCE_HOST_COUNT_CUTOFF
+                    }
+                    // `> t` requires host_count >= t + 1.
+                    PrevalenceOperator::Gt => {
+                        threshold.saturating_add(1) >= PREVALENCE_HOST_COUNT_CUTOFF
+                    }
+                    _ => false,
+                };
+                if requires_at_least_cutoff {
+                    analysis.warnings.push(QueryWarning {
+                        severity: WarningSeverity::Warning,
+                        code: "PREVALENCE_COUNT_ABOVE_CUTOFF".to_string(),
+                        message: format!(
+                            "prevalence condition `{} {} {}` can never match: the rarity \
+                             dictionary only tracks entities with host_count < {} — anything at \
+                             or above the cutoff is treated as common and not indexed, so this \
+                             rule silently matches nothing",
+                            cond.field.as_str(),
+                            cond.operator.as_str(),
+                            threshold,
+                            PREVALENCE_HOST_COUNT_CUTOFF
+                        ),
+                        suggestion: Some(format!(
+                            "Prevalence is a rarity index: use a LOW threshold (e.g. \
+                             `{} <= 5`) to hunt rare entities. To match COMMON entities, filter \
+                             on raw UDM/enrichment fields instead of prevalence.",
+                            cond.field.as_str()
+                        )),
+                        impact: Some("Rule matches nothing (fail-closed).".to_string()),
+                    });
+                }
+            }
+        }
+
         _ => {}
     }
 }
@@ -842,6 +904,47 @@ mod tests {
                     .iter()
                     .any(|w| w.code == "CROSS_DATASET_CORRELATION"),
                 "dataset=logs from logs must not fire the cross-dataset advisory"
+            );
+        }
+    }
+
+    // Audit D4c (NAN-1705): a prevalence count condition at/above the rarity
+    // dict cutoff can never match — warn.
+    #[test]
+    fn prevalence_count_at_or_above_cutoff_warns() {
+        for q in [
+            "* | prevalence hash_prevalence >= 1000",
+            "* | prevalence domain_prevalence > 999", // > 999 ⇒ ≥ 1000
+            "* | prevalence hash_prevalence = 5000",
+        ] {
+            let analysis = analyze_query_cost(&parse_query(q).unwrap());
+            let w = analysis
+                .warnings
+                .iter()
+                .find(|w| w.code == "PREVALENCE_COUNT_ABOVE_CUTOFF")
+                .unwrap_or_else(|| panic!("expected cutoff warning for `{q}`"));
+            assert_eq!(w.severity, WarningSeverity::Warning);
+            assert!(w.message.contains("never match"), "{}", w.message);
+        }
+    }
+
+    // A rarity hunt (low threshold) or a mid-range threshold that CAN match
+    // must NOT warn.
+    #[test]
+    fn prevalence_rarity_threshold_does_not_warn() {
+        for q in [
+            "* | prevalence hash_prevalence <= 5",
+            "* | prevalence hash_prevalence < 5",
+            "* | prevalence domain_prevalence > 500", // matches 501..=999
+            "* | prevalence hash_prevalence = 999",
+        ] {
+            let analysis = analyze_query_cost(&parse_query(q).unwrap());
+            assert!(
+                !analysis
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "PREVALENCE_COUNT_ABOVE_CUTOFF"),
+                "unexpected cutoff warning for `{q}`"
             );
         }
     }

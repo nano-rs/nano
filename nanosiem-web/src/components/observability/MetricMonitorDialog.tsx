@@ -71,6 +71,12 @@ const INTERVAL_OPTS: Array<[label: string, secs: number]> = [
 export interface MonitorQuerySeed {
   metric_name: string;
   agg: MetricAgg;
+  /**
+   * Optional service scope (promoted `service_name` column, NAN-1564). Carried
+   * end-to-end so the saved monitor evaluates the same scope the chart showed
+   * (O31); undefined/null ⇒ fleet-wide.
+   */
+  service_name?: string | null;
   group_by?: string;
   filters: MetricFilter[];
 }
@@ -80,6 +86,7 @@ function seedFromMonitor(m: MetricMonitor): MonitorQuerySeed {
   return {
     metric_name: m.metric_name,
     agg: m.agg,
+    service_name: m.service_name,
     group_by: m.group_by,
     filters: m.filters,
   };
@@ -156,6 +163,9 @@ export function MetricMonitorDialog({
       name: name.trim(),
       metric_name: querySeed.metric_name,
       agg: querySeed.agg,
+      // O31: preserve the service scope (like group_by/filters, part of the
+      // read-only query context). '' / null ⇒ undefined = fleet-wide.
+      service_name: querySeed.service_name || undefined,
       group_by: querySeed.group_by || undefined,
       filters: querySeed.filters,
       comparator,
@@ -182,6 +192,8 @@ export function MetricMonitorDialog({
 
   const querySummary = [
     `${querySeed.agg}(${querySeed.metric_name})`,
+    // O31: surface the service scope so it's clearly carried, not silently dropped.
+    querySeed.service_name ? `service=${querySeed.service_name}` : null,
     querySeed.group_by ? `by ${querySeed.group_by}` : null,
     ...querySeed.filters.map((f) => `${f.key}=${f.value}`),
   ]

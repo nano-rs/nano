@@ -97,5 +97,52 @@ pub use validation::{
     WarningSeverity,
 };
 
+/// Sanitize an untrusted value for safe interpolation inside an nPL
+/// **double-quoted** string literal, e.g. `field="<value>"`.
+///
+/// The nPL parser does NOT honor backslash escaping: `double_quoted_string`
+/// (`query::parser::values`) is `take_while(|c| c != '"')`, so the first `"`
+/// always terminates the literal and a backslash is a literal character. That
+/// is deliberate (NAN-1157) so Windows paths like `"C:\Windows\"` parse. There
+/// is therefore no escape sequence that can neutralize a `"`; the only safe
+/// option is to STRIP the characters that could terminate the literal (or, if a
+/// value were ever embedded unquoted, introduce a new pipe stage). Do NOT
+/// rewrite this as a backslash-escaper — that is a no-op against this grammar.
+///
+/// Removes `"` (the breakout char) plus `|`, backtick, and newlines as defense
+/// in depth; KEEPS `\` (so Windows paths still match) and `'` (so usernames like
+/// `O'Connor` still match) since both are inert inside a double-quoted literal.
+/// Callers must wrap the result in double quotes.
+///
+/// This is the single source of truth for both the shadow-investigation pivots
+/// (`cases::shadow_investigation`) and the pivt tool-loop (`melod`) so the two
+/// can't drift (NAN-1740 / NAN-1744).
+pub fn sanitize_npl_quoted_value(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !matches!(c, '"' | '|' | '`' | '\n' | '\r'))
+        .collect()
+}
+
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::sanitize_npl_quoted_value as sanitize;
+
+    #[test]
+    fn strips_breakout_and_inject_chars() {
+        // The canonical injection payload: close the quote, inject a pipe stage.
+        let out = sanitize("evil\" | where 1=0 \"");
+        assert!(!out.contains('"'), "quote removed: {out:?}");
+        assert!(!out.contains('|'), "pipe removed: {out:?}");
+        // Backtick and newlines are stripped too.
+        assert_eq!(sanitize("a`b\nc\rd"), "abcd");
+    }
+
+    #[test]
+    fn keeps_backslash_and_apostrophe() {
+        // Windows paths and apostrophe usernames must survive so pivots match.
+        assert_eq!(sanitize(r"C:\Windows\System32"), r"C:\Windows\System32");
+        assert_eq!(sanitize(r"DOMAIN\Administrator"), r"DOMAIN\Administrator");
+        assert_eq!(sanitize("O'Connor"), "O'Connor");
+    }
+}

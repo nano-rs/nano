@@ -241,6 +241,12 @@ impl ClickHouseSqlGenerator {
             None => String::new(),
         };
 
+        // O27 (NAN-1721): order the streamstats windows on the active dataset's
+        // time column (`start_time` for spans) — a bare `dataset=spans …
+        // | streamstats …` otherwise references a nonexistent `timestamp`
+        // column. Logs keep `timestamp` byte-identical.
+        let tc = self.time_column();
+
         // Build window function expressions for each aggregation
         let window_exprs: Vec<String> = aggregations.iter()
             .map(|agg| {
@@ -251,50 +257,50 @@ impl ClickHouseSqlGenerator {
                 // Map aggregation functions to window functions
                 // For last() with current=false, use lagInFrame for "previous value"
                 let window_func = match agg.func {
-                    AggFunc::Count => format!("count({}) OVER ({}ORDER BY timestamp {})",
+                    AggFunc::Count => format!("count({}) OVER ({}ORDER BY {tc} {})",
                         if field_expr == "*" { "" } else { &field_expr }, partition_clause, frame_spec),
-                    AggFunc::Sum => format!("sum({}) OVER ({}ORDER BY timestamp {})",
+                    AggFunc::Sum => format!("sum({}) OVER ({}ORDER BY {tc} {})",
                         field_expr, partition_clause, frame_spec),
-                    AggFunc::Avg => format!("avg({}) OVER ({}ORDER BY timestamp {})",
+                    AggFunc::Avg => format!("avg({}) OVER ({}ORDER BY {tc} {})",
                         field_expr, partition_clause, frame_spec),
-                    AggFunc::Min => format!("min({}) OVER ({}ORDER BY timestamp {})",
+                    AggFunc::Min => format!("min({}) OVER ({}ORDER BY {tc} {})",
                         field_expr, partition_clause, frame_spec),
-                    AggFunc::Max => format!("max({}) OVER ({}ORDER BY timestamp {})",
+                    AggFunc::Max => format!("max({}) OVER ({}ORDER BY {tc} {})",
                         field_expr, partition_clause, frame_spec),
                     AggFunc::First => {
                         // first() in streamstats context means first value in the window
-                        format!("first_value({}) OVER ({}ORDER BY timestamp {})",
+                        format!("first_value({}) OVER ({}ORDER BY {tc} {})",
                             field_expr, partition_clause, frame_spec)
                     }
                     AggFunc::Last => {
                         // For current=false, last() means "previous value" - use lagInFrame
                         if !current {
-                            format!("lagInFrame({}, 1) OVER ({}ORDER BY timestamp)",
+                            format!("lagInFrame({}, 1) OVER ({}ORDER BY {tc})",
                                 field_expr, partition_clause)
                         } else {
-                            format!("last_value({}) OVER ({}ORDER BY timestamp {})",
+                            format!("last_value({}) OVER ({}ORDER BY {tc} {})",
                                 field_expr, partition_clause, frame_spec)
                         }
                     }
-                    AggFunc::Dc => format!("uniqExact({}) OVER ({}ORDER BY timestamp {})",
+                    AggFunc::Dc => format!("uniqExact({}) OVER ({}ORDER BY {tc} {})",
                         field_expr, partition_clause, frame_spec),
-                    AggFunc::EstDc => format!("uniqCombined64({}) OVER ({}ORDER BY timestamp {})",
+                    AggFunc::EstDc => format!("uniqCombined64({}) OVER ({}ORDER BY {tc} {})",
                         field_expr, partition_clause, frame_spec),
-                    AggFunc::Values => format!("arrayStringConcat(arrayFilter(x -> x != '', groupArrayDistinct({})(toString({})) OVER ({}ORDER BY timestamp {})), ', ')",
+                    AggFunc::Values => format!("arrayStringConcat(arrayFilter(x -> x != '', groupArrayDistinct({})(toString({})) OVER ({}ORDER BY {tc} {})), ', ')",
                         self.max_group_array_size, field_expr, partition_clause, frame_spec),
-                    AggFunc::List => format!("arrayStringConcat(arrayFilter(x -> x != '', groupArray({})(toString({})) OVER ({}ORDER BY timestamp {})), ', ')",
+                    AggFunc::List => format!("arrayStringConcat(arrayFilter(x -> x != '', groupArray({})(toString({})) OVER ({}ORDER BY {tc} {})), ', ')",
                         self.max_group_array_size, field_expr, partition_clause, frame_spec),
-                    AggFunc::Stdev => format!("stddevPop({}) OVER ({}ORDER BY timestamp {})",
+                    AggFunc::Stdev => format!("stddevPop({}) OVER ({}ORDER BY {tc} {})",
                         field_expr, partition_clause, frame_spec),
-                    AggFunc::Var => format!("varPop({}) OVER ({}ORDER BY timestamp {})",
+                    AggFunc::Var => format!("varPop({}) OVER ({}ORDER BY {tc} {})",
                         field_expr, partition_clause, frame_spec),
-                    AggFunc::Range => format!("(max({}) OVER ({}ORDER BY timestamp {}) - min({}) OVER ({}ORDER BY timestamp {}))",
+                    AggFunc::Range => format!("(max({}) OVER ({}ORDER BY {tc} {}) - min({}) OVER ({}ORDER BY {tc} {}))",
                         field_expr, partition_clause, frame_spec, field_expr, partition_clause, frame_spec),
-                    AggFunc::Earliest => format!("min({}) OVER ({}ORDER BY timestamp {})",
+                    AggFunc::Earliest => format!("min({}) OVER ({}ORDER BY {tc} {})",
                         field_expr, partition_clause, frame_spec),
-                    AggFunc::Latest => format!("max({}) OVER ({}ORDER BY timestamp {})",
+                    AggFunc::Latest => format!("max({}) OVER ({}ORDER BY {tc} {})",
                         field_expr, partition_clause, frame_spec),
-                    _ => format!("count({}) OVER ({}ORDER BY timestamp {})",
+                    _ => format!("count({}) OVER ({}ORDER BY {tc} {})",
                         field_expr, partition_clause, frame_spec),
                 };
 
@@ -360,6 +366,11 @@ impl ClickHouseSqlGenerator {
             .unwrap_or_default();
         let grouped = !key_exprs.is_empty();
 
+        // O27 (NAN-1721): earliest()/latest() argMin/argMax on the active dataset's
+        // time column (`start_time` for spans), not the logs-only `timestamp`.
+        // Logs keep `timestamp` byte-identical.
+        let tc = self.time_column();
+
         let mut value_exprs: Vec<String> = Vec::with_capacity(aggregations.len());
         let mut aliases: Vec<String> = Vec::with_capacity(aggregations.len());
         for agg in aggregations {
@@ -424,8 +435,8 @@ impl ClickHouseSqlGenerator {
                 ),
                 AggFunc::First => format!("any({})", field_expr),
                 AggFunc::Last => format!("anyLast({})", field_expr),
-                AggFunc::Earliest => format!("argMin({}, timestamp)", field_expr),
-                AggFunc::Latest => format!("argMax({}, timestamp)", field_expr),
+                AggFunc::Earliest => format!("argMin({}, {tc})", field_expr),
+                AggFunc::Latest => format!("argMax({}, {tc})", field_expr),
                 AggFunc::Mode => format!("(topK(1)({}))[1]", field_expr),
                 AggFunc::Sparkline => {
                     return Err(SqlGenError::InvalidQuery(

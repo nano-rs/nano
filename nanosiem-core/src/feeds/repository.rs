@@ -344,6 +344,10 @@ impl FeedRepository {
     ) -> Result<Vec<FeedStats>, FeedRepositoryError> {
         let mut stats = Vec::new();
 
+        // NAN-1728 (H5): route the logs read through the `_distributed` wrapper on
+        // a cluster so feed stats cover ALL shards (~1/N undercount otherwise).
+        // `read_bare` returns the bare `logs` on single-node — byte-identical.
+        let logs_table = self.table_names.read_bare("logs");
         for feed in feeds {
             let where_clause = Self::build_feed_where_clause(feed);
             let sql = format!(
@@ -351,7 +355,7 @@ impl FeedRepository {
                 SELECT
                     count(*) as event_count,
                     max(timestamp) as last_event_at
-                FROM logs
+                FROM {logs_table}
                 WHERE {}
                 "#,
                 where_clause
@@ -466,6 +470,9 @@ impl FeedRepository {
     ) -> Result<FeedHealthMetrics, FeedRepositoryError> {
         let where_clause = Self::build_feed_where_clause(feed);
 
+        // NAN-1728 (H5): route through the `_distributed` wrapper on a cluster so
+        // feed health metrics cover all shards; bare `logs` on single-node.
+        let logs_table = self.table_names.read_bare("logs");
         let sql = format!(
             r#"
             SELECT
@@ -477,7 +484,7 @@ impl FeedRepository {
                 if(max(timestamp) = toDateTime64('1970-01-01 00:00:00', 6, 'UTC'), NULL,
                    dateDiff('second', max(timestamp), now()) / 3600.0) as data_freshness_hours,
                 sum(length(message) + length(metadata) + length(source_type) + 200) as total_size_bytes
-            FROM logs
+            FROM {logs_table}
             WHERE {}
             "#,
             where_clause
@@ -791,12 +798,15 @@ impl FeedRepository {
     ) -> Result<Vec<FeedHistoryPoint>, FeedRepositoryError> {
         let where_clause = Self::build_feed_where_clause(feed);
 
+        // NAN-1728 (H5): route through the `_distributed` wrapper on a cluster so
+        // the ingestion-history buckets cover all shards; bare `logs` on single-node.
+        let logs_table = self.table_names.read_bare("logs");
         let sql = format!(
             r#"
             SELECT
                 toStartOfHour(timestamp) as hour_bucket,
                 count(*) as event_count
-            FROM logs
+            FROM {logs_table}
             WHERE {}
               AND timestamp >= now() - INTERVAL 24 HOUR
             GROUP BY hour_bucket

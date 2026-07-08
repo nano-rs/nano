@@ -54,7 +54,14 @@ impl CoverageAnalyzer {
         // Query all distinct source types (no time filter).
         // NAN-1241: read the active ingested-events table (ocsf_logs under OCSF)
         // so rule coverage sees the source types that actually exist. UDM-identical.
-        let logs_table = crate::schema::active_logs_table();
+        // NAN-1728 (H5): route through the `_distributed` wrapper on a cluster so
+        // DISTINCT source_type sees source types on ALL shards (otherwise rules
+        // whose data landed on another shard are falsely reported as having no
+        // matching data); bare local name on single-node (byte-identical).
+        let logs_table = self
+            .dual_pool
+            .table_names()
+            .read_bare(crate::schema::active_logs_table());
         let query = format!(
             r#"
             SELECT DISTINCT source_type

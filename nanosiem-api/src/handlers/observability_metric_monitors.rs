@@ -52,6 +52,10 @@ pub struct MetricMonitorRequest {
     pub metric_name: String,
     /// Aggregate: `avg`|`sum`|`min`|`max`|`count`|`rate`|`p50`|`p95`|`p99`.
     pub agg: String,
+    /// Optional service scope; NULL evaluates the metric fleet-wide. The
+    /// promoted `otel_metrics.service_name` column (NAN-1564), NOT a tag filter.
+    #[serde(default)]
+    pub service_name: Option<String>,
     /// Optional tag/attribute key to split into per-series evaluation.
     #[serde(default)]
     pub group_by: Option<String>,
@@ -80,6 +84,7 @@ struct ValidatedMonitor {
     name: String,
     metric_name: String,
     agg: String,
+    service_name: Option<String>,
     group_by: Option<String>,
     filters: Vec<MonitorTagFilter>,
 }
@@ -109,6 +114,16 @@ impl MetricMonitorRequest {
             .ok_or_else(|| ApiError::BadRequest(format!("unknown agg: {}", self.agg)))?
             .as_str()
             .to_string();
+
+        // service_name: promoted-column scope (NAN-1564). Empty/whitespace -> None
+        // (fleet-wide). Compared RAW against the `service_name` column, so no tag-key
+        // validation applies; escaping happens in the SQL builder.
+        let service_name = self
+            .service_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
 
         // group_by: empty -> None; otherwise must be a valid tag key.
         let group_by = match self.group_by.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -157,11 +172,25 @@ impl MetricMonitorRequest {
                 "eval_interval_secs must be in {EVAL_INTERVAL_MIN}..={EVAL_INTERVAL_MAX}"
             )));
         }
+        // O16 (NAN-1721): validated together, not just independently — a window
+        // shorter than the eval cadence leaves permanent blind spots. Each
+        // evaluation only inspects the trailing `window_secs`, so
+        // `eval_interval_secs - window_secs` of every interval is never examined
+        // (e.g. window=60s, interval=3600s → 59 min/hour unseen). Require the
+        // window to cover at least one full cadence. Enforced on create AND
+        // update (both call `validate`).
+        if self.window_secs < self.eval_interval_secs {
+            return Err(ApiError::BadRequest(format!(
+                "window_secs ({}) must be >= eval_interval_secs ({}): a shorter window leaves gaps between evaluations",
+                self.window_secs, self.eval_interval_secs
+            )));
+        }
 
         Ok(ValidatedMonitor {
             name,
             metric_name,
             agg,
+            service_name,
             group_by,
             filters,
         })
@@ -243,6 +272,7 @@ pub async fn create_metric_monitor(
             &v.name,
             &v.metric_name,
             &v.agg,
+            v.service_name.as_deref(),
             v.group_by.as_deref(),
             &v.filters,
             req.comparator,
@@ -290,6 +320,7 @@ pub async fn update_metric_monitor(
             &v.name,
             &v.metric_name,
             &v.agg,
+            v.service_name.as_deref(),
             v.group_by.as_deref(),
             &v.filters,
             req.comparator,

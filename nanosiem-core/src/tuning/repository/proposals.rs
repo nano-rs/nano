@@ -118,6 +118,54 @@ impl TuningRepository {
         Ok(())
     }
 
+    /// Record that a detection-as-code PR was opened for a proposal: stamps the
+    /// PR metadata and moves the proposal to `pr_opened` in a single write
+    /// (NAN-1745). Used instead of applying the tuned query to the DB.
+    pub async fn set_pr_opened(
+        &self,
+        proposal_id: Uuid,
+        pr_url: &str,
+        pr_number: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE tuning_proposals
+            SET status = 'pr_opened', pr_url = $1, pr_number = $2, pr_state = 'open'
+            WHERE id = $3
+            "#,
+        )
+        .bind(pr_url)
+        .bind(pr_number as i32)
+        .bind(proposal_id)
+        .execute(&self.pool)
+        .await
+        .context("Failed to record PR on tuning proposal")?;
+
+        Ok(())
+    }
+
+    /// Whether a detection-as-code tuning PR was opened for `rule_id` within the
+    /// last 7 days (NAN-1745). Used to avoid spamming duplicate PRs when a noisy
+    /// rule keeps breaching before the earlier PR is reviewed. The window bounds
+    /// suppression since v1 does not sync PR merge/close state back.
+    pub async fn has_recent_pr_for_rule(&self, rule_id: Uuid) -> Result<bool> {
+        let exists: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM tuning_proposals
+                WHERE rule_id = $1
+                  AND status = 'pr_opened'
+                  AND created_at > NOW() - INTERVAL '7 days'
+            )
+            "#,
+        )
+        .bind(rule_id)
+        .fetch_one(&self.pool)
+        .await
+        .context("Failed to check for recent tuning PR")?;
+        Ok(exists)
+    }
+
     /// Upgrade an open silent-rule proposal in place when the rule crosses to
     /// a higher tier (NAN-880). Updates the descriptive fields without
     /// resetting `created_at`, so the analyst sees how long the rule has been
@@ -196,7 +244,10 @@ impl TuningRepository {
                 tp.status,
                 tp.current_hints,
                 tp.proposed_hints,
-                tp.hints_diff
+                tp.hints_diff,
+                tp.pr_url,
+                tp.pr_number,
+                tp.pr_state
             FROM tuning_proposals tp
             LEFT JOIN detection_rules r ON r.id = tp.rule_id
             WHERE 1=1
@@ -258,6 +309,7 @@ impl TuningRepository {
                 "reverted" => TuningStatus::Reverted,
                 "manually_approved" => TuningStatus::ManuallyApproved,
                 "rejected" => TuningStatus::Rejected,
+                "pr_opened" => TuningStatus::PrOpened,
                 _ => TuningStatus::Proposed,
             };
 
@@ -299,6 +351,9 @@ impl TuningRepository {
                 current_hints,
                 proposed_hints,
                 hints_diff,
+                pr_url: row.try_get("pr_url")?,
+                pr_number: row.try_get("pr_number")?,
+                pr_state: row.try_get("pr_state")?,
             });
         }
 
@@ -332,7 +387,10 @@ impl TuningRepository {
                 tp.status,
                 tp.current_hints,
                 tp.proposed_hints,
-                tp.hints_diff
+                tp.hints_diff,
+                tp.pr_url,
+                tp.pr_number,
+                tp.pr_state
             FROM tuning_proposals tp
             LEFT JOIN detection_rules r ON r.id = tp.rule_id
             WHERE tp.id = $1
@@ -355,6 +413,7 @@ impl TuningRepository {
                 "reverted" => TuningStatus::Reverted,
                 "manually_approved" => TuningStatus::ManuallyApproved,
                 "rejected" => TuningStatus::Rejected,
+                "pr_opened" => TuningStatus::PrOpened,
                 _ => TuningStatus::Proposed,
             };
 
@@ -395,6 +454,9 @@ impl TuningRepository {
                 current_hints,
                 proposed_hints,
                 hints_diff,
+                pr_url: row.try_get("pr_url")?,
+                pr_number: row.try_get("pr_number")?,
+                pr_state: row.try_get("pr_state")?,
             }))
         } else {
             Ok(None)

@@ -2,6 +2,7 @@
 
 //! Dashboard repository for CRUD operations
 
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use thiserror::Error;
 use uuid::Uuid;
@@ -21,6 +22,11 @@ pub enum DashboardRepositoryError {
     AccessDenied(Uuid),
     #[error("Only the owner can share this dashboard")]
     NotOwner,
+    /// Optimistic-concurrency precondition failed: the dashboard was modified
+    /// by another writer since the caller last read it (DSH9). Mapped to HTTP
+    /// 409 Conflict by the handler.
+    #[error("Dashboard was modified by another update: {0}")]
+    Conflict(Uuid),
 }
 
 /// Repository for dashboard operations
@@ -159,6 +165,47 @@ impl DashboardRepository {
         Ok(groups)
     }
 
+    /// Get shared groups for many dashboards in a single query, keyed by
+    /// dashboard id (DSH42). Dashboards with no group rows are absent from the
+    /// map, so callers should default to an empty vec. Lets list endpoints
+    /// populate `shared_groups` without an N+1 per-dashboard fetch.
+    pub async fn get_shared_groups_for_dashboards(
+        &self,
+        dashboard_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<DashboardSharedGroup>>, DashboardRepositoryError>
+    {
+        use std::collections::HashMap;
+
+        if dashboard_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query_as::<_, (Uuid, Uuid, String)>(
+            r#"
+            SELECT dg.dashboard_id, g.id, g.name
+            FROM dashboard_groups dg
+            JOIN groups g ON g.id = dg.group_id
+            WHERE dg.dashboard_id = ANY($1)
+            ORDER BY g.name
+            "#,
+        )
+        .bind(dashboard_ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut map: HashMap<Uuid, Vec<DashboardSharedGroup>> = HashMap::new();
+        for (dashboard_id, group_id, group_name) in rows {
+            map.entry(dashboard_id)
+                .or_default()
+                .push(DashboardSharedGroup {
+                    id: group_id,
+                    name: group_name,
+                });
+        }
+
+        Ok(map)
+    }
+
     /// Get users in specified groups (for affected users calculation)
     async fn get_users_in_groups(
         &self,
@@ -218,11 +265,21 @@ impl DashboardRepository {
             return Err(DashboardRepositoryError::AccessDenied(id));
         }
 
-        // Get shared groups
-        let shared_groups = self.get_shared_groups(id).await?;
+        self.context_from_with_owner(dashboard, user_id).await
+    }
 
-        // Build context
-        let is_owner = dashboard.owner_id == Some(user_id);
+    /// Build a `DashboardWithContext` from an already-fetched `DashboardWithOwner`
+    /// WITHOUT an access check. Callers requiring authorization must check first
+    /// (e.g. `find_by_id_for_user`); the admin share path uses this directly
+    /// because the admin is already authorized and may not have view access to
+    /// the dashboard it just mutated (DSH11).
+    async fn context_from_with_owner(
+        &self,
+        dashboard: DashboardWithOwner,
+        viewer_user_id: Uuid,
+    ) -> Result<DashboardWithContext, DashboardRepositoryError> {
+        let shared_groups = self.get_shared_groups(dashboard.id).await?;
+        let is_owner = dashboard.owner_id == Some(viewer_user_id);
 
         Ok(DashboardWithContext {
             id: dashboard.id,
@@ -300,86 +357,122 @@ impl DashboardRepository {
         Ok(results)
     }
 
-    /// Update a dashboard
+    /// Update a dashboard (no ownership check — internal/legacy callers only).
     pub async fn update(
         &self,
         id: Uuid,
         update: &UpdateDashboard,
     ) -> Result<Dashboard, DashboardRepositoryError> {
-        // First check if dashboard exists
-        self.find_by_id(id).await?;
+        self.apply_update(id, update, None).await
+    }
+
+    /// Apply the field update atomically, honoring the optimistic-concurrency
+    /// precondition and the tri-state clearable fields.
+    ///
+    /// - `description`/`refresh_interval` are `Option<Option<_>>`: `None` leaves
+    ///   the column untouched, `Some(None)` clears it to NULL, `Some(Some(v))`
+    ///   sets it (DSH13).
+    /// - When `expected_updated_at` is `Some`, the write is gated on the row's
+    ///   `updated_at` still matching; a mismatch (or a concurrent delete)
+    ///   yields `Conflict` (DSH9). When `None`, it behaves as an unconditional
+    ///   update.
+    async fn apply_update(
+        &self,
+        id: Uuid,
+        update: &UpdateDashboard,
+        expected_updated_at: Option<DateTime<Utc>>,
+    ) -> Result<Dashboard, DashboardRepositoryError> {
+        // Decompose the tri-state clearable fields into (should_set, value).
+        let (set_description, description) = match &update.description {
+            None => (false, None),
+            Some(value) => (true, value.clone()),
+        };
+        let (set_refresh, refresh_interval) = match update.refresh_interval {
+            None => (false, None),
+            Some(value) => (true, value),
+        };
 
         let result = sqlx::query_as::<_, Dashboard>(
             r#"
             UPDATE dashboards SET
                 name = COALESCE($2, name),
-                description = COALESCE($3, description),
-                layout = COALESCE($4, layout),
-                panels = COALESCE($5, panels),
-                refresh_interval = COALESCE($6, refresh_interval),
+                description = CASE WHEN $3 THEN $4::text ELSE description END,
+                layout = COALESCE($5, layout),
+                panels = COALESCE($6, panels),
+                refresh_interval = CASE WHEN $7 THEN $8::integer ELSE refresh_interval END,
                 updated_at = NOW()
-            WHERE id = $1
+            WHERE id = $1 AND ($9::timestamptz IS NULL OR updated_at = $9)
             RETURNING *
             "#,
         )
         .bind(id)
         .bind(&update.name)
-        .bind(&update.description)
+        .bind(set_description)
+        .bind(description)
         .bind(&update.layout)
         .bind(&update.panels)
-        .bind(update.refresh_interval)
-        .fetch_one(&self.pool)
+        .bind(set_refresh)
+        .bind(refresh_interval)
+        .bind(expected_updated_at)
+        .fetch_optional(&self.pool)
         .await?;
 
-        Ok(result)
+        match result {
+            Some(dashboard) => Ok(dashboard),
+            None => {
+                // No row updated: either the id no longer exists, or the
+                // optimistic-concurrency precondition failed. Disambiguate with
+                // a light existence probe so the caller gets NotFound vs Conflict.
+                let exists: Option<Uuid> =
+                    sqlx::query_scalar(r#"SELECT id FROM dashboards WHERE id = $1"#)
+                        .bind(id)
+                        .fetch_optional(&self.pool)
+                        .await?;
+                if exists.is_some() {
+                    Err(DashboardRepositoryError::Conflict(id))
+                } else {
+                    Err(DashboardRepositoryError::NotFound(id))
+                }
+            }
+        }
     }
 
-    /// Update a dashboard, verifying user has access
+    /// Update a dashboard, verifying the caller is the owner (DSH2).
+    ///
+    /// Public/legacy (owner-less) dashboards are no longer world-editable —
+    /// non-owners are rejected. Admins edit foreign/legacy dashboards through
+    /// `update_as_admin`. `expected_updated_at` enables optimistic concurrency
+    /// (DSH9).
     pub async fn update_owned(
         &self,
         id: Uuid,
         user_id: Uuid,
         update: &UpdateDashboard,
+        expected_updated_at: Option<DateTime<Utc>>,
     ) -> Result<Dashboard, DashboardRepositoryError> {
-        // First check access
         let dashboard = self.find_by_id(id).await?;
-        let has_access = self.check_user_access(&dashboard, user_id).await?;
-        if !has_access {
+
+        if dashboard.owner_id != Some(user_id) {
             return Err(DashboardRepositoryError::AccessDenied(id));
         }
 
-        // Only owner or public dashboards can be edited
-        let is_owner = dashboard.owner_id == Some(user_id);
-        let is_public = dashboard.visibility == "public";
-        let is_legacy = dashboard.owner_id.is_none();
+        self.apply_update(id, update, expected_updated_at).await
+    }
 
-        if !is_owner && !is_public && !is_legacy {
-            return Err(DashboardRepositoryError::AccessDenied(id));
-        }
-
-        let result = sqlx::query_as::<_, Dashboard>(
-            r#"
-            UPDATE dashboards SET
-                name = COALESCE($2, name),
-                description = COALESCE($3, description),
-                layout = COALESCE($4, layout),
-                panels = COALESCE($5, panels),
-                refresh_interval = COALESCE($6, refresh_interval),
-                updated_at = NOW()
-            WHERE id = $1
-            RETURNING *
-            "#,
-        )
-        .bind(id)
-        .bind(&update.name)
-        .bind(&update.description)
-        .bind(&update.layout)
-        .bind(&update.panels)
-        .bind(update.refresh_interval)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(result)
+    /// Update a dashboard as an admin, bypassing the ownership check (DSH2).
+    ///
+    /// The caller must already be authorized (SETTINGS_SYSTEM checked at the
+    /// handler). `expected_updated_at` enables optimistic concurrency (DSH9).
+    pub async fn update_as_admin(
+        &self,
+        id: Uuid,
+        update: &UpdateDashboard,
+        expected_updated_at: Option<DateTime<Utc>>,
+    ) -> Result<Dashboard, DashboardRepositoryError> {
+        // Ensure the dashboard exists so a missing id surfaces as NotFound even
+        // when no version precondition is supplied.
+        self.find_by_id(id).await?;
+        self.apply_update(id, update, expected_updated_at).await
     }
 
     /// Share a dashboard (owner only)
@@ -419,7 +512,30 @@ impl DashboardRepository {
             .get_users_in_groups(&removed_group_ids, user_id)
             .await?;
 
-        // Update visibility
+        // Apply the visibility change and group rewrite atomically (DSH12) so a
+        // mid-sequence failure can't leave visibility='group' with missing rows.
+        self.apply_share_mutation(id, &request.visibility, &new_group_ids)
+            .await?;
+
+        // Fetch the updated dashboard with context (owner always retains access).
+        let dashboard_with_context = self.find_by_id_for_user(id, user_id).await?;
+
+        Ok(DashboardShareResult {
+            dashboard: dashboard_with_context,
+            users_who_lost_access,
+        })
+    }
+
+    /// Apply a share change (visibility + group membership rewrite) inside a
+    /// single transaction so it is all-or-nothing (DSH12).
+    async fn apply_share_mutation(
+        &self,
+        id: Uuid,
+        visibility: &str,
+        new_group_ids: &[Uuid],
+    ) -> Result<(), DashboardRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+
         sqlx::query(
             r#"
             UPDATE dashboards SET visibility = $2, updated_at = NOW()
@@ -427,19 +543,17 @@ impl DashboardRepository {
             "#,
         )
         .bind(id)
-        .bind(&request.visibility)
-        .execute(&self.pool)
+        .bind(visibility)
+        .execute(&mut *tx)
         .await?;
 
-        // Clear all dashboard_groups entries
         sqlx::query(r#"DELETE FROM dashboard_groups WHERE dashboard_id = $1"#)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
-        // Insert new dashboard_groups entries if visibility is 'group'
-        if request.visibility == "group" {
-            for group_id in &new_group_ids {
+        if visibility == "group" {
+            for group_id in new_group_ids {
                 sqlx::query(
                     r#"
                     INSERT INTO dashboard_groups (dashboard_id, group_id)
@@ -449,18 +563,13 @@ impl DashboardRepository {
                 )
                 .bind(id)
                 .bind(group_id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
             }
         }
 
-        // Fetch the updated dashboard with context
-        let dashboard_with_context = self.find_by_id_for_user(id, user_id).await?;
-
-        Ok(DashboardShareResult {
-            dashboard: dashboard_with_context,
-            users_who_lost_access,
-        })
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Share a dashboard as admin (bypasses ownership check)
@@ -497,43 +606,17 @@ impl DashboardRepository {
             .get_users_in_groups(&removed_group_ids, exclude_user)
             .await?;
 
-        // Update visibility
-        sqlx::query(
-            r#"
-            UPDATE dashboards SET visibility = $2, updated_at = NOW()
-            WHERE id = $1
-            "#,
-        )
-        .bind(id)
-        .bind(&request.visibility)
-        .execute(&self.pool)
-        .await?;
-
-        // Clear all dashboard_groups entries
-        sqlx::query(r#"DELETE FROM dashboard_groups WHERE dashboard_id = $1"#)
-            .bind(id)
-            .execute(&self.pool)
+        // Apply the visibility change and group rewrite atomically (DSH12).
+        self.apply_share_mutation(id, &request.visibility, &new_group_ids)
             .await?;
 
-        // Insert new dashboard_groups entries if visibility is 'group'
-        if request.visibility == "group" {
-            for group_id in &new_group_ids {
-                sqlx::query(
-                    r#"
-                    INSERT INTO dashboard_groups (dashboard_id, group_id)
-                    VALUES ($1, $2)
-                    ON CONFLICT DO NOTHING
-                    "#,
-                )
-                .bind(id)
-                .bind(group_id)
-                .execute(&self.pool)
-                .await?;
-            }
-        }
-
-        // Fetch the updated dashboard with context
-        let dashboard_with_context = self.find_by_id_for_user(id, admin_user_id).await?;
+        // Rebuild the context WITHOUT an access check (DSH11): the admin is
+        // already authorized and may have just made the dashboard private or a
+        // group they don't belong to. Running `find_by_id_for_user` here would
+        // 403 AFTER the mutation committed, reporting a real success as failure
+        // and skipping the audit emit.
+        let updated = self.find_by_id_with_owner(id).await?;
+        let dashboard_with_context = self.context_from_with_owner(updated, admin_user_id).await?;
 
         Ok(DashboardShareResult {
             dashboard: dashboard_with_context,
@@ -555,24 +638,33 @@ impl DashboardRepository {
         Ok(())
     }
 
-    /// Delete a dashboard, verifying ownership
+    /// Delete a dashboard, verifying the caller is the owner (DSH2).
+    ///
+    /// Legacy (owner-less) dashboards are no longer deletable by arbitrary
+    /// users — they must be removed through `delete_as_admin`.
     pub async fn delete_owned(
         &self,
         id: Uuid,
         user_id: Uuid,
     ) -> Result<(), DashboardRepositoryError> {
-        let result = sqlx::query(
-            r#"DELETE FROM dashboards WHERE id = $1 AND (owner_id = $2 OR owner_id IS NULL)"#,
-        )
-        .bind(id)
-        .bind(user_id)
-        .execute(&self.pool)
-        .await?;
+        let result = sqlx::query(r#"DELETE FROM dashboards WHERE id = $1 AND owner_id = $2"#)
+            .bind(id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
 
         if result.rows_affected() == 0 {
             return Err(DashboardRepositoryError::AccessDenied(id));
         }
 
         Ok(())
+    }
+
+    /// Delete a dashboard as an admin, bypassing the ownership check (DSH2).
+    ///
+    /// The caller must already be authorized (SETTINGS_SYSTEM checked at the
+    /// handler). Mirrors `share_as_admin`/`update_as_admin`.
+    pub async fn delete_as_admin(&self, id: Uuid) -> Result<(), DashboardRepositoryError> {
+        self.delete(id).await
     }
 }

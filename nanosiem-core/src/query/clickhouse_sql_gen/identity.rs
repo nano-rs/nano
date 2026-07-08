@@ -378,6 +378,11 @@ impl ClickHouseSqlGenerator {
                 Err(poisoned) => (**poisoned.get_ref()).clone(),
             }
         };
+        // NAN-1728 (R2): route the ASOF build side to the `_distributed` wrapper
+        // when clustered so `| identity` enrichment joins against observations
+        // from ALL shards, not just the LB-connected node. Single-shard (default)
+        // keeps the bare `identity_observations` literal — byte-identical.
+        let identity_obs_table = self.route_dataset_table("identity_observations");
         let build_side = bounded_window
             .and_then(|tr| {
                 // try_seconds + checked_sub_signed: a crafted max_age (the
@@ -388,12 +393,12 @@ impl ClickHouseSqlGenerator {
                     .and_then(chrono::Duration::try_seconds)
                     .and_then(|d| tr.start.checked_sub_signed(d))?;
                 Some(format!(
-                    "(\n    SELECT * FROM identity_observations\n    WHERE observed_at BETWEEN '{}' AND '{}'\n  )",
+                    "(\n    SELECT * FROM {identity_obs_table}\n    WHERE observed_at BETWEEN '{}' AND '{}'\n  )",
                     crate::sql_hygiene::format_ch_bound_micros(&lower),
                     crate::sql_hygiene::format_ch_bound_micros(&tr.end)
                 ))
             })
-            .unwrap_or_else(|| "identity_observations".to_string());
+            .unwrap_or_else(|| identity_obs_table.clone());
 
         Ok(format!(
             r#"  SELECT

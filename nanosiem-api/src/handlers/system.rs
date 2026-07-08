@@ -201,7 +201,13 @@ async fn get_event_count(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
 ) -> Result<i64, ApiError> {
-    get_event_count_clickhouse(state.dual_pool.clickhouse(), start, end).await
+    get_event_count_clickhouse(
+        state.dual_pool.clickhouse(),
+        state.dual_pool.is_clustered(),
+        start,
+        end,
+    )
+    .await
 }
 
 /// Get event count from ClickHouse using system.parts for fast approximate counts
@@ -212,6 +218,7 @@ async fn get_event_count(
 /// for dashboard metrics.
 async fn get_event_count_clickhouse(
     client: &ClickhouseClient,
+    is_clustered: bool,
     start: DateTime<Utc>,
     _end: DateTime<Utc>,
 ) -> Result<i64, ApiError> {
@@ -220,11 +227,24 @@ async fn get_event_count_clickhouse(
 
     // Query system.parts for fast row count - nearly instant regardless of volume.
     // NAN-1241: count the active ingested-events table (ocsf_logs under OCSF).
+    //
+    // NAN-1728 M-5: on a cluster `system.parts` on the LB'd connection is one
+    // shard's slice (~1/N of events, jittering per connection). Aggregate across
+    // shards via `cluster(...)` — one replica per shard, so `sum(rows)` counts
+    // each shard exactly once (no replica double-count). On single-node this is
+    // byte-identical: plain `system.parts`. The cluster name mirrors the
+    // `CLICKHOUSE_CLUSTER` gate the deploy sets only on clustered ClickHouse.
     let logs_table = nanosiem_core::schema::active_logs_table();
+    let parts_source = match (is_clustered, std::env::var("CLICKHOUSE_CLUSTER").ok()) {
+        (true, Some(cl)) if !cl.trim().is_empty() => {
+            format!("cluster('{}', system.parts)", cl.trim())
+        }
+        _ => "system.parts".to_string(),
+    };
     let sql = format!(
         r#"
         SELECT sum(rows) as count
-        FROM system.parts
+        FROM {parts_source}
         WHERE database = 'nanosiem'
           AND table = '{logs_table}'
           AND active

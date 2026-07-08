@@ -43,6 +43,7 @@ import { subHours, subDays } from 'date-fns';
 import { api } from '@/lib/api';
 import type { VisualizationType, VisualizationConfig } from '@/lib/api';
 import { VisualizationRenderer } from './VisualizationRenderer';
+import { substituteVariables } from './variable-substitution';
 
 interface QueryTestModalProps {
   open: boolean;
@@ -70,27 +71,6 @@ const TIME_PRESETS = [
   { label: 'Last 24 hours', value: '24h', getRange: () => ({ start: subDays(new Date(), 1), end: new Date() }) },
   { label: 'Last 7 days', value: '7d', getRange: () => ({ start: subDays(new Date(), 7), end: new Date() }) },
 ];
-
-// Substitute variables in query string
-// If a variable has no value, remove the entire "field=$var" clause to avoid type errors
-function substituteVariables(query: string, variables?: Record<string, string>): string {
-  // First, remove entire "field=$var" or "field = $var" clauses where variable is empty
-  let result = query.replace(/\b(\w+)\s*=\s*\$([a-zA-Z_][a-zA-Z0-9_]*)\b/g, (_match, field, varName) => {
-    const value = variables?.[varName];
-    if (!value) {
-      return '';
-    }
-    return `${field}=${value}`;
-  });
-
-  // Clean up any remaining $var patterns (not in field=$var format)
-  result = result.replace(/\$([a-zA-Z_][a-zA-Z0-9_]*)/g, (_, varName) => {
-    return variables?.[varName] || '*';
-  });
-
-  // Clean up multiple spaces and trim
-  return result.replace(/\s+/g, ' ').trim();
-}
 
 export function QueryTestModal({
   open,
@@ -127,8 +107,12 @@ export function QueryTestModal({
       end: range.end.toISOString(),
     };
 
-    // Substitute variables before testing
-    const substitutedQuery = substituteVariables(query, variables);
+    // Substitute variables client-side with the SHARED module (CONTRACT 5) so
+    // the preview matches exactly what the saved dashboard view runs. Only the
+    // defined variable names (the keys of `variables`) are substituted; the
+    // already-substituted query is sent WITHOUT `variables` so the server does
+    // not re-substitute (which would diverge from the view — DSH21 parity).
+    const substitutedQuery = substituteVariables(query, variables ?? {}, Object.keys(variables ?? {}));
 
     try {
       setTestError(null);
@@ -140,7 +124,6 @@ export function QueryTestModal({
         query: substitutedQuery,
         query_mode: queryMode,
         time_range: timeRange,
-        variables,
       });
 
       setTestData({

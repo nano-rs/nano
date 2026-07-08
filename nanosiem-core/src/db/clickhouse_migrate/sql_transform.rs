@@ -68,6 +68,7 @@ impl ClickHouseMigrator {
         sql.contains("nano:keep-local-engine")
     }
 
+
     /// Escape a value for use inside a single-quoted ClickHouse string literal.
     ///
     /// CH treats `\` as an escape character inside `'...'` strings, so a
@@ -148,6 +149,37 @@ impl ClickHouseMigrator {
             "{clickhouse_self_password}",
             &Self::escape_for_string_literal(password),
         )
+    }
+
+    /// NAN-1728: resolve the general `{dist_suffix}` placeholder — appended after
+    /// ANY base table name in migration / init SQL — to the correct read target
+    /// for the detected topology, from ONE static definition:
+    ///   - clustered  → `{dist_suffix}` = `"_distributed"` (read the wrapper)
+    ///   - single-node → `{dist_suffix}` = `""`            (read the local table)
+    ///
+    /// Used wherever SQL must read cross-shard on a cluster but the plain local
+    /// table on single-node — e.g. the prevalence CACHE-dict SOURCE QUERYs
+    /// (`FROM nanosiem.hash_prevalence_summary{dist_suffix}`) and reference-table
+    /// reads (`FROM nanosiem.ip_enrichments{dist_suffix}`). The three
+    /// `*_prevalence_summary` tables are per-shard AggregatingMergeTree summaries;
+    /// a dict reading the LOCAL summary on a multi-shard cluster sees only ~1/N of
+    /// the hosts (broken rare/common verdicts, C3), so on a cluster it must read
+    /// the reconciler-created `_distributed` wrapper to fan `uniqMerge` across
+    /// shards. On a TRUE single-node deployment (dev / open-core install.sh, no
+    /// `<remote_servers>`) `detect_cluster()` is `None`, `ensure_distributed_tables`
+    /// is a no-op, and no wrapper exists — the SQL must read the plain local table.
+    /// Hardcoding `_distributed` breaks single-node with
+    /// `CACHE_DICTIONARY_UPDATE_FAIL` on the first ingest-time `dictGet` (a
+    /// fail-closed ingest halt); creating a `*_distributed` object on single-node
+    /// is forbidden (it would false-positive `DualPool`'s
+    /// `logs_distributed`-presence cluster detection). Hence a substitution.
+    ///
+    /// The `is_clustered` signal is the SAME `detect_cluster()` result the
+    /// reconciler uses to decide whether to create the wrappers, so the read
+    /// target and wrapper existence can never disagree.
+    pub(super) fn substitute_dist_suffix(sql: &str, is_clustered: bool) -> String {
+        let suffix = if is_clustered { "_distributed" } else { "" };
+        sql.replace("{dist_suffix}", suffix)
     }
 
     /// Substitute PostgreSQL connection details in dictionary SOURCE blocks.
@@ -266,6 +298,79 @@ impl ClickHouseMigrator {
         s
     }
 
+    /// Rewrite a `*MergeTree` engine clause to its `Replicated*` variant in
+    /// place, preserving any version argument for ReplacingMergeTree.
+    ///
+    /// Shared by the `CREATE TABLE` and inline-engine `CREATE MATERIALIZED VIEW`
+    /// transform branches (M-2/D5) so both replicate the engine identically.
+    /// `replicated_db` (CH Cloud or a Replicated-database self-hosted setup) →
+    /// empty engine args (CH manages zoo paths); an explicit cluster → the given
+    /// `zoo_path` + `{replica}` macro.
+    fn replicate_engine(mut s: String, zoo_path: &str, replicated_db: bool) -> String {
+        let (mt_args, amt_args, smt_args) = if replicated_db {
+            ("()".to_string(), "()".to_string(), "()".to_string())
+        } else {
+            (
+                format!("('{}', '{{replica}}')", zoo_path),
+                format!("('{}', '{{replica}}')", zoo_path),
+                format!("('{}', '{{replica}}')", zoo_path),
+            )
+        };
+
+        // MergeTree (with or without empty parens)
+        let re_mt = Regex::new(r"(?i)\bENGINE\s*=\s*MergeTree(?:\s*\(\s*\))?").unwrap();
+        if re_mt.is_match(&s) {
+            s = re_mt
+                .replace(
+                    &s,
+                    format!("ENGINE = ReplicatedMergeTree{}", mt_args).as_str(),
+                )
+                .to_string();
+        }
+
+        // AggregatingMergeTree (with or without empty parens)
+        let re_amt =
+            Regex::new(r"(?i)\bENGINE\s*=\s*AggregatingMergeTree(?:\s*\(\s*\))?").unwrap();
+        if re_amt.is_match(&s) {
+            s = re_amt
+                .replace(
+                    &s,
+                    format!("ENGINE = ReplicatedAggregatingMergeTree{}", amt_args).as_str(),
+                )
+                .to_string();
+        }
+
+        // ReplacingMergeTree(version_col) - preserve the version argument
+        let re_rmt = Regex::new(r"(?i)\bENGINE\s*=\s*ReplacingMergeTree\(([^)]+)\)").unwrap();
+        if re_rmt.is_match(&s) {
+            s = re_rmt
+                .replace(&s, |caps: &regex::Captures| {
+                    if replicated_db {
+                        format!("ENGINE = ReplicatedReplacingMergeTree({})", &caps[1])
+                    } else {
+                        format!(
+                            "ENGINE = ReplicatedReplacingMergeTree('{}', '{{replica}}', {})",
+                            zoo_path, &caps[1]
+                        )
+                    }
+                })
+                .to_string();
+        }
+
+        // SummingMergeTree (with or without empty parens)
+        let re_smt = Regex::new(r"(?i)\bENGINE\s*=\s*SummingMergeTree(?:\s*\(\s*\))?").unwrap();
+        if re_smt.is_match(&s) {
+            s = re_smt
+                .replace(
+                    &s,
+                    format!("ENGINE = ReplicatedSummingMergeTree{}", smt_args).as_str(),
+                )
+                .to_string();
+        }
+
+        s
+    }
+
     /// Transform a SQL statement for cluster mode.
     ///
     /// Applies the following transformations:
@@ -303,6 +408,17 @@ impl ClickHouseMigrator {
         }
 
         // Skip non-DDL statements (SET, INSERT, SELECT, SYSTEM, etc.)
+        //
+        // M-2/D5 TODO: GRANT/REVOKE are left untouched deliberately. Access
+        // control DDL takes `ON CLUSTER` in the form `GRANT ON CLUSTER 'c' <priv>
+        // ON db.* TO role` (the clause sits *before* the privilege, not after a
+        // table name), so it can't reuse the append-after-name machinery below,
+        // and a malformed rewrite would silently break dictionary-permission
+        // grants (which are already soft-fail). On explicit clusters the operator
+        // provisions users/roles cluster-wide out of band, so per-node GRANTs are
+        // currently benign. If migrations start issuing GRANTs that must fan out,
+        // add a dedicated `GRANT ON CLUSTER` branch (with its own tests) rather
+        // than widening this one. Same reasoning for REVOKE.
         if upper.starts_with("SET ")
             || upper.starts_with("INSERT ")
             || upper.starts_with("SELECT ")
@@ -393,68 +509,7 @@ impl ClickHouseMigrator {
             // macro. NAN-1092.
             let replicated_db = is_cloud || cluster_name == default_db;
             let zoo_path = format!("/clickhouse/tables/{{shard}}/{}/{}", db_name, table_name);
-            let (mt_args, amt_args, smt_args) = if replicated_db {
-                // Replicated database: empty args, CH manages zoo paths
-                ("()".to_string(), "()".to_string(), "()".to_string())
-            } else {
-                // Explicit cluster: supply zoo path + replica macro
-                (
-                    format!("('{}', '{{replica}}')", zoo_path),
-                    format!("('{}', '{{replica}}')", zoo_path),
-                    format!("('{}', '{{replica}}')", zoo_path),
-                )
-            };
-
-            // MergeTree (with or without empty parens)
-            let re_mt = Regex::new(r"(?i)\bENGINE\s*=\s*MergeTree(?:\s*\(\s*\))?").unwrap();
-            if re_mt.is_match(&s) {
-                s = re_mt
-                    .replace(
-                        &s,
-                        format!("ENGINE = ReplicatedMergeTree{}", mt_args).as_str(),
-                    )
-                    .to_string();
-            }
-
-            // AggregatingMergeTree (with or without empty parens)
-            let re_amt =
-                Regex::new(r"(?i)\bENGINE\s*=\s*AggregatingMergeTree(?:\s*\(\s*\))?").unwrap();
-            if re_amt.is_match(&s) {
-                s = re_amt
-                    .replace(
-                        &s,
-                        format!("ENGINE = ReplicatedAggregatingMergeTree{}", amt_args).as_str(),
-                    )
-                    .to_string();
-            }
-
-            // ReplacingMergeTree(version_col) - preserve the version argument
-            let re_rmt = Regex::new(r"(?i)\bENGINE\s*=\s*ReplacingMergeTree\(([^)]+)\)").unwrap();
-            if re_rmt.is_match(&s) {
-                s = re_rmt
-                    .replace(&s, |caps: &regex::Captures| {
-                        if replicated_db {
-                            format!("ENGINE = ReplicatedReplacingMergeTree({})", &caps[1])
-                        } else {
-                            format!(
-                                "ENGINE = ReplicatedReplacingMergeTree('{}', '{{replica}}', {})",
-                                zoo_path, &caps[1]
-                            )
-                        }
-                    })
-                    .to_string();
-            }
-
-            // SummingMergeTree (with or without empty parens)
-            let re_smt = Regex::new(r"(?i)\bENGINE\s*=\s*SummingMergeTree(?:\s*\(\s*\))?").unwrap();
-            if re_smt.is_match(&s) {
-                s = re_smt
-                    .replace(
-                        &s,
-                        format!("ENGINE = ReplicatedSummingMergeTree{}", smt_args).as_str(),
-                    )
-                    .to_string();
-            }
+            s = Self::replicate_engine(s, &zoo_path, replicated_db);
 
             // Add storage_policy = 'tiered' for main data tables (skip if already present).
             // ClickHouse Cloud manages hot/warm tiering internally — there's no
@@ -486,11 +541,30 @@ impl ClickHouseMigrator {
                 r"(?i)(CREATE\s+MATERIALIZED\s+VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?)(\w+(?:\.\w+)?)",
             )
             .unwrap();
+            let (db_name, view_name) = if let Some(caps) = re.captures(&s) {
+                split_name(&caps[2])
+            } else {
+                (default_db.to_string(), String::new())
+            };
             s = re
                 .replace(&s, |caps: &regex::Captures| {
                     format!("{}{}{}", &caps[1], &caps[2], on_cluster_clause)
                 })
                 .to_string();
+
+            // M-2/D5: an inline-engine MV (`... ENGINE = *MergeTree ... AS
+            // SELECT`, i.e. NOT the `TO <table>` form) owns its own storage and
+            // must get a Replicated engine like a CREATE TABLE, otherwise it is a
+            // non-replicated table on one node. Every MV in the tree is TO-form
+            // today, so this branch is latent — but leaving it silent would
+            // reintroduce the bug the moment an inline-engine MV is added. TO-form
+            // MVs have no `ENGINE =`, so `replicate_engine` is a no-op for them.
+            let re_engine = Regex::new(r"(?i)\bENGINE\s*=\s*\w*MergeTree").unwrap();
+            if re_engine.is_match(&s) && !view_name.is_empty() {
+                let zoo_path =
+                    format!("/clickhouse/tables/{{shard}}/{}/{}", db_name, view_name);
+                s = Self::replicate_engine(s, &zoo_path, replicated_db);
+            }
             return s;
         }
 
@@ -515,6 +589,43 @@ impl ClickHouseMigrator {
                 s = re_port.replace_all(&s, "PORT 9001").to_string();
             }
 
+            return s;
+        }
+
+        // 4b. CREATE [OR REPLACE] VIEW — plain (non-materialized) view. M-2/D5:
+        // e.g. `nat_candidates_view`; without ON CLUSTER it exists on one node
+        // only and any reader hitting another node 400s. (Checked AFTER the
+        // MATERIALIZED VIEW branch, which returns first, so this only sees plain
+        // views.)
+        if upper.starts_with("CREATE VIEW") || upper.starts_with("CREATE OR REPLACE VIEW") {
+            let re = Regex::new(
+                r"(?i)(CREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?)(\w+(?:\.\w+)?)",
+            )
+            .unwrap();
+            s = re
+                .replace(&s, |caps: &regex::Captures| {
+                    format!("{}{}{}", &caps[1], &caps[2], on_cluster_clause)
+                })
+                .to_string();
+            return s;
+        }
+
+        // 4c. CREATE [OR REPLACE] SETTINGS PROFILE — M-2/D5. The profile name is
+        // a single-quoted literal (`'nanosiem_realtime'`); ON CLUSTER follows it.
+        // Without ON CLUSTER the profile exists on one node, so the roles/users
+        // that reference it resolve to different settings per shard.
+        if upper.starts_with("CREATE SETTINGS PROFILE")
+            || upper.starts_with("CREATE OR REPLACE SETTINGS PROFILE")
+        {
+            let re = Regex::new(
+                r"(?i)(CREATE\s+(?:OR\s+REPLACE\s+)?SETTINGS\s+PROFILE\s+(?:IF\s+NOT\s+EXISTS\s+)?)('[^']+'|\w+)",
+            )
+            .unwrap();
+            s = re
+                .replace(&s, |caps: &regex::Captures| {
+                    format!("{}{}{}", &caps[1], &caps[2], on_cluster_clause)
+                })
+                .to_string();
             return s;
         }
 
@@ -549,6 +660,7 @@ impl ClickHouseMigrator {
 
         // 7. DROP TABLE/VIEW/DICTIONARY
         if upper.starts_with("DROP ") {
+            let is_drop_table = upper.starts_with("DROP TABLE");
             let re = Regex::new(
                 r"(?i)(DROP\s+(?:TABLE|VIEW|DICTIONARY|MATERIALIZED\s+VIEW)\s+(?:IF\s+EXISTS\s+)?)(\w+(?:\.\w+)?)",
             )
@@ -558,6 +670,31 @@ impl ClickHouseMigrator {
                     format!("{}{}{}", &caps[1], &caps[2], on_cluster_clause)
                 })
                 .to_string();
+
+            // M-7/D12: `DROP TABLE ... ON CLUSTER` on a Replicated table must be
+            // SYNC, otherwise the drop is asynchronous and a subsequent CREATE
+            // with the same ZooKeeper path can race the still-registered replica
+            // (the "poisoned znode" class — a leftover `/clickhouse/tables/...`
+            // node makes the recreate fail with REPLICA_ALREADY_EXISTS). SYNC
+            // waits for the local drop to fully deregister before returning.
+            // Scoped to DROP TABLE (SYNC is a table-drop modifier); only when we
+            // actually emitted ON CLUSTER (explicit cluster).
+            if is_drop_table && !on_cluster_clause.is_empty() {
+                let already_sync = {
+                    let u = s.to_uppercase();
+                    let t = u.trim_end();
+                    t.ends_with("SYNC") || t.ends_with("SYNC;")
+                };
+                if !already_sync {
+                    let had_semi = s.trim_end().ends_with(';');
+                    let core = s.trim_end().trim_end_matches(';').trim_end();
+                    s = if had_semi {
+                        format!("{} SYNC;", core)
+                    } else {
+                        format!("{} SYNC", core)
+                    };
+                }
+            }
             return s;
         }
 

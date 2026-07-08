@@ -166,6 +166,10 @@ pub const RULE_REPOSITORIES_MANAGE: &str = "rule_repositories:manage";
 pub const RULE_REPOSITORIES_SYNC: &str = "rule_repositories:sync";
 pub const RULE_REPOSITORIES_IMPORT: &str = "rule_repositories:import";
 
+// Detection-as-Code push target permissions (NAN-1745)
+pub const DETECTION_CODE_TARGETS_VIEW: &str = "detection_code_targets:view";
+pub const DETECTION_CODE_TARGETS_MANAGE: &str = "detection_code_targets:manage";
+
 // Parser Repository permissions
 pub const PARSER_REPOSITORIES_VIEW: &str = "parser_repositories:view";
 pub const PARSER_REPOSITORIES_MANAGE: &str = "parser_repositories:manage";
@@ -324,6 +328,9 @@ pub const ALL_PERMISSIONS: &[&str] = &[
     RULE_REPOSITORIES_MANAGE,
     RULE_REPOSITORIES_SYNC,
     RULE_REPOSITORIES_IMPORT,
+    // Detection-as-Code push targets
+    DETECTION_CODE_TARGETS_VIEW,
+    DETECTION_CODE_TARGETS_MANAGE,
     // Parser Repositories
     PARSER_REPOSITORIES_VIEW,
     PARSER_REPOSITORIES_MANAGE,

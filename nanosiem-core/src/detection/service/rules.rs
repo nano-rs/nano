@@ -414,7 +414,11 @@ impl DetectionService {
                 let mv_affecting_change = update.query.is_some()
                     || update.severity.is_some()
                     || update.risk_score.is_some()
-                    || update.risk_entity_field.is_some();
+                    || update.risk_entity_field.is_some()
+                    // Audit D31: the MV bakes `'<name>' AS rule_name` into its
+                    // projection, so a rename must recreate it or signals keep the
+                    // stale name and new cases are titled with the old one.
+                    || update.name.is_some();
                 if mv_affecting_change {
                     // Update the rule first
                     let updated_rule = self.rule_repo.update(id, &update).await?;
@@ -704,8 +708,30 @@ impl DetectionService {
             None
         };
 
+        // Audit D27: a scheduled, runnable rule with NO cron is excluded from
+        // both claiming and startup backfill — it silently never runs. Surface it.
+        if rule.detection_mode == DetectionMode::Scheduled
+            && rule.mode != RuleMode::Staging
+            && rule.mode != RuleMode::Paused
+            && rule.schedule_cron.is_none()
+        {
+            tracing::error!(
+                rule_id = %rule.id,
+                "Scheduled rule '{}' has no schedule_cron — it will never run; set a cron expression",
+                rule.name
+            );
+        }
+
         if let Err(e) = self.update_next_run_at(rule.id, next_run).await {
-            tracing::warn!(rule_id = %rule.id, "Failed to sync next_run_at: {}", e);
+            // Audit D27: a failed sync leaves next_run_at unset → the rule is not
+            // claimed until the next restart's backfill. Log at ERROR (was warn)
+            // so the silent unscheduling is visible.
+            tracing::error!(
+                rule_id = %rule.id,
+                "Failed to sync next_run_at for rule '{}' — it will not be scheduled until restart: {}",
+                rule.name,
+                e
+            );
         }
     }
 }

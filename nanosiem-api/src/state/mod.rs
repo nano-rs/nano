@@ -21,7 +21,7 @@ use nanosiem_core::auth::{
 };
 use nanosiem_core::db::repository::RateLimitRepository;
 use nanosiem_core::db::DualPool;
-use nanosiem_core::detection::{MaterializedViewGenerator, RealtimeEvaluator, SignalProcessor};
+use nanosiem_core::detection::{MaterializedViewGenerator, SignalProcessor};
 use nanosiem_core::enrichment::EnrichmentService;
 use nanosiem_core::identity::IdentitySyncService;
 #[cfg(feature = "enterprise")]
@@ -85,8 +85,6 @@ pub struct AppState {
     pub distributed_scheduler: Arc<RwLock<Option<Arc<DistributedDetectionScheduler>>>>,
     /// Node ID for distributed scheduling
     pub node_id: String,
-    /// Real-time evaluator for incoming events
-    pub realtime_evaluator: Arc<RealtimeEvaluator>,
     /// Enrichment service
     pub enrichment: Arc<RwLock<EnrichmentService>>,
     /// Feed service
@@ -205,7 +203,7 @@ pub struct AppState {
     pub rule_test_in_flight: Arc<dashmap::DashMap<uuid::Uuid, ()>>,
     /// Shared shadow-investigation hook. On enterprise this is the live
     /// `ShadowInvestigationService` (also wired into detection_service /
-    /// signal_processor / realtime_evaluator). On open-core it's the no-op
+    /// signal_processor). On open-core it's the no-op
     /// hook so the cases handlers can blindly call it. Held here so the
     /// per-request `CaseService` built in handlers can pick it up via
     /// `CasesAppState::shadow_investigation_hook`, which is what makes the

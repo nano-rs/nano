@@ -18,6 +18,7 @@
 
 import { useMemo } from 'react';
 import { REDChart, Sparkline, type RedSeries } from './charts';
+import { parseUTCTimestamp } from '@/lib/date-utils';
 import type { MetricSeries } from '@/lib/api/types';
 
 export type MetricVizMode =
@@ -230,11 +231,19 @@ function Heatmap({
   unit?: string;
   height: number;
 }) {
-  // Align on the longest series's bucket axis (backend buckets all series on the
-  // same step). Cap rows for legibility.
+  // Cap rows for legibility.
   const rows = series.slice(0, 30);
-  const longest = rows.reduce((a, b) => (b.points.length > a.points.length ? b : a), rows[0]);
-  const cols = longest.points.length;
+  // Unified time axis = the union of every row's `t` values, time-sorted. Rows
+  // are gappy / different-length (metrics-v2 omits empty buckets), so indexing
+  // cells by array position slides holey rows out of alignment (O11). Index by
+  // TIMESTAMP instead; a row with no point at a bucket renders as an empty
+  // (no-data) cell rather than borrowing a neighbour's value.
+  const axisSet = new Set<string>();
+  for (const s of rows) for (const p of s.points) axisSet.add(p.t);
+  const axis = Array.from(axisSet).sort(
+    (a, b) => parseUTCTimestamp(a).getTime() - parseUTCTimestamp(b).getTime(),
+  );
+  const rowMaps = rows.map((s) => new Map(s.points.map((p) => [p.t, p.v] as const)));
   const max = Math.max(1e-9, ...rows.flatMap((s) => s.points.map((p) => p.v)));
 
   return (
@@ -246,9 +255,14 @@ function Heatmap({
               {s.key || 'value'}
             </span>
             <div className="flex gap-[2px]">
-              {Array.from({ length: cols }).map((_, ci) => {
-                const v = s.points[ci]?.v ?? 0;
-                const intensity = Math.max(0.04, v / max);
+              {axis.map((t, ci) => {
+                const raw = rowMaps[ri].get(t);
+                const has = raw !== undefined;
+                const intensity = has ? Math.max(0.04, raw / max) : 0;
+                // Parse as UTC — the raw `t` string has no zone suffix, so
+                // `new Date()` would render the label shifted by the browser
+                // offset (O12).
+                const hm = parseUTCTimestamp(t).toISOString().slice(11, 16);
                 return (
                   <div
                     key={ci}
@@ -257,7 +271,7 @@ function Heatmap({
                       background: 'var(--color-brand)',
                       opacity: intensity,
                     }}
-                    title={`${fmtMetric(v, unit)}${s.points[ci] ? ` @ ${new Date(s.points[ci].t).toISOString().slice(11, 16)}` : ''}`}
+                    title={`${has ? fmtMetric(raw, unit) : 'no data'} @ ${hm}`}
                   />
                 );
               })}
@@ -285,14 +299,34 @@ function TimeseriesChart({
   height: number;
   variant: 'timeseries' | 'area' | 'bars';
 }) {
-  const longest = series.reduce((a, b) => (b.points.length > a.points.length ? b : a), series[0]);
-  const buckets = longest.points.map((p) => p.t);
-  const redSeries: RedSeries[] = series.map((s, i) => ({
-    points: s.points.map((p) => p.v),
-    color: METRIC_SERIES_COLORS[i % METRIC_SERIES_COLORS.length],
-    label: s.key || metricName,
-    fill: variant === 'area' || (variant === 'timeseries' && series.length === 1),
-  }));
+  // Unified bucket axis: the union of every series' `t` values, time-sorted.
+  // Metrics-v2 SQL emits only buckets that have data (no zero-fill), so series
+  // can be gappy and different-length. Aligning by array index would shift a
+  // gappy series in time and misattribute tooltip values (O11). Align by
+  // TIMESTAMP instead, null-filling the buckets a series is missing so the line
+  // breaks over gaps rather than sliding earlier points forward.
+  const { buckets, redSeries } = useMemo(() => {
+    const axisSet = new Set<string>();
+    for (const s of series) for (const p of s.points) axisSet.add(p.t);
+    const axis = Array.from(axisSet).sort(
+      (a, b) => parseUTCTimestamp(a).getTime() - parseUTCTimestamp(b).getTime(),
+    );
+    const idxOf = new Map(axis.map((t, i) => [t, i] as const));
+    const built: RedSeries[] = series.map((s, i) => {
+      const vals: Array<number | null> = new Array(axis.length).fill(null);
+      for (const p of s.points) {
+        const j = idxOf.get(p.t);
+        if (j !== undefined) vals[j] = p.v;
+      }
+      return {
+        points: vals,
+        color: METRIC_SERIES_COLORS[i % METRIC_SERIES_COLORS.length],
+        label: s.key || metricName,
+        fill: variant === 'area' || (variant === 'timeseries' && series.length === 1),
+      };
+    });
+    return { buckets: axis as Array<number | string>, redSeries: built };
+  }, [series, metricName, variant]);
 
   // REDChart renders lines + optional fill; "bars" reuses the area form so a
   // single SVG primitive serves all three timeseries variants without a second

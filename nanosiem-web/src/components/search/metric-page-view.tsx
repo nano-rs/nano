@@ -13,6 +13,7 @@ import { api } from '@/lib/api';
 import { MetricsExplorer } from '@/components/observability/MetricsExplorer';
 import { MetricMonitorsList } from '@/components/observability/MetricMonitorsList';
 import { useReportPhase2Status } from './footer-reporter';
+import { toApiTimeRange } from '@/hooks/use-api';
 import type { TimeRange } from '@/lib/api/types';
 
 export interface MetricPageViewProps {
@@ -56,7 +57,10 @@ export function MetricPageView({ metric, service, timeRange }: MetricPageViewPro
     };
   }, []);
 
-  const apiTimeRange: TimeRange = timeRange ?? { start: '', end: '' };
+  // O57 (NAN-1721): fall back to a resolved default preset, not an empty
+  // {start:'',end:''}. An empty window serializes to an invalid time_range and
+  // the explorer's first fetch 4xxs; "Last hour" is the console's own default.
+  const apiTimeRange: TimeRange = timeRange ?? toApiTimeRange('Last hour');
 
   // NAN-1600: MetricsExplorer is the phase-2 reporter for `| metric`, but it
   // only mounts in the normal case — the catalog loading / error / no-metrics

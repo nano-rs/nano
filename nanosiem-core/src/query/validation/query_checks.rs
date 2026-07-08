@@ -26,9 +26,13 @@ pub fn contains_aggregation(query: &Query) -> bool {
         Query::Search(_) => false,
         Query::Piped { source, command } => {
             // Check if this command is an aggregation
+            // Audit D34: keep this in lockstep with `is_aggregation_command`
+            // below — `Chart` was missing here, so `validate_realtime_rule` gave
+            // the wrong error message for a `| chart` rule.
             let is_agg_command = matches!(
                 command,
                 Command::Stats { .. }
+                    | Command::Chart { .. }
                     | Command::Timechart { .. }
                     | Command::Top { .. }
                     | Command::Rare { .. }

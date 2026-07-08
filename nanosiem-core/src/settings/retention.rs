@@ -9,6 +9,56 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use thiserror::Error;
 
+use crate::db::dual_pool::{on_cluster_clause, TableNames};
+
+// ---------------------------------------------------------------------------
+// Cluster-aware runtime helpers (NAN-1728 H1)
+//
+// `ClickHouseStorageService` holds a bare `ClickHouseClient` (no `DualPool`), so
+// cluster mode is derived from the same `CLICKHOUSE_CLUSTER` env signal that
+// gates `on_cluster_clause` — the deploy sets it only on clustered ClickHouse.
+// On single-node / open-core (`CLICKHOUSE_CLUSTER` unset) every helper below
+// falls back to the exact pre-cluster form, so this file is byte-identical
+// there.
+// ---------------------------------------------------------------------------
+
+/// Configured ClickHouse cluster name, or `None` on single-node deployments.
+fn clickhouse_cluster_name() -> Option<String> {
+    std::env::var("CLICKHOUSE_CLUSTER").ok().and_then(|c| {
+        let t = c.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    })
+}
+
+/// Read-side table name for `base`, routed to the `_distributed` wrapper so it
+/// fans in across all shards on a cluster; bare local name (byte-identical to
+/// the pre-cluster form) on single-node.
+fn read_routed(base: &str) -> String {
+    TableNames::new(clickhouse_cluster_name().is_some()).read_bare(base)
+}
+
+/// `system.parts` source that dedupes replicas to one per shard on a cluster
+/// (`cluster(...)`), so byte/row sums count each shard exactly once. Plain
+/// `system.parts` on single-node.
+fn parts_source_dedup() -> String {
+    match clickhouse_cluster_name() {
+        Some(cl) => format!("cluster('{}', system.parts)", cl),
+        None => "system.parts".to_string(),
+    }
+}
+
+/// Database predicate for `system.parts` reads. `currentDatabase()` is unsafe
+/// inside `cluster(...)` (evaluated on remote shards, where the default DB may
+/// not be `nanosiem`), so on a cluster pin the literal DB the app owns; keep
+/// `currentDatabase()` on single-node so the query is byte-identical.
+fn cluster_db_filter() -> &'static str {
+    if clickhouse_cluster_name().is_some() {
+        "database = 'nanosiem'"
+    } else {
+        "database = currentDatabase()"
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum RetentionError {
     #[error("Database error: {0}")]
@@ -330,7 +380,18 @@ impl ClickHouseStorageService {
         }
 
         // NAN-1241: storage stats for the active ingested-events table.
+        // NAN-1728 H1: on a cluster, aggregate `system.parts` across shards via
+        // `cluster(...)` (one replica per shard, so byte/row sums are not
+        // double-counted). Plain `system.parts` on single-node. The parts still
+        // belong to the LOCAL MergeTree, so the table filter uses the bare local
+        // name (not the `_distributed` wrapper).
         let stats_logs_table = crate::schema::active_logs_table();
+        let parts_source = parts_source_dedup();
+        // Inside `cluster(...)` the WHERE runs on remote shards, where
+        // `currentDatabase()` may resolve to the cluster connection's default
+        // (not `nanosiem`) and drop every remote row — so on a cluster filter by
+        // the literal DB. Single-node keeps `currentDatabase()` (byte-identical).
+        let db_filter = cluster_db_filter();
         let stats: Option<TableStats> = match self
             .client
             .query(&format!(
@@ -341,8 +402,8 @@ impl ClickHouseStorageService {
                     count() as parts_count,
                     COALESCE(sum(data_uncompressed_bytes), 0) as uncompressed_bytes,
                     COALESCE(countDistinct(partition), 0) as partition_count
-                FROM system.parts
-                WHERE database = currentDatabase()
+                FROM {parts_source}
+                WHERE {db_filter}
                   AND table = '{stats_logs_table}'
                   AND active = 1
             "#
@@ -369,7 +430,10 @@ impl ClickHouseStorageService {
 
         // NAN-1241: storage stats reflect the active ingested-events table
         // (ocsf_logs under OCSF — where the bulk of data lands). UDM-identical.
-        let logs_table = crate::schema::active_logs_table();
+        // NAN-1728 H1: route the row-count / time-range reads through the
+        // `_distributed` wrapper on a cluster so they cover all shards (~1/N
+        // undercount otherwise); bare local name on single-node.
+        let logs_table = read_routed(crate::schema::active_logs_table());
         let row_count: RowCount = self
             .client
             .query(&format!("SELECT count() as cnt FROM {logs_table}"))
@@ -460,9 +524,13 @@ impl ClickHouseStorageService {
     /// Update ClickHouse TTL retention period
     pub async fn update_retention(&self, days: u32) -> Result<(), RetentionError> {
         // NAN-1241: target the active ingested-events table (ocsf_logs under OCSF).
+        // NAN-1728 H1: TTL runs on the LOCAL MergeTree; `ON CLUSTER` fans the
+        // ALTER out to every shard (empty clause → byte-identical on single-node)
+        // so all shards keep the same retention window.
         let logs_table = crate::schema::active_logs_table();
+        let on_cluster = on_cluster_clause();
         let query = format!(
-            "ALTER TABLE {logs_table} MODIFY TTL timestamp + INTERVAL {} DAY DELETE",
+            "ALTER TABLE {logs_table}{on_cluster} MODIFY TTL timestamp + INTERVAL {} DAY DELETE",
             days
         );
 
@@ -485,24 +553,34 @@ impl ClickHouseStorageService {
 
         // NAN-1241: force TTL on the active ingested-events table (ocsf_logs
         // under OCSF — where the retention-relevant bulk data lives). UDM-identical.
-        let logs_table = crate::schema::active_logs_table();
+        // NAN-1728 H1: before/after counts read the `_distributed` wrapper so
+        // they see all shards; MATERIALIZE TTL / OPTIMIZE FINAL run on the LOCAL
+        // MergeTree with `ON CLUSTER` fanning them out to every shard (empty
+        // clause on single-node → byte-identical).
+        let local_logs_table = crate::schema::active_logs_table();
+        let read_logs_table = read_routed(local_logs_table);
+        let on_cluster = on_cluster_clause();
         let before: RowCount = self
             .client
-            .query(&format!("SELECT count() as count FROM {logs_table}"))
+            .query(&format!("SELECT count() as count FROM {read_logs_table}"))
             .fetch_one()
             .await
             .map_err(|e| RetentionError::ClickHouse(e.to_string()))?;
 
         // Force TTL materialization
         self.client
-            .query(&format!("ALTER TABLE {logs_table} MATERIALIZE TTL"))
+            .query(&format!(
+                "ALTER TABLE {local_logs_table}{on_cluster} MATERIALIZE TTL"
+            ))
             .execute()
             .await
             .map_err(|e| RetentionError::ClickHouse(e.to_string()))?;
 
         // Optimize to merge parts and actually delete data
         self.client
-            .query(&format!("OPTIMIZE TABLE {logs_table} FINAL"))
+            .query(&format!(
+                "OPTIMIZE TABLE {local_logs_table}{on_cluster} FINAL"
+            ))
             .execute()
             .await
             .map_err(|e| RetentionError::ClickHouse(e.to_string()))?;
@@ -510,7 +588,7 @@ impl ClickHouseStorageService {
         // Get row count after
         let after: RowCount = self
             .client
-            .query(&format!("SELECT count() as count FROM {logs_table}"))
+            .query(&format!("SELECT count() as count FROM {read_logs_table}"))
             .fetch_one()
             .await
             .map_err(|e| RetentionError::ClickHouse(e.to_string()))?;

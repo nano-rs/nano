@@ -40,7 +40,7 @@ impl SearchService {
             ))
         })?;
 
-        let sql = trace_by_id_sql(trace_id);
+        let sql = trace_by_id_sql(trace_id, self.table_names.is_clustered());
         debug!("OTEL trace fetch SQL: {}", sql);
         ch_executor.execute_sql_to_json(&sql).await
     }
@@ -62,7 +62,7 @@ impl SearchService {
             ))
         })?;
 
-        let sql = metric_timeseries_sql(metric_name, service_name, time_range, step_secs);
+        let sql = metric_timeseries_sql(metric_name, service_name, time_range, step_secs, self.table_names.is_clustered());
         debug!("OTEL metric timeseries SQL: {}", sql);
         ch_executor.execute_sql_to_json(&sql).await
     }
@@ -87,7 +87,7 @@ impl SearchService {
             ))
         })?;
 
-        let sql = metric_timeseries_v2_sql(query, time_range);
+        let sql = metric_timeseries_v2_sql(query, time_range, self.table_names.is_clustered());
         debug!("OTEL metric timeseries v2 SQL: {}", sql);
         let rows = ch_executor.execute_sql_to_json(&sql).await?;
 
@@ -139,7 +139,7 @@ impl SearchService {
             ))
         })?;
 
-        let sql = metric_tag_keys_sql(metric_name, time_range);
+        let sql = metric_tag_keys_sql(metric_name, time_range, self.table_names.is_clustered());
         debug!("OTEL metric tag-keys SQL: {}", sql);
         let rows = ch_executor.execute_sql_to_json(&sql).await?;
         Ok(rows.iter().map(|r| json_str(r, "k")).filter(|s| !s.is_empty()).collect())
@@ -161,7 +161,7 @@ impl SearchService {
             ))
         })?;
 
-        let sql = metric_tag_values_sql(metric_name, key, time_range);
+        let sql = metric_tag_values_sql(metric_name, key, time_range, self.table_names.is_clustered());
         debug!("OTEL metric tag-values SQL: {}", sql);
         let rows = ch_executor.execute_sql_to_json(&sql).await?;
         Ok(rows
@@ -173,29 +173,50 @@ impl SearchService {
 
     /// Metric-monitor EVAL (NAN-1540): compute the monitor's aggregate as one
     /// scalar PER SERIES over the window via [`metric_scalar_sql`], returning
-    /// `(series_key, value)` pairs. The jobs runner compares each value to the
-    /// monitor threshold per its comparator and raises on breach. A monitor with
-    /// no `group_by` yields exactly one pair with key `""`; an empty result
-    /// (no data points in the window) yields an empty vec — the runner treats
-    /// "no data" as no breach. Bounded by the window + LIMIT (NAN-1032).
+    /// `(series_key, value)` pairs where `value` is `Option<f64>`. The jobs
+    /// runner compares each `Some(value)` to the monitor threshold per its
+    /// comparator and raises on breach. A monitor with no `group_by` yields
+    /// exactly one pair with key `""`; an empty result (a group_by series that
+    /// vanished) yields an empty vec.
+    ///
+    /// O13 (NAN-1721): `value` is `None` for a no-data window — either
+    /// `row_count == 0` (Contract #1: `metric_scalar_sql` emits
+    /// `count() AS row_count`) or a NULL aggregate (avg/min/max/quantile over an
+    /// empty set). None is NEVER coerced to 0.0, so the runner treats it as
+    /// no-data (no compare, no alert) instead of false-firing an `lt`/`eq 0`
+    /// monitor when the metric stops reporting. Bounded by the window + LIMIT
+    /// (NAN-1032).
     #[instrument(skip(self))]
     pub async fn evaluate_metric_monitor(
         &self,
         query: &MetricQuery<'_>,
         time_range: &TimeRange,
-    ) -> Result<Vec<(String, f64)>, SearchError> {
+    ) -> Result<Vec<(String, Option<f64>)>, SearchError> {
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
                 "ClickHouse client not configured".into(),
             ))
         })?;
 
-        let sql = metric_scalar_sql(query, time_range);
+        let sql = metric_scalar_sql(query, time_range, self.table_names.is_clustered());
         debug!("OTEL metric-monitor eval SQL: {}", sql);
         let rows = ch_executor.execute_sql_to_json(&sql).await?;
         Ok(rows
             .iter()
-            .map(|r| (json_str(r, "series_key"), json_f64(r, "v")))
+            .map(|r| {
+                // Contract #1 (O13/NAN-1721): a no-data window — `row_count == 0`
+                // or a NULL aggregate — maps to `None`, NEVER coerced to 0.0, so
+                // the runner treats it as no-data (no compare, no alert) instead
+                // of false-firing an `lt`/`eq 0` monitor when the metric stops
+                // reporting. When `row_count` is absent (SQL not yet carrying it)
+                // this still nulls a NULL aggregate but falls through on the
+                // count gate — no worse than the pre-fix 0.0 floor.
+                let value = match json_f64_opt(r, "row_count") {
+                    Some(rc) if rc == 0.0 => None,
+                    _ => json_f64_opt(r, "v"),
+                };
+                (json_str(r, "series_key"), value)
+            })
             .collect())
     }
 
@@ -219,7 +240,7 @@ impl SearchService {
             ))
         })?;
 
-        let sql = recent_traces_sql(time_range, filters);
+        let sql = recent_traces_sql(time_range, filters, self.table_names.is_clustered());
         debug!("OTEL recent-traces SQL: {}", sql);
         ch_executor.execute_sql_to_json(&sql).await
     }
@@ -239,7 +260,7 @@ impl SearchService {
             ))
         })?;
 
-        let sql = metric_names_sql(service_name);
+        let sql = metric_names_sql(service_name, self.table_names.is_clustered());
         debug!("OTEL metric-names SQL: {}", sql);
         ch_executor.execute_sql_to_json(&sql).await
     }
@@ -289,11 +310,11 @@ impl SearchService {
 
         let window_secs = ((time_range.end - time_range.start).num_seconds().max(1)) as f64;
 
-        let overview_sql = services_overview_sql(time_range, filters);
+        let overview_sql = services_overview_sql(time_range, filters, self.table_names.is_clustered());
         debug!("OTEL services-overview SQL: {}", overview_sql);
         let rows = ch_executor.execute_sql_to_json(&overview_sql).await?;
 
-        let spark_sql = services_sparkline_sql(time_range, sparkline_step_secs);
+        let spark_sql = services_sparkline_sql(time_range, sparkline_step_secs, self.table_names.is_clustered());
         debug!("OTEL services-sparkline SQL: {}", spark_sql);
         let spark_rows = ch_executor.execute_sql_to_json(&spark_sql).await?;
 
@@ -387,7 +408,7 @@ impl SearchService {
             ))
         })?;
 
-        let red_sql = service_red_timeseries_sql(service, time_range, red_step_secs);
+        let red_sql = service_red_timeseries_sql(service, time_range, red_step_secs, self.table_names.is_clustered());
         debug!("OTEL service-detail RED SQL: {}", red_sql);
         let red_rows = ch_executor.execute_sql_to_json(&red_sql).await?;
 
@@ -406,7 +427,7 @@ impl SearchService {
             }));
         }
 
-        let endpoints_sql = service_endpoints_sql(service, time_range);
+        let endpoints_sql = service_endpoints_sql(service, time_range, self.table_names.is_clustered());
         debug!("OTEL service-detail endpoints SQL: {}", endpoints_sql);
         let endpoint_rows = ch_executor.execute_sql_to_json(&endpoints_sql).await?;
         let endpoints: Vec<serde_json::Value> = endpoint_rows
@@ -428,7 +449,7 @@ impl SearchService {
             })
             .collect();
 
-        let exemplars_sql = service_exemplars_sql(service, time_range, exemplar_limit);
+        let exemplars_sql = service_exemplars_sql(service, time_range, exemplar_limit, self.table_names.is_clustered());
         debug!("OTEL service-detail exemplars SQL: {}", exemplars_sql);
         let exemplar_rows = ch_executor.execute_sql_to_json(&exemplars_sql).await?;
         let exemplars: Vec<serde_json::Value> = exemplar_rows
@@ -454,14 +475,20 @@ impl SearchService {
 
     /// Compute one SLO's spans-based attainment over `time_range` (NAN-1536).
     ///
-    /// Returns `(current, total_spans)` where `current` is the SLI attainment in
-    /// `0..1`: availability = `good_non_error / total`, latency =
-    /// `under_threshold / total`. `total = 0` (no spans in window) yields
-    /// `current = 1.0` — a service with no traffic isn't "breaching" its SLO; the
-    /// api layer can treat a zero `total_spans` as "no data" if it prefers. The
-    /// api/PG slice owns the SLO record + the budget/burn/status math on top of
-    /// `current`. `latency_threshold_ms` is required for [`SliKind::Latency`]
-    /// (the SQL builder degrades to availability if absent).
+    /// Returns `(current, total_spans, no_data)` where `current` is the SLI
+    /// attainment in `0..1`: availability = `good_non_error / total`, latency =
+    /// `under_threshold / total`. `latency_threshold_ms` is required for
+    /// [`SliKind::Latency`] (the SQL builder degrades to availability if absent).
+    /// The api/PG slice owns the SLO record + the budget/burn/status math on top
+    /// of `current`.
+    ///
+    /// O17 (NAN-1721 / Contract #2): `total = 0` (no spans in window) still
+    /// yields `current = 1.0` numerically, but `no_data = true` flags it so
+    /// callers do NOT treat a zero-traffic window as "attained". A hard-down
+    /// service or a stopped collector produces exactly this, and the rolling
+    /// window sliding past old errors would otherwise make the SLO *improve*
+    /// while the service is dead. The api surfaces status `"no_data"` and the
+    /// scheduler does not alert (neither breach nor recovery) on it.
     #[instrument(skip(self))]
     pub async fn observability_slo_compute(
         &self,
@@ -469,26 +496,28 @@ impl SearchService {
         sli_kind: SliKind,
         latency_threshold_ms: Option<f64>,
         time_range: &TimeRange,
-    ) -> Result<(f64, i64), SearchError> {
+    ) -> Result<(f64, i64, bool), SearchError> {
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
                 "ClickHouse client not configured".into(),
             ))
         })?;
 
-        let sql = slo_compute_sql(service, sli_kind, latency_threshold_ms, time_range);
+        let sql = slo_compute_sql(service, sli_kind, latency_threshold_ms, time_range, self.table_names.is_clustered());
         debug!("OTEL SLO-compute SQL: {}", sql);
         let rows = ch_executor.execute_sql_to_json(&sql).await?;
 
         let row = match rows.first() {
             Some(r) => r,
-            // No row (empty result) → no traffic → fully attained.
-            None => return Ok((1.0, 0)),
+            // No row (empty result) → no traffic → NO DATA (Contract #2 / O17).
+            None => return Ok((1.0, 0, true)),
         };
         let total = json_f64(row, "total");
         let good = json_f64(row, "good");
         let current = if total > 0.0 { good / total } else { 1.0 };
-        Ok((current, total as i64))
+        // Contract #2 (O17): a zero-span window is NOT attained — flag no_data.
+        let no_data = total <= 0.0;
+        Ok((current, total as i64, no_data))
     }
 
     // ========================================================================
@@ -506,12 +535,13 @@ impl SearchService {
     ///   - `group`    — `host.group` resource attr, else `service_name`
     ///   - `status`   — `good`|`warn`|`bad` from cpu/mem thresholds
     ///
-    /// A gauge a host never reported comes back 0 from `argMaxIf`; the glue maps
-    /// an absent gauge (count 0 in the raw row would require companions, but the
-    /// SQL surfaces the raw value) to `null` only when the host's whole row is
-    /// zero for that metric — pragmatically a 0 reading and "no reading" both
-    /// render via the same value, so we emit `null` only for a 0 that the
-    /// thresholds would otherwise paint misleadingly. Bounded single read.
+    /// A gauge a host never reported comes back 0 from `argMaxIf`; O52 (NAN-1721)
+    /// disambiguates that ABSENT reading from a genuine reported 0.0 via the
+    /// per-metric count companions (`cpu_n`/`mem_n`/`load_n`/`net_n` =
+    /// `countIf(metric_name = …)`): a gauge with zero data points → `null`, a
+    /// reported 0.0 stays 0.0 (an idle host at 0% CPU no longer renders "–").
+    /// Until the SQL carries those companions the glue falls back to the legacy
+    /// "null a bare 0.0" heuristic (see [`gauge_or_null`]). Bounded single read.
     #[instrument(skip(self))]
     pub async fn observability_infra_hosts(
         &self,
@@ -527,7 +557,7 @@ impl SearchService {
             ))
         })?;
 
-        let sql = infra_hosts_sql(time_range, filters);
+        let sql = infra_hosts_sql(time_range, filters, self.table_names.is_clustered());
         debug!("OTEL infra-hosts SQL: {}", sql);
         let rows = ch_executor.execute_sql_to_json(&sql).await?;
 
@@ -547,10 +577,10 @@ impl SearchService {
                 let obj = serde_json::json!({
                     "host": host,
                     "group": if group.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(group) },
-                    "cpu_pct": null_if_zero(cpu_pct),
-                    "mem_pct": null_if_zero(mem_pct),
-                    "load": null_if_zero(load),
-                    "net_bytes_per_sec": null_if_zero(net),
+                    "cpu_pct": gauge_or_null(&row, cpu_pct, "cpu_n"),
+                    "mem_pct": gauge_or_null(&row, mem_pct, "mem_n"),
+                    "load": gauge_or_null(&row, load, "load_n"),
+                    "net_bytes_per_sec": gauge_or_null(&row, net, "net_n"),
                     "status": status,
                 });
                 (status, obj)
@@ -602,7 +632,7 @@ impl SearchService {
         })?;
 
         // Web vitals (p75), with count companions to distinguish "no data" from 0.
-        let vitals_sql = rum_web_vitals_sql(time_range, filters);
+        let vitals_sql = rum_web_vitals_sql(time_range, filters, self.table_names.is_clustered());
         debug!("OTEL RUM web-vitals SQL: {}", vitals_sql);
         let vitals_rows = ch_executor.execute_sql_to_json(&vitals_sql).await?;
         let web_vitals = match vitals_rows.first() {
@@ -615,7 +645,7 @@ impl SearchService {
         };
 
         // Page views + JS errors, bucketed.
-        let series_sql = rum_pageviews_series_sql(time_range, series_step_secs, filters);
+        let series_sql = rum_pageviews_series_sql(time_range, series_step_secs, filters, self.table_names.is_clustered());
         debug!("OTEL RUM page-views series SQL: {}", series_sql);
         let series_rows = ch_executor.execute_sql_to_json(&series_sql).await?;
         let mut page_views: i64 = 0;
@@ -632,7 +662,7 @@ impl SearchService {
         }
 
         // Top pages with per-page p75 LCP.
-        let top_pages_sql = rum_top_pages_sql(time_range, None, filters);
+        let top_pages_sql = rum_top_pages_sql(time_range, None, filters, self.table_names.is_clustered());
         debug!("OTEL RUM top-pages SQL: {}", top_pages_sql);
         let top_rows = ch_executor.execute_sql_to_json(&top_pages_sql).await?;
         let top_pages: Vec<serde_json::Value> = top_rows
@@ -648,7 +678,7 @@ impl SearchService {
             .collect();
 
         // Recent JS-error sample.
-        let errors_sql = rum_recent_errors_sql(time_range, None, filters);
+        let errors_sql = rum_recent_errors_sql(time_range, None, filters, self.table_names.is_clustered());
         debug!("OTEL RUM recent-errors SQL: {}", errors_sql);
         let error_rows = ch_executor.execute_sql_to_json(&errors_sql).await?;
         let recent_errors: Vec<serde_json::Value> = error_rows
@@ -698,7 +728,7 @@ impl SearchService {
             ))
         })?;
 
-        let sql = synthetic_summary_sql(time_range);
+        let sql = synthetic_summary_sql(time_range, self.table_names.is_clustered());
         debug!("OTEL synthetics-summary SQL: {}", sql);
         let rows = ch_executor.execute_sql_to_json(&sql).await?;
 
@@ -743,7 +773,7 @@ impl SearchService {
             ))
         })?;
 
-        let sql = synthetic_history_sql(check_id, time_range, limit);
+        let sql = synthetic_history_sql(check_id, time_range, limit, self.table_names.is_clustered());
         debug!("OTEL synthetic-history SQL: {}", sql);
         let rows = ch_executor.execute_sql_to_json(&sql).await?;
 
@@ -770,28 +800,34 @@ impl SearchService {
     /// `time_range` (NAN-1542) — the cross-link that powers the service detail's
     /// "security signals" panel.
     ///
-    /// Two bounded reads: (1) resolve the service's distinct entities (src_ip +
+    /// Three bounded reads: (1) resolve the service's distinct entities (src_ip +
     /// host) from `otel_spans`, capped at `SERVICE_ENTITY_CAP`; (2) find
     /// detection signals whose `risk_entity` is one of those entities, over the
-    /// same window. Returns `(host_count, signal_count, signals)` where:
+    /// same window (bounded by `limit`); (3) O54 (NAN-1721): a companion `count()`
+    /// over the SAME entity predicate + window for the TRUE range total (the
+    /// sample is capped by `limit`, so `signals.len()` under-counts). Returns
+    /// `(host_count, signal_count, signal_total, signals)` where:
     ///   - `host_count`   — distinct entities resolved for the service;
-    ///   - `signal_count` — signals returned (bounded by `limit`);
+    ///   - `signal_count` — signals returned in the sample (bounded by `limit`);
+    ///   - `signal_total` — TRUE count of matching signals over the window
+    ///     (`>= signal_count`); the FE header + "+N more in range" use this;
     ///   - `signals`      — `[{ ts, rule_name, src_host, src_ip, severity }]`,
     ///     most recent first. The matched `risk_entity` is mapped to `src_ip`
     ///     (when it is one of the resolved IPs) or `src_host` (when it is one of
     ///     the resolved hosts), else surfaced as `src_host` (best-effort label).
     ///
-    /// When the service has no entities in the window the second read is skipped
-    /// entirely (no point querying `signals IN ()`), returning empty. Both reads
-    /// are window+LIMIT bounded, so they use `execute_sql_to_json` directly (no
-    /// count companion, NAN-1032).
+    /// When the service has no entities in the window the signal reads are skipped
+    /// entirely (no point querying `signals IN ()`), returning empty. All reads
+    /// use `execute_sql_to_json` directly; the count companion (3) is a deliberate
+    /// exception to the NAN-1032 "no companion" default because the `limit` cap
+    /// makes the true total unrecoverable from the bounded sample rows.
     #[instrument(skip(self))]
     pub async fn observability_service_security_signals(
         &self,
         service: &str,
         time_range: &TimeRange,
         limit: Option<u32>,
-    ) -> Result<(usize, usize, Vec<serde_json::Value>), SearchError> {
+    ) -> Result<(usize, usize, u64, Vec<serde_json::Value>), SearchError> {
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
                 "ClickHouse client not configured".into(),
@@ -799,7 +835,7 @@ impl SearchService {
         })?;
 
         // 1) Resolve the service's distinct entities (src_ip + host).
-        let entities_sql = service_entities_sql(service, time_range);
+        let entities_sql = service_entities_sql(service, time_range, self.table_names.is_clustered());
         debug!("OTEL service-entities SQL: {}", entities_sql);
         let entity_rows = ch_executor.execute_sql_to_json(&entities_sql).await?;
         let entities: Vec<String> = entity_rows
@@ -810,7 +846,7 @@ impl SearchService {
 
         let host_count = entities.len();
         if entities.is_empty() {
-            return Ok((0, 0, Vec::new()));
+            return Ok((0, 0, 0, Vec::new()));
         }
 
         // Set membership to map a matched risk_entity back to ip vs host. An
@@ -823,7 +859,12 @@ impl SearchService {
             .collect();
 
         // 2) Find detection signals against those entities.
-        let signals_sql = security_signals_for_entities_sql(&entities, time_range, limit);
+        let signals_sql = security_signals_for_entities_sql(
+            &entities,
+            time_range,
+            limit,
+            self.table_names.is_clustered(),
+        );
         debug!("OTEL service-security-signals SQL: {}", signals_sql);
         let signal_rows = ch_executor.execute_sql_to_json(&signals_sql).await?;
 
@@ -857,7 +898,38 @@ impl SearchService {
             .collect();
 
         let signal_count = signals.len();
-        Ok((host_count, signal_count, signals))
+
+        // 3) O54 (NAN-1721 / Contract #4): the sample above is capped by `limit`,
+        // so `signals.len()` is NOT the range total. Issue a dedicated UNBOUNDED
+        // count over the SAME entity predicate + window so the FE header
+        // ("N on K hosts · +M more in range") reflects the true total, not the
+        // page. Built inline (the sample's SQL builder bakes a `LIMIT`, so it
+        // can't be reused for the count); entities are escaped via the shared
+        // `sql_hygiene::escape_sql_string` — byte-identical to the builder's
+        // `escape_string` — and `entities` is non-empty here (early-returned).
+        let entity_list = entities
+            .iter()
+            .map(|e| format!("'{}'", crate::sql_hygiene::escape_sql_string(e)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sig_table = self.table_names.read("signals");
+        let sig_ref = self.table_names.read_bare("signals");
+        let count_sql = format!(
+            "SELECT count() AS signal_total\n\
+             FROM {sig_table}\n\
+             WHERE {sig_ref}.timestamp BETWEEN '{start}' AND '{end}'\n  \
+               AND (risk_entity IN ({entity_list}))",
+            start = crate::sql_hygiene::format_ch_bound_micros(&time_range.start),
+            end = crate::sql_hygiene::format_ch_bound_micros(&time_range.end),
+        );
+        debug!("OTEL service-security-signals count SQL: {}", count_sql);
+        let count_rows = ch_executor.execute_sql_to_json(&count_sql).await?;
+        let signal_total = count_rows
+            .first()
+            .map(|r| json_f64(r, "signal_total") as u64)
+            .unwrap_or(signal_count as u64);
+
+        Ok((host_count, signal_count, signal_total, signals))
     }
 }
 
@@ -900,6 +972,20 @@ fn json_opt_f64(row: &serde_json::Value, key: &str) -> serde_json::Value {
             .map(|v| serde_json::json!(v))
             .unwrap_or(serde_json::Value::Null),
         _ => serde_json::Value::Null,
+    }
+}
+
+/// Read a numeric cell as a Rust `Option<f64>` — `None` for SQL NULL, an absent
+/// key, or a non-numeric value; `Some(v)` for a real number (NAN-1721). Unlike
+/// [`json_f64`] (floors everything to 0.0) and [`json_opt_f64`] (returns a JSON
+/// value), this yields the `Option<f64>` the no-data decision paths need so a
+/// reported 0.0 is never conflated with "no data" (O13 breach gate, O52 gauge
+/// count companion).
+fn json_f64_opt(row: &serde_json::Value, key: &str) -> Option<f64> {
+    match row.get(key) {
+        Some(serde_json::Value::Number(n)) => n.as_f64(),
+        Some(serde_json::Value::String(s)) => s.trim().parse::<f64>().ok(),
+        _ => None,
     }
 }
 
@@ -955,6 +1041,27 @@ fn null_if_zero(v: f64) -> serde_json::Value {
         serde_json::Value::Null
     } else {
         serde_json::json!(v)
+    }
+}
+
+/// A host gauge cell (O52, NAN-1721): distinguish an ABSENT reading — the host
+/// never reported the metric, so its count companion `*_n` == 0 — from a genuine
+/// reported `0.0`. Returns `null` only when the companion says there were no
+/// data points; a reported `0.0` stays `0.0` (an idle host at 0% CPU is real,
+/// not "–"). `value` is the already-derived reading (e.g. cpu_util × 100); the
+/// companion counts the raw metric's data points, so the scaling is irrelevant.
+///
+/// When the count companion column is NOT present in the row (the SQL has not
+/// yet been extended to emit `cpu_n`/`mem_n`/`load_n`/`net_n`) this FALLS BACK
+/// to the legacy [`null_if_zero`] behavior so a reading is never silently
+/// zeroed-out wholesale — the fix activates once the companion columns land.
+fn gauge_or_null(row: &serde_json::Value, value: f64, count_key: &str) -> serde_json::Value {
+    match json_f64_opt(row, count_key) {
+        // Companion present: 0 data points → absent → null; else the real value.
+        Some(n) if n <= 0.0 => serde_json::Value::Null,
+        Some(_) => serde_json::json!(value),
+        // Companion absent (SQL not updated yet): preserve legacy behavior.
+        None => null_if_zero(value),
     }
 }
 

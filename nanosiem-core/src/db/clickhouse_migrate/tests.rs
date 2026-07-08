@@ -1111,4 +1111,252 @@ mod tests {
             );
         }
     }
+
+    // ── NAN-1728 M-2/D5: CREATE VIEW / SETTINGS PROFILE / inline-engine MV ──
+
+    #[test]
+    fn create_or_replace_view_gets_on_cluster() {
+        let sql = "CREATE OR REPLACE VIEW nanosiem.nat_candidates_view AS SELECT 1";
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        assert!(
+            result.contains("nanosiem.nat_candidates_view ON CLUSTER 'nanosiem_cluster'"),
+            "plain VIEW must get ON CLUSTER after the name: {result}"
+        );
+    }
+
+    #[test]
+    fn create_settings_profile_gets_on_cluster() {
+        let sql = "CREATE SETTINGS PROFILE IF NOT EXISTS 'nanosiem_realtime' SETTINGS max_threads = 4";
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        assert!(
+            result.contains("'nanosiem_realtime' ON CLUSTER 'nanosiem_cluster'"),
+            "SETTINGS PROFILE must get ON CLUSTER after the quoted name: {result}"
+        );
+    }
+
+    #[test]
+    fn to_form_materialized_view_is_not_engine_rewritten() {
+        // TO-form MVs have no ENGINE — only ON CLUSTER is added, no engine rewrite.
+        let sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.foo_mv TO nanosiem.foo_agg AS SELECT 1";
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        assert!(result.contains("ON CLUSTER 'nanosiem_cluster'"), "{result}");
+        assert!(!result.contains("Replicated"), "TO-form MV must not gain an engine: {result}");
+    }
+
+    #[test]
+    fn inline_engine_materialized_view_is_replicated() {
+        // Latent guard (all MVs are TO-form today): an inline-engine MV must get
+        // a Replicated engine like a CREATE TABLE.
+        let sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.foo_mv ENGINE = AggregatingMergeTree() ORDER BY k AS SELECT k FROM nanosiem.logs";
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        assert!(result.contains("ON CLUSTER 'nanosiem_cluster'"), "{result}");
+        assert!(
+            result.contains("ReplicatedAggregatingMergeTree("),
+            "inline-engine MV must be replicated: {result}"
+        );
+        assert!(
+            result.contains("/clickhouse/tables/{shard}/nanosiem/foo_mv"),
+            "inline-engine MV zoo path keyed on the view name: {result}"
+        );
+    }
+
+    // ── NAN-1728 M-7/D12: DROP ... ON CLUSTER gets SYNC ──
+
+    #[test]
+    fn drop_table_on_cluster_gets_sync() {
+        let sql = "DROP TABLE IF EXISTS nanosiem.logs";
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        assert!(result.contains("ON CLUSTER 'nanosiem_cluster'"), "{result}");
+        assert!(result.trim_end().ends_with("SYNC"), "DROP TABLE must end with SYNC: {result}");
+    }
+
+    #[test]
+    fn drop_table_replicated_db_mode_no_sync() {
+        // Replicated-DB / single-cluster mode → no ON CLUSTER, hence no SYNC.
+        let sql = "DROP TABLE IF EXISTS nanosiem.logs";
+        let result = ClickHouseMigrator::transform_for_cluster(sql, "nanosiem", "nanosiem", false);
+        assert!(!result.contains("ON CLUSTER"), "{result}");
+        assert!(!result.trim_end().ends_with("SYNC"), "no SYNC without ON CLUSTER: {result}");
+    }
+
+    #[test]
+    fn drop_dictionary_on_cluster_no_sync() {
+        // SYNC is a table-drop modifier; DROP DICTIONARY must not get it.
+        let sql = "DROP DICTIONARY IF EXISTS nanosiem.ioc_enrichment_dict";
+        let result =
+            ClickHouseMigrator::transform_for_cluster(sql, "nanosiem_cluster", "nanosiem", false);
+        assert!(result.contains("ON CLUSTER 'nanosiem_cluster'"), "{result}");
+        assert!(!result.trim_end().ends_with("SYNC"), "DROP DICTIONARY must not get SYNC: {result}");
+    }
+
+    // ── NAN-1728: {dist_suffix} read target resolves per topology ──
+
+    /// The general `{dist_suffix}` placeholder must resolve to `""` (the local
+    /// table) on a single-node deployment — where no `_distributed` wrapper
+    /// exists and a hardcoded `_distributed` would halt ingest with
+    /// CACHE_DICTIONARY_UPDATE_FAIL — and to `_distributed` (the wrapper) on a
+    /// cluster. Works after ANY base table name (prevalence summary AND the
+    /// reference tables).
+    #[test]
+    fn dist_suffix_resolves_per_topology() {
+        let query = "QUERY 'SELECT file_hash FROM nanosiem.hash_prevalence_summary{dist_suffix} GROUP BY file_hash'";
+        // Single-node → local table, NO wrapper name.
+        let single = ClickHouseMigrator::substitute_dist_suffix(query, false);
+        assert!(
+            single.contains("FROM nanosiem.hash_prevalence_summary GROUP BY"),
+            "single-node must read the plain local table: {single}"
+        );
+        assert!(!single.contains("_distributed"), "no wrapper on single-node: {single}");
+        assert!(!single.contains("{dist_suffix}"), "placeholder must be substituted: {single}");
+
+        // Cluster → the _distributed wrapper.
+        let clustered = ClickHouseMigrator::substitute_dist_suffix(query, true);
+        assert!(
+            clustered.contains("FROM nanosiem.hash_prevalence_summary_distributed GROUP BY"),
+            "cluster must read the _distributed wrapper: {clustered}"
+        );
+        assert!(!clustered.contains("{dist_suffix}"), "placeholder must be substituted: {clustered}");
+
+        // General: works after a reference-table name too.
+        let refq = "SELECT * FROM nanosiem.ip_enrichments{dist_suffix}";
+        assert_eq!(
+            ClickHouseMigrator::substitute_dist_suffix(refq, false),
+            "SELECT * FROM nanosiem.ip_enrichments"
+        );
+        assert_eq!(
+            ClickHouseMigrator::substitute_dist_suffix(refq, true),
+            "SELECT * FROM nanosiem.ip_enrichments_distributed"
+        );
+    }
+
+    // ── NAN-1728 C2/P0: dict-refresh MV repoint to _distributed wrapper ──
+
+    /// `repoint_from_table` swaps the bare local base for its `_distributed`
+    /// wrapper, is boundary-aware (never double-suffixes), and is idempotent
+    /// (returns None when already pointing at the wrapper or when there's no bare
+    /// base reference). This is what the migrator's post-reconcile MODIFY QUERY
+    /// step uses; single-node never calls it (the whole step is cluster-gated).
+    #[test]
+    fn repoint_from_table_swaps_base_to_wrapper_idempotently() {
+        use crate::db::clickhouse_migrate::distributed::repoint_from_table;
+
+        // Bare local base → wrapper.
+        assert_eq!(
+            repoint_from_table(
+                "SELECT network FROM nanosiem.ip_enrichments GROUP BY network",
+                "nanosiem",
+                "ip_enrichments"
+            )
+            .as_deref(),
+            Some("SELECT network FROM nanosiem.ip_enrichments_distributed GROUP BY network")
+        );
+
+        // Idempotent: already the wrapper → None (no MODIFY QUERY issued), and it
+        // must NOT double-suffix.
+        assert_eq!(
+            repoint_from_table(
+                "SELECT network FROM nanosiem.ip_enrichments_distributed GROUP BY network",
+                "nanosiem",
+                "ip_enrichments"
+            ),
+            None
+        );
+
+        // Base appears inside a subquery (user_registry shape) → still swapped.
+        let sub = "SELECT * FROM (SELECT username_lc FROM nanosiem.user_registry WHERE x) WHERE y";
+        assert_eq!(
+            repoint_from_table(sub, "nanosiem", "user_registry").as_deref(),
+            Some("SELECT * FROM (SELECT username_lc FROM nanosiem.user_registry_distributed WHERE x) WHERE y")
+        );
+
+        // Multiple references (custom_enrichment_results can appear twice) → all
+        // swapped.
+        let multi = "SELECT a FROM nanosiem.custom_enrichment_results, nanosiem.custom_enrichment_results b";
+        assert_eq!(
+            repoint_from_table(multi, "nanosiem", "custom_enrichment_results").as_deref(),
+            Some("SELECT a FROM nanosiem.custom_enrichment_results_distributed, nanosiem.custom_enrichment_results_distributed b")
+        );
+
+        // No reference to the base → None.
+        assert_eq!(
+            repoint_from_table("SELECT 1 FROM nanosiem.other_table", "nanosiem", "ip_enrichments"),
+            None
+        );
+    }
+
+    // ── NAN-1728 C4/W2 + M-1/D4: sharding keys & wrapper drift ──
+
+    #[test]
+    fn sharding_key_content_hash_for_write_through_lanes() {
+        use crate::db::clickhouse_migrate::distributed::sharding_key_for;
+        assert_eq!(sharding_key_for("logs"), "cityHash64(id)");
+        assert_eq!(sharding_key_for("ocsf_logs"), "cityHash64(id)");
+        assert_eq!(sharding_key_for("signals"), "cityHash64(id)");
+        assert_eq!(sharding_key_for("ingestion_errors"), "cityHash64(id)");
+        assert_eq!(sharding_key_for("otel_spans"), "cityHash64(trace_id)");
+        assert_eq!(sharding_key_for("otel_spans_trace_id_ts"), "cityHash64(trace_id)");
+        // MV-fed aggregate wrappers keep rand() (never inserted through the wrapper).
+        assert_eq!(sharding_key_for("hash_prevalence_summary"), "rand()");
+        assert_eq!(sharding_key_for("entity_time_range_agg"), "rand()");
+        assert_eq!(sharding_key_for("identity_observations"), "rand()");
+        assert_eq!(sharding_key_for("synthetic_check_results"), "rand()");
+    }
+
+    #[test]
+    fn wrapper_sharding_key_matches_detects_drift() {
+        use crate::db::clickhouse_migrate::distributed::wrapper_sharding_key_matches;
+        let rand_wrapper =
+            "CREATE TABLE nanosiem.logs_distributed (id UUID) ENGINE = Distributed('c', 'nanosiem', 'logs', rand())";
+        let hashed_wrapper =
+            "CREATE TABLE nanosiem.logs_distributed (id UUID) ENGINE = Distributed('c', 'nanosiem', 'logs', cityHash64(id))";
+        // Old rand() wrapper vs intended content hash → drift (no match).
+        assert!(!wrapper_sharding_key_matches(rand_wrapper, "cityHash64(id)"));
+        // Correct content-hash wrapper → match.
+        assert!(wrapper_sharding_key_matches(hashed_wrapper, "cityHash64(id)"));
+        // rand() wrapper with intended rand() → match (whitespace-insensitive).
+        assert!(wrapper_sharding_key_matches(rand_wrapper, "rand()"));
+        assert!(wrapper_sharding_key_matches(
+            "ENGINE = Distributed('c','nanosiem','logs', cityHash64(id) )",
+            "cityHash64(id)"
+        ));
+        // Non-Distributed / unparseable → treated as drift (safe: recreate).
+        assert!(!wrapper_sharding_key_matches("CREATE TABLE x (id UUID) ENGINE = MergeTree", "rand()"));
+    }
+
+    #[test]
+    fn columns_type_drift_only_flags_type_changes_on_common_columns() {
+        use crate::db::clickhouse_migrate::distributed::columns_type_drift;
+        let s = |n: &str, t: &str| (n.to_string(), t.to_string(), String::new(), String::new());
+        // Identical → no drift.
+        let a = vec![s("id", "UUID"), s("ts", "DateTime64(6)")];
+        assert!(!columns_type_drift(&a, &a));
+        // Type changed on a common column (migration 127 timestamp retype) → drift.
+        let wrapper = vec![s("id", "UUID"), s("ts", "DateTime64(3)")];
+        let source = vec![s("id", "UUID"), s("ts", "DateTime64(6)")];
+        assert!(columns_type_drift(&wrapper, &source));
+        // Presence-only difference (source has an extra column) → NOT drift
+        // (handled by the ADD path, not recreate).
+        let wrapper = vec![s("id", "UUID")];
+        let source = vec![s("id", "UUID"), s("new_col", "String")];
+        assert!(!columns_type_drift(&wrapper, &source));
+        // Expression/default-only difference on a common column → NOT drift.
+        let wrapper = vec![(
+            "c".to_string(),
+            "UInt8".to_string(),
+            "MATERIALIZED".to_string(),
+            "1".to_string(),
+        )];
+        let source = vec![(
+            "c".to_string(),
+            "UInt8".to_string(),
+            "MATERIALIZED".to_string(),
+            "2".to_string(),
+        )];
+        assert!(!columns_type_drift(&wrapper, &source));
+    }
 }

@@ -64,6 +64,18 @@ fn ensure_distributed_ddl_timeout(sql: &str) -> String {
         return sql.to_string();
     }
 
+    // NAN-1728 (M-7/D12): `ALTER TABLE <mv> … MODIFY QUERY …` (refreshable /
+    // incremental MV redefinition, e.g. migration 156) is an ALTER TABLE form
+    // whose trailing text is the MV's SELECT and, crucially, a
+    // `SETTINGS distributed_ddl_task_timeout = 900` appended here would be baked
+    // INTO the stored MV definition — it binds to the view's query settings, not
+    // the DDL execution, so it silently alters MV behavior forever (and CH may
+    // reject it outright). Skip injection exactly like MODIFY REFRESH; these
+    // redefinitions are metadata-only and finish inside the default timeout.
+    if trimmed_upper.contains("MODIFY QUERY") {
+        return sql.to_string();
+    }
+
     // Find a top-level SETTINGS clause (not inside parens — e.g. CREATE TABLE
     // column defs / TTL / ENGINE() args may contain `SETTINGS` as a keyword
     // for the engine config; we only want to amend the trailing query-level
@@ -128,6 +140,13 @@ impl ClickHouseMigrator {
         // password is rotated off the default. init.sql has always done this
         // — now numbered migrations do too.
         let migration_sql = Self::substitute_clickhouse_self_vars(&migration_sql);
+
+        // NAN-1728: resolve the `{dist_suffix}` placeholder to `_distributed` on
+        // clusters (read the reconciler-created wrapper — fans across shards) or
+        // `` on single-node (read the local, complete table). Keyed on the SAME
+        // cluster signal the reconciler uses to create the wrappers, so the read
+        // target always matches wrapper existence.
+        let migration_sql = Self::substitute_dist_suffix(&migration_sql, cluster_name.is_some());
 
         // Sanitize entire migration SQL for CH Cloud before splitting into statements.
         // This strips incompatible settings/index types so the core DDL executes cleanly.
@@ -414,6 +433,10 @@ impl ClickHouseMigrator {
         // this function so numbered migrations share the same helper.
         let sql = Self::substitute_clickhouse_self_vars(&sql);
         let sql = Self::substitute_postgres_vars(&sql);
+        // NAN-1728: topology-correct `{dist_suffix}` read target. See
+        // substitute_dist_suffix. `cluster_name.is_some()` is the same signal
+        // that gates wrapper creation.
+        let sql = Self::substitute_dist_suffix(&sql, cluster_name.is_some());
 
         // Sanitize for cloud if needed
         let sql = if is_cloud {
@@ -550,10 +573,23 @@ impl ClickHouseMigrator {
             "INSERT INTO {}._migrations (version, name, checksum) VALUES ('{}', '{}', '{}')",
             self.database, version_key, label, hash
         );
-        // Use ALTER + DELETE for replicated tables (no REPLACE INTO in ClickHouse)
+        // Use ALTER + DELETE for replicated tables (no REPLACE INTO in ClickHouse).
+        //
+        // NAN-1728 (W11): on an explicit operator-managed cluster the DELETE must
+        // be ON CLUSTER so the mutation is submitted on every node. `_migrations`
+        // is now cluster-wide replicated (one group across all shards, see
+        // `ensure_migrations_table`), so the INSERT below replicates on its own;
+        // but a bare ALTER … DELETE only issues the mutation on the connected
+        // node's replica set — ON CLUSTER guarantees it fans out. Cloud /
+        // Replicated-database mode auto-propagates DDL, so no clause there
+        // (matching `ensure_migrations_table` / `transform_for_cluster` gating).
+        let migrations_on_cluster = match cluster_name.as_ref() {
+            Some(c) if !is_cloud && c != &self.database => format!(" ON CLUSTER '{}'", c),
+            _ => String::new(),
+        };
         let delete_sql = format!(
-            "ALTER TABLE {}._migrations DELETE WHERE version = '{}'",
-            self.database, version_key
+            "ALTER TABLE {}._migrations{} DELETE WHERE version = '{}'",
+            self.database, migrations_on_cluster, version_key
         );
         // Best-effort: don't fail startup if hash storage fails
         let _ = self.client.query(&delete_sql).execute().await;
@@ -879,6 +915,26 @@ mod tests {
                 ensure_distributed_ddl_timeout(sql),
                 sql,
                 "MODIFY REFRESH must not get a query-level SETTINGS clause: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn modify_query_on_cluster_is_not_amended() {
+        // NAN-1728 (M-7/D12): `ALTER TABLE <mv> … MODIFY QUERY …` (migration 156)
+        // redefines the MV's SELECT. An injected `SETTINGS
+        // distributed_ddl_task_timeout = 900` would bind to / be baked into the
+        // stored MV query, not the DDL execution — must stay verbatim despite
+        // being an `ALTER TABLE … ON CLUSTER` statement.
+        let cases = [
+            "ALTER TABLE nanosiem.otel_service_red_1m_mv ON CLUSTER 'default' MODIFY QUERY SELECT 1",
+            "ALTER TABLE nanosiem.foo_mv ON CLUSTER 'default' MODIFY QUERY SELECT a, b FROM nanosiem.logs",
+        ];
+        for sql in cases {
+            assert_eq!(
+                ensure_distributed_ddl_timeout(sql),
+                sql,
+                "MODIFY QUERY must not get a query-level SETTINGS clause: {sql}"
             );
         }
     }

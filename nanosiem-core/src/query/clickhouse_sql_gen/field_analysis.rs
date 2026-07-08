@@ -511,14 +511,25 @@ fn collect_fields_from_command(
             }
         }
         Command::Top {
-            field, by_fields, ..
+            field,
+            by_fields,
+            inject_bounds,
+            ..
         }
         | Command::Rare {
-            field, by_fields, ..
+            field,
+            by_fields,
+            inject_bounds,
+            ..
         } => {
             fields.insert(canon_collect(field, profile));
             for by in by_fields {
                 fields.insert(canon_collect(by, profile));
+            }
+            // NAN-1711 / audit D15: the injected canonical window aggregates
+            // `min/max(timestamp)`, so the base stage must project the column.
+            if *inject_bounds {
+                fields.insert("timestamp".to_string());
             }
         }
         Command::Transaction {
@@ -1163,9 +1174,15 @@ fn collect_computed_from_command(cmd: &Command, computed: &mut HashSet<String>) 
             computed.insert("transaction_start".to_string());
             computed.insert("transaction_end".to_string());
         }
-        Command::Top { .. } | Command::Rare { .. } => {
+        Command::Top { inject_bounds, .. } | Command::Rare { inject_bounds, .. } => {
             computed.insert("count".to_string());
             computed.insert("percent".to_string());
+            // NAN-1711 / audit D15: the detection-injected canonical window
+            // columns are real output columns of this stage.
+            if *inject_bounds {
+                computed.insert("_first_seen".to_string());
+                computed.insert("_last_seen".to_string());
+            }
         }
         Command::Eval { assignments } => {
             for assignment in assignments {

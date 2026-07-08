@@ -12,7 +12,7 @@
 //! - **Self-healing**: stale claims from crashed nodes are automatically reclaimed
 //! - **No single bottleneck**: no leader election needed for detection rules
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use metrics::{counter, histogram};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -43,6 +43,15 @@ pub struct DistributedSchedulerConfig {
     pub jitter_max_secs: u64,
     /// Default lookback period for first-run rules (minutes)
     pub default_lookback_minutes: i64,
+    /// Upper bound on the catch-up window derived from `last_run_at` (minutes).
+    ///
+    /// Caps how far back a long-dormant rule scans on its first run after being
+    /// resumed/reclaimed (audit D22). Without this, a rule idle for months would
+    /// build a multi-month window that times out — and, with the D1 fix leaving
+    /// `last_run_at` untouched on failure, would then retry that giant window
+    /// forever. The cap bounds the scan so it succeeds and progresses. Explicit
+    /// `lookback_minutes` rules are unaffected (their window is intentional).
+    pub max_catchup_minutes: i64,
     /// Maximum seconds a single rule execution may run before being timed out (default: 300s)
     pub execution_timeout_secs: u64,
 }
@@ -56,6 +65,7 @@ impl Default for DistributedSchedulerConfig {
             stale_claim_timeout_secs: 300,
             jitter_max_secs: 30,
             default_lookback_minutes: 15,
+            max_catchup_minutes: 1440,
             execution_timeout_secs: 300,
         }
     }
@@ -71,6 +81,7 @@ impl DistributedSchedulerConfig {
             stale_claim_timeout_secs: parse_env("NRT_STALE_CLAIM_TIMEOUT_SECS", 300) as i64,
             jitter_max_secs: parse_env("NRT_JITTER_MAX_SECS", 30),
             default_lookback_minutes: parse_env("NRT_DEFAULT_LOOKBACK_MINUTES", 15) as i64,
+            max_catchup_minutes: parse_env("NRT_MAX_CATCHUP_MINUTES", 1440) as i64,
             execution_timeout_secs: parse_env("DETECTION_EXECUTION_TIMEOUT_SECS", 300),
         }
     }
@@ -211,12 +222,25 @@ impl DistributedDetectionScheduler {
 
     /// One poll cycle: claim due rules, execute them concurrently, release claims.
     async fn poll_and_execute(&self) -> anyhow::Result<usize> {
+        // Audit D21: never let another node reclaim a rule before the node
+        // executing it can plausibly finish AND release its claim. The stale and
+        // execution timeouts are independent knobs that both default to 300s, so
+        // a claim could be reclaimed at exactly the execution timeout → double
+        // execution (double-counted stats / detection_matches). Floor the stale
+        // timeout at `execution_timeout + buffer` (the buffer covers the permit
+        // wait + release round-trip) so reclaim only ever fires for a genuinely
+        // dead node.
+        const STALE_CLAIM_EXEC_BUFFER_SECS: i64 = 60;
+        let effective_stale_timeout = self.config.stale_claim_timeout_secs.max(
+            self.config.execution_timeout_secs as i64 + STALE_CLAIM_EXEC_BUFFER_SECS,
+        );
+
         let claimed = self
             .rule_repo
             .claim_due_rules(
                 self.config.batch_size,
                 &self.node_id,
-                self.config.stale_claim_timeout_secs,
+                effective_stale_timeout,
             )
             .await?;
 
@@ -287,16 +311,17 @@ async fn execute_and_release(
 ) {
     let mode_str = format!("{:?}", rule.mode).to_lowercase();
 
-    // Calculate time range (same logic as old scheduler)
+    // Calculate time range. `end` is captured *before* the query so that, on
+    // success, `last_run_at` can be stamped to exactly this value (audit D2) —
+    // see `compute_window_start` for the start-of-window precedence rules.
     let end = Utc::now();
-    let start = if let Some(lookback_minutes) = rule.lookback_minutes {
-        end - Duration::minutes(lookback_minutes as i64)
-    } else if let Some(last_run) = rule.last_run_at {
-        // 5-second overlap buffer for ingestion lag / clock skew
-        last_run - Duration::seconds(5)
-    } else {
-        end - Duration::minutes(config.default_lookback_minutes)
-    };
+    let start = compute_window_start(
+        rule.lookback_minutes,
+        rule.last_run_at,
+        end,
+        config.default_lookback_minutes,
+        config.max_catchup_minutes,
+    );
     let time_range = TimeRangeInput::new(start, end);
 
     debug!(
@@ -364,20 +389,87 @@ async fn execute_and_release(
     }
 
     // Compute next_run_at and release claim (always, even on error)
-    let next_run_at = rule
-        .schedule_cron
+    // Audit D26: re-read the CURRENT cron so a cron edit that landed mid-execution
+    // isn't clobbered by a next_run_at computed from the claim-time snapshot. On a
+    // fetch error (e.g. the rule was deleted mid-run) fall back to the snapshot.
+    let current_cron = rule_repo
+        .get_schedule_cron(rule.id)
+        .await
+        .ok()
+        .flatten()
+        .or_else(|| rule.schedule_cron.clone());
+    let next_run_at = current_cron
         .as_ref()
         .map(|cron| {
             calculate_next_run_with_jitter(cron, Utc::now(), rule.id, config.jitter_max_secs)
         })
         .unwrap_or_else(|| Utc::now() + Duration::hours(1));
 
-    if let Err(e) = rule_repo.release_claim(rule.id, node_id, next_run_at).await {
+    // Decide how last_run_at advances (audit D1). Success stamps the executed
+    // window end; a normal failure leaves the high-water mark untouched so the
+    // failed window is re-scanned next cycle instead of being silently dropped.
+    let advance_last_run_to = next_last_run_at(success, rule.last_run_at, start, end);
+    if let Err(e) = rule_repo
+        .release_claim(rule.id, node_id, next_run_at, advance_last_run_to)
+        .await
+    {
         error!(
             rule_id = %rule.id,
             "Failed to release claim: {}. Rule will be reclaimed after stale timeout.",
             e
         );
+    }
+}
+
+/// Decide what value `last_run_at` should take after an execution attempt.
+///
+/// - **Success** → the executed window `end`; the high-water mark advances so
+///   the next window starts exactly where this one ended (audit D2).
+/// - **Failure with a prior high-water mark** → `None` (leave `last_run_at`
+///   as-is; the failed window is re-scanned from the existing mark — audit D1).
+/// - **Failure on the *first* run** (no prior mark) → the window `start`, so the
+///   bootstrap window is re-covered next cycle instead of sliding forward with a
+///   fresh `now() - default_lookback` (which would drop its trailing edge).
+fn next_last_run_at(
+    success: bool,
+    prior_last_run_at: Option<DateTime<Utc>>,
+    window_start: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    if success {
+        Some(window_end)
+    } else if prior_last_run_at.is_none() {
+        Some(window_start)
+    } else {
+        None
+    }
+}
+
+/// Compute the start of the query window for a claimed rule.
+///
+/// Precedence:
+/// 1. Explicit `lookback_minutes` → sliding window `end - lookback` (intentional
+///    overlap; bounded by the rule's own lookback cap). Not capped here.
+/// 2. `last_run_at` → contiguous catch-up from the last successfully-scanned
+///    window end, minus a 5s overlap buffer for ingestion lag / clock skew,
+///    floored at `end - max_catchup_minutes` so a long-dormant rule (audit D22)
+///    doesn't build a giant window that times out and then retries forever.
+/// 3. First run (no lookback, never run) → `end - default_lookback_minutes`.
+fn compute_window_start(
+    lookback_minutes: Option<i32>,
+    last_run_at: Option<DateTime<Utc>>,
+    end: DateTime<Utc>,
+    default_lookback_minutes: i64,
+    max_catchup_minutes: i64,
+) -> DateTime<Utc> {
+    if let Some(lookback_minutes) = lookback_minutes {
+        end - Duration::minutes(lookback_minutes as i64)
+    } else if let Some(last_run) = last_run_at {
+        let candidate = last_run - Duration::seconds(5);
+        let floor = end - Duration::minutes(max_catchup_minutes);
+        candidate.max(floor)
+    } else {
+        end - Duration::minutes(default_lookback_minutes)
     }
 }
 
@@ -394,3 +486,6 @@ fn parse_env(key: &str, default: u64) -> u64 {
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
 }
+
+#[cfg(test)]
+mod tests;

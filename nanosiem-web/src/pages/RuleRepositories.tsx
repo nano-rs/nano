@@ -10,8 +10,10 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { AlertTriangle, ArrowUpRight } from 'lucide-react';
+import { AlertTriangle, ArrowUpRight, GitPullRequest } from 'lucide-react';
 import { useSyncCompleteEffect } from '@/hooks/use-sync-complete';
+import { useAuth } from '@/contexts/AuthContext';
+import { DetectionCodeTargetsDrawer } from '@/components/repositories/DetectionCodeTargetsDrawer';
 import { ImportBundleButton } from '@/components/airgap/ImportBundleButton';
 import { importRulesBundle } from '@/lib/api/airgap';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
@@ -52,6 +54,25 @@ export function RuleRepositories() {
   const { toast } = useToast();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const { hasPermission } = useAuth();
+
+  // Detection-as-Code push targets (NAN-1745) — a push destination for AI-tuned
+  // rules, distinct from the pull-only rule repositories on this page.
+  const canViewDac = hasPermission('detection_code_targets:view');
+  const canManageDac = hasPermission('detection_code_targets:manage');
+  const [dacOpen, setDacOpen] = useState(false);
+
+  const pushTargetsButton = canViewDac ? (
+    <button
+      type="button"
+      onClick={() => setDacOpen(true)}
+      title="Detection-as-Code push targets — open PRs in your own repo"
+      className="h-[28px] px-3 rounded-md border border-border bg-card hover:bg-muted text-[11.5px] font-medium text-foreground/80 flex items-center gap-1.5 shrink-0"
+    >
+      <GitPullRequest className="w-[12px] h-[12px]" strokeWidth={1.5} />
+      Push targets
+    </button>
+  ) : null;
 
   // Air-gap mode: rule repositories sync from Git over the internet, which is
   // unavailable offline. The page stays usable (browse + import); the egress
@@ -416,21 +437,24 @@ export function RuleRepositories() {
                 : 'Track detections from Git. Sync upstream rules, preview diffs, remap sources, and import — bulk or one-by-one.'}
             </div>
           </div>
-          {airGap ? (
-            <ImportBundleButton
-              noun="rules"
-              onUpload={importRulesBundle}
-              onSynced={refetchCatalog}
-            />
-          ) : (
-            <button
-              type="button"
-              onClick={() => setAddOpen(true)}
-              className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium"
-            >
-              Connect a repo
-            </button>
-          )}
+          <div className="flex items-center gap-2 shrink-0">
+            {pushTargetsButton}
+            {airGap ? (
+              <ImportBundleButton
+                noun="rules"
+                onUpload={importRulesBundle}
+                onSynced={refetchCatalog}
+              />
+            ) : (
+              <button
+                type="button"
+                onClick={() => setAddOpen(true)}
+                className="h-[28px] px-3 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-[11.5px] font-medium"
+              >
+                Connect a repo
+              </button>
+            )}
+          </div>
         </div>
         <div className="flex-1 flex items-center justify-center p-8 text-center">
           <div className="max-w-md">
@@ -506,6 +530,12 @@ export function RuleRepositories() {
             });
           }}
         />
+
+        <DetectionCodeTargetsDrawer
+          open={dacOpen}
+          onClose={() => setDacOpen(false)}
+          canManage={canManageDac}
+        />
         </div>
       </TooltipProvider>
     );
@@ -519,6 +549,7 @@ export function RuleRepositories() {
         onSyncNow={() => syncMutation.mutate(activeRepo.id)}
         onOpenHistory={() => setHistoryOpen(true)}
         syncing={syncMutation.isPending && syncMutation.variables === activeRepo.id}
+        pushTargetsSlot={pushTargetsButton}
         airgapSlot={
           airGap ? (
             <ImportBundleButton
@@ -671,6 +702,12 @@ export function RuleRepositories() {
         description="All cached rules will be deleted. You can re-add it later to sync again."
         confirmLabel="Remove"
         onConfirm={() => deleteRepoId && deleteMutation.mutate(deleteRepoId)}
+      />
+
+      <DetectionCodeTargetsDrawer
+        open={dacOpen}
+        onClose={() => setDacOpen(false)}
+        canManage={canManageDac}
       />
       </div>
     </TooltipProvider>

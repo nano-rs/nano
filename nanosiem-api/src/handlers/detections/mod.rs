@@ -8,7 +8,7 @@
 //! - `lifecycle` — pause, resume, promote, demote
 //! - `testing` — test rule, test query, format query, validate
 //! - `import_export` — import and export rules
-//! - `stats` — trigger, stats, today counts, matches, reload realtime
+//! - `stats` — trigger, stats, today counts, matches
 
 mod aggregates;
 mod bulk;
@@ -142,7 +142,6 @@ impl utoipa::OpenApi for DetectionsApiDoc {
                 get_detection_stats,
                 get_today_counts,
                 get_detection_matches,
-                reload_realtime_rules,
                 format_query,
                 validate_detection,
                 bulk_update_rules,

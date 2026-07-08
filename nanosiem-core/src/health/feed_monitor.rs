@@ -11,6 +11,17 @@ use tracing::{debug, warn};
 
 use super::types::FeedStalenessStatus;
 
+/// Whether this deployment is a multi-shard ClickHouse cluster, derived from the
+/// `CLICKHOUSE_CLUSTER` env — `FeedMonitor` holds a bare `ClickHouseClient` (no
+/// `DualPool`), so it uses the same env signal `on_cluster_clause` / retention.rs
+/// use. Unset (single-node / open-core) → `TableNames::new(false)` returns the
+/// bare local table, byte-identical to the pre-cluster form (NAN-1728).
+fn feed_monitor_is_clustered() -> bool {
+    std::env::var("CLICKHOUSE_CLUSTER")
+        .ok()
+        .is_some_and(|c| !c.trim().is_empty())
+}
+
 /// Data feed staleness monitor (monitors log_sources table)
 pub struct FeedMonitor {
     pool: PgPool,
@@ -132,7 +143,14 @@ impl FeedMonitor {
         let where_clause = source.build_where_clause();
         // NAN-1241: read the active ingested-events table (ocsf_logs under OCSF)
         // so feed staleness reflects where events actually land. UDM-identical.
-        let logs_table = crate::schema::active_logs_table();
+        // NAN-1728 (H5): route through the `_distributed` wrapper on a cluster so
+        // `max(timestamp)` reflects ALL shards (otherwise the newest event on
+        // another shard is invisible → false stale-feed alerts). `FeedMonitor`
+        // holds a bare `ClickHouseClient` (no `DualPool`), so cluster mode comes
+        // from the `CLICKHOUSE_CLUSTER` env — unset → bare local name,
+        // byte-identical on single-node.
+        let logs_table = crate::db::TableNames::new(feed_monitor_is_clustered())
+            .read_bare(crate::schema::active_logs_table());
         let sql = format!(
             r#"
             SELECT max(timestamp) as last_event_at

@@ -26,25 +26,38 @@ import { SyntheticEditorDialog } from '@/components/observability/SyntheticEdito
 import { cn } from '@/lib/utils';
 import type { ObservabilityTabProps } from '../types';
 
-type SynStatus = 'up' | 'degraded' | 'down';
+type SynStatus = 'up' | 'degraded' | 'down' | 'nodata';
 
 const STATUS_TONE: Record<SynStatus, { dot: string; text: string; label: string }> = {
   up: { dot: 'bg-good', text: 'text-good', label: 'Up' },
   degraded: { dot: 'bg-warn', text: 'text-warn', label: 'Degraded' },
   down: { dot: 'bg-danger', text: 'text-danger', label: 'Down' },
+  nodata: { dot: 'bg-border-2', text: 'text-fg-4', label: 'No data' },
 };
 
+// O33 (NAN-1721): the backend flags checks with zero recorded runs via
+// `has_runs`. A brand-new check must NOT report 0% uptime rendered as a red
+// pulsing "Down" (a phantom outage) — treat it as a neutral no-data state.
+// Read the flag defensively until the shared SyntheticCheck api type carries it
+// (Contract #3); when absent (older backend) assume the check has runs so
+// existing behavior is preserved.
+function hasRuns(c: SyntheticCheck): boolean {
+  return (c as { has_runs?: boolean }).has_runs ?? true;
+}
+
 function statusOf(c: SyntheticCheck): SynStatus {
+  if (!hasRuns(c)) return 'nodata';
   if (!c.enabled) return 'degraded';
-  if (c.uptime_pct >= 99.9) return 'up';
-  if (c.uptime_pct >= 99) return 'degraded';
+  const u = c.uptime_pct ?? 0;
+  if (u >= 99.9) return 'up';
+  if (u >= 99) return 'degraded';
   return 'down';
 }
 
 const fmtMs = (v: number | null): string =>
   v == null ? '–' : v >= 1000 ? `${(v / 1000).toFixed(2)}s` : `${Math.round(v * 10) / 10}ms`;
 
-const fmtUptime = (v: number): string => `${v.toFixed(2)}%`;
+const fmtUptime = (v: number | null): string => (v == null ? '–' : `${v.toFixed(2)}%`);
 
 export function SyntheticsTab(_props: ObservabilityTabProps) {
   const [checks, setChecks] = useState<SyntheticCheck[]>([]);
@@ -123,17 +136,27 @@ export function SyntheticsTab(_props: ObservabilityTabProps) {
     setEditorOpen(true);
   };
 
-  // Summary counts. A paused check is treated as degraded (not actively up).
+  // Summary counts. A paused check is treated as degraded (not actively up);
+  // a check with no recorded runs is neutral no-data (excluded from up/down).
   const up = checks.filter((c) => statusOf(c) === 'up').length;
   const degraded = checks.filter((c) => statusOf(c) === 'degraded').length;
   const down = checks.filter((c) => statusOf(c) === 'down').length;
+  // Overall uptime averages only checks that actually recorded runs — a no-run
+  // check has no uptime to contribute and must not drag the average toward 0%.
+  const withRuns = checks.filter(hasRuns);
   const overall =
-    checks.length > 0
-      ? (checks.reduce((a, c) => a + c.uptime_pct, 0) / checks.length).toFixed(2)
+    withRuns.length > 0
+      ? (withRuns.reduce((a, c) => a + (c.uptime_pct ?? 0), 0) / withRuns.length).toFixed(2)
       : null;
 
-  // Sort by uptime ascending — worst first, matching the design.
-  const sorted = [...checks].sort((a, b) => a.uptime_pct - b.uptime_pct);
+  // Sort by uptime ascending — worst first, matching the design. No-run checks
+  // (uptime_pct defaults to 0) aren't "worst"; sort them to the bottom.
+  const sorted = [...checks].sort((a, b) => {
+    const ar = hasRuns(a);
+    const br = hasRuns(b);
+    if (ar !== br) return ar ? -1 : 1;
+    return (a.uptime_pct ?? 0) - (b.uptime_pct ?? 0);
+  });
 
   return (
     <div className="flex flex-col gap-3.5">
@@ -252,14 +275,16 @@ export function SyntheticsTab(_props: ObservabilityTabProps) {
                     <div
                       className={cn(
                         'font-mono text-[13px] tabular-nums',
-                        c.uptime_pct >= 99.9
-                          ? 'text-good'
-                          : c.uptime_pct >= 99
-                            ? 'text-warn'
-                            : 'text-danger',
+                        !hasRuns(c)
+                          ? 'text-fg-4'
+                          : (c.uptime_pct ?? 0) >= 99.9
+                            ? 'text-good'
+                            : (c.uptime_pct ?? 0) >= 99
+                              ? 'text-warn'
+                              : 'text-danger',
                       )}
                     >
-                      {fmtUptime(c.uptime_pct)}
+                      {hasRuns(c) ? fmtUptime(c.uptime_pct) : '–'}
                     </div>
                   </div>
                   <div className="text-right">

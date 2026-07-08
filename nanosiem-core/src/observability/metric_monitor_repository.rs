@@ -95,6 +95,10 @@ pub struct MetricMonitor {
     /// Aggregation: `avg|sum|min|max|count|rate|p50|p95|p99`. Validated at the
     /// API layer against [`crate::query::MetricAgg::from_str`].
     pub agg: String,
+    /// Optional service scope (the promoted `otel_metrics.service_name` column,
+    /// NAN-1564). NULL evaluates the metric fleet-wide (all services).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
     /// Optional tag/attribute key to split into per-series evaluation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group_by: Option<String>,
@@ -128,8 +132,8 @@ impl MetricMonitorRepository {
     pub async fn list(&self) -> Result<Vec<MetricMonitor>, MetricMonitorRepositoryError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, name, metric_name, agg, group_by, filters, comparator,
-                   threshold, window_secs, eval_interval_secs, enabled,
+            SELECT id, name, metric_name, agg, service_name, group_by, filters,
+                   comparator, threshold, window_secs, eval_interval_secs, enabled,
                    created_by, created_at, updated_at
             FROM observability_metric_monitors
             ORDER BY name ASC, created_at DESC
@@ -147,8 +151,8 @@ impl MetricMonitorRepository {
     pub async fn list_enabled(&self) -> Result<Vec<MetricMonitor>, MetricMonitorRepositoryError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, name, metric_name, agg, group_by, filters, comparator,
-                   threshold, window_secs, eval_interval_secs, enabled,
+            SELECT id, name, metric_name, agg, service_name, group_by, filters,
+                   comparator, threshold, window_secs, eval_interval_secs, enabled,
                    created_by, created_at, updated_at
             FROM observability_metric_monitors
             WHERE enabled = TRUE
@@ -165,8 +169,8 @@ impl MetricMonitorRepository {
     pub async fn get(&self, id: Uuid) -> Result<MetricMonitor, MetricMonitorRepositoryError> {
         let row = sqlx::query(
             r#"
-            SELECT id, name, metric_name, agg, group_by, filters, comparator,
-                   threshold, window_secs, eval_interval_secs, enabled,
+            SELECT id, name, metric_name, agg, service_name, group_by, filters,
+                   comparator, threshold, window_secs, eval_interval_secs, enabled,
                    created_by, created_at, updated_at
             FROM observability_metric_monitors
             WHERE id = $1
@@ -187,6 +191,7 @@ impl MetricMonitorRepository {
         name: &str,
         metric_name: &str,
         agg: &str,
+        service_name: Option<&str>,
         group_by: Option<&str>,
         filters: &[MonitorTagFilter],
         comparator: MonitorComparator,
@@ -201,17 +206,18 @@ impl MetricMonitorRepository {
         let row = sqlx::query(
             r#"
             INSERT INTO observability_metric_monitors
-                (name, metric_name, agg, group_by, filters, comparator, threshold,
-                 window_secs, eval_interval_secs, enabled, created_by)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            RETURNING id, name, metric_name, agg, group_by, filters, comparator,
-                      threshold, window_secs, eval_interval_secs, enabled,
+                (name, metric_name, agg, service_name, group_by, filters, comparator,
+                 threshold, window_secs, eval_interval_secs, enabled, created_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            RETURNING id, name, metric_name, agg, service_name, group_by, filters,
+                      comparator, threshold, window_secs, eval_interval_secs, enabled,
                       created_by, created_at, updated_at
             "#,
         )
         .bind(name)
         .bind(metric_name)
         .bind(agg)
+        .bind(service_name)
         .bind(group_by)
         .bind(filters_json)
         .bind(comparator.as_str())
@@ -234,6 +240,7 @@ impl MetricMonitorRepository {
         name: &str,
         metric_name: &str,
         agg: &str,
+        service_name: Option<&str>,
         group_by: Option<&str>,
         filters: &[MonitorTagFilter],
         comparator: MonitorComparator,
@@ -250,17 +257,18 @@ impl MetricMonitorRepository {
             SET name = $2,
                 metric_name = $3,
                 agg = $4,
-                group_by = $5,
-                filters = $6,
-                comparator = $7,
-                threshold = $8,
-                window_secs = $9,
-                eval_interval_secs = $10,
-                enabled = $11,
+                service_name = $5,
+                group_by = $6,
+                filters = $7,
+                comparator = $8,
+                threshold = $9,
+                window_secs = $10,
+                eval_interval_secs = $11,
+                enabled = $12,
                 updated_at = NOW()
             WHERE id = $1
-            RETURNING id, name, metric_name, agg, group_by, filters, comparator,
-                      threshold, window_secs, eval_interval_secs, enabled,
+            RETURNING id, name, metric_name, agg, service_name, group_by, filters,
+                      comparator, threshold, window_secs, eval_interval_secs, enabled,
                       created_by, created_at, updated_at
             "#,
         )
@@ -268,6 +276,7 @@ impl MetricMonitorRepository {
         .bind(name)
         .bind(metric_name)
         .bind(agg)
+        .bind(service_name)
         .bind(group_by)
         .bind(filters_json)
         .bind(comparator.as_str())
@@ -306,6 +315,7 @@ impl MetricMonitorRepository {
             name: row.get("name"),
             metric_name: row.get("metric_name"),
             agg: row.get("agg"),
+            service_name: row.get("service_name"),
             group_by: row.get("group_by"),
             filters,
             comparator,

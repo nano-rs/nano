@@ -1,14 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Detection statistics, trigger, matches, and realtime reload
+//! Detection statistics, trigger, and matches
 
 use axum::{
     extract::{Path, Query, State},
     Extension, Json,
 };
-use nanosiem_core::audit::{
-    AuditEvent, AuditSource, ClientContext, REALTIME_RULES_RELOADED, RULE_TRIGGERED,
-};
+use nanosiem_core::audit::{AuditEvent, AuditSource, ClientContext, RULE_TRIGGERED};
 use nanosiem_core::auth::permissions;
 use nanosiem_core::typeid::TypeIdParam;
 use uuid::Uuid;
@@ -324,51 +322,4 @@ pub async fn get_detection_matches(
         .collect();
 
     Ok(Json(DetectionMatchesResponse { total, matches }))
-}
-
-/// Reload all detection rules in the real-time evaluator
-/// This is useful after bulk imports or if the cache gets out of sync
-#[utoipa::path(
-    post,
-    path = "/api/rules/reload-realtime",
-    tag = "detections",
-    responses(
-        (status = 200, description = "Rules reloaded successfully", body = inline(Object)),
-        (status = 403, description = "Missing permission: detections:edit", body = ErrorResponse),
-        (status = 500, description = "Failed to reload rules", body = ErrorResponse),
-    ),
-    security(("bearer_auth" = []), ("api_key" = []))
-)]
-pub async fn reload_realtime_rules(
-    State(state): State<AppState>,
-    Extension(auth): Extension<AuthContext>,
-    Extension(client): Extension<ClientContext>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    ensure_permission(&auth, permissions::DETECTIONS_EDIT)?;
-
-    state
-        .realtime_evaluator
-        .load_rules()
-        .await
-        .map_err(|e| ApiError::InternalError(format!("Failed to reload rules: {}", e)))?;
-
-    let count = state.realtime_evaluator.rule_count().await;
-    tracing::info!("Reloaded {} rules into real-time evaluator", count);
-
-    // Emit audit event
-    state.emit_audit(
-        AuditEvent::builder(AuditSource::Detection, REALTIME_RULES_RELOADED)
-            .actor(Some(auth.user_id()), None)
-            .api_key(auth.api_key_id, auth.api_key_name.clone())
-            .client_context(&client)
-            .details(serde_json::json!({
-                "rules_loaded": count,
-            }))
-            .build(),
-    );
-
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "rules_loaded": count
-    })))
 }

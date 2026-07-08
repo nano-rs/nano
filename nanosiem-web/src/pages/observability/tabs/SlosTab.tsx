@@ -24,11 +24,18 @@ import { SloEditorDialog } from '@/components/observability/SloEditorDialog';
 import { cn } from '@/lib/utils';
 import type { ObservabilityTabProps } from '../types';
 
+// O17 (NAN-1721): the backend now returns a distinct "no_data" status when a
+// SLO'd service has zero traffic in the window (a hard-down service must NOT
+// read as 100% attained). Widen the local status union to cover it until the
+// shared `SloStatus` api type carries it (Contract #2).
+type SloStatusExt = SloStatus | 'no_data';
+
 // Status → tone classes (mirrors the design's HEALTH map onto nano tokens).
-const STATUS_TONE: Record<SloStatus, { dot: string; text: string; border: string; bg: string; label: string }> = {
+const STATUS_TONE: Record<SloStatusExt, { dot: string; text: string; border: string; bg: string; label: string }> = {
   ok: { dot: 'bg-good', text: 'text-good', border: 'border-border', bg: 'bg-good/10', label: 'Healthy' },
   at_risk: { dot: 'bg-warn', text: 'text-warn', border: 'border-warn/30', bg: 'bg-warn/10', label: 'Burning' },
   breaching: { dot: 'bg-danger', text: 'text-danger', border: 'border-danger/30', bg: 'bg-danger/10', label: 'Breaching' },
+  no_data: { dot: 'bg-border-2', text: 'text-fg-4', border: 'border-border', bg: 'bg-foreground/5', label: 'No data' },
 };
 
 const fmtPct = (v: number, digits = 2): string => `${v.toFixed(digits)}%`;
@@ -97,7 +104,11 @@ export function SlosTab({ onOpenService }: ObservabilityTabProps) {
   const sorted = [...slos].sort(
     (a, b) => a.budget_remaining_pct - b.budget_remaining_pct,
   );
-  const burning = slos.filter((s) => s.status !== 'ok').length;
+  // A no-data SLO is neither healthy nor "burning" — exclude it from the count.
+  const burning = slos.filter((s) => {
+    const st = s.status as SloStatusExt;
+    return st !== 'ok' && st !== 'no_data';
+  }).length;
 
   return (
     <div className="flex flex-col gap-3.5">
@@ -144,6 +155,9 @@ export function SlosTab({ onOpenService }: ObservabilityTabProps) {
         <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
           {sorted.map((s) => {
             const tone = STATUS_TONE[s.status];
+            // O17: a no-data SLO has no meaningful budget/burn — render the
+            // figures neutral ("–") instead of a fabricated 100% / 0% consumed.
+            const noData = (s.status as SloStatusExt) === 'no_data';
             // budget_remaining_pct: 100 = full budget, can go negative.
             const consumedPct = 100 - s.budget_remaining_pct;
             const remaining = Math.max(0, s.budget_remaining_pct);
@@ -201,25 +215,33 @@ export function SlosTab({ onOpenService }: ObservabilityTabProps) {
                 <div className="grid grid-cols-3 gap-2">
                   <Metric
                     label="current"
-                    value={fmtPct(currentPct, 2)}
-                    cls={metPlan ? 'text-good' : 'text-danger'}
+                    value={noData ? '–' : fmtPct(currentPct, 2)}
+                    cls={noData ? 'text-fg-4' : metPlan ? 'text-good' : 'text-danger'}
                   />
                   <Metric
                     label="budget left"
-                    value={fmtPct(remaining, 0)}
+                    value={noData ? '–' : fmtPct(remaining, 0)}
                     cls={
-                      s.budget_remaining_pct <= 0
-                        ? 'text-danger'
-                        : s.budget_remaining_pct < 25
-                          ? 'text-warn'
-                          : 'text-fg'
+                      noData
+                        ? 'text-fg-4'
+                        : s.budget_remaining_pct <= 0
+                          ? 'text-danger'
+                          : s.budget_remaining_pct < 25
+                            ? 'text-warn'
+                            : 'text-fg'
                     }
                   />
                   <Metric
                     label="burn rate"
-                    value={`${s.burn_rate.toFixed(1)}×`}
+                    value={noData ? '–' : `${s.burn_rate.toFixed(1)}×`}
                     cls={
-                      s.burn_rate >= 5 ? 'text-danger' : s.burn_rate >= 2 ? 'text-warn' : 'text-fg-2'
+                      noData
+                        ? 'text-fg-4'
+                        : s.burn_rate >= 5
+                          ? 'text-danger'
+                          : s.burn_rate >= 2
+                            ? 'text-warn'
+                            : 'text-fg-2'
                     }
                   />
                 </div>
@@ -230,17 +252,19 @@ export function SlosTab({ onOpenService }: ObservabilityTabProps) {
                     <span>error budget consumed</span>
                     <span
                       className={cn(
-                        consumedPct >= 100
-                          ? 'text-danger'
-                          : consumedPct >= 75
-                            ? 'text-warn'
-                            : 'text-fg-3',
+                        noData
+                          ? 'text-fg-4'
+                          : consumedPct >= 100
+                            ? 'text-danger'
+                            : consumedPct >= 75
+                              ? 'text-warn'
+                              : 'text-fg-3',
                       )}
                     >
-                      {fmtPct(Math.max(0, consumedPct), 0)}
+                      {noData ? '–' : fmtPct(Math.max(0, consumedPct), 0)}
                     </span>
                   </div>
-                  <BudgetBar consumedPct={consumedPct} />
+                  <BudgetBar consumedPct={noData ? 0 : consumedPct} />
                 </div>
 
                 {/* actions */}

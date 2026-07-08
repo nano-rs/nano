@@ -103,6 +103,17 @@ ORDER BY network;
 CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ip_enrichment_dict_refresh
 REFRESH EVERY 6 HOUR TO nanosiem.ip_enrichment_dict_staging AS
 SELECT network, argMax(country, updated_at) AS country, argMax(country_code, updated_at) AS country_code, argMax(continent, updated_at) AS continent, argMax(continent_code, updated_at) AS continent_code, argMax(asn, updated_at) AS asn, argMax(as_name, updated_at) AS as_name, argMax(as_domain, updated_at) AS as_domain
+-- NAN-1728 (C2): this refreshable MV reads the LOCAL base table at init time.
+-- Refreshable-MV DDL validates its FROM source EAGERLY, and the
+-- `ip_enrichments_distributed` wrapper does not exist until
+-- `ensure_distributed_tables` runs (AFTER init.sql), so reading the wrapper here
+-- would abort cluster boot with UNKNOWN_TABLE. On a cluster the migrator's
+-- post-reconcile `repoint_dict_refresh_mvs_distributed` step then issues
+-- `ALTER TABLE … MODIFY QUERY … FROM ip_enrichments_distributed` once the
+-- wrapper exists, so the staging dict becomes cross-shard-complete. Single-node
+-- keeps reading local (complete on one shard). The argMax(...,updated_at)
+-- GROUP BY network already collapses the same CIDR across shards to the latest
+-- version, so the cross-shard fan-in is dedup-correct with no projection change.
 FROM nanosiem.ip_enrichments
 GROUP BY network
 HAVING argMax(deleted, updated_at) = 0
@@ -176,7 +187,30 @@ SELECT
     toInt32(anyLast(confidence)) AS confidence_level,
     arrayStringConcat(groupUniqArrayArray(tags), ',') AS tags
 FROM (
-    SELECT * FROM nanosiem.custom_enrichment_results
+    -- NAN-1728 (C2): reads the LOCAL base at init (refreshable MVs validate FROM
+    -- eagerly and the _distributed wrapper doesn't exist until
+    -- ensure_distributed_tables runs after init.sql). On a cluster the migrator's
+    -- post-reconcile repoint_dict_refresh_mvs_distributed step swaps this FROM to
+    -- custom_enrichment_results_distributed once the wrapper exists. Reading all
+    -- shards can surface the same ReplacingMergeTree row (namespace,
+    -- enrichment_name, key_type, key_value) at DIFFERENT versions across shards
+    -- (merges are per-shard), so collapse to the latest version per base key with
+    -- argMax(...,version) BEFORE the outer per-ioc_value aggregation. On
+    -- single-node this stays local — a no-op dedup over one shard. The filter lives in an OUTER WHERE over the collapsed columns,
+    -- NOT a HAVING on the aggregates (NAN-1120: alias re-resolution makes a
+    -- HAVING on an argMax'd column ILLEGAL_AGGREGATION).
+    SELECT * FROM (
+        SELECT enrichment_name, key_type, key_value,
+               argMax(threat_type, version) AS threat_type,
+               argMax(malware, version) AS malware,
+               argMax(confidence, version) AS confidence,
+               argMax(tags, version) AS tags,
+               argMax(is_ioc, version) AS is_ioc,
+               argMax(is_marketplace, version) AS is_marketplace,
+               argMax(expires_at, version) AS expires_at
+        FROM nanosiem.custom_enrichment_results
+        GROUP BY namespace, enrichment_name, key_type, key_value
+    )
     WHERE expires_at > now() AND is_ioc = 1 AND is_marketplace = 1
     ORDER BY confidence DESC
 )
@@ -381,7 +415,20 @@ SELECT
     groupUniqArrayArray(tags) as tags,
     max(coalesce(risk_score, 0)) as risk_score,
     groupUniqArray(enrichment_name) as enrichment_names
-FROM nanosiem.custom_enrichment_results
+FROM (
+    -- NAN-1728 (C2): reads LOCAL at init; repointed to
+    -- custom_enrichment_results_distributed on clusters by the migrator's
+    -- post-reconcile repoint step (see ip_enrichment_dict_refresh). Collapse each
+    -- ReplacingMergeTree base key to its latest version before the outer
+    -- per-(key_type,key_value) aggregation (see ioc_enrichment_dict_refresh).
+    SELECT enrichment_name, key_type, key_value,
+           argMax(tags, version) AS tags,
+           argMax(risk_score, version) AS risk_score,
+           argMax(is_ioc, version) AS is_ioc,
+           argMax(expires_at, version) AS expires_at
+    FROM nanosiem.custom_enrichment_results
+    GROUP BY namespace, enrichment_name, key_type, key_value
+)
 WHERE expires_at > now() AND is_ioc = 0
 GROUP BY key_type, key_value
 SETTINGS max_bytes_before_external_group_by = 1000000000, max_memory_usage = 2500000000, max_threads = 2;
@@ -435,7 +482,23 @@ SELECT
     groupUniqArrayArray(tags) as tags,
     groupUniqArray(enrichment_name) as enrichment_names
 FROM (
-    SELECT * FROM nanosiem.custom_enrichment_results
+    -- NAN-1728 (C2): reads LOCAL at init; repointed to
+    -- custom_enrichment_results_distributed on clusters by the migrator's
+    -- post-reconcile repoint step (see ip_enrichment_dict_refresh). Collapse each
+    -- ReplacingMergeTree base key to its latest version before the outer
+    -- per-(key_type,key_value) aggregation (see ioc_enrichment_dict_refresh).
+    SELECT * FROM (
+        SELECT enrichment_name, key_type, key_value,
+               argMax(threat_type, version) AS threat_type,
+               argMax(malware, version) AS malware,
+               argMax(confidence, version) AS confidence,
+               argMax(tags, version) AS tags,
+               argMax(is_ioc, version) AS is_ioc,
+               argMax(is_marketplace, version) AS is_marketplace,
+               argMax(expires_at, version) AS expires_at
+        FROM nanosiem.custom_enrichment_results
+        GROUP BY namespace, enrichment_name, key_type, key_value
+    )
     WHERE expires_at > now() AND is_ioc = 1 AND is_marketplace = 0
     ORDER BY confidence DESC
 )
@@ -497,6 +560,32 @@ LIFETIME(MIN 60 MAX 300);
 -- capped at the 9999 marker (NOT dropped), so an ingest dict MISS unambiguously
 -- means "genuinely new" and stamps 1 (rare/new) via the call-site default,
 -- rather than being confused with a dropped-common artifact.
+--
+-- NAN-1728 (C3): the QUERY reads FROM nanosiem.<x>_prevalence_summary followed
+-- by the generalized {dist_suffix} placeholder, which the migrator's
+-- substitution pipeline resolves per topology:
+--   * on a cluster  → "_distributed"  (reads the reconciler-created wrapper)
+--   * on single-node → ""             (reads the local, complete summary)
+-- The summary tables are AggregatingMergeTree and per-shard (NOT cluster-wide
+-- replicated — they're 80M+ rows on Saturn, far too large to fully replicate;
+-- C2's cluster-wide model is for small reference tables only). Reading the local
+-- summary on a MULTI-shard cluster would yield host_count ~= 1/3 of reality,
+-- breaking the NAN-1662 9999 common-mask invariant and stamping wrong
+-- ingest-time prevalence per landing shard — hence the wrapper on clusters. The
+-- uniqMerge(...) GROUP BY merges the per-shard uniq partials correctly (uniqMerge
+-- over a Distributed AggregatingMergeTree is the standard cross-shard fan-in).
+-- The reconciler auto-creates the wrapper on clusters (the three
+-- *_prevalence_summary tables are in dual_pool::DISTRIBUTED_TABLES).
+--
+-- The placeholder is why we DON'T hardcode "_distributed": on a true single-node
+-- deployment (dev, open-core install.sh — no <remote_servers> so
+-- detect_cluster() returns None) the reconciler is a no-op and no wrapper exists,
+-- so a hardcoded "_distributed" would throw CACHE_DICTIONARY_UPDATE_FAIL on the
+-- first ingest-time dictGet (a fail-closed insert halt). We deliberately do NOT
+-- create any *_distributed object on single-node (it would false-positive
+-- DualPool's logs_distributed-presence cluster detection); the suffix resolves to
+-- the plain local table instead. The resolution uses the SAME detect_cluster()
+-- signal that gates wrapper creation, so target and wrapper can never disagree.
 
 CREATE OR REPLACE DICTIONARY nanosiem.hash_prevalence_dict
 (
@@ -518,7 +607,7 @@ SOURCE(CLICKHOUSE(
                   min(first_seen) AS first_seen,
                   max(last_seen) AS last_seen,
                   toUInt64(sum(total_count)) AS total_occurrences
-           FROM nanosiem.hash_prevalence_summary
+           FROM nanosiem.hash_prevalence_summary{dist_suffix}
            GROUP BY file_hash
            SETTINGS max_memory_usage = 536870912, max_bytes_before_external_group_by = 268435456, max_threads = 2'
 ))
@@ -545,7 +634,7 @@ SOURCE(CLICKHOUSE(
                   min(first_seen) AS first_seen,
                   max(last_seen) AS last_seen,
                   toUInt64(sum(total_count)) AS total_occurrences
-           FROM nanosiem.domain_prevalence_summary
+           FROM nanosiem.domain_prevalence_summary{dist_suffix}
            GROUP BY domain
            SETTINGS max_memory_usage = 536870912, max_bytes_before_external_group_by = 268435456, max_threads = 2'
 ))
@@ -577,7 +666,7 @@ SOURCE(CLICKHOUSE(
                   min(first_seen) AS first_seen,
                   max(last_seen) AS last_seen,
                   toUInt64(sum(total_count)) AS total_occurrences
-           FROM nanosiem.ip_prevalence_summary
+           FROM nanosiem.ip_prevalence_summary{dist_suffix}
            WHERE is_private = 0
            GROUP BY ip
            SETTINGS max_memory_usage = 536870912, max_bytes_before_external_group_by = 268435456, max_threads = 2'
@@ -1317,6 +1406,107 @@ SELECT
     last_seen,
     total_count
 FROM nanosiem.ip_prevalence_agg;
+
+-- ── Prevalence finalized-host_count tables (NAN-1732, P2-D phase 1) ──────────
+-- Pre-finalized per-entity masked host_count so the dict + rare/new explorer can
+-- point-look-up instead of re-aggregating the 80M-row summary on every miss
+-- (Saturn: 254 GiB / 3h). PHASE 1 = tables + maintenance MVs only; the dict and
+-- explorer still read the summary until phase 2 cuts them over. See migration
+-- clickhouse/160_prevalence_finalized_host_count.sql for the full rationale
+-- (keep-local ReplacingMergeTree, bounded-recency APPEND, two-step GLOBAL IN
+-- cross-shard keying, DICT_REFRESH_MV_BASES repoint). Kept byte-identical to 160.
+CREATE TABLE IF NOT EXISTS nanosiem.hash_prevalence_final
+(
+    file_hash String,
+    host_count UInt16,
+    first_seen DateTime64(6),
+    last_seen DateTime64(6),
+    total_occurrences UInt64,
+    version DateTime64(6)
+)
+ENGINE = ReplacingMergeTree(version) /* nano:keep-local-engine */
+ORDER BY file_hash
+-- 30d retention parity with *_prevalence_summary: inactive entities expire in
+-- sync; the refresh resets last_seen (hence the TTL) for active ones.
+TTL toDateTime(last_seen) + toIntervalDay(30);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.hash_prevalence_final_refresh
+REFRESH EVERY 10 MINUTE APPEND TO nanosiem.hash_prevalence_final AS
+SELECT file_hash,
+       if(uniqMerge(host_count) >= 1000, toUInt16(9999), toUInt16(least(9998, uniqMerge(host_count)))) AS host_count,
+       min(first_seen) AS first_seen,
+       max(last_seen) AS last_seen,
+       toUInt64(sum(total_count)) AS total_occurrences,
+       now64(6) AS version
+FROM nanosiem.hash_prevalence_summary
+WHERE file_hash GLOBAL IN (
+    SELECT file_hash FROM nanosiem.hash_prevalence_summary
+    WHERE last_seen >= now64(6) - INTERVAL 40 MINUTE
+)
+GROUP BY file_hash
+SETTINGS max_memory_usage = 536870912, max_bytes_before_external_group_by = 268435456, max_threads = 2;
+
+CREATE TABLE IF NOT EXISTS nanosiem.domain_prevalence_final
+(
+    domain String,
+    host_count UInt16,
+    first_seen DateTime64(6),
+    last_seen DateTime64(6),
+    total_occurrences UInt64,
+    version DateTime64(6)
+)
+ENGINE = ReplacingMergeTree(version) /* nano:keep-local-engine */
+ORDER BY domain
+-- 30d retention parity with *_prevalence_summary: inactive entities expire in
+-- sync; the refresh resets last_seen (hence the TTL) for active ones.
+TTL toDateTime(last_seen) + toIntervalDay(30);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.domain_prevalence_final_refresh
+REFRESH EVERY 10 MINUTE APPEND TO nanosiem.domain_prevalence_final AS
+SELECT domain,
+       if(uniqMerge(source_host_count) >= 1000, toUInt16(9999), toUInt16(least(9998, uniqMerge(source_host_count)))) AS host_count,
+       min(first_seen) AS first_seen,
+       max(last_seen) AS last_seen,
+       toUInt64(sum(total_count)) AS total_occurrences,
+       now64(6) AS version
+FROM nanosiem.domain_prevalence_summary
+WHERE domain GLOBAL IN (
+    SELECT domain FROM nanosiem.domain_prevalence_summary
+    WHERE last_seen >= now64(6) - INTERVAL 40 MINUTE
+)
+GROUP BY domain
+SETTINGS max_memory_usage = 536870912, max_bytes_before_external_group_by = 268435456, max_threads = 2;
+
+CREATE TABLE IF NOT EXISTS nanosiem.ip_prevalence_final
+(
+    ip String,
+    host_count UInt16,
+    first_seen DateTime64(6),
+    last_seen DateTime64(6),
+    total_occurrences UInt64,
+    version DateTime64(6)
+)
+ENGINE = ReplacingMergeTree(version) /* nano:keep-local-engine */
+ORDER BY ip
+-- 30d retention parity with *_prevalence_summary: inactive entities expire in
+-- sync; the refresh resets last_seen (hence the TTL) for active ones.
+TTL toDateTime(last_seen) + toIntervalDay(30);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS nanosiem.ip_prevalence_final_refresh
+REFRESH EVERY 10 MINUTE APPEND TO nanosiem.ip_prevalence_final AS
+SELECT ip,
+       if(uniqMerge(source_host_count) >= 1000, toUInt16(9999), toUInt16(least(9998, uniqMerge(source_host_count)))) AS host_count,
+       min(first_seen) AS first_seen,
+       max(last_seen) AS last_seen,
+       toUInt64(sum(total_count)) AS total_occurrences,
+       now64(6) AS version
+FROM nanosiem.ip_prevalence_summary
+WHERE is_private = 0 AND ip GLOBAL IN (
+    SELECT ip FROM nanosiem.ip_prevalence_summary
+    WHERE is_private = 0 AND last_seen >= now64(6) - INTERVAL 40 MINUTE
+)
+GROUP BY ip
+SETTINGS max_memory_usage = 536870912, max_bytes_before_external_group_by = 268435456, max_threads = 2;
 
 -- Per-source_type 5-minute log telemetry MV (NAN-733).
 -- Lowercases source_type at write time so callers don't have to.

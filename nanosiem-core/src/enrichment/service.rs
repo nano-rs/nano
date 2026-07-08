@@ -18,6 +18,7 @@ use tracing::{info, instrument, warn};
 
 use super::repository::{EnrichmentRepository, EnrichmentRepositoryError};
 use super::types::*;
+use crate::db::dual_pool::{on_cluster_clause, TableNames};
 use crate::inputlookup::SsrfValidator;
 
 #[derive(Error, Debug)]
@@ -535,6 +536,13 @@ impl EnrichmentService {
             .with_validation(false)
             .with_option("async_insert", "0")
             .with_option("wait_end_of_query", "1");
+        // Writes the LOCAL name (a Distributed table can't be a native-insert
+        // target). NAN-1728: ip_enrichments is a per-shard table with an additive
+        // `_distributed` wrapper; the bulk load lands on whichever shard the LB
+        // pinned this connection to. The write path is deliberately left
+        // per-shard (NAN-1728 M-6 / dict-source completeness is handled on the
+        // foundation side); reads route through the wrapper. Single-node: the one
+        // shard holds everything.
         let mut insert = writer
             .insert::<IpEnrichRow>("nanosiem.ip_enrichments")
             .await?;
@@ -638,14 +646,20 @@ impl EnrichmentService {
             //     Replicated insert dedup kept the OLD (pre-run_ms-stamped)
             //     rows — which this delete then removed. Explicit stamps make
             //     retry blocks distinct; dedup can't resurrect stale stamps.
-            ch.query(
-                "ALTER TABLE nanosiem.ip_enrichments \
+            // ON CLUSTER so the stale-generation purge runs on every shard
+            // (ip_enrichments is a per-shard table, NAN-1728; a bare mutation only
+            // lands on the connected shard, leaving prior generations live on the
+            // other shards). Empty clause on single-node → identical DDL.
+            let purge_sql = format!(
+                "ALTER TABLE nanosiem.ip_enrichments{on_cluster} \
                  DELETE WHERE source_id = ? AND updated_at < fromUnixTimestamp64Milli(toInt64(?))",
-            )
-            .bind(source_id)
-            .bind(run_ms)
-            .execute()
-            .await?;
+                on_cluster = on_cluster_clause()
+            );
+            ch.query(&purge_sql)
+                .bind(source_id)
+                .bind(run_ms)
+                .execute()
+                .await?;
             info!(source_id, "Stale IP enrichment CIDRs removed (lightweight delete)");
         } else {
             warn!(
@@ -673,15 +687,26 @@ impl EnrichmentService {
     ) -> Result<(), EnrichmentError> {
         let ch = self.ch()?;
         let run_ms = chrono::Utc::now().timestamp_millis() as u64;
-        ch.query(
+        // NAN-1728: ip_enrichments is a per-shard table with an additive
+        // `_distributed` wrapper (in DISTRIBUTED_TABLES). The SELECT source must
+        // read ALL shards so we re-stamp a tombstone for every live CIDR the
+        // source owns cluster-wide, not just those on the connected shard — so it
+        // routes through the wrapper (`.read()` returns the local name on
+        // single-node → byte-identical). The INSERT TARGET stays the LOCAL name
+        // (a Distributed table can't be an INSERT target here and the write path
+        // is deliberately left per-shard, NAN-1728 M-6). `INSERT … SELECT` takes
+        // no ON CLUSTER; the ALTER-DELETE purge path is what gets
+        // `on_cluster_clause()`.
+        let src = TableNames::new(!on_cluster_clause().is_empty()).read("ip_enrichments");
+        ch.query(&format!(
             "INSERT INTO nanosiem.ip_enrichments \
              (network, source_id, country, country_code, continent, continent_code, \
               asn, as_name, as_domain, updated_at, deleted) \
              SELECT network, source_id, country, country_code, continent, continent_code, \
               asn, as_name, as_domain, ?, 1 \
-             FROM nanosiem.ip_enrichments \
+             FROM {src} \
              WHERE source_id = ? AND deleted = 0",
-        )
+        ))
         .bind(run_ms)
         .bind(source_id)
         .execute()
@@ -828,8 +853,19 @@ impl EnrichmentService {
 
         let total_ip_records = match self.ch() {
             Ok(ch) => {
+                // NAN-1728: ip_enrichments is per-shard with an additive
+                // `_distributed` wrapper. Route the read through the wrapper so
+                // the count spans all shards, not just the connected one;
+                // `.read()` returns the local name on single-node → byte-identical.
+                // `count(DISTINCT network)` collapses cross-shard duplicates of a
+                // CIDR intrinsically, so no version-collapse is needed for this
+                // display-only stat.
+                let table =
+                    TableNames::new(!on_cluster_clause().is_empty()).read("ip_enrichments");
                 let count: u64 = ch
-                    .query("SELECT count(DISTINCT network) FROM nanosiem.ip_enrichments WHERE deleted = 0")
+                    .query(&format!(
+                        "SELECT count(DISTINCT network) FROM {table} WHERE deleted = 0"
+                    ))
                     .fetch_one::<u64>()
                     .await?;
                 count as i64

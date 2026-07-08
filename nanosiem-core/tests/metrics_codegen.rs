@@ -160,3 +160,28 @@ fn metrics_service_alias_canonicalizes() {
     assert!(sql.contains("GROUP BY service_name"), "{sql}");
     assert!(!sql.contains("cloud_service"), "{sql}");
 }
+
+// --- O45 (NAN-1733): the audit-view gate is a logs-only concern -------------
+
+#[test]
+fn metrics_drop_the_logs_audit_exclusion() {
+    // `enforce_non_audit_query` appends `… AND source_type != "audit"` for users
+    // without `audit:view`. On metrics there is no `source_type` column — it would
+    // resolve to a per-row attributes-Map lookup that hides any data point a tenant
+    // tagged `source_type=audit`. It must be dropped for `Dataset::Metrics`.
+    for q in [r#"metric_name="x""#, r#"metric_name="x" | stats avg(value) by service"#] {
+        let enforced = nanosiem_core::search::query_processing::enforce_non_audit_query(q)
+            .unwrap_or_else(|e| panic!("enforce {q}: {e}"));
+        let sql = ClickHouseSqlGenerator::new()
+            .with_dataset(Dataset::Metrics)
+            .generate(
+                &parse_query(&enforced).unwrap_or_else(|e| panic!("parse {enforced}: {e}")),
+                &tr(),
+            )
+            .unwrap_or_else(|e| panic!("generate {enforced}: {e}"));
+        assert!(
+            !sql.contains("!= 'audit'") && !sql.contains("'audit'"),
+            "metrics must not carry the audit gate for `{q}`: {sql}"
+        );
+    }
+}

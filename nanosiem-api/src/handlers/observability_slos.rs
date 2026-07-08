@@ -30,7 +30,14 @@ use nanosiem_core::typeid::TypeIdParam;
 
 const NAME_MAX_LEN: usize = 200;
 const SERVICE_MAX_LEN: usize = 200;
-const WINDOW_DAYS_MAX: i32 = 90;
+// O5 (NAN-1721): the window cap ties `window_days` to the 30-day TTL on
+// `otel_spans` (clickhouse/138) and the RED rollups (clickhouse/143). A window
+// longer than retention would compute attainment over TTL-dropped spans and
+// silently overstate it — old breaches age out and the budget resets toward
+// ~100% while the window still claims to cover them. We enforce ≤ 30 here in the
+// handler rather than in the shipped PG migration 209 CHECK (which still permits
+// ≤ 90 and must not be modified).
+const WINDOW_DAYS_MAX: i32 = 30;
 
 /// An SLO with its live attainment merged in. Flattens the stored
 /// [`SloDefinition`] and adds the computed fields.
@@ -49,7 +56,7 @@ pub struct Slo {
     /// window. `1.0` = on track to exactly exhaust the budget at window end;
     /// `>1` = burning too fast. `0` when there is budget to spare / no errors.
     pub burn_rate: f64,
-    /// Rollup status: `ok` | `at_risk` | `breaching`.
+    /// Rollup status: `ok` | `at_risk` | `breaching` | `no_data`.
     pub status: &'static str,
 }
 
@@ -68,7 +75,7 @@ pub struct SloRequest {
     pub sli_kind: SloSliKind,
     /// Objective as a fraction in (0,1], e.g. 0.995.
     pub target: f64,
-    /// Rolling evaluation window in days (1..=90).
+    /// Rolling evaluation window in days (1..=30, capped at span retention).
     pub window_days: i32,
     /// Required when `sli_kind = latency`: per-span duration threshold (ms).
     #[serde(default)]
@@ -106,7 +113,7 @@ impl SloRequest {
         }
         if !(1..=WINDOW_DAYS_MAX).contains(&self.window_days) {
             return Err(ApiError::BadRequest(format!(
-                "window_days must be in 1..={WINDOW_DAYS_MAX}"
+                "window_days must be in 1..={WINDOW_DAYS_MAX} (capped at the {WINDOW_DAYS_MAX}-day span retention)"
             )));
         }
         let threshold = match self.sli_kind {
@@ -143,7 +150,7 @@ async fn enrich(state: &AppState, def: SloDefinition) -> Result<Slo, ApiError> {
     let begin = now - chrono::Duration::days(def.window_days as i64);
     let time_range = TimeRange::new(begin, now);
 
-    let (current, _total) = state
+    let (current, _total, no_data) = state
         .search_service
         .observability_slo_compute(
             &def.service,
@@ -166,7 +173,15 @@ async fn enrich(state: &AppState, def: SloDefinition) -> Result<Slo, ApiError> {
     // track to exhaust by window end).
     let burn_rate = consumed / allowed;
 
-    let status = if current < def.target {
+    // O17 (NAN-1721): a zero-traffic window computes `current = 1.0` (no spans →
+    // nothing failed), which would otherwise read as a perfectly-met SLO. A
+    // hard-down service or a stopped collector produces exactly this, and the
+    // rolling window sliding past old errors makes the SLO *improve* while the
+    // service is dead. Surface `no_data` so the API does not report ok/attained;
+    // the FE renders it neutrally and the scheduler does not alert on it.
+    let status = if no_data {
+        "no_data"
+    } else if current < def.target {
         "breaching"
     } else if budget_remaining_pct < 25.0 {
         "at_risk"

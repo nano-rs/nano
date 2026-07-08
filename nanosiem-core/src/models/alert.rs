@@ -120,6 +120,14 @@ pub struct NewAlert {
     /// Optional event hash for deduplication
     #[serde(default)]
     pub event_hash: Option<String>,
+    /// A13 (NAN-1752): the TRUE number of events this alert matched, persisted
+    /// to `alerts.matched_event_count`. `matched_events` only stores a capped
+    /// SAMPLE (the newest `max_events_per_alert`) for grouped alerts, so its
+    /// `jsonb_array_length` undercounts a large match. Set to the real match
+    /// count by the detection paths; `None` for producers that don't know it
+    /// (the read side then falls back to the stored sample size).
+    #[serde(default)]
+    pub match_count: Option<i64>,
 }
 
 /// Input for acknowledging an alert

@@ -66,8 +66,12 @@ pub struct SecuritySignal {
 pub struct ServiceSecuritySignalsResponse {
     /// Number of distinct entities (src_ip + host) resolved for the service.
     pub host_count: usize,
-    /// Number of security signals returned (bounded by `limit`).
+    /// Number of security signals in the returned sample (bounded by `limit`).
     pub signal_count: usize,
+    /// True total number of matching signals in the range (unbounded count),
+    /// which may exceed `signal_count` when the sample is `limit`-capped. Drives
+    /// the "+N more in range" affordance (O54).
+    pub signal_total: u64,
     /// The bounded signal sample, most recent first.
     pub signals: Vec<serde_json::Value>,
 }
@@ -119,7 +123,7 @@ pub async fn get_service_security_signals(
     }
     let time_range = TimeRange::new(begin, end);
 
-    let (host_count, signal_count, signals) = state
+    let (host_count, signal_count, signal_total, signals) = state
         .search_service
         .observability_service_security_signals(&service, &time_range, params.limit)
         .await
@@ -131,6 +135,7 @@ pub async fn get_service_security_signals(
     Ok(Json(ServiceSecuritySignalsResponse {
         host_count,
         signal_count,
+        signal_total,
         signals,
     }))
 }

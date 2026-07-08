@@ -36,6 +36,7 @@ use super::postgres_repository::PostgresLookupRepository;
 use super::repository::{LookupRepositoryError, LookupStore, RuleReferenceRow};
 use super::snowflake;
 use super::types::*;
+use crate::db::dual_pool::{on_cluster_clause, TableNames};
 use crate::upload::ColumnType;
 
 /// Max value tuples per INSERT batch (mirrors identity's CH chunking).
@@ -174,6 +175,14 @@ impl ClickHouseLookupRepository {
     /// `key_filter`, when present, is appended as an additional outer predicate
     /// (e.g. `key_lc IN ('a','b')` or `key_raw IN ('A','B')`).
     pub(crate) fn deduped_read_sql(select_cols: &str, key_filter: Option<&str>) -> String {
+        // NAN-1728: `lookup_rows` is a per-shard ReplacingMergeTree with an
+        // additive `_distributed` wrapper (in DISTRIBUTED_TABLES). Reads route
+        // through the wrapper so rows uploaded to any shard are visible; the
+        // `argMax(…, version) GROUP BY row_id` below already collapses cross-shard
+        // duplicates of a `row_id` to its latest version, so the wrapper read is
+        // correct. On single-node `.read()` returns the local name → the emitted
+        // SQL is byte-identical to the pre-NAN-1728 form.
+        let table = TableNames::new(!on_cluster_clause().is_empty()).read("lookup_rows");
         let mut sql = format!(
             "SELECT {select_cols} FROM (\
              SELECT row_id, \
@@ -181,7 +190,7 @@ impl ClickHouseLookupRepository {
              argMax(key_lc, version) AS key_lc, \
              argMax(cols_json, version) AS cols_json, \
              argMax(deleted, version) AS d \
-             FROM nanosiem.lookup_rows \
+             FROM {table} \
              WHERE lookup_table_name = ? \
              GROUP BY row_id) \
              WHERE d = 0"
@@ -387,6 +396,12 @@ impl ClickHouseLookupRepository {
         for chunk in rows.chunks(CH_INSERT_CHUNK) {
             let tuple = "(?, ?, ?, ?, ?, ?, ?)";
             let placeholders = vec![tuple; chunk.len()].join(", ");
+            // INSERT targets the LOCAL name (a Distributed table isn't the insert
+            // target here). NAN-1728: lookup_rows is a per-shard table with an
+            // additive `_distributed` wrapper; a write lands on whichever shard
+            // the connection hit. Reads route through the wrapper + argMax dedup,
+            // so rows are visible cluster-wide; the DELETE/purge mutations run ON
+            // CLUSTER. Single-node: the one shard holds everything.
             let sql = format!(
                 "INSERT INTO nanosiem.lookup_rows \
                  (lookup_table_name, row_id, key_raw, key_lc, cols_json, version, deleted) \
@@ -512,8 +527,16 @@ impl LookupStore for ClickHouseLookupRepository {
             ));
         }
         // Async mutation; the registry delete is handled by the service.
+        // ON CLUSTER so the purge runs on every shard (lookup_rows is a per-shard
+        // table, NAN-1728; without it a mutation only lands on the connected
+        // node, leaving orphaned rows on the others).
+        // `on_cluster_clause()` is empty on single-node → byte-identical DDL.
+        let sql = format!(
+            "ALTER TABLE nanosiem.lookup_rows{on_cluster} DELETE WHERE lookup_table_name = ?",
+            on_cluster = on_cluster_clause()
+        );
         self.ch
-            .query("ALTER TABLE nanosiem.lookup_rows DELETE WHERE lookup_table_name = ?")
+            .query(&sql)
             .bind(table_name)
             .execute()
             .await
@@ -570,11 +593,15 @@ impl LookupStore for ClickHouseLookupRepository {
         self.insert_tuples(old_physical, &rekeyed).await?;
 
         // Drop the prior live generation (everything older than this swap).
+        // ON CLUSTER so the prior generation is purged on every shard (per-shard
+        // table, NAN-1728); empty clause on single-node → identical DDL.
+        let drop_sql = format!(
+            "ALTER TABLE nanosiem.lookup_rows{on_cluster} DELETE \
+             WHERE lookup_table_name = ? AND version < ?",
+            on_cluster = on_cluster_clause()
+        );
         self.ch
-            .query(
-                "ALTER TABLE nanosiem.lookup_rows DELETE \
-                 WHERE lookup_table_name = ? AND version < ?",
-            )
+            .query(&drop_sql)
             .bind(old_physical)
             .bind(swap_version)
             .execute()
@@ -634,6 +661,10 @@ impl LookupStore for ClickHouseLookupRepository {
     async fn get_table_size(&self, table_name: &str) -> Result<i64, LookupRepositoryError> {
         // Display-only estimate: apportion lookup_rows' on-disk bytes by this
         // table's share of the registry row_count. Never a full scan per edit.
+        // TODO(NAN-1728): system.parts is read on the connected node only, so on
+        // a cluster this reflects ONE shard's slice of lookup_rows (per-shard
+        // table). Display-only, so left node-local for now; a cluster-accurate
+        // figure would need `clusterAllReplicas(system.parts)` summed by shard.
         let active_bytes: i64 = {
             let mut cursor = self
                 .ch
