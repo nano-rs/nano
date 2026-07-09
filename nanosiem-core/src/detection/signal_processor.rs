@@ -1828,6 +1828,8 @@ mod tests {
             claimed_at: None,
             playbook_selector_mode: "none".to_string(),
             playbook_id: None,
+            source_path: None,
+            source_repo_url: None,
         }
     }
 

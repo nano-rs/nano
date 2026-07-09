@@ -15,9 +15,7 @@ use crate::middleware::{AuthContext, check_permission};
 use crate::state::AppState;
 use nanosiem_core::Query as ParsedQuery;
 use nanosiem_core::auth::permissions;
-use nanosiem_core::prevalence::{
-    PrevalenceError, PrevalenceScatterData, PrevalenceSettings, TimeWindow,
-};
+use nanosiem_core::prevalence::{PrevalenceScatterData, PrevalenceSettings, TimeWindow};
 use nanosiem_core::query::{ClickHouseSqlGenerator, SearchExpr};
 
 use super::settings::prevalence_settings_error_to_response;
@@ -97,8 +95,6 @@ pub async fn get_rare_artifacts(
                 has_more,
             }))
         }
-        // NAN-1729 (P2-B): a too-wide IP window is a client error, not a 500.
-        Err(PrevalenceError::WindowNotViable(msg)) => Err((StatusCode::BAD_REQUEST, msg)),
         Err(e) => {
             error!("Failed to get rare artifacts: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
@@ -180,8 +176,6 @@ pub async fn get_new_artifacts(
                 has_more,
             }))
         }
-        // NAN-1729 (P2-B): a too-wide IP window is a client error, not a 500.
-        Err(PrevalenceError::WindowNotViable(msg)) => Err((StatusCode::BAD_REQUEST, msg)),
         Err(e) => {
             error!("Failed to get new artifacts: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))

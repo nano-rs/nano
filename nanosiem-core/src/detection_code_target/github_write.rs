@@ -79,6 +79,15 @@ struct PullResponse {
     number: i64,
 }
 #[derive(Debug, Deserialize)]
+struct CodeSearchItem {
+    path: String,
+}
+#[derive(Debug, Deserialize)]
+struct CodeSearchResponse {
+    #[serde(default)]
+    items: Vec<CodeSearchItem>,
+}
+#[derive(Debug, Deserialize)]
 struct RepoPermissions {
     #[serde(default)]
     push: bool,
@@ -251,6 +260,72 @@ impl GitHubWriteClient {
             });
         }
         Ok(Some(text))
+    }
+
+    /// Best-effort: locate the file carrying `rule_id` in its frontmatter by
+    /// GitHub code search, returning its repo path. Used as the second rung of
+    /// the push-target matching cascade (after provenance `source_path`, before
+    /// the name template) so a rule nano previously wrote — or one the customer
+    /// stamped with the id — is found even if it was moved/renamed.
+    ///
+    /// Caveats worth knowing at the call site: code search only indexes the
+    /// **default branch** and lags commits, and returns nothing when the id was
+    /// never written to a file. Treat `Ok(None)` and errors alike as "not found"
+    /// and fall through to the template — this is an optimization, not a
+    /// correctness guarantee (that's what `source_path` is for).
+    pub async fn find_file_by_rule_id(
+        &self,
+        repo_url: &str,
+        rule_id: &str,
+    ) -> Result<Option<String>, GitHubWriteError> {
+        Self::validate_endpoint(GITHUB_API).await?;
+        let (owner, repo) = Self::parse_github_repo(repo_url)?;
+        // Scope the search to this repo; quote the id so the hyphenated UUID is
+        // matched as a unit rather than tokenized.
+        let q = format!("\"{rule_id}\" repo:{owner}/{repo}");
+        let url = reqwest::Url::parse_with_params(
+            &format!("{GITHUB_API}/search/code"),
+            &[("q", q.as_str()), ("per_page", "1")],
+        )
+        .map_err(|e| GitHubWriteError::InvalidUrl(e.to_string()))?;
+        let resp = self.auth(self.http.get(url)).send().await?;
+        // 422 (repo not indexed yet) / 403 (search rate limit) are expected
+        // transient misses — not push-blocking. Surface only as "not found".
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+        let body: CodeSearchResponse = match Self::parse(resp).await {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        Ok(body.items.into_iter().next().map(|i| i.path))
+    }
+
+    /// Best-effort: add `labels` to an already-opened PR (PRs are issues). Never
+    /// push-blocking — a repo without the label, or a token lacking issues:write,
+    /// just means the PR ships unlabeled; the `nano-rule-id` body marker is the
+    /// reliable machine link.
+    pub async fn add_labels(
+        &self,
+        repo_url: &str,
+        pr_number: i64,
+        labels: &[&str],
+    ) -> Result<(), GitHubWriteError> {
+        Self::validate_endpoint(GITHUB_API).await?;
+        let (owner, repo) = Self::parse_github_repo(repo_url)?;
+        let url = format!("{GITHUB_API}/repos/{owner}/{repo}/issues/{pr_number}/labels");
+        let body = json!({ "labels": labels });
+        let resp = self.auth(self.http.post(&url)).json(&body).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            let message = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
+                .unwrap_or_else(|| text.chars().take(200).collect());
+            return Err(GitHubWriteError::Api { status, message });
+        }
+        Ok(())
     }
 
     /// Create `head_branch` off `base_branch`, commit `file_content` at

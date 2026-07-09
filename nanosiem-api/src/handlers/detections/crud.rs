@@ -747,6 +747,8 @@ mod tests {
             claimed_at: None,
             playbook_selector_mode: "none".into(),
             playbook_id: None,
+            source_path: None,
+            source_repo_url: None,
         }
     }
 
@@ -931,6 +933,8 @@ mod tests {
             alert_mode: None,
             playbook_selector_mode: None,
             playbook_id: None,
+            source_path: None,
+            source_repo_url: None,
         }
     }
 

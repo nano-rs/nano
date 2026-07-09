@@ -80,6 +80,8 @@ fn new_realtime_rule(name: &str, source: &str, alert_mode: AlertMode) -> NewDete
         alert_mode: Some(alert_mode),
         playbook_selector_mode: None,
         playbook_id: None,
+        source_path: None,
+        source_repo_url: None,
     }
 }
 

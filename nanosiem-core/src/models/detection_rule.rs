@@ -235,6 +235,18 @@ pub struct DetectionRule {
     #[serde(default, with = "typeid::playbook::opt")]
     #[schema(value_type = Option<String>)]
     pub playbook_id: Option<Uuid>,
+    /// Path of this rule's file within its detection-as-code repo (NULL =
+    /// nano-native, not git-managed). When set, AI tuning PRs (NAN-1745) target
+    /// this exact file instead of a name-templated path — so an existing rule in
+    /// the customer's repo is updated in place rather than duplicated (NAN-1764).
+    #[sqlx(default)]
+    #[serde(default)]
+    pub source_path: Option<String>,
+    /// Repo URL this rule was imported from (NULL = nano-native). Informational
+    /// in v1 — the push target is tenant-wide (NAN-1764).
+    #[sqlx(default)]
+    #[serde(default)]
+    pub source_repo_url: Option<String>,
 }
 
 /// Input for creating a new detection rule
@@ -298,6 +310,13 @@ pub struct NewDetectionRule {
     #[serde(default, with = "typeid::playbook::opt")]
     #[schema(value_type = Option<String>)]
     pub playbook_id: Option<Uuid>,
+    /// Detection-as-Code provenance: path of this rule's file within its DaC repo.
+    /// Set by the DaC pipeline on import so tuning PRs target the real file (NAN-1764).
+    #[serde(default)]
+    pub source_path: Option<String>,
+    /// Detection-as-Code provenance: repo URL this rule was imported from (NAN-1764).
+    #[serde(default)]
+    pub source_repo_url: Option<String>,
 }
 
 /// Input for updating a detection rule
@@ -365,6 +384,13 @@ pub struct UpdateDetectionRule {
     #[serde(default, with = "typeid::playbook::opt")]
     #[schema(value_type = Option<String>)]
     pub playbook_id: Option<Uuid>,
+    /// Detection-as-Code provenance: path of this rule's file within its DaC repo.
+    /// Preserved across normal edits (COALESCE); only a re-import updates it (NAN-1764).
+    #[serde(default)]
+    pub source_path: Option<String>,
+    /// Detection-as-Code provenance: repo URL this rule was imported from (NAN-1764).
+    #[serde(default)]
+    pub source_repo_url: Option<String>,
 }
 
 /// Validation error for detection rule risk fields
@@ -803,6 +829,8 @@ mod tests {
             alert_mode: None,
             playbook_selector_mode: None,
             playbook_id: None,
+            source_path: None,
+            source_repo_url: None,
         }
     }
 

@@ -18,8 +18,8 @@ impl DetectionRuleRepository {
     ) -> Result<DetectionRule, DetectionRuleRepositoryError> {
         let result = sqlx::query_as::<_, DetectionRule>(
             r#"
-            INSERT INTO detection_rules (name, description, query, severity, mitre_tactics, mitre_techniques, schedule_cron, mode, narrative, reference_url, author, tags, ai_generated, realtime_enabled, risk_score, risk_entity_field, risk_modifiers, detection_mode, lookback_minutes, auto_tuning_enabled, auto_tuning_min_confidence, auto_tuning_critical, ai_triage_hints, folder, case_visibility, alert_mode, case_assigned_group, playbook_selector_mode, playbook_id, dataset)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
+            INSERT INTO detection_rules (name, description, query, severity, mitre_tactics, mitre_techniques, schedule_cron, mode, narrative, reference_url, author, tags, ai_generated, realtime_enabled, risk_score, risk_entity_field, risk_modifiers, detection_mode, lookback_minutes, auto_tuning_enabled, auto_tuning_min_confidence, auto_tuning_critical, ai_triage_hints, folder, case_visibility, alert_mode, case_assigned_group, playbook_selector_mode, playbook_id, dataset, source_path, source_repo_url)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)
             RETURNING *
             "#,
         )
@@ -56,6 +56,10 @@ impl DetectionRuleRepository {
         .bind(rule.playbook_selector_mode.as_deref().unwrap_or("none"))
         .bind(rule.playbook_id)
         .bind(&rule.dataset)
+        // NAN-1764: DaC provenance. NULL for nano-native rules; set by the DaC
+        // pipeline on import so tuning PRs can target the real file.
+        .bind(&rule.source_path)
+        .bind(&rule.source_repo_url)
         .fetch_one(&self.pool)
         .await?;
 
@@ -150,6 +154,11 @@ impl DetectionRuleRepository {
                     ELSE NULL
                 END,
                 dataset = COALESCE($34, dataset),
+                -- NAN-1764: provenance is set-once at import. COALESCE preserves it
+                -- across normal edits (a UI/tuning update never sends it), so only
+                -- a deliberate re-import that supplies a new value updates it.
+                source_path = COALESCE($35, source_path),
+                source_repo_url = COALESCE($36, source_repo_url),
                 updated_at = NOW()
             WHERE id = $1 AND updated_at = $31
             RETURNING *
@@ -194,6 +203,8 @@ impl DetectionRuleRepository {
         .bind(&update.playbook_selector_mode) // $32
         .bind(&update.playbook_id) // $33
         .bind(&update.dataset) // $34
+        .bind(&update.source_path) // $35
+        .bind(&update.source_repo_url) // $36
         .fetch_optional(&self.pool)
         .await?
         .ok_or(DetectionRuleRepositoryError::ConcurrentModification(id))?;

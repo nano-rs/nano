@@ -31,6 +31,12 @@ pub enum SerializeError {
 /// clones are cheap.
 #[derive(Serialize)]
 struct NplFrontmatterOut {
+    /// Stable nano rule id (raw UUID). Emitted first so the file carries a
+    /// machine link back to the rule even before provenance is recorded: a later
+    /// push with no `source_path` can locate this file by searching the repo for
+    /// the id, and it survives file moves/renames (NAN-1764). `RawNplFrontmatter`
+    /// ignores unknown keys, so this round-trips cleanly through pull-sync.
+    id: String,
     title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
@@ -82,6 +88,7 @@ fn hints_are_empty(h: &AiTriageHints) -> bool {
 pub fn serialize_rule_to_npl(rule: &DetectionRule, query: &str) -> Result<String, SerializeError> {
     let hints = &rule.ai_triage_hints.0;
     let fm = NplFrontmatterOut {
+        id: rule.id.to_string(),
         title: rule.name.clone(),
         description: rule.description.clone(),
         author: rule.author.clone(),

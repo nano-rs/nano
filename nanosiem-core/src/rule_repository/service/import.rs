@@ -279,6 +279,11 @@ impl RuleRepositoryService {
             // Repository-imported rules default to the logs dataset (NAN-1561);
             // spans/metrics rules are authored via the editor today.
             dataset: None,
+            // Curated pull-feed rules carry NO DaC provenance (NAN-1764): this is
+            // nano's outbound curated repo, not the customer's inbound DaC push
+            // target, so a tuning PR must not be steered at a curated-feed path.
+            source_path: None,
+            source_repo_url: None,
         };
 
         // Check if a detection rule with this name already exists from this repo.

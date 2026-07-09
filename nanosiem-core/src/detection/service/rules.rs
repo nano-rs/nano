@@ -398,6 +398,9 @@ impl DetectionService {
                     .or(Some(existing_rule.playbook_selector_mode.clone())),
                 playbook_id: update.playbook_id.or(existing_rule.playbook_id),
                 dataset: update.dataset.clone().or(existing_rule.dataset.clone()),
+                // Provenance doesn't affect realtime validation; carry it faithfully.
+                source_path: existing_rule.source_path.clone(),
+                source_repo_url: existing_rule.source_repo_url.clone(),
             };
             self.validate_realtime_rule(&validation_rule)?;
         }

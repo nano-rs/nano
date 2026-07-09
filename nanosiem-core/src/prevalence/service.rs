@@ -13,7 +13,7 @@ use clickhouse::Client as ClickHouseClient;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, instrument};
 
 use super::repository::{DictArtifactKind, PrevalenceRepository};
 use super::types::*;
@@ -668,20 +668,6 @@ impl PrevalenceService {
         Ok(results)
     }
 
-    /// The widest window an IP rarity/newness lookup can run without exhausting
-    /// shared-ClickHouse memory (NAN-1729, P2-B): the `uniqMerge` GROUP BY
-    /// aggregates every in-window IP entity, so 24h is fine, 7d is ~47 s / 2 GiB,
-    /// and 30d OOMs on Saturn. Lifts once the pre-finalized IP table (shared with
-    /// P2-D) removes the per-request aggregation.
-    const IP_RARITY_MAX_WINDOW_HOURS: i64 = 7 * 24;
-
-    /// Actionable message returned (as HTTP 400) when an explicit IP lookup
-    /// exceeds `IP_RARITY_MAX_WINDOW_HOURS`.
-    const IP_RARITY_WINDOW_MSG: &'static str =
-        "Rare/new IP lookups are limited to a 7-day window for now — a wider window \
-         aggregates every observed IP and exhausts memory. Use 24h or 7d, or filter \
-         to hashes or domains.";
-
     /// Get list of rare artifacts (below threshold)
     #[instrument(skip(self))]
     pub async fn get_rare_artifacts(
@@ -728,36 +714,24 @@ impl PrevalenceService {
             }
         }
 
-        // Get rare IPs if requested or no filter
+        // Get rare IPs if requested or no filter. NAN-1762 lifted the NAN-1729
+        // <=7d IP window gate: `get_rare_ips` now reads the pre-finalized
+        // `ip_prevalence_final` via `argMax` (no `uniqMerge`) under a
+        // memory-bounded GROUP BY, so 30d is viable without the shared-CH OOM
+        // the gate guarded against.
         let include_ips = artifact_type.map_or(true, |t| t.is_ip());
         if include_ips && config.enable_ip_tracking {
-            // NAN-1729 (P2-B): gate the IP aggregation to a viable window. Explicit
-            // `type=ip` past the bound → actionable 400 (WindowNotViable) instead of
-            // a shared-CH OOM / 300s slog; the all-types view degrades to
-            // hash/domain (the IP path is the only non-viable one).
-            if time_window.hours() <= Self::IP_RARITY_MAX_WINDOW_HOURS {
-                let ip_rows = self
-                    .repository
-                    .get_rare_ips(rarity_threshold, time_window, limit)
-                    .await
-                    .map_err(PrevalenceError::ClickHouse)?;
+            let ip_rows = self
+                .repository
+                .get_rare_ips(rarity_threshold, time_window, limit)
+                .await
+                .map_err(PrevalenceError::ClickHouse)?;
 
-                for row in ip_rows {
-                    results.push(PrevalenceRepository::ip_row_to_prevalence_data(
-                        row,
-                        rarity_threshold,
-                    ));
-                }
-            } else if artifact_type.is_some() {
-                return Err(PrevalenceError::WindowNotViable(
-                    Self::IP_RARITY_WINDOW_MSG.to_string(),
+            for row in ip_rows {
+                results.push(PrevalenceRepository::ip_row_to_prevalence_data(
+                    row,
+                    rarity_threshold,
                 ));
-            } else {
-                warn!(
-                    window_hours = time_window.hours(),
-                    "prevalence rare: skipping IP path for non-viable window \
-                     (all-types view degraded to hash/domain)"
-                );
             }
         }
 
@@ -814,37 +788,23 @@ impl PrevalenceService {
             }
         }
 
-        // Get new IPs if requested or no filter
+        // Get new IPs if requested or no filter. NAN-1762 lifted the NAN-1729
+        // <=7d IP window gate — `get_new_ips` reads the pre-finalized
+        // `ip_prevalence_final` via `argMax` under a memory-bounded GROUP BY, so
+        // an arbitrarily-old `since` (up to the 30d TTL horizon) is viable.
         let include_ips = artifact_type.map_or(true, |t| t.is_ip());
         if include_ips && config.enable_ip_tracking {
-            // NAN-1729 (P2-B): `since` is a free-form timestamp, so derive the
-            // window age and gate the IP aggregation the same way as the rare path.
-            // A small margin keeps an exact 7-day request (whose `since` is ~168h
-            // old by eval time) on the viable side.
-            let window_hours = (Utc::now() - since).num_hours();
-            if window_hours <= Self::IP_RARITY_MAX_WINDOW_HOURS + 6 {
-                let ip_rows = self
-                    .repository
-                    .get_new_ips(since, limit)
-                    .await
-                    .map_err(PrevalenceError::ClickHouse)?;
+            let ip_rows = self
+                .repository
+                .get_new_ips(since, limit)
+                .await
+                .map_err(PrevalenceError::ClickHouse)?;
 
-                for row in ip_rows {
-                    results.push(PrevalenceRepository::ip_row_to_prevalence_data(
-                        row,
-                        rarity_threshold,
-                    ));
-                }
-            } else if artifact_type.is_some() {
-                return Err(PrevalenceError::WindowNotViable(
-                    Self::IP_RARITY_WINDOW_MSG.to_string(),
+            for row in ip_rows {
+                results.push(PrevalenceRepository::ip_row_to_prevalence_data(
+                    row,
+                    rarity_threshold,
                 ));
-            } else {
-                warn!(
-                    window_hours,
-                    "prevalence new: skipping IP path for non-viable window \
-                     (all-types view degraded to hash/domain)"
-                );
             }
         }
 
@@ -1400,14 +1360,6 @@ pub enum PrevalenceError {
 
     #[error("Configuration error: {0}")]
     Config(String),
-
-    /// NAN-1729 (P2-B): the requested window is too wide for an IP rarity/newness
-    /// lookup to run without exhausting shared-ClickHouse memory (the `uniqMerge`
-    /// GROUP BY aggregates every in-window IP; Saturn-measured OOM at 30d). Surfaced
-    /// as a 400 so the caller narrows the window rather than hitting a shared-CH
-    /// OOM / multi-minute timeout. Lifts once the pre-finalized IP table lands.
-    #[error("{0}")]
-    WindowNotViable(String),
 }
 
 #[cfg(test)]

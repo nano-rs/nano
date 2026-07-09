@@ -561,31 +561,35 @@ LIFETIME(MIN 60 MAX 300);
 -- means "genuinely new" and stamps 1 (rare/new) via the call-site default,
 -- rather than being confused with a dropped-common artifact.
 --
--- NAN-1728 (C3): the QUERY reads FROM nanosiem.<x>_prevalence_summary followed
--- by the generalized {dist_suffix} placeholder, which the migrator's
--- substitution pipeline resolves per topology:
---   * on a cluster  → "_distributed"  (reads the reconciler-created wrapper)
---   * on single-node → ""             (reads the local, complete summary)
--- The summary tables are AggregatingMergeTree and per-shard (NOT cluster-wide
--- replicated — they're 80M+ rows on Saturn, far too large to fully replicate;
--- C2's cluster-wide model is for small reference tables only). Reading the local
--- summary on a MULTI-shard cluster would yield host_count ~= 1/3 of reality,
--- breaking the NAN-1662 9999 common-mask invariant and stamping wrong
--- ingest-time prevalence per landing shard — hence the wrapper on clusters. The
--- uniqMerge(...) GROUP BY merges the per-shard uniq partials correctly (uniqMerge
--- over a Distributed AggregatingMergeTree is the standard cross-shard fan-in).
--- The reconciler auto-creates the wrapper on clusters (the three
--- *_prevalence_summary tables are in dual_pool::DISTRIBUTED_TABLES).
+-- NAN-1732 (P2-D, migration 162): the QUERY reads the LOCAL
+-- nanosiem.<x>_prevalence_final as a point-lookup — argMax(col, version) GROUP BY
+-- key over the ReplacingMergeTree, and because this is a CACHE (KEY-PUSHDOWN)
+-- dict, CH pushes `WHERE key IN (<miss batch>)` into the source so each miss reads
+-- only the batch's rows via the entity ORDER BY. There is NO {dist_suffix} and NO
+-- cross-shard read at dictGet time: `final` is kept-local and already complete on
+-- every node — its refresh MVs (init.sql `*_prevalence_final_refresh`, repointed
+-- to the *_prevalence_summary_distributed wrapper post-reconcile by
+-- repoint_dict_refresh_mvs_distributed) fold the per-shard uniq partials so each
+-- node's `final` holds the GLOBAL host_count.
 --
--- The placeholder is why we DON'T hardcode "_distributed": on a true single-node
--- deployment (dev, open-core install.sh — no <remote_servers> so
--- detect_cluster() returns None) the reconciler is a no-op and no wrapper exists,
--- so a hardcoded "_distributed" would throw CACHE_DICTIONARY_UPDATE_FAIL on the
--- first ingest-time dictGet (a fail-closed insert halt). We deliberately do NOT
--- create any *_distributed object on single-node (it would false-positive
--- DualPool's logs_distributed-presence cluster detection); the suffix resolves to
--- the plain local table instead. The resolution uses the SAME detect_cluster()
--- signal that gates wrapper creation, so target and wrapper can never disagree.
+-- This is a deliberate change from migration 159, whose SOURCE read
+-- *_prevalence_summary{dist_suffix} (→ *_prevalence_summary_distributed on a
+-- cluster) with a per-cache-miss uniqMerge fanned across shards. That path had two
+-- problems, both fixed by reading `final` locally: (a) the cross-shard fan-in was
+-- slow enough to hit the 6000ms dict-source timeout, so a whole miss batch fell
+-- back to the host_count=9999 default and genuinely-rare artifacts were stamped
+-- common (NAN-1761 #2); and (b) 159 repointed a LIVE dict at the _distributed
+-- wrapper before ensure_distributed_tables created it, so ingest cache-misses in
+-- the migrator window flapped CACHE_DICTIONARY_UPDATE_FAIL on upgrades
+-- (NAN-1761 #1, the deploy-ordering blip). Reading `final` LOCALLY means no dict
+-- SOURCE eagerly reads a _distributed wrapper at create/load time — the only
+-- _distributed reads left are the dict-refresh MVs, which init.sql creates against
+-- the LOCAL base and the migrator repoints only AFTER ensure_distributed_tables
+-- (local-then-repoint, so they never eager-fail). New-artifact misses (an entity
+-- younger than the ~10-min refresh cadence, not yet in `final`) fall to the dict
+-- default and are covered by the D4b dict-blind rescue (NAN-1705). CREATE OR
+-- REPLACE DICTIONARY is idempotent; being CACHE (lazy) it stores the definition
+-- without triggering a load — the next ingest-time dictGet reads `final`.
 
 CREATE OR REPLACE DICTIONARY nanosiem.hash_prevalence_dict
 (
@@ -1418,7 +1422,12 @@ CREATE TABLE IF NOT EXISTS nanosiem.hash_prevalence_final
     first_seen DateTime64(6),
     last_seen DateTime64(6),
     total_occurrences UInt64,
-    version DateTime64(6)
+    version DateTime64(6),
+    -- Recency minmax (NAN-1762): the rare/new explorer pushes last_seen (rare) /
+    -- first_seen (new) filters below the `argMax GROUP BY entity`; these
+    -- granule-prune out-of-window entities for sub-30d windows (migration 163).
+    INDEX idx_first_seen first_seen TYPE minmax GRANULARITY 1,
+    INDEX idx_last_seen last_seen TYPE minmax GRANULARITY 1
 )
 ENGINE = ReplacingMergeTree(version) /* nano:keep-local-engine */
 ORDER BY file_hash
@@ -1449,7 +1458,12 @@ CREATE TABLE IF NOT EXISTS nanosiem.domain_prevalence_final
     first_seen DateTime64(6),
     last_seen DateTime64(6),
     total_occurrences UInt64,
-    version DateTime64(6)
+    version DateTime64(6),
+    -- Recency minmax (NAN-1762): the rare/new explorer pushes last_seen (rare) /
+    -- first_seen (new) filters below the `argMax GROUP BY entity`; these
+    -- granule-prune out-of-window entities for sub-30d windows (migration 163).
+    INDEX idx_first_seen first_seen TYPE minmax GRANULARITY 1,
+    INDEX idx_last_seen last_seen TYPE minmax GRANULARITY 1
 )
 ENGINE = ReplacingMergeTree(version) /* nano:keep-local-engine */
 ORDER BY domain
@@ -1480,7 +1494,12 @@ CREATE TABLE IF NOT EXISTS nanosiem.ip_prevalence_final
     first_seen DateTime64(6),
     last_seen DateTime64(6),
     total_occurrences UInt64,
-    version DateTime64(6)
+    version DateTime64(6),
+    -- Recency minmax (NAN-1762): the rare/new explorer pushes last_seen (rare) /
+    -- first_seen (new) filters below the `argMax GROUP BY entity`; these
+    -- granule-prune out-of-window entities for sub-30d windows (migration 163).
+    INDEX idx_first_seen first_seen TYPE minmax GRANULARITY 1,
+    INDEX idx_last_seen last_seen TYPE minmax GRANULARITY 1
 )
 ENGINE = ReplacingMergeTree(version) /* nano:keep-local-engine */
 ORDER BY ip

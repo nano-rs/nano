@@ -1389,13 +1389,12 @@ SOURCE(CLICKHOUSE(
     PASSWORD '{clickhouse_self_password}'
     DB 'nanosiem'
     QUERY 'SELECT file_hash,
-                  if(uniqMerge(host_count) >= 1000, toUInt16(9999), toUInt16(least(9998, uniqMerge(host_count)))) AS host_count,
-                  min(first_seen) AS first_seen,
-                  max(last_seen) AS last_seen,
-                  toUInt64(sum(total_count)) AS total_occurrences
-           FROM nanosiem.hash_prevalence_summary
-           GROUP BY file_hash
-           SETTINGS max_memory_usage = 536870912, max_bytes_before_external_group_by = 268435456, max_threads = 2'
+                  argMax(host_count, version) AS host_count,
+                  argMax(first_seen, version) AS first_seen,
+                  argMax(last_seen, version) AS last_seen,
+                  argMax(total_occurrences, version) AS total_occurrences
+           FROM nanosiem.hash_prevalence_final
+           GROUP BY file_hash'
 ))
 LIFETIME(MIN 900 MAX 1800)
 LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 1000000));
@@ -1416,13 +1415,12 @@ SOURCE(CLICKHOUSE(
     PASSWORD '{clickhouse_self_password}'
     DB 'nanosiem'
     QUERY 'SELECT domain,
-                  if(uniqMerge(source_host_count) >= 1000, toUInt16(9999), toUInt16(least(9998, uniqMerge(source_host_count)))) AS host_count,
-                  min(first_seen) AS first_seen,
-                  max(last_seen) AS last_seen,
-                  toUInt64(sum(total_count)) AS total_occurrences
-           FROM nanosiem.domain_prevalence_summary
-           GROUP BY domain
-           SETTINGS max_memory_usage = 536870912, max_bytes_before_external_group_by = 268435456, max_threads = 2'
+                  argMax(host_count, version) AS host_count,
+                  argMax(first_seen, version) AS first_seen,
+                  argMax(last_seen, version) AS last_seen,
+                  argMax(total_occurrences, version) AS total_occurrences
+           FROM nanosiem.domain_prevalence_final
+           GROUP BY domain'
 ))
 LIFETIME(MIN 900 MAX 1800)
 LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 1000000));
@@ -1443,14 +1441,12 @@ SOURCE(CLICKHOUSE(
     PASSWORD '{clickhouse_self_password}'
     DB 'nanosiem'
     QUERY 'SELECT ip,
-                  if(uniqMerge(source_host_count) >= 1000, toUInt16(9999), toUInt16(least(9998, uniqMerge(source_host_count)))) AS host_count,
-                  min(first_seen) AS first_seen,
-                  max(last_seen) AS last_seen,
-                  toUInt64(sum(total_count)) AS total_occurrences
-           FROM nanosiem.ip_prevalence_summary
-           WHERE is_private = 0
-           GROUP BY ip
-           SETTINGS max_memory_usage = 536870912, max_bytes_before_external_group_by = 268435456, max_threads = 2'
+                  argMax(host_count, version) AS host_count,
+                  argMax(first_seen, version) AS first_seen,
+                  argMax(last_seen, version) AS last_seen,
+                  argMax(total_occurrences, version) AS total_occurrences
+           FROM nanosiem.ip_prevalence_final
+           GROUP BY ip'
 ))
 LIFETIME(MIN 900 MAX 1800)
 LAYOUT(COMPLEX_KEY_CACHE(SIZE_IN_CELLS 5000000));

@@ -21,6 +21,20 @@ use crate::db::TableNames;
 /// `max_query_size` (262KB) — 1000 sha256 hashes ≈ 67KB.
 const DICT_QUERY_CHUNK: usize = 1000;
 
+/// Memory-bound settings for the explorer's full-universe
+/// `argMax(col, version) GROUP BY entity` reads over `*_prevalence_final`
+/// (P2-B, NAN-1762). The rare/new explorer scans the whole retained entity
+/// universe (up to ~119M IPs on Saturn) and aggregates per entity. An
+/// unbounded `GROUP BY` grows the aggregation hash table to ~25 GiB at that
+/// cardinality (local-measured ~208 bytes/entity marginal) and OOMs — exactly
+/// the failure that gated rare/new IP to <=7d (NAN-1729). These settings spill
+/// the aggregation to disk past 1 GiB and hard-cap the query at 2.5 GiB, so 30d
+/// is viable and provably bounded regardless of cardinality. Byte-identical to
+/// the deployed full-scan `argMax` dict source
+/// (clickhouse/130 ip_enrichments: 1 GiB spill / 2.5 GiB cap / 2 threads).
+const FINAL_AGG_SETTINGS: &str = "SETTINGS max_bytes_before_external_group_by = 1000000000, \
+     max_memory_usage = 2500000000, max_threads = 2";
+
 /// Internal row type for hash prevalence queries
 #[derive(Debug, Row, Deserialize)]
 pub struct HashPrevalenceRow {
@@ -139,6 +153,18 @@ pub struct PrevalenceRepository {
     hash_prevalence_summary: String,
     domain_prevalence_summary: String,
     ip_prevalence_summary: String,
+    // Pre-finalized per-entity tables (migration 160 / NAN-1732 P2-D). Hold the
+    // MASKED UInt16 host_count already finalized (`if(uniqMerge>=1000, 9999,
+    // least(9998, uniqMerge))`), read per entity via `argMax(col, version)` over
+    // the ReplacingMergeTree(version). The rare/new explorer reads these instead
+    // of re-running `uniqMerge(host_count)` over `*_prevalence_summary` on every
+    // request (NAN-1762): no HLL merge, so 30d rare/new IP is viable (the
+    // uniqMerge form OOM'd at 30d → NAN-1729 gated it to <=7d). Keep-local (not
+    // distributed) and complete per node — read the bare local name, like the CH
+    // dict source (migration 162).
+    hash_prevalence_final: String,
+    domain_prevalence_final: String,
+    ip_prevalence_final: String,
 }
 
 impl PrevalenceRepository {
@@ -158,6 +184,13 @@ impl PrevalenceRepository {
             hash_prevalence_summary: table_names.read("hash_prevalence_summary"),
             domain_prevalence_summary: table_names.read("domain_prevalence_summary"),
             ip_prevalence_summary: table_names.read("ip_prevalence_summary"),
+            // `*_prevalence_final` are keep-local (not in DISTRIBUTED_TABLE_SET),
+            // so `read()` returns the node-local name — the LOCAL point-read the
+            // dict source uses (migration 162). The refresh MV keeps each node's
+            // copy globally-complete, so no distributed wrapper is needed.
+            hash_prevalence_final: table_names.read("hash_prevalence_final"),
+            domain_prevalence_final: table_names.read("domain_prevalence_final"),
+            ip_prevalence_final: table_names.read("ip_prevalence_final"),
         }
     }
 
@@ -741,44 +774,46 @@ impl PrevalenceRepository {
 
     /// Get rare artifacts (below threshold) that were active within the window.
     ///
-    /// Reads the per-entity `hash_prevalence_summary` table (audit P10): the
-    /// `GROUP BY file_hash` is bounded by N_entities, not N_entities × N_hours,
-    /// so it no longer OOMs on busy tenants the way the hourly-bucketed
-    /// `*_prevalence_agg` scan did. `host_count` is the GLOBAL (retention-bounded,
-    /// 30d TTL) prevalence — the correct notion of "how rare is this overall" —
-    /// and the `time_window` now scopes *recency* via `last_seen >= cutoff`
-    /// rather than windowing the host count itself. Rarity boundary is `<`
-    /// (strictly below threshold): threshold N means "seen on fewer than N
-    /// hosts" (audit P10 — Lane L2 search-side must match this `<`, not `<=`).
+    /// Reads the pre-finalized per-entity `hash_prevalence_final` table
+    /// (NAN-1762, P2-B): `host_count` is ALREADY the finalized, masked prevalence
+    /// (`if(uniqMerge>=1000, 9999, least(9998, uniqMerge))` — byte-identical to
+    /// the CH dict source), so the read is `argMax(host_count, version)` per
+    /// entity over the ReplacingMergeTree(version) — NO `uniqMerge` HLL. That
+    /// removal is what makes 30d rare IP viable (the old summary `uniqMerge` at
+    /// 30d OOM'd, so NAN-1729 gated IP windows to <=7d). `host_count` is the
+    /// GLOBAL (30d-TTL-bounded) prevalence; `time_window` scopes *recency* via
+    /// `last_seen >= cutoff`. Rarity boundary is `<` (strictly below threshold):
+    /// threshold N means "seen on fewer than N hosts" (audit P10 — Lane L2
+    /// search-side must match this `<`, not `<=`). `hash_type` is synthesized
+    /// from the hash length (final does not store it), mirroring the summary MV
+    /// (`multiIf(length…)`).
     #[instrument(skip(self))]
-    // Recency filter pushdown (audit NAN-1664): the recency/newness predicate is
-    // applied in a nested `SELECT * … WHERE …` BEFORE the GROUP BY, so ClickHouse
-    // only aggregates in-window entities. Filtering after the GROUP BY forced a
-    // full per-entity aggregation of every retained artifact first — Saturn-measured
-    // non-viable for IPs (106M entities: >30s / 3 GiB ceiling); with the pushdown a
-    // 24h window is ~4.5M entities (4.7s / 1.3 GiB). The `*_prevalence_summary`
-    // tables are ~1 row per entity (Saturn: 1.01), so `max(last_seen)`/`min(first_seen)`
-    // over that single row equals the raw column and the pushdown is exact — verified
-    // byte-identical result sets vs the outer-filter form on local CH. The filter must
-    // live in the nested subquery, not the aggregating SELECT's WHERE, because that
-    // SELECT aliases `max(last_seen) AS last_seen` etc. which would shadow the raw
-    // column (ILLEGAL_AGGREGATION — the R2 alias-shadow class).
+    // Recency filter pushdown (audit NAN-1664): the recency predicate is applied
+    // in a nested `SELECT * … WHERE …` BEFORE the GROUP BY, so ClickHouse only
+    // aggregates in-window entities (fewer distinct keys → smaller aggregation
+    // hash table). It MUST live in the nested subquery, not the aggregating
+    // SELECT's WHERE, because that SELECT aliases `argMax(last_seen, version) AS
+    // last_seen` which would shadow the raw column (ILLEGAL_AGGREGATION — the R2
+    // alias-shadow class). Pushdown is exact: `last_seen` is monotonically
+    // non-decreasing across an entity's finalization versions, so any surviving
+    // row's `last_seen >= cutoff` implies the argMax-latest is too, and an entity
+    // whose latest `last_seen < cutoff` has ALL rows dropped (correctly excluded).
     //
-    // CORRECTNESS CAVEAT (post-audit cross-review, NAN-1678): the "~1 row/entity ⇒
-    // exact" claim is the *merged* steady state. `*_prevalence_summary` is an
-    // AggregatingMergeTree; between background merges a freshly-active entity can
-    // transiently hold >1 part. The nested filter tests each part's RAW `last_seen`
-    // (a per-part `max`), so an older part whose unmerged `last_seen` predates the
-    // cutoff is dropped BEFORE its `uniqMerge(host_count)` state contributes — a
-    // transient host_count UNDERCOUNT that can momentarily mis-flag a
-    // common-but-recently-active entity as rare (symmetrically `get_new_*` can flag a
-    // returning-old entity as new). Self-heals on merge; bounded by
-    // unmerged-parts-per-entity (~1% transient at Saturn scale). So this is NOT exact
-    // on unmerged parts — the accuracy-for-viability trade is deliberate (aggregating
-    // all 106M entities to filter on `HAVING max(last_seen)` is the non-viable form
-    // the pushdown exists to avoid). Re-measure rare/new counts after a busy-ingest
-    // burst before treating them as precise; a real fix (staged query / bounded
-    // FINAL) is tracked, not attempted here.
+    // MEMORY (NAN-1762): 30d admits the whole entity universe (up to ~119M IPs on
+    // Saturn; TTL bounds all rows to 30d so recency does not prune at 30d). The
+    // full `GROUP BY entity` is bounded by FINAL_AGG_SETTINGS — the aggregation
+    // spills to disk past 1 GiB and the query hard-caps at 2.5 GiB (the deployed
+    // full-scan argMax dict-source budget), so it stays bounded instead of the
+    // ~25 GiB unbounded footprint. Sub-30d additionally prunes via the recency
+    // pushdown + the `idx_last_seen` minmax skip index (migration 163).
+    //
+    // CORRECTNESS CAVEAT (carried from the summary path): `argMax(…, version)` is
+    // exact in the merged steady state. `*_prevalence_final` is a
+    // ReplacingMergeTree; between merges an entity can transiently hold multiple
+    // finalization rows. argMax over ALL of them still picks the latest version,
+    // so the read is robust to unmerged duplicates — but the recency pushdown
+    // drops rows below the cutoff first, which is exact only under the monotonic
+    // `last_seen` argument above. The 30d TTL bounds duplication.
     pub async fn get_rare_hashes(
         &self,
         threshold: u64,
@@ -801,25 +836,27 @@ impl PrevalenceRepository {
             FROM (
                 SELECT
                     file_hash,
-                    hash_type,
-                    uniqMerge(host_count) AS host_count,
-                    min(first_seen) AS first_seen,
-                    max(last_seen) AS last_seen,
-                    sum(total_count) AS total_count
+                    multiIf(length(file_hash) = 32, 'md5', length(file_hash) = 40, 'sha1', length(file_hash) = 64, 'sha256', 'unknown') AS hash_type,
+                    toUInt64(argMax(host_count, version)) AS host_count,
+                    argMax(first_seen, version) AS first_seen,
+                    argMax(last_seen, version) AS last_seen,
+                    argMax(total_occurrences, version) AS total_count
                 FROM (
-                    SELECT * FROM {hash_prevalence_summary}
+                    SELECT * FROM {hash_prevalence_final}
                     WHERE {recency}
                 )
-                GROUP BY file_hash, hash_type
+                GROUP BY file_hash
             )
             WHERE host_count < {threshold}
             ORDER BY last_seen DESC
             LIMIT {limit}
+            {settings}
             "#,
-            hash_prevalence_summary = self.hash_prevalence_summary,
+            hash_prevalence_final = self.hash_prevalence_final,
             threshold = threshold,
             recency = recency,
-            limit = limit
+            limit = limit,
+            settings = FINAL_AGG_SETTINGS,
         );
 
         debug!("Executing rare hashes query with threshold {}", threshold);
@@ -829,9 +866,11 @@ impl PrevalenceRepository {
 
     /// Get rare domains (below threshold) active within the window.
     ///
-    /// Reads `domain_prevalence_summary` (per-entity, bounded) — see
-    /// `get_rare_hashes` for the rationale and the recency/rarity semantics
-    /// (audit P10).
+    /// Reads `domain_prevalence_final` (finalized per-entity, `argMax` read) —
+    /// see `get_rare_hashes` for the rationale, memory bound, and recency/rarity
+    /// semantics (NAN-1762). `is_subdomain` is synthesized from the label count
+    /// (final does not store it), mirroring the summary MV
+    /// (`if(length(splitByChar('.', domain)) > 2, 1, 0)`).
     #[instrument(skip(self))]
     pub async fn get_rare_domains(
         &self,
@@ -855,13 +894,13 @@ impl PrevalenceRepository {
             FROM (
                 SELECT
                     domain,
-                    max(is_subdomain) AS is_subdomain,
-                    uniqMerge(source_host_count) AS source_host_count,
-                    min(first_seen) AS first_seen,
-                    max(last_seen) AS last_seen,
-                    sum(total_count) AS total_count
+                    if(length(splitByChar('.', domain)) > 2, 1, 0) AS is_subdomain,
+                    toUInt64(argMax(host_count, version)) AS source_host_count,
+                    argMax(first_seen, version) AS first_seen,
+                    argMax(last_seen, version) AS last_seen,
+                    argMax(total_occurrences, version) AS total_count
                 FROM (
-                    SELECT * FROM {domain_prevalence_summary}
+                    SELECT * FROM {domain_prevalence_final}
                     WHERE {recency}
                 )
                 GROUP BY domain
@@ -869,11 +908,13 @@ impl PrevalenceRepository {
             WHERE source_host_count < {threshold}
             ORDER BY last_seen DESC
             LIMIT {limit}
+            {settings}
             "#,
-            domain_prevalence_summary = self.domain_prevalence_summary,
+            domain_prevalence_final = self.domain_prevalence_final,
             recency = recency,
             threshold = threshold,
-            limit = limit
+            limit = limit,
+            settings = FINAL_AGG_SETTINGS,
         );
 
         debug!("Executing rare domains query with threshold {}", threshold);
@@ -884,27 +925,22 @@ impl PrevalenceRepository {
     /// Get genuinely new hashes — those whose GLOBAL first_seen falls inside
     /// the requested window (audit P6).
     ///
-    /// The previous implementation restricted the aggregation to buckets with
-    /// `time_bucket >= since` and then filtered `min(first_seen) >= since`. But
-    /// `first_seen` is a per-bucket min, and every surviving bucket already
-    /// starts at/after `since`, so the predicate was VACUOUSLY TRUE — the query
-    /// returned every artifact active in the window, not the newly-seen ones.
-    ///
-    /// The fix reads `hash_prevalence_summary`, whose `first_seen`
-    /// (SimpleAggregateFunction(min)) collapses to the true earliest-ever sighting
-    /// across all retained buckets. Filtering that global minimum against `since`
-    /// is now meaningful: an artifact first observed months ago but seen again
-    /// today has a global first_seen far below `since` and is correctly excluded.
-    /// The per-entity table also bounds the read by N_entities (audit P10).
+    /// Reads `hash_prevalence_final`, whose `first_seen` is the finalized true
+    /// earliest-ever sighting (`argMax(first_seen, version)`). Filtering that
+    /// global minimum against `since` is meaningful: an artifact first observed
+    /// months ago but seen again today has a `first_seen` far below `since` and
+    /// is correctly excluded. Reads the finalized value via `argMax` (no HLL
+    /// `uniqMerge`) so the read is memory-bounded at 30d (NAN-1762); see
+    /// `get_rare_hashes` for the pushdown/memory/correctness notes.
     #[instrument(skip(self))]
     pub async fn get_new_hashes(
         &self,
         since: DateTime<Utc>,
         limit: i64,
     ) -> Result<Vec<HashPrevalenceRow>, clickhouse::error::Error> {
-        // NAN-1729 (P2-B): the recency predicate compares the raw `first_seen`
-        // column so the idx_first_seen minmax index prunes; `since_micros` feeds
-        // fromUnixTimestamp64Micro in recency_at_least (same instant, same rows).
+        // The recency predicate compares the raw `first_seen` column so the
+        // idx_first_seen minmax index (migration 163) can prune; `since_micros`
+        // feeds fromUnixTimestamp64Micro in recency_at_least (same instant).
         let since_micros = since.timestamp_micros();
         let recency = Self::recency_at_least("first_seen", since_micros);
 
@@ -920,23 +956,25 @@ impl PrevalenceRepository {
             FROM (
                 SELECT
                     file_hash,
-                    hash_type,
-                    uniqMerge(host_count) AS host_count,
-                    min(first_seen) AS first_seen,
-                    max(last_seen) AS last_seen,
-                    sum(total_count) AS total_count
+                    multiIf(length(file_hash) = 32, 'md5', length(file_hash) = 40, 'sha1', length(file_hash) = 64, 'sha256', 'unknown') AS hash_type,
+                    toUInt64(argMax(host_count, version)) AS host_count,
+                    argMax(first_seen, version) AS first_seen,
+                    argMax(last_seen, version) AS last_seen,
+                    argMax(total_occurrences, version) AS total_count
                 FROM (
-                    SELECT * FROM {hash_prevalence_summary}
+                    SELECT * FROM {hash_prevalence_final}
                     WHERE {recency}
                 )
-                GROUP BY file_hash, hash_type
+                GROUP BY file_hash
             )
             ORDER BY first_seen DESC
             LIMIT {limit}
+            {settings}
             "#,
-            hash_prevalence_summary = self.hash_prevalence_summary,
+            hash_prevalence_final = self.hash_prevalence_final,
             recency = recency,
-            limit = limit
+            limit = limit,
+            settings = FINAL_AGG_SETTINGS,
         );
 
         debug!("Executing new hashes query since {}", since);
@@ -945,17 +983,17 @@ impl PrevalenceRepository {
     }
 
     /// Get genuinely new domains — global first_seen inside the window.
-    /// Reads `domain_prevalence_summary` for the true earliest-ever sighting;
-    /// see `get_new_hashes` for why the old agg-table predicate was vacuous
-    /// (audit P6/P10).
+    /// Reads `domain_prevalence_final` for the finalized true earliest-ever
+    /// sighting (`argMax(first_seen, version)`); see `get_new_hashes` for the
+    /// semantics and `get_rare_domains` for the `is_subdomain` synthesis
+    /// (NAN-1762).
     #[instrument(skip(self))]
     pub async fn get_new_domains(
         &self,
         since: DateTime<Utc>,
         limit: i64,
     ) -> Result<Vec<DomainPrevalenceRow>, clickhouse::error::Error> {
-        // NAN-1729 (P2-B): raw `first_seen` predicate (index-eligible) — see
-        // get_new_hashes.
+        // Raw `first_seen` predicate (idx_first_seen-eligible) — see get_new_hashes.
         let since_micros = since.timestamp_micros();
         let recency = Self::recency_at_least("first_seen", since_micros);
 
@@ -971,23 +1009,25 @@ impl PrevalenceRepository {
             FROM (
                 SELECT
                     domain,
-                    max(is_subdomain) AS is_subdomain,
-                    uniqMerge(source_host_count) AS source_host_count,
-                    min(first_seen) AS first_seen,
-                    max(last_seen) AS last_seen,
-                    sum(total_count) AS total_count
+                    if(length(splitByChar('.', domain)) > 2, 1, 0) AS is_subdomain,
+                    toUInt64(argMax(host_count, version)) AS source_host_count,
+                    argMax(first_seen, version) AS first_seen,
+                    argMax(last_seen, version) AS last_seen,
+                    argMax(total_occurrences, version) AS total_count
                 FROM (
-                    SELECT * FROM {domain_prevalence_summary}
+                    SELECT * FROM {domain_prevalence_final}
                     WHERE {recency}
                 )
                 GROUP BY domain
             )
             ORDER BY first_seen DESC
             LIMIT {limit}
+            {settings}
             "#,
-            domain_prevalence_summary = self.domain_prevalence_summary,
+            domain_prevalence_final = self.domain_prevalence_final,
             recency = recency,
-            limit = limit
+            limit = limit,
+            settings = FINAL_AGG_SETTINGS,
         );
 
         debug!("Executing new domains query since {}", since);
@@ -996,9 +1036,13 @@ impl PrevalenceRepository {
     }
 
     /// Get rare IPs (below threshold) active within the window.
-    /// Reads `ip_prevalence_summary` (per-entity, bounded) — see
-    /// `get_rare_hashes` for the rationale (audit P10).
-    /// Note: Excludes private/RFC1918 IPs by default to reduce noise.
+    /// Reads `ip_prevalence_final` (finalized per-entity, `argMax` read) — see
+    /// `get_rare_hashes` for the rationale and memory bound (NAN-1762).
+    /// `ip_prevalence_final` already holds only public IPs (its refresh MV
+    /// filters `is_private = 0`), so the private-IP exclusion is structural and
+    /// `is_private`/`direction` are hardcoded (0 / 'dest'). Reading `final`
+    /// removes the summary `uniqMerge`, which is what lifts the NAN-1729 <=7d IP
+    /// window gate: 30d rare IP is now viable.
     #[instrument(skip(self))]
     pub async fn get_rare_ips(
         &self,
@@ -1024,26 +1068,27 @@ impl PrevalenceRepository {
                 SELECT
                     ip,
                     'dest' AS direction,
-                    max(is_private) AS is_private,
-                    uniqMerge(source_host_count) AS source_host_count,
-                    min(first_seen) AS first_seen,
-                    max(last_seen) AS last_seen,
-                    sum(total_count) AS total_count
+                    toUInt8(0) AS is_private,
+                    toUInt64(argMax(host_count, version)) AS source_host_count,
+                    argMax(first_seen, version) AS first_seen,
+                    argMax(last_seen, version) AS last_seen,
+                    argMax(total_occurrences, version) AS total_count
                 FROM (
-                    SELECT * FROM {ip_prevalence_summary}
-                    WHERE is_private = 0
-                      AND {recency}
+                    SELECT * FROM {ip_prevalence_final}
+                    WHERE {recency}
                 )
                 GROUP BY ip
             )
             WHERE source_host_count < {threshold}
             ORDER BY last_seen DESC
             LIMIT {limit}
+            {settings}
             "#,
-            ip_prevalence_summary = self.ip_prevalence_summary,
+            ip_prevalence_final = self.ip_prevalence_final,
             recency = recency,
             threshold = threshold,
-            limit = limit
+            limit = limit,
+            settings = FINAL_AGG_SETTINGS,
         );
 
         debug!("Executing rare IPs query with threshold {}", threshold);
@@ -1052,16 +1097,16 @@ impl PrevalenceRepository {
     }
 
     /// Get genuinely new IPs — global first_seen inside the window.
-    /// Reads `ip_prevalence_summary`; see `get_new_hashes` (audit P6/P10).
-    /// Note: Excludes private/RFC1918 IPs by default to reduce noise.
+    /// Reads `ip_prevalence_final` (finalized per-entity, `argMax` read); see
+    /// `get_new_hashes` for the semantics and `get_rare_ips` for the structural
+    /// public-IP-only / hardcoded `is_private`/`direction` note (NAN-1762).
     #[instrument(skip(self))]
     pub async fn get_new_ips(
         &self,
         since: DateTime<Utc>,
         limit: i64,
     ) -> Result<Vec<IpPrevalenceRow>, clickhouse::error::Error> {
-        // NAN-1729 (P2-B): raw `first_seen` predicate (index-eligible) — see
-        // get_new_hashes.
+        // Raw `first_seen` predicate (idx_first_seen-eligible) — see get_new_hashes.
         let since_micros = since.timestamp_micros();
         let recency = Self::recency_at_least("first_seen", since_micros);
 
@@ -1079,24 +1124,25 @@ impl PrevalenceRepository {
                 SELECT
                     ip,
                     'dest' AS direction,
-                    max(is_private) AS is_private,
-                    uniqMerge(source_host_count) AS source_host_count,
-                    min(first_seen) AS first_seen,
-                    max(last_seen) AS last_seen,
-                    sum(total_count) AS total_count
+                    toUInt8(0) AS is_private,
+                    toUInt64(argMax(host_count, version)) AS source_host_count,
+                    argMax(first_seen, version) AS first_seen,
+                    argMax(last_seen, version) AS last_seen,
+                    argMax(total_occurrences, version) AS total_count
                 FROM (
-                    SELECT * FROM {ip_prevalence_summary}
-                    WHERE is_private = 0
-                      AND {recency}
+                    SELECT * FROM {ip_prevalence_final}
+                    WHERE {recency}
                 )
                 GROUP BY ip
             )
             ORDER BY first_seen DESC
             LIMIT {limit}
+            {settings}
             "#,
-            ip_prevalence_summary = self.ip_prevalence_summary,
+            ip_prevalence_final = self.ip_prevalence_final,
             recency = recency,
-            limit = limit
+            limit = limit,
+            settings = FINAL_AGG_SETTINGS,
         );
 
         debug!("Executing new IPs query since {}", since);
