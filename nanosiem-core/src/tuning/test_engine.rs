@@ -3,8 +3,7 @@
 //! Test Engine for AI Detection Auto-Tuning
 //!
 //! This module provides the TestEngine that validates tuning proposals by:
-//! - Creating temporary test rules with proposed changes
-//! - Executing them against historical data
+//! - Replaying original and proposed queries through production evaluation windows
 //! - Comparing alert volumes and patterns
 //! - Validating that known true positives still trigger
 //! - Calculating improvement metrics
@@ -12,12 +11,32 @@
 //! Requirements: 5.1, 5.2, 5.3, 5.4, 5.5
 
 use chrono::{Duration, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
+use tokio::sync::Semaphore;
 
-use crate::query::{parse_query, TimeRange};
-use crate::search::{SearchRequest, SearchService, TimeRangeInput};
-use crate::tuning::types::{ComparisonMetrics, PatternChange, TestResults, TuningProposal};
+use crate::detection::service::{
+    tuning_test_windows, TuningReplayBudget, TuningWindowEvidence,
+    MAX_AUTONOMOUS_TUNING_TOTAL_BYTES, MAX_AUTONOMOUS_TUNING_TOTAL_ROWS,
+};
+use crate::detection::DetectionService;
+use crate::query::{extract_time_modifier_tokens, parse_query, Command, Query};
+use crate::search::TimeRangeInput;
+use crate::tuning::types::{
+    ComparisonMetrics, PatternChange, TestResults, TuningProposal, TuningValidationProof,
+    TuningValidationWindow,
+};
+use sha2::{Digest, Sha256};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+const VALIDATION_HORIZON_HOURS: i64 = 24;
+const TRUE_POSITIVE_CORPUS_LIMIT: usize = 10_000;
+const VALIDATION_PROOF_VERSION: u32 = 1;
+const SOURCE_IDENTITY_MODE: &str = "physical_id_uuid_v1";
+const AUTONOMOUS_VALIDATION_TIMEOUT_SECS: u64 = 300;
+static AUTONOMOUS_VALIDATION_ADMISSION: Semaphore = Semaphore::const_new(1);
 
 /// Error type for test engine operations
 #[derive(Debug, thiserror::Error)]
@@ -38,8 +57,8 @@ pub enum TestEngineError {
 /// Test Engine for validating tuning proposals
 ///
 /// The TestEngine validates tuning proposals by:
-/// 1. Creating temporary test rules with proposed changes
-/// 2. Executing against last 24 hours of data
+/// 1. Replaying raw identity-preserving queries through production evaluation
+/// 2. Using the rule's exact cron cadence and lookback windows
 /// 3. Comparing alert volumes and patterns
 /// 4. Verifying known true positives still trigger
 /// 5. Calculating improvement metrics
@@ -49,23 +68,29 @@ pub enum TestEngineError {
 /// - ❌ Fail: <10% reduction (not effective)
 /// - ❌ Fail: >80% reduction (too aggressive)
 pub struct TestEngine {
-    /// Search service for executing test queries
-    search_service: Arc<SearchService>,
+    /// Production detection evaluator used by scheduled rule execution.
+    detection_service: Arc<DetectionService>,
+    /// PostgreSQL stores analyst dispositions and their matched-event corpus.
+    pg_pool: PgPool,
 }
 
 impl TestEngine {
     /// Create a new Test Engine
     ///
     /// # Arguments
-    /// * `search_service` - Search service for executing test queries
-    pub fn new(search_service: Arc<SearchService>) -> Self {
-        Self { search_service }
+    /// * `detection_service` - Production detection evaluator
+    /// * `pg_pool` - PostgreSQL pool used to load analyst-confirmed true positives
+    pub fn new(detection_service: Arc<DetectionService>, pg_pool: PgPool) -> Self {
+        Self {
+            detection_service,
+            pg_pool,
+        }
     }
 
     /// Test a tuning proposal against historical data
     ///
     /// This is the main entry point for testing. It:
-    /// 1. Executes the original query against last 24 hours
+    /// 1. Executes the original query over production schedule/lookback windows
     /// 2. Executes the proposed query against the same time range
     /// 3. Compares the results
     /// 4. Validates the reduction is within acceptable bounds (30-80%)
@@ -80,6 +105,9 @@ impl TestEngine {
     pub async fn test_proposal(
         &self,
         proposal: &TuningProposal,
+        dataset: Option<&str>,
+        schedule_cron: Option<&str>,
+        lookback_minutes: Option<i64>,
     ) -> Result<TestResults, TestEngineError> {
         tracing::info!(
             "Starting test for proposal {} (rule {})",
@@ -87,10 +115,36 @@ impl TestEngine {
             proposal.rule_id
         );
 
-        // Define test time range (last 24 hours)
+        if query_has_inline_time_modifiers(&proposal.original_query)
+            || query_has_inline_time_modifiers(&proposal.proposed_query)
+        {
+            return Err(TestEngineError::Validation(
+                "Autonomous validation does not allow inline earliest/latest modifiers; the rule schedule and explicit production lookback define every replay window"
+                    .to_string(),
+            ));
+        }
+
+        if !query_preserves_physical_source_identity(&proposal.original_query)?
+            || !query_preserves_physical_source_identity(&proposal.proposed_query)?
+        {
+            return Err(TestEngineError::Validation(
+                "Autonomous validation requires raw identity-preserving queries; aggregation, projection, eval, rename, lookup, and other row-shaping commands require human review"
+                    .to_string(),
+            ));
+        }
+
+        // The horizon selects cron ticks; every tick is replayed against the
+        // rule's production lookback window.
         let end_time = Utc::now();
-        let start_time = end_time - Duration::hours(24);
-        let time_range = TimeRange::new(start_time, end_time);
+        let start_time = end_time - Duration::hours(VALIDATION_HORIZON_HOURS);
+        let time_range = TimeRangeInput::new(start_time, end_time);
+        let plan = tuning_test_windows(&time_range, schedule_cron, lookback_minutes)
+            .map_err(|error| TestEngineError::Validation(error.to_string()))?;
+        if plan.windows.is_empty() {
+            return Err(TestEngineError::Validation(
+                "The validation horizon contains no production schedule ticks".to_string(),
+            ));
+        }
 
         tracing::info!(
             "Test time range: {} to {}",
@@ -98,47 +152,189 @@ impl TestEngine {
             crate::sql_hygiene::format_ch_bound(&end_time)
         );
 
-        // Execute original query
-        tracing::debug!("Executing original query");
-        let original_results = self
-            .run_test_rule(&proposal.original_query, &time_range)
+        let validation_id = Uuid::now_v7();
+        let original_query_id_prefix = format!("tuning-{validation_id}-original");
+        let proposed_query_id_prefix = format!("tuning-{validation_id}-proposed");
+        let execution = tokio::time::timeout(
+            StdDuration::from_secs(AUTONOMOUS_VALIDATION_TIMEOUT_SECS),
+            async {
+                let _admission = AUTONOMOUS_VALIDATION_ADMISSION
+                    .acquire()
+                    .await
+                    .map_err(|_| {
+                        TestEngineError::Validation(
+                            "Autonomous tuning validation admission is unavailable".to_string(),
+                        )
+                    })?;
+
+                // Analyst-confirmed matches are the preservation corpus. An
+                // empty corpus is not evidence of preservation and cannot pass.
+                let true_positive_corpus = self
+                    .load_true_positive_corpus(proposal.rule_id, &time_range)
+                    .await?;
+
+                tracing::info!(
+                    "Loaded {} analyst-confirmed true-positive events for validation",
+                    true_positive_corpus.event_count
+                );
+
+                let original_results = self
+                    .detection_service
+                    .evaluate_tuning_windows(
+                        &proposal.original_query,
+                        &plan.windows,
+                        dataset.map(str::to_owned),
+                        TuningReplayBudget {
+                            rows: MAX_AUTONOMOUS_TUNING_TOTAL_ROWS,
+                            bytes: MAX_AUTONOMOUS_TUNING_TOTAL_BYTES,
+                        },
+                        &original_query_id_prefix,
+                    )
+                    .await;
+                let tuned_results = if evidence_is_exact(&original_results) {
+                    self.detection_service
+                        .evaluate_tuning_windows(
+                            &proposal.proposed_query,
+                            &plan.windows,
+                            dataset.map(str::to_owned),
+                            remaining_replay_budget(&original_results),
+                            &proposed_query_id_prefix,
+                        )
+                        .await
+                } else {
+                    // There is no value in spending a second ClickHouse replay
+                    // after the first one has already made exact validation
+                    // impossible. Mark the skipped side non-exact so the proof
+                    // remains explicitly fail-closed.
+                    TuningWindowEvidence {
+                        failed_windows: 1,
+                        ..TuningWindowEvidence::default()
+                    }
+                };
+
+                Ok::<_, TestEngineError>((true_positive_corpus, original_results, tuned_results))
+            },
+        )
+        .await;
+        let (true_positive_corpus, original_results, tuned_results) = match execution {
+            Ok(result) => result?,
+            Err(_) => {
+                if let Err(error) = self
+                    .detection_service
+                    .cancel_tuning_replays(
+                        &[&original_query_id_prefix, &proposed_query_id_prefix],
+                        plan.windows.len(),
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        validation_id = %validation_id,
+                        error = %error,
+                        "Failed to explicitly cancel timed-out tuning validation"
+                    );
+                }
+                return Err(TestEngineError::Validation(format!(
+                    "Autonomous tuning validation exceeded its {AUTONOMOUS_VALIDATION_TIMEOUT_SECS}-second admission and execution budget"
+                )));
+            }
+        };
+
+        tracing::info!(
+            windows = plan.windows.len(),
+            original_total = original_results.total_matches,
+            tuned_total = tuned_results.total_matches,
+            original_truncated_windows = original_results.truncated_windows,
+            tuned_truncated_windows = tuned_results.truncated_windows,
+            "Completed stepped tuning validation"
+        );
+
+        let counts_exact = evidence_is_exact(&original_results)
+            && evidence_is_exact(&tuned_results)
+            && !true_positive_corpus.truncated
+            && true_positive_corpus.identity_complete;
+
+        let true_positives_preserved = counts_exact
+            && corpus_is_preserved(
+                &true_positive_corpus.source_ids,
+                &original_results.source_ids,
+                &tuned_results.source_ids,
+            );
+
+        let mut comparison_metrics = self
+            .compare_results(
+                &original_results.sample_events,
+                &tuned_results.sample_events,
+            )
             .await?;
 
-        tracing::info!("Original query returned {} results", original_results.len());
-
-        // Execute tuned query
-        tracing::debug!("Executing tuned query");
-        let tuned_results = self
-            .run_test_rule(&proposal.proposed_query, &time_range)
-            .await?;
-
-        tracing::info!("Tuned query returned {} results", tuned_results.len());
-
-        // Compare results
-        let comparison_metrics = self
-            .compare_results(&original_results, &tuned_results)
-            .await?;
-
-        // Calculate reduction percentage
-        let original_count = original_results.len() as i64;
-        let tuned_count = tuned_results.len() as i64;
+        let original_count = count_as_i64(original_results.total_matches);
+        let tuned_count = count_as_i64(tuned_results.total_matches);
+        comparison_metrics.alerts_removed = original_count - tuned_count;
+        comparison_metrics.alerts_preserved = tuned_count;
         let reduction_percentage = if original_count > 0 {
             ((original_count - tuned_count) as f64 / original_count as f64) * 100.0
         } else {
             0.0
         };
 
+        let volume_validation_passed = reduction_percentage >= 30.0 && reduction_percentage <= 80.0;
+        let validation_passed = counts_exact && volume_validation_passed;
+
+        let windows = plan
+            .windows
+            .iter()
+            .map(|window| TuningValidationWindow {
+                start: window.start,
+                end: window.end,
+            })
+            .collect::<Vec<_>>();
+        let validation_proof = TuningValidationProof {
+            proof_version: VALIDATION_PROOF_VERSION,
+            original_query_sha256: sha256_hex(proposal.original_query.as_bytes()),
+            proposed_query_sha256: sha256_hex(proposal.proposed_query.as_bytes()),
+            dataset: dataset.unwrap_or("logs").to_ascii_lowercase(),
+            schedule_cron: plan.schedule_cron,
+            lookback_minutes: plan.lookback_minutes,
+            evaluation_start: time_range.start,
+            evaluation_end: time_range.end,
+            windows_sha256: digest_windows(&windows),
+            windows,
+            corpus_count: true_positive_corpus.event_count,
+            corpus_sha256: true_positive_corpus.digest,
+            corpus_revision: true_positive_corpus.revision,
+            corpus_unique_source_count: u64::try_from(true_positive_corpus.source_ids.len())
+                .unwrap_or(u64::MAX),
+            corpus_source_ids_sha256: digest_source_ids(&true_positive_corpus.source_ids),
+            corpus_truncated: true_positive_corpus.truncated,
+            corpus_identity_complete: true_positive_corpus.identity_complete,
+            original_match_count: original_results.total_matches,
+            proposed_match_count: tuned_results.total_matches,
+            original_source_ids_sha256: digest_source_ids(&original_results.source_ids),
+            proposed_source_ids_sha256: digest_source_ids(&tuned_results.source_ids),
+            original_failed_windows: original_results.failed_windows,
+            proposed_failed_windows: tuned_results.failed_windows,
+            original_truncated_windows: original_results.truncated_windows,
+            proposed_truncated_windows: tuned_results.truncated_windows,
+            original_identity_errors: original_results.identity_errors,
+            proposed_identity_errors: tuned_results.identity_errors,
+            original_rows_examined: original_results.rows_examined,
+            proposed_rows_examined: tuned_results.rows_examined,
+            original_bytes_examined: original_results.bytes_examined,
+            proposed_bytes_examined: tuned_results.bytes_examined,
+            original_budget_exceeded: original_results.budget_exceeded,
+            proposed_budget_exceeded: tuned_results.budget_exceeded,
+            counts_exact,
+            true_positives_preserved,
+            identity_mode: SOURCE_IDENTITY_MODE.to_string(),
+        };
+
         tracing::info!(
-            "Alert reduction: {} -> {} ({:.1}% reduction)",
+            "Alert reduction: {} -> {} ({:.1}% reduction; exact={})",
             original_count,
             tuned_count,
-            reduction_percentage
+            reduction_percentage,
+            counts_exact
         );
-
-        // Validate reduction is within acceptable bounds
-        // Pass: 30-80% reduction
-        // Fail: <10% reduction (not effective) or >80% reduction (too aggressive)
-        let validation_passed = reduction_percentage >= 30.0 && reduction_percentage <= 80.0;
 
         if !validation_passed {
             if reduction_percentage < 10.0 {
@@ -164,12 +360,13 @@ impl TestEngine {
             );
         }
 
-        // For now, assume true positives are preserved
-        // In a production system, you would:
-        // 1. Fetch known true positive alerts for this rule
-        // 2. Verify they still match the tuned query
-        // 3. Set this flag based on that verification
-        let true_positives_preserved = true;
+        if !true_positives_preserved {
+            tracing::warn!(
+                proposal_id = %proposal.id,
+                corpus_size = true_positive_corpus.event_count,
+                "Validation FAILED: analyst-confirmed true positives were not preserved"
+            );
+        }
 
         Ok(TestResults {
             proposal_id: proposal.id,
@@ -180,57 +377,82 @@ impl TestEngine {
             true_positives_preserved,
             validation_passed,
             comparison_metrics,
+            validation_proof: Some(validation_proof),
         })
     }
 
-    /// Execute a test rule against historical data
-    ///
-    /// Runs the query against the specified time range and returns matching results.
-    ///
-    /// # Arguments
-    /// * `query` - The query to execute
-    /// * `time_range` - Time range to query
-    ///
-    /// # Returns
-    /// Vector of search results (as JSON values)
-    ///
-    /// Requirements: 5.1, 5.2
-    pub async fn run_test_rule(
+    async fn load_true_positive_corpus(
         &self,
-        query: &str,
-        time_range: &TimeRange,
-    ) -> Result<Vec<serde_json::Value>, TestEngineError> {
-        // Validate query syntax
-        parse_query(query).map_err(|e| TestEngineError::QueryParse(e.to_string()))?;
+        rule_id: uuid::Uuid,
+        time_range: &TimeRangeInput,
+    ) -> Result<TruePositiveCorpus, TestEngineError> {
+        let mut tx = self.pg_pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
+            .await?;
+        let revision = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COALESCE(
+                (SELECT revision
+                 FROM tuning_tp_corpus_revisions
+                 WHERE rule_id = $1),
+                0
+            )
+            "#,
+        )
+        .bind(rule_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let mut rows = sqlx::query_scalar::<_, serde_json::Value>(
+            r#"
+            SELECT event.value
+            FROM detection_matches AS dm
+            CROSS JOIN LATERAL jsonb_array_elements(dm.matched_events) AS event(value)
+            WHERE dm.rule_id = $1
+              AND dm.disposition = 'true_positive'
+              AND dm.detected_at >= $2
+              AND dm.detected_at <= $3
+            ORDER BY dm.detected_at DESC
+            LIMIT $4
+            "#,
+        )
+        .bind(rule_id)
+        .bind(time_range.start)
+        .bind(time_range.end)
+        .bind(i64::try_from(TRUE_POSITIVE_CORPUS_LIMIT + 1).unwrap_or(i64::MAX))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
 
-        // Create search request
-        let search_request = SearchRequest {
-            query: query.to_string(),
-            time_range: TimeRangeInput {
-                start: time_range.start,
-                end: time_range.end,
-            },
-            limit: Some(10000), // High limit for testing
-            offset: None,
-            include_sql: Some(false),
-            skip_histogram: true,
-            skip_field_stats: true,
-            use_cache: false,
-            table_view: false,
-            request_id: None,
-            async_mode: false,
-            priority: None,
-            dataset: None,
-        };
+        let truncated = rows.len() > TRUE_POSITIVE_CORPUS_LIMIT;
+        if truncated {
+            rows.truncate(TRUE_POSITIVE_CORPUS_LIMIT);
+        }
 
-        // Execute search
-        let response = self
-            .search_service
-            .search(search_request)
-            .await
-            .map_err(|e| TestEngineError::Search(e.to_string()))?;
+        let digest = digest_corpus(&rows);
+        let mut source_ids = HashSet::new();
+        let mut identity_complete = true;
+        for row in &rows {
+            match row
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+            {
+                Some(id) => {
+                    source_ids.insert(id);
+                }
+                None => identity_complete = false,
+            }
+        }
 
-        Ok(response.results)
+        Ok(TruePositiveCorpus {
+            event_count: u64::try_from(rows.len()).unwrap_or(u64::MAX),
+            source_ids,
+            digest,
+            revision,
+            truncated,
+            identity_complete,
+        })
     }
 
     /// Compare results between original and tuned queries
@@ -453,6 +675,123 @@ impl TestEngine {
     }
 }
 
+fn count_as_i64(count: u64) -> i64 {
+    i64::try_from(count).unwrap_or(i64::MAX)
+}
+
+struct TruePositiveCorpus {
+    event_count: u64,
+    source_ids: HashSet<Uuid>,
+    digest: String,
+    revision: i64,
+    truncated: bool,
+    identity_complete: bool,
+}
+
+fn evidence_is_exact(evidence: &TuningWindowEvidence) -> bool {
+    evidence.failed_windows == 0
+        && evidence.truncated_windows == 0
+        && evidence.identity_errors == 0
+        && !evidence.budget_exceeded
+}
+
+fn remaining_replay_budget(evidence: &TuningWindowEvidence) -> TuningReplayBudget {
+    TuningReplayBudget {
+        rows: MAX_AUTONOMOUS_TUNING_TOTAL_ROWS.saturating_sub(evidence.rows_examined),
+        bytes: MAX_AUTONOMOUS_TUNING_TOTAL_BYTES.saturating_sub(evidence.bytes_examined),
+    }
+}
+
+fn corpus_is_preserved(
+    corpus_ids: &HashSet<Uuid>,
+    original_ids: &HashSet<Uuid>,
+    tuned_ids: &HashSet<Uuid>,
+) -> bool {
+    !corpus_ids.is_empty() && corpus_ids.is_subset(original_ids) && corpus_ids.is_subset(tuned_ids)
+}
+
+fn query_preserves_physical_source_identity(query: &str) -> Result<bool, TestEngineError> {
+    let parsed =
+        parse_query(query).map_err(|error| TestEngineError::QueryParse(error.to_string()))?;
+
+    fn preserves_identity(query: &Query) -> bool {
+        match query {
+            Query::Search(_) => true,
+            Query::Piped { source, command } => {
+                preserves_identity(source)
+                    && matches!(
+                        command,
+                        Command::Where { .. }
+                            | Command::Sort { .. }
+                            | Command::Head { .. }
+                            | Command::Tail { .. }
+                            | Command::Dedup { .. }
+                    )
+            }
+        }
+    }
+
+    Ok(preserves_identity(&parsed))
+}
+
+fn query_has_inline_time_modifiers(query: &str) -> bool {
+    !extract_time_modifier_tokens(query).is_empty()
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+    hex::encode(Sha256::digest(value))
+}
+
+fn digest_source_ids(source_ids: &HashSet<Uuid>) -> String {
+    let mut source_ids = source_ids.iter().copied().collect::<Vec<_>>();
+    source_ids.sort_unstable();
+
+    let mut digest = Sha256::new();
+    for source_id in source_ids {
+        digest.update(source_id.as_bytes());
+    }
+    hex::encode(digest.finalize())
+}
+
+fn digest_windows(windows: &[TuningValidationWindow]) -> String {
+    sha256_hex(&serde_json::to_vec(windows).unwrap_or_default())
+}
+
+fn digest_corpus(corpus: &[serde_json::Value]) -> String {
+    let mut encoded = corpus
+        .iter()
+        .map(canonicalize_event)
+        .map(|event| serde_json::to_vec(&event).unwrap_or_default())
+        .collect::<Vec<_>>();
+    encoded.sort_unstable();
+
+    let mut digest = Sha256::new();
+    for event in encoded {
+        digest.update(u64::try_from(event.len()).unwrap_or(u64::MAX).to_be_bytes());
+        digest.update(event);
+    }
+    hex::encode(digest.finalize())
+}
+
+fn canonicalize_event(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+
+            let mut canonical = serde_json::Map::new();
+            for (key, child) in entries {
+                canonical.insert(key.clone(), canonicalize_event(child));
+            }
+            serde_json::Value::Object(canonical)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonicalize_event).collect())
+        }
+        scalar => scalar.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,5 +903,120 @@ mod tests {
         // Test above upper bound (80.1%)
         let reduction = 80.1;
         assert!(!(reduction >= 30.0 && reduction <= 80.0));
+    }
+
+    #[test]
+    fn preservation_requires_a_nonempty_confirmed_corpus() {
+        let event_id = Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        let results = HashSet::from([event_id]);
+        assert!(!corpus_is_preserved(&HashSet::new(), &results, &results));
+    }
+
+    #[test]
+    fn preservation_requires_each_confirmed_event_in_both_executions() {
+        let tp_one = Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        let tp_two = Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
+        let corpus = HashSet::from([tp_one, tp_two]);
+
+        assert!(corpus_is_preserved(&corpus, &corpus, &corpus));
+        assert!(!corpus_is_preserved(
+            &corpus,
+            &corpus,
+            &HashSet::from([tp_one])
+        ));
+    }
+
+    #[test]
+    fn corpus_digest_is_order_independent_but_binds_all_fields() {
+        let first = serde_json::json!({"id": "a", "nested": {"b": 2, "a": 1}});
+        let second = serde_json::json!({"id": "b", "src_ip": "10.0.0.2"});
+        assert_eq!(
+            digest_corpus(&[first.clone(), second.clone()]),
+            digest_corpus(&[second.clone(), first.clone()])
+        );
+
+        let changed = serde_json::json!({"id": "a", "nested": {"b": 3, "a": 1}});
+        assert_ne!(
+            digest_corpus(&[first, second.clone()]),
+            digest_corpus(&[changed, second])
+        );
+    }
+
+    #[test]
+    fn autonomous_queries_must_preserve_physical_rows() {
+        for query in [
+            "src_ip=10.0.0.1",
+            "src_ip=10.0.0.1 | where dest_port=443",
+            "* | sort -timestamp | head 100 | dedup id",
+        ] {
+            assert!(
+                query_preserves_physical_source_identity(query).unwrap(),
+                "{query}"
+            );
+        }
+
+        for query in [
+            "* | stats count by src_ip",
+            "* | table id, src_ip",
+            "* | fields id, src_ip",
+            "* | eval id=src_ip",
+            "* | rename src_ip as id",
+            "* | lookup assets src_ip OUTPUT owner",
+        ] {
+            assert!(
+                !query_preserves_physical_source_identity(query).unwrap(),
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn autonomous_queries_reject_inline_time_modifiers() {
+        assert!(query_has_inline_time_modifiers(
+            "src_ip=10.0.0.1 earliest=-12h"
+        ));
+        assert!(query_has_inline_time_modifiers(
+            "src_ip=10.0.0.1 LATEST=now"
+        ));
+        assert!(!query_has_inline_time_modifiers(
+            "message=\"latest=release\" | where src_ip=10.0.0.1"
+        ));
+    }
+
+    #[test]
+    fn exact_evidence_fails_closed_on_partial_or_capped_results() {
+        let exact = TuningWindowEvidence {
+            total_matches: 1,
+            ..TuningWindowEvidence::default()
+        };
+        assert!(evidence_is_exact(&exact));
+
+        let mut failed = exact.clone();
+        failed.failed_windows = 1;
+        assert!(!evidence_is_exact(&failed));
+
+        let mut truncated = exact.clone();
+        truncated.truncated_windows = 1;
+        assert!(!evidence_is_exact(&truncated));
+
+        let mut identity_error = exact;
+        identity_error.identity_errors = 1;
+        assert!(!evidence_is_exact(&identity_error));
+
+        let mut over_budget = TuningWindowEvidence::default();
+        over_budget.budget_exceeded = true;
+        assert!(!evidence_is_exact(&over_budget));
+    }
+
+    #[test]
+    fn original_and_proposed_replays_share_one_total_budget() {
+        let evidence = TuningWindowEvidence {
+            rows_examined: MAX_AUTONOMOUS_TUNING_TOTAL_ROWS - 7,
+            bytes_examined: MAX_AUTONOMOUS_TUNING_TOTAL_BYTES - 11,
+            ..TuningWindowEvidence::default()
+        };
+        let remaining = remaining_replay_budget(&evidence);
+        assert_eq!(remaining.rows, 7);
+        assert_eq!(remaining.bytes, 11);
     }
 }

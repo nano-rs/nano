@@ -179,6 +179,20 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Publish only a complete DB-derived generation. The same reconciler runs
+    // on every API replica so a new emptyDir can recover the committed
+    // generation; the PostgreSQL CAS prevents stale replicas from advancing it.
+    match state.reconcile_vector_config_publication().await {
+        Ok(outcome) => tracing::info!(?outcome, "Vector config publication reconciled"),
+        Err(error) => tracing::warn!(
+            %error,
+            "Initial Vector config publication failed; the background reconciler will retry"
+        ),
+    }
+    let vector_config_handle = state.start_vector_config_publication_reconciler();
+    state.add_task_handle(vector_config_handle).await;
+    tracing::info!("Vector config publication reconciler started");
+
     // === License status poller (reads cached status from PG, written by nanosiem-jobs) ===
     // Enterprise-only: the open edition ships no license / phone-home machinery
     // and runs unrestricted by construction (NAN-1193).
@@ -248,8 +262,16 @@ async fn main() -> Result<()> {
             );
         }
         *state.license_status.write().await = decided;
-        // No phone-home poller: air-gap has no LICENSE_URL to poll. Re-imports
-        // update the in-memory RwLock directly (see import_offline_license).
+        // Every API replica listens for committed offline imports. The listener
+        // also polls periodically, closing notification-loss and reconnect races.
+        let refresh_state = state.clone();
+        let refresh_handle = tokio::spawn(async move {
+            run_airgap_license_refresh(refresh_state).await;
+        });
+        state.add_task_handle(refresh_handle).await;
+        tracing::info!(
+            "Air-gap license refresh started (PostgreSQL NOTIFY + 30s fallback poll)"
+        );
     } else {
         tracing::info!(
             "License enforcement not configured (LICENSE_URL not set) — running unrestricted"
@@ -299,15 +321,11 @@ async fn main() -> Result<()> {
         .layer(prometheus_layer)
         .merge(app_metrics.metrics_router());
 
-    // Set up graceful shutdown signal handler
-    let shutdown_state = state.clone();
-    let shutdown_signal = async move {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to install CTRL+C signal handler");
-        tracing::info!("Shutdown signal received, stopping background tasks...");
-        shutdown_state.shutdown_all_tasks().await;
-        tracing::info!("Shutdown complete");
+    let wait_for_shutdown = async {
+        match nanosiem_core::shutdown::wait_for_shutdown_signal().await {
+            Ok(signal) => tracing::info!(%signal, "Shutdown signal received"),
+            Err(error) => tracing::error!(%error, "Shutdown signal handler failed"),
+        }
     };
 
     // Start server with ConnectInfo support for capturing client IP addresses
@@ -316,11 +334,78 @@ async fn main() -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&bind_address).await?;
     let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
-    axum::serve(listener, make_service)
-        .with_graceful_shutdown(shutdown_signal)
-        .await?;
+    let server_shutdown = nanosiem_core::shutdown::ShutdownToken::new();
+    let graceful_shutdown = server_shutdown.clone();
+    let server = axum::serve(listener, make_service).with_graceful_shutdown(async move {
+        graceful_shutdown.cancelled().await;
+    });
+    let cleanup_state = state.clone();
+    let cleanup = async move {
+        tracing::info!("Stopping background tasks...");
+        cleanup_state.shutdown_all_tasks().await;
+        tracing::info!("Shutdown complete");
+    };
+    nanosiem_core::shutdown::run_server_with_shutdown(
+        server,
+        server_shutdown,
+        wait_for_shutdown,
+        cleanup,
+    )
+    .await?;
 
     Ok(())
+}
+
+#[cfg(feature = "enterprise")]
+async fn refresh_airgap_license_status(state: &AppState) {
+    let repository = nanosiem_core::LicenseRepository::new(state.pool.clone());
+    match repository.get_status().await {
+        Ok(persisted) => {
+            let decided = airgap_boot_license_status(persisted, chrono::Utc::now());
+            *state.license_status.write().await = decided;
+        }
+        Err(error) => {
+            // Keep the last known in-memory status on a transient database
+            // failure. The next notification or bounded poll retries.
+            tracing::warn!(%error, "Failed to refresh air-gap license status");
+        }
+    }
+}
+
+#[cfg(feature = "enterprise")]
+async fn run_airgap_license_refresh(state: AppState) {
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+    const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+    loop {
+        let mut listener = match sqlx::postgres::PgListener::connect_with(&state.pool).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                tracing::warn!(%error, "Failed to connect air-gap license listener");
+                refresh_airgap_license_status(&state).await;
+                tokio::time::sleep(RECONNECT_DELAY).await;
+                continue;
+            }
+        };
+        if let Err(error) = listener.listen("license_status_changed").await {
+            tracing::warn!(%error, "Failed to subscribe air-gap license listener");
+            refresh_airgap_license_status(&state).await;
+            tokio::time::sleep(RECONNECT_DELAY).await;
+            continue;
+        }
+
+        // Close the load-before-LISTEN race on startup/reconnect.
+        refresh_airgap_license_status(&state).await;
+        loop {
+            match tokio::time::timeout(POLL_INTERVAL, listener.recv()).await {
+                Ok(Ok(_)) | Err(_) => refresh_airgap_license_status(&state).await,
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "Air-gap license listener disconnected");
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Decide the boot license status for an **air-gapped** deployment (NAN-1222).

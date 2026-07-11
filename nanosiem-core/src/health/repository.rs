@@ -7,6 +7,16 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::types::HealthIssue;
+use crate::models::notification::NotificationType;
+
+/// Notification payload inserted transactionally with a health-issue claim.
+pub struct HealthNotification {
+    pub notification_type: NotificationType,
+    pub title: String,
+    pub message: Option<String>,
+    pub link: Option<String>,
+    pub metadata: serde_json::Value,
+}
 
 #[derive(Error, Debug)]
 pub enum HealthRepositoryError {
@@ -81,6 +91,88 @@ impl HealthRepository {
             resolved_at: row.get("resolved_at"),
             notification_sent: row.get("notification_sent"),
         })
+    }
+
+    /// Reopen/create an issue and notify admins exactly once in one transaction.
+    ///
+    /// `Some(recipient_count)` means this caller won the notification claim;
+    /// `None` means another scheduler already completed it for this active issue.
+    pub async fn notify_issue_once(
+        &self,
+        issue_type: &str,
+        issue_key: &str,
+        notification: &HealthNotification,
+    ) -> Result<Option<u64>, HealthRepositoryError> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            INSERT INTO health_issue_tracker (issue_type, issue_key)
+            VALUES ($1, $2)
+            ON CONFLICT (issue_type, issue_key) DO UPDATE SET
+                resolved_at = NULL,
+                first_detected_at = CASE
+                    WHEN health_issue_tracker.resolved_at IS NOT NULL THEN NOW()
+                    ELSE health_issue_tracker.first_detected_at
+                END,
+                notification_sent = CASE
+                    WHEN health_issue_tracker.resolved_at IS NOT NULL THEN false
+                    ELSE COALESCE(health_issue_tracker.notification_sent, false)
+                END
+            RETURNING id
+            "#,
+        )
+        .bind(issue_type)
+        .bind(issue_key)
+        .fetch_one(&mut *tx)
+        .await?;
+        let issue_id: Uuid = row.get("id");
+
+        let claimed = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            UPDATE health_issue_tracker
+            SET notification_sent = true
+            WHERE id = $1 AND COALESCE(notification_sent, false) = false
+            RETURNING id
+            "#,
+        )
+        .bind(issue_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+
+        if !claimed {
+            tx.commit().await?;
+            return Ok(None);
+        }
+
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO notifications (
+                user_id, notification_type, title, message, link, metadata
+            )
+            SELECT DISTINCT
+                u.id, $1, $2, $3, $4, $5
+            FROM users u
+            WHERE u.status = 'active'
+              AND EXISTS (
+                  SELECT 1 FROM user_groups ug
+                  JOIN group_roles gr ON gr.group_id = ug.group_id
+                  JOIN roles r ON r.id = gr.role_id
+                  WHERE ug.user_id = u.id AND r.name = 'Admin'
+              )
+            "#,
+        )
+        .bind(notification.notification_type.to_string())
+        .bind(&notification.title)
+        .bind(&notification.message)
+        .bind(&notification.link)
+        .bind(&notification.metadata)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+
+        Ok(Some(inserted))
     }
 
     /// Mark an issue as resolved

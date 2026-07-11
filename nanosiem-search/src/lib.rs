@@ -72,6 +72,8 @@ pub struct SearchState {
     leader_rx: Option<watch::Receiver<bool>>,
     /// Search result cache (Dragonfly/Redis — None if unavailable)
     pub result_cache: Option<cache::SearchResultCache>,
+    /// Shared request ownership used to authorize cancellation on any search replica.
+    query_owner_redis: Option<redis::aio::ConnectionManager>,
     /// IP allowlist service for access control
     pub ip_allowlist_service: Arc<IpAllowlistService>,
 }
@@ -173,8 +175,13 @@ impl SearchState {
             }
         }
 
-        // Connect to Dragonfly/Redis for job store and result caching (optional)
+        // Connect to Dragonfly/Redis for job store, cancellation ownership, and
+        // result caching (optional).
         let redis_url = std::env::var("REDIS_URL").ok();
+        let query_owner_redis = match redis_url.as_deref() {
+            Some(url) => Self::connect_redis(url).await,
+            None => None,
+        };
 
         // Wire Redis for job store and cluster-wide admission limits (falls back to in-memory/local)
         if let Some(ref url) = redis_url {
@@ -238,8 +245,57 @@ impl SearchState {
             start_time: Instant::now(),
             leader_rx: None,
             result_cache,
+            query_owner_redis,
             ip_allowlist_service,
         }
+    }
+
+    fn query_owner_key(request_id: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(request_id.as_bytes());
+        format!("nanosiem:search:query-owner:{}", hex::encode(digest))
+    }
+
+    /// Reserve a client request id for an authenticated user across all search replicas.
+    pub async fn reserve_query_owner(
+        &self,
+        request_id: &str,
+        user_id: uuid::Uuid,
+    ) -> redis::RedisResult<bool> {
+        let Some(mut conn) = self.query_owner_redis.clone() else {
+            return Ok(true);
+        };
+        const OWNER_TTL_SECS: u64 = 60 * 60;
+        let key = Self::query_owner_key(request_id);
+        let owner = user_id.to_string();
+        let inserted: Option<String> = redis::cmd("SET")
+            .arg(&key).arg(&owner).arg("NX").arg("EX").arg(OWNER_TTL_SECS)
+            .query_async(&mut conn).await?;
+        if inserted.is_some() {
+            return Ok(true);
+        }
+        let existing: Option<String> = redis::cmd("GET")
+            .arg(&key).query_async(&mut conn).await?;
+        if existing.as_deref() != Some(owner.as_str()) {
+            return Ok(false);
+        }
+        // Companion queries reuse the main request id. Keep the proof alive.
+        let _: bool = redis::cmd("EXPIRE")
+            .arg(&key).arg(OWNER_TTL_SECS).query_async(&mut conn).await?;
+        Ok(true)
+    }
+
+    /// Resolve request ownership from the shared active/active registry.
+    pub async fn shared_query_owner(
+        &self,
+        request_id: &str,
+    ) -> redis::RedisResult<Option<uuid::Uuid>> {
+        let Some(mut conn) = self.query_owner_redis.clone() else {
+            return Ok(None);
+        };
+        let owner: Option<String> = redis::cmd("GET")
+            .arg(Self::query_owner_key(request_id)).query_async(&mut conn).await?;
+        Ok(owner.and_then(|value| uuid::Uuid::parse_str(&value).ok()))
     }
 
     /// Start periodic cleanup for query tracker stale entries and expired search jobs.
@@ -760,4 +816,17 @@ pub fn create_router(
         .with_state(state)
         // Merge the prometheus metrics endpoint
         .merge(search_metrics.metrics_router())
+}
+
+#[cfg(test)]
+mod query_owner_tests {
+    use super::SearchState;
+
+    #[test]
+    fn query_owner_keys_are_stable_and_do_not_embed_client_ids() {
+        let key = SearchState::query_owner_key("customer-visible-request-id");
+        assert_eq!(key, SearchState::query_owner_key("customer-visible-request-id"));
+        assert_ne!(key, SearchState::query_owner_key("other-request-id"));
+        assert!(!key.contains("customer-visible-request-id"));
+    }
 }

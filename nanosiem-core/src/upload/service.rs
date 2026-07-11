@@ -207,10 +207,17 @@ impl UploadService {
                         .map_err(|e| UploadError::IngestionError(e.to_string()))?;
                 }
 
-                lookup_service
-                    .insert_records(table_name, records)
-                    .await
-                    .map_err(|e| UploadError::IngestionError(e.to_string()))?
+                if let Some(idempotency_key) = request.idempotency_key {
+                    lookup_service
+                        .insert_records_idempotent(table_name, records, idempotency_key)
+                        .await
+                        .map_err(|e| UploadError::IngestionError(e.to_string()))?
+                } else {
+                    lookup_service
+                        .insert_records(table_name, records)
+                        .await
+                        .map_err(|e| UploadError::IngestionError(e.to_string()))?
+                }
             }
         };
 

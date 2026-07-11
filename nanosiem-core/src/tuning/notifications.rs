@@ -79,11 +79,8 @@ impl NotificationService {
         results: &TestResults,
         rule_name: &str,
     ) -> Result<Vec<Uuid>, NotificationError> {
-        let status = if results.validation_passed {
-            "PASSED"
-        } else {
-            "FAILED"
-        };
+        let fully_passed = results.validation_passed && results.true_positives_preserved;
+        let status = if fully_passed { "PASSED" } else { "FAILED" };
 
         let title = format!("Validation {}: {}", status, rule_name);
         let message = format!(
@@ -91,11 +88,7 @@ impl NotificationService {
             Alert reduction: {:.1}% ({} → {}). \
             True positives preserved: {}",
             rule_name,
-            if results.validation_passed {
-                "passed"
-            } else {
-                "failed"
-            },
+            if fully_passed { "passed" } else { "failed" },
             results.reduction_percentage,
             results.original_alert_count,
             results.tuned_alert_count,

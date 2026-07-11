@@ -72,6 +72,7 @@ fn create_test_log_entry(rule_id: Uuid) -> TuningLogEntry {
                 severity_distribution_change: HashMap::new(),
                 pattern_changes: vec![],
             },
+            validation_proof: None,
         }),
         staging_deployment: None,
         status: TuningStatus::TestPassed,

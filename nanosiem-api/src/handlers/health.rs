@@ -50,6 +50,12 @@ pub struct PublicHealthResponse {
     pub status: String,
 }
 
+async fn control_plane_ready(state: &AppState) -> bool {
+    // The API intentionally degrades to PostgreSQL-only operation when ClickHouse
+    // is unavailable. Search has its own CH-dependent readiness endpoint.
+    state.dual_pool().health_check().await.postgres_healthy
+}
+
 /// Health check response for PostgreSQL-only mode
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct HealthResponse {
@@ -206,6 +212,23 @@ pub async fn health_check(State(state): State<AppState>) -> Json<PublicHealthRes
     })
 }
 
+#[utoipa::path(
+    get, path = "/ready", tag = "health",
+    responses(
+        (status = 200, description = "API is ready", body = PublicHealthResponse),
+        (status = 503, description = "API dependencies are unavailable", body = PublicHealthResponse),
+    ),
+    security(())
+)]
+pub async fn ready_check(State(state): State<AppState>) -> impl axum::response::IntoResponse {
+    let ready = control_plane_ready(&state).await;
+    let status = if ready { axum::http::StatusCode::OK }
+        else { axum::http::StatusCode::SERVICE_UNAVAILABLE };
+    (status, Json(PublicHealthResponse {
+        status: if ready { "ready" } else { "not_ready" }.to_string(),
+    }))
+}
+
 /// Detailed health check endpoint (authenticated)
 ///
 /// Returns health status for all configured databases and downstream services.
@@ -332,7 +355,7 @@ pub async fn health_check_detailed(
 
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(health_check, health_check_detailed),
+    paths(health_check, ready_check, health_check_detailed),
     components(schemas(
         PublicHealthResponse,
         HealthResponse,

@@ -241,6 +241,44 @@ impl ParserRepositoryService {
         Ok(())
     }
 
+    /// Run a repository sync in the caller's task.
+    ///
+    /// Leader-owned schedulers use this form so aborting the scheduler also
+    /// cancels every in-flight network, parse, and status-write future.
+    pub async fn sync_repository(
+        &self,
+        id: Uuid,
+    ) -> Result<SyncResult, ParserRepositoryError> {
+        let repo = self.get_repository(id).await?;
+        if !repo.enabled {
+            return Err(ParserRepositoryError::RepositoryDisabled);
+        }
+        {
+            let mut syncing = self.syncing_repos.write().await;
+            if !syncing.insert(id) {
+                return Err(ParserRepositoryError::SyncInProgress(id));
+            }
+        }
+
+        if let Err(error) = self
+            .repo_repository
+            .update_sync_status(id, "syncing", None, None, None)
+            .await
+        {
+            self.syncing_repos.write().await.remove(&id);
+            return Err(ParserRepositoryError::Internal(error.to_string()));
+        }
+        let result = self.run_sync(id).await;
+        if let Err(error) = &result {
+            let _ = self
+                .repo_repository
+                .update_sync_status(id, "failed", None, None, Some(&error.to_string()))
+                .await;
+        }
+        self.syncing_repos.write().await.remove(&id);
+        result
+    }
+
     /// Run sync (blocking, called from background task)
     async fn run_sync(&self, id: Uuid) -> Result<SyncResult, ParserRepositoryError> {
         let start = Instant::now();

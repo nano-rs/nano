@@ -249,3 +249,57 @@ impl ClickHouseExecutor {
         Ok(result)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn exact_batch_cancellation_checks_and_kills_all_owned_ids() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("SELECT count()"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw("{\"cnt\":2}\n", "application/json"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("KILL QUERY"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let executor = ClickHouseExecutor::new(
+            clickhouse::Client::default()
+                .with_url(server.uri())
+                .with_compression(clickhouse::Compression::None),
+        );
+        let ids = vec![
+            "tuning-validation-original-0".to_string(),
+            "tuning-validation-proposed-0".to_string(),
+        ];
+        assert!(executor.cancel_queries(&ids).await.expect("cancel queries"));
+
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(
+            requests.len(),
+            2,
+            "one running check and one synchronous kill"
+        );
+        let bodies = requests
+            .iter()
+            .map(|request| String::from_utf8_lossy(&request.body).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for id in ids {
+            assert!(bodies.contains(&id), "missing exact query id {id}");
+        }
+        assert!(bodies.contains("KILL QUERY"));
+        assert!(bodies.contains(" SYNC"));
+    }
+}

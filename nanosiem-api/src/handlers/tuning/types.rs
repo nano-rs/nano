@@ -68,7 +68,7 @@ pub struct ApproveProposalRequest {
     /// Optional modified query — if provided, overrides the AI-proposed query.
     /// Allows analysts to tweak the proposal before approving.
     pub modified_query: Option<String>,
-    /// Skip syntax validation (default: false). Use with caution.
+    /// Skip syntax validation (default: false). Requires detections:promote and a non-empty comment.
     #[serde(default)]
     pub skip_validation: bool,
 }
@@ -112,11 +112,25 @@ pub struct TuningSettings {
 }
 
 /// Response for proposal approval
+#[derive(Debug, Clone, Copy, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalOutcome {
+    Applied,
+    PrOpened,
+}
+
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ApprovalResponse {
     pub success: bool,
     pub message: String,
     pub version_id: Option<i32>,
+    pub outcome: Option<ApprovalOutcome>,
+    pub status: Option<TuningStatus>,
+    pub pr_url: Option<String>,
+    pub effective_query: Option<String>,
+    /// True when PostgreSQL committed but real-time ClickHouse DDL will retry.
+    pub runtime_sync_pending: bool,
+    pub runtime_sync_error: Option<String>,
 }
 
 /// Response for proposal rejection

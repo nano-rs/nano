@@ -71,6 +71,7 @@ pub mod scheduler;
 pub mod schema;
 pub mod search;
 pub mod settings;
+pub mod shutdown;
 pub mod siem_health;
 pub mod source_configs;
 pub mod sql_hygiene;
@@ -189,8 +190,8 @@ pub use detection::{
     calculate_next_run_with_jitter, generate_node_id, DailyMatchCount, DetectionError,
     DetectionService, DistributedDetectionScheduler, DistributedSchedulerConfig,
     HistoricalAnalysisResult, MaterializedViewError, MaterializedViewGenerator,
-    RiskError, RiskModifier, RiskResult, ScoreCalculator, SignalProcessor, SignalProcessorConfig,
-    TimeBucket,
+    RiskError, RiskModifier, RiskResult, RuleTestAdmission, RuleTestAdmissionError,
+    RuleTestPermit, ScoreCalculator, SignalProcessor, SignalProcessorConfig, TimeBucket,
 };
 pub use enrichment::{
     EnrichmentError, EnrichmentRepository, EnrichmentService, IpEnrichmentResult, LogEnrichment,
@@ -278,8 +279,9 @@ pub use parsers::{
     CredentialRepositoryError, DeploymentAction, DeploymentResult, DeploymentStatus,
     GcpPubSubCredentials, GcpPubSubSourceConfig, KafkaCredentials,
     KafkaSourceConfig as ParserKafkaSourceConfig, NewParser, Parser, ParserCategory,
-    ParserDeployment, ParserService, ParserServiceError, ParserTestResult, S3SourceConfig,
-    UpdateCloudCredential, UpdateParser, ValidationResult, VrlValidationResult,
+    ParserDeployment, ParserService, ParserServiceError, ParserTestResult, PublicationOutcome,
+    S3SourceConfig, SnapshotBundle, UpdateCloudCredential, UpdateParser, ValidationResult,
+    VectorConfigPublicationError, VectorConfigPublisher, VrlValidationResult,
 };
 pub use prevalence::{
     ArtifactType, BulkPrevalenceRequest, ExportFormat, PrevalenceConfig, PrevalenceData,

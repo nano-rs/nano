@@ -15,8 +15,39 @@ use nanosiem_core::license::checker::LicenseCheckerConfig;
 use nanosiem_core::LeaderElection;
 #[cfg(feature = "enterprise")]
 use nanosiem_core::LicenseChecker;
+use std::future::Future;
 #[cfg(feature = "enterprise")]
 use std::sync::Arc;
+
+async fn abort_and_await_leader_tasks(handles: &mut Vec<tokio::task::JoinHandle<()>>) {
+    if handles.is_empty() {
+        return;
+    }
+
+    tracing::info!(
+        tasks = handles.len(),
+        "Stopping leader-only scheduler tasks"
+    );
+    for handle in handles.iter() {
+        handle.abort();
+    }
+    while let Some(handle) = handles.pop() {
+        match handle.await {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => tracing::warn!(?error, "Leader-only scheduler task failed"),
+        }
+    }
+}
+
+async fn stop_then_release_claims<S, R>(stop_tasks: S, release_claims: R)
+where
+    S: Future<Output = ()>,
+    R: Future<Output = ()>,
+{
+    stop_tasks.await;
+    release_claims.await;
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -27,6 +58,7 @@ async fn main() -> Result<()> {
     // Load configuration (reuses API config — same env vars)
     let config = ApiConfig::from_env();
     tracing::info!("Configuration loaded");
+    let leader_election_enabled = leader_election_configuration()?;
 
     // Initialize AppState with DualPool. Both ClickHouse and PostgreSQL are
     // required; the historical PG-only fallback was removed in NAN-800.
@@ -111,11 +143,6 @@ async fn main() -> Result<()> {
         state.add_task_handle(handle).await;
     }
 
-    // Health monitoring
-    tracing::info!("Starting health monitoring scheduler...");
-    let health_handle = state.start_health_scheduler();
-    state.add_task_handle(health_handle).await;
-
     // meloD config poller (needed for tuning orchestrator AI client).
     // Enterprise only — open tuning runs without AI proposal generation.
     #[cfg(feature = "enterprise")]
@@ -135,32 +162,37 @@ async fn main() -> Result<()> {
     }
 
     // === Leader-only tasks ===
-    let leader_election_enabled = std::env::var("LEADER_ELECTION_ENABLED")
-        .map(|v| v.to_lowercase() != "false" && v != "0")
-        .unwrap_or(true);
-
     if leader_election_enabled {
         tracing::info!("Leader election enabled — starting advisory lock election");
         let election = LeaderElection::new(state.pool.clone(), lock_ids::API_SCHEDULER);
-        let mut rx = election.start();
+        let leader_shutdown = state.shutdown_token();
+        let (mut rx, election_handle) = election.start(leader_shutdown.clone());
+        state.add_task_handle(election_handle).await;
 
         let leader_state = state.clone();
         let leader_handle = tokio::spawn(async move {
             let mut leader_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
             loop {
-                if rx.changed().await.is_err() {
-                    tracing::error!("Leader election channel closed unexpectedly");
-                    return;
+                tokio::select! {
+                    biased;
+                    _ = leader_shutdown.cancelled() => {
+                        abort_and_await_leader_tasks(&mut leader_handles).await;
+                        return;
+                    }
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            abort_and_await_leader_tasks(&mut leader_handles).await;
+                            if !leader_shutdown.is_cancelled() {
+                                tracing::error!("Leader election channel closed unexpectedly");
+                            }
+                            return;
+                        }
+                    }
                 }
 
-                if !leader_handles.is_empty() {
-                    tracing::info!(
-                        "Stopping {} leader-only scheduler task(s)",
-                        leader_handles.len()
-                    );
-                    for handle in leader_handles.drain(..) {
-                        handle.abort();
-                    }
+                abort_and_await_leader_tasks(&mut leader_handles).await;
+                if leader_shutdown.is_cancelled() {
+                    return;
                 }
 
                 if *rx.borrow() {
@@ -170,7 +202,7 @@ async fn main() -> Result<()> {
         });
         state.add_task_handle(leader_handle).await;
     } else {
-        tracing::warn!("Leader election disabled — starting all schedulers unconditionally");
+        tracing::warn!("Leader election disabled for explicitly declared single-node jobs service");
         let handles = state.start_leader_schedulers().await;
         for handle in handles {
             state.add_task_handle(handle).await;
@@ -229,25 +261,162 @@ async fn main() -> Result<()> {
         .merge(app_metrics.metrics_router())
         .layer(prometheus_layer);
 
-    let shutdown_state = state.clone();
-    let shutdown_signal = async move {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to install CTRL+C signal handler");
-        tracing::info!("Shutdown signal received, stopping background tasks...");
-        shutdown_state.shutdown_all_tasks().await;
-        tracing::info!("Releasing distributed claims...");
-        shutdown_state.release_all_distributed_claims().await;
-        tracing::info!("Shutdown complete");
+    let wait_for_shutdown = async {
+        match nanosiem_core::shutdown::wait_for_shutdown_signal().await {
+            Ok(signal) => tracing::info!(%signal, "Shutdown signal received"),
+            Err(error) => tracing::error!(%error, "Shutdown signal handler failed"),
+        }
     };
 
     let bind_address = format!("0.0.0.0:{}", jobs_port);
     tracing::info!("Starting health + metrics endpoint on {}", bind_address);
 
     let listener = tokio::net::TcpListener::bind(&bind_address).await?;
-    axum::serve(listener, health_router)
-        .with_graceful_shutdown(shutdown_signal)
-        .await?;
+    let server_shutdown = nanosiem_core::shutdown::ShutdownToken::new();
+    let graceful_shutdown = server_shutdown.clone();
+    let server = axum::serve(listener, health_router).with_graceful_shutdown(async move {
+        graceful_shutdown.cancelled().await;
+    });
+    let cleanup_state = state.clone();
+    let cleanup = async move {
+        stop_then_release_claims(
+            async {
+                tracing::info!("Stopping background tasks...");
+                cleanup_state.shutdown_all_tasks().await;
+            },
+            async {
+                tracing::info!("Releasing distributed claims...");
+                cleanup_state.release_all_distributed_claims().await;
+            },
+        )
+        .await;
+        tracing::info!("Shutdown complete");
+    };
+    nanosiem_core::shutdown::run_server_with_shutdown(
+        server,
+        server_shutdown,
+        wait_for_shutdown,
+        cleanup,
+    )
+    .await?;
 
     Ok(())
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .map(|value| value.to_ascii_lowercase() != "false" && value != "0")
+        .unwrap_or(default)
+}
+
+fn leader_election_configuration() -> Result<bool> {
+    let enabled = env_flag("LEADER_ELECTION_ENABLED", true);
+    let single_node = std::env::var("JOBS_SINGLE_NODE")
+        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "true" | "1"))
+        .unwrap_or(false);
+    validate_leader_election_configuration(enabled, single_node)?;
+    Ok(enabled)
+}
+
+fn validate_leader_election_configuration(enabled: bool, single_node: bool) -> Result<()> {
+    if !enabled && !single_node {
+        anyhow::bail!(
+            "LEADER_ELECTION_ENABLED=false requires JOBS_SINGLE_NODE=true; refusing to start because unfenced leader schedulers are unsafe in a multi-node jobs deployment"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    struct RunningGuard(Arc<AtomicUsize>);
+
+    impl Drop for RunningGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn leader_children_are_aborted_and_awaited() {
+        let running = Arc::new(AtomicUsize::new(2));
+        let started = Arc::new(tokio::sync::Barrier::new(3));
+        let mut handles = Vec::new();
+
+        for _ in 0..2 {
+            let task_running = Arc::clone(&running);
+            let task_started = Arc::clone(&started);
+            handles.push(tokio::spawn(async move {
+                let _guard = RunningGuard(task_running);
+                task_started.wait().await;
+                std::future::pending::<()>().await;
+            }));
+        }
+        started.wait().await;
+
+        abort_and_await_leader_tasks(&mut handles).await;
+
+        assert!(handles.is_empty());
+        assert_eq!(running.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn claims_are_released_only_after_tracked_work_stops() {
+        let work_running = Arc::new(AtomicBool::new(true));
+        let claims_released = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&work_running);
+        let observed_running = Arc::clone(&work_running);
+        let released = Arc::clone(&claims_released);
+
+        stop_then_release_claims(
+            async move {
+                tokio::task::yield_now().await;
+                stopped.store(false, Ordering::SeqCst);
+            },
+            async move {
+                assert!(!observed_running.load(Ordering::SeqCst));
+                released.store(true, Ordering::SeqCst);
+            },
+        )
+        .await;
+
+        assert!(claims_released.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn disabled_election_requires_an_explicit_single_node_declaration() {
+        assert!(validate_leader_election_configuration(false, false).is_err());
+        assert!(validate_leader_election_configuration(false, true).is_ok());
+        assert!(validate_leader_election_configuration(true, false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn leadership_loss_aborts_and_awaits_owned_work() {
+        // Reconciled onto the single retained teardown helper: 1781's
+        // stop_leader_tasks was folded into abort_and_await_leader_tasks so the
+        // abort-then-await-then-release-claims ordering is preserved.
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
+        let mut handles = vec![tokio::spawn(async move {
+            let _signal = DropSignal(Some(dropped_tx));
+            std::future::pending::<()>().await;
+        })];
+        tokio::task::yield_now().await;
+        abort_and_await_leader_tasks(&mut handles).await;
+
+        assert!(handles.is_empty());
+        assert!(dropped_rx.await.is_ok());
+    }
 }

@@ -1,14 +1,17 @@
 {
   "name": "vite-react-typescript-starter",
   "private": true,
-  "version": "0.1.663",
+  "version": "0.1.664",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "generate:udm": "node scripts/generate-udm-fields.mjs",
     "build": "node scripts/generate-udm-fields.mjs && tsc -b && vite build",
     "lint": "eslint .",
+    "test:mitre": "node tests/run-mitre-contract-tests.mjs",
     "preview": "vite preview",
+    "test:tuning-contract": "node --test src/enterprise/api/tuning-response.test.mjs",
+    "test:mitre-readiness": "node --test src/components/mitre/types.test.ts",
     "typecheck": "tsc --noEmit -p tsconfig.app.json"
   },
   "dependencies": {

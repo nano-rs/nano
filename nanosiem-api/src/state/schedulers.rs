@@ -4,16 +4,19 @@ use super::AppState;
 
 #[cfg(feature = "enterprise")]
 use nanosiem_core::crypto::EncryptionService;
-#[cfg(feature = "enterprise")]
-use nanosiem_enterprise::custom_enrichment::scheduler::CustomEnrichmentScheduler;
 use nanosiem_core::enrichment::{EnrichmentRepository, EnrichmentScheduler};
 use nanosiem_core::identity::IdentitySyncScheduler;
 use nanosiem_core::marketplace::MarketplaceSyncService;
-#[cfg(feature = "enterprise")]
-use nanosiem_enterprise::melod::ModelCatalogScheduler;
+use nanosiem_core::mitre::{MitreRepository, MitreSync, MitreSyncOutcome};
+use nanosiem_core::models::detection_rule::DetectionMode;
 use nanosiem_core::parser_repository::ParserRepositoryService;
 use nanosiem_core::rule_repository::RuleRepositoryService;
+use nanosiem_core::tuning::versions::{PendingRuntimeSync, RuleVersionManager};
 use nanosiem_core::{DistributedDetectionScheduler, DistributedSchedulerConfig};
+#[cfg(feature = "enterprise")]
+use nanosiem_enterprise::custom_enrichment::scheduler::CustomEnrichmentScheduler;
+#[cfg(feature = "enterprise")]
+use nanosiem_enterprise::melod::ModelCatalogScheduler;
 use std::sync::Arc;
 
 impl AppState {
@@ -56,8 +59,14 @@ impl AppState {
             *guard = Some(scheduler.clone());
         }
 
-        handles.push(scheduler.start());
+        handles.push(scheduler.start_with_shutdown(self.shutdown_token()));
         tracing::info!("Distributed detection scheduler started");
+
+        // Query changes and rollbacks commit a durable reconciliation job with
+        // PostgreSQL state. Every API node competes for these jobs so a crash
+        // between commit and ClickHouse DDL is recoverable.
+        handles.push(self.start_rule_runtime_sync_reconciler());
+        tracing::info!("Distributed rule runtime reconciliation started");
 
         // --- Distributed scheduled jobs ---
         // These are inputlookup ingestion jobs that fetch remote feed URLs over
@@ -77,7 +86,10 @@ impl AppState {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(30);
-            handles.push(scheduler_service.start_scheduler(poll_interval));
+            handles.push(
+                scheduler_service
+                    .start_scheduler_with_shutdown(poll_interval, self.shutdown_token()),
+            );
             tracing::info!(
                 "Distributed scheduled jobs loop started ({}s poll)",
                 poll_interval
@@ -87,14 +99,203 @@ impl AppState {
         handles
     }
 
+    fn start_rule_runtime_sync_reconciler(&self) -> tokio::task::JoinHandle<()> {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let manager = RuleVersionManager::new(state.pool.clone());
+            loop {
+                let owner = format!("{}:{}", state.node_id, uuid::Uuid::now_v7());
+                match manager.claim_pending_runtime_sync(&owner).await {
+                    Ok(Some(pending)) => {
+                        match state.reconcile_rule_runtime_sync(&pending, &owner).await {
+                            Ok(()) => tracing::info!(
+                                rule_id = %pending.rule_id,
+                                version_id = pending.desired_version_id,
+                                "Reconciled rule runtime after PostgreSQL change"
+                            ),
+                            Err(error) => tracing::warn!(
+                                rule_id = %pending.rule_id,
+                                %error,
+                                "Rule runtime reconciliation will retry"
+                            ),
+                        }
+                    }
+                    Ok(None) => tokio::time::sleep(std::time::Duration::from_secs(5)).await,
+                    Err(error) => {
+                        tracing::warn!(%error, "Failed to claim runtime reconciliation job");
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        })
+    }
+
+    /// Render and acknowledge a runtime sync only for the exact PostgreSQL
+    /// revision loaded under the shared per-rule writer lock. If the rule is
+    /// revised during DDL, the CAS fails and the loop renders the newer state.
+    pub(crate) async fn reconcile_rule_runtime_sync(
+        &self,
+        pending: &PendingRuntimeSync,
+        owner: &str,
+    ) -> Result<(), String> {
+        const MAX_REVISION_RETRIES: usize = 3;
+        const DDL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+        let _runtime_lock = self
+            .detection_service
+            .acquire_rule_runtime_lock(pending.rule_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let manager = RuleVersionManager::new(self.pool.clone());
+        for _ in 0..MAX_REVISION_RETRIES {
+            let renewed = manager
+                .renew_runtime_sync_lease(pending, owner)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !renewed {
+                if matches!(
+                    self.detection_service.get_rule(pending.rule_id).await,
+                    Err(nanosiem_core::detection::DetectionError::RuleNotFound(_))
+                ) {
+                    return self
+                        .cleanup_deleted_rule_runtime(pending, owner, &manager)
+                        .await;
+                }
+                return Err("runtime reconciliation lease is no longer owned".to_string());
+            }
+
+            let rule = match self.detection_service.get_rule(pending.rule_id).await {
+                Ok(rule) => rule,
+                Err(nanosiem_core::detection::DetectionError::RuleNotFound(_)) => {
+                    return self
+                        .cleanup_deleted_rule_runtime(pending, owner, &manager)
+                        .await;
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    let _ = manager.fail_runtime_sync(pending, owner, &message).await;
+                    return Err(message);
+                }
+            };
+            let mut rendered_revision = rule.updated_at;
+            if rule.detection_mode == DetectionMode::RealTime {
+                match tokio::time::timeout(
+                    DDL_TIMEOUT,
+                    self.materialized_view_generator.recreate_view(&rule),
+                )
+                .await
+                {
+                    Ok(Ok(view_name)) => {
+                        if rule.materialized_view_name.as_deref() != Some(&view_name) {
+                            let revision: Option<chrono::DateTime<chrono::Utc>> =
+                                sqlx::query_scalar(
+                                    "UPDATE detection_rules
+                                     SET materialized_view_name = $1, updated_at = NOW()
+                                     WHERE id = $2 AND updated_at = $3
+                                     RETURNING updated_at",
+                                )
+                                .bind(&view_name)
+                                .bind(rule.id)
+                                .bind(rule.updated_at)
+                                .fetch_optional(&self.pool)
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            let Some(revision) = revision else {
+                                continue;
+                            };
+                            rendered_revision = revision;
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        let message = error.to_string();
+                        let _ = manager.fail_runtime_sync(pending, owner, &message).await;
+                        return Err(message);
+                    }
+                    Err(_) => {
+                        let message = "materialized-view reconciliation timed out".to_string();
+                        let _ = manager.fail_runtime_sync(pending, owner, &message).await;
+                        return Err(message);
+                    }
+                }
+            } else {
+                if let Err(message) = self.drop_rule_runtime_view(rule.id).await {
+                    let _ = manager.fail_runtime_sync(pending, owner, &message).await;
+                    return Err(message);
+                }
+            }
+
+            match manager
+                .complete_runtime_sync(pending, owner, rendered_revision)
+                .await
+            {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    if matches!(
+                        self.detection_service.get_rule(pending.rule_id).await,
+                        Err(nanosiem_core::detection::DetectionError::RuleNotFound(_))
+                    ) {
+                        return self
+                            .cleanup_deleted_rule_runtime(pending, owner, &manager)
+                            .await;
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    let _ = manager.fail_runtime_sync(pending, owner, &message).await;
+                    return Err(message);
+                }
+            }
+        }
+
+        let message = "rule changed repeatedly during runtime reconciliation".to_string();
+        let _ = manager.fail_runtime_sync(pending, owner, &message).await;
+        Err(message)
+    }
+
+    async fn drop_rule_runtime_view(&self, rule_id: uuid::Uuid) -> Result<(), String> {
+        let view_name =
+            nanosiem_core::detection::MaterializedViewGenerator::view_name_for_rule_id(rule_id);
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            self.materialized_view_generator.drop_view(&view_name),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(_) => Err("materialized-view cleanup timed out".to_string()),
+        }
+    }
+
+    async fn cleanup_deleted_rule_runtime(
+        &self,
+        pending: &PendingRuntimeSync,
+        owner: &str,
+        manager: &RuleVersionManager,
+    ) -> Result<(), String> {
+        if let Err(message) = self.drop_rule_runtime_view(pending.rule_id).await {
+            let _ = manager.fail_runtime_sync(pending, owner, &message).await;
+            return Err(message);
+        }
+        match manager.complete_deleted_runtime_sync(pending, owner).await {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                Err("deleted-rule runtime cleanup lost its reconciliation lease".to_string())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
     /// Start the enrichment auto-sync scheduler
     ///
     /// This spawns a background task that periodically checks enrichment sources
     /// and syncs them if they're due for an update.
     pub fn start_enrichment_scheduler(&self) -> tokio::task::JoinHandle<()> {
         let enrichment_repo = EnrichmentRepository::new(self.pool.clone());
-        let scheduler = EnrichmentScheduler::with_defaults(self.enrichment.clone(), enrichment_repo)
-            .with_clickhouse(self.dual_pool.clickhouse().clone());
+        let scheduler =
+            EnrichmentScheduler::with_defaults(self.enrichment.clone(), enrichment_repo)
+                .with_clickhouse(self.dual_pool.clickhouse().clone());
         let scheduler = Arc::new(scheduler);
         scheduler.start()
     }
@@ -152,7 +353,7 @@ impl AppState {
                     Ok(repos) => {
                         tracing::info!(count = repos.len(), "Auto-syncing marketplace repos");
                         for r in &repos {
-                            if let Err(e) = sync_service.start_sync(r.id).await {
+                            if let Err(e) = sync_service.sync_repository(r.id).await {
                                 tracing::warn!(repo = %r.name, error = %e, "Failed to auto-sync marketplace repo");
                             }
                         }
@@ -195,7 +396,7 @@ impl AppState {
                     Ok(repos) => {
                         tracing::info!(count = repos.len(), "Auto-syncing parser repos");
                         for r in &repos {
-                            if let Err(e) = service.start_sync(r.id).await {
+                            if let Err(e) = service.sync_repository(r.id).await {
                                 tracing::warn!(repo = %r.name, error = %e, "Failed to auto-sync parser repo");
                             }
                         }
@@ -238,7 +439,7 @@ impl AppState {
                     Ok(repos) => {
                         tracing::info!(count = repos.len(), "Auto-syncing rule repos");
                         for r in &repos {
-                            if let Err(e) = service.start_sync(r.id).await {
+                            if let Err(e) = service.sync_repository(r.id).await {
                                 tracing::warn!(repo = %r.name, error = %e, "Failed to auto-sync rule repo");
                             }
                         }
@@ -265,6 +466,80 @@ impl AppState {
             .unwrap_or(86400); // 24 hours
 
         ModelCatalogScheduler::new(pool, interval_secs).start()
+    }
+
+    /// Start the pinned MITRE ATT&CK catalog synchronizer.
+    ///
+    /// The first tick runs immediately. Until the catalog is first populated the
+    /// loop ticks on a short boot cadence (MITRE_SYNC_BOOT_INTERVAL_SECS, default
+    /// 60s) so a transient first-boot failure re-exposes an empty catalog
+    /// (NAN-1103) for at most that long rather than for a full long-interval
+    /// period — the persisted 300s·2ⁿ retry backoff otherwise sits well under
+    /// the 6h interval and never gets a chance to fire (NAN-1766 / D4). Once the
+    /// catalog is current the loop falls back to the long interval
+    /// (MITRE_SYNC_INTERVAL_SECS, default 6h). `sync_if_due` dedupes every tick
+    /// via the durable release/digest check and the persisted retry window, so
+    /// fast ticking never triggers redundant fetches. PostgreSQL advisory
+    /// locking fences manual sync and leader-failover overlap across nodes.
+    pub fn start_mitre_sync_scheduler(&self) -> tokio::task::JoinHandle<()> {
+        let pool = self.pool.clone();
+        let interval_secs: u64 = std::env::var("MITRE_SYNC_INTERVAL_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(21_600); // 6 hours
+        let boot_interval_secs: u64 = std::env::var("MITRE_SYNC_BOOT_INTERVAL_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(60);
+
+        tokio::spawn(async move {
+            let sync = MitreSync::new(MitreRepository::new(pool));
+            let long_interval = std::time::Duration::from_secs(interval_secs.max(60));
+            // Never let the boot cadence exceed the steady-state interval, and
+            // keep a small floor so a misconfiguration can't hot-loop.
+            let boot_interval = std::time::Duration::from_secs(
+                boot_interval_secs.clamp(15, interval_secs.max(60)),
+            );
+            let mut catalog_ready = false;
+            let mut interval = tokio::time::interval(boot_interval);
+            loop {
+                interval.tick().await;
+                let mut newly_ready = false;
+                match sync.sync_if_due().await {
+                    Ok(MitreSyncOutcome::Synced(result)) => {
+                        tracing::info!(
+                            release = %result.release,
+                            tactics = result.tactic_count,
+                            techniques = result.technique_count,
+                            "Scheduled MITRE catalog sync completed"
+                        );
+                        newly_ready = true;
+                    }
+                    Ok(MitreSyncOutcome::AlreadyCurrent) => {
+                        tracing::debug!("MITRE catalog is already current");
+                        newly_ready = true;
+                    }
+                    Ok(MitreSyncOutcome::RetryBackoff) => {
+                        tracing::debug!("MITRE catalog sync remains in retry backoff")
+                    }
+                    Ok(MitreSyncOutcome::AlreadyRunning) => {
+                        tracing::debug!("MITRE catalog sync is already running on another node")
+                    }
+                    Err(error) => tracing::warn!(%error, "Scheduled MITRE catalog sync failed"),
+                }
+
+                // Once the catalog is confirmed current, drop to the long steady
+                // -state cadence. `interval_at` schedules the next tick a full
+                // long interval out instead of firing immediately.
+                if newly_ready && !catalog_ready {
+                    catalog_ready = true;
+                    interval = tokio::time::interval_at(
+                        tokio::time::Instant::now() + long_interval,
+                        long_interval,
+                    );
+                }
+            }
+        })
     }
 
     /// Start the risk-decay sweep scheduler (NAN-1675).
@@ -298,7 +573,7 @@ impl AppState {
         // import it. Keep both imports gated so the open build doesn't trip
         // the unused-import lint.
         #[cfg(feature = "enterprise")]
-        use nanosiem_core::tuning::TuningRepository;
+        use nanosiem_core::tuning::{TestEngine, TuningRepository};
         #[cfg(feature = "enterprise")]
         use nanosiem_enterprise::tuning::orchestrator::TuningOrchestrator;
 
@@ -336,55 +611,61 @@ impl AppState {
             tuning_cache,
         );
 
-        // If AI is configured, create and add the orchestrator. Open-core
-        // builds skip this entirely — tuning still detects threshold breaches
-        // but never generates proposals.
+        // Enterprise always wires the orchestrator: durable PR recovery must
+        // run after leader failover even when AI is unavailable and there are
+        // no fresh breaches. The optional AI client gates only new generation.
         #[cfg(feature = "enterprise")]
-        if let Ok(melod_guard) = self.melod_service.try_read() {
-            if melod_guard.is_some() {
-                drop(melod_guard);
-                tracing::info!("AI is configured - enabling auto-tuning proposal generation");
+        {
+            let ai_client: Option<Arc<dyn nanosiem_core::extensions::AiClient>> = match self
+                .melod_service
+                .try_read()
+            {
+                Ok(melod_guard) if melod_guard.is_some() => {
+                    drop(melod_guard);
+                    tracing::info!("AI is configured - enabling auto-tuning proposal generation");
+                    Some(Arc::new(
+                        nanosiem_enterprise::melod::MelodAiClientBridge::live(
+                            self.melod_service.clone(),
+                            self.agent_config_registry.clone(),
+                        ),
+                    ))
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                            "AI is not configured - new tuning proposals are disabled; durable PR recovery remains enabled"
+                        );
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!(
+                            "Could not read meloD service state - new tuning proposals are disabled; durable PR recovery remains enabled"
+                        );
+                    None
+                }
+            };
 
-                let tuning_repository = TuningRepository::new(self.pool.clone());
-                let threshold_detector_arc = Arc::new(ThresholdDetector::new(
-                    self.pool.clone(),
-                    Arc::new(BaselineMonitor::new(self.pool.clone())),
-                ));
-                let notification_service_arc =
-                    Arc::new(NotificationService::new(self.pool.clone()));
+            let tuning_repository = TuningRepository::new(self.pool.clone());
+            let threshold_detector_arc = Arc::new(ThresholdDetector::new(
+                self.pool.clone(),
+                Arc::new(BaselineMonitor::new(self.pool.clone())),
+            ));
+            let notification_service_arc = Arc::new(NotificationService::new(self.pool.clone()));
+            let test_engine = Arc::new(TestEngine::new(
+                Arc::new(self.detection_service.clone()),
+                self.pool.clone(),
+            ));
 
-                // Wrap the reloadable meloD handles in a `MelodAiClientBridge::live`
-                // so the tuning agents see only the open-core `AiClient` trait.
-                // Per-agent routing (`tuning_auto`, `tuning_hint`) is handled
-                // inside the bridge.
-                let ai_client: Arc<dyn nanosiem_core::extensions::AiClient> = Arc::new(
-                    nanosiem_enterprise::melod::MelodAiClientBridge::live(
-                        self.melod_service.clone(),
-                        self.agent_config_registry.clone(),
-                    ),
-                );
-
-                let orchestrator = TuningOrchestrator::new(
-                    threshold_detector_arc,
-                    Arc::new(tuning_repository),
-                    notification_service_arc,
-                    Arc::new(dual_pool),
-                    Some(ai_client),
-                    self.config.schema_profile(),
-                );
-
-                scheduler = scheduler.with_orchestrator(Arc::new(orchestrator));
-            } else {
-                tracing::warn!(
-                    "AI is not configured - tuning scheduler will monitor metrics and detect breaches, \
-                    but will not generate tuning proposals. Configure AI credentials in Settings > meloD to enable auto-tuning."
-                );
-            }
-        } else {
-            tracing::warn!(
-                "Could not read meloD service state - tuning scheduler will monitor metrics and detect breaches, \
-                but will not generate tuning proposals."
+            let orchestrator = TuningOrchestrator::new(
+                threshold_detector_arc,
+                Arc::new(tuning_repository),
+                notification_service_arc,
+                test_engine,
+                Arc::new(dual_pool),
+                ai_client,
+                self.config.schema_profile(),
             );
+
+            scheduler = scheduler.with_orchestrator(Arc::new(orchestrator));
         }
 
         tracing::info!("Starting tuning scheduler tasks");
@@ -416,10 +697,10 @@ impl AppState {
 
     /// Start the SIEM health check scheduler (leader-only, every 12 hours)
     pub fn start_siem_health_check_scheduler(&self) -> tokio::task::JoinHandle<()> {
-        use std::sync::Arc;
-        use nanosiem_core::extensions::SiemHealthAiAnalyzer;
         #[cfg(not(feature = "enterprise"))]
         use nanosiem_core::extensions::NoopSiemHealthAiAnalyzer;
+        use nanosiem_core::extensions::SiemHealthAiAnalyzer;
+        use std::sync::Arc;
 
         let ch_client = self.dual_pool.clickhouse().clone();
         let is_clustered = self.dual_pool.table_names().is_clustered();
@@ -493,8 +774,7 @@ impl AppState {
             .unwrap_or(3600);
 
         tokio::spawn(async move {
-            let repo =
-                nanosiem_core::observability::MetricMonitorRepository::new(pool.clone());
+            let repo = nanosiem_core::observability::MetricMonitorRepository::new(pool.clone());
             // Last-evaluation instant per monitor id (in-memory due-time gate).
             let mut last_eval: HashMap<Uuid, Instant> = HashMap::new();
 
@@ -517,8 +797,7 @@ impl AppState {
                 // Drop due-gate entries for monitors that no longer exist so the
                 // map doesn't grow unbounded across deletes (O46; mirrors the SLO
                 // loop's retain at start_slo_scheduler).
-                let live: std::collections::HashSet<Uuid> =
-                    monitors.iter().map(|m| m.id).collect();
+                let live: std::collections::HashSet<Uuid> = monitors.iter().map(|m| m.id).collect();
                 last_eval.retain(|id, _| live.contains(id));
 
                 let now = Instant::now();
@@ -593,9 +872,8 @@ impl AppState {
         use nanosiem_core::query::{MetricAgg, MetricQuery, MetricTagFilter, TimeRange};
 
         // Re-parse the stored (already-validated) aggregate.
-        let agg = MetricAgg::from_str(&monitor.agg).ok_or_else(|| {
-            anyhow::anyhow!("monitor has unknown agg '{}'", monitor.agg)
-        })?;
+        let agg = MetricAgg::from_str(&monitor.agg)
+            .ok_or_else(|| anyhow::anyhow!("monitor has unknown agg '{}'", monitor.agg))?;
 
         // Bridge the owned monitor filters into the query-layer borrow form.
         let filters: Vec<MetricTagFilter> = monitor
@@ -868,18 +1146,17 @@ impl AppState {
                 for slo in slos {
                     // Isolate each SLO's evaluation (NAN-1102).
                     let fut = super::AppState::evaluate_one_slo(&search_service, &pool, &slo);
-                    let breaching =
-                        match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
-                            Ok(Ok(b)) => b,
-                            Ok(Err(e)) => {
-                                tracing::warn!(slo = %slo.name, error = %e, "SLO evaluation failed");
-                                continue;
-                            }
-                            Err(_) => {
-                                tracing::error!(slo = %slo.name, "SLO evaluation PANICKED (isolated)");
-                                continue;
-                            }
-                        };
+                    let breaching = match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+                        Ok(Ok(b)) => b,
+                        Ok(Err(e)) => {
+                            tracing::warn!(slo = %slo.name, error = %e, "SLO evaluation failed");
+                            continue;
+                        }
+                        Err(_) => {
+                            tracing::error!(slo = %slo.name, "SLO evaluation PANICKED (isolated)");
+                            continue;
+                        }
+                    };
 
                     let payload = match breaching {
                         Some(payload) => payload,
@@ -908,7 +1185,8 @@ impl AppState {
                         .await
                     {
                         Ok(Some(last_created)) => {
-                            if slo_alert_within_rearm(last_created, chrono::Utc::now(), rearm_secs) {
+                            if slo_alert_within_rearm(last_created, chrono::Utc::now(), rearm_secs)
+                            {
                                 // Within window. Refresh the in-memory pre-filter
                                 // so subsequent ticks short-circuit the DB query.
                                 last_alerted.insert(slo.id, now);

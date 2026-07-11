@@ -247,6 +247,9 @@ impl From<nanosiem_core::DetectionError> for ApiError {
             nanosiem_core::DetectionError::InvalidCronExpression(msg) => {
                 ApiError::ValidationError(msg.clone())
             }
+            nanosiem_core::DetectionError::InvalidMitreMapping(msg) => {
+                ApiError::ValidationError(msg.clone())
+            }
             nanosiem_core::DetectionError::ConcurrentModification(id) => {
                 ApiError::Conflict(format!(
                     "Rule {} was modified by another request. Please refresh and try again.",

@@ -47,6 +47,9 @@ pub enum DetectionError {
     #[error("Invalid real-time rule: {0}")]
     InvalidRealtimeRule(String),
 
+    #[error("Invalid MITRE ATT&CK mapping: {0}")]
+    InvalidMitreMapping(String),
+
     #[error("Materialized view error: {0}")]
     MaterializedViewError(String),
 
@@ -68,6 +71,9 @@ impl From<crate::db::repository::detection_rules::DetectionRuleRepositoryError> 
             }
             crate::db::repository::detection_rules::DetectionRuleRepositoryError::InvalidModeTransition(id, mode) => {
                 DetectionError::InvalidStateTransition(format!("Rule {} is currently in '{}' mode", id, mode))
+            }
+            crate::db::repository::detection_rules::DetectionRuleRepositoryError::InvalidMitreMapping(message) => {
+                DetectionError::InvalidMitreMapping(message)
             }
         }
     }

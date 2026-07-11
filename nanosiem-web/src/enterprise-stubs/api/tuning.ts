@@ -2,7 +2,7 @@
 
 // Open-edition stub for TuningAPI. Auto-tuning + tuning proposals are enterprise-only.
 
-import type { TuningSettings } from '@/lib/api/types';
+import type { TuningSettings, TuningStatus } from '@/lib/api/types';
 
 const ENTERPRISE_ONLY = (): Promise<never> =>
   Promise.reject(new Error('TuningAPI is enterprise-only'));
@@ -34,7 +34,7 @@ export interface TuningProposal {
     }[];
     critical_indicators_preserved: boolean;
   };
-  status: string;
+  status: TuningStatus;
   current_hints?: unknown;
   proposed_hints?: unknown;
   hints_diff?: unknown;
@@ -55,6 +55,12 @@ export interface ApprovalResponse {
   success: boolean;
   message: string;
   version_id: number | null;
+  outcome: 'applied' | 'pr_opened' | null;
+  status: TuningStatus | null;
+  pr_url: string | null;
+  effective_query: string | null;
+  runtime_sync_pending: boolean;
+  runtime_sync_error: string | null;
 }
 
 export interface RejectionResponse {

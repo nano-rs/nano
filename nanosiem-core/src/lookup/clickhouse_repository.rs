@@ -28,7 +28,7 @@
 //! the backend is opt-in (default postgres) until then.
 
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{debug, instrument};
 use uuid::Uuid;
 
@@ -643,6 +643,58 @@ impl LookupStore for ClickHouseLookupRepository {
         let n = tuples.len();
         self.insert_tuples(table_name, &tuples).await?;
         Ok(n)
+    }
+
+    async fn idempotent_record_counts(
+        &self,
+        table_name: &str,
+        idempotency_key: Uuid,
+        record_count: usize,
+    ) -> Result<(i64, usize), LookupRepositoryError> {
+        if record_count == 0 {
+            return Ok((self.get_table_row_count(table_name).await?, 0));
+        }
+        let expected: HashSet<u64> = (0..record_count)
+            .map(|index| super::repository::idempotent_row_id(idempotency_key, index))
+            .collect();
+        let existing = self.read_live_rows(table_name, None, false).await?;
+        let present = existing
+            .iter()
+            .filter(|row| expected.contains(&row.row_id))
+            .count();
+        Ok((
+            existing.len() as i64,
+            record_count.saturating_sub(present),
+        ))
+    }
+
+    async fn insert_records_idempotent(
+        &self,
+        table_name: &str,
+        columns: &[LookupColumn],
+        records: &[HashMap<String, serde_json::Value>],
+        idempotency_key: Uuid,
+    ) -> Result<usize, LookupRepositoryError> {
+        if records.is_empty() {
+            return Ok(0);
+        }
+        let key_field = self.resolve_key_field(table_name, columns).await;
+        let tuples: Vec<InsertTuple> = records
+            .iter()
+            .enumerate()
+            .map(|(index, record)| {
+                let (key_raw, cols) = Self::encode_record(&key_field, columns, record);
+                InsertTuple {
+                    row_id: super::repository::idempotent_row_id(idempotency_key, index),
+                    key_raw,
+                    cols_json: serde_json::Value::Object(cols).to_string(),
+                    deleted: 0,
+                }
+            })
+            .collect();
+        let inserted = tuples.len();
+        self.insert_tuples(table_name, &tuples).await?;
+        Ok(inserted)
     }
 
     #[instrument(skip(self))]

@@ -13,10 +13,12 @@
 //! - **No single bottleneck**: no leader election needed for detection rules
 
 use chrono::{DateTime, Duration, Utc};
+use futures::stream::{self, StreamExt};
+use futures::FutureExt;
 use metrics::{counter, histogram};
 use sqlx::PgPool;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -24,6 +26,7 @@ use crate::db::repository::detection_rules::DetectionRuleRepository;
 use crate::models::DetectionRule;
 use crate::search::TimeRangeInput;
 use crate::settings::DeveloperSettingsRepository;
+use crate::shutdown::ShutdownToken;
 
 use super::scheduler::calculate_next_run_with_jitter;
 use super::service::DetectionService;
@@ -155,9 +158,16 @@ impl DistributedDetectionScheduler {
 
     /// Start the distributed scheduler loop.
     ///
-    /// Returns a JoinHandle. On graceful shutdown, abort the handle and then
-    /// call `release_all_claims()` to free any in-progress claims.
+    /// Returns a JoinHandle. The no-token form runs until the handle is aborted.
     pub fn start(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        self.start_with_shutdown(ShutdownToken::new())
+    }
+
+    /// Start with cooperative cancellation at every pre-claim boundary.
+    pub fn start_with_shutdown(
+        self: Arc<Self>,
+        shutdown: ShutdownToken,
+    ) -> tokio::task::JoinHandle<()> {
         let scheduler = self;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
@@ -176,25 +186,35 @@ impl DistributedDetectionScheduler {
             );
 
             loop {
-                interval.tick().await;
+                if shutdown
+                    .run_until_cancelled(interval.tick())
+                    .await
+                    .is_none()
+                {
+                    break;
+                }
 
                 // Check developer settings toggle
                 if let Some(ref settings_repo) = scheduler.developer_settings {
-                    match settings_repo.is_detection_scheduler_enabled().await {
-                        Ok(false) => {
+                    let enabled = shutdown
+                        .run_until_cancelled(settings_repo.is_detection_scheduler_enabled())
+                        .await;
+                    match enabled {
+                        None => break,
+                        Some(Ok(false)) => {
                             debug!("Detection scheduler disabled via developer settings");
                             continue;
                         }
-                        Err(e) => {
+                        Some(Err(e)) => {
                             warn!("Failed to check scheduler enabled status: {}", e);
                             // Fail-open: continue execution
                         }
-                        Ok(true) => {}
+                        Some(Ok(true)) => {}
                     }
                 }
 
                 // Claim and execute due rules
-                match scheduler.poll_and_execute().await {
+                match scheduler.poll_and_execute(&shutdown).await {
                     Ok(executed) => {
                         if executed > 0 {
                             debug!(node_id = %scheduler.node_id, executed, "Executed rules");
@@ -213,15 +233,25 @@ impl DistributedDetectionScheduler {
                             "Distributed scheduler error (attempt {}, backoff {}s): {}",
                             consecutive_errors, backoff_secs, e
                         );
-                        tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+                        if shutdown
+                            .run_until_cancelled(tokio::time::sleep(
+                                tokio::time::Duration::from_secs(backoff_secs),
+                            ))
+                            .await
+                            .is_none()
+                        {
+                            break;
+                        }
                     }
                 }
             }
+
+            info!(node_id = %scheduler.node_id, "Distributed detection scheduler stopped");
         })
     }
 
     /// One poll cycle: claim due rules, execute them concurrently, release claims.
-    async fn poll_and_execute(&self) -> anyhow::Result<usize> {
+    async fn poll_and_execute(&self, shutdown: &ShutdownToken) -> anyhow::Result<usize> {
         // Audit D21: never let another node reclaim a rule before the node
         // executing it can plausibly finish AND release its claim. The stale and
         // execution timeouts are independent knobs that both default to 300s, so
@@ -231,18 +261,20 @@ impl DistributedDetectionScheduler {
         // wait + release round-trip) so reclaim only ever fires for a genuinely
         // dead node.
         const STALE_CLAIM_EXEC_BUFFER_SECS: i64 = 60;
-        let effective_stale_timeout = self.config.stale_claim_timeout_secs.max(
-            self.config.execution_timeout_secs as i64 + STALE_CLAIM_EXEC_BUFFER_SECS,
-        );
+        let effective_stale_timeout = self
+            .config
+            .stale_claim_timeout_secs
+            .max(self.config.execution_timeout_secs as i64 + STALE_CLAIM_EXEC_BUFFER_SECS);
 
-        let claimed = self
-            .rule_repo
-            .claim_due_rules(
-                self.config.batch_size,
-                &self.node_id,
-                effective_stale_timeout,
-            )
-            .await?;
+        let claim = self.rule_repo.claim_due_rules(
+            self.config.batch_size,
+            &self.node_id,
+            effective_stale_timeout,
+        );
+        let Some(claimed) = shutdown.run_until_cancelled(claim).await else {
+            return Ok(0);
+        };
+        let claimed = claimed?;
 
         if claimed.is_empty() {
             return Ok(0);
@@ -255,29 +287,30 @@ impl DistributedDetectionScheduler {
             "Claimed rules for execution"
         );
 
-        // Execute with concurrency limit
-        let semaphore = Arc::new(Semaphore::new(self.config.max_concurrent_executions));
-        let mut handles = Vec::with_capacity(count);
-
-        for rule in claimed {
-            let detection_service = self.detection_service.clone();
-            let rule_repo = self.rule_repo.clone();
-            let node_id = self.node_id.clone();
-            let config = self.config.clone();
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
-
-            handles.push(tokio::spawn(async move {
-                let _permit = permit;
-                execute_and_release(&detection_service, &rule_repo, &rule, &node_id, &config).await;
-            }));
-        }
-
-        // Wait for all executions
-        for handle in handles {
-            if let Err(e) = handle.await {
-                error!("Rule execution task panicked: {}", e);
-            }
-        }
+        // Keep execution futures owned by the scheduler task. If shutdown aborts
+        // the scheduler, dropping this stream cancels every in-flight execution
+        // before the scheduler handle resolves and its claims are bulk-released.
+        stream::iter(claimed)
+            .for_each_concurrent(self.config.max_concurrent_executions.max(1), |rule| {
+                let detection_service = self.detection_service.clone();
+                let rule_repo = self.rule_repo.clone();
+                let node_id = self.node_id.clone();
+                let config = self.config.clone();
+                async move {
+                    let rule_id = rule.id;
+                    let execution = execute_and_release(
+                        &detection_service,
+                        &rule_repo,
+                        &rule,
+                        &node_id,
+                        &config,
+                    );
+                    if AssertUnwindSafe(execution).catch_unwind().await.is_err() {
+                        error!(%rule_id, "Rule execution task panicked");
+                    }
+                }
+            })
+            .await;
 
         // Track how many rules were executed in this poll cycle
         counter!("nanosiem_detection_rules_executed_total").increment(count as u64);

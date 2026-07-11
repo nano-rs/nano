@@ -11,8 +11,72 @@
 use crate::detection::risk::default_score_for_severity;
 use crate::models::detection_rule::DetectionRule;
 use crate::query::{parse_query, ClickHouseSqlGenerator, Query, SearchExpr};
+use sqlx::pool::PoolConnection;
+use sqlx::{PgPool, Postgres};
 use thiserror::Error;
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::{debug, error, info};
+use uuid::Uuid;
+
+static RULE_RUNTIME_WRITER_ADMISSION: Semaphore = Semaphore::const_new(1);
+
+/// Holds local writer admission and the cross-node PostgreSQL advisory lock.
+pub struct RuleRuntimeLockGuard {
+    _connection: PoolConnection<Postgres>,
+    _admission: SemaphorePermit<'static>,
+}
+
+/// Serialize PostgreSQL and materialized-view writers for a rule across nodes.
+///
+/// The lock key includes the full UUID. The connection is closed on drop so a
+/// cancelled task cannot return a session that still owns the advisory lock to
+/// the pool.
+pub async fn acquire_rule_runtime_lock(
+    pool: &PgPool,
+    rule_id: Uuid,
+) -> Result<RuleRuntimeLockGuard, sqlx::Error> {
+    if pool.options().get_max_connections() < 2 {
+        return Err(sqlx::Error::Configuration(Box::new(std::io::Error::other(
+            "rule runtime serialization requires a PostgreSQL pool with at least 2 connections",
+        ))));
+    }
+
+    let admission = RULE_RUNTIME_WRITER_ADMISSION
+        .acquire()
+        .await
+        .map_err(|error| {
+            sqlx::Error::Configuration(Box::new(std::io::Error::other(error.to_string())))
+        })?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut backoff = std::time::Duration::from_millis(20);
+    loop {
+        let mut connection = pool.acquire().await?;
+        // Set this before the query: cancellation after PostgreSQL grants the
+        // lock must close the session instead of returning it to the pool.
+        connection.close_on_drop();
+        let acquired: bool = sqlx::query_scalar(
+            "SELECT pg_try_advisory_lock(
+                hashtextextended($1::text, 5638868622159100997)
+             )",
+        )
+        .bind(rule_id.to_string())
+        .fetch_one(&mut *connection)
+        .await?;
+        if acquired {
+            return Ok(RuleRuntimeLockGuard {
+                _connection: connection,
+                _admission: admission,
+            });
+        }
+        connection.close().await?;
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err(sqlx::Error::PoolTimedOut);
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(std::time::Duration::from_millis(250));
+    }
+}
 
 /// Validate that a field name is safe for interpolation into DDL statements.
 ///
@@ -106,9 +170,7 @@ fn reject_unsupported_for_realtime(expr: &SearchExpr) -> Result<(), Materialized
             reject_unsupported_for_realtime(left)?;
             reject_unsupported_for_realtime(right)
         }
-        SearchExpr::Not(inner) | SearchExpr::Group(inner) => {
-            reject_unsupported_for_realtime(inner)
-        }
+        SearchExpr::Not(inner) | SearchExpr::Group(inner) => reject_unsupported_for_realtime(inner),
         SearchExpr::FieldFilter { .. }
         | SearchExpr::FunctionFilter { .. }
         | SearchExpr::FieldFunctionFilter { .. }
@@ -216,7 +278,12 @@ impl MaterializedViewGenerator {
     ///
     /// Example: mv_rt_detection_550e8400e29b41d4a716446655440000
     fn generate_view_name(rule: &DetectionRule) -> String {
-        format!("mv_rt_detection_{}", rule.id.to_string().replace('-', ""))
+        Self::view_name_for_rule_id(rule.id)
+    }
+
+    /// Deterministic view name used by durable reconciliation and delete cleanup.
+    pub fn view_name_for_rule_id(rule_id: Uuid) -> String {
+        format!("mv_rt_detection_{}", rule_id.to_string().replace('-', ""))
     }
 
     /// Bare logs-table name the MV reads `FROM` for the active profile.
@@ -732,7 +799,9 @@ FROM (
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::detection_rule::{AiTriageHints, AlertMode, DetectionMode, RuleMode, Severity};
+    use crate::models::detection_rule::{
+        AiTriageHints, AlertMode, DetectionMode, RuleMode, Severity,
+    };
     use chrono::Utc;
     use uuid::Uuid;
 
@@ -844,14 +913,18 @@ mod tests {
     fn test_realtime_eligible_simple_filters() {
         // Simple column predicates are the whole point of the MV path.
         assert!(is_realtime_eligible("src_ip=\"10.0.0.1\""));
-        assert!(is_realtime_eligible("dest_port=445 AND process_name=\"cmd.exe\""));
+        assert!(is_realtime_eligible(
+            "dest_port=445 AND process_name=\"cmd.exe\""
+        ));
         assert!(is_realtime_eligible("NOT (user=\"admin\")"));
     }
 
     #[test]
     fn test_realtime_ineligible_piped_commands() {
         // Anything after a `|` (stats/where/timechart/prevalence/…) drops out.
-        assert!(!is_realtime_eligible("src_ip=\"10.0.0.1\" | stats count by user"));
+        assert!(!is_realtime_eligible(
+            "src_ip=\"10.0.0.1\" | stats count by user"
+        ));
         assert!(!is_realtime_eligible("error | where count > 10"));
     }
 
@@ -893,7 +966,20 @@ mod tests {
     fn test_generate_view_name() {
         let rule = create_test_rule();
         let view_name = MaterializedViewGenerator::generate_view_name(&rule);
-        assert_eq!(view_name, "mv_rt_detection_550e8400e29b41d4a716446655440000");
+        assert_eq!(
+            view_name,
+            "mv_rt_detection_550e8400e29b41d4a716446655440000"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_lock_rejects_pool_without_a_spare_connection() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://postgres:postgres@localhost/nanosiem_test")
+            .expect("lazy pool");
+        let result = acquire_rule_runtime_lock(&pool, Uuid::now_v7()).await;
+        assert!(matches!(result, Err(sqlx::Error::Configuration(_))));
     }
 
     #[test]
@@ -919,16 +1005,16 @@ mod tests {
     #[test]
     fn test_realtime_where_matches_canonical() {
         for q in [
-            "process_name=\"Mimikatz\"",                          // case folding
-            "process_name=/mimikatz/",                            // regex -> (?i)/iLike
-            "command_line=\"*powershell*\"",                      // wildcard -> iLike
-            "src_host=\"dc01\"",                                  // FQDN expansion
-            "dest_ip=\"192.0.2.1\"",                              // IP equality
-            "dest_port=443",                                      // numeric equality
+            "process_name=\"Mimikatz\"",                         // case folding
+            "process_name=/mimikatz/",                           // regex -> (?i)/iLike
+            "command_line=\"*powershell*\"",                     // wildcard -> iLike
+            "src_host=\"dc01\"",                                 // FQDN expansion
+            "dest_ip=\"192.0.2.1\"",                             // IP equality
+            "dest_port=443",                                     // numeric equality
             "user=\"alice\" AND action=\"login\"",               // AND
             "dest_ip=\"192.0.2.1\" OR dest_ip=\"198.51.100.1\"", // OR
-            "NOT process_name=\"explorer.exe\"",                  // NOT
-            "dest_ip IN (\"192.0.2.1\", \"198.51.100.1\")",       // IN-list
+            "NOT process_name=\"explorer.exe\"",                 // NOT
+            "dest_ip IN (\"192.0.2.1\", \"198.51.100.1\")",      // IN-list
         ] {
             assert_where_matches_canonical(q);
         }
@@ -1104,7 +1190,9 @@ mod tests {
     #[test]
     fn test_validate_ddl_field_name_rejects_injection_and_unknown() {
         let udm = crate::schema::UdmProfile::new();
-        assert!(validate_ddl_field_name("concat(currentDatabase(), ':', version())", &udm).is_err());
+        assert!(
+            validate_ddl_field_name("concat(currentDatabase(), ':', version())", &udm).is_err()
+        );
         assert!(validate_ddl_field_name("1; DROP TABLE logs--", &udm).is_err());
         assert!(validate_ddl_field_name("src_ip' OR '1'='1", &udm).is_err());
         assert!(validate_ddl_field_name("", &udm).is_err());
@@ -1179,4 +1267,3 @@ mod tests {
         }
     }
 }
-

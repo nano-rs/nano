@@ -65,6 +65,7 @@ impl ClickHouseExecutor {
         offset: usize,
         query_id: &str,
         bounded_count: Option<BoundedCountInput<'_>>,
+        execution_limits: Option<&crate::search::SearchExecutionLimits>,
     ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
         // Check if this is an aggregation query that needs all data
         if is_aggregation_query(sql) {
@@ -78,9 +79,18 @@ impl ClickHouseExecutor {
                 sql, limit, offset
             );
 
-            let mut results = self
-                .execute_dynamic_query_with_query_id(&combined_sql, query_id)
-                .await?;
+            let mut results = if let Some(limits) = execution_limits {
+                self.execute_dynamic_query_with_execution_limits(
+                    &combined_sql,
+                    query_id,
+                    None,
+                    limits,
+                )
+                .await?
+            } else {
+                self.execute_dynamic_query_with_query_id(&combined_sql, query_id)
+                    .await?
+            };
 
             let total_count = results
                 .first()
@@ -102,6 +112,19 @@ impl ClickHouseExecutor {
             );
 
             let paginated_sql = inject_limit_offset(sql, limit, offset);
+
+            if let Some(limits) = execution_limits {
+                let results = self
+                    .execute_dynamic_query_with_execution_limits(
+                        &paginated_sql,
+                        query_id,
+                        None,
+                        limits,
+                    )
+                    .await?;
+                let total_count = results.len() as u64;
+                return Ok((results, total_count));
+            }
 
             // NAN-1645: page flips (offset > 0) skip the count companion — the
             // exact total was already delivered with page 1.
@@ -150,6 +173,7 @@ impl ClickHouseExecutor {
         query_id: &str,
         settings: &crate::search::admission::ClickHouseQuerySettings,
         bounded_count: Option<BoundedCountInput<'_>>,
+        execution_limits: Option<&crate::search::SearchExecutionLimits>,
     ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
         if is_aggregation_query(sql) {
             debug!("Detected aggregation query with settings, using full scan");
@@ -159,9 +183,18 @@ impl ClickHouseExecutor {
                 sql, limit, offset
             );
 
-            let mut results = self
-                .execute_dynamic_query_with_settings(&combined_sql, query_id, settings)
-                .await?;
+            let mut results = if let Some(limits) = execution_limits {
+                self.execute_dynamic_query_with_execution_limits(
+                    &combined_sql,
+                    query_id,
+                    Some(settings),
+                    limits,
+                )
+                .await?
+            } else {
+                self.execute_dynamic_query_with_settings(&combined_sql, query_id, settings)
+                    .await?
+            };
 
             let total_count = results
                 .first()
@@ -180,6 +213,19 @@ impl ClickHouseExecutor {
             debug!("Detected raw log query with settings, using optimized LIMIT injection");
 
             let paginated_sql = inject_limit_offset(sql, limit, offset);
+
+            if let Some(limits) = execution_limits {
+                let results = self
+                    .execute_dynamic_query_with_execution_limits(
+                        &paginated_sql,
+                        query_id,
+                        Some(settings),
+                        limits,
+                    )
+                    .await?;
+                let total_count = results.len() as u64;
+                return Ok((results, total_count));
+            }
 
             // NAN-1645: page flips (offset > 0) skip the count companion — the
             // exact total was already delivered with page 1.

@@ -27,8 +27,10 @@ mod validation;
 
 pub use github_write::{GitHubWriteClient, GitHubWriteError, OpenedPr};
 pub use models::{DetectionCodeTarget, NewDetectionCodeTarget, UpdateDetectionCodeTarget};
-pub use push_service::{DetectionCodePushService, PushError};
-pub use repository::{DetectionCodeTargetError, DetectionCodeTargetRepository};
+pub use push_service::{DetectionCodePushService, PrExecutionError, PushError};
+pub use repository::{
+    acquire_autonomous_tuning_dac_lock, DetectionCodeTargetError, DetectionCodeTargetRepository,
+};
 pub use serializer::{serialize_rule_to_npl, SerializeError};
 pub use validation::{
     validate_git_ref, validate_path_template, validate_ref_prefix, TargetValidationError,

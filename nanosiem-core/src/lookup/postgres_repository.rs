@@ -292,7 +292,7 @@ impl PostgresLookupRepository {
         }
 
         // Build CREATE TABLE statement (prepend hidden _row_id for stable row identification)
-        let mut column_defs = vec!["\"_row_id\" BIGSERIAL".to_string()];
+        let mut column_defs = vec!["\"_row_id\" BIGSERIAL PRIMARY KEY".to_string()];
         for col in columns {
             let null_constraint = if col.nullable { "" } else { " NOT NULL" };
             column_defs.push(format!(
@@ -479,6 +479,136 @@ impl PostgresLookupRepository {
 
             let result = query.execute(&self.pool).await?;
             inserted += result.rows_affected() as usize;
+        }
+
+        Ok(inserted)
+    }
+
+    async fn ensure_idempotent_row_index(
+        &self,
+        table_name: &str,
+    ) -> Result<(), LookupRepositoryError> {
+        use std::hash::{Hash, Hasher};
+
+        if !Self::is_valid_identifier(table_name) {
+            return Err(LookupRepositoryError::InvalidTableName(
+                table_name.to_string(),
+            ));
+        }
+        let already_unique: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_index i
+                JOIN pg_attribute a
+                  ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+                WHERE i.indrelid = to_regclass($1)
+                  AND i.indisunique
+                  AND i.indnkeyatts = 1
+                  AND a.attname = '_row_id'
+            )
+            "#,
+        )
+        .bind(table_name)
+        .fetch_one(&self.pool)
+        .await?;
+        if already_unique {
+            return Ok(());
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        table_name.hash(&mut hasher);
+        let index_name = format!("idx_lookup_idem_{:016x}", hasher.finish());
+        let sql = format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS \"{}\" ON \"{}\" (\"_row_id\")",
+            index_name, table_name
+        );
+        sqlx::query(&sql).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    fn idempotent_pg_row_ids(idempotency_key: Uuid, record_count: usize) -> Vec<i64> {
+        (0..record_count)
+            .map(|index| {
+                let magnitude =
+                    (super::repository::idempotent_row_id(idempotency_key, index) & i64::MAX as u64)
+                        .max(1);
+                -(magnitude as i64)
+            })
+            .collect()
+    }
+
+    pub async fn idempotent_record_counts(
+        &self,
+        table_name: &str,
+        idempotency_key: Uuid,
+        record_count: usize,
+    ) -> Result<(i64, usize), LookupRepositoryError> {
+        if record_count == 0 {
+            return Ok((self.get_table_row_count(table_name).await?, 0));
+        }
+        self.ensure_idempotent_row_index(table_name).await?;
+        let row_ids = Self::idempotent_pg_row_ids(idempotency_key, record_count);
+        let sql = format!(
+            "SELECT COUNT(*), COUNT(*) FILTER (WHERE \"_row_id\" = ANY($1)) FROM \"{}\"",
+            table_name
+        );
+        let (current, existing): (i64, i64) = sqlx::query_as(&sql)
+            .bind(&row_ids)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok((current, record_count.saturating_sub(existing as usize)))
+    }
+
+    pub async fn insert_records_idempotent(
+        &self,
+        table_name: &str,
+        columns: &[LookupColumn],
+        records: &[HashMap<String, serde_json::Value>],
+        idempotency_key: Uuid,
+    ) -> Result<usize, LookupRepositoryError> {
+        if records.is_empty() {
+            return Ok(0);
+        }
+        self.ensure_idempotent_row_index(table_name).await?;
+
+        let column_names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+        let row_ids = Self::idempotent_pg_row_ids(idempotency_key, records.len());
+        let mut inserted = 0usize;
+
+        for (chunk_index, chunk) in records.chunks(500).enumerate() {
+            let mut values_parts = Vec::with_capacity(chunk.len());
+            let mut param_idx = 1;
+            for _ in chunk {
+                let placeholders: Vec<String> = (0..=column_names.len())
+                    .map(|_| {
+                        let placeholder = format!("${}", param_idx);
+                        param_idx += 1;
+                        placeholder
+                    })
+                    .collect();
+                values_parts.push(format!("({})", placeholders.join(", ")));
+            }
+
+            let mut quoted_columns = vec!["\"_row_id\"".to_string()];
+            quoted_columns.extend(column_names.iter().map(|c| format!("\"{}\"", c)));
+            let insert_sql = format!(
+                "INSERT INTO \"{}\" ({}) VALUES {} ON CONFLICT (\"_row_id\") DO NOTHING",
+                table_name,
+                quoted_columns.join(", "),
+                values_parts.join(", ")
+            );
+            let mut query = sqlx::query(&insert_sql);
+            for (offset, record) in chunk.iter().enumerate() {
+                query = query.bind(row_ids[chunk_index * 500 + offset]);
+                for (column_index, column_name) in column_names.iter().enumerate() {
+                    query = Self::bind_value(
+                        query,
+                        record.get(*column_name),
+                        &columns[column_index].data_type,
+                    );
+                }
+            }
+            inserted += query.execute(&self.pool).await?.rows_affected() as usize;
         }
 
         Ok(inserted)
@@ -1252,6 +1382,38 @@ impl LookupStore for PostgresLookupRepository {
         records: &[HashMap<String, serde_json::Value>],
     ) -> Result<usize, LookupRepositoryError> {
         PostgresLookupRepository::insert_records(self, table_name, columns, records).await
+    }
+
+    async fn idempotent_record_counts(
+        &self,
+        table_name: &str,
+        idempotency_key: Uuid,
+        record_count: usize,
+    ) -> Result<(i64, usize), LookupRepositoryError> {
+        PostgresLookupRepository::idempotent_record_counts(
+            self,
+            table_name,
+            idempotency_key,
+            record_count,
+        )
+        .await
+    }
+
+    async fn insert_records_idempotent(
+        &self,
+        table_name: &str,
+        columns: &[LookupColumn],
+        records: &[HashMap<String, serde_json::Value>],
+        idempotency_key: Uuid,
+    ) -> Result<usize, LookupRepositoryError> {
+        PostgresLookupRepository::insert_records_idempotent(
+            self,
+            table_name,
+            columns,
+            records,
+            idempotency_key,
+        )
+        .await
     }
 
     async fn get_table_row_count(&self, table_name: &str) -> Result<i64, LookupRepositoryError> {

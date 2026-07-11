@@ -4,7 +4,7 @@
 
 use super::TuningRepository;
 use crate::tuning::types::{
-    ProposalType, TestResults, TuningLogEntry, TuningProposal, TuningStatus,
+    TestResults, TuningLogEntry, TuningProposal, TuningStatus, TuningValidationProof,
 };
 use anyhow::{Context, Result};
 use sqlx::Row;
@@ -22,6 +22,18 @@ impl TuningRepository {
     /// # Returns
     /// The UUID of the created log entry
     pub async fn create_log_entry(&self, entry: TuningLogEntry) -> Result<Uuid> {
+        self.create_log_entry_with_test_result_id(entry, None).await
+    }
+
+    /// Create a tuning log linked to an already-persisted validation result.
+    ///
+    /// The test result is referenced by ID instead of being inserted again, so
+    /// the audit record points at the exact proof row used by the apply gate.
+    pub async fn create_log_entry_with_test_result_id(
+        &self,
+        entry: TuningLogEntry,
+        test_result_id: Option<Uuid>,
+    ) -> Result<Uuid> {
         // Validate serialization (but don't use the results since we store references)
         let _proposal_json =
             serde_json::to_value(&entry.proposal).context("Failed to serialize proposal")?;
@@ -57,7 +69,26 @@ impl TuningRepository {
                 reverted_to_version_id,
                 revert_reason
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            SELECT
+                $1, $2, $3, $4, $5, $6, $7,
+                COALESCE(
+                    $8,
+                    (
+                        SELECT id
+                        FROM detection_rule_versions
+                        WHERE rule_id = $2 AND tuning_proposal_id = $6
+                        ORDER BY version_number DESC
+                        LIMIT 1
+                    )
+                ),
+                $9, $10, $11, $12, $13
+            WHERE $7::uuid IS NULL
+               OR EXISTS (
+                    SELECT 1
+                    FROM tuning_test_results
+                    WHERE id = $7
+                      AND proposal_id = $6
+               )
             RETURNING id
             "#,
         )
@@ -67,7 +98,7 @@ impl TuningRepository {
         .bind(&entry.triggered_at)
         .bind(&entry.trigger_reason)
         .bind(&entry.proposal.id)
-        .bind(entry.test_results.as_ref().map(|tr| tr.proposal_id))
+        .bind(test_result_id)
         .bind(entry.staging_deployment.as_ref().map(|sd| sd.version_id))
         .bind(entry.status.to_string())
         .bind(&entry.reverted_at)
@@ -84,6 +115,104 @@ impl TuningRepository {
         .context("Failed to create tuning log entry")?;
 
         Ok(id)
+    }
+
+    /// Create a log only while the proposal remains in an expected state.
+    /// Locking the proposal serializes this with approve/reject/PR transitions:
+    /// either the proposed log lands first and the winner updates it, or the
+    /// terminal transition wins and no stale scheduler log is inserted.
+    pub async fn create_log_entry_if_proposal_status(
+        &self,
+        entry: TuningLogEntry,
+        expected: &[TuningStatus],
+    ) -> Result<Option<Uuid>> {
+        self.create_log_entry_if_proposal_status_with_test_result(entry, expected, None)
+            .await
+    }
+
+    /// Create a conditional log linked to the exact validation result used by
+    /// the autonomous apply gate.
+    pub async fn create_log_entry_if_proposal_status_with_test_result(
+        &self,
+        entry: TuningLogEntry,
+        expected: &[TuningStatus],
+        test_result_id: Option<Uuid>,
+    ) -> Result<Option<Uuid>> {
+        let mut tx = self.pool.begin().await?;
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT status FROM tuning_proposals WHERE id = $1 FOR UPDATE")
+                .bind(entry.proposal.id)
+                .fetch_optional(&mut *tx)
+                .await
+                .context("Failed to lock tuning proposal for audit logging")?;
+        let expected: Vec<String> = expected.iter().map(ToString::to_string).collect();
+        if !current
+            .as_ref()
+            .map(|status| expected.contains(status))
+            .unwrap_or(false)
+        {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+
+        let id = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            INSERT INTO tuning_logs (
+                id, rule_id, rule_name, triggered_at, trigger_reason,
+                proposal_id, test_results_id, applied_version_id, status,
+                reverted_at, reverted_by, reverted_to_version_id, revert_reason
+            )
+            SELECT
+                $1, $2, $3, $4, $5, $6, $7,
+                COALESCE(
+                    $8,
+                    (
+                        SELECT id
+                        FROM detection_rule_versions
+                        WHERE rule_id = $2 AND tuning_proposal_id = $6
+                        ORDER BY version_number DESC
+                        LIMIT 1
+                    )
+                ),
+                $9, $10, $11, $12, $13
+            WHERE $7::uuid IS NULL
+               OR EXISTS (
+                    SELECT 1
+                    FROM tuning_test_results
+                    WHERE id = $7
+                      AND proposal_id = $6
+               )
+            RETURNING id
+            "#,
+        )
+        .bind(entry.id)
+        .bind(entry.rule_id)
+        .bind(&entry.rule_name)
+        .bind(entry.triggered_at)
+        .bind(&entry.trigger_reason)
+        .bind(entry.proposal.id)
+        .bind(test_result_id)
+        .bind(
+            entry
+                .staging_deployment
+                .as_ref()
+                .map(|deployment| deployment.version_id),
+        )
+        .bind(entry.status.to_string())
+        .bind(entry.reverted_at)
+        .bind(entry.reverted_by)
+        .bind(
+            entry
+                .staging_deployment
+                .as_ref()
+                .and_then(|deployment| entry.reverted_at.map(|_| deployment.version_id)),
+        )
+        .bind(entry.revert_reason)
+        .fetch_one(&mut *tx)
+        .await
+        .context("Failed to create conditional tuning log entry")?;
+        tx.commit().await?;
+        Ok(Some(id))
     }
 
     /// Get a tuning log entry by ID
@@ -111,6 +240,7 @@ impl TuningRepository {
                 tl.revert_reason,
                 tp.id as proposal_id,
                 tp.created_at as proposal_created_at,
+                tp.proposal_type,
                 tp.original_query,
                 tp.proposed_query,
                 tp.rationale,
@@ -125,7 +255,8 @@ impl TuningRepository {
                 ttr.reduction_percentage,
                 ttr.true_positives_preserved,
                 ttr.validation_passed,
-                ttr.comparison_metrics
+                ttr.comparison_metrics,
+                ttr.validation_proof
             FROM tuning_logs tl
             INNER JOIN tuning_proposals tp ON tl.proposal_id = tp.id
             LEFT JOIN tuning_test_results ttr ON tl.test_results_id = ttr.id
@@ -143,7 +274,10 @@ impl TuningRepository {
                 rule_id: row.try_get("rule_id")?,
                 rule_name: None,
                 created_at: row.try_get("proposal_created_at")?,
-                proposal_type: ProposalType::QueryTuning,
+                proposal_type: row
+                    .try_get::<String, _>("proposal_type")?
+                    .parse()
+                    .map_err(anyhow::Error::msg)?,
                 original_query: row.try_get("original_query")?,
                 proposed_query: row.try_get("proposed_query")?,
                 rationale: row.try_get("rationale")?,
@@ -174,6 +308,9 @@ impl TuningRepository {
                     validation_passed: row.try_get("validation_passed")?,
                     comparison_metrics: serde_json::from_value(row.try_get("comparison_metrics")?)
                         .context("Failed to deserialize comparison_metrics")?,
+                    validation_proof: deserialize_validation_proof(
+                        row.try_get("validation_proof")?,
+                    )?,
                 })
             } else {
                 None
@@ -190,6 +327,8 @@ impl TuningRepository {
                 "reverted" => TuningStatus::Reverted,
                 "manually_approved" => TuningStatus::ManuallyApproved,
                 "rejected" => TuningStatus::Rejected,
+                "pr_pending" => TuningStatus::PrPending,
+                "pr_opened" => TuningStatus::PrOpened,
                 _ => TuningStatus::Proposed,
             };
 
@@ -237,6 +376,7 @@ impl TuningRepository {
                 tl.revert_reason,
                 tp.id as proposal_id,
                 tp.created_at as proposal_created_at,
+                tp.proposal_type,
                 tp.original_query,
                 tp.proposed_query,
                 tp.rationale,
@@ -251,7 +391,8 @@ impl TuningRepository {
                 ttr.reduction_percentage,
                 ttr.true_positives_preserved,
                 ttr.validation_passed,
-                ttr.comparison_metrics
+                ttr.comparison_metrics,
+                ttr.validation_proof
             FROM tuning_logs tl
             INNER JOIN tuning_proposals tp ON tl.proposal_id = tp.id
             LEFT JOIN tuning_test_results ttr ON tl.test_results_id = ttr.id
@@ -271,7 +412,10 @@ impl TuningRepository {
                 rule_id: row.try_get("rule_id")?,
                 rule_name: None,
                 created_at: row.try_get("proposal_created_at")?,
-                proposal_type: ProposalType::QueryTuning,
+                proposal_type: row
+                    .try_get::<String, _>("proposal_type")?
+                    .parse()
+                    .map_err(anyhow::Error::msg)?,
                 original_query: row.try_get("original_query")?,
                 proposed_query: row.try_get("proposed_query")?,
                 rationale: row.try_get("rationale")?,
@@ -302,6 +446,9 @@ impl TuningRepository {
                     validation_passed: row.try_get("validation_passed")?,
                     comparison_metrics: serde_json::from_value(row.try_get("comparison_metrics")?)
                         .context("Failed to deserialize comparison_metrics")?,
+                    validation_proof: deserialize_validation_proof(
+                        row.try_get("validation_proof")?,
+                    )?,
                 })
             } else {
                 None
@@ -318,6 +465,8 @@ impl TuningRepository {
                 "reverted" => TuningStatus::Reverted,
                 "manually_approved" => TuningStatus::ManuallyApproved,
                 "rejected" => TuningStatus::Rejected,
+                "pr_pending" => TuningStatus::PrPending,
+                "pr_opened" => TuningStatus::PrOpened,
                 _ => TuningStatus::Proposed,
             };
 
@@ -365,6 +514,7 @@ impl TuningRepository {
                 tl.revert_reason,
                 tp.id as proposal_id,
                 tp.created_at as proposal_created_at,
+                tp.proposal_type,
                 tp.original_query,
                 tp.proposed_query,
                 tp.rationale,
@@ -379,7 +529,8 @@ impl TuningRepository {
                 ttr.reduction_percentage,
                 ttr.true_positives_preserved,
                 ttr.validation_passed,
-                ttr.comparison_metrics
+                ttr.comparison_metrics,
+                ttr.validation_proof
             FROM tuning_logs tl
             INNER JOIN tuning_proposals tp ON tl.proposal_id = tp.id
             LEFT JOIN tuning_test_results ttr ON tl.test_results_id = ttr.id
@@ -399,7 +550,10 @@ impl TuningRepository {
                 rule_id: row.try_get("rule_id")?,
                 rule_name: None,
                 created_at: row.try_get("proposal_created_at")?,
-                proposal_type: ProposalType::QueryTuning,
+                proposal_type: row
+                    .try_get::<String, _>("proposal_type")?
+                    .parse()
+                    .map_err(anyhow::Error::msg)?,
                 original_query: row.try_get("original_query")?,
                 proposed_query: row.try_get("proposed_query")?,
                 rationale: row.try_get("rationale")?,
@@ -430,6 +584,9 @@ impl TuningRepository {
                     validation_passed: row.try_get("validation_passed")?,
                     comparison_metrics: serde_json::from_value(row.try_get("comparison_metrics")?)
                         .context("Failed to deserialize comparison_metrics")?,
+                    validation_proof: deserialize_validation_proof(
+                        row.try_get("validation_proof")?,
+                    )?,
                 })
             } else {
                 None
@@ -446,6 +603,8 @@ impl TuningRepository {
                 "reverted" => TuningStatus::Reverted,
                 "manually_approved" => TuningStatus::ManuallyApproved,
                 "rejected" => TuningStatus::Rejected,
+                "pr_pending" => TuningStatus::PrPending,
+                "pr_opened" => TuningStatus::PrOpened,
                 _ => TuningStatus::Proposed,
             };
 
@@ -532,5 +691,29 @@ impl TuningRepository {
         .context("Failed to update revert information")?;
 
         Ok(())
+    }
+}
+
+fn deserialize_validation_proof(
+    value: Option<serde_json::Value>,
+) -> Result<Option<TuningValidationProof>> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value)
+            .map(Some)
+            .context("Failed to deserialize tuning validation proof"),
+    }
+}
+
+#[cfg(test)]
+mod validation_proof_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_sql_and_json_null_proofs_read_as_absent() {
+        assert!(deserialize_validation_proof(None).unwrap().is_none());
+        assert!(deserialize_validation_proof(Some(serde_json::Value::Null))
+            .unwrap()
+            .is_none());
     }
 }

@@ -229,6 +229,7 @@ pub async fn update_target(
         (status = 204, description = "Target deleted"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
+        (status = 409, description = "Target is claimed by a tuning PR operation"),
     ),
     security(("api_key" = []))
 )]

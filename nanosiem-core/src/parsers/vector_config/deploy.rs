@@ -1418,6 +1418,14 @@ if otlp_time != "" {
         Ok(())
     }
 
+    /// Render a complete parser tree without signaling a live Vector process.
+    /// Used by the DB-backed publication reconciler, which renders into an
+    /// isolated directory before the revision CAS makes it visible.
+    pub async fn render_parsers(&self, parsers: &[Parser]) -> Result<(), VectorConfigError> {
+        let _guard = self.deploy_lock.lock().await;
+        self.deploy_parsers(parsers).await
+    }
+
     /// Check if Vector is healthy by querying its internal API or checking process status.
     ///
     /// Vector exposes a health endpoint at http://localhost:8686/health when

@@ -11,20 +11,18 @@ use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
 
 use crate::audit::{AuditEmitter, AuditEvent, AuditSource};
-use crate::db::repository::NotificationRepository;
 use crate::db::DualPool;
-use crate::models::notification::{NewNotification, NotificationType};
+use crate::models::notification::NotificationType;
 
 use super::ai_monitor::{AiMonitor, AiProviderConnectivityChecker};
 use super::feed_monitor::FeedMonitor;
-use super::repository::HealthRepository;
+use super::repository::{HealthNotification, HealthRepository};
 use super::types::{HealthIssueType, HealthSchedulerConfig};
 
 /// Health monitoring scheduler
 pub struct HealthScheduler {
     config: HealthSchedulerConfig,
     health_repo: HealthRepository,
-    notification_repo: NotificationRepository,
     ai_monitor: AiMonitor,
     feed_monitor: FeedMonitor,
     audit_emitter: AuditEmitter,
@@ -47,7 +45,6 @@ impl HealthScheduler {
         Self {
             config,
             health_repo: HealthRepository::new(pool.clone()),
-            notification_repo: NotificationRepository::new(pool.clone()),
             ai_monitor: AiMonitor::new(pool.clone(), ai_checker, airgap),
             feed_monitor: FeedMonitor::with_clickhouse(pool, dual_pool.clickhouse().clone()),
             audit_emitter: AuditEmitter::new(dual_pool),
@@ -120,28 +117,25 @@ impl HealthScheduler {
             let issue_key = status.provider_type.clone();
 
             if !status.is_healthy {
-                // Provider is down - create or update issue
-                let existing = self
+                let notification = Self::ai_provider_notification(&status);
+                if let Some(recipients) = self
                     .health_repo
-                    .find_active_issue(&HealthIssueType::AiProvider.to_string(), &issue_key)
-                    .await?;
-
-                if let Some(issue) = existing {
-                    if !issue.notification_sent {
-                        // Send notification
-                        self.send_ai_provider_notification(&status).await?;
-                        self.health_repo.mark_notification_sent(issue.id).await?;
+                    .notify_issue_once(
+                        &HealthIssueType::AiProvider.to_string(),
+                        &issue_key,
+                        &notification,
+                    )
+                    .await?
+                {
+                    if recipients == 0 {
+                        warn!("No admin users found to notify about AI provider issue");
+                    } else {
+                        info!(
+                            provider = %status.provider_name,
+                            recipients,
+                            "Sent AI provider down notifications to admin users"
+                        );
                     }
-                } else {
-                    // Create new issue
-                    let issue = self
-                        .health_repo
-                        .create_issue(&HealthIssueType::AiProvider.to_string(), &issue_key)
-                        .await?;
-
-                    // Send notification
-                    self.send_ai_provider_notification(&status).await?;
-                    self.health_repo.mark_notification_sent(issue.id).await?;
                 }
             } else {
                 // Provider is healthy - resolve any existing issue
@@ -162,30 +156,25 @@ impl HealthScheduler {
             let issue_key = status.feed_id.to_string();
 
             if status.is_stale {
-                // Feed is stale - create or update issue
-                let existing = self
+                let notification = Self::feed_stale_notification(&status);
+                if let Some(recipients) = self
                     .health_repo
-                    .find_active_issue(&HealthIssueType::DataFeed.to_string(), &issue_key)
-                    .await?;
-
-                if let Some(issue) = existing {
-                    if !issue.notification_sent {
-                        // Send notification
-                        self.send_feed_stale_notification(&status).await?;
-                        self.health_repo.mark_notification_sent(issue.id).await?;
+                    .notify_issue_once(
+                        &HealthIssueType::DataFeed.to_string(),
+                        &issue_key,
+                        &notification,
+                    )
+                    .await?
+                {
+                    if recipients == 0 {
+                        warn!("No admin users found to notify about stale feed");
+                    } else {
+                        info!(
+                            feed = %status.feed_name,
+                            recipients,
+                            "Sent stale feed notifications to admin users"
+                        );
                     }
-                } else {
-                    // Create new issue
-                    let issue = self
-                        .health_repo
-                        .create_issue(&HealthIssueType::DataFeed.to_string(), &issue_key)
-                        .await?;
-
-                    // Send notification
-                    self.send_feed_stale_notification(&status).await?;
-                    self.health_repo.mark_notification_sent(issue.id).await?;
-
-                    // Emit audit event for feed staleness
                     self.emit_feed_stale_audit(&status).await;
                 }
             } else {
@@ -199,71 +188,30 @@ impl HealthScheduler {
         Ok(())
     }
 
-    /// Send notification for AI provider being down
-    async fn send_ai_provider_notification(
-        &self,
-        status: &super::types::AiProviderStatus,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let admin_user_ids = self.health_repo.get_admin_user_ids().await?;
-
-        if admin_user_ids.is_empty() {
-            warn!("No admin users found to notify about AI provider issue");
-            return Ok(());
-        }
-
+    fn ai_provider_notification(status: &super::types::AiProviderStatus) -> HealthNotification {
         let error_detail = status
             .error_message
             .as_ref()
             .map(|e| format!(": {}", e))
             .unwrap_or_default();
 
-        for user_id in admin_user_ids {
-            let notification = NewNotification {
-                user_id,
-                notification_type: NotificationType::AiProviderDown,
-                title: format!("AI Provider Down: {}", status.provider_name),
-                message: Some(format!(
-                    "The {} AI provider is not responding{}",
-                    status.provider_name, error_detail
-                )),
-                link: Some("/settings/ai".to_string()),
-                metadata: serde_json::json!({
-                    "provider_type": status.provider_type,
-                    "provider_name": status.provider_name,
-                    "error_message": status.error_message,
-                }),
-            };
-
-            if let Err(e) = self.notification_repo.create(&notification).await {
-                warn!(
-                    user_id = %user_id,
-                    provider = %status.provider_name,
-                    error = %e,
-                    "Failed to create AI provider down notification"
-                );
-            }
+        HealthNotification {
+            notification_type: NotificationType::AiProviderDown,
+            title: format!("AI Provider Down: {}", status.provider_name),
+            message: Some(format!(
+                "The {} AI provider is not responding{}",
+                status.provider_name, error_detail
+            )),
+            link: Some("/settings/ai".to_string()),
+            metadata: serde_json::json!({
+                "provider_type": status.provider_type,
+                "provider_name": status.provider_name,
+                "error_message": status.error_message,
+            }),
         }
-
-        info!(
-            provider = %status.provider_name,
-            "Sent AI provider down notifications to admin users"
-        );
-
-        Ok(())
     }
 
-    /// Send notification for stale feed
-    async fn send_feed_stale_notification(
-        &self,
-        status: &super::types::FeedStalenessStatus,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let admin_user_ids = self.health_repo.get_admin_user_ids().await?;
-
-        if admin_user_ids.is_empty() {
-            warn!("No admin users found to notify about stale feed");
-            return Ok(());
-        }
-
+    fn feed_stale_notification(status: &super::types::FeedStalenessStatus) -> HealthNotification {
         let staleness_detail = status
             .minutes_since_last_event
             .map(|m| {
@@ -275,41 +223,22 @@ impl HealthScheduler {
             })
             .unwrap_or_else(|| "No data has ever been received".to_string());
 
-        for user_id in admin_user_ids {
-            let notification = NewNotification {
-                user_id,
-                notification_type: NotificationType::DataFeedStale,
-                title: format!("Data Feed Stale: {}", status.feed_name),
-                message: Some(format!(
-                    "{}. Threshold: {} minutes",
-                    staleness_detail, status.stale_threshold_minutes
-                )),
-                link: Some(format!("/log-sources/{}", status.feed_id)),
-                metadata: serde_json::json!({
-                    "feed_id": status.feed_id.to_string(),
-                    "feed_name": status.feed_name,
-                    "last_event_at": status.last_event_at,
-                    "stale_threshold_minutes": status.stale_threshold_minutes,
-                    "minutes_since_last_event": status.minutes_since_last_event,
-                }),
-            };
-
-            if let Err(e) = self.notification_repo.create(&notification).await {
-                warn!(
-                    user_id = %user_id,
-                    feed = %status.feed_name,
-                    error = %e,
-                    "Failed to create stale feed notification"
-                );
-            }
+        HealthNotification {
+            notification_type: NotificationType::DataFeedStale,
+            title: format!("Data Feed Stale: {}", status.feed_name),
+            message: Some(format!(
+                "{}. Threshold: {} minutes",
+                staleness_detail, status.stale_threshold_minutes
+            )),
+            link: Some(format!("/log-sources/{}", status.feed_id)),
+            metadata: serde_json::json!({
+                "feed_id": status.feed_id.to_string(),
+                "feed_name": status.feed_name,
+                "last_event_at": status.last_event_at,
+                "stale_threshold_minutes": status.stale_threshold_minutes,
+                "minutes_since_last_event": status.minutes_since_last_event,
+            }),
         }
-
-        info!(
-            feed = %status.feed_name,
-            "Sent stale feed notifications to admin users"
-        );
-
-        Ok(())
     }
 
     /// Emit an audit event when a feed goes stale

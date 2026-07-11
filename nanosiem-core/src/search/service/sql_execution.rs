@@ -271,7 +271,7 @@ impl SearchService {
         limit: usize,
         offset: usize,
     ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
-        self.execute_clickhouse_sql_with_query_id(sql, limit, offset, None, None, None)
+        self.execute_clickhouse_sql_with_query_id(sql, limit, offset, None, None, None, None)
             .await
     }
 
@@ -287,6 +287,7 @@ impl SearchService {
         query_id: Option<&str>,
         ch_settings: Option<&super::admission::ClickHouseQuerySettings>,
         bounded_count: Option<BoundedCountInput<'_>>,
+        execution_limits: Option<&crate::search::SearchExecutionLimits>,
     ) -> Result<(Vec<serde_json::Value>, u64), SearchError> {
         let ch_executor = self.ch_executor.as_ref().ok_or_else(|| {
             SearchError::DatabaseError(sqlx::Error::Configuration(
@@ -300,11 +301,26 @@ impl SearchService {
         // If both query_id and settings are provided, use the settings-aware method
         if let (Some(id), Some(settings)) = (query_id, effective_settings) {
             ch_executor
-                .execute_sql_with_settings(sql, limit, offset, id, settings, bounded_count)
+                .execute_sql_with_settings(
+                    sql,
+                    limit,
+                    offset,
+                    id,
+                    settings,
+                    bounded_count,
+                    execution_limits,
+                )
                 .await
         } else if let Some(id) = query_id {
             ch_executor
-                .execute_sql_with_query_id(sql, limit, offset, id, bounded_count)
+                .execute_sql_with_query_id(
+                    sql,
+                    limit,
+                    offset,
+                    id,
+                    bounded_count,
+                    execution_limits,
+                )
                 .await
         } else {
             ch_executor.execute_sql(sql, limit, offset).await

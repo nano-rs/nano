@@ -15,7 +15,9 @@ import {
   type RedesignFilters,
   type TacticCoverage,
   type TechniqueCoverage,
+  filterTechniqueGroup,
   statusOf,
+  summarizeTechniqueCoverage,
   tierFor,
 } from './types';
 
@@ -126,23 +128,13 @@ function TechCell({
       {expanded && hasSubs && (
         <div className="ml-3 pl-2 border-l border-border flex flex-col gap-0.5">
           {subs.map((sub) => (
-            <button
+            <SubTechniqueCell
               key={sub.technique_id}
-              type="button"
-              onClick={() => onOpen(tactic.tactic_id, sub.technique_id)}
-              className="text-left px-1.5 py-1 rounded-[4px] hover:bg-foreground/5 transition group"
-            >
-              <div className="flex items-baseline gap-1.5">
-                {showIds && (
-                  <span className="font-mono text-[9px] text-muted-foreground group-hover:text-foreground/80">
-                    {sub.technique_id}
-                  </span>
-                )}
-                <span className="text-[10.5px] text-muted-foreground group-hover:text-foreground leading-tight">
-                  {sub.technique_name}
-                </span>
-              </div>
-            </button>
+              tacticId={tactic.tactic_id}
+              technique={sub}
+              showIds={showIds}
+              onOpen={onOpen}
+            />
           ))}
         </div>
       )}
@@ -152,10 +144,56 @@ function TechCell({
 
 interface TacticHeaderProps {
   tactic: TacticCoverage;
+  covered: number;
+  total: number;
   pct: number;
 }
 
-function TacticHeader({ tactic, pct }: TacticHeaderProps) {
+function SubTechniqueCell({
+  tacticId,
+  technique,
+  showIds,
+  onOpen,
+}: {
+  tacticId: string;
+  technique: TechniqueCoverage;
+  showIds: boolean;
+  onOpen: (tacticId: string, techniqueId: string) => void;
+}) {
+  const tier = tierFor(technique);
+  const liveCount = (technique.rules || []).filter(
+    (rule) => statusOf(rule.mode) === 'live',
+  ).length;
+
+  return (
+    <button
+      type="button"
+      onClick={() => onOpen(tacticId, technique.technique_id)}
+      className={cn(
+        'text-left px-1.5 py-1 rounded-[4px] border transition-colors group',
+        tierClasses(tier),
+      )}
+    >
+      <div className="flex items-baseline gap-1.5">
+        {showIds && (
+          <span className="font-mono text-[9px] opacity-70">
+            {technique.technique_id}
+          </span>
+        )}
+        <span className="text-[10.5px] flex-1 leading-tight">
+          {technique.technique_name}
+        </span>
+        {liveCount > 0 && (
+          <span className="font-mono text-[9px] tabular-nums opacity-80">
+            {liveCount}
+          </span>
+        )}
+      </div>
+    </button>
+  );
+}
+
+function TacticHeader({ tactic, covered, total, pct }: TacticHeaderProps) {
   return (
     <div className="sticky top-0 z-10 bg-background border-b border-border pb-2 pt-2 px-1.5">
       <div className="flex items-baseline justify-between gap-2 mb-1">
@@ -166,7 +204,7 @@ function TacticHeader({ tactic, pct }: TacticHeaderProps) {
           <div className="font-mono text-[9.5px] text-muted-foreground mt-px">{tactic.tactic_id}</div>
         </div>
         <div className="shrink-0 font-mono text-[10px] text-foreground/80 tabular-nums">
-          {tactic.covered_techniques}/{tactic.total_techniques}
+          {covered}/{total}
         </div>
       </div>
       <div className="h-1 rounded-full bg-border overflow-hidden">
@@ -225,55 +263,16 @@ export function CoverageMatrix({
     return TACTIC_ORDER.map((id) => byId.get(id)).filter((t): t is TacticCoverage => Boolean(t));
   }, [tactics]);
 
-  // Per-tactic coverage % (recomputed from live-rule-derived tier so it
-  // matches the cell colours instead of the API's bracket-based level).
-  const pctByTactic = useMemo(() => {
-    const map = new Map<string, number>();
+  // Count parents and sub-techniques as independent units, matching the API.
+  const statsByTactic = useMemo(() => {
+    const map = new Map<string, ReturnType<typeof summarizeTechniqueCoverage>>();
     tacticsOrdered.forEach((tactic) => {
-      const techs = byTactic.get(tactic.tactic_id) ?? [];
-      if (techs.length === 0) {
-        map.set(tactic.tactic_id, 0);
-        return;
-      }
-      const covered = techs.filter((t) => {
-        const tier = tierFor(t);
-        return tier === 'full' || tier === 'partial';
-      }).length;
-      map.set(tactic.tactic_id, Math.round((covered / techs.length) * 100));
+      const units = techniques.filter((technique) =>
+        technique.tactic_ids.includes(tactic.tactic_id));
+      map.set(tactic.tactic_id, summarizeTechniqueCoverage(units));
     });
     return map;
-  }, [tacticsOrdered, byTactic]);
-
-  const matchesFilter = (t: TechniqueCoverage): boolean => {
-    const tier = tierFor(t);
-    if (filters.gapOnly && (tier === 'full' || tier === 'partial')) return false;
-
-    if (filters.status.size > 0) {
-      const hits = (t.rules || []).some((r) => filters.status.has(statusOf(r.mode)));
-      if (!hits && !filters.gapOnly && !filters.q) return false;
-    }
-
-    if (filters.platforms.size > 0) {
-      const hits = (t.rules || []).some((r) => r.source && filters.platforms.has(r.source));
-      if (!hits) return false;
-    }
-
-    if (filters.q.trim().length > 0) {
-      const q = filters.q.toLowerCase();
-      const subs = subsByParent.get(t.technique_id) ?? [];
-      const haystack = [
-        t.technique_id,
-        t.technique_name,
-        ...subs.flatMap((s) => [s.technique_id, s.technique_name]),
-        ...(t.rules || []).map((r) => r.name),
-      ]
-        .join(' ')
-        .toLowerCase();
-      if (!haystack.includes(q)) return false;
-    }
-
-    return true;
-  };
+  }, [tacticsOrdered, techniques]);
 
   const colWidth = density === 'compact' ? 'w-[140px]' : 'w-[160px]';
   const colGap = density === 'compact' ? 'gap-1' : 'gap-1.5';
@@ -291,26 +290,38 @@ export function CoverageMatrix({
     <div className="flex-1 min-h-0 overflow-auto bg-background">
       <div className="flex gap-1 p-3 min-w-max">
         {tacticsOrdered.map((tactic) => {
-          const techs = (byTactic.get(tactic.tactic_id) ?? []).filter(matchesFilter);
+          const tacticStats = statsByTactic.get(tactic.tactic_id)
+            ?? summarizeTechniqueCoverage([]);
+          const groups = (byTactic.get(tactic.tactic_id) ?? [])
+            .map((parent) => {
+              const tacticSubs = (subsByParent.get(parent.technique_id) ?? [])
+                .filter((sub) => sub.tactic_ids.includes(tactic.tactic_id));
+              return { parent, ...filterTechniqueGroup(parent, tacticSubs, filters) };
+            })
+            .filter((group) => group.visible);
           return (
             <div key={tactic.tactic_id} className={cn('flex flex-col', colGap, colWidth)}>
-              <TacticHeader tactic={tactic} pct={pctByTactic.get(tactic.tactic_id) ?? 0} />
+              <TacticHeader
+                tactic={tactic}
+                covered={tacticStats.covered}
+                total={tacticStats.total}
+                pct={tacticStats.percentage}
+              />
               <div className={cn('flex flex-col px-0.5', colGap)}>
-                {techs.length === 0 ? (
+                {groups.length === 0 ? (
                   <div className="text-[10px] text-muted-foreground font-mono text-center py-3 opacity-50">—</div>
                 ) : (
-                  techs.map((technique) => {
-                    const key = `${tactic.tactic_id}/${technique.technique_id}`;
-                    const subs = subsByParent.get(technique.technique_id) ?? [];
+                  groups.map(({ parent, parentMatches, subs }) => {
+                    const key = `${tactic.tactic_id}/${parent.technique_id}`;
                     return (
                       <TechCell
                         key={key}
                         tactic={tactic}
-                        technique={technique}
+                        technique={parent}
                         subs={subs}
                         density={density}
                         showIds={showIds}
-                        expanded={expanded.has(key)}
+                        expanded={expanded.has(key) || (!parentMatches && subs.length > 0)}
                         onToggleExpand={() => toggleExpand(key)}
                         onOpen={onOpenTechnique}
                       />

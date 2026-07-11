@@ -13,12 +13,42 @@ import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import {
   type CoveringRule,
+  type RequiredDataSource,
   type StatusKey,
   type TacticCoverage,
   type TechniqueCoverage,
+  readinessLabel,
+  readinessOf,
   statusOf,
   tierFor,
 } from './types';
+
+function readinessPresentation(source: RequiredDataSource) {
+  const readiness = readinessOf(source);
+  const color = readiness === 'active'
+    ? 'text-emerald-500'
+    : readiness === 'stale'
+      ? 'text-amber-500'
+      : 'text-muted-foreground';
+  const dot = readiness === 'active'
+    ? 'bg-emerald-500'
+    : readiness === 'stale'
+      ? 'bg-amber-500'
+      : 'bg-muted-foreground';
+  const title = source.last_seen_at
+    ? `Last event ${new Date(source.last_seen_at).toLocaleString()}`
+    : readiness === 'stale'
+      ? 'Configured, with no events observed in the retained telemetry window'
+      : source.mapping_known === false
+        ? 'No nano source mapping is available for this ATT&CK data source'
+        : source.configured === false
+        ? 'No enabled and deployed source is mapped to this data source'
+        : readiness === 'unknown'
+          ? 'Ingestion health is unavailable'
+          : 'Active ingestion';
+
+  return { color, dot, label: readinessLabel(source), title };
+}
 
 const TIER_BANNER: Record<ReturnType<typeof tierFor>, { label: string; cls: string; dot: string }> = {
   full:      { label: 'Full coverage',    cls: 'bg-emerald-500/12 border-emerald-500/40 text-emerald-500', dot: 'bg-emerald-500' },
@@ -105,20 +135,18 @@ export function TechniqueDetailSheet({
   if (!open || !technique) return null;
 
   const isSub = technique.is_subtechnique;
-  const displayTechnique = isSub && parentTechnique ? parentTechnique : technique;
-  const displaySub = isSub ? technique : null;
+  const parentContext = isSub ? parentTechnique : null;
 
-  // Tier is computed against the *parent* (rules + sources hang off the parent
-  // in our API). This matches the mockup behaviour where the drawer banner
-  // reflects parent coverage even when navigated via a sub-technique.
-  const tier = tierFor(displayTechnique);
+  // Every ATT&CK technique ID is its own coverage unit. The selected child's
+  // rules and telemetry must never be inherited from its parent.
+  const tier = tierFor(technique);
   const banner = TIER_BANNER[tier];
-  const live = (displayTechnique.rules || []).filter((r) => statusOf(r.mode) === 'live');
-  const review = (displayTechnique.rules || []).filter((r) => statusOf(r.mode) === 'review');
-  const disabled = (displayTechnique.rules || []).filter((r) => statusOf(r.mode) === 'disabled');
+  const live = (technique.rules || []).filter((r) => statusOf(r.mode) === 'live');
+  const review = (technique.rules || []).filter((r) => statusOf(r.mode) === 'review');
+  const disabled = (technique.rules || []).filter((r) => statusOf(r.mode) === 'disabled');
   const orderedRules = [...live, ...review, ...disabled];
 
-  const mitreId = (displaySub ?? displayTechnique).technique_id;
+  const mitreId = technique.technique_id;
   const mitreUrl = `https://attack.mitre.org/techniques/${mitreId.replace('.', '/')}/`;
 
   const close = () => onOpenChange(false);
@@ -143,16 +171,16 @@ export function TechniqueDetailSheet({
               <div className="flex items-center gap-1.5 text-[10px] font-mono text-muted-foreground uppercase tracking-wider">
                 {tactic && <span>{tactic.tactic_name}</span>}
                 {tactic && <ChevronRight className="w-[9px] h-[9px]" />}
-                <span className="text-foreground/80">{displayTechnique.technique_id}</span>
-                {displaySub && (
+                {parentContext && (
                   <>
+                    <span className="text-foreground/80">{parentContext.technique_id}</span>
                     <ChevronRight className="w-[9px] h-[9px]" />
-                    <span>{displaySub.technique_id}</span>
                   </>
                 )}
+                <span>{technique.technique_id}</span>
               </div>
               <div className="text-[15px] font-semibold tracking-[-0.01em] text-foreground mt-0.5 break-words">
-                {displaySub ? displaySub.technique_name : displayTechnique.technique_name}
+                {technique.technique_name}
               </div>
             </div>
             <Button variant="ghost" size="icon" className="h-[24px] w-[24px] shrink-0" onClick={close}>
@@ -169,7 +197,7 @@ export function TechniqueDetailSheet({
             </span>
             {tier === 'hot-gap' && (
               <span className="ml-auto text-[10px] font-mono uppercase tracking-wider opacity-80">
-                sources connected
+                active telemetry
               </span>
             )}
           </div>
@@ -181,7 +209,7 @@ export function TechniqueDetailSheet({
           <section className="px-4 py-3 border-b border-border">
             <div className="flex items-center justify-between mb-2">
               <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
-                Rules mapped to {displaySub ? displaySub.technique_id : displayTechnique.technique_id}
+                Rules mapped to {technique.technique_id}
               </div>
               <button
                 type="button"
@@ -204,11 +232,31 @@ export function TechniqueDetailSheet({
             ) : (
               <div className="text-[11px] text-muted-foreground italic py-2">
                 No rules mapped. {tier === 'hot-gap'
-                  ? 'Your data sources would support detection here — consider writing one.'
-                  : 'Connect a data source below to unlock coverage.'}
+                  ? 'Active telemetry would support detection here. Consider writing one.'
+                  : 'Configure or restore active telemetry below to unlock coverage.'}
               </div>
             )}
           </section>
+
+          {/* Parent is context only; its rules/readiness never roll down. */}
+          {parentContext && (
+            <section className="px-4 py-3 border-b border-border">
+              <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">
+                Parent technique
+              </div>
+              <div className="flex items-center gap-2 px-2 py-1.5 rounded-md border border-border bg-card">
+                <span className="font-mono text-[10px] text-muted-foreground shrink-0">
+                  {parentContext.technique_id}
+                </span>
+                <span className="text-[11.5px] text-foreground flex-1">
+                  {parentContext.technique_name}
+                </span>
+                <span className="font-mono text-[9.5px] text-muted-foreground">
+                  {parentContext.rule_count} parent-mapped
+                </span>
+              </div>
+            </section>
+          )}
 
           {/* Sub-techniques */}
           {subs.length > 0 && (
@@ -218,7 +266,7 @@ export function TechniqueDetailSheet({
               </div>
               <div className="flex flex-col gap-1">
                 {subs.map((s) => {
-                  const active = displaySub?.technique_id === s.technique_id;
+                  const active = isSub && technique.technique_id === s.technique_id;
                   return (
                     <div
                       key={s.technique_id}
@@ -241,7 +289,7 @@ export function TechniqueDetailSheet({
           {/* Data sources */}
           <section className="px-4 py-3 border-b border-border">
             <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">Required data sources</div>
-            {(displayTechnique.data_sources ?? []).length === 0 ? (
+            {(technique.data_sources ?? []).length === 0 ? (
               <div className="flex items-start gap-2 text-[11px] text-muted-foreground italic py-2">
                 <Database className="w-[12px] h-[12px] mt-px shrink-0" />
                 <span>
@@ -251,19 +299,25 @@ export function TechniqueDetailSheet({
               </div>
             ) : (
               <div className="flex flex-col gap-1">
-                {(displayTechnique.data_sources ?? []).map((d) => (
-                  <div
-                    key={d.id}
-                    className="flex items-center gap-2 px-2 py-1 rounded-md border border-border bg-card"
-                  >
-                    <span className={cn('w-1.5 h-1.5 rounded-full shrink-0', d.connected ? 'bg-emerald-500' : 'bg-muted-foreground')} />
-                    <span className="text-[11.5px] text-foreground flex-1">{d.name}</span>
-                    <span className={cn('font-mono text-[9.5px] uppercase tracking-wider',
-                      d.connected ? 'text-emerald-500' : 'text-muted-foreground')}>
-                      {d.connected ? 'connected' : 'missing'}
-                    </span>
-                  </div>
-                ))}
+                {(technique.data_sources ?? []).map((d) => {
+                  const presentation = readinessPresentation(d);
+                  return (
+                    <div
+                      key={d.id}
+                      title={presentation.title}
+                      className="flex items-center gap-2 px-2 py-1 rounded-md border border-border bg-card"
+                    >
+                      <span className={cn('w-1.5 h-1.5 rounded-full shrink-0', presentation.dot)} />
+                      <span className="text-[11.5px] text-foreground flex-1">{d.name}</span>
+                      <span className={cn(
+                        'font-mono text-[9.5px] uppercase tracking-wider shrink-0 whitespace-nowrap',
+                        presentation.color,
+                      )}>
+                        {presentation.label}
+                      </span>
+                    </div>
+                  );
+                })}
               </div>
             )}
           </section>

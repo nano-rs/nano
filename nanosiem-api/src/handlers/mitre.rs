@@ -4,37 +4,24 @@
 
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
     Extension, Json,
 };
 use serde::{Deserialize, Serialize};
 
+use crate::handlers::AuditExt;
 use crate::middleware::{check_permission, AuthContext};
 use crate::state::AppState;
+use nanosiem_core::audit::{AuditEvent, AuditSource, ClientContext, MITRE_CATALOG_SYNCED};
 use nanosiem_core::auth::permissions;
 use nanosiem_core::mitre::{
-    MitreCoverageResponse, MitreRepository, MitreSync, MitreSyncMetadata, MitreTactic,
-    MitreTechnique,
+    DataSource, DataSourceReadiness, MitreCoverageResponse, MitreRepository, MitreSync,
+    MitreSyncMetadata, MitreSyncOutcome, MitreSyncState, MitreTactic, MitreTechnique,
+    TelemetryReadinessSnapshot, TELEMETRY_READINESS_LOOKBACK_HOURS,
 };
 
-/// Ensure the ATT&CK catalog is populated, lazily syncing it from upstream on
-/// first use. The catalog (`mitre_tactics` / `mitre_techniques`) is not seeded
-/// by migration, so it must be synced at runtime. Sync failures are logged and
-/// swallowed so the caller still returns a (possibly empty) response rather
-/// than a 500 — the catalog is retried on the next request. Shared by
-/// `get_mitre_data` and `get_mitre_coverage` so every MITRE surface self-seeds,
-/// not just the rule-editor data endpoint (NAN-1103).
-async fn ensure_mitre_catalog(pool: &sqlx::PgPool) {
-    let sync = MitreSync::new(MitreRepository::new(pool.clone()));
-    match sync.sync_if_empty().await {
-        Ok(true) => tracing::info!("MITRE catalog was empty — lazily synced from upstream"),
-        Ok(false) => {}
-        Err(e) => tracing::warn!(
-            "MITRE catalog lazy sync failed (will retry on next request): {}",
-            e
-        ),
-    }
-}
+const TELEMETRY_READINESS_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Response containing all MITRE data for frontend dropdowns
 #[derive(Serialize, utoipa::ToSchema)]
@@ -42,6 +29,7 @@ pub struct MitreDataResponse {
     pub tactics: Vec<MitreTactic>,
     pub techniques: Vec<MitreTechnique>,
     pub last_sync: Option<MitreSyncMetadata>,
+    pub sync_state: Option<MitreSyncState>,
 }
 
 /// Get all MITRE ATT&CK tactics and techniques
@@ -59,13 +47,9 @@ pub struct MitreDataResponse {
 pub async fn get_mitre_data(
     Extension(auth): Extension<AuthContext>,
     State(state): State<AppState>,
-) -> Result<Json<MitreDataResponse>, (StatusCode, String)> {
+) -> Result<Response, (StatusCode, String)> {
     check_permission(&auth, permissions::MITRE_VIEW)
         .map_err(|(status, json)| (status, json.0.message))?;
-
-    // Lazily seed the ATT&CK catalog on first use. If the sync fails, the
-    // queries below return empty vecs — same graceful-empty result as before.
-    ensure_mitre_catalog(&state.pool).await;
 
     let repo = MitreRepository::new(state.pool.clone());
 
@@ -90,11 +74,36 @@ pub async fn get_mitre_data(
         )
     })?;
 
-    Ok(Json(MitreDataResponse {
-        tactics,
-        techniques,
-        last_sync,
-    }))
+    let sync_state = repo.get_sync_state().await.map_err(|e| {
+        tracing::error!(%e, "Failed to get MITRE sync state");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to get MITRE sync state".to_string(),
+        )
+    })?;
+
+    // The ATT&CK catalog changes only on manual/scheduled sync, so a populated
+    // response keeps a long browser cache. An *empty* catalog, however, is the
+    // transient boot/seed window — caching it for an hour would hide the
+    // freshly-seeded catalog from every client for that long (NAN-1766 / D5).
+    // Setting the header here supersedes the route's static Cache-Control layer,
+    // which is now `if_not_present`.
+    let cache_control = if tactics.is_empty() || techniques.is_empty() {
+        "private, no-store"
+    } else {
+        "private, max-age=3600, stale-while-revalidate=300"
+    };
+
+    Ok((
+        [(header::CACHE_CONTROL, HeaderValue::from_static(cache_control))],
+        Json(MitreDataResponse {
+            tactics,
+            techniques,
+            last_sync,
+            sync_state,
+        }),
+    )
+        .into_response())
 }
 
 /// Trigger a manual sync of MITRE data
@@ -105,12 +114,15 @@ pub async fn get_mitre_data(
     responses(
         (status = 200, description = "MITRE data synced successfully", body = SyncResponse),
         (status = 403, description = "Forbidden - Missing permission: mitre:sync"),
+        (status = 409, description = "A MITRE sync is already running"),
+        (status = 503, description = "Outbound synchronization is disabled"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
 pub async fn sync_mitre_data(
     Extension(auth): Extension<AuthContext>,
+    Extension(client): Extension<ClientContext>,
     State(state): State<AppState>,
 ) -> Result<Json<SyncResponse>, (StatusCode, String)> {
     check_permission(&auth, permissions::MITRE_SYNC)
@@ -118,24 +130,115 @@ pub async fn sync_mitre_data(
 
     let repo = MitreRepository::new(state.pool.clone());
     let sync = MitreSync::new(repo);
+    let expected_release = sync.release().to_string();
+    let expected_source_url = sync.source_url().to_string();
+    let expected_source_sha256 = sync.source_sha256().to_string();
 
-    let (tactic_count, technique_count) = sync.sync().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Sync failed: {}", e),
-        )
-    })?;
+    if !state.config.egress_jobs_enabled() {
+        state.emit_audit(
+            AuditEvent::builder(AuditSource::Mitre, MITRE_CATALOG_SYNCED)
+                .actor(Some(auth.user_id()), None)
+                .api_key(auth.api_key_id, auth.api_key_name.clone())
+                .resource("mitre_catalog", None, Some(expected_release.clone()))
+                .client_context(&client)
+                .success(false)
+                .details(serde_json::json!({
+                    "release": expected_release,
+                    "source_url": expected_source_url,
+                    "source_sha256": expected_source_sha256,
+                    "result": "egress_disabled",
+                }))
+                .build(),
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Outbound MITRE catalog synchronization is disabled".to_string(),
+        ));
+    }
 
-    Ok(Json(SyncResponse {
-        success: true,
-        tactic_count,
-        technique_count,
-    }))
+    match sync.sync().await {
+        Ok(MitreSyncOutcome::Synced(result)) => {
+            state.emit_audit(
+                AuditEvent::builder(AuditSource::Mitre, MITRE_CATALOG_SYNCED)
+                    .actor(Some(auth.user_id()), None)
+                    .api_key(auth.api_key_id, auth.api_key_name.clone())
+                    .resource("mitre_catalog", None, Some(result.release.clone()))
+                    .client_context(&client)
+                    .details(serde_json::json!({
+                        "release": &result.release,
+                        "source_url": &result.source_url,
+                        "source_sha256": &result.source_sha256,
+                        "tactic_count": result.tactic_count,
+                        "technique_count": result.technique_count,
+                    }))
+                    .build(),
+            );
+
+            Ok(Json(SyncResponse {
+                success: true,
+                release: result.release,
+                source_sha256: result.source_sha256,
+                tactic_count: result.tactic_count,
+                technique_count: result.technique_count,
+            }))
+        }
+        Ok(outcome) => {
+            let reason = match outcome {
+                MitreSyncOutcome::AlreadyRunning => "already_running",
+                MitreSyncOutcome::AlreadyCurrent => "already_current",
+                MitreSyncOutcome::RetryBackoff => "retry_backoff",
+                MitreSyncOutcome::Synced(_) => unreachable!(),
+            };
+            state.emit_audit(
+                AuditEvent::builder(AuditSource::Mitre, MITRE_CATALOG_SYNCED)
+                    .actor(Some(auth.user_id()), None)
+                    .api_key(auth.api_key_id, auth.api_key_name.clone())
+                    .resource("mitre_catalog", None, None)
+                    .client_context(&client)
+                    .success(false)
+                    .details(serde_json::json!({
+                        "release": expected_release,
+                        "source_url": expected_source_url,
+                        "source_sha256": expected_source_sha256,
+                        "result": reason,
+                    }))
+                    .build(),
+            );
+            Err((
+                StatusCode::CONFLICT,
+                "MITRE catalog synchronization is already in progress".to_string(),
+            ))
+        }
+        Err(error) => {
+            tracing::error!(%error, "Manual MITRE catalog sync failed");
+            state.emit_audit(
+                AuditEvent::builder(AuditSource::Mitre, MITRE_CATALOG_SYNCED)
+                    .actor(Some(auth.user_id()), None)
+                    .api_key(auth.api_key_id, auth.api_key_name.clone())
+                    .resource("mitre_catalog", None, None)
+                    .client_context(&client)
+                    .success(false)
+                    .details(serde_json::json!({
+                        "release": expected_release,
+                        "source_url": expected_source_url,
+                        "source_sha256": expected_source_sha256,
+                        "error": error.to_string(),
+                    }))
+                    .build(),
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "MITRE catalog synchronization failed".to_string(),
+            ))
+        }
+    }
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct SyncResponse {
     pub success: bool,
+    pub release: String,
+    pub source_sha256: String,
     pub tactic_count: i32,
     pub technique_count: i32,
 }
@@ -171,11 +274,70 @@ pub async fn get_mitre_coverage(
     check_permission(&auth, permissions::MITRE_VIEW)
         .map_err(|(status, json)| (status, json.0.message))?;
 
-    // Lazily seed the ATT&CK catalog so the Coverage page is self-sufficient
-    // and never renders a phantom 0/0 before the first /api/mitre hit (NAN-1103).
-    ensure_mitre_catalog(&state.pool).await;
-
     let repo = MitreRepository::new(state.pool.clone());
+
+    let configured_source_types = repo.configured_source_types().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to get configured telemetry sources: {}", e),
+        )
+    })?;
+    let telemetry = if configured_source_types.is_empty() {
+        TelemetryReadinessSnapshot::observed(
+            configured_source_types,
+            std::collections::HashMap::new(),
+            chrono::Utc::now(),
+        )
+    } else {
+        let requested_sources: Vec<String> = configured_source_types.iter().cloned().collect();
+        let stats = match tokio::time::timeout(
+            TELEMETRY_READINESS_QUERY_TIMEOUT,
+            state
+                .log_telemetry_service
+                .stats_by_source_type(&requested_sources, TELEMETRY_READINESS_LOOKBACK_HOURS),
+        )
+        .await
+        {
+            Ok(Ok(stats)) => Some(stats),
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    error = %error,
+                    configured_source_count = requested_sources.len(),
+                    "MITRE telemetry readiness unavailable; returning unknown readiness"
+                );
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    configured_source_count = requested_sources.len(),
+                    timeout_seconds = TELEMETRY_READINESS_QUERY_TIMEOUT.as_secs(),
+                    "MITRE telemetry readiness timed out; returning unknown readiness"
+                );
+                None
+            }
+        };
+
+        match stats {
+            Some(stats) => {
+                let last_seen_by_source_type = stats
+                    .into_iter()
+                    .filter_map(|(source_type, stats)| {
+                        stats
+                            .last_event_at
+                            .map(|last_seen| (source_type, last_seen))
+                    })
+                    .collect();
+                TelemetryReadinessSnapshot::observed(
+                    configured_source_types,
+                    last_seen_by_source_type,
+                    chrono::Utc::now(),
+                )
+            }
+            None => {
+                TelemetryReadinessSnapshot::unavailable(configured_source_types, chrono::Utc::now())
+            }
+        }
+    };
 
     // Parse comma-separated filter values
     let severity_filter: Option<Vec<String>> = params.severity.map(|s| {
@@ -193,7 +355,11 @@ pub async fn get_mitre_coverage(
     });
 
     let coverage = repo
-        .get_coverage(severity_filter.as_deref(), mode_filter.as_deref())
+        .get_coverage(
+            severity_filter.as_deref(),
+            mode_filter.as_deref(),
+            &telemetry,
+        )
         .await
         .map_err(|e| {
             (
@@ -221,7 +387,10 @@ impl utoipa::OpenApi for MitreApiDoc {
             ),
             components(schemas(
                 MitreDataResponse,
+                MitreSyncState,
                 SyncResponse,
+                DataSource,
+                DataSourceReadiness,
             )),
             tags(
                 (name = "mitre", description = "MITRE ATT&CK framework integration endpoints")
@@ -230,5 +399,50 @@ impl utoipa::OpenApi for MitreApiDoc {
         struct ApiDoc;
 
         ApiDoc::openapi()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coverage_data_source_json_exposes_truthful_readiness_contract() {
+        let active = DataSource {
+            id: "process_process_creation".to_string(),
+            name: "Process: Process Creation".to_string(),
+            mapping_known: true,
+            configured: true,
+            readiness: DataSourceReadiness::Active,
+            last_seen_at: Some(chrono::DateTime::UNIX_EPOCH),
+            connected: true,
+        };
+        let stale = DataSource {
+            readiness: DataSourceReadiness::Stale,
+            last_seen_at: None,
+            connected: false,
+            ..active.clone()
+        };
+        let unknown = DataSource {
+            configured: true,
+            readiness: DataSourceReadiness::Unknown,
+            last_seen_at: None,
+            connected: false,
+            ..active.clone()
+        };
+
+        let active_json = serde_json::to_value(active).expect("serialize active source");
+        let stale_json = serde_json::to_value(stale).expect("serialize stale source");
+        let unknown_json = serde_json::to_value(unknown).expect("serialize unknown source");
+
+        assert_eq!(active_json["readiness"], "active");
+        assert_eq!(active_json["mapping_known"], true);
+        assert_eq!(active_json["configured"], true);
+        assert_eq!(active_json["connected"], true);
+        assert_eq!(stale_json["readiness"], "stale");
+        assert_eq!(stale_json["last_seen_at"], serde_json::Value::Null);
+        assert_eq!(stale_json["connected"], false);
+        assert_eq!(unknown_json["readiness"], "unknown");
+        assert_eq!(unknown_json["connected"], false);
     }
 }

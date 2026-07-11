@@ -28,6 +28,8 @@ impl RuleRepositoryService {
         &self,
         filter: CoverageFilter,
     ) -> Result<CoverageAnalysis, RuleRepositoryError> {
+        let filter = filter.normalized();
+
         // Get rules to analyze
         let rules = if let Some(repo_id) = filter.repository_id {
             self.list_rules(repo_id, RepositoryRuleFilter::default())

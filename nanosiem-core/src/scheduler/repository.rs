@@ -411,7 +411,7 @@ impl SchedulerRepository {
 
     // ==================== DISTRIBUTED CLAIMING METHODS ====================
 
-    /// Atomically claim a batch of due jobs using SKIP LOCKED.
+    /// Atomically claim due jobs using SKIP LOCKED.
     ///
     /// Returns jobs that are now claimed by this node. Other nodes calling
     /// this concurrently will get disjoint sets (no double-execution).
@@ -433,7 +433,12 @@ impl SchedulerRepository {
                 LIMIT $1
                 FOR UPDATE SKIP LOCKED
             )
-            UPDATE scheduled_jobs SET claimed_by = $2, claimed_at = NOW(), last_run_status = 'running'
+            UPDATE scheduled_jobs SET
+                claimed_by = $2,
+                claimed_at = NOW(),
+                claim_generation = scheduled_jobs.claim_generation + 1,
+                claim_run_id = COALESCE(scheduled_jobs.claim_run_id, gen_random_uuid()),
+                last_run_status = 'running'
             WHERE id IN (SELECT id FROM claimable)
             RETURNING *
             "#,
@@ -452,39 +457,66 @@ impl SchedulerRepository {
             .collect()
     }
 
+    /// Renew a lease only while this exact owner generation still holds it.
+    #[instrument(skip(self))]
+    pub async fn renew_job_claim(
+        &self,
+        job_id: Uuid,
+        node_id: &str,
+        generation: i64,
+    ) -> Result<bool, SchedulerRepositoryError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE scheduled_jobs
+            SET claimed_at = NOW()
+            WHERE id = $1 AND claimed_by = $2 AND claim_generation = $3
+            "#,
+        )
+        .bind(job_id)
+        .bind(node_id)
+        .bind(generation)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Release a claimed job after execution, updating status and next_run_at.
     ///
-    /// Safety: only releases if still claimed by the same node_id.
+    /// Safety: only releases if still held by the same owner generation.
     #[instrument(skip(self))]
     pub async fn release_job_claim(
         &self,
         job_id: Uuid,
         node_id: &str,
+        generation: i64,
         status: JobStatus,
         error: Option<&str>,
         next_run_at: Option<DateTime<Utc>>,
-    ) -> Result<(), SchedulerRepositoryError> {
-        sqlx::query(
+    ) -> Result<bool, SchedulerRepositoryError> {
+        let result = sqlx::query(
             r#"
             UPDATE scheduled_jobs SET
                 claimed_by = NULL,
                 claimed_at = NULL,
+                claim_run_id = NULL,
                 last_run_at = NOW(),
-                last_run_status = $3,
-                last_run_error = $4,
-                next_run_at = $5
-            WHERE id = $1 AND claimed_by = $2
+                last_run_status = $4,
+                last_run_error = $5,
+                next_run_at = $6
+            WHERE id = $1 AND claimed_by = $2 AND claim_generation = $3
             "#,
         )
         .bind(job_id)
         .bind(node_id)
+        .bind(generation)
         .bind(status.as_str())
         .bind(error)
         .bind(next_run_at)
         .execute(&self.pool)
         .await?;
 
-        Ok(())
+        Ok(result.rows_affected() == 1)
     }
 
     /// Release all claims held by a node (graceful shutdown).

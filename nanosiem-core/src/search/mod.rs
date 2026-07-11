@@ -68,3 +68,4 @@ pub use types::{
     RetroVerdict, SearchError, SearchRequest, SearchResponse, TimeRangeInput, UdmFieldQueryRequest,
     UdmQueryOperator,
 };
+pub(crate) use types::SearchExecutionLimits;

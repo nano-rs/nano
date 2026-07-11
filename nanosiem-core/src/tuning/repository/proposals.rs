@@ -3,11 +3,204 @@
 //! Proposal operations for the tuning repository.
 
 use super::{ProposalHistorySummary, TuningRepository};
+use crate::detection_code_target::DetectionCodePushService;
+use crate::models::detection_rule::DetectionRule;
 use crate::models::AiTriageHints;
 use crate::tuning::types::{HintsDiff, ProposalType, TuningProposal, TuningStatus};
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use thiserror::Error;
 use uuid::Uuid;
+
+const PR_OPERATION_LEASE_MINUTES: i64 = 5;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrApprovalProvenance {
+    pub actor_user_id: Option<Uuid>,
+    pub api_key_id: Option<Uuid>,
+    pub api_key_name: Option<String>,
+    pub validation_skipped: bool,
+    pub reason: Option<String>,
+}
+
+impl PrApprovalProvenance {
+    pub fn automated() -> Self {
+        Self {
+            actor_user_id: None,
+            api_key_id: None,
+            api_key_name: None,
+            validation_skipped: false,
+            reason: None,
+        }
+    }
+
+    fn validate(&self, proposal_id: Uuid) -> std::result::Result<(), PrOperationError> {
+        if self.validation_skipped && self.actor_user_id.is_none() {
+            return Err(PrOperationError::InvalidMetadata {
+                proposal_id,
+                reason: "validation override has no durable authorizing actor".to_string(),
+            });
+        }
+        if self.validation_skipped
+            && self
+                .reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+                .is_none()
+        {
+            return Err(PrOperationError::InvalidMetadata {
+                proposal_id,
+                reason: "validation override has no durable approval reason".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrozenPrOperation {
+    pub proposal_id: Uuid,
+    pub target_id: Uuid,
+    pub repo_url: String,
+    pub base_branch: String,
+    pub path_template: String,
+    pub rule_format: String,
+    pub branch: String,
+    pub effective_query: String,
+    pub original_query: String,
+    pub rationale: String,
+    pub confidence_score: f64,
+    pub changes_summary: Vec<String>,
+    pub rule: DetectionRule,
+    #[serde(default)]
+    pub approval_provenance: Option<PrApprovalProvenance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrDestinationPayload {
+    pub file_path: String,
+    pub file_content: String,
+    pub commit_message: String,
+    pub title: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrOperationPhase {
+    Claimed,
+    DestinationReady,
+    BranchReady,
+    CommitReady,
+    PrReady,
+    Completed,
+    Cancelled,
+}
+
+impl PrOperationPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claimed => "claimed",
+            Self::DestinationReady => "destination_ready",
+            Self::BranchReady => "branch_ready",
+            Self::CommitReady => "commit_ready",
+            Self::PrReady => "pr_ready",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    fn parse(proposal_id: Uuid, value: &str) -> std::result::Result<Self, PrOperationError> {
+        match value {
+            "claimed" => Ok(Self::Claimed),
+            "destination_ready" => Ok(Self::DestinationReady),
+            "branch_ready" => Ok(Self::BranchReady),
+            "commit_ready" => Ok(Self::CommitReady),
+            "pr_ready" => Ok(Self::PrReady),
+            "completed" => Ok(Self::Completed),
+            "cancelled" => Ok(Self::Cancelled),
+            _ => Err(PrOperationError::InvalidMetadata {
+                proposal_id,
+                reason: format!("unknown PR operation phase '{value}'"),
+            }),
+        }
+    }
+}
+
+/// Durable external-effect provenance loaded with a fenced PR claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrOperationCheckpoint {
+    pub phase: PrOperationPhase,
+    pub branch_sha: Option<String>,
+    pub commit_sha: Option<String>,
+    pub pr_url: Option<String>,
+    pub pr_number: Option<i32>,
+    pub pr_state: Option<String>,
+}
+
+impl PrOperationCheckpoint {
+    fn validate(
+        self,
+        proposal_id: Uuid,
+        destination_frozen: bool,
+    ) -> std::result::Result<Self, PrOperationError> {
+        let invalid = if self.phase >= PrOperationPhase::PrReady
+            && (self.pr_url.is_none() || self.pr_number.is_none() || self.pr_state.is_none())
+        {
+            Some("PR-ready phase has no complete PR identity")
+        } else if self.phase >= PrOperationPhase::CommitReady && self.commit_sha.is_none() {
+            Some("commit-ready phase has no commit SHA")
+        } else if self.phase >= PrOperationPhase::BranchReady && self.branch_sha.is_none() {
+            Some("branch-ready phase has no branch SHA")
+        } else if self.phase >= PrOperationPhase::DestinationReady && !destination_frozen {
+            Some("destination-ready phase has no frozen destination")
+        } else {
+            None
+        };
+        if let Some(reason) = invalid {
+            return Err(PrOperationError::InvalidMetadata {
+                proposal_id,
+                reason: reason.to_string(),
+            });
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum PrOperationClaim {
+    Claimed {
+        resumed: bool,
+        attempt: i32,
+        operation: FrozenPrOperation,
+        destination: Option<PrDestinationPayload>,
+        checkpoint: PrOperationCheckpoint,
+    },
+    AlreadyOpened {
+        url: String,
+        number: i32,
+        state: String,
+        effective_query: String,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum PrOperationError {
+    #[error("tuning proposal not found: {0}")]
+    ProposalNotFound(Uuid),
+    #[error("tuning proposal {proposal_id} cannot start a PR operation from status '{status}'")]
+    InvalidState { proposal_id: Uuid, status: String },
+    #[error("tuning proposal {0} already has an active PR operation")]
+    InProgress(Uuid),
+    #[error("tuning proposal {proposal_id} is stale because rule {rule_id} changed after it was generated")]
+    StaleRuleBase { proposal_id: Uuid, rule_id: Uuid },
+    #[error("tuning proposal {proposal_id} has incompatible PR operation metadata: {reason}")]
+    InvalidMetadata { proposal_id: Uuid, reason: String },
+    #[error("database error while transitioning tuning PR operation: {0}")]
+    Database(#[from] sqlx::Error),
+}
 
 impl TuningRepository {
     /// Create a new tuning proposal
@@ -92,56 +285,1049 @@ impl TuningRepository {
         Ok(())
     }
 
-    /// Update proposal status
-    ///
-    /// # Arguments
-    /// * `proposal_id` - The UUID of the proposal
-    /// * `status` - The new status
-    pub async fn update_proposal_status(
-        &self,
-        proposal_id: Uuid,
-        status: TuningStatus,
-    ) -> Result<()> {
-        sqlx::query(
+    /// Return the target frozen by an in-flight PR claim. Recovery must use
+    /// this exact target even if a different target became active meanwhile.
+    pub async fn get_pr_operation_target_id(&self, proposal_id: Uuid) -> Result<Option<Uuid>> {
+        let target: Option<(Option<Uuid>, Option<String>)> = sqlx::query_as(
             r#"
-            UPDATE tuning_proposals
-            SET status = $1
-            WHERE id = $2
+                SELECT pr_target_id, pr_operation_snapshot->>'target_id'
+                FROM tuning_proposals WHERE id = $1
+                "#,
+        )
+        .bind(proposal_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to load tuning PR operation target")?;
+        Ok(match target {
+            Some((Some(target_id), _)) => Some(target_id),
+            Some((None, Some(snapshot_target_id))) => Uuid::parse_str(&snapshot_target_id).ok(),
+            Some((None, None)) | None => None,
+        })
+    }
+
+    /// Oldest-expired-first recovery queue. Returning only expired leases keeps
+    /// active workers out of the recovery batch, and the stable `(lease, id)`
+    /// order prevents newer proposals from starving an older interrupted one.
+    pub async fn list_recoverable_pr_operation_ids(&self, limit: i64) -> Result<Vec<Uuid>> {
+        sqlx::query_scalar(
+            r#"
+            SELECT id
+            FROM tuning_proposals
+            WHERE status = 'pr_pending'
+              AND (
+                  pr_operation_started_at IS NULL
+                  OR pr_operation_started_at <= NOW() - ($1 * INTERVAL '1 minute')
+              )
+            ORDER BY pr_operation_started_at ASC NULLS FIRST, id ASC
+            LIMIT $2
             "#,
         )
-        .bind(status.to_string())
+        .bind(PR_OPERATION_LEASE_MINUTES)
+        .bind(limit.clamp(1, 1_000))
+        .fetch_all(&self.pool)
+        .await
+        .context("Failed to list recoverable tuning PR operations")
+    }
+
+    /// Move an expired candidate to the back of the recovery queue when it
+    /// failed before `claim_pr_operation` could renew its lease. The expiry
+    /// predicate prevents a delayed worker from touching a newer active claim.
+    pub async fn defer_expired_pr_operation_recovery(
+        &self,
+        proposal_id: Uuid,
+        error: &str,
+    ) -> Result<bool> {
+        let error: String = error.chars().take(1000).collect();
+        let deferred = sqlx::query(
+            r#"
+            UPDATE tuning_proposals
+            SET pr_operation_started_at = NOW(),
+                pr_last_error = $1
+            WHERE id = $2
+              AND status = 'pr_pending'
+              AND (
+                  pr_operation_started_at IS NULL
+                  OR pr_operation_started_at <= NOW() - ($3 * INTERVAL '1 minute')
+              )
+            "#,
+        )
+        .bind(error)
         .bind(proposal_id)
+        .bind(PR_OPERATION_LEASE_MINUTES)
         .execute(&self.pool)
         .await
-        .context("Failed to update proposal status")?;
+        .context("Failed to defer expired tuning PR recovery")?;
+        Ok(deferred.rows_affected() == 1)
+    }
 
+    /// Persist a retryable failure against the current fenced attempt while
+    /// keeping the operation pending. A stale worker cannot overwrite the
+    /// diagnostics or renew the lease of a newer claimant.
+    pub async fn record_pr_operation_error(
+        &self,
+        proposal_id: Uuid,
+        branch: &str,
+        attempt: i32,
+        error: &str,
+    ) -> std::result::Result<bool, PrOperationError> {
+        let error: String = error.chars().take(1000).collect();
+        let recorded = sqlx::query(
+            r#"
+            UPDATE tuning_proposals
+            SET pr_operation_started_at = NOW(),
+                pr_last_error = $1
+            WHERE id = $2
+              AND status = 'pr_pending'
+              AND pr_branch = $3
+              AND pr_attempt_count = $4
+            "#,
+        )
+        .bind(error)
+        .bind(proposal_id)
+        .bind(branch)
+        .bind(attempt)
+        .execute(&self.pool)
+        .await?;
+        Ok(recorded.rows_affected() == 1)
+    }
+
+    /// Claim the deterministic GitHub side effect before making a network call.
+    /// An expired `pr_pending` lease can be reclaimed so a crash between GitHub
+    /// and PostgreSQL is resumable.
+    pub async fn claim_pr_operation(
+        &self,
+        proposal_id: Uuid,
+        target_id: Uuid,
+        query: &str,
+    ) -> std::result::Result<PrOperationClaim, PrOperationError> {
+        self.claim_pr_operation_with_provenance(
+            proposal_id,
+            target_id,
+            query,
+            PrApprovalProvenance::automated(),
+        )
+        .await
+    }
+
+    /// Claim a manual PR operation while freezing the authorizing actor and any
+    /// validation override. Recovery must never infer these from a later retry.
+    pub async fn claim_pr_operation_with_provenance(
+        &self,
+        proposal_id: Uuid,
+        target_id: Uuid,
+        query: &str,
+        approval_provenance: PrApprovalProvenance,
+    ) -> std::result::Result<PrOperationClaim, PrOperationError> {
+        approval_provenance.validate(proposal_id)?;
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            SELECT
+                tp.rule_id,
+                COALESCE(tp.proposal_type, 'query_tuning') AS proposal_type,
+                tp.status,
+                tp.original_query,
+                tp.rationale,
+                tp.confidence_score,
+                tp.changes_summary,
+                tp.pr_target_id,
+                tp.pr_branch,
+                tp.pr_operation_query,
+                tp.pr_operation_snapshot,
+                tp.pr_destination_payload,
+                tp.pr_operation_phase,
+                tp.pr_branch_sha,
+                tp.pr_commit_sha,
+                tp.pr_url,
+                tp.pr_number,
+                tp.pr_state,
+                (
+                    tp.pr_operation_started_at IS NULL
+                    OR tp.pr_operation_started_at <= NOW() - ($2 * INTERVAL '1 minute')
+                ) AS lease_expired,
+                dr.query AS current_query,
+                dr.name AS rule_name
+            FROM tuning_proposals tp
+            JOIN detection_rules dr ON dr.id = tp.rule_id
+            WHERE tp.id = $1
+            FOR UPDATE OF tp, dr
+            "#,
+        )
+        .bind(proposal_id)
+        .bind(PR_OPERATION_LEASE_MINUTES)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(PrOperationError::ProposalNotFound(proposal_id))?;
+
+        let rule_id: Uuid = row.try_get("rule_id")?;
+        let proposal_type: String = row.try_get("proposal_type")?;
+        let status: String = row.try_get("status")?;
+        let original_query: String = row.try_get("original_query")?;
+        let rationale: String = row.try_get("rationale")?;
+        let confidence_score: f64 = row.try_get("confidence_score")?;
+        let changes_summary: serde_json::Value = row.try_get("changes_summary")?;
+        let current_query: String = row.try_get("current_query")?;
+        let rule_name: String = row.try_get("rule_name")?;
+        let stored_target_id: Option<Uuid> = row.try_get("pr_target_id")?;
+        let stored_branch: Option<String> = row.try_get("pr_branch")?;
+        let stored_query: Option<String> = row.try_get("pr_operation_query")?;
+        let stored_snapshot: Option<serde_json::Value> = row.try_get("pr_operation_snapshot")?;
+        let stored_destination: Option<serde_json::Value> =
+            row.try_get("pr_destination_payload")?;
+        let stored_phase: Option<String> = row.try_get("pr_operation_phase")?;
+        let stored_branch_sha: Option<String> = row.try_get("pr_branch_sha")?;
+        let stored_commit_sha: Option<String> = row.try_get("pr_commit_sha")?;
+        let lease_expired: bool = row.try_get("lease_expired")?;
+
+        if status == "pr_opened" {
+            let url: Option<String> = row.try_get("pr_url")?;
+            let number: Option<i32> = row.try_get("pr_number")?;
+            let state: Option<String> = row.try_get("pr_state")?;
+            let effective_query = stored_snapshot
+                .and_then(|value| serde_json::from_value::<FrozenPrOperation>(value).ok())
+                .map(|operation| operation.effective_query)
+                .or(stored_query);
+            return match (url, number, effective_query) {
+                (Some(url), Some(number), Some(effective_query)) => {
+                    let updated = sqlx::query(
+                        "UPDATE tuning_logs SET status = 'pr_opened' WHERE proposal_id = $1",
+                    )
+                    .bind(proposal_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    if updated.rows_affected() == 0 {
+                        sqlx::query(
+                            r#"
+                            INSERT INTO tuning_logs (
+                                id, rule_id, rule_name, triggered_at, trigger_reason,
+                                proposal_id, status
+                            )
+                            VALUES ($1, $2, $3, NOW(), $4, $5, 'pr_opened')
+                            "#,
+                        )
+                        .bind(Uuid::now_v7())
+                        .bind(rule_id)
+                        .bind(rule_name)
+                        .bind("Reconciled an already-open Detection-as-Code PR")
+                        .bind(proposal_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    tx.commit().await?;
+                    Ok(PrOperationClaim::AlreadyOpened {
+                        url,
+                        number,
+                        state: state.unwrap_or_else(|| "open".to_string()),
+                        effective_query,
+                    })
+                }
+                _ => {
+                    tx.rollback().await?;
+                    Err(PrOperationError::InvalidMetadata {
+                        proposal_id,
+                        reason: "pr_opened proposal has no URL/number/effective query".to_string(),
+                    })
+                }
+            };
+        }
+
+        if proposal_type != "query_tuning" && proposal_type != "silent_rule" {
+            return Err(PrOperationError::InvalidMetadata {
+                proposal_id,
+                reason: format!("proposal type '{proposal_type}' cannot open a PR"),
+            });
+        }
+
+        let (resumed, operation_query) = if status == "pr_pending" {
+            if stored_target_id != Some(target_id) {
+                return Err(PrOperationError::InvalidMetadata {
+                    proposal_id,
+                    reason: format!(
+                        "claimed target '{}' does not match retry target '{target_id}'",
+                        stored_target_id
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "<missing>".to_string())
+                    ),
+                });
+            }
+            if !lease_expired {
+                tx.rollback().await?;
+                return Err(PrOperationError::InProgress(proposal_id));
+            }
+            let stored_query = stored_query.ok_or_else(|| PrOperationError::InvalidMetadata {
+                proposal_id,
+                reason: "pr_pending proposal has no frozen query".to_string(),
+            })?;
+            (true, stored_query)
+        } else if status == "proposed" || status == "test_passed" {
+            if current_query != original_query {
+                return Err(PrOperationError::StaleRuleBase {
+                    proposal_id,
+                    rule_id,
+                });
+            }
+            if let Some(stored_target_id) = stored_target_id {
+                if stored_target_id != target_id {
+                    return Err(PrOperationError::InvalidMetadata {
+                        proposal_id,
+                        reason: format!(
+                            "prior target '{stored_target_id}' does not match retry target '{target_id}'"
+                        ),
+                    });
+                }
+                let stored_query =
+                    stored_query.ok_or_else(|| PrOperationError::InvalidMetadata {
+                        proposal_id,
+                        reason: "retried proposal has no frozen query".to_string(),
+                    })?;
+                (true, stored_query)
+            } else {
+                (false, query.to_string())
+            }
+        } else {
+            return Err(PrOperationError::InvalidState {
+                proposal_id,
+                status,
+            });
+        };
+
+        let target = sqlx::query(
+            r#"
+            SELECT repo_url, base_branch, path_template, pr_branch_prefix, rule_format
+            FROM detection_code_targets
+            WHERE id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(target_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| PrOperationError::InvalidMetadata {
+            proposal_id,
+            reason: format!("claimed target '{target_id}' no longer exists"),
+        })?;
+
+        let operation = if let Some(snapshot) = stored_snapshot {
+            let operation: FrozenPrOperation =
+                serde_json::from_value(snapshot).map_err(|error| {
+                    PrOperationError::InvalidMetadata {
+                        proposal_id,
+                        reason: format!("cannot decode frozen PR operation: {error}"),
+                    }
+                })?;
+            if operation.target_id != target_id || operation.effective_query != operation_query {
+                return Err(PrOperationError::InvalidMetadata {
+                    proposal_id,
+                    reason: "frozen PR operation disagrees with claimed metadata".to_string(),
+                });
+            }
+            let provenance = operation.approval_provenance.as_ref().ok_or_else(|| {
+                PrOperationError::InvalidMetadata {
+                    proposal_id,
+                    reason: "frozen PR operation has no durable approval provenance".to_string(),
+                }
+            })?;
+            provenance.validate(proposal_id)?;
+            operation
+        } else {
+            let frozen_rule: DetectionRule =
+                sqlx::query_as("SELECT * FROM detection_rules WHERE id = $1")
+                    .bind(rule_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let branch = DetectionCodePushService::branch_for_identity(
+                target.try_get("pr_branch_prefix")?,
+                &frozen_rule.name,
+                proposal_id,
+            );
+            FrozenPrOperation {
+                proposal_id,
+                target_id,
+                repo_url: target.try_get("repo_url")?,
+                base_branch: target.try_get("base_branch")?,
+                path_template: target.try_get("path_template")?,
+                rule_format: target.try_get("rule_format")?,
+                branch,
+                effective_query: operation_query.clone(),
+                original_query: original_query.clone(),
+                rationale,
+                confidence_score,
+                changes_summary: serde_json::from_value(changes_summary).map_err(|error| {
+                    PrOperationError::InvalidMetadata {
+                        proposal_id,
+                        reason: format!("cannot decode proposal changes: {error}"),
+                    }
+                })?,
+                rule: frozen_rule,
+                approval_provenance: Some(approval_provenance),
+            }
+        };
+        if stored_branch
+            .as_deref()
+            .is_some_and(|branch| branch != operation.branch)
+        {
+            return Err(PrOperationError::InvalidMetadata {
+                proposal_id,
+                reason: "stored branch disagrees with frozen PR operation".to_string(),
+            });
+        }
+        let destination = stored_destination
+            .map(|value| {
+                serde_json::from_value(value).map_err(|error| PrOperationError::InvalidMetadata {
+                    proposal_id,
+                    reason: format!("cannot decode frozen PR destination: {error}"),
+                })
+            })
+            .transpose()?;
+        let checkpoint = PrOperationCheckpoint {
+            phase: stored_phase
+                .as_deref()
+                .map(|phase| PrOperationPhase::parse(proposal_id, phase))
+                .transpose()?
+                .unwrap_or(if destination.is_some() {
+                    PrOperationPhase::DestinationReady
+                } else {
+                    PrOperationPhase::Claimed
+                }),
+            branch_sha: stored_branch_sha,
+            commit_sha: stored_commit_sha,
+            pr_url: row.try_get("pr_url")?,
+            pr_number: row.try_get("pr_number")?,
+            pr_state: row.try_get("pr_state")?,
+        }
+        .validate(proposal_id, destination.is_some())?;
+        if matches!(
+            checkpoint.phase,
+            PrOperationPhase::Completed | PrOperationPhase::Cancelled
+        ) {
+            return Err(PrOperationError::InvalidMetadata {
+                proposal_id,
+                reason: format!(
+                    "actionable proposal has terminal PR operation phase '{}'",
+                    checkpoint.phase.as_str()
+                ),
+            });
+        }
+
+        // NAN-1766 (D6): a reclaimed lease still at the `Claimed` phase has
+        // produced zero external effects (no frozen destination, branch, commit,
+        // or PR), so the frozen query can still be safely abandoned if the rule
+        // changed under the lease. Fresh claims run this stale-base check before
+        // freezing anything; the `pr_pending` reclaim path bypassed it, letting a
+        // reclaimed operation open a PR against a query the rule no longer has.
+        // Re-run it here, but only at `Claimed`: once the operation has advanced,
+        // GitHub-visible artifacts may already exist and rechecking would orphan
+        // them, so skipping the recheck there is intentional.
+        if status == "pr_pending"
+            && checkpoint.phase == PrOperationPhase::Claimed
+            && current_query != original_query
+        {
+            return Err(PrOperationError::StaleRuleBase {
+                proposal_id,
+                rule_id,
+            });
+        }
+
+        let snapshot = serde_json::to_value(&operation).map_err(|error| {
+            PrOperationError::InvalidMetadata {
+                proposal_id,
+                reason: format!("cannot encode frozen PR operation: {error}"),
+            }
+        })?;
+
+        let attempt: i32 = sqlx::query_scalar(
+            r#"
+            UPDATE tuning_proposals
+            SET status = 'pr_pending',
+                pr_target_id = $1,
+                pr_branch = $2,
+                pr_operation_query = $3,
+                pr_operation_started_at = NOW(),
+                pr_operation_completed_at = NULL,
+                pr_attempt_count = pr_attempt_count + 1,
+                pr_last_error = NULL,
+                pr_operation_snapshot = COALESCE(pr_operation_snapshot, $4),
+                pr_operation_phase = COALESCE(
+                    pr_operation_phase,
+                    CASE
+                        WHEN pr_destination_payload IS NULL THEN 'claimed'
+                        ELSE 'destination_ready'
+                    END
+                ),
+                pr_phase_updated_at = COALESCE(pr_phase_updated_at, NOW())
+            WHERE id = $5 AND status = $6
+            RETURNING pr_attempt_count
+            "#,
+        )
+        .bind(target_id)
+        .bind(&operation.branch)
+        .bind(&operation_query)
+        .bind(snapshot)
+        .bind(proposal_id)
+        .bind(&status)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let updated_logs =
+            sqlx::query("UPDATE tuning_logs SET status = 'pr_pending' WHERE proposal_id = $1")
+                .bind(proposal_id)
+                .execute(&mut *tx)
+                .await?;
+        if updated_logs.rows_affected() == 0 {
+            sqlx::query(
+                r#"
+                INSERT INTO tuning_logs (
+                    id, rule_id, rule_name, triggered_at, trigger_reason,
+                    proposal_id, status
+                )
+                VALUES ($1, $2, $3, NOW(), $4, $5, 'pr_pending')
+                "#,
+            )
+            .bind(Uuid::now_v7())
+            .bind(rule_id)
+            .bind(rule_name)
+            .bind(if resumed && status == "pr_pending" {
+                "Detection-as-Code PR operation reclaimed after an expired lease"
+            } else if resumed {
+                "Detection-as-Code PR operation retried after a failed attempt"
+            } else {
+                "Detection-as-Code PR operation claimed"
+            })
+            .bind(proposal_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(PrOperationClaim::Claimed {
+            resumed,
+            attempt,
+            operation,
+            destination,
+            checkpoint,
+        })
+    }
+
+    /// Persist the resolved GitHub destination before the first write. A stale
+    /// worker cannot replace a destination after another worker reclaims the
+    /// lease because the attempt number is fenced.
+    pub async fn freeze_pr_destination(
+        &self,
+        proposal_id: Uuid,
+        attempt: i32,
+        destination: &PrDestinationPayload,
+    ) -> std::result::Result<PrDestinationPayload, PrOperationError> {
+        let value = serde_json::to_value(destination).map_err(|error| {
+            PrOperationError::InvalidMetadata {
+                proposal_id,
+                reason: format!("cannot encode PR destination: {error}"),
+            }
+        })?;
+        let stored: Option<serde_json::Value> = sqlx::query_scalar(
+            r#"
+            UPDATE tuning_proposals
+            SET pr_destination_payload = COALESCE(pr_destination_payload, $1),
+                pr_operation_phase = CASE
+                    WHEN COALESCE(pr_operation_phase, 'claimed') = 'claimed'
+                        THEN 'destination_ready'
+                    ELSE pr_operation_phase
+                END,
+                pr_operation_started_at = NOW(),
+                pr_phase_updated_at = NOW()
+            WHERE id = $2
+              AND status = 'pr_pending'
+              AND pr_attempt_count = $3
+              AND COALESCE(pr_operation_phase, 'claimed') IN (
+                  'claimed', 'destination_ready', 'branch_ready',
+                  'commit_ready', 'pr_ready'
+              )
+            RETURNING pr_destination_payload
+            "#,
+        )
+        .bind(value)
+        .bind(proposal_id)
+        .bind(attempt)
+        .fetch_optional(&self.pool)
+        .await?;
+        let stored = stored.ok_or_else(|| PrOperationError::InvalidState {
+            proposal_id,
+            status: "claim attempt is no longer current".to_string(),
+        })?;
+        serde_json::from_value(stored).map_err(|error| PrOperationError::InvalidMetadata {
+            proposal_id,
+            reason: format!("cannot decode PR destination: {error}"),
+        })
+    }
+
+    /// Record the deterministic head ref after GitHub confirms it exists. The
+    /// SHA is immutable provenance for this operation; a conflicting retry is
+    /// rejected instead of silently attaching the proposal to another ref.
+    pub async fn checkpoint_pr_branch(
+        &self,
+        proposal_id: Uuid,
+        branch: &str,
+        attempt: i32,
+        branch_sha: &str,
+    ) -> std::result::Result<(), PrOperationError> {
+        self.checkpoint_pr_sha(
+            proposal_id,
+            branch,
+            attempt,
+            "branch_ready",
+            branch_sha,
+            true,
+        )
+        .await
+    }
+
+    /// Record the commit containing the exact frozen destination payload.
+    pub async fn checkpoint_pr_commit(
+        &self,
+        proposal_id: Uuid,
+        branch: &str,
+        attempt: i32,
+        commit_sha: &str,
+    ) -> std::result::Result<(), PrOperationError> {
+        self.checkpoint_pr_sha(
+            proposal_id,
+            branch,
+            attempt,
+            "commit_ready",
+            commit_sha,
+            false,
+        )
+        .await
+    }
+
+    async fn checkpoint_pr_sha(
+        &self,
+        proposal_id: Uuid,
+        branch: &str,
+        attempt: i32,
+        next_phase: &str,
+        sha: &str,
+        branch_checkpoint: bool,
+    ) -> std::result::Result<(), PrOperationError> {
+        let checkpointed = if branch_checkpoint {
+            sqlx::query(
+                r#"
+                UPDATE tuning_proposals
+                SET pr_branch_sha = COALESCE(pr_branch_sha, $1),
+                    pr_operation_phase = CASE
+                        WHEN pr_operation_phase = 'destination_ready' THEN $2
+                        ELSE pr_operation_phase
+                    END,
+                    pr_operation_started_at = NOW(),
+                    pr_phase_updated_at = NOW()
+                WHERE id = $3
+                  AND status = 'pr_pending'
+                  AND pr_branch = $4
+                  AND pr_attempt_count = $5
+                  AND pr_destination_payload IS NOT NULL
+                  AND pr_operation_phase IN (
+                      'destination_ready', 'branch_ready', 'commit_ready', 'pr_ready'
+                  )
+                  AND (pr_branch_sha IS NULL OR pr_branch_sha = $1)
+                "#,
+            )
+            .bind(sha)
+            .bind(next_phase)
+            .bind(proposal_id)
+            .bind(branch)
+            .bind(attempt)
+            .execute(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"
+                UPDATE tuning_proposals
+                SET pr_commit_sha = COALESCE(pr_commit_sha, $1),
+                    pr_operation_phase = CASE
+                        WHEN pr_operation_phase = 'branch_ready' THEN $2
+                        ELSE pr_operation_phase
+                    END,
+                    pr_operation_started_at = NOW(),
+                    pr_phase_updated_at = NOW()
+                WHERE id = $3
+                  AND status = 'pr_pending'
+                  AND pr_branch = $4
+                  AND pr_attempt_count = $5
+                  AND pr_branch_sha IS NOT NULL
+                  AND pr_operation_phase IN ('branch_ready', 'commit_ready', 'pr_ready')
+                  AND (pr_commit_sha IS NULL OR pr_commit_sha = $1)
+                "#,
+            )
+            .bind(sha)
+            .bind(next_phase)
+            .bind(proposal_id)
+            .bind(branch)
+            .bind(attempt)
+            .execute(&self.pool)
+            .await?
+        };
+        if checkpointed.rows_affected() == 0 {
+            return Err(PrOperationError::InvalidState {
+                proposal_id,
+                status: format!("cannot record {next_phase} for this claim attempt"),
+            });
+        }
         Ok(())
     }
 
-    /// Record that a detection-as-code PR was opened for a proposal: stamps the
-    /// PR metadata and moves the proposal to `pr_opened` in a single write
-    /// (NAN-1745). Used instead of applying the tuned query to the DB.
-    pub async fn set_pr_opened(
+    /// Persist the remote PR identity before proposal/log completion. A retry
+    /// after a lost database response can rediscover the same head/base PR and
+    /// safely replay this fenced checkpoint.
+    pub async fn checkpoint_pull_request(
         &self,
         proposal_id: Uuid,
+        branch: &str,
+        attempt: i32,
         pr_url: &str,
         pr_number: i64,
-    ) -> Result<()> {
-        sqlx::query(
+        pr_state: &str,
+    ) -> std::result::Result<(), PrOperationError> {
+        let number = i32::try_from(pr_number).map_err(|_| PrOperationError::InvalidMetadata {
+            proposal_id,
+            reason: format!("GitHub PR number {pr_number} does not fit in PostgreSQL INTEGER"),
+        })?;
+        let checkpointed = sqlx::query(
             r#"
             UPDATE tuning_proposals
-            SET status = 'pr_opened', pr_url = $1, pr_number = $2, pr_state = 'open'
-            WHERE id = $3
+            SET pr_url = COALESCE(pr_url, $1),
+                pr_number = COALESCE(pr_number, $2),
+                pr_state = $3,
+                pr_operation_phase = 'pr_ready',
+                pr_operation_started_at = NOW(),
+                pr_phase_updated_at = NOW()
+            WHERE id = $4
+              AND status = 'pr_pending'
+              AND pr_branch = $5
+              AND pr_attempt_count = $6
+              AND pr_commit_sha IS NOT NULL
+              AND pr_operation_phase IN ('commit_ready', 'pr_ready')
+              AND (pr_url IS NULL OR pr_url = $1)
+              AND (pr_number IS NULL OR pr_number = $2)
             "#,
         )
         .bind(pr_url)
-        .bind(pr_number as i32)
+        .bind(number)
+        .bind(pr_state)
         .bind(proposal_id)
+        .bind(branch)
+        .bind(attempt)
         .execute(&self.pool)
-        .await
-        .context("Failed to record PR on tuning proposal")?;
-
+        .await?;
+        if checkpointed.rows_affected() == 0 {
+            return Err(PrOperationError::InvalidState {
+                proposal_id,
+                status: "cannot record pr_ready for this claim attempt".to_string(),
+            });
+        }
         Ok(())
+    }
+
+    /// Reconcile a remotely durable PR when PostgreSQL missed one or more
+    /// preceding checkpoint responses. The verified PR head proves the branch
+    /// and commit effects; any conflicting commit checkpoint remains fenced.
+    pub async fn checkpoint_reconciled_pull_request(
+        &self,
+        proposal_id: Uuid,
+        branch: &str,
+        attempt: i32,
+        head_sha: &str,
+        pr_url: &str,
+        pr_number: i64,
+        pr_state: &str,
+    ) -> std::result::Result<(), PrOperationError> {
+        let number = i32::try_from(pr_number).map_err(|_| PrOperationError::InvalidMetadata {
+            proposal_id,
+            reason: format!("GitHub PR number {pr_number} does not fit in PostgreSQL INTEGER"),
+        })?;
+        let checkpointed = sqlx::query(
+            r#"
+            UPDATE tuning_proposals
+            SET pr_branch_sha = COALESCE(pr_branch_sha, $1),
+                pr_commit_sha = COALESCE(pr_commit_sha, $1),
+                pr_url = COALESCE(pr_url, $2),
+                pr_number = COALESCE(pr_number, $3),
+                pr_state = $4,
+                pr_operation_phase = 'pr_ready',
+                pr_operation_started_at = NOW(),
+                pr_phase_updated_at = NOW()
+            WHERE id = $5
+              AND status = 'pr_pending'
+              AND pr_branch = $6
+              AND pr_attempt_count = $7
+              AND pr_destination_payload IS NOT NULL
+              AND pr_operation_phase IN (
+                  'destination_ready', 'branch_ready', 'commit_ready', 'pr_ready'
+              )
+              AND (pr_commit_sha IS NULL OR pr_commit_sha = $1)
+              AND (pr_url IS NULL OR pr_url = $2)
+              AND (pr_number IS NULL OR pr_number = $3)
+            "#,
+        )
+        .bind(head_sha)
+        .bind(pr_url)
+        .bind(number)
+        .bind(pr_state)
+        .bind(proposal_id)
+        .bind(branch)
+        .bind(attempt)
+        .execute(&self.pool)
+        .await?;
+        if checkpointed.rows_affected() == 0 {
+            return Err(PrOperationError::InvalidState {
+                proposal_id,
+                status: "cannot reconcile remote PR for this claim attempt".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Complete a claimed PR operation and its tuning log atomically. Repeating
+    /// the same completion is idempotent after a lost HTTP response.
+    pub async fn complete_pr_operation(
+        &self,
+        proposal_id: Uuid,
+        branch: &str,
+        attempt: i32,
+        pr_url: &str,
+        pr_number: i64,
+        pr_state: &str,
+        reviewer_notes: Option<&str>,
+        approval_provenance: &PrApprovalProvenance,
+    ) -> std::result::Result<(), PrOperationError> {
+        let pr_number =
+            i32::try_from(pr_number).map_err(|_| PrOperationError::InvalidMetadata {
+                proposal_id,
+                reason: "GitHub PR number does not fit in PostgreSQL INTEGER".to_string(),
+            })?;
+        approval_provenance.validate(proposal_id)?;
+        let approval_provenance = serde_json::to_value(approval_provenance).map_err(|error| {
+            PrOperationError::InvalidMetadata {
+                proposal_id,
+                reason: format!("cannot encode PR approval provenance: {error}"),
+            }
+        })?;
+        let mut tx = self.pool.begin().await?;
+        let transitioned = sqlx::query(
+            r#"
+            UPDATE tuning_proposals
+            SET status = 'pr_opened',
+                pr_url = $1,
+                pr_number = $2,
+                pr_state = $3,
+                pr_operation_completed_at = NOW(),
+                pr_last_error = NULL,
+                reviewer_notes = COALESCE($4, reviewer_notes),
+                pr_target_id = NULL,
+                pr_operation_phase = 'completed',
+                pr_phase_updated_at = NOW()
+            WHERE id = $5
+              AND status = 'pr_pending'
+              AND pr_branch = $6
+              AND pr_attempt_count = $7
+              AND pr_operation_phase = 'pr_ready'
+              AND pr_url = $1
+              AND pr_number = $2
+            "#,
+        )
+        .bind(pr_url)
+        .bind(pr_number)
+        .bind(pr_state)
+        .bind(reviewer_notes)
+        .bind(proposal_id)
+        .bind(branch)
+        .bind(attempt)
+        .execute(&mut *tx)
+        .await?;
+
+        if transitioned.rows_affected() == 0 {
+            let existing: Option<(
+                String,
+                Option<String>,
+                Option<i32>,
+                Option<String>,
+                Option<String>,
+                i32,
+            )> =
+                sqlx::query_as(
+                    "SELECT status, pr_url, pr_number, pr_state, pr_branch, pr_attempt_count FROM tuning_proposals WHERE id = $1",
+                )
+                .bind(proposal_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            return match existing {
+                Some((
+                    status,
+                    Some(url),
+                    Some(number),
+                    _stored_state,
+                    stored_branch,
+                    stored_attempt,
+                )) if status == "pr_opened"
+                    && url == pr_url
+                    && number == pr_number
+                    && stored_branch.as_deref() == Some(branch)
+                    && stored_attempt == attempt =>
+                {
+                    // GitHub may report the same PR as open, closed, or merged
+                    // on a later reconciliation. Accept the same fenced PR
+                    // identity and refresh its state.
+                    sqlx::query(
+                        "UPDATE tuning_proposals
+                         SET pr_state = $2,
+                             pr_operation_completed_at = NOW(),
+                             pr_last_error = NULL,
+                             reviewer_notes = COALESCE($3, reviewer_notes),
+                             pr_operation_phase = 'completed',
+                             pr_phase_updated_at = NOW(),
+                             pr_target_id = NULL
+                         WHERE id = $1",
+                    )
+                    .bind(proposal_id)
+                    .bind(pr_state)
+                    .bind(reviewer_notes)
+                    .execute(&mut *tx)
+                    .await?;
+                    let audited = sqlx::query(
+                        "UPDATE tuning_logs
+                         SET status = 'pr_opened',
+                             pr_approval_provenance = COALESCE(pr_approval_provenance, $2)
+                         WHERE proposal_id = $1",
+                    )
+                    .bind(proposal_id)
+                    .bind(&approval_provenance)
+                    .execute(&mut *tx)
+                    .await?;
+                    if audited.rows_affected() == 0 {
+                        tx.rollback().await?;
+                        return Err(PrOperationError::InvalidState {
+                            proposal_id,
+                            status: "completed PR operation has no tuning audit row".to_string(),
+                        });
+                    }
+                    tx.commit().await?;
+                    Ok(())
+                }
+                Some((status, _, _, _, _, _)) => {
+                    tx.rollback().await?;
+                    Err(PrOperationError::InvalidState {
+                        proposal_id,
+                        status,
+                    })
+                }
+                None => {
+                    tx.rollback().await?;
+                    Err(PrOperationError::ProposalNotFound(proposal_id))
+                }
+            };
+        }
+
+        let audited = sqlx::query(
+            "UPDATE tuning_logs
+             SET status = 'pr_opened',
+                 pr_approval_provenance = COALESCE(pr_approval_provenance, $2)
+             WHERE proposal_id = $1",
+        )
+            .bind(proposal_id)
+            .bind(&approval_provenance)
+            .execute(&mut *tx)
+            .await?;
+        if audited.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Err(PrOperationError::InvalidState {
+                proposal_id,
+                status: "PR operation cannot complete without a tuning audit row".to_string(),
+            });
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Release a failed claimed PR operation back to analyst review. The
+    /// attempt fence prevents a delayed worker from releasing a reclaimed or
+    /// completed operation.
+    pub async fn fail_pr_operation(
+        &self,
+        proposal_id: Uuid,
+        branch: &str,
+        attempt: i32,
+        error: &str,
+    ) -> std::result::Result<bool, PrOperationError> {
+        let error: String = error.chars().take(1000).collect();
+        let mut tx = self.pool.begin().await?;
+        let failed = sqlx::query(
+            r#"
+            UPDATE tuning_proposals
+            SET status = 'proposed',
+                pr_operation_completed_at = NOW(),
+                pr_last_error = $1
+            WHERE id = $2
+              AND status = 'pr_pending'
+              AND pr_branch = $3
+              AND pr_attempt_count = $4
+            "#,
+        )
+        .bind(error)
+        .bind(proposal_id)
+        .bind(branch)
+        .bind(attempt)
+        .execute(&mut *tx)
+        .await?;
+        if failed.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query("UPDATE tuning_logs SET status = 'proposed' WHERE proposal_id = $1")
+            .bind(proposal_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Cancel an expired PR operation. Active attempts must finish, fail, or
+    /// expire before cancellation so a user cannot race a live GitHub write.
+    pub async fn cancel_expired_pr_operation(
+        &self,
+        proposal_id: Uuid,
+        reason: &str,
+    ) -> std::result::Result<bool, PrOperationError> {
+        let mut tx = self.pool.begin().await?;
+        let cancelled = sqlx::query(
+            r#"
+            UPDATE tuning_proposals
+            SET status = 'rejected',
+                reviewer_notes = $1,
+                pr_operation_completed_at = NOW(),
+                pr_target_id = NULL,
+                pr_operation_phase = 'cancelled',
+                pr_phase_updated_at = NOW()
+            WHERE id = $2
+              AND status = 'pr_pending'
+              AND (
+                  pr_operation_started_at IS NULL
+                  OR pr_operation_started_at <= NOW() - ($3 * INTERVAL '1 minute')
+              )
+            "#,
+        )
+        .bind(reason)
+        .bind(proposal_id)
+        .bind(PR_OPERATION_LEASE_MINUTES)
+        .execute(&mut *tx)
+        .await?;
+        if cancelled.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query("UPDATE tuning_logs SET status = 'rejected' WHERE proposal_id = $1")
+            .bind(proposal_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Whether a detection-as-code tuning PR was opened for `rule_id` within the
@@ -171,26 +1357,24 @@ impl TuningRepository {
     /// resetting `created_at`, so the analyst sees how long the rule has been
     /// queued and that it just escalated.
     ///
-    /// Caller is responsible for ensuring the proposal is still in
-    /// `proposed` / `test_passed`; calling this on an actioned row is a no-op
-    /// but technically allowed.
+    /// Returns `false` when another actor actioned the proposal first.
     pub async fn upgrade_silent_proposal(
         &self,
         proposal_id: Uuid,
         rationale: &str,
         confidence_score: f64,
         changes_summary: &[String],
-    ) -> Result<()> {
-        let changes_summary_json = serde_json::to_value(changes_summary)
-            .context("Failed to serialize changes summary")?;
+    ) -> Result<bool> {
+        let changes_summary_json =
+            serde_json::to_value(changes_summary).context("Failed to serialize changes summary")?;
 
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             UPDATE tuning_proposals
             SET rationale = $1,
                 confidence_score = $2,
                 changes_summary = $3
-            WHERE id = $4
+            WHERE id = $4 AND status IN ('proposed', 'test_passed')
             "#,
         )
         .bind(rationale)
@@ -201,7 +1385,7 @@ impl TuningRepository {
         .await
         .context("Failed to upgrade silent proposal")?;
 
-        Ok(())
+        Ok(result.rows_affected() == 1)
     }
 
     /// List tuning proposals with optional filters
@@ -235,7 +1419,10 @@ impl TuningRepository {
                 tp.created_at,
                 COALESCE(tp.proposal_type, 'query_tuning') as proposal_type,
                 tp.original_query,
-                tp.proposed_query,
+                COALESCE(
+                    tp.pr_operation_snapshot->>'effective_query',
+                    tp.proposed_query
+                ) AS proposed_query,
                 tp.rationale,
                 tp.confidence_score,
                 tp.changes_summary,
@@ -309,6 +1496,7 @@ impl TuningRepository {
                 "reverted" => TuningStatus::Reverted,
                 "manually_approved" => TuningStatus::ManuallyApproved,
                 "rejected" => TuningStatus::Rejected,
+                "pr_pending" => TuningStatus::PrPending,
                 "pr_opened" => TuningStatus::PrOpened,
                 _ => TuningStatus::Proposed,
             };
@@ -378,7 +1566,10 @@ impl TuningRepository {
                 tp.created_at,
                 COALESCE(tp.proposal_type, 'query_tuning') as proposal_type,
                 tp.original_query,
-                tp.proposed_query,
+                COALESCE(
+                    tp.pr_operation_snapshot->>'effective_query',
+                    tp.proposed_query
+                ) AS proposed_query,
                 tp.rationale,
                 tp.confidence_score,
                 tp.changes_summary,
@@ -413,6 +1604,7 @@ impl TuningRepository {
                 "reverted" => TuningStatus::Reverted,
                 "manually_approved" => TuningStatus::ManuallyApproved,
                 "rejected" => TuningStatus::Rejected,
+                "pr_pending" => TuningStatus::PrPending,
                 "pr_opened" => TuningStatus::PrOpened,
                 _ => TuningStatus::Proposed,
             };
@@ -513,5 +1705,35 @@ impl TuningRepository {
             .context("Failed to set reviewer notes")?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod approval_provenance_tests {
+    use super::*;
+
+    #[test]
+    fn validation_override_requires_a_durable_reason() {
+        let proposal_id = Uuid::now_v7();
+        let mut provenance = PrApprovalProvenance {
+            actor_user_id: Some(Uuid::now_v7()),
+            api_key_id: None,
+            api_key_name: None,
+            validation_skipped: true,
+            reason: Some("  ".to_string()),
+        };
+        assert!(matches!(
+            provenance.validate(proposal_id),
+            Err(PrOperationError::InvalidMetadata { .. })
+        ));
+
+        provenance.reason = Some("approved legacy syntax".to_string());
+        assert!(provenance.validate(proposal_id).is_ok());
+
+        provenance.actor_user_id = None;
+        assert!(matches!(
+            provenance.validate(proposal_id),
+            Err(PrOperationError::InvalidMetadata { .. })
+        ));
     }
 }

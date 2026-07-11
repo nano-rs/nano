@@ -24,6 +24,7 @@ pub mod risk;
 pub mod scheduler;
 pub mod service;
 pub mod signal_processor;
+pub mod test_admission;
 
 pub use event_envelope::normalize_match_event;
 
@@ -39,3 +40,4 @@ pub use service::{
     DailyMatchCount, DetectionService, DetectionServiceConfig, HistoricalAnalysisResult, TimeBucket,
 };
 pub use signal_processor::{SignalProcessor, SignalProcessorConfig};
+pub use test_admission::{RuleTestAdmission, RuleTestAdmissionError, RuleTestPermit};

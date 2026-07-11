@@ -1847,6 +1847,40 @@
         }
     }
 
+    #[test]
+    fn system_source_renderer_emits_only_meaningful_routes() {
+        let routed = make_config(
+            "http",
+            vec![make_rule(
+                10,
+                "source_type",
+                "exact",
+                Some("windows"),
+                "windows_event",
+            )],
+        );
+        let rendered = SourceConfigService::render_system_source_config(
+            &routed,
+            "source_type_extract",
+        )
+        .expect("non-default system rule should render");
+        assert!(rendered.contains("[transforms.test_source_route]"));
+        assert!(rendered.contains("inputs = [\"source_type_extract\"]"));
+
+        let passthrough = make_config(
+            "http",
+            vec![make_rule(1000, "source_type", "default", None, "unknown")],
+        );
+        assert!(
+            SourceConfigService::render_system_source_config(
+                &passthrough,
+                "source_type_extract",
+            )
+            .is_none(),
+            "a passthrough-only system source must not create a duplicate route"
+        );
+    }
+
     /// End-to-end shape of the generated routing TOML for a splunk_hec deploy:
     /// transform-only, consumes from `hec_normalize`, no `[sources.*]` block.
     #[test]
@@ -2422,6 +2456,44 @@
             lock_b.try_lock().is_err(),
             "lock acquired via one handle must block subsequent try_lock on a clone of the same Arc",
         );
+    }
+
+    #[test]
+    fn canonical_source_render_requires_parser_router_first() {
+        let root = tempfile::tempdir().unwrap();
+        let error = SourceConfigService::require_canonical_router(root.path())
+            .expect_err("a source render without the parser router must fail closed");
+        let is_precondition_error = matches!(
+            &error,
+            SourceConfigServiceError::InvalidConfig(message)
+                if message.contains("parser router")
+        );
+        assert!(
+            is_precondition_error,
+            "unexpected error: {error}"
+        );
+
+        let router = root.path().join("sources/parsers/_router.toml");
+        std::fs::create_dir_all(router.parent().unwrap()).unwrap();
+        std::fs::write(&router, "[transforms.source_router]\n").unwrap();
+        SourceConfigService::require_canonical_router(root.path())
+            .expect("an existing canonical router should satisfy the render precondition");
+    }
+
+    #[test]
+    fn publication_renderer_forces_credentials_into_snapshot_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_path = "/etc/vector/runtime/current".to_string();
+        let backend = SourceConfigService::publication_creds_backend(
+            root.path().to_path_buf(),
+            runtime_path.clone(),
+        );
+
+        assert!(matches!(
+            backend,
+            CredsBackend::Disk { config_dir, runtime_path: actual }
+                if config_dir == root.path() && actual == runtime_path
+        ));
     }
 
     // ----------------------------------------------------------------------

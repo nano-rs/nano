@@ -535,7 +535,13 @@ impl RuleRepositoryService {
             syncing.insert(id);
         }
 
-        let repo = self.get_repository(id).await?;
+        let repo = match self.get_repository(id).await {
+            Ok(repo) => repo,
+            Err(error) => {
+                self.syncing_repos.write().await.remove(&id);
+                return Err(error);
+            }
+        };
 
         if !repo.enabled {
             let mut syncing = self.syncing_repos.write().await;
@@ -717,6 +723,7 @@ impl RuleRepositoryService {
         Ok(())
     }
 }
+
 
 /// Resolve the rule files for a sparse-checkout (folder-picker) sync.
 ///
@@ -925,4 +932,3 @@ mod tests {
         assert!(untranslated.is_empty());
     }
 }
-

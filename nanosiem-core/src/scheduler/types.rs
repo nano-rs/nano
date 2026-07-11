@@ -55,6 +55,14 @@ pub struct ScheduledJob {
     pub created_at: DateTime<Utc>,
     /// Last update timestamp
     pub updated_at: DateTime<Utc>,
+    /// Current distributed-claim generation. Internal scheduler state only.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub claim_generation: i64,
+    /// Stable identity for the current due run, preserved across stale reclaims.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub claim_run_id: Option<Uuid>,
 }
 
 /// Database row representation for scheduled jobs
@@ -79,6 +87,8 @@ pub struct ScheduledJobRow {
     pub lookup_table_name: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub claim_generation: i64,
+    pub claim_run_id: Option<Uuid>,
 }
 
 impl TryFrom<ScheduledJobRow> for ScheduledJob {
@@ -108,6 +118,8 @@ impl TryFrom<ScheduledJobRow> for ScheduledJob {
             lookup_table_name: row.lookup_table_name,
             created_at: row.created_at,
             updated_at: row.updated_at,
+            claim_generation: row.claim_generation,
+            claim_run_id: row.claim_run_id,
         })
     }
 }

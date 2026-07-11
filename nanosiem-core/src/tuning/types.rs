@@ -393,6 +393,56 @@ pub struct PatternChange {
     pub after_count: i64,
 }
 
+/// One exact production schedule/lookback window used by a tuning proof.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct TuningValidationWindow {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+}
+
+/// Durable evidence binding an autonomous apply decision to the exact queries,
+/// source corpus, dataset, and production execution windows that were tested.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct TuningValidationProof {
+    pub proof_version: u32,
+    pub original_query_sha256: String,
+    pub proposed_query_sha256: String,
+    pub dataset: String,
+    pub schedule_cron: String,
+    pub lookback_minutes: i64,
+    pub evaluation_start: DateTime<Utc>,
+    pub evaluation_end: DateTime<Utc>,
+    pub windows: Vec<TuningValidationWindow>,
+    pub windows_sha256: String,
+    pub corpus_count: u64,
+    pub corpus_sha256: String,
+    #[serde(default)]
+    pub corpus_revision: i64,
+    pub corpus_unique_source_count: u64,
+    pub corpus_source_ids_sha256: String,
+    pub corpus_truncated: bool,
+    pub corpus_identity_complete: bool,
+    pub original_match_count: u64,
+    pub proposed_match_count: u64,
+    pub original_source_ids_sha256: String,
+    pub proposed_source_ids_sha256: String,
+    pub original_failed_windows: u32,
+    pub proposed_failed_windows: u32,
+    pub original_truncated_windows: u32,
+    pub proposed_truncated_windows: u32,
+    pub original_identity_errors: u64,
+    pub proposed_identity_errors: u64,
+    pub original_rows_examined: u64,
+    pub proposed_rows_examined: u64,
+    pub original_bytes_examined: u64,
+    pub proposed_bytes_examined: u64,
+    pub original_budget_exceeded: bool,
+    pub proposed_budget_exceeded: bool,
+    pub counts_exact: bool,
+    pub true_positives_preserved: bool,
+    pub identity_mode: String,
+}
+
 /// Test results for a tuning proposal
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct TestResults {
@@ -412,6 +462,9 @@ pub struct TestResults {
     pub validation_passed: bool,
     /// Detailed comparison metrics
     pub comparison_metrics: ComparisonMetrics,
+    /// Exact durable proof required for autonomous application.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_proof: Option<TuningValidationProof>,
 }
 
 /// Detection rule version
@@ -494,6 +547,8 @@ pub enum TuningStatus {
     ManuallyApproved,
     /// Rejected by user or system
     Rejected,
+    /// A durable Detection-as-Code PR operation is claimed and in progress.
+    PrPending,
     /// A Pull Request was opened in the detection-as-code push target; the
     /// change applies when the customer merges it and their DaC pipeline
     /// redeploys the rule to nano (NAN-1745).
@@ -512,6 +567,7 @@ impl std::fmt::Display for TuningStatus {
             TuningStatus::Reverted => write!(f, "reverted"),
             TuningStatus::ManuallyApproved => write!(f, "manually_approved"),
             TuningStatus::Rejected => write!(f, "rejected"),
+            TuningStatus::PrPending => write!(f, "pr_pending"),
             TuningStatus::PrOpened => write!(f, "pr_opened"),
         }
     }
@@ -645,6 +701,8 @@ mod tests {
             "manually_approved"
         );
         assert_eq!(TuningStatus::Rejected.to_string(), "rejected");
+        assert_eq!(TuningStatus::PrPending.to_string(), "pr_pending");
+        assert_eq!(TuningStatus::PrOpened.to_string(), "pr_opened");
     }
 
     #[test]

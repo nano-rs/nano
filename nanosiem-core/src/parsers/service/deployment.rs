@@ -12,6 +12,24 @@ use crate::parsers::types::{
 use crate::parsers::vector_config::redact_config_snapshot;
 
 impl ParserService {
+    /// Render the canonical parser configuration without reloading Vector.
+    /// Publication callers construct this service against an isolated render
+    /// root, so no pod-local live tree is treated as shared state.
+    pub async fn render_to_vector_config(&self) -> Result<(), ParserServiceError> {
+        let parsers = self.list().await?;
+        let mut parsers_with_creds = self.inject_credentials_for_all(&parsers).await?;
+        crate::parsers::resolve_parser_dispatch_routes(
+            &self.pool,
+            &mut parsers_with_creds,
+        )
+        .await
+        .map_err(|e| ParserServiceError::DeploymentFailed(e.to_string()))?;
+        self.vector_config
+            .render_parsers(&parsers_with_creds)
+            .await?;
+        Ok(())
+    }
+
     /// Deploy all enabled parsers to Vector
     pub async fn deploy_to_vector(&self) -> Result<(), ParserServiceError> {
         let parsers = self.list().await?;

@@ -9,7 +9,7 @@ import { useMemo, useState } from 'react';
 import { AlertTriangle, Loader2, Search as SearchIcon, Shield } from 'lucide-react';
 
 import { useDocumentTitle } from '@/hooks/useDocumentTitle';
-import { useMitreCoverage } from '@/hooks/useMitreData';
+import { useMitreCoverage, useMitreData, type MitreSyncState } from '@/hooks/useMitreData';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { cn } from '@/lib/utils';
@@ -22,8 +22,7 @@ import {
   type RedesignFilters,
   type StatusKey,
   type TechniqueCoverage,
-  statusOf,
-  tierFor,
+  summarizeTechniqueCoverage,
 } from '@/components/mitre/types';
 
 // ----------------------------------------------------------------------------
@@ -107,7 +106,7 @@ function SummaryStrip({ pct, covered, total, tiers, coverageGaps, totalGapCount,
           </div>
           <div className="text-[11.5px] text-muted-foreground mt-0.5 leading-relaxed max-w-[780px]">
             Coverage is computed from live detection rules mapped to each technique. Disabled and
-            draft rules don&apos;t count. Techniques with no rules but connected data sources are surfaced
+            draft rules don&apos;t count. Techniques with no rules but active telemetry are surfaced
             as <span className="text-rose-500">hot gaps</span> — you have the signal, just no detection.
           </div>
         </div>
@@ -153,8 +152,8 @@ function SummaryStrip({ pct, covered, total, tiers, coverageGaps, totalGapCount,
           </div>
         </div>
 
-        {/* Coverage gaps — surfaces parent techniques with zero live rules,
-            ranked by sub-technique count so the most impactful gaps lead.
+        {/* Coverage gaps — every parent and sub-technique is an independent
+            coverage unit, matching the API and matrix headers.
             Replaces the older "Top hot gaps" panel which gated chips on
             data_source.connected — that flag isn't reliably populated, so
             the panel always read "0 with connected sources · 0 live rules"
@@ -331,6 +330,51 @@ function FilterRow({ filters, onChange, density, onDensity, showIds, onShowIds, 
 }
 
 // ----------------------------------------------------------------------------
+// Boot / seed window — the pinned ATT&CK catalog hasn't populated yet, so the
+// coverage matrix would render a phantom 0-of-0 grid. Surface the real sync
+// state instead of implying "zero coverage" (NAN-1766 / D5).
+// ----------------------------------------------------------------------------
+
+function CatalogEmptyState({ syncState }: { syncState: MitreSyncState | null }) {
+  const neverSynced = syncState == null || syncState.last_success_at == null;
+  const failed = syncState?.status === 'failed';
+  // Treat unknown/never-synced as "syncing" — an empty catalog on first boot is
+  // overwhelmingly the seed window, not a terminal failure.
+  const syncing = !failed && (syncState == null || syncState.status === 'syncing' || neverSynced);
+
+  return (
+    <div className="flex-1 flex items-center justify-center p-8">
+      <div className="max-w-[460px] text-center flex flex-col items-center gap-3">
+        {syncing ? (
+          <>
+            <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
+            <div className="text-[14px] font-semibold text-foreground">ATT&amp;CK catalog syncing…</div>
+            <div className="text-[11.5px] text-muted-foreground leading-relaxed">
+              The MITRE ATT&amp;CK catalog is being fetched and validated. Coverage will appear as soon
+              as techniques are available — this usually takes under a minute on first boot.
+            </div>
+          </>
+        ) : (
+          <>
+            <AlertTriangle className="w-8 h-8 text-amber-500" />
+            <div className="text-[14px] font-semibold text-foreground">ATT&amp;CK catalog unavailable</div>
+            <div className="text-[11.5px] text-muted-foreground leading-relaxed">
+              The catalog hasn&apos;t been populated yet. On air-gapped or egress-restricted
+              deployments it must be seeded before coverage can be computed.
+            </div>
+            {syncState?.last_error ? (
+              <div className="text-[10.5px] font-mono text-rose-500/90 break-words max-w-full">
+                {syncState.last_error}
+              </div>
+            ) : null}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------
 // Page.
 // ----------------------------------------------------------------------------
 
@@ -351,11 +395,13 @@ export function MitreCoverage() {
   const [drawer, setDrawer] = useState<{ tacticId: string; techniqueId: string } | null>(null);
 
   const { data, loading, error } = useMitreCoverage({ severity: [], mode: [] });
+  // Only used to distinguish an empty catalog that is still syncing from a
+  // genuine no-data state; the coverage endpoint itself carries no sync state.
+  const { data: catalogData } = useMitreData();
 
-  const techniques = data?.techniques ?? [];
-  const tactics = data?.tactics ?? [];
+  const techniques = useMemo(() => data?.techniques ?? [], [data?.techniques]);
+  const tactics = useMemo(() => data?.tactics ?? [], [data?.tactics]);
 
-  const parents = useMemo(() => techniques.filter((t) => !t.is_subtechnique), [techniques]);
   const techniqueById = useMemo(() => new Map(techniques.map((t) => [t.technique_id, t])), [techniques]);
 
   const subsByParent = useMemo(() => {
@@ -372,30 +418,14 @@ export function MitreCoverage() {
 
   const tactsById = useMemo(() => new Map(tactics.map((t) => [t.tactic_id, t])), [tactics]);
 
-  // Derive tier totals from live rules (matches matrix cell colours).
-  const tiers: TierTotals = useMemo(() => {
-    const acc: TierTotals = { full: 0, partial: 0, 'hot-gap': 0, gap: 0 };
-    parents.forEach((t) => {
-      acc[tierFor(t)] += 1;
-    });
-    return acc;
-  }, [parents]);
-
-  const total = parents.length;
-  const covered = tiers.full + tiers.partial;
-  const pct = total > 0 ? Math.round((covered / total) * 100) : 0;
-
-  // Coverage gaps: parent techniques with no live rule. Doesn't depend on
-  // data_sources.connected (which isn't reliably populated by the backend)
-  // — uses the same `live` filter the matrix renders against, so what's
-  // shown here matches what the matrix paints rose.
-  const allCoverageGaps = useMemo(
-    () =>
-      parents.filter(
-        (t) => (t.rules || []).filter((r) => statusOf(r.mode) === 'live').length === 0,
-      ),
-    [parents],
-  );
+  // Parents and sub-techniques are independent coverage units everywhere.
+  // The backend summary carries the same explicit `technique` unit contract.
+  const coverageStats = useMemo(() => summarizeTechniqueCoverage(techniques), [techniques]);
+  const tiers: TierTotals = coverageStats.tiers;
+  const total = data?.summary.total_techniques ?? coverageStats.total;
+  const covered = coverageStats.covered;
+  const pct = coverageStats.percentage;
+  const allCoverageGaps = coverageStats.gaps;
   const coverageGaps = useMemo(() => allCoverageGaps.slice(0, 8), [allCoverageGaps]);
 
   // Surface the union of rule sources actually present in the response — empty
@@ -436,6 +466,16 @@ export function MitreCoverage() {
           </Button>
         </CardContent>
       </Card>
+    );
+  }
+
+  // Boot/seed window: an empty catalog would otherwise render as a phantom
+  // 0-of-0 matrix. Show the real catalog sync state instead (NAN-1766 / D5).
+  if (!loading && techniques.length === 0) {
+    return (
+      <div className="flex flex-col h-full min-h-0 -m-3">
+        <CatalogEmptyState syncState={catalogData?.sync_state ?? null} />
+      </div>
     );
   }
 

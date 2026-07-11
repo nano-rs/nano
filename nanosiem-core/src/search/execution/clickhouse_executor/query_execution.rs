@@ -400,6 +400,85 @@ impl ClickHouseExecutor {
         Ok(results)
     }
 
+    /// Execute one unattended query with server-side result overflow settings
+    /// and a matching client-side byte guard. The caller owns `query_id` and can
+    /// therefore issue an explicit distributed KILL on timeout or early exit.
+    pub(crate) async fn execute_dynamic_query_with_execution_limits(
+        &self,
+        sql: &str,
+        query_id: &str,
+        settings: Option<&crate::search::admission::ClickHouseQuerySettings>,
+        limits: &crate::search::SearchExecutionLimits,
+    ) -> Result<Vec<serde_json::Value>, SearchError> {
+        let escaped_sql = escape_question_marks_in_strings(sql);
+        let mut query = self
+            .client
+            .query(&escaped_sql)
+            .with_option("query_id", query_id)
+            .with_option("max_result_rows", &limits.max_result_rows.to_string())
+            .with_option("max_result_bytes", &limits.max_result_bytes.to_string())
+            .with_option("result_overflow_mode", "throw");
+        if let Some(settings) = settings {
+            query = query
+                .with_option(
+                    "max_execution_time",
+                    &settings.max_execution_time.to_string(),
+                )
+                .with_option(
+                    "max_memory_usage",
+                    &settings.max_memory_usage_bytes.to_string(),
+                )
+                .with_option("max_threads", &settings.max_threads.to_string())
+                .with_option("priority", &settings.priority.to_string())
+                .with_option("queue_max_wait_ms", &settings.queue_max_wait_ms.to_string());
+        }
+
+        let mut cursor = query
+            .fetch_bytes("JSONEachRow")
+            .map_err(|error| parse_clickhouse_error(&error.to_string()))?;
+        let byte_limit = usize::try_from(limits.max_result_bytes).unwrap_or(usize::MAX);
+        let mut response_bytes = Vec::new();
+        loop {
+            match cursor.next().await {
+                Ok(Some(chunk)) => {
+                    let next_size = response_bytes
+                        .len()
+                        .checked_add(chunk.len())
+                        .ok_or(SearchError::ResponseTooLarge(usize::MAX, byte_limit))?;
+                    if next_size > byte_limit {
+                        return Err(SearchError::ResponseTooLarge(next_size, byte_limit));
+                    }
+                    response_bytes.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(error) => return Err(parse_clickhouse_error(&error.to_string())),
+            }
+        }
+
+        let response = String::from_utf8(response_bytes).map_err(|error| {
+            SearchError::DatabaseError(sqlx::Error::Protocol(format!(
+                "Invalid UTF-8 in bounded ClickHouse response: {error}"
+            )))
+        })?;
+        let mut results = Vec::new();
+        for line in response.lines().filter(|line| !line.is_empty()) {
+            let row = Self::parse_and_postprocess_row(line).ok_or_else(|| {
+                SearchError::DatabaseError(sqlx::Error::Protocol(
+                    "Invalid JSONEachRow value in bounded ClickHouse response".to_string(),
+                ))
+            })?;
+            results.push(row);
+        }
+        if u64::try_from(results.len()).unwrap_or(u64::MAX) > limits.max_result_rows {
+            return Err(SearchError::SqlGenError(format!(
+                "Bounded query returned {} rows, exceeding the {}-row limit",
+                results.len(),
+                limits.max_result_rows
+            )));
+        }
+        Ok(results)
+    }
+
     /// Parse a single JSONEachRow line and apply post-processing (shared by streaming path).
     pub(crate) fn parse_and_postprocess_row(line: &str) -> Option<serde_json::Value> {
         let mut json: serde_json::Value = serde_json::from_str(line).ok()?;

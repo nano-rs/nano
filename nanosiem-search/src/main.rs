@@ -148,12 +148,15 @@ async fn main() -> Result<()> {
     let leader_election_enabled = std::env::var("SEARCH_LEADER_ELECTION_ENABLED")
         .map(|v| v.to_lowercase() != "false" && v != "0")
         .unwrap_or(false);
+    let election_shutdown = nanosiem_core::shutdown::ShutdownToken::new();
+    let mut election_handle = None;
 
     if leader_election_enabled {
         tracing::info!("Search leader election enabled — starting advisory lock election");
         let election = LeaderElection::new(dual_pool.postgres().clone(), lock_ids::SEARCH_ACTIVE);
-        let rx = election.start();
+        let (rx, handle) = election.start(election_shutdown.clone());
         state.set_leader_rx(rx);
+        election_handle = Some(handle);
     } else {
         tracing::warn!("Search leader election disabled (SEARCH_LEADER_ELECTION_ENABLED=false) — always serving traffic");
     }
@@ -170,7 +173,34 @@ async fn main() -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&bind_address).await?;
     let make_service = app.into_make_service_with_connect_info::<SocketAddr>();
-    axum::serve(listener, make_service).await?;
+    let wait_for_shutdown = async {
+        match nanosiem_core::shutdown::wait_for_shutdown_signal().await {
+            Ok(signal) => tracing::info!(%signal, "Shutdown signal received"),
+            Err(error) => tracing::error!(%error, "Shutdown signal handler failed"),
+        }
+    };
+    let server_shutdown = nanosiem_core::shutdown::ShutdownToken::new();
+    let graceful_shutdown = server_shutdown.clone();
+    let server = axum::serve(listener, make_service).with_graceful_shutdown(async move {
+        graceful_shutdown.cancelled().await;
+    });
+    let cleanup = async move {
+        election_shutdown.cancel();
+        if let Some(handle) = election_handle {
+            match handle.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => tracing::warn!(?error, "Search leader election task failed"),
+            }
+        }
+    };
+    nanosiem_core::shutdown::run_server_with_shutdown(
+        server,
+        server_shutdown,
+        wait_for_shutdown,
+        cleanup,
+    )
+    .await?;
 
     Ok(())
 }

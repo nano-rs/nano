@@ -23,6 +23,7 @@ mod tests;
 // Audit D13: the real-time SignalProcessor shares the scheduled path's
 // finding-emission dedup (candidate type + store helpers in `helpers`).
 pub(crate) use alerts::ClaimedFinding;
+pub(crate) use analysis::tuning_test_windows;
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -34,6 +35,17 @@ use uuid::Uuid;
 
 /// Cache TTL for system settings (5 minutes)
 const SETTINGS_CACHE_TTL_SECS: u64 = 300;
+
+/// Autonomous tuning replays are intentionally tighter than the interactive
+/// rule tester because they can run without an analyst explicitly admitting
+/// the ClickHouse workload.
+pub(crate) const MAX_AUTONOMOUS_TUNING_WINDOWS: usize = 500;
+pub(crate) const AUTONOMOUS_TUNING_REPLAY_QUERY_COUNT: i64 = 2;
+pub(crate) const MAX_AUTONOMOUS_TUNING_TOTAL_SCAN_SECONDS: i64 = 7 * 24 * 60 * 60;
+pub(crate) const MAX_AUTONOMOUS_TUNING_ROWS_PER_WINDOW: u64 = 10_000;
+pub(crate) const MAX_AUTONOMOUS_TUNING_BYTES_PER_WINDOW: u64 = 8 * 1024 * 1024;
+pub(crate) const MAX_AUTONOMOUS_TUNING_TOTAL_ROWS: u64 = 100_000;
+pub(crate) const MAX_AUTONOMOUS_TUNING_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
 use crate::db::repository::{AlertRepository, DetectionRuleRepository};
 use crate::db::DualPool;
@@ -134,6 +146,34 @@ pub struct TimeBucket {
     pub count: u64,
 }
 
+/// Exact evidence from replaying one identity-preserving query over fixed
+/// production schedule/lookback windows.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TuningWindowEvidence {
+    pub total_matches: u64,
+    pub source_ids: std::collections::HashSet<Uuid>,
+    pub sample_events: Vec<serde_json::Value>,
+    pub rows_examined: u64,
+    pub bytes_examined: u64,
+    pub failed_windows: u32,
+    pub truncated_windows: u32,
+    pub identity_errors: u64,
+    pub budget_exceeded: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TuningReplayBudget {
+    pub rows: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct TuningWindowPlan {
+    pub schedule_cron: String,
+    pub lookback_minutes: i64,
+    pub windows: Vec<TimeRangeInput>,
+}
+
 /// Detection service for managing detection rules and alerts
 ///
 /// Supports two modes:
@@ -175,6 +215,14 @@ pub struct DetectionService {
 }
 
 impl DetectionService {
+    /// Serialize materialized-view writers for one rule across API nodes.
+    pub async fn acquire_rule_runtime_lock(
+        &self,
+        rule_id: Uuid,
+    ) -> Result<super::materialized_view::RuleRuntimeLockGuard, DetectionError> {
+        Ok(super::materialized_view::acquire_rule_runtime_lock(&self.pg_pool, rule_id).await?)
+    }
+
     /// Create a new detection service with DualPool and prevalence support
     ///
     /// This is the recommended constructor for production use with prevalence-based detection:

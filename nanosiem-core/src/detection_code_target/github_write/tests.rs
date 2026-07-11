@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use super::{GitHubWriteClient, GitHubWriteError};
+use super::{
+    ensure_exact_operation_diff, pull_body_matches_operation, pull_state, ChangedFile,
+    GitHubWriteClient, GitHubWriteError, PullHead, PullResponse,
+};
 
 #[test]
 fn parses_standard_github_urls() {
@@ -102,5 +105,91 @@ fn rejects_dot_segments() {
             GitHubWriteClient::parse_github_repo(url).is_err(),
             "{url} must be rejected (dot segment)"
         );
+    }
+}
+
+#[test]
+fn pull_reconciliation_distinguishes_open_closed_and_merged() {
+    let response = |state: &str, merged: bool| PullResponse {
+        html_url: "https://github.com/acme/detections/pull/1".to_string(),
+        number: 1,
+        body: None,
+        state: state.to_string(),
+        merged_at: merged.then(|| "2026-07-10T00:00:00Z".to_string()),
+        head: PullHead {
+            sha: "commit-sha".to_string(),
+        },
+    };
+    assert_eq!(pull_state(&response("open", false)), "open");
+    assert_eq!(pull_state(&response("closed", false)), "closed");
+    assert_eq!(pull_state(&response("closed", true)), "merged");
+}
+
+#[test]
+fn pull_reconciliation_requires_the_frozen_operation_identity() {
+    let expected =
+        "proposal 123\n\n<!-- nano-pr-operation: 123 -->\n\n<!-- nano-rule-id: abc -->\n";
+    let legacy = "proposal 123\n\n<!-- nano-rule-id: abc -->\n";
+
+    assert!(pull_body_matches_operation(Some(expected), expected));
+    assert!(pull_body_matches_operation(Some(legacy), expected));
+    assert!(pull_body_matches_operation(
+        Some("analyst notes\n<!-- nano-pr-operation: 123 -->\n"),
+        expected
+    ));
+    assert!(!pull_body_matches_operation(
+        Some("proposal 456\n<!-- nano-pr-operation: 456 -->\n"),
+        expected
+    ));
+    assert!(!pull_body_matches_operation(None, expected));
+}
+
+#[test]
+fn reconciliation_rejects_unrelated_branch_or_pr_changes() {
+    let expected = "detections/rule.npl";
+    assert!(ensure_exact_operation_diff(
+        &[ChangedFile {
+            filename: expected.to_string(),
+            status: "modified".to_string(),
+            previous_filename: None,
+        }],
+        expected,
+        "pull request",
+    )
+    .is_ok());
+
+    for files in [
+        vec![],
+        vec![ChangedFile {
+            filename: "detections/other.npl".to_string(),
+            status: "modified".to_string(),
+            previous_filename: None,
+        }],
+        vec![
+            ChangedFile {
+                filename: expected.to_string(),
+                status: "modified".to_string(),
+                previous_filename: None,
+            },
+            ChangedFile {
+                filename: "deploy/production.yaml".to_string(),
+                status: "modified".to_string(),
+                previous_filename: None,
+            },
+        ],
+    ] {
+        assert!(matches!(
+            ensure_exact_operation_diff(&files, expected, "pull request"),
+            Err(GitHubWriteError::RemoteConflict(_))
+        ));
+    }
+
+    for status in ["removed", "renamed", "copied"] {
+        let file = ChangedFile {
+            filename: expected.to_string(),
+            status: status.to_string(),
+            previous_filename: (status == "renamed").then(|| "deploy/production.yaml".to_string()),
+        };
+        assert!(ensure_exact_operation_diff(&[file], expected, "pull request").is_err());
     }
 }

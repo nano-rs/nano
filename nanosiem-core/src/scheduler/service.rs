@@ -14,6 +14,7 @@ use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
 use crate::inputlookup::SsrfValidator;
+use crate::shutdown::ShutdownToken;
 
 use super::repository::{JobStats, SchedulerRepository, SchedulerRepositoryError};
 use super::types::*;
@@ -45,6 +46,9 @@ pub enum SchedulerError {
 
     #[error("Job is already running")]
     AlreadyRunning,
+
+    #[error("Distributed job claim was lost")]
+    ClaimLost,
 
     #[error("URL blocked by SSRF protection: {0}")]
     SsrfBlocked(String),
@@ -221,7 +225,7 @@ impl SchedulerService {
         self.repository.mark_job_running(job.id).await?;
 
         // Execute the job with retry logic
-        let result = self.execute_with_retry(job).await;
+        let result = self.execute_with_retry(job, Uuid::now_v7(), None).await;
 
         // Calculate next run time
         let next_run_at = if job.enabled {
@@ -263,6 +267,8 @@ impl SchedulerService {
     async fn execute_with_retry(
         &self,
         job: &ScheduledJob,
+        run_id: Uuid,
+        claim: Option<(&str, i64)>,
     ) -> Result<(usize, usize), SchedulerError> {
         let mut last_error = None;
         let max_attempts = job.retry_policy.max_retries + 1;
@@ -275,7 +281,7 @@ impl SchedulerService {
                 "Starting job execution attempt"
             );
 
-            match self.fetch_and_process(job).await {
+            match self.fetch_and_process(job, run_id, claim).await {
                 Ok(result) => {
                     if attempt > 1 {
                         info!(
@@ -286,6 +292,7 @@ impl SchedulerService {
                     }
                     return Ok(result);
                 }
+                Err(e) if matches!(e, SchedulerError::ClaimLost) => return Err(e),
                 Err(e) => {
                     let error_msg = e.to_string();
                     last_error = Some(e);
@@ -323,6 +330,8 @@ impl SchedulerService {
     async fn fetch_and_process(
         &self,
         job: &ScheduledJob,
+        run_id: Uuid,
+        claim: Option<(&str, i64)>,
     ) -> Result<(usize, usize), SchedulerError> {
         info!(job_id = %job.id, url = %job.url, "Fetching data from URL");
 
@@ -430,6 +439,17 @@ impl SchedulerService {
         // Basic content format validation
         validate_content_format(&content, expected_format)?;
 
+        // Fence the external write as close to its side-effect boundary as
+        // possible. A reclaimed generation must never publish or complete.
+        if let Some((node_id, generation)) = claim {
+            let renewed = self
+                .renew_job_claim_bounded(job.id, node_id, generation)
+                .await?;
+            if !renewed {
+                return Err(SchedulerError::ClaimLost);
+            }
+        }
+
         // Process through upload service
         let upload_service = crate::upload::UploadService::new(self.pool.clone());
         let upload_request = crate::upload::UploadRequest {
@@ -437,6 +457,7 @@ impl SchedulerService {
             content: content.to_vec(),
             destination: job.destination.clone(),
             config: job.parser_config.clone(),
+            idempotency_key: Some(run_id),
         };
 
         let result = upload_service
@@ -445,6 +466,97 @@ impl SchedulerService {
             .map_err(|e| SchedulerError::UploadError(e.to_string()))?;
 
         Ok((result.records_processed, result.records_ingested))
+    }
+
+    async fn maintain_job_lease(
+        &self,
+        job_id: Uuid,
+        node_id: &str,
+        generation: i64,
+        stale_timeout_secs: i64,
+        mut stop: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), SchedulerError> {
+        let renew_interval =
+            std::time::Duration::from_secs((stale_timeout_secs.max(3) as u64 / 3).max(1));
+        loop {
+            tokio::select! {
+                _ = &mut stop => return Ok(()),
+                _ = tokio::time::sleep(renew_interval) => {
+                    match self.renew_job_claim_bounded(job_id, node_id, generation).await {
+                        Ok(true) => {}
+                        Ok(false) => return Err(SchedulerError::ClaimLost),
+                        Err(error) => {
+                            warn!(job_id = %job_id, error = %error, "Scheduled-job lease renewal failed closed");
+                            return Err(error.into());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn renew_job_claim_bounded(
+        &self,
+        job_id: Uuid,
+        node_id: &str,
+        generation: i64,
+    ) -> Result<bool, SchedulerError> {
+        let timeout = Self::claim_database_timeout();
+        let timeout_secs = timeout.as_secs();
+        match tokio::time::timeout(
+            timeout,
+            self.repository.renew_job_claim(job_id, node_id, generation),
+        )
+        .await
+        {
+            Ok(result) => Ok(result?),
+            Err(_) => {
+                warn!(
+                    job_id = %job_id,
+                    generation,
+                    timeout_secs,
+                    "Scheduled-job lease renewal timed out; abandoning execution"
+                );
+                Err(SchedulerError::ClaimLost)
+            }
+        }
+    }
+
+    fn claim_database_timeout() -> std::time::Duration {
+        let timeout_secs = std::env::var("SCHEDULER_LEASE_RENEW_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(5)
+            .max(1);
+        std::time::Duration::from_secs(timeout_secs)
+    }
+
+    async fn execute_claimed_job(
+        &self,
+        job: &ScheduledJob,
+        node_id: &str,
+        stale_timeout_secs: i64,
+    ) -> Result<(usize, usize), SchedulerError> {
+        let run_id = job.claim_run_id.ok_or(SchedulerError::ClaimLost)?;
+        let generation = job.claim_generation;
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let execution = self.execute_with_retry(job, run_id, Some((node_id, generation)));
+        let lease =
+            self.maintain_job_lease(job.id, node_id, generation, stale_timeout_secs, stop_rx);
+        tokio::pin!(execution);
+        tokio::pin!(lease);
+
+        tokio::select! {
+            result = &mut execution => {
+                let _ = stop_tx.send(());
+                lease.await?;
+                result
+            }
+            lease_result = &mut lease => {
+                lease_result?;
+                Err(SchedulerError::ClaimLost)
+            }
+        }
     }
 
     /// Get jobs that are due to run
@@ -458,11 +570,27 @@ impl SchedulerService {
     /// If a node_id is configured, uses SKIP LOCKED claiming for distributed execution.
     /// Otherwise falls back to the legacy get_due_jobs + mark_running pattern.
     pub async fn run_scheduler_loop(&self, poll_interval_secs: u64) {
+        self.run_scheduler_loop_with_shutdown(poll_interval_secs, &ShutdownToken::new())
+            .await;
+    }
+
+    /// Run the scheduler until cancellation, draining jobs already claimed by this node.
+    pub async fn run_scheduler_loop_with_shutdown(
+        &self,
+        poll_interval_secs: u64,
+        shutdown: &ShutdownToken,
+    ) {
         // Stale timeout for scheduled jobs is longer (45 min) since feed fetches can be slow
+        let minimum_stale_timeout = Self::claim_database_timeout()
+            .as_secs()
+            .saturating_mul(3)
+            .min(i64::MAX as u64) as i64;
         let stale_timeout_secs: i64 = std::env::var("SCHEDULER_JOB_STALE_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(2700); // 45 minutes
+            .unwrap_or(2700)
+            .max(3)
+            .max(minimum_stale_timeout); // 45 minutes by default
 
         if let Some(ref node_id) = self.node_id {
             info!(poll_interval_secs, node_id = %node_id, "Starting distributed scheduler loop (SKIP LOCKED)");
@@ -471,20 +599,31 @@ impl SchedulerService {
         }
 
         loop {
+            if shutdown.is_cancelled() {
+                break;
+            }
+
+            let mut ran_distributed_job = false;
             if let Some(ref node_id) = self.node_id {
-                // Distributed mode: claim jobs via SKIP LOCKED
-                match self
+                // Distributed mode: claim jobs via SKIP LOCKED. Claim one at a
+                // time so a later feed never ages while waiting behind a slow
+                // fetch or retry owned by the same node, and keep the claim
+                // cancellable so shutdown drains cleanly.
+                let claim = self
                     .repository
-                    .claim_due_jobs(5, node_id, stale_timeout_secs)
-                    .await
-                {
-                    Ok(jobs) => {
+                    .claim_due_jobs(1, node_id, stale_timeout_secs);
+                match shutdown.run_until_cancelled(claim).await {
+                    None => break,
+                    Some(Ok(jobs)) => {
+                        ran_distributed_job = !jobs.is_empty();
                         if !jobs.is_empty() {
                             info!(job_count = jobs.len(), node_id = %node_id, "Claimed due jobs");
                         }
 
                         for job in jobs {
-                            let result = self.execute_with_retry(&job).await;
+                            let result = self
+                                .execute_claimed_job(&job, node_id, stale_timeout_secs)
+                                .await;
 
                             let next_run_at = if job.enabled {
                                 calculate_next_run(&job.cron_expression).ok().flatten()
@@ -509,29 +648,45 @@ impl SchedulerService {
                                 }
                             };
 
-                            if let Err(e) = self
-                                .repository
-                                .release_job_claim(
+                            match tokio::time::timeout(
+                                Self::claim_database_timeout(),
+                                self.repository.release_job_claim(
                                     job.id,
                                     node_id,
+                                    job.claim_generation,
                                     status,
                                     error_msg.as_deref(),
                                     next_run_at,
-                                )
-                                .await
+                                ),
+                            )
+                            .await
                             {
-                                warn!(job_id = %job.id, "Failed to release job claim: {}", e);
+                                Ok(Ok(true)) => {}
+                                Ok(Ok(false)) => warn!(
+                                    job_id = %job.id,
+                                    generation = job.claim_generation,
+                                    "Skipped stale scheduled-job completion"
+                                ),
+                                Ok(Err(e)) => {
+                                    warn!(job_id = %job.id, "Failed to release job claim: {}", e)
+                                }
+                                Err(_) => warn!(
+                                    job_id = %job.id,
+                                    generation = job.claim_generation,
+                                    "Timed out completing scheduled-job claim"
+                                ),
                             }
                         }
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         warn!(error = %e, "Failed to claim due jobs");
                     }
                 }
             } else {
                 // Legacy mode: get due jobs without locking
-                match self.get_due_jobs().await {
-                    Ok(jobs) => {
+                match shutdown.run_until_cancelled(self.get_due_jobs()).await {
+                    None => break,
+                    Some(Ok(jobs)) => {
                         if !jobs.is_empty() {
                             info!(job_count = jobs.len(), "Found due jobs to execute");
                         }
@@ -547,23 +702,49 @@ impl SchedulerService {
                             }
                         }
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         warn!(error = %e, "Failed to get due jobs");
                     }
                 }
             }
 
+            if ran_distributed_job {
+                tokio::task::yield_now().await;
+                continue;
+            }
+
             // Sleep until next poll
-            tokio::time::sleep(std::time::Duration::from_secs(poll_interval_secs)).await;
+            if shutdown
+                .run_until_cancelled(tokio::time::sleep(std::time::Duration::from_secs(
+                    poll_interval_secs,
+                )))
+                .await
+                .is_none()
+            {
+                break;
+            }
         }
+
+        info!("Scheduled job loop stopped");
     }
 
     /// Start the scheduler as a background task
     /// Returns a JoinHandle that can be used to await or abort the task
     pub fn start_scheduler(&self, poll_interval_secs: u64) -> tokio::task::JoinHandle<()> {
+        self.start_scheduler_with_shutdown(poll_interval_secs, ShutdownToken::new())
+    }
+
+    /// Start the scheduler with cooperative cancellation.
+    pub fn start_scheduler_with_shutdown(
+        &self,
+        poll_interval_secs: u64,
+        shutdown: ShutdownToken,
+    ) -> tokio::task::JoinHandle<()> {
         let service = self.clone();
         tokio::spawn(async move {
-            service.run_scheduler_loop(poll_interval_secs).await;
+            service
+                .run_scheduler_loop_with_shutdown(poll_interval_secs, &shutdown)
+                .await;
         })
     }
 
@@ -744,6 +925,23 @@ use std::str::FromStr;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    #[tokio::test]
+    async fn pre_cancelled_scheduler_stops_before_claiming() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:postgres@127.0.0.1:9/nanosiem")
+            .unwrap();
+        let service = SchedulerService::with_node_id(pool, "test-node".to_string());
+        let shutdown = ShutdownToken::new();
+        shutdown.cancel();
+
+        let handle = service.start_scheduler_with_shutdown(30, shutdown);
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("cancelled scheduler must stop without polling Postgres")
+            .expect("scheduler task must not panic");
+    }
 
     #[test]
     fn test_validate_cron_valid() {

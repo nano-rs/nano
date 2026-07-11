@@ -40,6 +40,11 @@ pub use nanosiem_api_lib::{
 /// All entries are matched exactly (no prefix matching).
 const PUBLIC_ENDPOINTS: &[&str] = &[
     "/health",
+    // Kubernetes readiness probe (HA8, NAN-1777). Probes are unauthenticated;
+    // without this the auth middleware 401s /ready before the handler's
+    // 200/503 control-plane check runs, so the pod never becomes Ready. The
+    // IP-allowlist middleware already bypasses /ready — keep the two in sync.
+    "/ready",
     "/api/auth/login",
     "/api/auth/refresh",
     "/api/auth/password/reset-request",
@@ -502,6 +507,7 @@ mod tests {
     fn test_is_public_endpoint() {
         // Exact matches
         assert!(is_public_endpoint("/health"));
+        assert!(is_public_endpoint("/ready"));
         assert!(is_public_endpoint("/api/auth/login"));
         assert!(is_public_endpoint("/api/auth/refresh"));
         assert!(is_public_endpoint("/api/auth/oidc/providers"));

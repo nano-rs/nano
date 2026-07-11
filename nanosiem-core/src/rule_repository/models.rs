@@ -392,6 +392,122 @@ pub struct CoverageFilter {
     pub mitre_technique: Option<String>,
 }
 
+impl CoverageFilter {
+    /// Return a canonical filter so equivalent API inputs share matching
+    /// semantics across repository metadata from Sigma and nPL sources.
+    pub(crate) fn normalized(&self) -> Self {
+        Self {
+            repository_id: self.repository_id,
+            severity: normalize_optional_filter(
+                self.severity.as_deref(),
+                normalize_coverage_severity,
+            ),
+            mitre_tactic: normalize_optional_filter(
+                self.mitre_tactic.as_deref(),
+                normalize_coverage_tactic,
+            ),
+            mitre_technique: normalize_optional_filter(
+                self.mitre_technique.as_deref(),
+                normalize_technique,
+            ),
+        }
+    }
+
+    /// Whether a repository rule belongs to this canonical coverage scope.
+    pub(crate) fn matches_normalized(&self, rule: &RepositoryRule) -> bool {
+        if self
+            .repository_id
+            .is_some_and(|repository_id| repository_id != rule.repository_id)
+        {
+            return false;
+        }
+
+        if let Some(severity) = self.severity.as_deref() {
+            if rule
+                .severity
+                .as_deref()
+                .map(normalize_coverage_severity)
+                .as_deref()
+                != Some(severity)
+            {
+                return false;
+            }
+        }
+
+        if let Some(tactic) = self.mitre_tactic.as_deref() {
+            let matches_tactic = rule
+                .mitre_tactics
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|candidate| normalize_coverage_tactic(candidate) == tactic);
+            if !matches_tactic {
+                return false;
+            }
+        }
+
+        if let Some(technique) = self.mitre_technique.as_deref() {
+            let matches_technique = rule
+                .mitre_techniques
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|candidate| normalize_technique(candidate) == technique);
+            if !matches_technique {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+fn normalize_optional_filter(
+    value: Option<&str>,
+    normalize: impl Fn(&str) -> String,
+) -> Option<String> {
+    value
+        .map(normalize)
+        .and_then(|value| (!value.is_empty()).then_some(value))
+}
+
+pub(crate) fn normalize_coverage_severity(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+pub(crate) fn normalize_coverage_tactic(value: &str) -> String {
+    let normalized = normalize_coverage_severity(value)
+        .split(|character: char| {
+            character.is_ascii_whitespace() || character == '-' || character == '_'
+        })
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+
+    match normalized.as_str() {
+        "reconnaissance" | "ta0043" => "TA0043",
+        "resource_development" | "ta0042" => "TA0042",
+        "initial_access" | "ta0001" => "TA0001",
+        "execution" | "ta0002" => "TA0002",
+        "persistence" | "ta0003" => "TA0003",
+        "privilege_escalation" | "ta0004" => "TA0004",
+        "defense_evasion" | "ta0005" => "TA0005",
+        "credential_access" | "ta0006" => "TA0006",
+        "discovery" | "ta0007" => "TA0007",
+        "lateral_movement" | "ta0008" => "TA0008",
+        "collection" | "ta0009" => "TA0009",
+        "command_and_control" | "c2" | "ta0011" => "TA0011",
+        "exfiltration" | "ta0010" => "TA0010",
+        "impact" | "ta0040" => "TA0040",
+        _ => return normalized,
+    }
+    .to_string()
+}
+
+fn normalize_technique(value: &str) -> String {
+    value.trim().to_ascii_uppercase()
+}
+
 /// Result of coverage check for a single rule
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoverageResult {
@@ -469,4 +585,111 @@ pub struct RuleBundleImportResult {
     pub content_version: String,
     /// Number of rules synced (upserted) into the repository catalog.
     pub synced: usize,
+}
+
+#[cfg(test)]
+mod coverage_filter_tests {
+    use super::*;
+
+    fn repository_rule(repository_id: Uuid) -> RepositoryRule {
+        let now = Utc::now();
+        RepositoryRule {
+            id: Uuid::now_v7(),
+            repository_id,
+            file_path: "rules/example.yml".to_string(),
+            file_sha: None,
+            raw_content: String::new(),
+            title: Some("Example".to_string()),
+            description: None,
+            severity: Some("HIGH".to_string()),
+            mitre_tactics: Some(vec!["Credential Access".to_string()]),
+            mitre_techniques: Some(vec!["t1059.001".to_string()]),
+            tags: None,
+            requires_fields: None,
+            requires_source_types: None,
+            conversion_status: "pending".to_string(),
+            converted_npl: None,
+            conversion_confidence: None,
+            conversion_warnings: None,
+            conversion_field_mappings: None,
+            coverage_status: None,
+            coverage_missing_fields: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn coverage_filter_normalizes_and_applies_every_dimension() {
+        let repository_id = Uuid::now_v7();
+        let rule = repository_rule(repository_id);
+        let filter = CoverageFilter {
+            repository_id: Some(repository_id),
+            severity: Some(" high ".to_string()),
+            mitre_tactic: Some("credential -  access".to_string()),
+            mitre_technique: Some(" t1059.001 ".to_string()),
+        }
+        .normalized();
+
+        assert_eq!(filter.severity.as_deref(), Some("high"));
+        assert_eq!(filter.mitre_tactic.as_deref(), Some("TA0006"));
+        assert_eq!(filter.mitre_technique.as_deref(), Some("T1059.001"));
+        assert!(filter.matches_normalized(&rule));
+        assert!(CoverageFilter {
+            mitre_tactic: Some("ta0006".to_string()),
+            ..Default::default()
+        }
+        .normalized()
+        .matches_normalized(&rule));
+    }
+
+    #[test]
+    fn coverage_filter_rejects_each_mismatch_and_combinations() {
+        let repository_id = Uuid::now_v7();
+        let rule = repository_rule(repository_id);
+
+        for filter in [
+            CoverageFilter {
+                repository_id: Some(Uuid::now_v7()),
+                ..Default::default()
+            },
+            CoverageFilter {
+                severity: Some("critical".to_string()),
+                ..Default::default()
+            },
+            CoverageFilter {
+                mitre_tactic: Some("execution".to_string()),
+                ..Default::default()
+            },
+            CoverageFilter {
+                mitre_technique: Some("T1078".to_string()),
+                ..Default::default()
+            },
+            CoverageFilter {
+                repository_id: Some(repository_id),
+                severity: Some("high".to_string()),
+                mitre_tactic: Some("credential_access".to_string()),
+                mitre_technique: Some("T1078".to_string()),
+            },
+        ] {
+            assert!(!filter.normalized().matches_normalized(&rule));
+        }
+    }
+
+    #[test]
+    fn blank_coverage_filters_are_ignored() {
+        let rule = repository_rule(Uuid::now_v7());
+        let filter = CoverageFilter {
+            repository_id: None,
+            severity: Some("  ".to_string()),
+            mitre_tactic: Some(String::new()),
+            mitre_technique: Some("\t".to_string()),
+        }
+        .normalized();
+
+        assert_eq!(filter.severity, None);
+        assert_eq!(filter.mitre_tactic, None);
+        assert_eq!(filter.mitre_technique, None);
+        assert!(filter.matches_normalized(&rule));
+    }
 }

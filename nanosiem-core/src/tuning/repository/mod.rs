@@ -6,12 +6,23 @@
 //! a comprehensive audit trail of all auto-tuning activities including proposals,
 //! tests, deployments, and reverts.
 
+mod application;
 mod logs;
 mod proposals;
+mod test_results;
 #[cfg(test)]
 mod tests;
 
 use sqlx::PgPool;
+
+pub use application::{
+    AtomicProposalApplyError, AtomicProposalApplyRequest, AtomicProposalApplyResult,
+    ProposalRuleMutation,
+};
+pub use proposals::{
+    FrozenPrOperation, PrApprovalProvenance, PrDestinationPayload, PrOperationCheckpoint,
+    PrOperationClaim, PrOperationError, PrOperationPhase,
+};
 
 // Submodules add impl blocks to TuningRepository; no additional public types to re-export.
 

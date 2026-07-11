@@ -24,6 +24,29 @@ fn asset_view_total_count(results: &[serde_json::Value]) -> Option<u64> {
 const IN_MEMORY_PREVALENCE_FETCH_CAP: usize = 50_000;
 
 impl SearchService {
+    /// Kill an evaluator-owned set of exact ClickHouse query IDs in one
+    /// cluster-aware round trip. Autonomous replay owns every ID up front, so
+    /// timeout/error cleanup does not depend on local request tracking.
+    pub(crate) async fn cancel_exact_queries(
+        &self,
+        query_ids: &[String],
+    ) -> Result<bool, SearchError> {
+        let Some(executor) = &self.ch_executor else {
+            for query_id in query_ids {
+                self.query_tracker.unregister(query_id);
+            }
+            tracing::warn!(
+                "Exact query cancellation is unavailable for the PostgreSQL search backend"
+            );
+            return Ok(false);
+        };
+        let result = executor.cancel_queries(query_ids).await;
+        for query_id in query_ids {
+            self.query_tracker.unregister(query_id);
+        }
+        result
+    }
+
     /// Cancel a running query by its request ID
     ///
     /// Stateless cancellation: the frontend request_id IS used as the ClickHouse
@@ -1049,7 +1072,8 @@ impl SearchService {
                             offset,
                             Some(&query_id),
                             None,
-                            bounded_count
+                            bounded_count,
+                            self.active_execution_limits.as_ref(),
                         ),
                         ch_executor.execute_field_stats_query(
                             &field_stats_sql,
@@ -1085,6 +1109,7 @@ impl SearchService {
                             Some(&query_id),
                             None,
                             bounded_count,
+                            self.active_execution_limits.as_ref(),
                         )
                         .await?;
                 (results, total_count, None)

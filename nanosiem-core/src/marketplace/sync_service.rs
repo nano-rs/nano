@@ -120,6 +120,54 @@ impl MarketplaceSyncService {
         Ok(())
     }
 
+    /// Run a repository sync in the caller's task for structured leadership.
+    pub async fn sync_repository(&self, repo_id: Uuid) -> Result<RepoSyncResult, MarketplaceError> {
+        let repo = self.repository.get_repo(repo_id).await?;
+        {
+            let mut syncing = self.syncing_repos.write().await;
+            if !syncing.insert(repo_id) {
+                return Err(MarketplaceError::SyncInProgress(repo_id));
+            }
+        }
+        if let Err(error) = self
+            .repository
+            .update_repo_sync_status(repo.id, "syncing", None, None, None)
+            .await
+        {
+            self.syncing_repos.write().await.remove(&repo_id);
+            return Err(error);
+        }
+
+        let result = run_sync(&repo, &self.repository, &self.data_dir).await;
+        let status_result = match &result {
+            Ok(sync) => {
+                self.repository
+                    .update_repo_sync_status(
+                        repo.id,
+                        "success",
+                        sync.commit.as_deref(),
+                        Some(sync.enrichment_count),
+                        None,
+                    )
+                    .await
+            }
+            Err(error) => {
+                self.repository
+                    .update_repo_sync_status(
+                        repo.id,
+                        "failed",
+                        None,
+                        None,
+                        Some(&error.to_string()),
+                    )
+                    .await
+            }
+        };
+        self.syncing_repos.write().await.remove(&repo_id);
+        status_result?;
+        result
+    }
+
     /// Auto-sync all repos that are due
     pub async fn auto_sync_all(&self) -> Result<Vec<Uuid>, MarketplaceError> {
         let repos = self.repository.list_repos_for_auto_sync().await?;

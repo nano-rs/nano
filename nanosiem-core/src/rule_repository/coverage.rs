@@ -12,8 +12,8 @@ use tracing::info;
 use crate::db::DualPool;
 
 use super::models::{
-    CoverageAnalysis, CoverageBySeverity, CoverageFilter, CoverageResult, MissingFieldCount,
-    RepositoryRule, TacticCoverage,
+    normalize_coverage_severity, normalize_coverage_tactic, CoverageAnalysis, CoverageBySeverity,
+    CoverageFilter, CoverageResult, MissingFieldCount, RepositoryRule, TacticCoverage,
 };
 
 /// Row for ClickHouse source type query
@@ -179,114 +179,137 @@ impl CoverageAnalyzer {
     pub fn analyze_coverage(
         &self,
         rules: &[RepositoryRule],
-        _filter: &CoverageFilter,
+        filter: &CoverageFilter,
     ) -> CoverageAnalysis {
-        let mut total = 0;
-        let mut full = 0;
-        let mut partial = 0;
-        let mut none = 0;
+        analyze_coverage_with(rules, filter, &self.available_fields, |rule| {
+            self.check_rule_coverage(rule)
+        })
+    }
+}
 
-        let mut by_severity = CoverageBySeverity::default();
-        let mut tactic_counts: HashMap<String, (i32, i32, i32, i32)> = HashMap::new();
-        let mut missing_field_counts: HashMap<String, i32> = HashMap::new();
-        let mut all_suggested_source_types: HashSet<String> = HashSet::new();
+fn analyze_coverage_with<F>(
+    rules: &[RepositoryRule],
+    filter: &CoverageFilter,
+    available_fields: &HashMap<String, HashSet<String>>,
+    check_rule_coverage: F,
+) -> CoverageAnalysis
+where
+    F: Fn(&RepositoryRule) -> CoverageResult,
+{
+    let mut total = 0;
+    let mut full = 0;
+    let mut partial = 0;
+    let mut none = 0;
 
-        for rule in rules {
-            let coverage = self.check_rule_coverage(rule);
-            total += 1;
+    let mut by_severity = CoverageBySeverity::default();
+    let mut tactic_counts: HashMap<String, (i32, i32, i32, i32)> = HashMap::new();
+    let mut missing_field_counts: HashMap<String, i32> = HashMap::new();
+    let mut all_suggested_source_types: HashSet<String> = HashSet::new();
 
-            // Update overall counts
-            match coverage.status.as_str() {
-                "full" => full += 1,
-                "partial" => partial += 1,
-                "none" => none += 1,
-                _ => {}
-            }
+    let filter = filter.normalized();
+    for rule in rules.iter().filter(|rule| filter.matches_normalized(rule)) {
+        let coverage = check_rule_coverage(rule);
+        total += 1;
 
-            // Update by severity
-            let severity_counts = match rule.severity.as_deref() {
-                Some("critical") => &mut by_severity.critical,
-                Some("high") => &mut by_severity.high,
-                Some("medium") => &mut by_severity.medium,
-                Some("low") => &mut by_severity.low,
-                _ => &mut by_severity.informational,
-            };
-            severity_counts.total += 1;
-            match coverage.status.as_str() {
-                "full" => severity_counts.full += 1,
-                "partial" => severity_counts.partial += 1,
-                "none" => severity_counts.none += 1,
-                _ => {}
-            }
+        // Update overall counts
+        match coverage.status.as_str() {
+            "full" => full += 1,
+            "partial" => partial += 1,
+            "none" => none += 1,
+            _ => {}
+        }
 
-            // Update by tactic
-            if let Some(tactics) = &rule.mitre_tactics {
-                for tactic in tactics {
-                    let counts = tactic_counts.entry(tactic.clone()).or_insert((0, 0, 0, 0));
-                    counts.0 += 1; // total
-                    match coverage.status.as_str() {
-                        "full" => counts.1 += 1,
-                        "partial" => counts.2 += 1,
-                        "none" => counts.3 += 1,
-                        _ => {}
-                    }
+        // Update by severity
+        let severity = rule
+            .severity
+            .as_deref()
+            .map(normalize_coverage_severity)
+            .unwrap_or_default();
+        let severity_counts = match severity.as_str() {
+            "critical" => &mut by_severity.critical,
+            "high" => &mut by_severity.high,
+            "medium" => &mut by_severity.medium,
+            "low" => &mut by_severity.low,
+            _ => &mut by_severity.informational,
+        };
+        severity_counts.total += 1;
+        match coverage.status.as_str() {
+            "full" => severity_counts.full += 1,
+            "partial" => severity_counts.partial += 1,
+            "none" => severity_counts.none += 1,
+            _ => {}
+        }
+
+        // Update by tactic
+        if let Some(tactics) = &rule.mitre_tactics {
+            let canonical_tactics: HashSet<String> = tactics
+                .iter()
+                .map(|tactic| normalize_coverage_tactic(tactic))
+                .collect();
+            for tactic in canonical_tactics {
+                let counts = tactic_counts.entry(tactic).or_insert((0, 0, 0, 0));
+                counts.0 += 1; // total
+                match coverage.status.as_str() {
+                    "full" => counts.1 += 1,
+                    "partial" => counts.2 += 1,
+                    "none" => counts.3 += 1,
+                    _ => {}
                 }
-            }
-
-            // Track missing fields
-            for field in &coverage.missing_fields {
-                *missing_field_counts.entry(field.clone()).or_insert(0) += 1;
-            }
-
-            // Track suggested source types
-            for st in coverage.suggested_source_types {
-                all_suggested_source_types.insert(st);
             }
         }
 
-        // Build tactic coverage list
-        let coverage_by_tactic: Vec<TacticCoverage> = tactic_counts
-            .into_iter()
-            .map(|(tactic, (total, full, partial, none))| TacticCoverage {
-                tactic: tactic.clone(),
-                tactic_name: tactic_to_name(&tactic),
-                total,
-                full,
-                partial,
-                none,
-            })
-            .collect();
-
-        // Build missing fields list (sorted by count)
-        let mut missing_fields: Vec<MissingFieldCount> = missing_field_counts
-            .into_iter()
-            .map(|(field, count)| {
-                let source_types_with_field = self
-                    .available_fields
-                    .iter()
-                    .filter(|(_, fields)| fields.contains(&field))
-                    .map(|(st, _)| st.clone())
-                    .collect();
-                MissingFieldCount {
-                    field,
-                    count,
-                    source_types_with_field,
-                }
-            })
-            .collect();
-        missing_fields.sort_by(|a, b| b.count.cmp(&a.count));
-        missing_fields.truncate(20); // Top 20
-
-        CoverageAnalysis {
-            total_rules: total,
-            full_coverage: full,
-            partial_coverage: partial,
-            no_coverage: none,
-            coverage_by_severity: by_severity,
-            coverage_by_tactic,
-            most_missing_fields: missing_fields,
-            suggested_source_types: all_suggested_source_types.into_iter().collect(),
+        // Track missing fields
+        for field in &coverage.missing_fields {
+            *missing_field_counts.entry(field.clone()).or_insert(0) += 1;
         }
+
+        // Track suggested source types
+        for st in coverage.suggested_source_types {
+            all_suggested_source_types.insert(st);
+        }
+    }
+
+    // Build tactic coverage list
+    let coverage_by_tactic: Vec<TacticCoverage> = tactic_counts
+        .into_iter()
+        .map(|(tactic, (total, full, partial, none))| TacticCoverage {
+            tactic: tactic.clone(),
+            tactic_name: tactic_to_name(&tactic),
+            total,
+            full,
+            partial,
+            none,
+        })
+        .collect();
+
+    // Build missing fields list (sorted by count)
+    let mut missing_fields: Vec<MissingFieldCount> = missing_field_counts
+        .into_iter()
+        .map(|(field, count)| {
+            let source_types_with_field = available_fields
+                .iter()
+                .filter(|(_, fields)| fields.contains(&field))
+                .map(|(st, _)| st.clone())
+                .collect();
+            MissingFieldCount {
+                field,
+                count,
+                source_types_with_field,
+            }
+        })
+        .collect();
+    missing_fields.sort_by(|a, b| b.count.cmp(&a.count));
+    missing_fields.truncate(20); // Top 20
+
+    CoverageAnalysis {
+        total_rules: total,
+        full_coverage: full,
+        partial_coverage: partial,
+        no_coverage: none,
+        coverage_by_severity: by_severity,
+        coverage_by_tactic,
+        most_missing_fields: missing_fields,
+        suggested_source_types: all_suggested_source_types.into_iter().collect(),
     }
 }
 
@@ -317,20 +340,26 @@ fn normalize_field_name(field: &str) -> String {
 /// Convert MITRE tactic ID to human-readable name
 fn tactic_to_name(tactic: &str) -> String {
     match tactic.to_lowercase().as_str() {
-        "reconnaissance" => "Reconnaissance".to_string(),
-        "resource_development" | "resource-development" => "Resource Development".to_string(),
-        "initial_access" | "initial-access" => "Initial Access".to_string(),
-        "execution" => "Execution".to_string(),
-        "persistence" => "Persistence".to_string(),
-        "privilege_escalation" | "privilege-escalation" => "Privilege Escalation".to_string(),
-        "defense_evasion" | "defense-evasion" => "Defense Evasion".to_string(),
-        "credential_access" | "credential-access" => "Credential Access".to_string(),
-        "discovery" => "Discovery".to_string(),
-        "lateral_movement" | "lateral-movement" => "Lateral Movement".to_string(),
-        "collection" => "Collection".to_string(),
-        "command_and_control" | "command-and-control" | "c2" => "Command and Control".to_string(),
-        "exfiltration" => "Exfiltration".to_string(),
-        "impact" => "Impact".to_string(),
+        "reconnaissance" | "ta0043" => "Reconnaissance".to_string(),
+        "resource_development" | "resource-development" | "ta0042" => {
+            "Resource Development".to_string()
+        }
+        "initial_access" | "initial-access" | "ta0001" => "Initial Access".to_string(),
+        "execution" | "ta0002" => "Execution".to_string(),
+        "persistence" | "ta0003" => "Persistence".to_string(),
+        "privilege_escalation" | "privilege-escalation" | "ta0004" => {
+            "Privilege Escalation".to_string()
+        }
+        "defense_evasion" | "defense-evasion" | "ta0005" => "Defense Evasion".to_string(),
+        "credential_access" | "credential-access" | "ta0006" => "Credential Access".to_string(),
+        "discovery" | "ta0007" => "Discovery".to_string(),
+        "lateral_movement" | "lateral-movement" | "ta0008" => "Lateral Movement".to_string(),
+        "collection" | "ta0009" => "Collection".to_string(),
+        "command_and_control" | "command-and-control" | "c2" | "ta0011" => {
+            "Command and Control".to_string()
+        }
+        "exfiltration" | "ta0010" => "Exfiltration".to_string(),
+        "impact" | "ta0040" => "Impact".to_string(),
         _ => tactic.replace('_', " ").replace('-', " "),
     }
 }
@@ -338,6 +367,55 @@ fn tactic_to_name(tactic: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repository_rule(
+        repository_id: uuid::Uuid,
+        severity: &str,
+        tactics: &[&str],
+        techniques: &[&str],
+    ) -> RepositoryRule {
+        let now = chrono::Utc::now();
+        RepositoryRule {
+            id: uuid::Uuid::now_v7(),
+            repository_id,
+            file_path: "rules/example.yml".to_string(),
+            file_sha: None,
+            raw_content: String::new(),
+            title: Some("Example".to_string()),
+            description: None,
+            severity: Some(severity.to_string()),
+            mitre_tactics: Some(tactics.iter().map(|value| (*value).to_string()).collect()),
+            mitre_techniques: Some(
+                techniques
+                    .iter()
+                    .map(|value| (*value).to_string())
+                    .collect(),
+            ),
+            tags: None,
+            requires_fields: None,
+            requires_source_types: None,
+            conversion_status: "pending".to_string(),
+            converted_npl: None,
+            conversion_confidence: None,
+            conversion_warnings: None,
+            conversion_field_mappings: None,
+            coverage_status: None,
+            coverage_missing_fields: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn full_coverage() -> CoverageResult {
+        CoverageResult {
+            status: "full".to_string(),
+            required_fields: Vec::new(),
+            available_fields: Vec::new(),
+            missing_fields: Vec::new(),
+            suggested_source_types: Vec::new(),
+            available_source_types: Vec::new(),
+        }
+    }
 
     #[test]
     fn test_normalize_field_name() {
@@ -352,5 +430,39 @@ mod tests {
         assert_eq!(tactic_to_name("credential_access"), "Credential Access");
         assert_eq!(tactic_to_name("initial-access"), "Initial Access");
         assert_eq!(tactic_to_name("execution"), "Execution");
+    }
+
+    #[test]
+    fn analyzer_applies_combined_filters_and_canonicalizes_buckets() {
+        let repository_id = uuid::Uuid::now_v7();
+        let rules = [
+            repository_rule(
+                repository_id,
+                "HIGH",
+                &["Credential Access", "TA0006"],
+                &["t1059.001"],
+            ),
+            repository_rule(repository_id, "low", &["Execution"], &["T1059.001"]),
+        ];
+        let filter = CoverageFilter {
+            repository_id: Some(repository_id),
+            severity: Some(" high ".to_string()),
+            mitre_tactic: Some("ta0006".to_string()),
+            mitre_technique: Some("T1059.001".to_string()),
+        };
+
+        let analysis = analyze_coverage_with(&rules, &filter, &HashMap::new(), |_| full_coverage());
+
+        assert_eq!(analysis.total_rules, 1);
+        assert_eq!(analysis.full_coverage, 1);
+        assert_eq!(analysis.coverage_by_severity.high.total, 1);
+        assert_eq!(analysis.coverage_by_severity.informational.total, 0);
+        assert_eq!(analysis.coverage_by_tactic.len(), 1);
+        assert_eq!(analysis.coverage_by_tactic[0].tactic, "TA0006");
+        assert_eq!(
+            analysis.coverage_by_tactic[0].tactic_name,
+            "Credential Access"
+        );
+        assert_eq!(analysis.coverage_by_tactic[0].total, 1);
     }
 }

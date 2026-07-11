@@ -90,7 +90,7 @@ pub async fn get_tuning_settings(
     responses(
         (status = 200, description = "Settings updated", body = TuningSettings),
         (status = 400, description = "Invalid confidence threshold"),
-        (status = 403, description = "Missing permission: detections:edit"),
+        (status = 403, description = "Missing required detections edit or promote permission"),
         (status = 404, description = "Rule not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -112,34 +112,40 @@ pub async fn update_tuning_settings(
         ));
     }
 
-    // 1. Fetch current state so we can field-gate weakening transitions, and
-    // fold the existence check into the same query.
-    let existing: Option<(bool, bool, Option<DateTime<Utc>>, bool)> = sqlx::query_as(
+    // Lock the rule so authorization and the update observe one coherent state.
+    let mut tx = state.pool.begin().await.map_err(|e| {
+        ApiError::InternalError(format!("Failed to start tuning settings update: {e}"))
+    })?;
+    let existing: Option<(bool, f64, bool, Option<DateTime<Utc>>, bool)> = sqlx::query_as(
         r#"
         SELECT
             COALESCE(auto_tuning_enabled, true) as auto_tuning_enabled,
+            COALESCE(auto_tuning_min_confidence, 0.8) as auto_tuning_min_confidence,
             COALESCE(auto_tuning_critical, false) as auto_tuning_critical,
             auto_tuning_disabled_until,
             COALESCE(auto_apply_enabled, false) as auto_apply_enabled
         FROM detection_rules
         WHERE id = $1
+        FOR UPDATE
         "#,
     )
     .bind(*rule_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| ApiError::InternalError(format!("Failed to fetch tuning settings: {}", e)))?;
 
-    let (old_enabled, old_critical, old_disabled_until, old_auto_apply) = match existing {
-        Some(row) => row,
-        None => return Err(ApiError::NotFound("Rule not found".to_string())),
-    };
+    let (old_enabled, old_min_confidence, old_critical, old_disabled_until, old_auto_apply) =
+        match existing {
+            Some(row) => row,
+            None => return Err(ApiError::NotFound("Rule not found".to_string())),
+        };
 
     // Weakening tuning guardrails (disabling auto-tuning, removing the critical
     // flag, enabling auto-apply, or extending the disabled window) is a
     // promote-class change and must require detections:promote.
     if requires_promote_for_tuning(
         old_enabled,
+        old_min_confidence,
         old_critical,
         old_disabled_until,
         old_auto_apply,
@@ -171,9 +177,13 @@ pub async fn update_tuning_settings(
     .bind(settings.auto_tuning_disabled_until)
     .bind(settings.auto_apply_enabled)
     .bind(*rule_id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(|e| ApiError::InternalError(format!("Failed to update tuning settings: {}", e)))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::InternalError(format!("Failed to commit tuning settings: {e}")))?;
 
     // 3. Emit audit event
     state.emit_audit(
@@ -198,6 +208,7 @@ pub async fn update_tuning_settings(
 /// a way that the lifecycle endpoints would gate on `detections:promote`.
 fn requires_promote_for_tuning(
     old_enabled: bool,
+    old_min_confidence: f64,
     old_critical: bool,
     old_disabled_until: Option<DateTime<Utc>>,
     old_auto_apply: bool,
@@ -210,6 +221,11 @@ fn requires_promote_for_tuning(
         return true;
     }
     if !old_auto_apply && new.auto_apply_enabled {
+        return true;
+    }
+    if (old_auto_apply || new.auto_apply_enabled)
+        && new.auto_tuning_min_confidence < old_min_confidence
+    {
         return true;
     }
     let now = Utc::now();
@@ -243,7 +259,33 @@ mod tests {
             auto_tuning_min_confidence: 0.95,
             ..baseline_settings()
         };
-        assert!(!requires_promote_for_tuning(true, true, None, false, &new));
+        assert!(!requires_promote_for_tuning(
+            true, 0.8, true, None, false, &new
+        ));
+    }
+
+    #[test]
+    fn lowering_confidence_with_auto_apply_enabled_requires_promote() {
+        let new = TuningSettings {
+            auto_tuning_min_confidence: 0.1,
+            auto_apply_enabled: true,
+            ..baseline_settings()
+        };
+        assert!(requires_promote_for_tuning(
+            true, 0.8, false, None, true, &new,
+        ));
+    }
+
+    #[test]
+    fn lowering_confidence_for_manual_review_does_not_require_promote() {
+        let new = TuningSettings {
+            auto_tuning_min_confidence: 0.1,
+            auto_apply_enabled: false,
+            ..baseline_settings()
+        };
+        assert!(!requires_promote_for_tuning(
+            true, 0.8, false, None, false, &new,
+        ));
     }
 
     #[test]
@@ -252,13 +294,17 @@ mod tests {
             auto_tuning_enabled: false,
             ..baseline_settings()
         };
-        assert!(requires_promote_for_tuning(true, true, None, false, &new));
+        assert!(requires_promote_for_tuning(
+            true, 0.8, true, None, false, &new
+        ));
     }
 
     #[test]
     fn enabling_auto_tuning_does_not_require_promote() {
         let new = baseline_settings();
-        assert!(!requires_promote_for_tuning(false, true, None, false, &new));
+        assert!(!requires_promote_for_tuning(
+            false, 0.8, true, None, false, &new
+        ));
     }
 
     #[test]
@@ -267,7 +313,9 @@ mod tests {
             auto_tuning_critical: false,
             ..baseline_settings()
         };
-        assert!(requires_promote_for_tuning(true, true, None, false, &new));
+        assert!(requires_promote_for_tuning(
+            true, 0.8, true, None, false, &new
+        ));
     }
 
     #[test]
@@ -276,7 +324,9 @@ mod tests {
             auto_apply_enabled: true,
             ..baseline_settings()
         };
-        assert!(requires_promote_for_tuning(true, true, None, false, &new));
+        assert!(requires_promote_for_tuning(
+            true, 0.8, true, None, false, &new
+        ));
     }
 
     #[test]
@@ -285,7 +335,9 @@ mod tests {
             auto_apply_enabled: false,
             ..baseline_settings()
         };
-        assert!(!requires_promote_for_tuning(true, true, None, true, &new));
+        assert!(!requires_promote_for_tuning(
+            true, 0.8, true, None, true, &new
+        ));
     }
 
     #[test]
@@ -294,7 +346,9 @@ mod tests {
             auto_tuning_disabled_until: Some(Utc::now() + Duration::days(30)),
             ..baseline_settings()
         };
-        assert!(requires_promote_for_tuning(true, true, None, false, &new));
+        assert!(requires_promote_for_tuning(
+            true, 0.8, true, None, false, &new
+        ));
     }
 
     #[test]
@@ -306,6 +360,7 @@ mod tests {
         };
         assert!(!requires_promote_for_tuning(
             true,
+            0.8,
             true,
             Some(old_until),
             false,
@@ -322,6 +377,7 @@ mod tests {
         };
         assert!(!requires_promote_for_tuning(
             true,
+            0.8,
             true,
             Some(old_until),
             false,
@@ -335,6 +391,8 @@ mod tests {
             auto_tuning_disabled_until: Some(Utc::now() - Duration::days(1)),
             ..baseline_settings()
         };
-        assert!(!requires_promote_for_tuning(true, true, None, false, &new));
+        assert!(!requires_promote_for_tuning(
+            true, 0.8, true, None, false, &new
+        ));
     }
 }

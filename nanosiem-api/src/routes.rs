@@ -201,16 +201,30 @@ pub fn create_router(state: AppState) -> Router {
             HeaderValue::from_static("private, max-age=300, stale-while-revalidate=60"),
         ));
 
-    // MITRE framework data - 1 hour browser cache (changes only on manual sync)
+    // ATT&CK catalog data changes only on manual sync, so a populated catalog
+    // keeps the longer browser cache. The handler sets Cache-Control itself so
+    // it can drop the cache to `no-store` while the catalog is empty (the boot/
+    // seed window) and avoid pinning an empty catalog for an hour (NAN-1766 /
+    // D5). This layer is `if_not_present` so it only supplies a default when the
+    // handler somehow didn't set the header.
     let cached_mitre = Router::new()
         .route("/api/mitre", get(handlers::mitre::get_mitre_data))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, max-age=3600, stale-while-revalidate=300"),
+        ));
+
+    // Coverage includes live ingestion readiness. Keep it briefly cacheable
+    // without allowing the previous one-hour catalog cache to hide a source
+    // becoming active or stale.
+    let cached_mitre_coverage = Router::new()
         .route(
             "/api/mitre/coverage",
             get(handlers::mitre::get_mitre_coverage),
         )
         .layer(SetResponseHeaderLayer::overriding(
             header::CACHE_CONTROL,
-            HeaderValue::from_static("private, max-age=3600, stale-while-revalidate=300"),
+            HeaderValue::from_static("private, max-age=30, stale-while-revalidate=30"),
         ));
 
     // Demo routes — only registered when DEPLOYMENT_MODE=demo.
@@ -239,6 +253,7 @@ pub fn create_router(state: AppState) -> Router {
     let mut app = Router::new()
         // Health check (public - minimal info only)
         .route("/health", get(handlers::health_check))
+        .route("/ready", get(handlers::ready_check))
         // Detailed health check (authenticated - full diagnostics)
         .route("/health/detailed", get(handlers::health_check_detailed))
         // Build edition + capability flags (public; the SPA hits this on boot
@@ -2492,6 +2507,7 @@ pub fn create_router(state: AppState) -> Router {
         // Cacheable routes (with Cache-Control headers)
         .merge(cached_metadata)
         .merge(cached_mitre)
+        .merge(cached_mitre_coverage)
         // OpenAPI / Swagger UI
         .merge(openapi::swagger_ui());
     // Observability ↔ Security convergence cross-link (NAN-1542) — ENTERPRISE

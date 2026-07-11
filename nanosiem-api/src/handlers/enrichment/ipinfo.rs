@@ -90,6 +90,7 @@ pub async fn configure_ipinfo(
         (status = 202, description = "Sync started in background", body = AsyncSyncResponse),
         (status = 409, description = "Sync already in progress", body = AsyncSyncResponse),
         (status = 403, description = "Forbidden - missing permission"),
+        (status = 503, description = "Service is shutting down"),
     )
 )]
 pub async fn sync_ipinfo(
@@ -118,58 +119,65 @@ pub async fn sync_ipinfo(
         }
     }
 
-    // Spawn background task
+    // Atomically spawn and register so shutdown cannot snapshot the task list
+    // between these operations.
     let enrichment = state.enrichment.clone();
     let dual_pool = state.dual_pool.clone();
-    let handle = tokio::spawn(async move {
-        let enrichment_guard = enrichment.read().await;
-        match enrichment_guard.sync_ipinfo_lite().await {
-            Ok(result) => {
-                if result.success {
-                    tracing::info!(
-                        source_id = SOURCE_ID,
-                        records_loaded = result.records_loaded,
-                        duration_ms = result.duration_ms,
-                        "IPinfo Lite sync completed successfully"
-                    );
-                    // Reload ClickHouse dictionary so new enrichment data takes effect immediately.
-                    // ON CLUSTER when clustered so every node's dict reloads, not
-                    // just the node this connection landed on (NAN-1728 H3);
-                    // `on_cluster_clause()` is empty on single-node → identical DDL.
-                    // TODO(NAN-1728 H3 follow-up): dict reads staging refreshed on
-                    // a schedule — a REFRESH VIEW (+ WAIT) before reload would make
-                    // the freshly synced CIDRs visible immediately. Deferred.
-                    {
-                        let reload_sql = format!(
-                            "SYSTEM RELOAD DICTIONARY{on_cluster} nanosiem.ip_enrichment_dict",
-                            on_cluster = nanosiem_core::db::dual_pool::on_cluster_clause()
+    let accepted = state
+        .spawn_tracked(async move {
+            let enrichment_guard = enrichment.read().await;
+            match enrichment_guard.sync_ipinfo_lite().await {
+                Ok(result) => {
+                    if result.success {
+                        tracing::info!(
+                            source_id = SOURCE_ID,
+                            records_loaded = result.records_loaded,
+                            duration_ms = result.duration_ms,
+                            "IPinfo Lite sync completed successfully"
                         );
-                        if let Err(e) = dual_pool.clickhouse().query(&reload_sql).execute().await {
-                            tracing::warn!("Failed to reload ip_enrichment_dict: {}", e);
-                        } else {
-                            tracing::info!("Reloaded ip_enrichment_dict after sync");
+                        // Reload ClickHouse dictionary so new enrichment data takes effect immediately.
+                        // ON CLUSTER when clustered so every node's dict reloads, not
+                        // just the node this connection landed on (NAN-1728 H3);
+                        // `on_cluster_clause()` is empty on single-node → identical DDL.
+                        // TODO(NAN-1728 H3 follow-up): dict reads staging refreshed on
+                        // a schedule — a REFRESH VIEW (+ WAIT) before reload would make
+                        // the freshly synced CIDRs visible immediately. Deferred.
+                        {
+                            let reload_sql = format!(
+                                "SYSTEM RELOAD DICTIONARY{on_cluster} nanosiem.ip_enrichment_dict",
+                                on_cluster = nanosiem_core::db::dual_pool::on_cluster_clause()
+                            );
+                            if let Err(e) =
+                                dual_pool.clickhouse().query(&reload_sql).execute().await
+                            {
+                                tracing::warn!("Failed to reload ip_enrichment_dict: {}", e);
+                            } else {
+                                tracing::info!("Reloaded ip_enrichment_dict after sync");
+                            }
                         }
+                    } else {
+                        tracing::warn!(
+                            source_id = SOURCE_ID,
+                            error = ?result.error,
+                            "IPinfo Lite sync completed with errors"
+                        );
                     }
-                } else {
-                    tracing::warn!(
+                }
+                Err(e) => {
+                    tracing::error!(
                         source_id = SOURCE_ID,
-                        error = ?result.error,
-                        "IPinfo Lite sync completed with errors"
+                        error = %e,
+                        "IPinfo Lite sync failed"
                     );
                 }
             }
-            Err(e) => {
-                tracing::error!(
-                    source_id = SOURCE_ID,
-                    error = %e,
-                    "IPinfo Lite sync failed"
-                );
-            }
-        }
-    });
-
-    // Register for graceful shutdown
-    state.add_task_handle(handle).await;
+        })
+        .await;
+    if !accepted {
+        return Err(ApiError::ServiceUnavailable(
+            "IPinfo sync was not started because the service is shutting down".to_string(),
+        ));
+    }
 
     state.emit_audit(
         AuditEvent::builder(AuditSource::Enrichment, ENRICHMENT_SYNCED)

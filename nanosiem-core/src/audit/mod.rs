@@ -51,6 +51,8 @@ pub enum AuditSource {
     User,
     /// Auto-tuning events (proposal approve, reject, settings update)
     Tuning,
+    /// MITRE ATT&CK catalog synchronization events
+    Mitre,
     /// Case management events (create, update, delete)
     Case,
     /// API key events (create, delete, enable, disable)
@@ -118,6 +120,7 @@ impl std::fmt::Display for AuditSource {
             Self::Detection => write!(f, "detection"),
             Self::User => write!(f, "user"),
             Self::Tuning => write!(f, "tuning"),
+            Self::Mitre => write!(f, "mitre"),
             Self::Case => write!(f, "case"),
             Self::ApiKey => write!(f, "apikey"),
             Self::Role => write!(f, "role"),
@@ -528,6 +531,7 @@ mod tests {
         assert_eq!(AuditSource::Auth.to_string(), "auth");
         assert_eq!(AuditSource::Detection.to_string(), "detection");
         assert_eq!(AuditSource::User.to_string(), "user");
+        assert_eq!(AuditSource::Mitre.to_string(), "mitre");
         // Defenders filter exports by `source=audit`; lock the wire form (NAN-1365).
         assert_eq!(AuditSource::Audit.to_string(), "audit");
     }

@@ -3750,7 +3750,9 @@ export type TuningStatus =
   | 'promoted'
   | 'reverted'
   | 'manually_approved'
-  | 'rejected';
+  | 'rejected'
+  | 'pr_pending'
+  | 'pr_opened';
 
 export interface AlertPattern {
   field_name: string;

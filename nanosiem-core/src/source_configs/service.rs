@@ -101,6 +101,38 @@ impl SourceConfigService {
         }
     }
 
+    /// Construct an isolated publication renderer. Credential files must be
+    /// materialized inside the checksummed generation even on Kubernetes: a
+    /// mutable Secret volume can lag the object-store completion marker and
+    /// make Vector reload new TOML with an old credential. The normal live
+    /// deployment constructor keeps its auto-detected backend.
+    pub fn with_publication_vector_config_dir(
+        pool: PgPool,
+        config_dir: impl AsRef<Path>,
+    ) -> Self {
+        let config_dir = config_dir.as_ref().to_path_buf();
+        let runtime_path = Self::resolve_runtime_path();
+        let creds_backend = Self::publication_creds_backend(
+            config_dir.clone(),
+            runtime_path.clone(),
+        );
+        Self {
+            repository: SourceConfigRepository::new(pool.clone()),
+            credential_repo: CredentialRepository::new(pool),
+            vector_config_dir: config_dir,
+            vector_sources_runtime_path: runtime_path,
+            creds_backend: Arc::new(OnceCell::new_with(Some(creds_backend))),
+            deploy_lock: None,
+        }
+    }
+
+    fn publication_creds_backend(config_dir: PathBuf, runtime_path: String) -> CredsBackend {
+        CredsBackend::Disk {
+            config_dir,
+            runtime_path,
+        }
+    }
+
     /// Wire this service's `update_dynamic_router` into the same lock that
     /// the parser-deploy path uses, so the two paths can't interleave on
     /// `_router.toml`. Production callers pass `VectorConfigManager::deploy_lock()`;
@@ -112,7 +144,7 @@ impl SourceConfigService {
 
     /// Resolve the runtime path where Vector reads dynamic source configs.
     /// In Docker: /etc/vector/sources (shared volume mount)
-    /// In K8s: /etc/vector/dynamic (S3/GCS sync destination)
+    /// In K8s / multi-Vector: /etc/vector/runtime/current (atomic generation pointer)
     fn resolve_runtime_path() -> String {
         std::env::var("VECTOR_SOURCES_RUNTIME_PATH")
             .unwrap_or_else(|_| "/etc/vector/sources".to_string())
@@ -976,43 +1008,15 @@ impl SourceConfigService {
         // intermediary (source_type_extract or hec_normalize).
         if let Some(intermediary_source) = Self::system_intermediary_source(&config.config_type) {
             let has_meaningful_rules = Self::has_meaningful_routing_rules(&config_with_rules);
-
-            // HTTP / Vector / HEC all use passthrough-default semantics
-            // post-NAN-918: a default rule preserves the upstream
-            // `.source_type` (set by source_type_extract for HTTP/Vector,
-            // by hec_normalize for HEC). Lets imported parsers' sourcetypes
-            // flow through to parser matching without per-parser routing
-            // rules. Users who actually need to force `.source_type` to a
-            // fixed value can write a non-default rule (e.g. regex `.*`).
-            let routing_default_passthrough =
-                Self::system_intermediary_source(&config.config_type).is_some();
-
-            let vector_config = if has_meaningful_rules {
-                // NAN-940: pin route_name for system-level singletons so a
-                // rename of the OOTB row doesn't break parsers that hardcode
-                // the transform name (e.g. HEC parsers reading from
-                // `splunk_hec_route` via `parser_claimed_route`).
-                let route_name = Self::config_route_name(&config.config_type, &config.name);
-                let routing_block = Self::generate_routing_transform(
-                    &config_with_rules,
-                    intermediary_source,
-                    &route_name,
-                    routing_default_passthrough,
-                );
-                let config_content = format!(
-                    "# Auto-generated routing rules for system-level source: {}\n\
-                     # DO NOT EDIT - changes will be overwritten\n\
-                     # Generated at: {}\n\n\
-                     {}",
-                    config.name,
-                    chrono::Utc::now().to_rfc3339(),
-                    routing_block
-                );
-
+            let vector_config = Self::render_system_source_config(
+                &config_with_rules,
+                intermediary_source,
+            );
+            if let Some(config_content) = &vector_config {
                 // NAN-689 acceptance criterion #3: validate before
                 // mark_deployed / router-update / file write. Failure path
                 // records add_deployment("failure", reason) and aborts.
-                if let Err(e) = Self::validate_generated_config(&config_content) {
+                if let Err(e) = Self::validate_generated_config(config_content) {
                     let reason = e.to_string();
                     if let Err(audit_err) = self
                         .repository
@@ -1043,13 +1047,12 @@ impl SourceConfigService {
                 let config_file = self.get_config_file_path(&config.config_type, &config.name);
                 let configs_dir = config_file.parent().unwrap();
                 tokio::fs::create_dir_all(configs_dir).await?;
-                tokio::fs::write(&config_file, &config_content).await?;
-                Some(config_content)
-            } else {
-                None
-            };
+                tokio::fs::write(&config_file, config_content).await?;
+            }
 
-            self.repository.mark_deployed(id).await?;
+            if !config.deployed {
+                self.repository.mark_deployed(id).await?;
+            }
 
             // Update dynamic router — include this config's route transform in inputs
             self.update_dynamic_router().await?;
@@ -1130,7 +1133,9 @@ impl SourceConfigService {
         tokio::fs::write(&config_file, &vector_config).await?;
 
         // Mark as deployed BEFORE updating router, so the router query includes this config
-        self.repository.mark_deployed(id).await?;
+        if !config.deployed {
+            self.repository.mark_deployed(id).await?;
+        }
 
         // Update dynamic router to include this source
         self.update_dynamic_router().await?;
@@ -1263,6 +1268,66 @@ impl SourceConfigService {
         Ok(results)
     }
 
+    /// Render every deployed source configuration into this service's config
+    /// directory without changing deployment state or audit history. `deployed`
+    /// is the runtime authority; `enabled` controls eligibility for deploy_all
+    /// and does not implicitly undeploy an already-running source.
+    /// The publication reconciler uses a fresh directory, so deletion is
+    /// represented by absence and snapshots never inherit another pod's files.
+    pub async fn render_deployed_to_vector_config(
+        &self,
+    ) -> Result<(), SourceConfigServiceError> {
+        Self::require_canonical_router(&self.vector_config_dir)?;
+
+        let sources = self.repository.list_deployed().await?;
+        let source_ids: Vec<_> = sources.iter().map(|source| source.id).collect();
+        let mut rules_by_source = self.repository.list_rules_for_configs(&source_ids).await?;
+        let configs_dir = self.vector_config_dir.join("sources").join("configs");
+        tokio::fs::create_dir_all(&configs_dir).await?;
+
+        for source in sources {
+            let routing_rules = rules_by_source.remove(&source.id).unwrap_or_default();
+            let config_with_rules = SourceConfigurationWithRules {
+                config: source,
+                routing_rules,
+            };
+            let config = &config_with_rules.config;
+            let rendered = if let Some(intermediary) =
+                Self::system_intermediary_source(&config.config_type)
+            {
+                Self::render_system_source_config(&config_with_rules, intermediary)
+            } else {
+                Some(self.generate_vector_config(&config_with_rules).await?)
+            };
+
+            if let Some(rendered) = rendered {
+                Self::validate_generated_config(&rendered)?;
+                let path = self.get_config_file_path(&config.config_type, &config.name);
+                if let Some(parent) = path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                tokio::fs::write(path, rendered).await?;
+            }
+        }
+
+        self.update_dynamic_router().await?;
+        Ok(())
+    }
+
+    fn require_canonical_router(config_dir: &Path) -> Result<(), SourceConfigServiceError> {
+        let router_path = config_dir
+            .join("sources")
+            .join("parsers")
+            .join("_router.toml");
+        if !router_path.is_file() {
+            return Err(SourceConfigServiceError::InvalidConfig(format!(
+                "canonical parser router must be rendered before source configurations: {}",
+                router_path.display()
+            )));
+        }
+        Ok(())
+    }
+
     /// Get deployment history
     pub async fn get_deployment_history(
         &self,
@@ -1306,6 +1371,34 @@ impl SourceConfigService {
         Ok(toml)
     }
 
+    /// Render only the routing transform for a system-owned listener. Default
+    /// rules preserve the upstream source type, matching the live deploy path.
+    fn render_system_source_config(
+        config: &SourceConfigurationWithRules,
+        intermediary_source: &str,
+    ) -> Option<String> {
+        if !Self::has_meaningful_routing_rules(config) {
+            return None;
+        }
+
+        let route_name = Self::config_route_name(&config.config.config_type, &config.config.name);
+        let routing_block = Self::generate_routing_transform(
+            config,
+            intermediary_source,
+            &route_name,
+            true,
+        );
+        Some(format!(
+            "# Auto-generated routing rules for system-level source: {}\n\
+             # DO NOT EDIT - changes will be overwritten\n\
+             # Generated at: {}\n\n\
+             {}",
+            config.config.name,
+            chrono::Utc::now().to_rfc3339(),
+            routing_block
+        ))
+    }
+
     /// Generate the Vector source block based on config type
     async fn generate_source_block(
         &self,
@@ -1317,13 +1410,16 @@ impl SourceConfigService {
 
         // Get credentials if needed
         let creds = if let Some(cred_id) = config.config.credential_id {
-            match self.credential_repo.get_decrypted(cred_id).await {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    tracing::warn!("Failed to get credentials for source config: {}", e);
-                    None
-                }
-            }
+            Some(
+                self.credential_repo
+                    .get_decrypted(cred_id)
+                    .await
+                    .map_err(|error| {
+                        SourceConfigServiceError::CredentialError(format!(
+                            "failed to load credential {cred_id} for source config: {error}"
+                        ))
+                    })?,
+            )
         } else {
             None
         };
@@ -1976,13 +2072,7 @@ impl SourceConfigService {
         };
 
         // Get all deployed source configs
-        let deployed_configs = self
-            .repository
-            .list(Some(ListParams {
-                deployed: Some(true),
-                ..Default::default()
-            }))
-            .await?;
+        let deployed_configs = self.repository.list_deployed().await?;
 
         // NAN-930: load parser-route claims so the substitution stays correct
         // across source-config redeploys. Without this, the surgical inputs

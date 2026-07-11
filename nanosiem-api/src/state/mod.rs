@@ -12,6 +12,7 @@ mod lifecycle;
 #[cfg(feature = "enterprise")]
 mod melod;
 mod schedulers;
+mod vector_config;
 
 use nanosiem_core::audit::{AuditEmitter, AuditQueryService};
 use nanosiem_core::auth::{
@@ -39,6 +40,7 @@ use nanosiem_core::{
 #[cfg(feature = "enterprise")]
 use nanosiem_enterprise::risk::RiskAnalyticsService;
 use sqlx::PgPool;
+use std::future::Future;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -55,6 +57,59 @@ pub use nanosiem_enterprise::cases::CaseChangeEvent;
 /// Get the Vector config directory from environment or use default
 fn get_vector_config_dir() -> String {
     std::env::var("VECTOR_CONFIG_DIR").unwrap_or_else(|_| "config/vector".to_string())
+}
+
+#[derive(Clone, Default)]
+struct TaskRegistry {
+    handles: Arc<RwLock<Vec<tokio::task::JoinHandle<()>>>>,
+    shutdown: nanosiem_core::shutdown::ShutdownToken,
+}
+
+impl TaskRegistry {
+    async fn add_handle(&self, handle: tokio::task::JoinHandle<()>) -> bool {
+        let mut pending = Some(handle);
+        {
+            let mut handles = self.handles.write().await;
+            if !self.shutdown.is_cancelled() {
+                handles.push(pending.take().expect("task handle must be present"));
+            }
+        }
+
+        let Some(handle) = pending else {
+            return true;
+        };
+
+        handle.abort();
+        match handle.await {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => tracing::warn!(?error, "Late background task failed during shutdown"),
+        }
+        false
+    }
+
+    async fn spawn_tracked<F>(&self, future: F) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let mut handles = self.handles.write().await;
+        if self.shutdown.is_cancelled() {
+            return false;
+        }
+
+        handles.push(tokio::spawn(future));
+        true
+    }
+
+    async fn begin_shutdown(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut handles = self.handles.write().await;
+        self.shutdown.cancel();
+        std::mem::take(&mut *handles)
+    }
+
+    fn shutdown_token(&self) -> nanosiem_core::shutdown::ShutdownToken {
+        self.shutdown.clone()
+    }
 }
 
 /// Shared application state
@@ -97,6 +152,8 @@ pub struct AppState {
     pub log_telemetry_service: LogTelemetryService,
     /// Source configuration service
     pub source_config_service: SourceConfigService,
+    /// DB-authoritative publisher for immutable Vector configuration generations.
+    pub vector_config_publisher: Arc<nanosiem_core::VectorConfigPublisher>,
     /// meloD AI assistant service (optional, dynamically reloadable)
     #[cfg(feature = "enterprise")]
     pub melod_service: Arc<RwLock<Option<Arc<MelodService>>>>,
@@ -138,8 +195,8 @@ pub struct AppState {
     pub notification_service: Arc<NotificationService>,
     /// Tuning repository for proposal management
     pub tuning_repository: Arc<TuningRepository>,
-    /// Task handles for graceful shutdown
-    task_handles: Arc<RwLock<Vec<tokio::task::JoinHandle<()>>>>,
+    /// Atomic task registration and cooperative shutdown state.
+    task_registry: TaskRegistry,
     /// PostgreSQL-backed job repository for async meloD operations
     #[cfg(feature = "enterprise")]
     pub melod_job_repo: MelodJobRepository,
@@ -196,11 +253,10 @@ pub struct AppState {
     /// going through the search HTTP handler — also benefit from the 7-day
     /// compressed result cache. `None` when `REDIS_URL` is unset.
     pub search_result_cache: Option<nanosiem_search::cache::SearchResultCache>,
-    /// In-flight tracker for the rule live tester (NAN-741). Each test fans
-    /// out up to 16 concurrent ClickHouse queries; capping each user to one
-    /// concurrent test prevents click-spam from amplifying that into a
-    /// thundering herd against the database.
-    pub rule_test_in_flight: Arc<dashmap::DashMap<uuid::Uuid, ()>>,
+    /// Cross-replica per-user admission for the rule live tester. Each test
+    /// fans out up to 16 ClickHouse queries, so production uses a Dragonfly
+    /// lease instead of multiplying the cap by API replica count.
+    pub rule_test_admission: Arc<nanosiem_core::RuleTestAdmission>,
     /// Shared shadow-investigation hook. On enterprise this is the live
     /// `ShadowInvestigationService` (also wired into detection_service /
     /// signal_processor). On open-core it's the no-op
@@ -436,10 +492,88 @@ impl AppState {
         }
     }
 
-    /// Add a task handle for graceful shutdown management
-    pub async fn add_task_handle(&self, handle: tokio::task::JoinHandle<()>) {
-        let mut handles = self.task_handles.write().await;
-        handles.push(handle);
+    /// Register an already-spawned task, stopping it if shutdown already won.
+    pub async fn add_task_handle(&self, handle: tokio::task::JoinHandle<()>) -> bool {
+        self.task_registry.add_handle(handle).await
+    }
+
+    /// Atomically check shutdown state, spawn, and register a task.
+    pub async fn spawn_tracked<F>(&self, future: F) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.task_registry.spawn_tracked(future).await
+    }
+
+    /// Shared cancellation token for background tasks owned by this process.
+    pub fn shutdown_token(&self) -> nanosiem_core::shutdown::ShutdownToken {
+        self.task_registry.shutdown_token()
+    }
+}
+
+#[cfg(test)]
+mod task_registry_tests {
+    use super::*;
+    use futures::poll;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Poll;
+
+    struct RunningGuard(Arc<AtomicBool>);
+
+    impl Drop for RunningGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_wins_queued_registration_and_joins_late_handle() {
+        let registry = TaskRegistry::default();
+        let running = Arc::new(AtomicBool::new(true));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let task_running = Arc::clone(&running);
+        let task_started = Arc::clone(&started);
+        let handle = tokio::spawn(async move {
+            let _guard = RunningGuard(task_running);
+            task_started.notify_one();
+            std::future::pending::<()>().await;
+        });
+        started.notified().await;
+
+        let registry_lock = registry.handles.write().await;
+        let mut shutdown = Box::pin(registry.begin_shutdown());
+        assert!(matches!(poll!(shutdown.as_mut()), Poll::Pending));
+        let mut registration = Box::pin(registry.add_handle(handle));
+        assert!(matches!(poll!(registration.as_mut()), Poll::Pending));
+        drop(registry_lock);
+
+        let snapshot = shutdown.await;
+        let accepted = registration.await;
+
+        assert!(snapshot.is_empty());
+        assert!(!accepted);
+        assert!(!running.load(Ordering::SeqCst));
+        assert!(registry.handles.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_spawn_is_never_polled() {
+        let registry = TaskRegistry::default();
+        let snapshot = registry.begin_shutdown().await;
+        assert!(snapshot.is_empty());
+
+        let polled = Arc::new(AtomicBool::new(false));
+        let task_polled = Arc::clone(&polled);
+        let accepted = registry
+            .spawn_tracked(async move {
+                task_polled.store(true, Ordering::SeqCst);
+            })
+            .await;
+        tokio::task::yield_now().await;
+
+        assert!(!accepted);
+        assert!(!polled.load(Ordering::SeqCst));
+        assert!(registry.handles.read().await.is_empty());
     }
 }
 

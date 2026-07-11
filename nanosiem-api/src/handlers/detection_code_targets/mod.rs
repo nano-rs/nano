@@ -39,6 +39,9 @@ pub(crate) fn map_target_err(e: DetectionCodeTargetError) -> ApiError {
         DetectionCodeTargetError::DuplicateName(name) => {
             ApiError::Conflict(format!("A push target named '{name}' already exists"))
         }
+        DetectionCodeTargetError::InUse(id) => ApiError::Conflict(format!(
+            "Push target {id} is claimed by an actionable tuning PR operation; retry or reject that proposal first"
+        )),
         DetectionCodeTargetError::Encryption(msg) => {
             ApiError::InternalError(format!("Encryption error: {msg}"))
         }

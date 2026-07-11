@@ -8,7 +8,7 @@
 //! leaves this layer through the explicit `get_decrypted_token` call used by the
 //! GitHub write client.
 
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -23,6 +23,8 @@ pub enum DetectionCodeTargetError {
     NotFound(Uuid),
     #[error("A push target named '{0}' already exists")]
     DuplicateName(String),
+    #[error("Push target {0} is claimed by an actionable tuning PR operation")]
+    InUse(Uuid),
     #[error("Encryption error: {0}")]
     Encryption(String),
 }
@@ -32,6 +34,24 @@ pub enum DetectionCodeTargetError {
 const DCT_SELECT: &str = "id, name, repo_url, base_branch, path_template, pr_branch_prefix, \
      rule_format, enabled, (token_encrypted IS NOT NULL) AS has_token, last_pr_url, last_pr_at, \
      last_used_at, created_at, updated_at, created_by";
+
+/// Cross-table serialization key shared by DaC target mutations and the final
+/// autonomous rule apply. The lock linearizes "target becomes active" against
+/// "rule query changes directly" even though those writes touch different
+/// tables and therefore cannot use an ordinary row-level CAS.
+const AUTONOMOUS_TUNING_DAC_LOCK_KEY: i64 = 0x4E41_4E17_67;
+
+/// Acquire the transaction-scoped lock that serializes active-target changes
+/// with autonomous direct rule application.
+pub async fn acquire_autonomous_tuning_dac_lock(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(AUTONOMOUS_TUNING_DAC_LOCK_KEY)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct DetectionCodeTargetRepository {
@@ -65,7 +85,11 @@ impl DetectionCodeTargetRepository {
         Ok((ciphertext_bytes, encrypted.nonce))
     }
 
-    async fn name_taken(&self, name: &str, exclude: Option<Uuid>) -> Result<bool, DetectionCodeTargetError> {
+    async fn name_taken(
+        &self,
+        name: &str,
+        exclude: Option<Uuid>,
+    ) -> Result<bool, DetectionCodeTargetError> {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM detection_code_targets WHERE name = $1 AND ($2::uuid IS NULL OR id != $2)",
         )
@@ -104,6 +128,8 @@ impl DetectionCodeTargetRepository {
             RETURNING {DCT_SELECT}
             "#
         );
+        let mut tx = self.pool.begin().await?;
+        acquire_autonomous_tuning_dac_lock(&mut tx).await?;
         let row = sqlx::query(&sql)
             .bind(&req.name)
             .bind(&req.repo_url)
@@ -119,8 +145,9 @@ impl DetectionCodeTargetRepository {
             .bind(ciphertext)
             .bind(nonce)
             .bind(created_by)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(Self::row_to_target(&row))
     }
 
@@ -143,7 +170,9 @@ impl DetectionCodeTargetRepository {
     /// The push target that AI tuning should route PRs to: enabled and holding a
     /// token, most-recently-updated first. `None` means "no target configured",
     /// which the tuning paths treat as "fall back to the normal DB behavior".
-    pub async fn find_active(&self) -> Result<Option<DetectionCodeTarget>, DetectionCodeTargetError> {
+    pub async fn find_active(
+        &self,
+    ) -> Result<Option<DetectionCodeTarget>, DetectionCodeTargetError> {
         let sql = format!(
             "SELECT {DCT_SELECT} FROM detection_code_targets \
              WHERE enabled = TRUE AND token_encrypted IS NOT NULL \
@@ -178,6 +207,8 @@ impl DetectionCodeTargetRepository {
             RETURNING {DCT_SELECT}
             "#
         );
+        let mut tx = self.pool.begin().await?;
+        acquire_autonomous_tuning_dac_lock(&mut tx).await?;
         let row = sqlx::query(&sql)
             .bind(id)
             .bind(&req.name)
@@ -186,8 +217,9 @@ impl DetectionCodeTargetRepository {
             .bind(&req.path_template)
             .bind(&req.pr_branch_prefix)
             .bind(req.enabled)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(Self::row_to_target(&row))
     }
 
@@ -208,12 +240,15 @@ impl DetectionCodeTargetRepository {
             RETURNING {DCT_SELECT}
             "#
         );
+        let mut tx = self.pool.begin().await?;
+        acquire_autonomous_tuning_dac_lock(&mut tx).await?;
         let row = sqlx::query(&sql)
             .bind(id)
             .bind(&ciphertext)
             .bind(&nonce)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(Self::row_to_target(&row))
     }
 
@@ -272,13 +307,25 @@ impl DetectionCodeTargetRepository {
     }
 
     pub async fn delete(&self, id: Uuid) -> Result<(), DetectionCodeTargetError> {
-        let result = sqlx::query("DELETE FROM detection_code_targets WHERE id = $1")
+        let mut tx = self.pool.begin().await?;
+        acquire_autonomous_tuning_dac_lock(&mut tx).await?;
+        let result = match sqlx::query("DELETE FROM detection_code_targets WHERE id = $1")
             .bind(id)
-            .execute(&self.pool)
-            .await?;
+            .execute(&mut *tx)
+            .await
+        {
+            Ok(result) => result,
+            Err(sqlx::Error::Database(error))
+                if error.constraint() == Some("tuning_proposals_pr_target_id_fkey") =>
+            {
+                return Err(DetectionCodeTargetError::InUse(id));
+            }
+            Err(error) => return Err(DetectionCodeTargetError::Database(error)),
+        };
         if result.rows_affected() == 0 {
             return Err(DetectionCodeTargetError::NotFound(id));
         }
+        tx.commit().await?;
         Ok(())
     }
 

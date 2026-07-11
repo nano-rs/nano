@@ -4,20 +4,18 @@
 //!
 //! The MITRE STIX bundle declares required data sources per technique using
 //! human-readable labels like `"Process: Process Creation"` or
-//! `"Network Traffic: Flow"`. To decide whether a given technique is "covered"
-//! by our telemetry, we map each MITRE label to one or more nanosiem
-//! `source_type` identifiers (the same identifiers that appear in detection
-//! rule nPL queries — e.g. `source_type=windows_sysmon`).
+//! `"Network Traffic: Flow"`. To derive telemetry readiness, we map each
+//! MITRE label to one or more nanosiem `source_type` identifiers (e.g.
+//! `windows_sysmon`) and compare those identities with configured sources and
+//! recent ingestion health.
 //!
-//! A MITRE data source is considered *connected* when at least one detection
-//! rule in this deployment queries a `source_type` in its mapped set.
+//! A rule mentioning a source type is deliberately not readiness evidence.
 //!
 //! ## Coverage of the mapping
 //!
 //! This is intentionally a curated subset — not every MITRE data source has
-//! an entry. Unknown labels yield an empty mapping and the data source will
-//! always render as `connected = false`. This is the right default: we'd
-//! rather under-report coverage than fabricate it.
+//! an entry. Unknown labels yield an empty mapping and unknown readiness. This
+//! avoids claiming telemetry is missing when nano cannot map the label.
 //!
 //! ## Stable ids
 //!
@@ -27,15 +25,28 @@
 
 /// Returns the set of nanosiem `source_type` identifiers that satisfy the
 /// MITRE data-source label `mitre_label`. Returns an empty slice when the
-/// label is unknown (in which case the data source is treated as not
-/// connected).
+/// label is unknown (in which case readiness remains unknown).
 ///
 /// Match is case-insensitive on the label.
 pub fn nanosiem_sources_for(mitre_label: &str) -> &'static [&'static str] {
     let normalized = mitre_label.trim().to_ascii_lowercase();
+    // 1. Exact match on the full `"Category: Component"` label (pre-v10 form).
     for (label, sources) in MAPPING {
         if label.eq_ignore_ascii_case(&normalized) {
             return sources;
+        }
+    }
+    // 2. ATT&CK v19+ supplies the bare data-COMPONENT name with no
+    //    `"Category: "` prefix (e.g. `"Process Creation"`). Match it against the
+    //    component portion of each mapping key so the curated table is reused
+    //    unchanged across the pre-v10 and v19+ bundle shapes.
+    if !normalized.contains(':') {
+        for (label, sources) in MAPPING {
+            if let Some((_, component)) = label.split_once(':') {
+                if component.trim().eq_ignore_ascii_case(&normalized) {
+                    return sources;
+                }
+            }
         }
     }
     // Fallback: try matching the prefix before the first `:`. MITRE labels
@@ -377,6 +388,18 @@ mod tests {
     #[test]
     fn unknown_label_returns_empty() {
         assert!(nanosiem_sources_for("Asteroid: Asteroid Impact").is_empty());
+    }
+
+    #[test]
+    fn maps_bare_v19_component_name() {
+        // ATT&CK v19 supplies data-component names without the "Category: "
+        // prefix; they must map via the component portion of the table keys.
+        let creation = nanosiem_sources_for("Process Creation");
+        assert!(creation.contains(&"windows_sysmon"));
+        assert!(creation.contains(&"linux_auditd"));
+        assert_eq!(nanosiem_sources_for("network traffic flow"), &["netflow"]);
+        assert!(nanosiem_sources_for("Command Execution").contains(&"windows_sysmon"));
+        assert!(nanosiem_sources_for("Not A Real Component").is_empty());
     }
 
     #[test]

@@ -18,6 +18,25 @@ use super::SearchResultResponse;
 use crate::error::ErrorResponse;
 use crate::{SearchState, error::SearchError, metrics::record_search_query};
 
+async fn reserve_query_owner(
+    state: &SearchState,
+    request_id: String,
+    user_id: uuid::Uuid,
+) -> Result<(), SearchError> {
+    match state.reserve_query_owner(&request_id, user_id).await {
+        Ok(true) => {
+            state.search.query_tracker().reserve_request(request_id, user_id);
+            Ok(())
+        }
+        Ok(false) => Err(SearchError::BadRequest("request_id is already in use".to_string())),
+        Err(error) => {
+            tracing::warn!(%error, %request_id, "Shared query ownership unavailable; using local ownership");
+            state.search.query_tracker().reserve_request(request_id, user_id);
+            Ok(())
+        }
+    }
+}
+
 /// Enforce audit exclusion at AST level (prevents OR-based bypasses).
 ///
 /// NAN-704: thin shim mapping `nanosiem_core::SearchError` from the
@@ -67,10 +86,7 @@ pub async fn search(
         request.query = enforce_non_audit_query(&request.query)?;
     }
     if let Some(request_id) = request.request_id.clone() {
-        state
-            .search
-            .query_tracker()
-            .reserve_request(request_id, auth.claims.sub);
+        reserve_query_owner(&state, request_id, auth.claims.sub).await?;
     }
 
     let user_id = auth.claims.sub;
@@ -180,15 +196,23 @@ pub async fn cancel_search(
     tracing::info!("Received cancel request for request_id: {}", request_id);
 
     let can_admin_cancel = auth.claims.has_permission(permissions::SETTINGS_SYSTEM);
-    let query_info = state.search.query_tracker().get(&request_id);
-
-    // Enforce ownership for request-id based cancellation.
-    // If we can't prove ownership, return cancelled=false (do not leak existence details).
-    let Some(query_info) = query_info else {
-        return Ok(Json(CancelSearchResponse { cancelled: false }));
-    };
-    if !can_admin_cancel && query_info.owner_user_id != Some(auth.claims.sub) {
-        return Ok(Json(CancelSearchResponse { cancelled: false }));
+    if !can_admin_cancel {
+        let local_owner = state.search.query_tracker().get(&request_id)
+            .and_then(|info| info.owner_user_id);
+        let owner = if local_owner.is_some() {
+            local_owner
+        } else {
+            match state.shared_query_owner(&request_id).await {
+                Ok(owner) => owner,
+                Err(error) => {
+                    tracing::warn!(%error, %request_id, "Shared query ownership unavailable during cancellation");
+                    None
+                }
+            }
+        };
+        if owner != Some(auth.claims.sub) {
+            return Ok(Json(CancelSearchResponse { cancelled: false }));
+        }
     }
 
     let cancelled = state.search.cancel_query(&request_id).await.map_err(|e| {
@@ -564,10 +588,7 @@ pub async fn field_stats_for_query(
     // can authorize killing the derived `{request_id}-fstats` query even
     // after the main search has completed and unregistered the id.
     if let Some(rid) = request.request_id.clone() {
-        state
-            .search
-            .query_tracker()
-            .reserve_request(rid, auth.claims.sub);
+        reserve_query_owner(&state, rid, auth.claims.sub).await?;
     }
 
     // NAN-1427: admission-gated, with the derived companion query_id and

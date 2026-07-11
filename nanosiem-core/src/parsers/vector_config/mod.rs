@@ -20,6 +20,7 @@ mod backup;
 mod credentials;
 mod deploy;
 mod parser_config;
+mod publication;
 pub mod redaction;
 mod router;
 mod sources;
@@ -28,6 +29,10 @@ mod validation;
 
 pub use redaction::redact_config_snapshot;
 pub use router::{base_router_inputs, hec_normalize_present};
+pub use publication::{
+    PublicationOutcome, SnapshotBundle, VectorConfigPublicationError,
+    VectorConfigPublisher,
+};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

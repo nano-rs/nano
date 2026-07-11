@@ -11,7 +11,7 @@ use tracing::{debug, info, instrument, warn};
 use crate::detection::query_enrichment::inject_timestamp_bounds;
 use crate::models::{Alert, AlertMode, DetectionRule, RuleMode};
 use crate::query::{parse_query, PrettyPrint};
-use crate::search::{SearchRequest, TimeRangeInput};
+use crate::search::{SearchExecutionLimits, SearchRequest, TimeRangeInput};
 
 use super::DetectionError;
 use super::DetectionService;
@@ -39,6 +39,65 @@ impl DetectionService {
         time_range: TimeRangeInput,
         dataset: Option<String>,
     ) -> Result<Vec<serde_json::Value>, DetectionError> {
+        self.evaluate_window_with_limit(
+            query,
+            time_range,
+            dataset,
+            crate::query::ClickHouseSqlGenerator::DEFAULT_RESULT_LIMIT,
+        )
+        .await
+    }
+
+    /// Evaluate one production-equivalent window with a caller-supplied result
+    /// limit. Autonomous validation uses a deliberately small `cap + 1` limit
+    /// so it can distinguish an exact result from a capped one without ever
+    /// materializing the production 1M-row ceiling many times concurrently.
+    pub(crate) async fn evaluate_window_with_limit(
+        &self,
+        query: &str,
+        time_range: TimeRangeInput,
+        dataset: Option<String>,
+        result_limit: usize,
+    ) -> Result<Vec<serde_json::Value>, DetectionError> {
+        self.evaluate_window_with_options(query, time_range, dataset, result_limit, None, None)
+            .await
+    }
+
+    /// Autonomous counterpart with an evaluator-owned query ID, no interactive
+    /// count companion, and ClickHouse-enforced result row/byte ceilings.
+    pub(crate) async fn evaluate_tuning_window(
+        &self,
+        query: &str,
+        time_range: TimeRangeInput,
+        dataset: Option<String>,
+        result_limit: usize,
+        result_byte_limit: u64,
+        query_id: String,
+    ) -> Result<Vec<serde_json::Value>, DetectionError> {
+        let execution_limits = SearchExecutionLimits {
+            max_result_rows: u64::try_from(result_limit).unwrap_or(u64::MAX),
+            max_result_bytes: result_byte_limit,
+        };
+        self.evaluate_window_with_options(
+            query,
+            time_range,
+            dataset,
+            result_limit,
+            Some(query_id),
+            Some(execution_limits),
+        )
+        .await
+    }
+
+    async fn evaluate_window_with_options(
+        &self,
+        query: &str,
+        time_range: TimeRangeInput,
+        dataset: Option<String>,
+        result_limit: usize,
+        request_id: Option<String>,
+        execution_limits: Option<SearchExecutionLimits>,
+    ) -> Result<Vec<serde_json::Value>, DetectionError> {
         // Enrich aggregation queries with timestamp bounds so results always carry
         // _first_seen/_last_seen for detection latency calculation.
         let enriched_query = match parse_query(query) {
@@ -49,26 +108,27 @@ impl DetectionService {
         let request = SearchRequest {
             query: enriched_query,
             time_range,
-            // Audit D19: the detection window must see ALL matches (up to the
-            // standard 1M search safety cap), not the newest `max_events_per_alert`
-            // (100). Capping the QUERY at 100 silently shadowed older events on
-            // every overlapping run (they never alerted) and understated
-            // match_count / daily stats to <=100. `max_events_per_alert` still
-            // caps the *stored grouped-alert sample* (see handle_grouped_alert).
-            limit: Some(crate::query::ClickHouseSqlGenerator::DEFAULT_RESULT_LIMIT),
+            // Production passes the standard 1M safety cap here (audit D19).
+            // Autonomous validation passes a smaller cap+1 and treats reaching
+            // it as non-exact, routing the proposal to review.
+            limit: Some(result_limit),
             offset: None,
             include_sql: Some(false),
             skip_histogram: true,
             skip_field_stats: true,
             use_cache: false,
             table_view: false,
-            request_id: None,
+            request_id,
             async_mode: false,
             priority: None,
             dataset,
         };
 
-        self.search_service
+        let search_service = execution_limits.map_or_else(
+            || self.search_service.clone(),
+            |limits| self.search_service.clone().with_execution_limits(limits),
+        );
+        search_service
             .search(request)
             .await
             .map(|r| r.results)

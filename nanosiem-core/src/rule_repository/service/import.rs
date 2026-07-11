@@ -328,7 +328,7 @@ impl RuleRepositoryService {
             .bind(path)
             .execute(&self.pg_pool)
             .await
-            .map_err(|e| RuleRepositoryError::Database(e))?;
+            .map_err(map_rule_mitre_write_error)?;
 
             // Sync next_run_at in case mode/schedule changed
             if let Ok(rule) = detection_service.get_rule(existing_id).await {
@@ -354,7 +354,12 @@ impl RuleRepositoryService {
         let detection_rule = detection_service
             .create_rule_with_mode(new_rule, materialized_view_generator)
             .await
-            .map_err(|e| RuleRepositoryError::DetectionService(e.to_string()))?;
+            .map_err(|error| match error {
+                crate::detection::DetectionError::InvalidMitreMapping(message) => {
+                    RuleRepositoryError::ConversionFailed(message)
+                }
+                error => RuleRepositoryError::DetectionService(error.to_string()),
+            })?;
 
         // Set next_run_at so the distributed scheduler picks up the rule immediately
         detection_service.sync_next_run_at(&detection_rule).await;
@@ -590,5 +595,12 @@ impl RuleRepositoryService {
             }
             Err(e) => Err(RuleRepositoryError::Internal(e.to_string())),
         }
+    }
+}
+
+fn map_rule_mitre_write_error(error: sqlx::Error) -> RuleRepositoryError {
+    match crate::mitre::mapping::database_mapping_violation(&error) {
+        Some(message) => RuleRepositoryError::ConversionFailed(message),
+        None => RuleRepositoryError::Database(error),
     }
 }

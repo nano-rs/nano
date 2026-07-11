@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use super::AppState;
 use super::get_vector_config_dir;
+use super::{AppState, TaskRegistry};
 
 use nanosiem_core::audit::{AuditEmitter, AuditQueryService};
 use nanosiem_core::auth::{OidcRepository, OidcService};
@@ -324,15 +324,21 @@ impl AppState {
         // `VectorConfigManager` uses. Without this, the two services'
         // read-mutate-write of `_router.toml` can interleave and the
         // later writer clobbers the earlier one's changes.
+        let vector_config_dir = get_vector_config_dir();
         let parser_service = ParserService::with_vector_config_dir(
             pg_pool.clone(),
-            get_vector_config_dir(),
+            &vector_config_dir,
         );
         let source_config_service = SourceConfigService::with_vector_config_dir(
             pg_pool.clone(),
-            get_vector_config_dir(),
+            &vector_config_dir,
         )
         .with_deploy_lock(parser_service.deploy_lock());
+        let vector_config_publisher = Arc::new(nanosiem_core::VectorConfigPublisher::new(
+            pg_pool.clone(),
+            &vector_config_dir,
+            node_id.clone(),
+        ));
 
         Self {
             // Services using DualPool for ClickHouse log queries
@@ -350,7 +356,7 @@ impl AppState {
             parser_service,
             log_source_service: LogSourceService::with_dual_pool_and_config_dir(
                 &dual_pool,
-                get_vector_config_dir(),
+                &vector_config_dir,
             ),
             // ClickHouse-backed rollup of per-source_type events/bytes/last_event_at.
             // Reads through `table_names.read("logs_per_source_5m")` so it picks
@@ -361,6 +367,7 @@ impl AppState {
                 dual_pool.table_names(),
             ),
             source_config_service,
+            vector_config_publisher,
             #[cfg(feature = "enterprise")]
             melod_service,
             // Risk service needs DualPool for time-windowed queries (findings are in ClickHouse)
@@ -397,7 +404,7 @@ impl AppState {
             auth_enabled,
             notification_service,
             tuning_repository,
-            task_handles: Arc::new(RwLock::new(Vec::new())),
+            task_registry: TaskRegistry::default(),
             // Audit emitter and query service for ClickHouse audit logging
             audit_emitter,
             audit_query_service,
@@ -422,7 +429,7 @@ impl AppState {
                 nanosiem_core::marketplace::MarketplaceCoverageCache::new(),
             ),
             search_result_cache: None,
-            rule_test_in_flight: Arc::new(dashmap::DashMap::new()),
+            rule_test_admission: Arc::new(nanosiem_core::RuleTestAdmission::local()),
             shadow_investigation_hook,
             // P1 audit: shared prevalence handle for in-process config hot-reload
             // (settings PUT handler → live search/detection consumers).
@@ -652,7 +659,12 @@ impl AppState {
                 // search HTTP handler caches.
                 state.search_result_cache =
                     nanosiem_search::cache::SearchResultCache::connect(&redis_url).await;
-                tracing::info!(redis_url = %redis_url, "Case presence tracker + marketplace coverage cache + panel result cache initialized with Redis URL");
+                state.rule_test_admission = std::sync::Arc::new(
+                    nanosiem_core::RuleTestAdmission::try_with_redis_url(&redis_url).await,
+                );
+                tracing::info!(
+                    "Cross-replica caches and rule-test admission initialized with Redis"
+                );
 
                 // NAN-682: wire the same Dragonfly into the JWT JTI denylist
                 // so logout-driven revocations propagate across API replicas.
@@ -672,7 +684,7 @@ impl AppState {
             }
         } else {
             tracing::info!(
-                "REDIS_URL not set — case presence tracker is in-memory only, marketplace coverage cache is disabled, and JWT JTI denylist is per-pod (single-node mode)"
+                "REDIS_URL not set — distributed caches are disabled and rule-test admission is local (single-node mode)"
             );
         }
 

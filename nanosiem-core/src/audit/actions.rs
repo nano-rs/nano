@@ -660,8 +660,12 @@ pub const IDENTITY_PROVIDER_CREDENTIALS_UPDATED: &str = "identity_provider_crede
 pub const IDENTITY_SYNC_TRIGGERED: &str = "identity_sync_triggered";
 /// Identity directory sync completed
 pub const IDENTITY_SYNC_COMPLETED: &str = "identity_sync_completed";
+
 /// Identity users were pushed/synced
 pub const IDENTITY_USERS_PUSHED: &str = "identity_users_pushed";
+
+// MITRE ATT&CK catalog
+pub const MITRE_CATALOG_SYNCED: &str = "mitre_catalog_synced";
 
 // =============================================================================
 // Marketplace Actions (additional)

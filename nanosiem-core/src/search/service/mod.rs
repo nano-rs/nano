@@ -628,6 +628,10 @@ pub struct SearchService {
     admission_controller: Option<std::sync::Arc<super::admission::AdmissionController>>,
     /// Per-query ClickHouse settings (set by admission-controlled path, consumed by execute)
     active_ch_settings: Option<super::admission::ClickHouseQuerySettings>,
+    /// Internal server-side output limits for unattended execution. Presence
+    /// also suppresses the interactive count companion when the caller does
+    /// not consume `total_count`.
+    active_execution_limits: Option<super::types::SearchExecutionLimits>,
     /// AI client for inline LLM classification in queries (`| ai` pipe).
     /// Open-core builds wire `NoopAiClient`; enterprise builds inject the
     /// `AiPipeAgent`-backed implementation via `set_ai_client`.
@@ -794,6 +798,7 @@ impl SearchService {
             job_store: std::sync::Arc::new(super::jobs::InMemoryJobStore::new()),
             admission_controller: None,
             active_ch_settings: None,
+            active_execution_limits: None,
             ai_client: std::sync::Arc::new(NoopAiClient),
             cloud_risk: std::sync::Arc::new(NoopCloudRiskProvider),
             table_names: dual_pool.table_names(),
@@ -847,6 +852,7 @@ impl SearchService {
             job_store: std::sync::Arc::new(super::jobs::InMemoryJobStore::new()),
             admission_controller: None,
             active_ch_settings: None,
+            active_execution_limits: None,
             ai_client: std::sync::Arc::new(NoopAiClient),
             cloud_risk: std::sync::Arc::new(NoopCloudRiskProvider),
             table_names: dual_pool.table_names(),
@@ -864,6 +870,15 @@ impl SearchService {
     /// Get the current backend type
     pub fn backend(&self) -> SearchBackend {
         self.backend
+    }
+
+    /// Install hard ClickHouse output limits on a one-shot cloned service.
+    pub(crate) fn with_execution_limits(
+        mut self,
+        limits: super::types::SearchExecutionLimits,
+    ) -> Self {
+        self.active_execution_limits = Some(limits);
+        self
     }
     /// Set the prevalence service
     pub fn set_prevalence_service(&mut self, prevalence_service: PrevalenceService) {

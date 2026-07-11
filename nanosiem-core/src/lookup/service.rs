@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::instrument;
+use uuid::Uuid;
 
 use super::clickhouse_repository::ClickHouseLookupRepository;
 use super::postgres_repository::PostgresLookupRepository;
@@ -387,6 +388,53 @@ impl LookupService {
             .await?;
 
         // Update stats
+        let new_count = self
+            .repository
+            .get_table_row_count(&table.table_name)
+            .await?;
+        let size = self
+            .repository
+            .get_table_size(&table.table_name)
+            .await
+            .unwrap_or(0);
+        self.repository
+            .update_table_stats(table_name, new_count, size)
+            .await?;
+
+        Ok(inserted)
+    }
+
+    /// Insert a replay-safe append batch using stable per-run row identities.
+    #[instrument(skip(self, records))]
+    pub async fn insert_records_idempotent(
+        &self,
+        table_name: &str,
+        records: Vec<HashMap<String, serde_json::Value>>,
+        idempotency_key: Uuid,
+    ) -> Result<usize, LookupError> {
+        let table = self.repository.get_table(table_name).await?;
+        let (current_count, missing) = self
+            .repository
+            .idempotent_record_counts(
+                &table.table_name,
+                idempotency_key,
+                records.len(),
+            )
+            .await?;
+        if current_count + missing as i64 > MAX_LOOKUP_TABLE_ROWS {
+            return Err(LookupError::RowLimitExceeded(MAX_LOOKUP_TABLE_ROWS));
+        }
+
+        let inserted = self
+            .repository
+            .insert_records_idempotent(
+                &table.table_name,
+                &table.columns,
+                &records,
+                idempotency_key,
+            )
+            .await?;
+
         let new_count = self
             .repository
             .get_table_row_count(&table.table_name)

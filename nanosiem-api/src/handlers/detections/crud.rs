@@ -346,7 +346,7 @@ pub async fn create_detection(
     responses(
         (status = 200, description = "Detection rule updated successfully", body = DetectionResponse),
         (status = 400, description = "Validation error", body = ErrorResponse),
-        (status = 403, description = "Missing permission: detections:edit", body = ErrorResponse),
+        (status = 403, description = "Missing required detections edit or promote permission", body = ErrorResponse),
         (status = 404, description = "Rule not found", body = ErrorResponse),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
@@ -692,6 +692,12 @@ fn requires_promote_for_update(old: &DetectionRule, req: &UpdateDetectionRule) -
     if matches!(req.auto_tuning_critical, Some(false)) && old.auto_tuning_critical {
         return true;
     }
+    // The generic rule route has no atomically locked view of auto_apply_enabled.
+    // Gate every threshold write here so an editor cannot race or bypass the
+    // state-aware authorization in /api/tuning/settings/:rule_id.
+    if req.auto_tuning_min_confidence.is_some() {
+        return true;
+    }
     false
 }
 
@@ -898,6 +904,18 @@ mod tests {
             ..Default::default()
         };
         assert!(requires_promote_for_update(&old, &req));
+    }
+
+    #[test]
+    fn generic_confidence_update_always_requires_promote() {
+        let old = baseline_rule();
+        for confidence in [0.1, old.auto_tuning_min_confidence, 0.95] {
+            let req = UpdateDetectionRule {
+                auto_tuning_min_confidence: Some(confidence),
+                ..Default::default()
+            };
+            assert!(requires_promote_for_update(&old, &req));
+        }
     }
 
     fn baseline_new_rule() -> NewDetectionRule {

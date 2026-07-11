@@ -20,6 +20,8 @@ pub enum DetectionRuleRepositoryError {
     ConcurrentModification(Uuid),
     #[error("Invalid mode transition for rule {0}: rule is currently in '{1}' mode")]
     InvalidModeTransition(Uuid, String),
+    #[error("Invalid MITRE ATT&CK mapping: {0}")]
+    InvalidMitreMapping(String),
 }
 
 /// Daily stats for a detection rule

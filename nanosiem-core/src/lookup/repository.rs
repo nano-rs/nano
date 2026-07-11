@@ -24,6 +24,7 @@
 //! [`LookupStorageBackend`].
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use thiserror::Error;
 use uuid::Uuid;
@@ -172,6 +173,29 @@ pub trait LookupStore: Send + Sync {
         columns: &[LookupColumn],
         records: &[HashMap<String, serde_json::Value>],
     ) -> Result<usize, LookupRepositoryError>;
+    /// Return the current table count and records from an idempotent batch that
+    /// do not already exist.
+    ///
+    /// Backends that do not override this retain the conservative row-limit
+    /// behavior used by ordinary append writes.
+    async fn idempotent_record_counts(
+        &self,
+        table_name: &str,
+        _idempotency_key: Uuid,
+        record_count: usize,
+    ) -> Result<(i64, usize), LookupRepositoryError> {
+        Ok((self.get_table_row_count(table_name).await?, record_count))
+    }
+    /// Insert an append batch using stable row identities derived from the key.
+    async fn insert_records_idempotent(
+        &self,
+        table_name: &str,
+        columns: &[LookupColumn],
+        records: &[HashMap<String, serde_json::Value>],
+        _idempotency_key: Uuid,
+    ) -> Result<usize, LookupRepositoryError> {
+        self.insert_records(table_name, columns, records).await
+    }
     async fn get_table_row_count(&self, table_name: &str) -> Result<i64, LookupRepositoryError>;
     async fn get_table_size(&self, table_name: &str) -> Result<i64, LookupRepositoryError>;
     async fn lookup(
@@ -221,6 +245,38 @@ pub trait LookupStore: Send + Sync {
         table_name: &str,
         row_ids: &[i64],
     ) -> Result<u64, LookupRepositoryError>;
+}
+
+/// Stable row identity for a record within one logical append execution.
+///
+/// The high bit keeps these identities outside the positive snowflake range.
+pub(crate) fn idempotent_row_id(idempotency_key: Uuid, record_index: usize) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"nanosiem-lookup-append-v1\0");
+    hasher.update(idempotency_key.as_bytes());
+    hasher.update((record_index as u64).to_be_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(bytes) | (1u64 << 63)
+}
+
+#[cfg(test)]
+mod idempotency_tests {
+    use super::idempotent_row_id;
+    use uuid::Uuid;
+
+    #[test]
+    fn append_row_ids_are_stable_and_record_scoped() {
+        let key = Uuid::parse_str("018f5e5b-3b31-7cd7-a8b5-6c51a92aa001").unwrap();
+        assert_eq!(idempotent_row_id(key, 0), idempotent_row_id(key, 0));
+        assert_ne!(idempotent_row_id(key, 0), idempotent_row_id(key, 1));
+        assert_ne!(
+            idempotent_row_id(key, 0),
+            idempotent_row_id(Uuid::now_v7(), 0)
+        );
+        assert_ne!(idempotent_row_id(key, 0) & (1u64 << 63), 0);
+    }
 }
 
 /// Backward-compatible alias: `LookupRepository` is the PostgreSQL backend.

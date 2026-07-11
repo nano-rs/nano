@@ -278,7 +278,17 @@ impl CredentialRepository {
 
         let mut tx = self.pool.begin().await?;
 
-        // Lock the row to serialize concurrent rotations
+        // Publication triggers lock the singleton before source/credential
+        // rows. Preserve that global order here because this flow explicitly
+        // locks the credential before its later UPDATE fires the trigger.
+        sqlx::query(
+            "SELECT singleton FROM vector_config_publication_state \
+             WHERE singleton = TRUE FOR UPDATE",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // Lock the row to serialize concurrent rotations.
         sqlx::query("SELECT id FROM cloud_credentials WHERE id = $1 FOR UPDATE")
             .bind(id)
             .fetch_one(&mut *tx)
@@ -353,6 +363,15 @@ impl CredentialRepository {
         self.get(id).await?;
 
         let mut tx = self.pool.begin().await?;
+
+        // Match the singleton -> credential lock order used by publication
+        // triggers before taking the explicit row lock below.
+        sqlx::query(
+            "SELECT singleton FROM vector_config_publication_state \
+             WHERE singleton = TRUE FOR UPDATE",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
 
         sqlx::query("SELECT id FROM cloud_credentials WHERE id = $1 FOR UPDATE")
             .bind(id)
@@ -518,30 +537,45 @@ impl CredentialRepository {
         Ok(())
     }
 
-    /// Delete a credential (and cascade its versions via the FK).
+    /// Delete a credential (and cascade its versions via the FK) only when no
+    /// parser or source configuration references it. The reference predicates
+    /// are part of the DELETE statement to avoid a check-then-act gap and return
+    /// a useful in-use error; restrictive foreign keys remain the final guard
+    /// against concurrent and out-of-band writers.
     pub async fn delete(&self, id: Uuid) -> Result<(), CredentialRepositoryError> {
-        let log_source_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM log_sources WHERE credential_id = $1")
-                .bind(id)
-                .fetch_one(&self.pool)
-                .await?;
-
-        if log_source_count > 0 {
-            return Err(CredentialRepositoryError::EncryptionError(format!(
-                "Cannot delete credential: {log_source_count} log source(s) are using it"
-            )));
-        }
-
-        let result = sqlx::query("DELETE FROM cloud_credentials WHERE id = $1")
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query(
+            "DELETE FROM cloud_credentials cc \
+             WHERE cc.id = $1 \
+               AND NOT EXISTS (SELECT 1 FROM log_sources ls WHERE ls.credential_id = cc.id) \
+               AND NOT EXISTS (SELECT 1 FROM source_configurations sc WHERE sc.credential_id = cc.id)",
+        )
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
-        if result.rows_affected() == 0 {
+        if result.rows_affected() == 1 {
+            tx.commit().await?;
+            return Ok(());
+        }
+        tx.rollback().await?;
+
+        let counts = sqlx::query_as::<_, (bool, i64, i64)>(
+            "SELECT EXISTS(SELECT 1 FROM cloud_credentials WHERE id = $1), \
+                    (SELECT COUNT(*) FROM log_sources WHERE credential_id = $1), \
+                    (SELECT COUNT(*) FROM source_configurations WHERE credential_id = $1)",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+        if !counts.0 {
             return Err(CredentialRepositoryError::NotFound(id));
         }
 
-        Ok(())
+        Err(CredentialRepositoryError::EncryptionError(format!(
+            "Cannot delete credential: {} log source(s) and {} source configuration(s) are using it",
+            counts.1, counts.2
+        )))
     }
 
     pub async fn exists(&self, id: Uuid) -> Result<bool, CredentialRepositoryError> {

@@ -870,7 +870,10 @@ impl MarketplaceRepository {
         sqlx::query(
             r#"
             UPDATE enrichment_marketplace_repos SET
-                last_synced_at = NOW(),
+                last_synced_at = CASE
+                    WHEN $2 = 'success' THEN NOW()
+                    ELSE last_synced_at
+                END,
                 last_sync_status = $2,
                 last_sync_commit = COALESCE($3, last_sync_commit),
                 enrichment_count = COALESCE($4, enrichment_count),

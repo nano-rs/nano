@@ -473,6 +473,9 @@ fn scheduler_error_to_api(err: SchedulerError) -> ApiError {
         SchedulerError::AlreadyRunning => {
             ApiError::ValidationError("Ingestion is already running".to_string())
         }
+        SchedulerError::ClaimLost => {
+            ApiError::InternalError("Ingestion claim was lost during execution".to_string())
+        }
         SchedulerError::FetchError(msg) => ApiError::InternalError(format!("Fetch error: {}", msg)),
         SchedulerError::UploadError(msg) => {
             ApiError::InternalError(format!("Upload error: {}", msg))

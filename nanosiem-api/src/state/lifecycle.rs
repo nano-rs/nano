@@ -3,6 +3,58 @@
 use super::AppState;
 
 use std::sync::Arc;
+use tokio::task::{JoinError, JoinHandle};
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TaskShutdownSummary {
+    completed: usize,
+    cancelled: usize,
+    failed: usize,
+}
+
+fn record_task_result(result: Result<(), JoinError>, summary: &mut TaskShutdownSummary) {
+    match result {
+        Ok(()) => summary.completed += 1,
+        Err(error) if error.is_cancelled() => summary.cancelled += 1,
+        Err(error) => {
+            summary.failed += 1;
+            tracing::warn!(?error, "Background task failed during shutdown");
+        }
+    }
+}
+
+async fn shutdown_task_handles(
+    mut handles: Vec<JoinHandle<()>>,
+    timeout: tokio::time::Duration,
+) -> TaskShutdownSummary {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut summary = TaskShutdownSummary::default();
+
+    while let Some(mut handle) = handles.pop() {
+        match tokio::time::timeout_at(deadline, &mut handle).await {
+            Ok(result) => record_task_result(result, &mut summary),
+            Err(_) => {
+                tracing::warn!(
+                    remaining = handles.len() + 1,
+                    "Background task shutdown deadline reached; aborting remaining tasks"
+                );
+
+                handle.abort();
+                record_task_result(handle.await, &mut summary);
+
+                for handle in &handles {
+                    handle.abort();
+                }
+                while let Some(handle) = handles.pop() {
+                    record_task_result(handle.await, &mut summary);
+                }
+                break;
+            }
+        }
+    }
+
+    summary
+}
 
 impl AppState {
     /// Initialize and start the signal processor
@@ -196,15 +248,21 @@ impl AppState {
             Err(e) => tracing::error!("Failed to start signal processor: {}", e),
         }
 
+        // Health monitoring can create notifications and perform paid AI
+        // connectivity checks. Keep the entire check + transactional notify
+        // path under leadership so replicas do not duplicate external work.
+        handles.push(self.start_health_scheduler());
+        tracing::info!("Health monitoring scheduler started (leader-only)");
+
         // === Egress schedulers — skipped in air-gap mode ===
         // Air-gapped installs have no outbound internet, so any job that fetches
-        // from the internet (IPinfo enrichment, GitHub repo sync, model catalog)
+        // from the internet (IPinfo enrichment, GitHub repo sync, model/MITRE catalogs)
         // must NOT start — bundles arrive via the air-gap import surface instead.
         // Internal jobs (signal processor above; tuning / disk-pressure /
         // siem-health / cleanups below) are unaffected.
         if !self.config.egress_jobs_enabled() {
             tracing::info!(
-                "AIRGAP_MODE: skipping egress background jobs (enrichment, identity, repo auto-sync, marketplace, model-catalog, docs-rag)"
+                "AIRGAP_MODE: skipping egress background jobs (enrichment, identity, repo auto-sync, marketplace, model-catalog, MITRE catalog, docs-rag)"
             );
         } else {
             // Enrichment auto-sync scheduler (low-frequency singleton)
@@ -240,6 +298,9 @@ impl AppState {
             tracing::info!(
                 "Marketplace repo auto-sync scheduler started (leader-only, 30m initial delay)"
             );
+
+            handles.push(self.start_mitre_sync_scheduler());
+            tracing::info!("MITRE catalog sync scheduler started (leader-only)");
 
             // Model catalog auto-sync (daily by default) — enterprise only.
             #[cfg(feature = "enterprise")]
@@ -324,8 +385,7 @@ impl AppState {
     /// Waits for all tasks to complete, aborting any that take too long.
     pub async fn shutdown_all_tasks(&self) {
         tracing::info!("Initiating graceful shutdown of background tasks");
-
-        let mut handles = self.task_handles.write().await;
+        let handles = self.task_registry.begin_shutdown().await;
         let num_tasks = handles.len();
 
         if num_tasks == 0 {
@@ -335,25 +395,73 @@ impl AppState {
 
         tracing::info!("Waiting for {} background task(s) to complete", num_tasks);
 
-        // Give tasks a reasonable time to complete (30 seconds)
+        // Give in-flight work a shared 30-second deadline before cancellation.
         let timeout = tokio::time::Duration::from_secs(30);
-        let deadline = tokio::time::Instant::now() + timeout;
+        let summary = shutdown_task_handles(handles, timeout).await;
 
-        while let Some(handle) = handles.pop() {
-            match tokio::time::timeout_at(deadline, handle).await {
-                Ok(Ok(())) => {
-                    tracing::debug!("Background task completed successfully");
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!("Background task panicked: {:?}", e);
-                }
-                Err(_) => {
-                    tracing::warn!("Background task did not complete within timeout, aborting");
-                    // Task is already removed from handles, so it will be dropped and aborted
-                }
-            }
+        tracing::info!(
+            completed = summary.completed,
+            cancelled = summary.cancelled,
+            failed = summary.failed,
+            "All tracked background tasks stopped"
+        );
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct RunningGuard(Arc<AtomicBool>);
+
+    impl Drop for RunningGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
         }
+    }
 
-        tracing::info!("All background tasks shutdown complete");
+    #[tokio::test]
+    async fn shutdown_completes_finished_tasks() {
+        let handle = tokio::spawn(async {});
+
+        let summary =
+            shutdown_task_handles(vec![handle], tokio::time::Duration::from_secs(1)).await;
+
+        assert_eq!(
+            summary,
+            TaskShutdownSummary {
+                completed: 1,
+                cancelled: 0,
+                failed: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_and_awaits_tasks_after_deadline() {
+        let running = Arc::new(AtomicBool::new(true));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let task_running = Arc::clone(&running);
+        let task_started = Arc::clone(&started);
+        let handle = tokio::spawn(async move {
+            let _guard = RunningGuard(task_running);
+            task_started.notify_one();
+            std::future::pending::<()>().await;
+        });
+        started.notified().await;
+
+        let summary =
+            shutdown_task_handles(vec![handle], tokio::time::Duration::from_millis(10)).await;
+
+        assert_eq!(
+            summary,
+            TaskShutdownSummary {
+                completed: 0,
+                cancelled: 1,
+                failed: 0,
+            }
+        );
+        assert!(!running.load(Ordering::SeqCst));
     }
 }

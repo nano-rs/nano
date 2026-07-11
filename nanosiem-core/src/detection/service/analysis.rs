@@ -6,7 +6,8 @@
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use futures::stream::{FuturesUnordered, StreamExt};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::io::{self, Write};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -19,6 +20,10 @@ use crate::search::{SearchRequest, TimeRangeInput};
 
 use super::{
     DailyMatchCount, DetectionError, DetectionService, HistoricalAnalysisResult, TimeBucket,
+    TuningReplayBudget, TuningWindowEvidence, TuningWindowPlan,
+    AUTONOMOUS_TUNING_REPLAY_QUERY_COUNT, MAX_AUTONOMOUS_TUNING_BYTES_PER_WINDOW,
+    MAX_AUTONOMOUS_TUNING_ROWS_PER_WINDOW, MAX_AUTONOMOUS_TUNING_TOTAL_SCAN_SECONDS,
+    MAX_AUTONOMOUS_TUNING_WINDOWS,
 };
 
 /// Hard cap on the user-selected test range. Mirrors Google SecOps' "Run rule
@@ -30,6 +35,10 @@ pub const MAX_TEST_RANGE_DAYS: i64 = 14;
 /// the in-flight load a single test click can put on the database, regardless
 /// of how many windows the rule's cadence produces over the user's range.
 const STEPPED_TESTER_CONCURRENCY: usize = 16;
+
+/// Autonomous validation is background work and must leave ClickHouse capacity
+/// for live hunting and scheduled detections.
+const AUTONOMOUS_TUNING_CONCURRENCY: usize = 2;
 
 /// Lookback used when a rule has no `lookback_minutes` set. Matches the
 /// scheduler's default in `DetectionServiceConfig`.
@@ -54,13 +63,13 @@ const DEFAULT_STEPPED_CRON: &str = "*/5 * * * *";
 /// Sorted ascending; we pick the smallest size that keeps the bucket count below
 /// `MAX_BUCKETS` so the API response stays sane regardless of window length.
 const BUCKET_SIZES_SECS: &[u32] = &[
-    60,        // 1m
-    300,       // 5m
-    900,       // 15m
-    3600,      // 1h
-    21_600,    // 6h
-    86_400,    // 1d
-    604_800,   // 7d
+    60,      // 1m
+    300,     // 5m
+    900,     // 15m
+    3600,    // 1h
+    21_600,  // 6h
+    86_400,  // 1d
+    604_800, // 7d
 ];
 
 const MAX_BUCKETS: i64 = 50;
@@ -288,9 +297,8 @@ impl DetectionService {
         validate_test_range(&time_range)?;
         self.validate_query(query)?;
 
-        let lookback = Duration::minutes(
-            lookback_minutes.unwrap_or(DEFAULT_STEPPED_LOOKBACK_MINUTES),
-        );
+        let lookback =
+            Duration::minutes(lookback_minutes.unwrap_or(DEFAULT_STEPPED_LOOKBACK_MINUTES));
         let cron_expr = schedule_cron.unwrap_or(DEFAULT_STEPPED_CRON);
 
         let windows = enumerate_test_windows(&time_range, cron_expr, lookback)?;
@@ -308,7 +316,8 @@ impl DetectionService {
         info!(
             windows = windows.len(),
             cron = cron_expr,
-            "Stepped ad-hoc query test: evaluating {} windows", windows.len()
+            "Stepped ad-hoc query test: evaluating {} windows",
+            windows.len()
         );
 
         let result = self
@@ -428,6 +437,155 @@ impl DetectionService {
             failed_windows,
             error_sample,
         }
+    }
+
+    /// Replay an identity-preserving query over a fixed set of production
+    /// schedule/lookback windows for autonomous tuning validation.
+    ///
+    /// Counts are exact only when every window succeeds, no autonomous row or
+    /// byte budget is reached, and every returned row carries the physical
+    /// source `id`. Callers persist those conditions and fail closed otherwise.
+    pub(crate) async fn evaluate_tuning_windows(
+        &self,
+        query: &str,
+        windows: &[TimeRangeInput],
+        dataset: Option<String>,
+        budget: TuningReplayBudget,
+        query_id_prefix: &str,
+    ) -> TuningWindowEvidence {
+        if budget.rows == 0 || budget.bytes == 0 {
+            return TuningWindowEvidence {
+                budget_exceeded: true,
+                ..TuningWindowEvidence::default()
+            };
+        }
+
+        let semaphore = Arc::new(Semaphore::new(AUTONOMOUS_TUNING_CONCURRENCY));
+        let max_samples = self.config.max_events_per_alert;
+        let mut futures = FuturesUnordered::new();
+        let result_limit = usize::try_from(
+            (MAX_AUTONOMOUS_TUNING_ROWS_PER_WINDOW + 1).min(budget.rows.saturating_add(1)),
+        )
+        .expect("autonomous tuning row cap fits usize");
+        let result_byte_limit = MAX_AUTONOMOUS_TUNING_BYTES_PER_WINDOW.min(budget.bytes);
+        let query_ids = tuning_replay_query_ids(query_id_prefix, windows.len());
+
+        for (window, query_id) in windows.iter().zip(query_ids.iter().cloned()) {
+            let sem = semaphore.clone();
+            let service = self.clone();
+            let query = query.to_string();
+            let window = window.clone();
+            let dataset = dataset.clone();
+            futures.push(async move {
+                let _permit = sem
+                    .acquire_owned()
+                    .await
+                    .expect("stepped tuning semaphore should not close");
+                service
+                    .evaluate_tuning_window(
+                        &query,
+                        window,
+                        dataset,
+                        result_limit,
+                        result_byte_limit,
+                        query_id,
+                    )
+                    .await
+            });
+        }
+
+        let mut source_ids = HashSet::new();
+        let mut sample_events = Vec::new();
+        let mut rows_examined = 0_u64;
+        let mut bytes_examined = 0_u64;
+        let mut failed_windows = 0_u32;
+        let mut truncated_windows = 0_u32;
+        let mut identity_errors = 0_u64;
+        let mut budget_exceeded = false;
+        let mut cancel_remaining = false;
+
+        while let Some(result) = futures.next().await {
+            match result {
+                Ok(rows) => {
+                    if autonomous_window_is_truncated(rows.len()) {
+                        truncated_windows = truncated_windows.saturating_add(1);
+                        cancel_remaining = true;
+                        break;
+                    }
+
+                    let Some((next_rows_examined, next_bytes_examined)) =
+                        replay_batch_usage(&rows, rows_examined, bytes_examined, budget)
+                    else {
+                        budget_exceeded = true;
+                        cancel_remaining = true;
+                        break;
+                    };
+
+                    rows_examined = next_rows_examined;
+                    bytes_examined = next_bytes_examined;
+
+                    for row in rows {
+                        if sample_events.len() < max_samples {
+                            sample_events.push(row.clone());
+                        }
+
+                        let source_id = row
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(|value| Uuid::parse_str(value).ok());
+                        match source_id {
+                            Some(id) => {
+                                source_ids.insert(id);
+                            }
+                            None => identity_errors = identity_errors.saturating_add(1),
+                        }
+                    }
+                    if identity_errors > 0 {
+                        cancel_remaining = true;
+                        break;
+                    }
+                }
+                Err(error) => {
+                    failed_windows = failed_windows.saturating_add(1);
+                    warn!(error = %error, "Stepped tuning validation window failed");
+                    cancel_remaining = true;
+                    break;
+                }
+            }
+        }
+
+        if cancel_remaining {
+            if let Err(error) = self.search_service.cancel_exact_queries(&query_ids).await {
+                warn!(error = %error, "Failed to cancel remaining tuning replay queries");
+            }
+        }
+
+        TuningWindowEvidence {
+            total_matches: u64::try_from(source_ids.len()).unwrap_or(u64::MAX),
+            source_ids,
+            sample_events,
+            rows_examined,
+            bytes_examined,
+            failed_windows,
+            truncated_windows,
+            identity_errors,
+            budget_exceeded,
+        }
+    }
+
+    /// Explicitly kill every possible query ID for one or more replay lanes.
+    /// Used by the outer timeout, whose cancellation drops the replay future
+    /// before its normal error cleanup can run.
+    pub(crate) async fn cancel_tuning_replays(
+        &self,
+        query_id_prefixes: &[&str],
+        window_count: usize,
+    ) -> Result<bool, crate::search::SearchError> {
+        let query_ids = query_id_prefixes
+            .iter()
+            .flat_map(|prefix| tuning_replay_query_ids(prefix, window_count))
+            .collect::<Vec<_>>();
+        self.search_service.cancel_exact_queries(&query_ids).await
     }
 
     /// Run historical analysis using a query string with explicit time range
@@ -561,10 +719,7 @@ impl DetectionService {
             .unwrap_or(&parsed)
             .pretty_print();
 
-        let timechart_query = format!(
-            "{} | timechart span={}s count()",
-            base_filter, bucket_size
-        );
+        let timechart_query = format!("{} | timechart span={}s count()", base_filter, bucket_size);
         // Cap at MAX_BUCKETS + a small slack for boundary buckets.
         let limit = (MAX_BUCKETS as usize) + 5;
         let buckets = self
@@ -630,6 +785,66 @@ impl DetectionService {
     }
 }
 
+#[derive(Default)]
+struct JsonByteCounter(u64);
+
+impl Write for JsonByteCounter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(u64::try_from(buf.len()).unwrap_or(u64::MAX))
+            .ok_or_else(|| io::Error::other("serialized event size overflow"))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_size(value: &serde_json::Value) -> Option<u64> {
+    let mut counter = JsonByteCounter::default();
+    serde_json::to_writer(&mut counter, value).ok()?;
+    Some(counter.0)
+}
+
+fn replay_batch_usage(
+    rows: &[serde_json::Value],
+    rows_examined: u64,
+    bytes_examined: u64,
+    budget: TuningReplayBudget,
+) -> Option<(u64, u64)> {
+    let next_rows = rows_examined.checked_add(u64::try_from(rows.len()).ok()?)?;
+    if next_rows > budget.rows {
+        return None;
+    }
+
+    let batch_bytes = rows.iter().try_fold(0_u64, |total, row| {
+        serialized_json_size(row)
+            .and_then(|size| size.checked_add(1))
+            .and_then(|size| total.checked_add(size))
+    })?;
+    if autonomous_window_bytes_exceeded(batch_bytes) {
+        return None;
+    }
+    let next_bytes = bytes_examined.checked_add(batch_bytes)?;
+    (next_bytes <= budget.bytes).then_some((next_rows, next_bytes))
+}
+
+fn autonomous_window_is_truncated(row_count: usize) -> bool {
+    u64::try_from(row_count).unwrap_or(u64::MAX) > MAX_AUTONOMOUS_TUNING_ROWS_PER_WINDOW
+}
+
+fn autonomous_window_bytes_exceeded(byte_count: u64) -> bool {
+    byte_count > MAX_AUTONOMOUS_TUNING_BYTES_PER_WINDOW
+}
+
+fn tuning_replay_query_ids(prefix: &str, window_count: usize) -> Vec<String> {
+    (0..window_count)
+        .map(|index| format!("{prefix}-{index}"))
+        .collect()
+}
+
 /// Enumerate the cron-tick times in `[range.start, range.end]` and return one
 /// `TimeRangeInput` per tick covering `[tick - lookback, tick]`. Mirrors what
 /// the production scheduler would have evaluated at each tick within the
@@ -643,9 +858,8 @@ pub fn enumerate_test_windows(
     lookback: Duration,
 ) -> Result<Vec<TimeRangeInput>, DetectionError> {
     let normalized = crate::detection::scheduler::normalize_cron_expression(schedule_cron);
-    let schedule = cron::Schedule::from_str(&normalized).map_err(|e| {
-        DetectionError::InvalidCronExpression(format!("{}: {}", schedule_cron, e))
-    })?;
+    let schedule = cron::Schedule::from_str(&normalized)
+        .map_err(|e| DetectionError::InvalidCronExpression(format!("{}: {}", schedule_cron, e)))?;
 
     // Audit D36: `Schedule::after` yields ticks strictly greater than its
     // argument, so a tick landing exactly on `range.start` — which the
@@ -679,6 +893,58 @@ pub fn enumerate_test_windows(
         windows.push(TimeRangeInput::new(tick - lookback, tick));
     }
     Ok(windows)
+}
+
+/// Build the exact production cadence/lookback windows used by autonomous
+/// tuning validation while enforcing its tighter unattended-workload limits.
+pub(crate) fn tuning_test_windows(
+    range: &TimeRangeInput,
+    schedule_cron: Option<&str>,
+    lookback_minutes: Option<i64>,
+) -> Result<TuningWindowPlan, DetectionError> {
+    validate_test_range(range)?;
+    let schedule_cron = schedule_cron.ok_or_else(|| {
+        DetectionError::InvalidQuery(
+            "Autonomous tuning validation requires the rule's production schedule".to_string(),
+        )
+    })?;
+    let lookback_minutes = lookback_minutes.ok_or_else(|| {
+        DetectionError::InvalidQuery(
+            "Autonomous tuning validation requires the rule's explicit production lookback"
+                .to_string(),
+        )
+    })?;
+    if !(1..=10_080).contains(&lookback_minutes) {
+        return Err(DetectionError::InvalidQuery(format!(
+            "Autonomous tuning lookback must be between 1 and 10080 minutes (got {lookback_minutes})"
+        )));
+    }
+    let windows =
+        enumerate_test_windows(range, schedule_cron, Duration::minutes(lookback_minutes))?;
+    if windows.len() > MAX_AUTONOMOUS_TUNING_WINDOWS {
+        return Err(DetectionError::InvalidQuery(format!(
+            "Autonomous tuning produces {} evaluation windows, exceeding the {}-window cap",
+            windows.len(),
+            MAX_AUTONOMOUS_TUNING_WINDOWS
+        )));
+    }
+    let total_scan_seconds = windows
+        .iter()
+        .try_fold(0_i64, |total, window| {
+            total.checked_add((window.end - window.start).num_seconds())
+        })
+        .and_then(|seconds| seconds.checked_mul(AUTONOMOUS_TUNING_REPLAY_QUERY_COUNT));
+    if total_scan_seconds.is_none_or(|seconds| seconds > MAX_AUTONOMOUS_TUNING_TOTAL_SCAN_SECONDS) {
+        return Err(DetectionError::InvalidQuery(format!(
+            "Autonomous tuning scan exceeds the {}-second aggregate budget",
+            MAX_AUTONOMOUS_TUNING_TOTAL_SCAN_SECONDS
+        )));
+    }
+    Ok(TuningWindowPlan {
+        schedule_cron: schedule_cron.to_string(),
+        lookback_minutes,
+        windows,
+    })
 }
 
 /// Compute the step interval (in seconds) implied by a cron expression by
@@ -797,14 +1063,20 @@ mod tests {
     fn parse_bucket_timestamp_rfc3339() {
         let v = serde_json::Value::String("2026-05-04T12:30:00Z".to_string());
         let dt = parse_bucket_timestamp(&v).unwrap();
-        assert_eq!(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(), "2026-05-04T12:30:00Z");
+        assert_eq!(
+            dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "2026-05-04T12:30:00Z"
+        );
     }
 
     #[test]
     fn parse_bucket_timestamp_date_only() {
         let v = serde_json::Value::String("2026-05-04".to_string());
         let dt = parse_bucket_timestamp(&v).unwrap();
-        assert_eq!(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(), "2026-05-04T00:00:00Z");
+        assert_eq!(
+            dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "2026-05-04T00:00:00Z"
+        );
     }
 
     #[test]
@@ -863,6 +1135,126 @@ mod tests {
     }
 
     #[test]
+    fn autonomous_tuning_windows_bind_production_schedule_and_lookback() {
+        let start = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 0).unwrap();
+        let end = start + Duration::hours(1);
+        let range = TimeRangeInput::new(start, end);
+        let plan = tuning_test_windows(&range, Some("*/15 * * * *"), Some(7)).unwrap();
+
+        assert_eq!(plan.schedule_cron, "*/15 * * * *");
+        assert_eq!(plan.lookback_minutes, 7);
+        assert_eq!(plan.windows.len(), 5);
+        assert!(plan
+            .windows
+            .iter()
+            .all(|window| window.end - window.start == Duration::minutes(7)));
+    }
+
+    #[test]
+    fn autonomous_tuning_windows_require_a_schedule_and_valid_lookback() {
+        let start = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 0).unwrap();
+        let range = TimeRangeInput::new(start, start + Duration::hours(1));
+
+        assert!(tuning_test_windows(&range, None, Some(5)).is_err());
+        assert!(tuning_test_windows(&range, Some("*/5 * * * *"), None).is_err());
+        assert!(tuning_test_windows(&range, Some("*/5 * * * *"), Some(0)).is_err());
+        assert!(tuning_test_windows(&range, Some("*/5 * * * *"), Some(10_081)).is_err());
+    }
+
+    #[test]
+    fn autonomous_tuning_windows_enforce_fanout_and_scan_budgets() {
+        let start = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 0).unwrap();
+        let range = TimeRangeInput::new(start, start + Duration::hours(24));
+
+        assert!(tuning_test_windows(&range, Some("* * * * *"), Some(15)).is_err());
+        assert!(tuning_test_windows(&range, Some("0 * * * *"), Some(10_080)).is_err());
+        assert!(tuning_test_windows(&range, Some("*/5 * * * *"), Some(20)).is_err());
+
+        let admitted = tuning_test_windows(&range, Some("*/5 * * * *"), Some(15))
+            .expect("bounded autonomous replay should be admitted");
+        assert_eq!(admitted.windows.len(), 289);
+    }
+
+    #[test]
+    fn autonomous_replay_batch_enforces_cumulative_row_and_byte_budgets() {
+        let rows = vec![
+            serde_json::json!({"id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}),
+            serde_json::json!({"id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}),
+        ];
+        let exact_bytes = rows
+            .iter()
+            .map(|row| serialized_json_size(row).unwrap() + 1)
+            .sum::<u64>();
+
+        assert_eq!(
+            replay_batch_usage(
+                &rows,
+                0,
+                0,
+                TuningReplayBudget {
+                    rows: 2,
+                    bytes: exact_bytes,
+                },
+            ),
+            Some((2, exact_bytes))
+        );
+        assert!(replay_batch_usage(
+            &rows,
+            1,
+            0,
+            TuningReplayBudget {
+                rows: 2,
+                bytes: u64::MAX,
+            },
+        )
+        .is_none());
+        assert!(replay_batch_usage(
+            &rows,
+            0,
+            0,
+            TuningReplayBudget {
+                rows: u64::MAX,
+                bytes: exact_bytes - 1,
+            },
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn autonomous_replay_query_ids_are_owned_stable_and_unique() {
+        let ids = tuning_replay_query_ids("tuning-proof-original", 3);
+        assert_eq!(
+            ids,
+            vec![
+                "tuning-proof-original-0",
+                "tuning-proof-original-1",
+                "tuning-proof-original-2",
+            ]
+        );
+        assert_eq!(
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            3
+        );
+        assert_eq!(
+            AUTONOMOUS_TUNING_REPLAY_QUERY_COUNT, 2,
+            "only original and proposed data lanes are admitted; bounded search suppresses count companions"
+        );
+    }
+
+    #[test]
+    fn autonomous_window_cap_plus_one_preserves_exact_boundary_counts() {
+        let cap = usize::try_from(MAX_AUTONOMOUS_TUNING_ROWS_PER_WINDOW).unwrap();
+        assert!(!autonomous_window_is_truncated(cap));
+        assert!(autonomous_window_is_truncated(cap + 1));
+        assert!(!autonomous_window_bytes_exceeded(
+            MAX_AUTONOMOUS_TUNING_BYTES_PER_WINDOW
+        ));
+        assert!(autonomous_window_bytes_exceeded(
+            MAX_AUTONOMOUS_TUNING_BYTES_PER_WINDOW + 1
+        ));
+    }
+
+    #[test]
     fn enumerate_test_windows_includes_boundary_start_tick() {
         // Audit D36: a tick landing exactly on `range.start` must be included —
         // `Schedule::after` alone (strictly-greater) dropped it. Here 12:00:00 is
@@ -870,8 +1262,8 @@ mod tests {
         let start = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 0).unwrap();
         let end = Utc.with_ymd_and_hms(2026, 5, 5, 14, 0, 0).unwrap();
         let range = TimeRangeInput::new(start, end);
-        let windows = enumerate_test_windows(&range, "0 * * * *", Duration::minutes(30))
-            .expect("valid cron");
+        let windows =
+            enumerate_test_windows(&range, "0 * * * *", Duration::minutes(30)).expect("valid cron");
         // Inclusive on both ends: 12:00, 13:00, 14:00.
         assert_eq!(windows.len(), 3);
         assert_eq!(windows[0].end, start, "boundary start tick included");
@@ -885,8 +1277,8 @@ mod tests {
         let start = Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 30).unwrap();
         let end = Utc.with_ymd_and_hms(2026, 5, 5, 12, 2, 0).unwrap();
         let range = TimeRangeInput::new(start, end);
-        let windows = enumerate_test_windows(&range, "* * * * *", Duration::minutes(1))
-            .expect("valid cron");
+        let windows =
+            enumerate_test_windows(&range, "* * * * *", Duration::minutes(1)).expect("valid cron");
         // Only 12:01:00 and 12:02:00 fall in [12:00:30, 12:02:00]; 12:00:00 is
         // before the start and must be excluded.
         assert_eq!(windows.len(), 2);
@@ -899,8 +1291,7 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 5, 5, 12, 0, 0).unwrap(),
             Utc.with_ymd_and_hms(2026, 5, 5, 13, 0, 0).unwrap(),
         );
-        let err =
-            enumerate_test_windows(&range, "not a cron", Duration::minutes(15)).unwrap_err();
+        let err = enumerate_test_windows(&range, "not a cron", Duration::minutes(15)).unwrap_err();
         assert!(matches!(err, DetectionError::InvalidCronExpression(_)));
     }
 
@@ -912,8 +1303,8 @@ mod tests {
         let start = Utc.with_ymd_and_hms(2026, 5, 5, 0, 0, 0).unwrap();
         let end = start + Duration::days(14);
         let range = TimeRangeInput::new(start, end);
-        let windows = enumerate_test_windows(&range, "* * * * *", Duration::minutes(1))
-            .expect("valid cron");
+        let windows =
+            enumerate_test_windows(&range, "* * * * *", Duration::minutes(1)).expect("valid cron");
         assert!(
             windows.len() > MAX_STEPPED_WINDOWS,
             "1-min cron × 14d = {} windows; cap is {}",

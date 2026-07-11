@@ -149,8 +149,8 @@ impl ThresholdDetector {
         let is_breach = current_value > effective_threshold;
 
         if !is_breach {
-            // No breach - clear any consecutive period tracking
-            self.clear_consecutive_periods(rule_id).await?;
+            // No row for this period means the next breach cannot find an
+            // immediately preceding breach bucket, so its streak resets to one.
             return Ok(None);
         }
 
@@ -166,8 +166,22 @@ impl ThresholdDetector {
             }
         };
 
-        // Get or increment consecutive periods
-        let consecutive_periods = self.increment_consecutive_periods(rule_id).await?;
+        // Record this metric bucket once. Retries in the same bucket return the
+        // existing count; only an immediately preceding breach bucket advances
+        // the streak.
+        let period_start = evaluation_period_start(metrics.timestamp);
+        let detected_at = Utc::now();
+        let consecutive_periods = self
+            .record_breach_period(
+                rule_id,
+                period_start,
+                detected_at,
+                current_value,
+                baseline.mean_alerts_per_hour,
+                effective_threshold,
+                deviation_magnitude,
+            )
+            .await?;
 
         // Determine if this breach should trigger auto-tuning
         let should_trigger_tuning = consecutive_periods >= CONSECUTIVE_PERIODS_THRESHOLD;
@@ -175,7 +189,7 @@ impl ThresholdDetector {
         // Create breach record
         let breach = ThresholdBreach {
             rule_id,
-            detected_at: Utc::now(),
+            detected_at,
             current_value,
             baseline_mean: baseline.mean_alerts_per_hour,
             baseline_threshold: effective_threshold,
@@ -183,9 +197,6 @@ impl ThresholdDetector {
             consecutive_periods,
             should_trigger_tuning,
         };
-
-        // Persist breach to database
-        self.persist_breach(&breach).await?;
 
         Ok(Some(breach))
     }
@@ -281,79 +292,86 @@ impl ThresholdDetector {
         }))
     }
 
-    /// Increment consecutive breach periods for a rule
-    ///
-    /// This method tracks how many consecutive evaluation periods
-    /// a rule has been in breach state.
-    async fn increment_consecutive_periods(
+    /// Persist one breach per distinct metric period and return its streak count.
+    async fn record_breach_period(
         &self,
         rule_id: Uuid,
+        period_start: DateTime<Utc>,
+        detected_at: DateTime<Utc>,
+        current_value: f64,
+        baseline_mean: f64,
+        baseline_threshold: f64,
+        deviation_magnitude: f64,
     ) -> Result<i32, ThresholdDetectorError> {
-        let now = Utc::now();
-        let period_start = now - Duration::minutes(EVALUATION_PERIOD_MINUTES);
+        let mut tx = self.pg_pool.begin().await?;
 
-        // Check if there was a recent breach (within the last evaluation period)
-        let recent_breach: Option<(i32,)> = sqlx::query_as(
+        // Serialize adjacent buckets for one rule. The unique index handles same-
+        // bucket retries; this lock prevents a later bucket observing its predecessor
+        // before that predecessor commits.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))")
+            .bind(rule_id)
+            .execute(&mut *tx)
+            .await?;
+
+        let existing: Option<(i32,)> = sqlx::query_as(
             r#"
             SELECT consecutive_periods
             FROM detection_threshold_breaches
-            WHERE rule_id = $1 AND detected_at >= $2
-            ORDER BY detected_at DESC
-            LIMIT 1
+            WHERE rule_id = $1 AND period_start = $2
             "#,
         )
         .bind(rule_id)
         .bind(period_start)
-        .fetch_optional(&self.pg_pool)
+        .fetch_optional(&mut *tx)
         .await?;
+        if let Some((count,)) = existing {
+            tx.commit().await?;
+            return Ok(count);
+        }
 
-        // If there was a recent breach, increment the count
-        // Otherwise, start at 1
-        Ok(recent_breach.map(|(count,)| count + 1).unwrap_or(1))
-    }
+        let previous_period = period_start - Duration::minutes(EVALUATION_PERIOD_MINUTES);
+        let previous: Option<(i32,)> = sqlx::query_as(
+            r#"
+            SELECT consecutive_periods
+            FROM detection_threshold_breaches
+            WHERE rule_id = $1 AND period_start = $2
+            "#,
+        )
+        .bind(rule_id)
+        .bind(previous_period)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let consecutive_periods = previous.map(|(count,)| count + 1).unwrap_or(1);
 
-    /// Clear consecutive breach period tracking for a rule
-    ///
-    /// Called when a rule is no longer in breach state
-    async fn clear_consecutive_periods(
-        &self,
-        _rule_id: Uuid,
-    ) -> Result<(), ThresholdDetectorError> {
-        // Consecutive periods are tracked implicitly by the timestamp
-        // of the most recent breach. If no recent breach exists within
-        // the evaluation period, the count resets to 1 automatically.
-        // No explicit clearing is needed.
-        Ok(())
-    }
-
-    /// Persist a breach record to the database
-    async fn persist_breach(&self, breach: &ThresholdBreach) -> Result<(), ThresholdDetectorError> {
         sqlx::query(
             r#"
             INSERT INTO detection_threshold_breaches (
                 rule_id,
                 detected_at,
+                period_start,
                 current_value,
                 baseline_mean,
                 baseline_threshold,
                 deviation_magnitude,
                 consecutive_periods,
                 tuning_triggered
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             "#,
         )
-        .bind(breach.rule_id)
-        .bind(breach.detected_at)
-        .bind(breach.current_value)
-        .bind(breach.baseline_mean)
-        .bind(breach.baseline_threshold)
-        .bind(breach.deviation_magnitude)
-        .bind(breach.consecutive_periods)
-        .bind(breach.should_trigger_tuning)
-        .execute(&self.pg_pool)
+        .bind(rule_id)
+        .bind(detected_at)
+        .bind(period_start)
+        .bind(current_value)
+        .bind(baseline_mean)
+        .bind(baseline_threshold)
+        .bind(deviation_magnitude)
+        .bind(consecutive_periods)
+        .bind(consecutive_periods >= CONSECUTIVE_PERIODS_THRESHOLD)
+        .execute(&mut *tx)
         .await?;
 
-        Ok(())
+        tx.commit().await?;
+        Ok(consecutive_periods)
     }
 
     /// Check thresholds for all rules (alias for check_thresholds)
@@ -368,6 +386,12 @@ impl ThresholdDetector {
     ) -> Result<Vec<ThresholdBreach>, ThresholdDetectorError> {
         self.check_thresholds().await
     }
+}
+
+fn evaluation_period_start(timestamp: DateTime<Utc>) -> DateTime<Utc> {
+    let period_seconds = EVALUATION_PERIOD_MINUTES * 60;
+    let aligned_seconds = timestamp.timestamp().div_euclid(period_seconds) * period_seconds;
+    DateTime::from_timestamp(aligned_seconds, 0).expect("aligned timestamp is representable")
 }
 
 /// Database row for breach queries
@@ -449,16 +473,40 @@ mod tests {
     }
 
     #[test]
-    fn test_consecutive_periods_logic() {
-        // Test consecutive period increment logic
-        let recent_breach_count = Some(2);
-        let new_count = recent_breach_count.map(|count| count + 1).unwrap_or(1);
-        assert_eq!(new_count, 3);
+    fn evaluation_periods_are_stable_across_scheduler_jitter() {
+        let before_tick = DateTime::parse_from_rfc3339("2026-07-10T12:14:59Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let after_tick = DateTime::parse_from_rfc3339("2026-07-10T12:15:01Z")
+            .unwrap()
+            .with_timezone(&Utc);
 
-        // Test first breach (no recent breach)
-        let no_recent_breach: Option<i32> = None;
-        let first_count = no_recent_breach.map(|count| count + 1).unwrap_or(1);
-        assert_eq!(first_count, 1);
+        assert_eq!(
+            evaluation_period_start(before_tick),
+            DateTime::parse_from_rfc3339("2026-07-10T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
+        assert_eq!(
+            evaluation_period_start(after_tick),
+            DateTime::parse_from_rfc3339("2026-07-10T12:15:00Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
+    }
+
+    #[test]
+    fn repeated_evaluations_share_one_period_bucket() {
+        let first = DateTime::parse_from_rfc3339("2026-07-10T12:00:01Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let retry = DateTime::parse_from_rfc3339("2026-07-10T12:14:59Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            evaluation_period_start(first),
+            evaluation_period_start(retry)
+        );
     }
 
     #[test]

@@ -349,6 +349,17 @@ pub struct SearchRequest {
     pub dataset: Option<String>,
 }
 
+/// Internal hard limits for unattended query execution.
+///
+/// These are deliberately not part of the public `SearchRequest`: API callers
+/// cannot opt out of count companions or choose ClickHouse overflow settings.
+/// Detection tuning installs them on a cloned `SearchService` for one replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SearchExecutionLimits {
+    pub max_result_rows: u64,
+    pub max_result_bytes: u64,
+}
+
 /// Input for raw SQL search requests
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RawSqlRequest {

@@ -77,6 +77,8 @@ pub struct UploadRequest {
     pub destination: UploadDestination,
     /// Parser configuration
     pub config: ParserConfig,
+    /// Stable execution identity for replay-safe scheduled append ingestion.
+    pub idempotency_key: Option<Uuid>,
 }
 
 /// Upload result

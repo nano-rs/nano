@@ -122,6 +122,7 @@ impl SourceConfigRepository {
                       AND sc.id IS NOT NULL
                   )
               )
+            ORDER BY ls.name ASC
             "#,
         )
         .fetch_all(&self.pool)
@@ -488,6 +489,26 @@ impl SourceConfigRepository {
         .await?
         .into_iter()
         .map(|r| r.into())
+        .collect();
+
+        Ok(configs)
+    }
+
+    /// List the complete deployed set for canonical Vector generation. Unlike
+    /// the analyst-facing paginated list, this must never truncate routing
+    /// inputs at the API page cap.
+    pub async fn list_deployed(
+        &self,
+    ) -> Result<Vec<SourceConfiguration>, SourceConfigRepositoryError> {
+        let configs = sqlx::query_as::<_, SourceConfigRow>(
+            "SELECT id, name, description, config_type, connection_config, credential_id, \
+             enabled, deployed, deployed_at, created_at, updated_at \
+             FROM source_configurations WHERE deployed = true ORDER BY name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| row.into())
         .collect();
 
         Ok(configs)

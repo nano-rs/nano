@@ -70,6 +70,15 @@ pub async fn search_stream(
     }
 
     if let Some(request_id) = request.request_id.clone() {
+        match state.reserve_query_owner(&request_id, user_id).await {
+            Ok(true) => {}
+            Ok(false) => return Err(SearchError::BadRequest(
+                "request_id is already in use".to_string(),
+            )),
+            Err(error) => {
+                tracing::warn!(%error, %request_id, "Shared query ownership unavailable; using local ownership");
+            }
+        }
         state
             .search
             .query_tracker()

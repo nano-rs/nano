@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-/**
- * Hook for fetching and caching MITRE ATT&CK data
- */
+/** React Query hooks for the ATT&CK catalog and coverage data. */
 
-import { useState, useEffect } from 'react';
+import { useQuery } from '@tanstack/react-query';
+
+import type { CoverageFilters, MitreCoverageResponse } from '@/components/mitre/types';
+import { useAuth } from '@/contexts/AuthContext';
 import { getAccessToken } from '@/lib/auth-token';
+import { mitreAuthScope, mitreQueryKeys, normalizeMitreFilter } from './mitre-query-keys';
 
 interface MitreTactic {
   id: string;
@@ -26,6 +28,22 @@ interface MitreTechnique {
   deprecated: boolean;
 }
 
+/** Durable state of the latest ATT&CK catalog sync attempt (mirrors the API). */
+export interface MitreSyncState {
+  status: string;
+  release_version?: string | null;
+  source_url?: string | null;
+  source_sha256?: string | null;
+  tactic_count?: number | null;
+  technique_count?: number | null;
+  last_started_at?: string | null;
+  last_completed_at?: string | null;
+  last_success_at?: string | null;
+  last_error?: string | null;
+  consecutive_failures: number;
+  next_retry_at?: string | null;
+}
+
 interface MitreDataResponse {
   tactics: MitreTactic[];
   techniques: MitreTechnique[];
@@ -35,139 +53,98 @@ interface MitreDataResponse {
     technique_count: number;
     tactic_count: number;
   };
+  /** Populated on the boot/seed window so callers can distinguish an empty
+   *  catalog that is still syncing from a genuine no-data state. */
+  sync_state?: MitreSyncState | null;
 }
 
-// Cache the data in memory
-let cachedData: MitreDataResponse | null = null;
-let fetchPromise: Promise<MitreDataResponse> | null = null;
-
-// Use the same API base URL as the rest of the app
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? '';
 
+function authHeaders(): HeadersInit {
+  const token = getAccessToken();
+  return {
+    'Content-Type': 'application/json',
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+}
+
+async function fetchJson<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const headers = new Headers(authHeaders());
+  new Headers(init.headers).forEach((value, key) => headers.set(key, value));
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    ...init,
+    headers,
+    credentials: 'include',
+  });
+  if (!response.ok) {
+    throw new Error(`MITRE request failed (${response.status})`);
+  }
+  return response.json() as Promise<T>;
+}
+
+function errorMessage(error: unknown): string | null {
+  return error instanceof Error ? error.message : error ? 'Failed to load MITRE data' : null;
+}
+
 export function useMitreData() {
-  const [data, setData] = useState<MitreDataResponse | null>(cachedData);
-  const [loading, setLoading] = useState(!cachedData);
-  const [error, setError] = useState<string | null>(null);
+  const { user, isAuthenticated, isLoading: authLoading } = useAuth();
+  const authScope = mitreAuthScope(user?.id, getAccessToken());
+  const query = useQuery({
+    queryKey: mitreQueryKeys.catalog(authScope),
+    queryFn: ({ signal }) => fetchJson<MitreDataResponse>('/api/mitre', { signal }),
+    enabled: isAuthenticated && !authLoading,
+  });
 
-  useEffect(() => {
-    if (cachedData) {
-      setData(cachedData);
-      setLoading(false);
-      return;
-    }
-
-    // Deduplicate concurrent requests
-    if (!fetchPromise) {
-      const token = getAccessToken();
-      const headers: HeadersInit = {
-        'Content-Type': 'application/json',
-      };
-      if (token) {
-        headers['Authorization'] = `Bearer ${token}`;
-      }
-
-      // Use absolute URL like the rest of the app
-      fetchPromise = fetch(`${API_BASE_URL}/api/mitre`, { headers })
-        .then(async (response) => {
-          if (!response.ok) {
-            throw new Error(`Failed to fetch MITRE data: ${response.statusText}`);
-          }
-          const data = await response.json();
-          // Only cache if we got actual data
-          if (data.tactics?.length > 0 || data.techniques?.length > 0) {
-            cachedData = data;
-          }
-          return data;
-        })
-        .finally(() => {
-          fetchPromise = null;
-        });
-    }
-
-    fetchPromise
-      .then((response) => {
-        setData(response);
-        setLoading(false);
-      })
-      .catch((err) => {
-        console.error('[useMitreData] Error:', err);
-        setError(err.message || 'Failed to load MITRE data');
-        setLoading(false);
-        // Clear the cache on error so next mount will retry
-        cachedData = null;
-      });
-  }, []);
-
-  return { data, loading, error };
+  return {
+    data: query.data ?? null,
+    loading: authLoading || (isAuthenticated && query.isPending),
+    error: errorMessage(query.error),
+  };
 }
 
 // Convert MITRE data to autocomplete options format
 export function tacticsToOptions(tactics: MitreTactic[]) {
-  return tactics.map(t => ({
-    value: t.id,
-    label: `${t.id} - ${t.name}`,
-    description: t.description?.substring(0, 100) || '',
+  return tactics.map((tactic) => ({
+    value: tactic.id,
+    label: `${tactic.id} - ${tactic.name}`,
+    description: tactic.description?.substring(0, 100) || '',
   }));
 }
 
 export function techniquesToOptions(techniques: MitreTechnique[]) {
-  return techniques.map(t => ({
-    value: t.id,
-    label: `${t.id} - ${t.name}`,
-    description: t.description?.substring(0, 100) || '',
+  return techniques.map((technique) => ({
+    value: technique.id,
+    label: `${technique.id} - ${technique.name}`,
+    description: technique.description?.substring(0, 100) || '',
   }));
 }
 
-// Coverage types and hook
-import type { MitreCoverageResponse, CoverageFilters } from '@/components/mitre/types';
-
 export function useMitreCoverage(filters: CoverageFilters) {
-  const [data, setData] = useState<MitreCoverageResponse | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const { user, isAuthenticated, isLoading: authLoading } = useAuth();
+  const authScope = mitreAuthScope(user?.id, getAccessToken());
+  const severities = normalizeMitreFilter(filters.severity);
+  const modes = normalizeMitreFilter(filters.mode);
+  const severityKey = severities.join(',');
+  const modeKey = modes.join(',');
 
-  useEffect(() => {
-    const fetchCoverage = async () => {
-      setLoading(true);
-      setError(null);
+  const query = useQuery({
+    queryKey: mitreQueryKeys.coverage(authScope, severityKey, modeKey),
+    queryFn: ({ signal }) => {
+      const params = new URLSearchParams();
+      if (severityKey) params.set('severity', severityKey);
+      if (modeKey) params.set('mode', modeKey);
+      const queryString = params.toString();
+      return fetchJson<MitreCoverageResponse>(
+        `/api/mitre/coverage${queryString ? `?${queryString}` : ''}`,
+        { signal },
+      );
+    },
+    enabled: isAuthenticated && !authLoading,
+  });
 
-      try {
-        const token = getAccessToken();
-        const headers: HeadersInit = {
-          'Content-Type': 'application/json',
-        };
-        if (token) {
-          headers['Authorization'] = `Bearer ${token}`;
-        }
-
-        // Build query params
-        const params = new URLSearchParams();
-        if (filters.severity.length > 0) {
-          params.set('severity', filters.severity.join(','));
-        }
-        if (filters.mode.length > 0) {
-          params.set('mode', filters.mode.join(','));
-        }
-
-        const url = `${API_BASE_URL}/api/mitre/coverage${params.toString() ? '?' + params.toString() : ''}`;
-        const response = await fetch(url, { headers });
-
-        if (!response.ok) {
-          throw new Error(`Failed to fetch MITRE coverage: ${response.statusText}`);
-        }
-
-        const data = await response.json();
-        setData(data);
-      } catch (err) {
-        console.error('[useMitreCoverage] Error:', err);
-        setError(err instanceof Error ? err.message : 'Failed to load coverage data');
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    fetchCoverage();
-  }, [filters.severity.join(','), filters.mode.join(',')]);
-
-  return { data, loading, error };
+  return {
+    data: query.data ?? null,
+    loading: authLoading || (isAuthenticated && query.isPending),
+    error: errorMessage(query.error),
+  };
 }

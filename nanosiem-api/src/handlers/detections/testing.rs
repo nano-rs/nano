@@ -7,13 +7,10 @@ use axum::{
     Extension, Json,
 };
 use chrono::{Duration, Utc};
-use dashmap::DashMap;
 use nanosiem_core::auth::permissions;
 use nanosiem_core::search::TimeRangeInput;
 use nanosiem_core::typeid::TypeIdParam;
 use nanosiem_core::HistoricalAnalysisResult;
-use std::sync::Arc;
-use uuid::Uuid;
 
 use super::strip_comments;
 use super::types::*;
@@ -27,40 +24,6 @@ use crate::{
 /// "Run rule against historical data" default. Short on purpose so the
 /// drawer opens cheaply — explicit longer ranges are an opt-in click.
 const DEFAULT_TEST_RANGE_HOURS: i64 = 1;
-
-/// RAII guard that holds a per-user slot in the in-flight test tracker.
-/// Releases on drop so panics, early returns, and cancelled requests all
-/// clear the slot. Without this, a single failed test would block that
-/// user's API key forever.
-struct TestInFlightGuard {
-    map: Arc<DashMap<Uuid, ()>>,
-    user_id: Uuid,
-}
-
-impl Drop for TestInFlightGuard {
-    fn drop(&mut self) {
-        self.map.remove(&self.user_id);
-    }
-}
-
-/// Try to claim the per-user test slot. Returns `None` if a test is already
-/// in flight for this user — caller should respond 429.
-fn try_claim_test_slot(
-    map: &Arc<DashMap<Uuid, ()>>,
-    user_id: Uuid,
-) -> Option<TestInFlightGuard> {
-    use dashmap::mapref::entry::Entry;
-    match map.entry(user_id) {
-        Entry::Occupied(_) => None,
-        Entry::Vacant(v) => {
-            v.insert(());
-            Some(TestInFlightGuard {
-                map: map.clone(),
-                user_id,
-            })
-        }
-    }
-}
 
 /// Resolve the test time window from the request. Falls back to the legacy
 /// `days` field for back-compat with older clients, then to a 1-hour default.
@@ -100,6 +63,7 @@ fn resolve_test_range(request: &TestRuleRequest) -> TimeRangeInput {
         (status = 403, description = "Missing permission: detections:view", body = ErrorResponse),
         (status = 404, description = "Rule not found", body = ErrorResponse),
         (status = 429, description = "Another rule test is already in flight for this user", body = ErrorResponse),
+        (status = 503, description = "Distributed rule-test admission is unavailable", body = ErrorResponse),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -111,7 +75,11 @@ pub async fn test_detection(
 ) -> Result<Json<HistoricalAnalysisResult>, ApiError> {
     ensure_permission(&auth, permissions::DETECTIONS_VIEW)?;
 
-    let _guard = try_claim_test_slot(&state.rule_test_in_flight, auth.user_id())
+    let _guard = state
+        .rule_test_admission
+        .acquire(auth.user_id())
+        .await
+        .map_err(|error| ApiError::ServiceUnavailable(error.to_string()))?
         .ok_or_else(|| {
             ApiError::TooManyRequests(
                 "A rule test is already running. Wait for it to finish before starting another."
@@ -165,6 +133,7 @@ pub async fn test_detection(
         (status = 400, description = "Invalid request (e.g. range exceeds 14 days)", body = ErrorResponse),
         (status = 403, description = "Missing permission: detections:create", body = ErrorResponse),
         (status = 429, description = "Another rule test is already in flight for this user", body = ErrorResponse),
+        (status = 503, description = "Distributed rule-test admission is unavailable", body = ErrorResponse),
     ),
     security(("bearer_auth" = []), ("api_key" = []))
 )]
@@ -175,7 +144,11 @@ pub async fn test_query(
 ) -> Result<Json<HistoricalAnalysisResult>, ApiError> {
     ensure_permission(&auth, permissions::DETECTIONS_CREATE)?;
 
-    let _guard = try_claim_test_slot(&state.rule_test_in_flight, auth.user_id())
+    let _guard = state
+        .rule_test_admission
+        .acquire(auth.user_id())
+        .await
+        .map_err(|error| ApiError::ServiceUnavailable(error.to_string()))?
         .ok_or_else(|| {
             ApiError::TooManyRequests(
                 "A rule test is already running. Wait for it to finish before starting another."

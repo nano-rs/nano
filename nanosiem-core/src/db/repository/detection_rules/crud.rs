@@ -7,6 +7,9 @@ use uuid::Uuid;
 use crate::models::{
     AlertMode, DetectionMode, DetectionRule, NewDetectionRule, RuleMode, UpdateDetectionRule,
 };
+use crate::mitre::mapping::{
+    canonicalize_mitre_mappings, canonicalize_tactic_ids, canonicalize_technique_ids,
+};
 
 use super::types::{DetectionRuleRepository, DetectionRuleRepositoryError};
 
@@ -16,6 +19,11 @@ impl DetectionRuleRepository {
         &self,
         rule: &NewDetectionRule,
     ) -> Result<DetectionRule, DetectionRuleRepositoryError> {
+        let mappings = canonicalize_mitre_mappings(
+            rule.mitre_tactics.as_deref().unwrap_or_default(),
+            rule.mitre_techniques.as_deref().unwrap_or_default(),
+        )
+        .map_err(|error| DetectionRuleRepositoryError::InvalidMitreMapping(error.to_string()))?;
         let result = sqlx::query_as::<_, DetectionRule>(
             r#"
             INSERT INTO detection_rules (name, description, query, severity, mitre_tactics, mitre_techniques, schedule_cron, mode, narrative, reference_url, author, tags, ai_generated, realtime_enabled, risk_score, risk_entity_field, risk_modifiers, detection_mode, lookback_minutes, auto_tuning_enabled, auto_tuning_min_confidence, auto_tuning_critical, ai_triage_hints, folder, case_visibility, alert_mode, case_assigned_group, playbook_selector_mode, playbook_id, dataset, source_path, source_repo_url)
@@ -27,8 +35,8 @@ impl DetectionRuleRepository {
         .bind(&rule.description)
         .bind(&rule.query)
         .bind(&rule.severity)
-        .bind(rule.mitre_tactics.as_ref().unwrap_or(&vec![]))
-        .bind(rule.mitre_techniques.as_ref().unwrap_or(&vec![]))
+        .bind(&mappings.tactics)
+        .bind(&mappings.techniques)
         .bind(&rule.schedule_cron)
         .bind(rule.mode.unwrap_or(RuleMode::Staging))
         .bind(&rule.narrative)
@@ -61,7 +69,8 @@ impl DetectionRuleRepository {
         .bind(&rule.source_path)
         .bind(&rule.source_repo_url)
         .fetch_one(&self.pool)
-        .await?;
+        .await
+        .map_err(map_rule_write_error)?;
 
         // If case_visibility is 'group', add the group associations (batch insert)
         if rule.case_visibility.as_deref() == Some("group") {
@@ -110,6 +119,19 @@ impl DetectionRuleRepository {
         id: Uuid,
         update: &UpdateDetectionRule,
     ) -> Result<DetectionRule, DetectionRuleRepositoryError> {
+        let canonical_tactics = update
+            .mitre_tactics
+            .as_deref()
+            .map(canonicalize_tactic_ids)
+            .transpose()
+            .map_err(|error| DetectionRuleRepositoryError::InvalidMitreMapping(error.to_string()))?;
+        let canonical_techniques = update
+            .mitre_techniques
+            .as_deref()
+            .map(canonicalize_technique_ids)
+            .transpose()
+            .map_err(|error| DetectionRuleRepositoryError::InvalidMitreMapping(error.to_string()))?;
+
         // First fetch the rule to get its current updated_at for optimistic locking
         let existing = self.find_by_id(id).await?;
 
@@ -169,8 +191,8 @@ impl DetectionRuleRepository {
         .bind(&update.description)
         .bind(&update.query)
         .bind(&update.severity)
-        .bind(&update.mitre_tactics)
-        .bind(&update.mitre_techniques)
+        .bind(&canonical_tactics)
+        .bind(&canonical_techniques)
         .bind(&update.schedule_cron)
         .bind(&update.mode)
         .bind(&update.narrative)
@@ -206,7 +228,8 @@ impl DetectionRuleRepository {
         .bind(&update.source_path) // $35
         .bind(&update.source_repo_url) // $36
         .fetch_optional(&self.pool)
-        .await?
+        .await
+        .map_err(map_rule_write_error)?
         .ok_or(DetectionRuleRepositoryError::ConcurrentModification(id))?;
 
         // If case_group_ids is provided, update the group associations atomically
@@ -256,5 +279,12 @@ impl DetectionRuleRepository {
         }
 
         Ok(())
+    }
+}
+
+fn map_rule_write_error(error: sqlx::Error) -> DetectionRuleRepositoryError {
+    match crate::mitre::mapping::database_mapping_violation(&error) {
+        Some(message) => DetectionRuleRepositoryError::InvalidMitreMapping(message),
+        None => DetectionRuleRepositoryError::DatabaseError(error),
     }
 }

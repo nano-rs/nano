@@ -5,13 +5,15 @@
 //! Create, read, update, delete operations for detection rules,
 //! including mode-based routing and lifecycle management.
 
-use tracing::{error, info, instrument, warn};
+use tracing::{error, info, instrument};
 use uuid::Uuid;
 
 use crate::models::{DetectionRule, NewDetectionRule, RuleMode, Severity, UpdateDetectionRule};
 
 use super::DetectionError;
 use super::DetectionService;
+
+const RUNTIME_DDL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl DetectionService {
     // ========================================================================
@@ -296,6 +298,8 @@ impl DetectionService {
     ) -> Result<DetectionRule, DetectionError> {
         use crate::models::detection_rule::DetectionMode;
 
+        let _runtime_lock = self.acquire_rule_runtime_lock(id).await?;
+
         // Validate the query if it's being updated
         if let Some(ref query) = update.query {
             self.validate_query(query)?;
@@ -390,7 +394,9 @@ impl DetectionService {
                     .clone()
                     .or(Some(existing_rule.case_visibility.clone())),
                 case_group_ids: update.case_group_ids.clone(),
-                case_assigned_group: update.case_assigned_group.or(existing_rule.case_assigned_group),
+                case_assigned_group: update
+                    .case_assigned_group
+                    .or(existing_rule.case_assigned_group),
                 alert_mode: update.alert_mode.or(Some(existing_rule.alert_mode)),
                 playbook_selector_mode: update
                     .playbook_selector_mode
@@ -427,8 +433,13 @@ impl DetectionService {
                     let updated_rule = self.rule_repo.update(id, &update).await?;
 
                     // Recreate materialized view
-                    match materialized_view_generator.recreate_view(&updated_rule).await {
-                        Ok(view_name) => {
+                    match tokio::time::timeout(
+                        RUNTIME_DDL_TIMEOUT,
+                        materialized_view_generator.recreate_view(&updated_rule),
+                    )
+                    .await
+                    {
+                        Ok(Ok(view_name)) => {
                             info!(
                                 "Recreated materialized view {} for updated real-time rule {}",
                                 view_name, updated_rule.name
@@ -442,22 +453,25 @@ impl DetectionService {
                                 self.rule_repo.update(updated_rule.id, &view_update).await?;
 
                             // Create version entry
-                            self.create_version_entry(
-                                &final_rule,
-                                created_by,
-                                "manual_edit",
-                                None,
-                            )
-                            .await;
+                            self.create_version_entry(&final_rule, created_by, "manual_edit", None)
+                                .await;
 
                             Ok(final_rule)
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
+                            self.queue_runtime_reconciliation(updated_rule.id, &e.to_string())
+                                .await;
                             error!(
                                 "Failed to recreate materialized view for rule {}: {}",
                                 updated_rule.name, e
                             );
                             Err(DetectionError::MaterializedViewError(e.to_string()))
+                        }
+                        Err(_) => {
+                            let message = "materialized-view recreation timed out";
+                            self.queue_runtime_reconciliation(updated_rule.id, message)
+                                .await;
+                            Err(DetectionError::MaterializedViewError(message.to_string()))
                         }
                     }
                 } else {
@@ -489,8 +503,13 @@ impl DetectionService {
                 let updated_rule = self.rule_repo.update(id, &update).await?;
 
                 // Create materialized view
-                match materialized_view_generator.create_view(&updated_rule).await {
-                    Ok(view_name) => {
+                match tokio::time::timeout(
+                    RUNTIME_DDL_TIMEOUT,
+                    materialized_view_generator.create_view(&updated_rule),
+                )
+                .await
+                {
+                    Ok(Ok(view_name)) => {
                         info!(
                             "Created materialized view {} for rule {} (transitioned to real-time)",
                             view_name, updated_rule.name
@@ -514,35 +533,59 @@ impl DetectionService {
 
                         Ok(final_rule)
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
+                        self.queue_runtime_reconciliation(updated_rule.id, &e.to_string())
+                            .await;
                         error!(
                             "Failed to create materialized view for rule {}: {}",
                             updated_rule.name, e
                         );
                         Err(DetectionError::MaterializedViewError(e.to_string()))
                     }
+                    Err(_) => {
+                        let message = "materialized-view creation timed out";
+                        self.queue_runtime_reconciliation(updated_rule.id, message)
+                            .await;
+                        Err(DetectionError::MaterializedViewError(message.to_string()))
+                    }
                 }
             }
 
             // Transitioning FROM Real-Time
             (DetectionMode::RealTime, DetectionMode::Scheduled) => {
-                // Drop materialized view
-                if let Some(ref view_name) = existing_rule.materialized_view_name {
-                    match materialized_view_generator.drop_view(view_name).await {
-                        Ok(_) => {
-                            info!(
-                                "Dropped materialized view {} for rule {} (transitioned from real-time)",
-                                view_name, existing_rule.name
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to drop materialized view {} for rule {}: {}",
-                                view_name, existing_rule.name, e
-                            );
-                        }
+                let view_name = existing_rule.materialized_view_name.clone().unwrap_or_else(|| {
+                    super::super::materialized_view::MaterializedViewGenerator::view_name_for_rule_id(
+                        existing_rule.id,
+                    )
+                });
+                // Persist the repair intent before destructive DDL. If DROP succeeds but
+                // the following PostgreSQL update fails, the real-time rule remains the
+                // source of truth and the worker recreates its missing view.
+                self.require_runtime_reconciliation(existing_rule.id)
+                    .await?;
+                match tokio::time::timeout(
+                    RUNTIME_DDL_TIMEOUT,
+                    materialized_view_generator.drop_view(&view_name),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        self.queue_runtime_reconciliation(existing_rule.id, &error.to_string())
+                            .await;
+                        return Err(DetectionError::MaterializedViewError(error.to_string()));
+                    }
+                    Err(_) => {
+                        let message = "materialized-view cleanup timed out";
+                        self.queue_runtime_reconciliation(existing_rule.id, message)
+                            .await;
+                        return Err(DetectionError::MaterializedViewError(message.to_string()));
                     }
                 }
+                info!(
+                    "Dropped materialized view {} for rule {} (transitioned from real-time)",
+                    view_name, existing_rule.name
+                );
 
                 // Clear materialized_view_name
                 let mut update_with_cleared_view = update.clone();
@@ -588,6 +631,8 @@ impl DetectionService {
     ) -> Result<(), DetectionError> {
         use crate::models::detection_rule::DetectionMode;
 
+        let _runtime_lock = self.acquire_rule_runtime_lock(id).await?;
+
         // Get the rule to check its detection mode
         let rule = self.get_rule(id).await?;
 
@@ -599,24 +644,36 @@ impl DetectionService {
         // Clean up based on detection mode
         match rule.detection_mode {
             DetectionMode::RealTime => {
-                // Drop materialized view
-                if let Some(ref view_name) = rule.materialized_view_name {
-                    match materialized_view_generator.drop_view(view_name).await {
-                        Ok(_) => {
-                            info!(
-                                "Dropped materialized view {} for deleted rule {}",
-                                view_name, rule.name
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to drop materialized view {} for rule {}: {}",
-                                view_name, rule.name, e
-                            );
-                            // Continue with deletion even if view drop fails
-                        }
+                let view_name = rule.materialized_view_name.clone().unwrap_or_else(|| {
+                    super::super::materialized_view::MaterializedViewGenerator::view_name_for_rule_id(
+                        rule.id,
+                    )
+                });
+                // The tombstone survives a successful DROP until PostgreSQL deletion is
+                // known to have completed, closing the DROP-success/delete-failure window.
+                self.require_runtime_reconciliation(rule.id).await?;
+                match tokio::time::timeout(
+                    RUNTIME_DDL_TIMEOUT,
+                    materialized_view_generator.drop_view(&view_name),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        self.queue_runtime_reconciliation(rule.id, &error.to_string())
+                            .await;
+                        return Err(DetectionError::MaterializedViewError(error.to_string()));
+                    }
+                    Err(_) => {
+                        let message = "materialized-view cleanup timed out";
+                        self.queue_runtime_reconciliation(rule.id, message).await;
+                        return Err(DetectionError::MaterializedViewError(message.to_string()));
                     }
                 }
+                info!(
+                    "Dropped materialized view {} for deleted rule {}",
+                    view_name, rule.name
+                );
             }
             DetectionMode::Scheduled => {
                 // Row deletion will clear next_run_at automatically
@@ -628,6 +685,28 @@ impl DetectionService {
 
         info!("Successfully deleted detection rule: {}", id);
         Ok(())
+    }
+
+    async fn queue_runtime_reconciliation(&self, rule_id: Uuid, cause: &str) {
+        if let Err(error) = self.require_runtime_reconciliation(rule_id).await {
+            error!(
+                rule_id = %rule_id,
+                %cause,
+                %error,
+                "Failed to persist runtime reconciliation after DDL failure"
+            );
+        }
+    }
+
+    async fn require_runtime_reconciliation(&self, rule_id: Uuid) -> Result<(), DetectionError> {
+        self.version_manager
+            .enqueue_runtime_sync(rule_id, 0)
+            .await
+            .map_err(|error| {
+                DetectionError::RepositoryError(format!(
+                    "failed to persist runtime reconciliation: {error}"
+                ))
+            })
     }
 
     /// Pause a detection rule (set mode to paused)

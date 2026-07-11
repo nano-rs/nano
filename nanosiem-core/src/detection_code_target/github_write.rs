@@ -39,11 +39,11 @@ pub enum GitHubWriteError {
     #[error("Invalid GitHub URL: {0}")]
     InvalidUrl(String),
 
-    #[error("Head branch already exists: {0}")]
-    BranchExists(String),
-
     #[error("Egress endpoint blocked by SSRF policy: {0}")]
     BlockedEndpoint(String),
+
+    #[error("Existing GitHub state conflicts with this PR operation: {0}")]
+    RemoteConflict(String),
 }
 
 /// The PR that was opened.
@@ -51,6 +51,7 @@ pub enum GitHubWriteError {
 pub struct OpenedPr {
     pub html_url: String,
     pub number: i64,
+    pub state: String,
 }
 
 /// Result of a connectivity/permission probe against a target repo.
@@ -72,11 +73,46 @@ struct RefResponse {
 #[derive(Debug, Deserialize)]
 struct ContentsFile {
     sha: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
 }
 #[derive(Debug, Deserialize)]
+struct CommitResponse {
+    sha: String,
+}
+#[derive(Debug, Deserialize)]
+struct ContentsUpdateResponse {
+    commit: CommitResponse,
+}
+#[derive(Debug, Clone, Deserialize)]
+struct PullHead {
+    sha: String,
+}
+#[derive(Debug, Clone, Deserialize)]
 struct PullResponse {
     html_url: String,
     number: i64,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default = "default_pull_state")]
+    state: String,
+    #[serde(default)]
+    merged_at: Option<String>,
+    head: PullHead,
+}
+#[derive(Debug, Deserialize)]
+struct ChangedFile {
+    filename: String,
+    status: String,
+    #[serde(default)]
+    previous_filename: Option<String>,
+}
+#[derive(Debug, Deserialize)]
+struct CompareResponse {
+    #[serde(default)]
+    files: Vec<ChangedFile>,
 }
 #[derive(Debug, Deserialize)]
 struct CodeSearchItem {
@@ -204,10 +240,107 @@ impl GitHubWriteClient {
         })
     }
 
+    async fn find_pull_request(
+        &self,
+        owner: &str,
+        repo: &str,
+        base_branch: &str,
+        head_branch: &str,
+        expected_body: &str,
+        file_path: &str,
+        file_content: &str,
+    ) -> Result<Option<(OpenedPr, String)>, GitHubWriteError> {
+        let head = format!("{owner}:{head_branch}");
+        let url = reqwest::Url::parse_with_params(
+            &format!("{GITHUB_API}/repos/{owner}/{repo}/pulls"),
+            &[
+                ("state", "all"),
+                ("base", base_branch),
+                ("head", head.as_str()),
+                ("per_page", "1"),
+            ],
+        )
+        .map_err(|error| GitHubWriteError::InvalidUrl(error.to_string()))?;
+        let response = self.auth(self.http.get(url)).send().await?;
+        let pulls: Vec<PullResponse> = Self::parse(response).await?;
+        let Some(pull) = pulls.into_iter().next() else {
+            return Ok(None);
+        };
+        if !pull_body_matches_operation(pull.body.as_deref(), expected_body) {
+            return Err(GitHubWriteError::RemoteConflict(format!(
+                "pull request #{} on '{head_branch}' has no matching operation identity",
+                pull.number
+            )));
+        }
+        self.verify_pull_request_diff(owner, repo, pull.number, file_path)
+            .await?;
+        let head_sha = pull.head.sha.clone();
+        let content_matches = self
+            .get_contents_file(owner, repo, file_path, &head_sha)
+            .await?
+            .as_ref()
+            .is_some_and(|file| Self::contents_match(file, file_content.as_bytes()));
+        if !content_matches {
+            return Err(GitHubWriteError::RemoteConflict(format!(
+                "pull request #{} does not contain the frozen payload at head {head_sha}",
+                pull.number
+            )));
+        }
+        let state = pull_state(&pull);
+        Ok(Some((
+            OpenedPr {
+                html_url: pull.html_url,
+                number: pull.number,
+                state,
+            },
+            head_sha,
+        )))
+    }
+
+    async fn verify_branch_diff(
+        &self,
+        owner: &str,
+        repo: &str,
+        base_branch: &str,
+        head_branch: &str,
+        file_path: &str,
+    ) -> Result<(), GitHubWriteError> {
+        let mut url = reqwest::Url::parse(&format!("{GITHUB_API}/repos/{owner}/{repo}/compare/"))
+            .map_err(|error| GitHubWriteError::InvalidUrl(error.to_string()))?;
+        url.path_segments_mut()
+            .map_err(|_| {
+                GitHubWriteError::InvalidUrl(
+                    "GitHub compare URL cannot hold path segments".to_string(),
+                )
+            })?
+            .push(&format!("{base_branch}...{head_branch}"));
+        let response = self.auth(self.http.get(url)).send().await?;
+        let comparison: CompareResponse = Self::parse(response).await?;
+        ensure_exact_operation_diff(&comparison.files, file_path, "operation branch")
+    }
+
+    async fn verify_pull_request_diff(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: i64,
+        file_path: &str,
+    ) -> Result<(), GitHubWriteError> {
+        let url = reqwest::Url::parse_with_params(
+            &format!("{GITHUB_API}/repos/{owner}/{repo}/pulls/{pr_number}/files"),
+            &[("per_page", "2")],
+        )
+        .map_err(|error| GitHubWriteError::InvalidUrl(error.to_string()))?;
+        let response = self.auth(self.http.get(url)).send().await?;
+        let files: Vec<ChangedFile> = Self::parse(response).await?;
+        ensure_exact_operation_diff(&files, file_path, "pull request")
+    }
+
     /// Probe read + write access to a repo (used by "Test connection").
     pub async fn check_access(&self, repo_url: &str) -> Result<RepoAccess, GitHubWriteError> {
         Self::validate_endpoint(GITHUB_API).await?;
         let (owner, repo) = Self::parse_github_repo(repo_url)?;
+
         let url = format!("{GITHUB_API}/repos/{owner}/{repo}");
         let resp = self.auth(self.http.get(&url)).send().await?;
         let repo: RepoResponse = Self::parse(resp).await?;
@@ -328,8 +461,358 @@ impl GitHubWriteClient {
         Ok(())
     }
 
-    /// Create `head_branch` off `base_branch`, commit `file_content` at
-    /// `file_path` (create or update), and open a PR into `base_branch`.
+    async fn get_branch_ref(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<String>, GitHubWriteError> {
+        let url = format!("{GITHUB_API}/repos/{owner}/{repo}/git/ref/heads/{branch}");
+        let response = self.auth(self.http.get(&url)).send().await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let reference: RefResponse = Self::parse(response).await?;
+        Ok(Some(reference.object.sha))
+    }
+
+    async fn get_contents_file(
+        &self,
+        owner: &str,
+        repo: &str,
+        file_path: &str,
+        git_ref: &str,
+    ) -> Result<Option<ContentsFile>, GitHubWriteError> {
+        let url = format!("{GITHUB_API}/repos/{owner}/{repo}/contents/{file_path}?ref={git_ref}");
+        let response = self.auth(self.http.get(&url)).send().await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Self::parse(response).await.map(Some)
+    }
+
+    fn contents_match(file: &ContentsFile, expected: &[u8]) -> bool {
+        file.kind.as_deref() == Some("file")
+            && file
+                .content
+                .as_deref()
+                .and_then(|content| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(content.replace('\n', ""))
+                        .ok()
+                })
+                .is_some_and(|decoded| decoded == expected)
+    }
+
+    /// Ensure the proposal's deterministic branch exists and return its head
+    /// SHA. A `422` create response is ambiguous by design: re-read the exact
+    /// ref and reuse it instead of surfacing `BranchExists`.
+    pub(crate) async fn ensure_branch(
+        &self,
+        repo_url: &str,
+        base_branch: &str,
+        head_branch: &str,
+    ) -> Result<String, GitHubWriteError> {
+        Self::validate_endpoint(GITHUB_API).await?;
+        let (owner, repo) = Self::parse_github_repo(repo_url)?;
+        if let Some(sha) = self.get_branch_ref(&owner, &repo, head_branch).await? {
+            return Ok(sha);
+        }
+        let base_sha = self
+            .get_branch_ref(&owner, &repo, base_branch)
+            .await?
+            .ok_or_else(|| GitHubWriteError::Api {
+                status: StatusCode::NOT_FOUND.as_u16(),
+                message: format!("base branch '{base_branch}' was not found"),
+            })?;
+
+        let url = format!("{GITHUB_API}/repos/{owner}/{repo}/git/refs");
+        let body = json!({ "ref": format!("refs/heads/{head_branch}"), "sha": base_sha });
+        let response = self.auth(self.http.post(&url)).json(&body).send().await?;
+        if response.status() == StatusCode::UNPROCESSABLE_ENTITY {
+            return self
+                .get_branch_ref(&owner, &repo, head_branch)
+                .await?
+                .ok_or_else(|| GitHubWriteError::Api {
+                    status: StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+                    message: format!(
+                        "GitHub rejected branch creation and '{head_branch}' was not discoverable"
+                    ),
+                });
+        }
+        let reference: RefResponse = Self::parse(response).await?;
+        Ok(reference.object.sha)
+    }
+
+    /// Ensure a deterministic operation branch is either still at the current
+    /// base tip or already contains the exact frozen payload. This prevents a
+    /// coincidentally named divergent branch from being overwritten and later
+    /// attached to a tuning PR.
+    pub(crate) async fn ensure_operation_branch(
+        &self,
+        repo_url: &str,
+        base_branch: &str,
+        head_branch: &str,
+        file_path: &str,
+        file_content: &str,
+    ) -> Result<String, GitHubWriteError> {
+        self.ensure_branch(repo_url, base_branch, head_branch)
+            .await?;
+
+        let (owner, repo) = Self::parse_github_repo(repo_url)?;
+        let head_sha = self
+            .get_branch_ref(&owner, &repo, head_branch)
+            .await?
+            .ok_or_else(|| {
+                GitHubWriteError::RemoteConflict(format!(
+                    "operation branch '{head_branch}' disappeared during reconciliation"
+                ))
+            })?;
+        let base_sha = self
+            .get_branch_ref(&owner, &repo, base_branch)
+            .await?
+            .ok_or_else(|| GitHubWriteError::Api {
+                status: StatusCode::NOT_FOUND.as_u16(),
+                message: format!("base branch '{base_branch}' was not found"),
+            })?;
+        if head_sha == base_sha {
+            return Ok(head_sha);
+        }
+
+        let content_matches = self
+            .get_contents_file(&owner, &repo, file_path, head_branch)
+            .await?
+            .as_ref()
+            .is_some_and(|file| Self::contents_match(file, file_content.as_bytes()));
+        if content_matches {
+            self.verify_branch_diff(&owner, &repo, base_branch, head_branch, file_path)
+                .await?;
+            return Ok(head_sha);
+        }
+
+        Err(GitHubWriteError::RemoteConflict(format!(
+            "operation branch '{head_branch}' diverges from '{base_branch}' without the frozen payload"
+        )))
+    }
+
+    /// Ensure the branch contains the exact frozen file payload and return the
+    /// resulting commit SHA. Retries reuse matching content; conflicts are
+    /// reconciled with a read in case GitHub committed before its response was
+    /// lost.
+    pub(crate) async fn ensure_commit(
+        &self,
+        repo_url: &str,
+        head_branch: &str,
+        file_path: &str,
+        file_content: &str,
+        commit_message: &str,
+    ) -> Result<String, GitHubWriteError> {
+        Self::validate_endpoint(GITHUB_API).await?;
+        let (owner, repo) = Self::parse_github_repo(repo_url)?;
+        let existing = self
+            .get_contents_file(&owner, &repo, file_path, head_branch)
+            .await?;
+        if existing
+            .as_ref()
+            .is_some_and(|file| Self::contents_match(file, file_content.as_bytes()))
+        {
+            return self
+                .get_branch_ref(&owner, &repo, head_branch)
+                .await?
+                .ok_or_else(|| GitHubWriteError::Api {
+                    status: StatusCode::NOT_FOUND.as_u16(),
+                    message: format!("head branch '{head_branch}' disappeared"),
+                });
+        }
+
+        let url = format!("{GITHUB_API}/repos/{owner}/{repo}/contents/{file_path}");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(file_content.as_bytes());
+        let mut body = json!({
+            "message": commit_message,
+            "content": encoded,
+            "branch": head_branch,
+        });
+        if let Some(blob_sha) = existing.map(|file| file.sha) {
+            body["sha"] = json!(blob_sha);
+        }
+        let response = self.auth(self.http.put(&url)).json(&body).send().await?;
+        if matches!(
+            response.status(),
+            StatusCode::CONFLICT | StatusCode::UNPROCESSABLE_ENTITY
+        ) {
+            let reconciled = self
+                .get_contents_file(&owner, &repo, file_path, head_branch)
+                .await?;
+            if reconciled
+                .as_ref()
+                .is_some_and(|file| Self::contents_match(file, file_content.as_bytes()))
+            {
+                return self
+                    .get_branch_ref(&owner, &repo, head_branch)
+                    .await?
+                    .ok_or_else(|| GitHubWriteError::Api {
+                        status: StatusCode::NOT_FOUND.as_u16(),
+                        message: format!("head branch '{head_branch}' disappeared"),
+                    });
+            }
+            return Err(GitHubWriteError::RemoteConflict(format!(
+                "operation branch '{head_branch}' changed before the frozen payload could be committed"
+            )));
+        }
+        let update: ContentsUpdateResponse = Self::parse(response).await?;
+        Ok(update.commit.sha)
+    }
+
+    /// Confirm that the durable commit checkpoint is still the exact head and
+    /// still contains the frozen file. This is read-only: remote drift after a
+    /// checkpoint must stop reconciliation instead of silently adding it to the
+    /// pull request.
+    pub(crate) async fn verify_commit(
+        &self,
+        repo_url: &str,
+        base_branch: &str,
+        head_branch: &str,
+        file_path: &str,
+        file_content: &str,
+        expected_commit_sha: &str,
+    ) -> Result<(), GitHubWriteError> {
+        Self::validate_endpoint(GITHUB_API).await?;
+        let (owner, repo) = Self::parse_github_repo(repo_url)?;
+        let head_sha = self
+            .get_branch_ref(&owner, &repo, head_branch)
+            .await?
+            .ok_or_else(|| {
+                GitHubWriteError::RemoteConflict(format!(
+                    "operation branch '{head_branch}' no longer exists"
+                ))
+            })?;
+        if head_sha != expected_commit_sha {
+            return Err(GitHubWriteError::RemoteConflict(format!(
+                "operation branch '{head_branch}' moved from checkpoint {expected_commit_sha} to {head_sha}"
+            )));
+        }
+        let content_matches = self
+            .get_contents_file(&owner, &repo, file_path, head_branch)
+            .await?
+            .as_ref()
+            .is_some_and(|file| Self::contents_match(file, file_content.as_bytes()));
+        if !content_matches {
+            return Err(GitHubWriteError::RemoteConflict(format!(
+                "checkpointed commit {expected_commit_sha} no longer contains the frozen payload"
+            )));
+        }
+        self.verify_branch_diff(&owner, &repo, base_branch, head_branch, file_path)
+            .await?;
+        Ok(())
+    }
+
+    /// Find a PR created by this operation and verify both its durable body
+    /// marker and frozen file at the PR head. The head commit remains readable
+    /// after a merged PR's branch is deleted, so recovery does not need to
+    /// recreate remote state merely to finish its database checkpoint.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn find_existing_pull_request(
+        &self,
+        repo_url: &str,
+        base_branch: &str,
+        head_branch: &str,
+        file_path: &str,
+        file_content: &str,
+        pr_body: &str,
+    ) -> Result<Option<(OpenedPr, String)>, GitHubWriteError> {
+        Self::validate_endpoint(GITHUB_API).await?;
+        let (owner, repo) = Self::parse_github_repo(repo_url)?;
+        self.find_pull_request(
+            &owner,
+            &repo,
+            base_branch,
+            head_branch,
+            pr_body,
+            file_path,
+            file_content,
+        )
+        .await
+    }
+
+    /// Ensure exactly one PR exists for the deterministic head/base pair.
+    /// Closed and merged PRs are valid terminal remote markers and are reused.
+    pub(crate) async fn ensure_pull_request(
+        &self,
+        repo_url: &str,
+        base_branch: &str,
+        head_branch: &str,
+        file_path: &str,
+        file_content: &str,
+        pr_title: &str,
+        pr_body: &str,
+    ) -> Result<OpenedPr, GitHubWriteError> {
+        Self::validate_endpoint(GITHUB_API).await?;
+        let (owner, repo) = Self::parse_github_repo(repo_url)?;
+        if let Some(existing) = self
+            .find_pull_request(
+                &owner,
+                &repo,
+                base_branch,
+                head_branch,
+                pr_body,
+                file_path,
+                file_content,
+            )
+            .await?
+        {
+            return Ok(existing.0);
+        }
+
+        let url = format!("{GITHUB_API}/repos/{owner}/{repo}/pulls");
+        let body = json!({
+            "title": pr_title,
+            "head": head_branch,
+            "base": base_branch,
+            "body": pr_body,
+        });
+        let response = self.auth(self.http.post(&url)).json(&body).send().await?;
+        if response.status() == StatusCode::UNPROCESSABLE_ENTITY {
+            if let Some(existing) = self
+                .find_pull_request(
+                    &owner,
+                    &repo,
+                    base_branch,
+                    head_branch,
+                    pr_body,
+                    file_path,
+                    file_content,
+                )
+                .await?
+            {
+                return Ok(existing.0);
+            }
+            return Err(GitHubWriteError::RemoteConflict(format!(
+                "GitHub rejected PR creation and no matching operation PR was discoverable for '{head_branch}'"
+            )));
+        }
+        let pull: PullResponse = Self::parse(response).await?;
+        self.verify_pull_request_diff(&owner, &repo, pull.number, file_path)
+            .await?;
+        let content_matches = self
+            .get_contents_file(&owner, &repo, file_path, &pull.head.sha)
+            .await?
+            .as_ref()
+            .is_some_and(|file| Self::contents_match(file, file_content.as_bytes()));
+        if !content_matches {
+            return Err(GitHubWriteError::RemoteConflict(format!(
+                "new pull request #{} does not contain the frozen payload",
+                pull.number
+            )));
+        }
+        Ok(OpenedPr {
+            html_url: pull.html_url.clone(),
+            number: pull.number,
+            state: pull_state(&pull),
+        })
+    }
+
+    /// Compatibility wrapper for callers that do not persist staged
+    /// checkpoints. Tuning uses the durable reconciler in `push_service`.
     #[allow(clippy::too_many_arguments)]
     pub async fn open_pr(
         &self,
@@ -342,72 +825,84 @@ impl GitHubWriteClient {
         pr_title: &str,
         pr_body: &str,
     ) -> Result<OpenedPr, GitHubWriteError> {
-        Self::validate_endpoint(GITHUB_API).await?;
-        let (owner, repo) = Self::parse_github_repo(repo_url)?;
+        self.ensure_branch(repo_url, base_branch, head_branch)
+            .await?;
+        self.ensure_commit(
+            repo_url,
+            head_branch,
+            file_path,
+            file_content,
+            commit_message,
+        )
+        .await?;
+        self.ensure_pull_request(
+            repo_url,
+            base_branch,
+            head_branch,
+            file_path,
+            file_content,
+            pr_title,
+            pr_body,
+        )
+        .await
+    }
+}
 
-        // 1. Resolve the base branch tip SHA.
-        let base_sha = {
-            let url = format!("{GITHUB_API}/repos/{owner}/{repo}/git/ref/heads/{base_branch}");
-            let resp = self.auth(self.http.get(&url)).send().await?;
-            let r: RefResponse = Self::parse(resp).await?;
-            r.object.sha
-        };
+fn pull_body_matches_operation(actual: Option<&str>, expected: &str) -> bool {
+    let Some(actual) = actual else {
+        return false;
+    };
+    if actual == expected {
+        return true;
+    }
 
-        // 2. Create the head branch ref. A 422 means it already exists.
-        {
-            let url = format!("{GITHUB_API}/repos/{owner}/{repo}/git/refs");
-            let body = json!({ "ref": format!("refs/heads/{head_branch}"), "sha": base_sha });
-            let resp = self.auth(self.http.post(&url)).json(&body).send().await?;
-            if resp.status() == StatusCode::UNPROCESSABLE_ENTITY {
-                return Err(GitHubWriteError::BranchExists(head_branch.to_string()));
-            }
-            let _: serde_json::Value = Self::parse(resp).await?;
-        }
+    // NAN-1768 could leave an orphan PR immediately before NAN-1771 added the
+    // explicit operation marker. Its full generated body still carries the
+    // proposal and rule identities, so accept only that exact legacy body.
+    let Some(marker) = expected
+        .lines()
+        .find(|line| line.starts_with("<!-- nano-pr-operation: "))
+    else {
+        return false;
+    };
+    if actual.lines().any(|line| line.trim() == marker) {
+        return true;
+    }
+    actual == expected.replace(&format!("\n{marker}\n"), "")
+}
 
-        // 3. Look up the file's current blob SHA on the head branch (for update).
-        let existing_sha = {
-            let url = format!(
-                "{GITHUB_API}/repos/{owner}/{repo}/contents/{file_path}?ref={head_branch}"
-            );
-            let resp = self.auth(self.http.get(&url)).send().await?;
-            if resp.status() == StatusCode::NOT_FOUND {
-                None
-            } else {
-                let f: ContentsFile = Self::parse(resp).await?;
-                Some(f.sha)
-            }
-        };
+fn ensure_exact_operation_diff(
+    files: &[ChangedFile],
+    expected_path: &str,
+    remote_kind: &str,
+) -> Result<(), GitHubWriteError> {
+    if files.len() == 1
+        && files[0].filename == expected_path
+        && matches!(files[0].status.as_str(), "added" | "modified")
+        && files[0].previous_filename.is_none()
+    {
+        return Ok(());
+    }
+    let paths = files
+        .iter()
+        .take(5)
+        .map(|file| file.filename.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(GitHubWriteError::RemoteConflict(format!(
+        "{remote_kind} changes paths outside the frozen destination '{expected_path}' (observed: {paths})"
+    )))
+}
 
-        // 4. Commit the file (create or update) onto the head branch.
-        {
-            let url = format!("{GITHUB_API}/repos/{owner}/{repo}/contents/{file_path}");
-            let encoded = base64::engine::general_purpose::STANDARD.encode(file_content.as_bytes());
-            let mut body = json!({
-                "message": commit_message,
-                "content": encoded,
-                "branch": head_branch,
-            });
-            if let Some(sha) = existing_sha {
-                body["sha"] = json!(sha);
-            }
-            let resp = self.auth(self.http.put(&url)).json(&body).send().await?;
-            let _: serde_json::Value = Self::parse(resp).await?;
-        }
+fn default_pull_state() -> String {
+    "open".to_string()
+}
 
-        // 5. Open the PR.
-        let url = format!("{GITHUB_API}/repos/{owner}/{repo}/pulls");
-        let body = json!({
-            "title": pr_title,
-            "head": head_branch,
-            "base": base_branch,
-            "body": pr_body,
-        });
-        let resp = self.auth(self.http.post(&url)).json(&body).send().await?;
-        let pr: PullResponse = Self::parse(resp).await?;
-        Ok(OpenedPr {
-            html_url: pr.html_url,
-            number: pr.number,
-        })
+fn pull_state(pull: &PullResponse) -> String {
+    if pull.merged_at.is_some() {
+        "merged".to_string()
+    } else {
+        pull.state.clone()
     }
 }
 
