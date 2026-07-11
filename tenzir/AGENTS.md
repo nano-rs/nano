@@ -14,12 +14,17 @@ Ground truth for field mappings is the parser set in the **parsers repo**
 ## TL;DR — the rules that bite
 
 1. **Sink is fixed. Do not change it.** Write with the native `to_clickhouse`
-   operator into `nanosiem.ocsf_logs_native_raw`, `tls=false`, `mode="append"`,
+   operator into `nanosiem.ocsf_logs_raw`, `tls=false`, `mode="append"`,
    native port `9000`. Editing the table name or sink will break ingestion.
-2. **Requires Tenzir ≥ 6.4.0.** Earlier releases' `to_clickhouse` cannot write a
-   ClickHouse `JSON` column (`unsupported ClickHouse type 'JSON'`).
-3. **Target `ocsf_logs_native_raw`, never `ocsf_logs_raw` directly.** See
-   [Why the native entrypoint](#why-the-native-entrypoint).
+2. **Requires Tenzir ≥ 6.6.0.** The first release whose `to_clickhouse` accepts
+   `ocsf_logs_raw`'s column types AND omits server-derived columns it doesn't
+   send. On Tenzir 6.4.0–6.5.x, target the legacy `nanosiem.ocsf_logs_native_raw`
+   entrypoint instead — see
+   [Target table & the legacy entrypoint](#target-table--the-legacy-entrypoint).
+3. **Send only `{event, source_type}`.** `timestamp` and `id` are server-derived
+   — leave them out and their ClickHouse DEFAULTs fire. A **null** in a required
+   column still drops the event even with a DEFAULT (only ABSENT columns default),
+   so guard mapped values like `source_type` with `.otherwise("unknown")`.
 4. **Wire shape is `{event, source_type}`.** `event` is the full OCSF 1.8.0
    object; it MUST carry `class_uid` and `time` (epoch **milliseconds**).
 5. **Lowercase** `source_type` and any value you write that nano lowercases at
@@ -31,7 +36,7 @@ Ground truth for field mappings is the parser set in the **parsers repo**
 ## The sink (copy verbatim)
 
 ```tql
-to_clickhouse table="nanosiem.ocsf_logs_native_raw",
+to_clickhouse table="nanosiem.ocsf_logs_raw",
   host=env("NANO_CH_HOST").otherwise("clickhouse"),
   port=int(env("NANO_CH_NATIVE_PORT").otherwise("9000")),
   user=env("NANO_CH_INGEST_USER").otherwise("nanosiem_ingest"),
@@ -50,34 +55,44 @@ Why each argument:
 
 ---
 
-## Why the native entrypoint
+## Target table & the legacy entrypoint
 
-`to_clickhouse`'s `append` mode validates **every column type on the target
-table** — even DEFAULT columns it never writes — and rejects:
+Write directly to **`nanosiem.ocsf_logs_raw`** (Tenzir ≥ 6.6.0). It's an
+`ENGINE = Null` landing table exposing `event JSON` + `source_type` +
+server-derived `timestamp` + `id`. You send only `{event, source_type}`;
+`ocsf_logs_raw_mv` derives every promoted / enriched / prevalence column into
+`nanosiem.ocsf_logs`:
 
-| Column type | Verdict |
-|---|---|
-| `JSON` / `Nullable(JSON)` | OK (Tenzir ≥ 6.4.0 only) |
-| `String` | OK |
-| `LowCardinality(String)` | **rejected** — wants plain `String` |
-| `DateTime64(3, 'UTC')` | **rejected** — wants bare `DateTime64(9)` |
-| `DateTime64(9, 'UTC')` | **rejected** — the timezone arg itself is the blocker |
+```
+to_clickhouse → ocsf_logs_raw → ocsf_logs_raw_mv → ocsf_logs
+```
 
-`nanosiem.ocsf_logs_raw` (the table the Vector lane and HTTP clients use) carries
-both a `LowCardinality(String) source_type` and a `DateTime64(3, 'UTC') timestamp`,
-so `to_clickhouse` cannot target it. `nanosiem.ocsf_logs_native_raw` exposes only
-`event JSON` + `source_type String`; a forwarding MV pushes `(event, source_type)`
-into `ocsf_logs_raw`, where the existing timestamp/id DEFAULTs and
-`ocsf_logs_raw_mv` do all promotion. ClickHouse cascades MVs through the
-`ENGINE = Null` entrypoint, so the full chain runs:
+**Why 6.6.0.** `append` mode validates **every column type on the target
+table** — even DEFAULT columns it never writes — and older releases rejected two
+of `ocsf_logs_raw`'s columns. 6.6.0 also learned to **omit columns absent from
+the record** so their ClickHouse DEFAULTs fire (older releases dropped the event):
+
+| `ocsf_logs_raw` column | Tenzir ≤ 6.5.x | Tenzir ≥ 6.6.0 |
+|---|---|---|
+| `event JSON` | OK (≥ 6.4.0) | OK |
+| `source_type LowCardinality(String)` | **rejected** — wants plain `String` | OK |
+| `timestamp DateTime64(3, 'UTC')` | **rejected** — the timezone arg blocks it | OK |
+| absent `timestamp` / `id` (server-derived) | **event dropped** | omitted → DEFAULT fires |
+
+**Legacy fallback (Tenzir 6.4.0–6.5.x).** If you're pinned to an older node,
+target `nanosiem.ocsf_logs_native_raw` instead — a thin `ENGINE = Null` shim
+exposing only `event JSON` + `source_type String` (the types those releases
+accept), whose forwarding MV pushes `(event, source_type)` into `ocsf_logs_raw`:
 
 ```
 to_clickhouse → ocsf_logs_native_raw → (forwarding MV) → ocsf_logs_raw → ocsf_logs_raw_mv → ocsf_logs
 ```
 
-No projection is duplicated; `ocsf_logs_raw_mv` stays the single source of truth
-for derivation/enrichment. (Schema: `clickhouse/ocsf/init.sql`. Rationale:
-NAN-1603.)
+Same wire shape, same result, one extra hop. It stays supported but is
+**deprecated** in favour of the direct write. No projection is duplicated either
+way; `ocsf_logs_raw_mv` is the single source of truth for derivation/enrichment.
+(Schema: `clickhouse/ocsf/init.sql`. Rationale: NAN-1603 added the native shim;
+NAN-1788 made the direct `ocsf_logs_raw` write the default on Tenzir 6.6.0.)
 
 ---
 
@@ -159,9 +174,10 @@ scale too — local 2M-row timing can mislead.
 | Symptom | Cause / fix |
 |---|---|
 | `OpenSSL error: wrong version number` | `to_clickhouse` defaulted to TLS. Add `tls=false`. |
-| `unsupported ClickHouse type 'JSON'` | Tenzir < 6.4.0, or a clickhouse-cpp sink. Upgrade to ≥ 6.4.0. |
-| `unsupported ClickHouse type 'DateTime64(...)'` / `LowCardinality` | You targeted `ocsf_logs_raw`. Use `ocsf_logs_native_raw`. |
-| `ACCESS_DENIED` on insert | `nanosiem_ingest` lacks INSERT/SELECT on the entrypoint. Grants ship in `clickhouse/users.d/nanosiem-users.xml`; reload with `SYSTEM RELOAD USERS` (or redeploy). |
+| `unsupported ClickHouse type 'JSON'` | Tenzir < 6.4.0, or a clickhouse-cpp sink. Upgrade to ≥ 6.6.0. |
+| `unsupported ClickHouse type 'DateTime64(...)'` / `LowCardinality` | Tenzir < 6.6.0 writing to `ocsf_logs_raw`. Upgrade to ≥ 6.6.0, or target the legacy `ocsf_logs_native_raw` entrypoint. |
+| `required column missing in input` / events silently dropped | Tenzir < 6.6.0 can't omit the server-derived `timestamp`/`id`, or a **null** in a required column (nulls drop the event even with a DEFAULT). Upgrade to ≥ 6.6.0 and guard mapped values with `.otherwise(...)`. |
+| `ACCESS_DENIED` on insert | `nanosiem_ingest` lacks INSERT/SELECT on the target (`ocsf_logs_raw`, or `ocsf_logs_native_raw` on the legacy path) or `SELECT` on the `*_prevalence_agg` tables the MV cascade reads (NAN-1787). Grants ship in `clickhouse/users.d/nanosiem-users.xml`; reload with `SYSTEM RELOAD USERS` (or redeploy). |
 | Rows land as `source_type='unknown'` | Set a lowercase `source_type` on each record. |
 | Rows present but `timestamp` is "now" | `event.time` missing/garbage → fell back to insert time. Emit epoch ms. |
 | `event` is a JSON **string**, not an object | Emit a JSON object; a stringified blob fails parsing and async inserts can drop the batch. |

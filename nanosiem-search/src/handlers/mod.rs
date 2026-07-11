@@ -37,7 +37,7 @@ pub use assets::{
 };
 pub use cloud_dossier::get_cloud_dossier;
 pub use cloud_overview::get_cloud_overview;
-pub use health::{health, ready};
+pub use health::{health, livez, ready};
 pub use identity::resolve_identity;
 pub use otel::{
     get_metric_timeseries, get_rum_summary, get_service_detail, get_trace, list_infra_hosts,
@@ -116,6 +116,7 @@ pub enum SearchResultResponse {
         saved_searches::share_saved_search,
         health::health,
         health::ready,
+        health::livez,
         retro::retro,
         assets::get_asset_events,
         assets::get_cloud_events,

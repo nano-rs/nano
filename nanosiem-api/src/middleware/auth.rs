@@ -45,6 +45,8 @@ const PUBLIC_ENDPOINTS: &[&str] = &[
     // 200/503 control-plane check runs, so the pod never becomes Ready. The
     // IP-allowlist middleware already bypasses /ready — keep the two in sync.
     "/ready",
+    // Shallow liveness probe (NAN-1786) — unauthenticated, like /health//ready.
+    "/livez",
     "/api/auth/login",
     "/api/auth/refresh",
     "/api/auth/password/reset-request",
@@ -508,6 +510,7 @@ mod tests {
         // Exact matches
         assert!(is_public_endpoint("/health"));
         assert!(is_public_endpoint("/ready"));
+        assert!(is_public_endpoint("/livez"));
         assert!(is_public_endpoint("/api/auth/login"));
         assert!(is_public_endpoint("/api/auth/refresh"));
         assert!(is_public_endpoint("/api/auth/oidc/providers"));

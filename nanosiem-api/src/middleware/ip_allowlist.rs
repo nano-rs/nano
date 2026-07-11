@@ -20,7 +20,7 @@ use std::sync::Arc;
 use nanosiem_core::ip_allowlist::{IpAllowlistScope, IpAllowlistService};
 
 /// Endpoints that bypass IP allowlist checks (infrastructure probes)
-const BYPASS_ENDPOINTS: &[&str] = &["/health", "/ready", "/metrics"];
+const BYPASS_ENDPOINTS: &[&str] = &["/health", "/ready", "/livez", "/metrics"];
 
 /// State for the IP allowlist middleware
 #[derive(Clone)]

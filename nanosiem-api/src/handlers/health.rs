@@ -229,6 +229,27 @@ pub async fn ready_check(State(state): State<AppState>) -> impl axum::response::
     }))
 }
 
+/// Shallow liveness/readiness probe (NAN-1786).
+///
+/// Returns 200 whenever the process is running and the HTTP server is
+/// responsive — it deliberately touches NO dependencies. The listener only
+/// binds after DualPool init + migrations (see `main.rs`), so "serving" already
+/// implies "booted with deps present". This is what Kubernetes liveness (and
+/// readiness) probes should target: gating them on a live PG/CH check — as
+/// `/health` (deep PG+CH+shards) and `/ready` (control-plane) do — restart-storms
+/// or de-pools every replica on a transient backend blip. `/health` and `/ready`
+/// remain for monitoring/dashboards, not for k8s probes.
+#[utoipa::path(
+    get, path = "/livez", tag = "health",
+    responses((status = 200, description = "Process is alive", body = PublicHealthResponse)),
+    security(())
+)]
+pub async fn livez() -> Json<PublicHealthResponse> {
+    Json(PublicHealthResponse {
+        status: "alive".to_string(),
+    })
+}
+
 /// Detailed health check endpoint (authenticated)
 ///
 /// Returns health status for all configured databases and downstream services.
@@ -355,7 +376,7 @@ pub async fn health_check_detailed(
 
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(health_check, ready_check, health_check_detailed),
+    paths(health_check, ready_check, livez, health_check_detailed),
     components(schemas(
         PublicHealthResponse,
         HealthResponse,

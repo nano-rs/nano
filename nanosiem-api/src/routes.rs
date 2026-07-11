@@ -254,6 +254,10 @@ pub fn create_router(state: AppState) -> Router {
         // Health check (public - minimal info only)
         .route("/health", get(handlers::health_check))
         .route("/ready", get(handlers::ready_check))
+        // Shallow liveness/readiness probe — no dep checks (NAN-1786). What k8s
+        // liveness/readiness probes should target; /health and /ready are deep
+        // (dependency-gated) and are for monitoring, not probes.
+        .route("/livez", get(handlers::livez))
         // Detailed health check (authenticated - full diagnostics)
         .route("/health/detailed", get(handlers::health_check_detailed))
         // Build edition + capability flags (public; the SPA hits this on boot

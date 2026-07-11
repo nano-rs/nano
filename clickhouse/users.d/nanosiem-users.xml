@@ -145,6 +145,18 @@
         <query>GRANT dictGet ON nanosiem.ioc_enrichment_dict</query>
         <query>GRANT dictGet ON nanosiem.ip_enrichment_dict</query>
         <query>GRANT dictGet ON nanosiem.ip_prevalence_dict</query>
+        <!-- NAN-1787: same chained-MV class as NAN-1400. An ocsf_logs insert fires
+             the OCSF prevalence MVs (ocsf_*_prevalence_summary_*_mv) which write
+             INTO the *_prevalence_agg tables; that write in turn fires
+             {ip,hash,domain}_prevalence_summary_mv, whose SELECT reads FROM the agg
+             table and runs under the INSERTING user. Without table-level SELECT on
+             the agg tables, any OCSF event carrying a src_ip / hash / domain fails
+             497 AFTER committing the ocsf_logs part (row lands, insert errors,
+             producer retries -> duplicates). MV *target* pushes aren't grant-checked,
+             so SELECT on the three agg tables is the complete fix. -->
+        <query>GRANT SELECT ON nanosiem.ip_prevalence_agg</query>
+        <query>GRANT SELECT ON nanosiem.hash_prevalence_agg</query>
+        <query>GRANT SELECT ON nanosiem.domain_prevalence_agg</query>
       </grants>
     </nanosiem_ingest>
   </users>

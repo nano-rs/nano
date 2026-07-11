@@ -11,7 +11,7 @@ and INSERTs straight into `nanosiem.ocsf_logs_raw` as the INSERT-only
 ```
 log-blaster --tenzir ─NDJSON {message, timestamp, source_type}→ Tenzir accept_http :9095
   → route on source_type → parse raw (JSON / Apache combined log) → OCSF 1.8.0
-  → {event, source_type} → ClickHouse HTTP INSERT (nanosiem.ocsf_logs_raw)
+  → {event, source_type} → native to_clickhouse INSERT (nanosiem.ocsf_logs_raw)
 ```
 
 Producer contract: `docs/user-guide/direct-ocsf-ingestion.md`.
@@ -62,18 +62,25 @@ Environment knobs on the pipeline: `NANO_CH_INGEST_USER` (default
 `NANO_CH_HOST` (default `clickhouse`), `NANO_CH_NATIVE_PORT` (default `9000`),
 `NANO_TENZIR_LISTEN` (default `0.0.0.0:9095`).
 
-### Sink: native `to_clickhouse` (NAN-1603)
+### Sink: native `to_clickhouse` (NAN-1788)
 
 The rig streams to ClickHouse via the native `to_clickhouse` operator over the
-native protocol (port 9000) into the dedicated `nanosiem.ocsf_logs_native_raw`
-entrypoint. **Requires Tenzir ≥ 6.4.0** (the first release whose `to_clickhouse`
-can write a ClickHouse `JSON` column). The legacy `to_http`-JSONEachRow shooter
-was removed — native is the only path.
+native protocol (port 9000) directly into `nanosiem.ocsf_logs_raw`. **Requires
+Tenzir ≥ 6.6.0** — the first release whose `to_clickhouse` accepts
+`ocsf_logs_raw`'s `LowCardinality(String)` / timezone-qualified `DateTime64(3,
+'UTC')` columns and omits the server-derived `timestamp`/`id` so their ClickHouse
+DEFAULTs fire. The rig runs the unpinned `tenzir/tenzir` image, which tracks the
+same v6.6.0+ floor as the bundled pipeline. The legacy `to_http`-JSONEachRow
+shooter was removed (NAN-1603); native is the only path.
 
-A separate entrypoint table is required because `to_clickhouse`'s append mode
-rejects `ocsf_logs_raw`'s `LowCardinality` / timezone-qualified `DateTime64`
-columns; `ocsf_logs_native_raw` exposes only `event JSON` + `source_type String`
-and forwards into the same `ocsf_logs_raw_mv` derivation chain. Full rationale:
+On Tenzir 6.4.0–6.5.x, target the legacy `nanosiem.ocsf_logs_native_raw`
+entrypoint instead — a thin `ENGINE = Null` shim exposing only `event JSON` +
+`source_type String` (the types those releases accept), whose forwarding MV
+pushes `(event, source_type)` into `ocsf_logs_raw` and the same
+`ocsf_logs_raw_mv` derivation chain. It's kept as the older-Tenzir fallback but
+deprecated in favour of the direct write. Guard mapped values like `source_type`
+with `.otherwise(...)`: a null in a required column drops the event even with a
+DEFAULT (only ABSENT columns default). Full rationale:
 `docs/user-guide/direct-ocsf-ingestion.md`.
 
 ## Design notes
@@ -96,8 +103,9 @@ and forwards into the same `ocsf_logs_raw_mv` derivation chain. Full rationale:
   the parser.yaml intends); the deployed Vector VRL's `string()` errors on
   the integer `record_id` and falls back to `uuid_v4()`, so Vector-lane rows
   carry a random UUID there instead.
-- Validated against Tenzir v6.1 (`tenzir/tenzir` image). `from_http
-  server=true` was removed in v6 — `accept_http` is the listener.
+- Runs on the unpinned `tenzir/tenzir` image (v6.6.0+, per the sink floor
+  above). `from_http server=true` was removed in v6 — `accept_http` is the
+  listener.
 
 For the sink rules, OCSF mapping conventions, validation recipe, and gotchas
 when authoring/fixing any Tenzir → OCSF → nano pipeline, see **`tenzir/AGENTS.md`**

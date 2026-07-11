@@ -770,6 +770,8 @@ pub fn create_router(
         // Health endpoint (not metrics - that's handled by prometheus)
         .route("/health", get(handlers::health))
         .route("/ready", get(handlers::ready))
+        // Shallow liveness/readiness probe — no dep checks (NAN-1786).
+        .route("/livez", get(handlers::livez))
         // Add middleware
         // M9: Limit request body size to 256KB to prevent DoS via oversized payloads
         .layer(axum::extract::DefaultBodyLimit::max(256 * 1024))

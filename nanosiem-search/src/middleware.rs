@@ -63,7 +63,7 @@ impl std::fmt::Display for RequestId {
 }
 
 /// Public endpoints that don't require authentication
-const PUBLIC_ENDPOINTS: &[&str] = &["/health", "/ready", "/metrics"];
+const PUBLIC_ENDPOINTS: &[&str] = &["/health", "/ready", "/livez", "/metrics"];
 
 /// Error response for authentication failures
 #[derive(Debug, Serialize)]
@@ -505,7 +505,7 @@ pub async fn request_id_middleware(mut request: Request, next: Next) -> Response
 // ============================================================================
 
 /// Endpoints that bypass IP allowlist checks (infrastructure probes)
-const IP_BYPASS_ENDPOINTS: &[&str] = &["/health", "/ready", "/metrics"];
+const IP_BYPASS_ENDPOINTS: &[&str] = &["/health", "/ready", "/livez", "/metrics"];
 
 /// State for the IP allowlist middleware
 #[derive(Clone)]

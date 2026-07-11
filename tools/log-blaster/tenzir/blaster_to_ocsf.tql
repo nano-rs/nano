@@ -7,12 +7,16 @@
 // native Vector OCSF parsers (parsers-ocsf/{apache,aws_cloudtrail,
 // conduit_proxy,sysmon_json,windows_event}/parser.yaml), wraps each record in
 // the wire shape {event, source_type}, and streams it via the native
-// `to_clickhouse` operator into nanosiem.ocsf_logs_native_raw per the producer
+// `to_clickhouse` operator into nanosiem.ocsf_logs_raw per the producer
 // contract (docs/user-guide/direct-ocsf-ingestion.md).
 //
-// NAN-1603: the legacy HTTP `to_http`-JSONEachRow sink is removed — native
-// `to_clickhouse` (requires Tenzir >= 6.4.0, which can write ClickHouse JSON
-// columns) is the only supported path.
+// NAN-1788: native `to_clickhouse` writes straight into ocsf_logs_raw. Requires
+// Tenzir >= 6.6.0 — the first release whose to_clickhouse accepts ocsf_logs_raw's
+// LowCardinality / tz-qualified DateTime64 columns AND omits the server-derived
+// timestamp/id so their ClickHouse DEFAULTs fire. This rig runs the unpinned
+// tenzir/tenzir image (v6.6.0+, matching the bundled pipeline). On Tenzir
+// 6.4.0–6.5.x, target the legacy nanosiem.ocsf_logs_native_raw entrypoint
+// instead. The legacy HTTP `to_http`-JSONEachRow sink was removed in NAN-1603.
 //
 // Run it (see tenzir/README.md for the full recipe):
 //
@@ -866,12 +870,15 @@ if src == "windows_sysmon" {
 }
 
 // ---- producer-contract wire shape + sink ----------------------------------
+// `src` is guarded with `.otherwise("unknown")` above — a null in a required
+// column drops the event even with a DEFAULT (only ABSENT columns default).
 this = {event: ev, source_type: src}
-// NAN-1603: native `to_clickhouse` (Tenzir >= 6.4.0) streams straight into the
-// ocsf_logs_native_raw entrypoint over the native protocol — no HTTP shooter,
-// no per-second micro-batching. `mode="append"` writes the existing JSON
-// `event` column (the v6.4.0 fix); `tls=false` because the in-cluster CH port
-// is plaintext (the operator defaults to TLS otherwise). The native entrypoint
-// exists because to_clickhouse rejects ocsf_logs_raw's LowCardinality /
-// tz-qualified DateTime64 columns — see clickhouse/ocsf/init.sql.
-to_clickhouse table="nanosiem.ocsf_logs_native_raw", host=$ch_host, port=$ch_port, user=$ch_user, password=env("NANO_CH_INGEST_PASSWORD"), tls=false, mode="append"
+// NAN-1788: native `to_clickhouse` (Tenzir >= 6.6.0) streams straight into
+// ocsf_logs_raw over the native protocol — no HTTP shooter, no per-second
+// micro-batching. `mode="append"` writes the existing JSON `event` column;
+// `tls=false` because the in-cluster CH port is plaintext (the operator
+// defaults to TLS otherwise). 6.6.0 is the first release whose to_clickhouse
+// accepts ocsf_logs_raw's LowCardinality / tz-qualified DateTime64 columns and
+// omits the server-derived timestamp/id. On Tenzir 6.4.0–6.5.x, target the
+// legacy ocsf_logs_native_raw entrypoint instead — see clickhouse/ocsf/init.sql.
+to_clickhouse table="nanosiem.ocsf_logs_raw", host=$ch_host, port=$ch_port, user=$ch_user, password=env("NANO_CH_INGEST_PASSWORD"), tls=false, mode="append"

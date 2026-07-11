@@ -161,6 +161,7 @@ mod tests {
             "/api/search/rum",
             "/health",
             "/ready",
+            "/livez",
         ];
 
         for path in &expected {

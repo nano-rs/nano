@@ -40,14 +40,27 @@ accept_http $listen { read_ndjson }
 // parsing + OCSF mapping here and set a lowercase `source_type` per feed.
 // Every record's `event` must carry `class_uid` and `time` (epoch ms).
 this = { event: this, source_type: "tenzir" }
+// Guard: `to_clickhouse` drops an event that has a NULL in a required column —
+// even one that has a ClickHouse DEFAULT (only ABSENT columns take the default).
+// If you map `source_type` from event data and it can be null, keep this
+// fallback so a missing value lands as `unknown` instead of dropping the row.
+source_type = source_type.otherwise("unknown")
 // ───────────────────────────────────────────────────────────────────────────
 
 // ── SINK (pre-wired — keep the table) ──────────────────────────────────────
-// Native to_clickhouse into nano's OCSF entrypoint. nano's materialized-view
-// chain derives every promoted / enriched / prevalence column into
-// `nanosiem.ocsf_logs`. Requires Tenzir >= 6.4.0 (JSON-column support).
+// Native to_clickhouse straight into nano's OCSF landing table. nano's
+// materialized-view chain derives every promoted / enriched / prevalence column
+// into `nanosiem.ocsf_logs`; you send only {event, source_type} and the server
+// fills the timestamp (from event.time) and the row id.
+//
+// Requires Tenzir >= 6.6.0 — the first release whose `to_clickhouse` accepts
+// ocsf_logs_raw's LowCardinality(String) + DateTime64(3, 'UTC') columns AND
+// omits the server-derived columns it doesn't send (timestamp, id) so their
+// DEFAULTs fire. On Tenzir 6.4.0–6.5.x, target the legacy
+// `nanosiem.ocsf_logs_native_raw` entrypoint instead (a thin JSON/String shim
+// that forwards into ocsf_logs_raw) — see tenzir/AGENTS.md.
 // `tls=false` — the native port is plaintext on the internal docker network.
-to_clickhouse table="nanosiem.ocsf_logs_native_raw",
+to_clickhouse table="nanosiem.ocsf_logs_raw",
   host=$ch_host, port=$ch_port,
   user=$ch_user, password=env("CLICKHOUSE_INGEST_PASSWORD"),
   tls=false, mode="append"

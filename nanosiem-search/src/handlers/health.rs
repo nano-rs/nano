@@ -89,3 +89,24 @@ pub async fn ready(State(state): State<SearchState>) -> impl axum::response::Int
         (axum::http::StatusCode::SERVICE_UNAVAILABLE, body)
     }
 }
+
+/// Shallow liveness/readiness probe (NAN-1786).
+///
+/// Returns 200 whenever the process is responsive — it touches NO dependencies.
+/// `/health` and `/ready` are deep (ClickHouse / leader-gated) and are for
+/// monitoring; k8s liveness/readiness probes should target this instead so a
+/// backend blip doesn't restart-storm or de-pool every replica.
+#[utoipa::path(
+    get,
+    path = "/livez",
+    tag = "health",
+    security(()),
+    responses(
+        (status = 200, description = "Process is alive", body = HealthResponse),
+    )
+)]
+pub async fn livez() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "alive".to_string(),
+    })
+}
