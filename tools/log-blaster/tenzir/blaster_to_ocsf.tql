@@ -873,6 +873,18 @@ if src == "windows_sysmon" {
 // `src` is guarded with `.otherwise("unknown")` above — a null in a required
 // column drops the event even with a DEFAULT (only ABSENT columns default).
 this = {event: ev, source_type: src}
+
+// NAN-1839: coalesce before the sink. This rig emits maximally HETEROGENEOUS
+// OCSF (every class / field-set is a distinct Tenzir schema), so without this the
+// stream fragments into ~1-row table slices and `to_clickhouse` does one native
+// INSERT per event — at 200 eps that backs up in memory and OOM-kills the node
+// (measured: avg 1.4 rows/insert, 0.5% landed). `batch` buffers PER SCHEMA and in
+// the default ORDERED mode flushes on every schema change (can't coalesce
+// interleaved schemas); `unordered { batch }` accumulates same-schema events into
+// large inserts (measured avg ~23 rows/insert, max 183, bounded memory, 16× more
+// landed). Ordering is irrelevant once rows are in ClickHouse.
+unordered { batch 65536, timeout=2s }
+
 // NAN-1788: native `to_clickhouse` (Tenzir >= 6.6.0) streams straight into
 // ocsf_logs_raw over the native protocol — no HTTP shooter, no per-second
 // micro-batching. `mode="append"` writes the existing JSON `event` column;

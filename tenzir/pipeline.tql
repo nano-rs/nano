@@ -64,6 +64,19 @@ this = { event: this, source_type: "tenzir" }
 source_type = source_type.otherwise("unknown")
 // ───────────────────────────────────────────────────────────────────────────
 
+// ── BATCH (coalesce before the sink — keep this) ───────────────────────────
+// ClickHouse wants big inserts, not a storm of 1-row parts. A mapping that
+// produces HETEROGENEOUS events (real OCSF: each class / field-set is a distinct
+// Tenzir schema) fragments the stream into ~1-row table slices, and
+// `to_clickhouse` then issues one native INSERT per event — which at volume
+// backs up in the node's memory buffer and OOM-kills it (NAN-1839). `batch`
+// buffers PER SCHEMA and, in the default ORDERED mode, flushes on every schema
+// change (so it can't coalesce interleaved schemas); `unordered { batch }`
+// accumulates same-schema events across the stream into large inserts (measured
+// ~1.4 → 23 rows/insert, OOM → bounded memory). Order is irrelevant once rows
+// are in ClickHouse. Raise `timeout` for bigger batches at a little more latency.
+unordered { batch 65536, timeout=2s }
+
 // ── SINK (pre-wired — keep the table) ──────────────────────────────────────
 // Native to_clickhouse straight into nano's OCSF landing table. nano's
 // materialized-view chain derives every promoted / enriched / prevalence column

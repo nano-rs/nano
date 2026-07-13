@@ -30,6 +30,10 @@ Ground truth for field mappings is the parser set in the **parsers repo**
 5. **Lowercase** `source_type` and any value you write that nano lowercases at
    ingest (IPs, hostnames, hashes).
 6. You own everything between source and sink: parse + map your logs to OCSF.
+7. **Batch before the sink.** Put `unordered { batch }` right before
+   `to_clickhouse` — real OCSF is schema-heterogeneous, and without it every event
+   becomes a 1-row native INSERT that OOM-kills the node under load. See
+   [Batch before the sink](#batch-before-the-sink).
 
 ---
 
@@ -52,6 +56,32 @@ Why each argument:
 - `port=9000` — the **native** protocol, not the `8123` HTTP port.
 - `mode="append"` — the table exists; do not create it. (The `json=` argument is
   create-mode only and **errors** with `append`.)
+
+---
+
+## Batch before the sink
+
+Put this **immediately before** `to_clickhouse`:
+
+```tql
+unordered { batch 65536, timeout=2s }
+```
+
+ClickHouse wants big inserts, not a storm of 1-row parts. Real OCSF is
+**maximally heterogeneous** — every class / field-set is a distinct Tenzir
+schema — so the mapped stream fragments into ~1-row table slices and
+`to_clickhouse` issues **one native INSERT per event**. At volume that backs up
+in the node's in-memory buffer and **OOM-kills it** (measured: avg 1.4
+rows/insert, ~0.5 % landed at 200 eps, node SIGKILL'd at its memory limit).
+
+`batch` buffers **per schema** and, in the default **ordered** mode, flushes on
+every schema change — so it can't coalesce an interleaved heterogeneous stream.
+`unordered { batch }` accumulates same-schema events across the stream into large
+inserts. Measured on the OCSF rig: **avg ~23 rows/insert (max 183), bounded
+memory (no OOM), 16× more landed.** Order is irrelevant once rows are in
+ClickHouse. Raise `timeout` for bigger batches at a little more ingest latency.
+`unordered` alone (without `batch`) or `batch` alone (ordered) do **not** help —
+you need both. (Rationale: NAN-1839.)
 
 ---
 
